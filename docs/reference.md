@@ -43,7 +43,7 @@ The manager `workspace` namespace requires `--config` and refuses `--workspace`.
 | `aegis check` | Daily Workflow & Verification | Verify changes: Layer 1 checks, plus a Layer 2 model review with --full |
 | `aegis scan` | Daily Workflow & Verification | Show which rules apply to the given files (run before editing them) |
 | `aegis status` | Daily Workflow & Verification | Show active rules and stats |
-| `aegis team` | Daily Workflow & Verification | Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics) |
+| `aegis team` | Daily Workflow & Verification | Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics) |
 | `aegis workspace` | Daily Workflow & Verification | Audit management decisions using a separately approved manager policy |
 | `aegis rule` | Rule Evolution & Intelligence | Manage rule lifecycle (list, create, promote, demote, archive) and share rules as unsigned packs |
 | `aegis sync` | Rule Evolution & Intelligence | Rebuild rule fitness from the ledger and suggest promotions (--apply to apply them) |
@@ -216,11 +216,11 @@ Category: Daily Workflow & Verification.
 
 ### `aegis team`
 
-Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)
+Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `gc`, `list`, `metrics`, `release`, `renew`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -281,6 +281,17 @@ Renew by compare-and-swap; an expired lease is re-claimed, overlap check include
 | `lane` | `LANE` |  | Lane name: [a-z0-9][a-z0-9._-]{0,62} (required) |
 | `--expect` | `OID` |  | The lease oid the lane must hold now (printed by claim, renew, transfer and list) |
 | `--ttl` | `SECONDS` |  | New lifetime in seconds, at most 86400 (default: keep it) |
+
+### `aegis team status`
+
+Inspect every lane, branch and optional tip verdict
+
+A lease is conflict input, not liveness proof: it records which paths a lane declared and until when, not that its agent is still working. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics. Inspection changes no leases, worktrees or events.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--base` | `REF` |  | Compare branch tips to this commit (default: the base resolved by check --lane) |
+| `--check` |  |  | Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts |
 
 ### `aegis team transfer`
 
