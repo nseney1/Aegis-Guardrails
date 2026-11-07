@@ -6,26 +6,51 @@ packet carrying `"derive": "runner"`. The packet still names `checkout`, `commit
 `expected_tree`. Other derive values and derive on command or merge recipes are
 refused. Packets without derive retain their existing requirements and checks.
 
-At admit, the runner takes the dirty content digest from its live source witness.
-It derives the expected tree by running `read-tree`, `add -- <paths>` and
-`write-tree` through the recipe's sandbox, PATH, prefix and environment, using the
-same staging steps as commit execution. A temporary job folder holds the private
-index; admission never stages into the real index or moves HEAD. A no-op is
-refused. Explicit digest or tree fields must still match.
+At the first admission, the runner takes the dirty content digest from its live
+source witness. It derives the expected tree by running `read-tree`,
+`add -- <paths>` and `write-tree` through the recipe's sandbox, PATH, prefix and
+environment, using the same staging steps as commit execution. The private index,
+staging logs and process record live in the job's own durable folder. Admission
+never stages into the real index or moves HEAD. A no-op is refused. Explicit
+digest or tree fields must still match.
+
+After staging, `git diff-tree --name-only -r` compares the packet's commit with
+the derived tree. Every changed name must appear exactly in `paths`; directory
+names and `.` cannot authorize unlisted files beneath them. Otherwise admission
+refuses with `derive staged files outside paths: ...`. The runner also takes
+another source witness and refuses any change during derivation.
 
 The runner locates `<base>/host-plan.json` beside the registered `<base>/mailbox`.
-Derivation requires an `aegis.hierarchy-host-plan/v1` plan for this initiative with
-`team` equal to `claude-code`; a missing, unreadable, malformed or non-Claude plan
-is refused with `derive is for shell-less teams`. No additional CLI or store
-field is needed. This branch has no shared `hierarchy_hosts.py` reader, so the job
-runner checks these scope fields locally.
+The root must be exactly `<base>/mailbox`, and that base's `provision.json` must
+name the same mailbox and initiative. PR3's `hierarchy_hosts.base_plan` reader
+validates the complete `aegis.hierarchy-host-plan/v1` schema. The plan must serve
+this initiative with `team` equal to `claude-code`; missing, unreadable, invalid
+or non-Claude plans are refused with `derive is for shell-less teams`. A waiting
+admission and execution recheck the plan, including its hash.
 
-Before execution, `derivation.json` records `derived_by: runner`,
-`dirty_content_sha256` and `expected_tree`, plus the host plan's path, SHA-256 and
-team host. This file is included in the receipt's hashed evidence and survives an
-interrupted runner. The job result repeats these values, including when it
-refuses execution after an admit-to-run edit. The normal `before` and `after`
-witnesses and step logs remain evidence.
+The durable records are:
+
+- `claim.json` and the original `packet.md`: custody starts before staging.
+- `derivation.json`: `derived_by: runner`, `dirty_content_sha256`, `expected_tree`,
+  the sorted `changed_paths`, and `host_plan` with its path, SHA-256 and team host.
+  A known staging failure records available observations; uncomputed tree and
+  changed names are `null`.
+- `admitted.json`: written only after successful admission, binding the packet,
+  recipe and derivation bytes by SHA-256. Later polls reuse the first admission's
+  digest and tree, including after a job-limit wait; they never derive again.
+- `execution.json`: the one-use execution claim, separate from admission custody.
+- `result.json`: the outcome and repeated derivation fields when available. Its
+  `steps` describe execution; the separate staging logs remain alongside it.
+
+Completed, failed and refused receipts with a `derivation.json` hash-bind that
+file, the result and the retained step logs/outputs. Refusals before derivation
+starts and non-derived refusal receipts keep their existing behavior. Recovery
+uses the recorded digest, or a completed job's `after` witness, for comparison.
+
+An uncertain staging stop, a live staging group or a lost runner without a
+successful admission marker stays held/unknown under the job's process record.
+It produces no terminal refusal and is never automatically retried. The existing
+operator `resolve` flow must reconcile process effects before closing it.
 
 The guarantee lost is the lane's report-to-admit binding: the runner commits the
 named paths as they exist at admit, even if they differ from what the lane

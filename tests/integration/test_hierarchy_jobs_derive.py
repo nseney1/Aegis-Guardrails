@@ -2,16 +2,20 @@
 import hashlib
 import json
 import os
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 
 import pytest
 
-from tests.integration.test_hierarchy_jobs import (commit_request, first_job, needs_bubblewrap, shop,  # noqa: F401
-                                                   recorded, source_digest, verified_evidence)
+from tests.integration.test_hierarchy_jobs import (JOBS, commit_request, first_job, load_jobs_module, needs_bubblewrap,  # noqa: F401
+                                                   shop, recorded, source_digest, verified_evidence)
 from tests.integration.test_hierarchy_jobs import pytestmark as pytestmark
 from tests.integration.test_hierarchy_mailbox import git
-from tests.integration.test_hierarchy_workspace import write_lease
+from tests.integration.test_hierarchy_workspace import Workspace, write_lease
 
 
 PATHS = ["src/app.py", "tests/test_app.py"]
@@ -73,8 +77,10 @@ def test_derive_commits_exact_paths_and_records_the_runner_values(claude_shop, s
     assert result["expected_tree"] == result["after"]["source_tree"] == tree
     assert result["host_plan"] == {"path": str(plan), "sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
                                     "team": "claude-code"}
-    assert json.loads(evidence["derivation.json"].read_text()) == {
-        key: result[key] for key in ("derived_by", "dirty_content_sha256", "expected_tree", "host_plan")}
+    derivation = json.loads(evidence["derivation.json"].read_text())
+    assert all(derivation[key] == result[key]
+               for key in ("derived_by", "dirty_content_sha256", "expected_tree", "host_plan"))
+    assert derivation["changed_paths"] == PATHS
     assert git(shop.checkout, "rev-parse", "HEAD^") == before["commit"]
     assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
     assert sorted(git(shop.checkout, "show", "--format=", "--name-only", "HEAD").splitlines()) == PATHS
@@ -95,10 +101,166 @@ def test_an_edit_between_admit_and_run_refuses_without_moving_head_or_index(clau
     result = recorded(shop)
     assert result["steps"] == [] and result["derived_by"] == "runner"
     assert result["dirty_content_sha256"] == digest and result["expected_tree"] == tree
-    evidence = json.loads((shop.workspace.store / "jobs" / "pilot" / "job-1" / "derivation.json").read_text())
+    receipt_evidence = verified_evidence(shop.receipts("job-1")[-1])
+    assert set(receipt_evidence) >= {"derivation.json", "result.json"}
+    assert json.loads(receipt_evidence["result.json"].read_text()) == result
+    evidence = json.loads(receipt_evidence["derivation.json"].read_text())
     assert evidence["dirty_content_sha256"] == digest and evidence["expected_tree"] == tree
     assert git(shop.checkout, "rev-parse", "HEAD") == head
     assert (shop.checkout / ".git" / "index").read_bytes() == index
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_first_admission_survives_a_job_limit_and_later_polls(claude_shop, edit):
+    shop = claude_shop
+    edit_source(shop)
+    digest, tree = source_digest(shop)["dirty_content_sha256"], staged_tree(shop)
+    shop.request_job("job-0", "ok", dirty_content_sha256=digest)
+    request_derive(shop)
+    head, index = shop.head()["commit"], (shop.checkout / ".git" / "index").read_bytes()
+    answer = shop.run_open("--max-jobs", "1", expect=3)
+    assert [(r["job"], r["state"]) for r in answer["rows"]] == [("pilot/job-0", "completed"), ("pilot/job-1", "waiting")]
+    folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+    admitted_bytes = (folder / "derivation.json").read_bytes()
+    admitted = json.loads(admitted_bytes)
+    assert admitted["dirty_content_sha256"] == digest and admitted["expected_tree"] == tree
+    recovery = shop.jobs("recovery-status", expect=3)["jobs"]
+    source = next(row["source"] for row in recovery if row["job"] == "pilot/job-1")
+    assert source["state"] == "match" and source["expected"]["dirty_content_sha256"] == digest
+    if edit:
+        (shop.checkout / "src" / "app.py").write_text("value = 99\n")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == ("refused" if edit else "completed"), row
+    assert (folder / "derivation.json").read_bytes() == admitted_bytes
+    result = recorded(shop)
+    assert result["dirty_content_sha256"] == digest and result["expected_tree"] == tree
+    evidence = verified_evidence(shop.receipts("job-1")[-1])
+    assert {"derivation.json", "result.json"} <= set(evidence)
+    if edit:
+        assert "source does not match the packet" in row["reason"]
+        assert git(shop.checkout, "rev-parse", "HEAD") == head
+        assert (shop.checkout / ".git" / "index").read_bytes() == index
+    else:
+        assert git(shop.checkout, "rev-parse", "HEAD^{tree}") == tree
+        assert shop.run_open()["rows"] == []
+
+
+@pytest.mark.parametrize("alive, raise_error", [(False, True), (True, True), (True, False)])
+def test_uncertain_derivation_stays_in_job_custody_until_resolved(claude_shop, alive, raise_error):
+    shop = claude_shop
+    edit_source(shop)
+    request_derive(shop)
+    if alive:
+        shop.recipes["prefix"] = [sys.executable, "-c", "import time; time.sleep(30)"]
+        shop.recipes["recipes"]["commit-exact"]["timeout_seconds"] = 1
+        shop.save_recipes()
+    pid_file = shop.tmp / "uncertain-pid"
+    program = ("import importlib.util,json,sys\nfrom pathlib import Path\n"
+               "spec=importlib.util.spec_from_file_location('jobs_fault',sys.argv[1])\n"
+               "jobs=importlib.util.module_from_spec(spec); spec.loader.exec_module(jobs)\n"
+               "real_stop=jobs.stop_for_certain\n"
+               "def uncertain(process):\n"
+               "    Path(sys.argv[4]).write_text(str(process.pid))\n"
+               "    if sys.argv[5] == 'False': real_stop(process)\n"
+               "    if sys.argv[6] == 'True': raise jobs.StillRunning(process.pid,'injected uncertain OS stop')\n"
+               "jobs.stop_for_certain=uncertain\n"
+               "code,result=jobs.run_open(sys.argv[2],sys.argv[3],[],20,[],0)\n"
+               "print(json.dumps(result)); sys.exit(code)\n")
+    head, index = shop.head()["commit"], (shop.checkout / ".git" / "index").read_bytes()
+    pid = None
+    try:
+        answer = subprocess.run([sys.executable, "-I", "-c", program, str(JOBS), str(shop.workspace.store),
+                                 str(shop.recipes_path), str(pid_file), str(alive), str(raise_error)],
+                                capture_output=True, text=True, timeout=15, env=shop.env())
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+        assert answer.returncode == 3, answer.stdout + answer.stderr
+        row = json.loads(answer.stdout)["rows"][0]
+        assert row["state"] in ("abandoned", "waiting"), row
+        folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
+        assert (folder / "claim.json").is_file() and (folder / "process.json").is_file()
+        assert json.loads((folder / "process.json").read_text())["group"] == pid
+        assert not (folder / "result.json").exists()
+        assert "job-1" in shop.open_jobs()
+        assert shop.run_open(expect=3)["rows"][0]["state"] == "abandoned"
+        assert "refused" not in shop.states("job-1")
+        if alive:
+            refused = shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "test reconciliation", expect=2)
+            assert "still running" in refused["error"]
+        assert git(shop.checkout, "rev-parse", "HEAD") == head
+        assert (shop.checkout / ".git" / "index").read_bytes() == index
+    finally:
+        if pid is not None:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            jobs = load_jobs_module()
+            deadline = time.monotonic() + 5
+            while jobs.group_members(pid):
+                assert time.monotonic() < deadline, "test staging process survived cleanup"
+                time.sleep(0.01)
+    assert shop.jobs("resolve", "--job", "pilot/job-1", "--reason", "test confirmed process stopped")["state"] == "failed"
+
+
+def test_an_alternate_mailbox_cannot_borrow_the_canonical_plan(claude_shop):
+    shop = claude_shop
+    edit_source(shop)
+    request_derive(shop)
+    alternate = shop.base / "alternate-mailbox"
+    shutil.copytree(shop.root, alternate)
+    other_store = shop.tmp / "alternate-registration"
+    other_store.mkdir()
+    shop.workspace = Workspace(other_store)
+    shop.workspace.run("init", {"writer_limit": 3, "heavy_limit": 1})
+    shop.workspace.register("pilot", mailbox_root=str(alternate), checkouts=[str(shop.checkout)])
+    head = shop.head()["commit"]
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "derive is for shell-less teams" in row["reason"], row
+    assert git(shop.checkout, "rev-parse", "HEAD") == head
+
+
+def test_an_incomplete_plan_does_not_authorize_derive(claude_shop):
+    shop = claude_shop
+    (shop.base / "host-plan.json").write_text(json.dumps({"schema": "aegis.hierarchy-host-plan/v1",
+                                                       "hierarchy": "pilot", "team": "claude-code"}))
+    edit_source(shop)
+    request_derive(shop)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "host plan is missing" in row["reason"], row
+
+
+def test_a_folder_path_cannot_stage_unlisted_files(claude_shop):
+    shop = claude_shop
+    edit_source(shop)
+    head, index = shop.head()["commit"], (shop.checkout / ".git" / "index").read_bytes()
+    shop.request_job("job-1", "commit-exact", derive="runner", paths=["src"], message="fix: folder request")
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and row["reason"] == (
+        "derive staged files outside paths: src/app.py, src/other.py"), row
+    evidence = verified_evidence(shop.receipts("job-1")[-1])
+    derivation = json.loads(evidence["derivation.json"].read_text())
+    assert derivation["changed_paths"] == ["src/app.py", "src/other.py"]
+    assert git(shop.checkout, "rev-parse", "HEAD") == head
+    assert (shop.checkout / ".git" / "index").read_bytes() == index
+
+
+def test_source_must_match_the_witness_after_staging(claude_shop):
+    shop = claude_shop
+    edit_source(shop)
+    wrapper = shop.tmp / "git-boundary.py"
+    wrapper.write_text("import pathlib, subprocess, sys\n"
+                       "result = subprocess.run(sys.argv[1:])\n"
+                       "if 'add' in sys.argv[1:] and result.returncode == 0:\n"
+                       "    pathlib.Path('src/app.py').write_text('value = 33\\n')\n"
+                       "sys.exit(result.returncode)\n")
+    shop.recipes["prefix"] = [sys.executable, str(wrapper)]
+    shop.save_recipes()
+    head = shop.head()["commit"]
+    request_derive(shop)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and row["reason"] == "source changed during derivation", row
+    assert git(shop.checkout, "rev-parse", "HEAD") == head
 
 
 def test_a_derived_no_op_is_refused(claude_shop):
@@ -146,6 +308,48 @@ def test_missing_expected_tree_without_derive_keeps_the_existing_refusal(shop):
     commit_request(shop, expected_tree=None)
     row = shop.run_open()["rows"][0]
     assert row["state"] == "refused" and "commit recipe needs expected_tree and message" in row["reason"]
+    assert "evidence" not in shop.receipts("job-1")[-1]["receipt"]
+
+
+def test_staging_failure_receipts_bind_the_available_derivation_evidence(claude_shop):
+    shop = claude_shop
+    edit_source(shop)
+    head, index = shop.head()["commit"], (shop.checkout / ".git" / "index").read_bytes()
+    digest = source_digest(shop)["dirty_content_sha256"]
+    shop.request_job("job-1", "commit-exact", derive="runner", paths=["src/missing.py"], message="fix: missing")
+    row = shop.run_open()["rows"][0]
+    assert (row["state"], row["reason"]) == ("refused", "could not derive expected_tree: step 2 exited 128")
+    evidence = verified_evidence(shop.receipts("job-1")[-1])
+    derived = json.loads(evidence["derivation.json"].read_text())
+    assert derived["dirty_content_sha256"] == digest
+    assert derived["expected_tree"] is None and derived["changed_paths"] is None
+    assert "pathspec" in evidence["step-2.log"].read_text()
+    assert git(shop.checkout, "rev-parse", "HEAD") == head
+    assert (shop.checkout / ".git" / "index").read_bytes() == index
+
+
+def test_a_canonical_mailbox_must_agree_with_its_provision_record(claude_shop):
+    shop = claude_shop
+    setup_path = shop.base / "provision.json"
+    setup = json.loads(setup_path.read_text())
+    setup["mailbox_root"] = str(shop.base / "other-mailbox")
+    setup_path.write_text(json.dumps(setup))
+    edit_source(shop)
+    request_derive(shop)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "registered mailbox does not match provision.json" in row["reason"], row
+
+
+def test_a_symlink_plan_is_refused(claude_shop):
+    shop = claude_shop
+    plan = shop.base / "host-plan.json"
+    target = shop.tmp / "plan.json"
+    plan.rename(target)
+    plan.symlink_to(target)
+    edit_source(shop)
+    request_derive(shop)
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "refused" and "host plan must not be a symlink" in row["reason"], row
 
 
 @pytest.mark.parametrize("changes", [{"team": "codex-cli"}, {"team": "codex"}, {"hierarchy": "other"},
