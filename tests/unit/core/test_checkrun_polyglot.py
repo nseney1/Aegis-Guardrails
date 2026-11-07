@@ -204,7 +204,8 @@ def test_go_full_tree_receipt_uses_real_default_runner(project):
     project.write('app_test.go', 'package receipt\nimport "testing"\nfunc TestWorks(t *testing.T) {}\n')
     row = receipt(project)
     native = languages(row)['go']
-    assert row['passed'] and native['passed_ids'] == [['example.test/receipt', 'TestWorks']]
+    assert row['passed'] and native['passed_ids'] == [['example.test/receipt', 'TestWorks']], json.dumps(
+        row, sort_keys=True, indent=2)
     assert native['witness'] == 'aegis' and native['complete'] is True
 
 
