@@ -114,16 +114,21 @@ CAP_REASON = "turn cap reached"
 AUTH_MODES = ("api-key", "existing")
 AUTH_FILE = "auth.json"
 LOCK_FILE, LOG_DIR, TMP_DIR = "auth.lock", "log", "tmp"
+# Observed 2026-11-07 (dogfood run 1, real codex-cli 0.167.0 `codex login`): an empty auth.json.lock, mode 0600,
+# beside auth.lock. It gets the same checks and cleanup as auth.lock.
+AUTH_JSON_LOCK_FILE = "auth.json.lock"
+LOCK_FILES = (LOCK_FILE, AUTH_JSON_LOCK_FILE)
 LOCK_MAX_BYTES = 4096
 # A real login's tmp/ is tmp/arg0-linux/<one folder>/{.lock, apply_patch, applypatch, codex-linux-sandbox}: 4 levels
 # and a handful of entries. These bounds keep the preflight walk and the cleanup short whatever was planted there.
 TMP_MAX_DEPTH, TMP_MAX_ENTRIES = 8, 512
 ARG0_DIR = "arg0-linux"
 # What an existing login's CODEX_HOME may hold: the plan's owner mark and what a real `codex login` (codex-cli) writes:
-# auth.json, an empty auth.lock, log/codex-login.log and tmp/arg0-linux/<one folder>. Nothing else is taken on trust:
-# sessions/ would put a prior session's rollouts beside the probe's, config.toml is the codex_home write target and
-# would change the run's settings, and any other entry is unexplained.
-EXISTING_LOGIN_ENTRIES = (OWNER_MARK, AUTH_FILE, LOCK_FILE, LOG_DIR, TMP_DIR)
+# auth.json, an empty auth.lock (and, from codex-cli 0.167.0, an empty auth.json.lock), log/codex-login.log and
+# tmp/arg0-linux/<one folder>. Nothing else is taken on trust: sessions/ would put a prior session's rollouts beside
+# the probe's, config.toml is the codex_home write target and would change the run's settings, and any other entry is
+# unexplained.
+EXISTING_LOGIN_ENTRIES = (OWNER_MARK, AUTH_FILE, LOCK_FILE, AUTH_JSON_LOCK_FILE, LOG_DIR, TMP_DIR)
 API_KEY_VARIABLES = ("OPENAI_API_KEY", "CODEX_API_KEY")
 AUTH_CLEANUP_NOTE = "auth.json is deleted at cleanup; log in again for a new run"
 
@@ -570,27 +575,29 @@ def login_extras(folder, codex=None):
     and only when it resolves to codex (the codex on PATH, resolved once here); the cleanup only unlinks it."""
     folder = Path(folder)
     codex_real = os.path.realpath(codex) if codex else None
-    lock = folder / LOCK_FILE
-    if os.path.lexists(lock):
+    for name in LOCK_FILES:
+        lock = folder / name
+        if not os.path.lexists(lock):
+            continue
         info = os.lstat(lock)
         if stat.S_ISLNK(info.st_mode):
-            raise Refusal("auth.lock in CODEX_HOME is a symlink: " + str(lock))
+            raise Refusal("%s in CODEX_HOME is a symlink: %s" % (name, lock))
         if not stat.S_ISREG(info.st_mode):
-            raise Refusal("auth.lock in CODEX_HOME is not a regular file: " + str(lock))
+            raise Refusal("%s in CODEX_HOME is not a regular file: %s" % (name, lock))
         if info.st_nlink != 1:
-            raise Refusal("auth.lock in CODEX_HOME has %d hard links: %s" % (info.st_nlink, lock))
+            raise Refusal("%s in CODEX_HOME has %d hard links: %s" % (name, info.st_nlink, lock))
         if info.st_uid != os.getuid():
-            raise Refusal("auth.lock in CODEX_HOME is not owned by this user: " + str(lock))
+            raise Refusal("%s in CODEX_HOME is not owned by this user: %s" % (name, lock))
         if info.st_size > LOCK_MAX_BYTES:
-            raise Refusal("auth.lock in CODEX_HOME is larger than %d bytes (%d): %s" % (LOCK_MAX_BYTES, info.st_size,
-                                                                                      lock))
+            raise Refusal("%s in CODEX_HOME is larger than %d bytes (%d): %s" % (name, LOCK_MAX_BYTES, info.st_size,
+                                                                               lock))
         mode = stat.S_IMODE(info.st_mode)
         if mode & 0o002:
-            raise Refusal("auth.lock in CODEX_HOME is writable by others (mode %04o): %s" % (mode, lock))
-        # codex-cli creates it 0664 under the usual umask 002, where the group is the user's own private group.
+            raise Refusal("%s in CODEX_HOME is writable by others (mode %04o): %s" % (name, mode, lock))
+        # codex-cli creates auth.lock 0664 under the usual umask 002, where the group is the user's own private group.
         if mode & 0o020 and info.st_gid != os.getgid():
-            raise Refusal("auth.lock in CODEX_HOME is writable by group %d, not this user's own group (mode %04o): %s"
-                          % (info.st_gid, mode, lock))
+            raise Refusal("%s in CODEX_HOME is writable by group %d, not this user's own group (mode %04o): %s"
+                          % (name, info.st_gid, mode, lock))
     log = folder / LOG_DIR
     if os.path.lexists(log):
         if not stat.S_ISDIR(os.lstat(log).st_mode):
@@ -1399,18 +1406,18 @@ def remove_login(codex_home, guarded, left=None):
 
 
 def remove_login_extras(fd, left):
-    """auth.lock (a regular file), log/ (regular files only) and tmp/ (folders, regular files and symlinks, the links
-    themselves) under the codex-home handle fd. Each step is relative to a handle opened with O_NOFOLLOW, so no
-    symlink is ever followed; anything else stays and is recorded in left."""
-    try:
-        info = os.stat(LOCK_FILE, dir_fd=fd, follow_symlinks=False)
-    except FileNotFoundError:
-        info = None
-    if info is not None:
+    """auth.lock and auth.json.lock (regular files), log/ (regular files only) and tmp/ (folders, regular files and
+    symlinks, the links themselves) under the codex-home handle fd. Each step is relative to a handle opened with
+    O_NOFOLLOW, so no symlink is ever followed; anything else stays and is recorded in left."""
+    for name in LOCK_FILES:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
         if stat.S_ISREG(info.st_mode):
-            unlink_at(fd, LOCK_FILE, LOCK_FILE, left)
+            unlink_at(fd, name, name, left)
         else:
-            left.append(LOCK_FILE)
+            left.append(name)
     clear_folder(fd, LOG_DIR, LOG_DIR, False, left)
     clear_folder(fd, TMP_DIR, TMP_DIR, True, left)
 
