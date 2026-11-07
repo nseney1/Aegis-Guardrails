@@ -85,6 +85,7 @@ def validate_observation(row, value):
 
 
 def validate_association(policy, state, row, value, cid, at):
+    require("small_change" not in row, "canonical provider association is unavailable for small-change rows")
     fields(value, {"schema", "request_id", "request_sha256", "intent_id", "source", "authority", "authority_sha256",
                    "decision_sha256", "admission_sha256", "original_actor", "original_generation", "original_cap_seconds",
                    "authority_expires_at", "provider", "endpoint_id", "thread_id", "client_id", "deadline"})
@@ -491,22 +492,74 @@ def covered(scope, path):
     return any(parts[:len(PurePosixPath(granted).parts)] == PurePosixPath(granted).parts for granted in scope)
 
 
+def small_change_participant(policy, state, binding, expected, name, role):
+    """Check one configured identity/generation, never host authentication."""
+    fields(binding, {"cid", "generation"})
+    require(binding["cid"] == expected, "small-change " + name + " mismatch")
+    require(type(binding["generation"]) is int and binding["generation"] > 0,
+            "invalid small-change participant generation")
+    actor = policy["actors"].get(binding["cid"])
+    require(actor is not None and actor["role"] == role, "small-change participant role mismatch")
+    require(binding["generation"] == actor["generation"], "small-change participant generation mismatch")
+    require(state["current"][role] == binding["cid"], "small-change participant is no longer current")
+
+
 def small_change_participants(policy, state, row, plan, participants):
     """Check configured identity/generation only. This is not host authentication."""
     fields(participants, {"writer", "reviewer"})
     expected = {"writer": plan["writing_lanes"][0]["writer"], "reviewer": plan["reviewer"]}
     for name, role in (("writer", "operator"), ("reviewer", "reviewer")):
-        binding = participants[name]
-        fields(binding, {"cid", "generation"})
-        require(binding["cid"] == expected[name], "small-change " + name + " mismatch")
-        require(type(binding["generation"]) is int and binding["generation"] > 0,
-                "invalid small-change participant generation")
-        actor = policy["actors"].get(binding["cid"])
-        require(actor is not None and actor["role"] == role, "small-change participant role mismatch")
-        require(binding["generation"] == actor["generation"], "small-change participant generation mismatch")
-        require(state["current"][role] == binding["cid"], "small-change participant is no longer current")
+        small_change_participant(policy, state, participants[name], expected[name], name, role)
     require(participants["reviewer"]["cid"] not in {row["publisher"], participants["writer"]["cid"]},
             "small-change reviewer must be independent")
+
+
+def small_change_approval(state, row):
+    """Keep plan approval/admission separate from permission to start work."""
+    value, change = row["request"], row["small_change"]
+    canonical = [d for d in state["decisions"] if d["request_id"] == value["id"]]
+    require(not canonical or canonical[-1]["decision"] != "deny", "canonical request is denied")
+    decisions = change["decisions"]
+    require(decisions and decisions[-1]["decision"] == "approve", "small-change plan lacks approval")
+    require(change["admission"] is not None, "small-change plan lacks admission")
+    return change["registration"]
+
+
+def small_change_execution(policy, state, row, at):
+    """Validate the admitted plan's scope and bindings before new work."""
+    value = row["request"]
+    registration = small_change_approval(state, row)
+    require(parse_time(at) < parse_time(value["continuation"]["expires_at"]), "bounded authority expired")
+    plan = raw_value(registration["proposal"])["plan"]
+    small_change_participants(policy, state, row, plan, registration["participants"])
+    # Intent consumes the sole start. Start validates that same intent,
+    # so only a request without an intent needs an unspent start here.
+    if row["intent"] is None:
+        require(state["consumed"].get(value["authority"], 0) < value["continuation"]["max_starts"],
+                "bounded authority exhausted")
+    for prerequisite in value["prerequisites"]:
+        prior = state["requests"].get(prerequisite)
+        require(prior is not None and prior["resolution"] is not None and prior["resolution"]["kind"] == "complete",
+                "prerequisite lacks accepted delivery")
+    return plan
+
+
+def small_change_started(row):
+    """Terminal evidence and review require the same recorded start."""
+    intent, start = row["intent"], row["start"]
+    require(intent is not None and start is not None and start["intent_id"] == intent["id"],
+            "small-change evidence requires a recorded matching start")
+    return start
+
+
+def small_change_review(policy, state, row, cid):
+    """Review finished evidence without renewing expiry or the writer binding."""
+    registration = small_change_approval(state, row)
+    small_change_started(row)
+    plan = raw_value(registration["proposal"])["plan"]
+    small_change_participant(policy, state, registration["participants"]["reviewer"],
+                             plan["reviewer"], "reviewer", "reviewer")
+    require(cid == plan["reviewer"], "small-change review requires the registered Reviewer")
 
 
 def small_change_event(policy, state, row, event, mark, at):
@@ -735,14 +788,23 @@ def reduce_event(policy, state, envelope, at):
     elif kind == "read":
         row["read"] = mark
     elif kind == "route":
-        require("small_change" not in row, "small-change dispatch is not activated")
+        if "small_change" in row:
+            plan = small_change_execution(policy, state, row, at)
+            require(event["to"] == value["team"] + "/lane/" + plan["writing_lanes"][0]["lane"],
+                    "small-change route must target the approved lane")
         text(event["to"], "route recipient")
         row["routed"] = {**mark, "to": event["to"]}
     elif kind in {"admit", "intent"}:
-        require("small_change" not in row, "small-change dispatch is not activated")
+        if "small_change" in row:
+            require(kind == "intent", "small-change requires its separate admission")
         require(row["intent"] is None, "request already has an intent; settle its unknown effect")
         require(row["resolution"] is None, "disposed request cannot be admitted")
-        authority = approved_authority(state, row, at)
+        if "small_change" in row:
+            plan = small_change_execution(policy, state, row, at)
+            require(cid == plan["writing_lanes"][0]["writer"], "small-change intent writer mismatch")
+            authority = value["authority"]
+        else:
+            authority = approved_authority(state, row, at)
         if kind == "admit":
             require(event["source"] == value["source"], "admission source mismatch")
             fields(event["gates"], GATES)
@@ -750,8 +812,9 @@ def reduce_event(policy, state, envelope, at):
                 evidence(refs)
             row["admission"] = {**mark, "gates": event["gates"], "source": event["source"]}
         else:
-            require(row["admission"] is not None and row["admission"]["actor"] == cid,
-                    "intent requires the current operator's separate admission")
+            if "small_change" not in row:
+                require(row["admission"] is not None and row["admission"]["actor"] == cid,
+                        "intent requires the current operator's separate admission")
             matching(event["intent_id"], SLUG, "intent id")
             require(all(r["intent"] is None or r["intent"]["id"] != event["intent_id"] for r in state["requests"].values()),
                     "intent id already belongs to another request")
@@ -766,15 +829,24 @@ def reduce_event(policy, state, envelope, at):
         if state["meters"][cid]["open_since"] is None:
             state["meters"][cid]["open_since"] = at
     elif kind == "start":
+        if "small_change" in row:
+            plan = small_change_execution(policy, state, row, at)
+            require(cid == plan["writing_lanes"][0]["writer"], "small-change start writer mismatch")
         require(row["intent"] is not None and row["intent"]["id"] == event["intent_id"], "start intent correlation mismatch")
         require(row["intent"]["actor"] == cid and row["start"] is None and row["terminal"] is None,
                 "start requires its original current operator and an unresolved unstarted intent")
-        approved = [d for d in state["decisions"] if d["request_id"] == value["authority"]]
-        require(approved and approved[-1]["decision"] == "approve", "authority revoked before start")
-        require(parse_time(at) < parse_time(state["requests"][value["authority"]]["request"]["continuation"]["expires_at"]),
-                "bounded authority expired")
+        if "small_change" not in row:
+            approved = [d for d in state["decisions"] if d["request_id"] == value["authority"]]
+            require(approved and approved[-1]["decision"] == "approve", "authority revoked before start")
+            require(parse_time(at) < parse_time(state["requests"][value["authority"]]["request"]["continuation"]["expires_at"]),
+                    "bounded authority expired")
         row["start"] = {**mark, "intent_id": event["intent_id"]}
     elif kind == "terminal":
+        if "small_change" in row:
+            start = small_change_started(row)
+            require((cid, actor["generation"]) == (start["actor"], start["generation"]),
+                    "small-change terminal requires starting writer %s generation %s"
+                    % (start["actor"], start["generation"]))
         result = raw_value(event["result"])
         fields(result, {"request_sha256", "intent_id", "outcome", "exit_code", "source", "evidence"})
         require(row["intent"] is not None and result["intent_id"] == row["intent"]["id"]
@@ -792,6 +864,8 @@ def reduce_event(policy, state, envelope, at):
         row["results"].append(row["terminal"])
         row["review"], row["delivery"] = None, None
     elif kind == "review":
+        if "small_change" in row:
+            small_change_review(policy, state, row, cid)
         require(row["terminal"] is not None and event["result_sha256"] == row["terminal"]["sha256"], "review result sha256 mismatch")
         require(event["source"] == value["source"], "review source mismatch")
         require(cid != row["publisher"] and cid != row["intent"]["actor"], "reviewer must be independent")
@@ -925,6 +999,7 @@ class Lifecycle:
     def status(self):
         policy, state = self.load()
         obligations, candidates, holds = [], [], {}
+        small_change_ready = []
         at = timestamp()
         for identifier, row in sorted(state["requests"].items()):
             resolution = row["resolution"]
@@ -935,21 +1010,37 @@ class Lifecycle:
             obligations.append({"request_id": identifier, "request_sha256": row["raw"]["sha256"], "state": stage,
                                 "owner": owner["owner"], "next_decision": owner["next_decision"],
                                 "blocker": resolution if resolution and resolution["kind"] == "blocked" else None})
+            if "small_change" in row and unknown_effect(row):
+                writer = row["start"] or row["intent"]
+                current = state["current"]["operator"]
+                if (writer["actor"], writer["generation"]) != (current, policy["actors"][current]["generation"]):
+                    holds[identifier] = ("small-change interrupted writer %s generation %s; T1 dispatcher resume required"
+                                         % (writer["actor"], writer["generation"]))
             if not resolution and row["intent"] is None:
                 try:
-                    require("small_change" not in row, "small-change dispatch is not activated")
                     operator = state["current"]["operator"]
                     require(active_seconds(state, operator, at) < policy["actors"][operator]["cap_seconds"],
                             "actor cumulative active cap reached")
-                    approved_authority(state, row, at)
+                    if "small_change" in row:
+                        small_change_execution(policy, state, row, at)
+                    else:
+                        approved_authority(state, row, at)
                 except ValueError as exc:
                     holds[identifier] = str(exc)
                 else:
-                    candidates.append(identifier)
-        return {"schema": "aegis.lifecycle-status/v1", "state": "pending" if obligations else "complete" if state["requests"] else "untracked",
+                    if "small_change" in row:
+                        small_change_ready.append(identifier)
+                        holds[identifier] = "small-change requires the T1 dispatcher"
+                    else:
+                        candidates.append(identifier)
+        result = {"schema": "aegis.lifecycle-status/v1", "state": "pending" if obligations else "complete" if state["requests"] else "untracked",
                 "work_complete": bool(state["requests"]) and not obligations, "coverage": "registered_requests_only",
                 "execution_enabled": False, "native_enforcement": "unqualified", "policy_sha256": digest(policy),
                 "obligations": obligations, "continuation_candidates": candidates, "continuation_holds": holds, **state}
+        # This view-only key never changes canonical-only status or checkpoints.
+        if any("small_change" in row for row in state["requests"].values()):
+            result["small_change_ready"] = small_change_ready
+        return result
 
 
 def _prepare_initial(policy, state, envelope):
