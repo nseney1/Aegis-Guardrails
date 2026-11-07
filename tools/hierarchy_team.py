@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -417,14 +416,14 @@ def inside_owner(real, owner, check_identity):
     if not check_identity:
         return False
     try:
-        info = owner.stat()
+        info = os.stat(owner)
     except (FileNotFoundError, NotADirectoryError):
         return False
     identity = (info.st_dev, info.st_ino)
     candidate = Path(real)
     for ancestor in (candidate, *candidate.parents):
         try:
-            info = ancestor.stat()
+            info = os.stat(ancestor)
         except (FileNotFoundError, NotADirectoryError):
             continue
         if (info.st_dev, info.st_ino) == identity:
@@ -581,12 +580,12 @@ def init_complete(state):
     return bool(state and state["init"].get("complete_at"))
 
 
-def require_init(run):
+def require_init(run, *, record_command=True):
     state = load_state(run)
     if not init_complete(state):
-        refuse("init has not completed; run init first")
+        refuse("init has not completed; run init first", record_command=record_command)
     if state.get("down", {}).get("started_at") or state.get("down", {}).get("done"):
-        refuse("teardown has started; a new run needs a new run folder")
+        refuse("teardown has started; a new run needs a new run folder", record_command=record_command)
     return state
 
 
@@ -1046,8 +1045,9 @@ def init(run, args):
 # -- login and root -------------------------------------------------------------------------------------------------------
 
 @contextmanager
-def login_lock(run):
+def login_lock(run, busy_message="another login is running for this run"):
     """Keep one lock inode for this run; closing releases it on every success or exception, without unlinking it."""
+    import fcntl  # POSIX operations only; the module itself is imported during Windows test collection.
     revalidate_run(run)
     descriptor = os.open(str(run.run / ".login.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
@@ -1058,7 +1058,7 @@ def login_lock(run):
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            refuse("another login is running for this run", record_command=False)
+            refuse(busy_message, record_command=False)
         yield
     finally:
         os.close(descriptor)
@@ -1076,9 +1076,10 @@ def claude_login_preconditions(run):
 def login(run, args):
     """Each host the plan uses, logged in to the run's own home. A Codex-only plan answers as it always did."""
     require_init(run)
+    if not run.uses(CLAUDE):
+        return OK, login_codex(run)
     with login_lock(run):
-        if not run.uses(CLAUDE):
-            return OK, login_codex(run)
+        require_init(run)
         timeout = claude_login_preconditions(run)
         logins = {}
         try:
@@ -1187,6 +1188,18 @@ def remove_login_credentials(run, before, written):
     return True
 
 
+def discard_claude_login_evidence(run):
+    """A failed login must not leave an accepted login record or its index entry, including from an earlier login."""
+    revalidate_run(run)
+    (run.evidence / "login-claude.json").unlink(missing_ok=True)
+    path = run.evidence / "index.json"
+    if path.is_file():
+        value = read_json(path)
+        if "login-claude.json" in value["files"]:
+            del value["files"]["login-claude.json"]
+            write_atomic(path, as_json(value))
+
+
 def login_claude(run, timeout):
     """claude auth login in the run's CLAUDE_CONFIG_DIR, which the owner finishes in the browser, then its status. The
     evidence keeps the filtered auth record (no email or organization) and the credentials' hash, never the file."""
@@ -1205,6 +1218,8 @@ def login_claude(run, timeout):
         written = credential_observation(run)
         if proc.returncode != 0:
             fail("claude auth login exited %d" % proc.returncode)
+        # A teardown completed by an older command must remain authoritative after the browser login returns.
+        require_init(run, record_command=False)
         revalidate_homes(run)
         credentials_digest(run)
         proc = subprocess.run(["claude", "auth", "status", "--json"], env=child_env(run), capture_output=True, text=True,
@@ -1223,12 +1238,15 @@ def login_claude(run, timeout):
                   "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
         revalidate_homes(run)
         save(run, "login-claude.json", answer)
+        # ROOT can bind while the browser is open: merge only login's fields into the latest state under the lock.
+        state = require_init(run, record_command=False)
         state.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
         revalidate_homes(run)
         save_state(run, state)
         return answer
     except Exception as exc:
         removed = remove_login_credentials(run, before, written)
+        discard_claude_login_evidence(run)
         if removed and isinstance(exc, Stop):
             raise Stop(exc.code, str(exc) + "; removed credentials written by this login",
                        record_command=exc.record_command, **exc.detail) from exc
@@ -1346,11 +1364,12 @@ def expected_profile(run, mailbox, endpoint):
 
 
 def find_rollout(run, endpoint, session):
-    found = sorted((run.codex_home / "sessions").glob("**/rollout-*%s.jsonl" % session))
+    home = Path(run.validated_homes[CODEX]) if run.uses(CLAUDE) else run.codex_home
+    found = sorted((home / "sessions").glob("**/rollout-*%s.jsonl" % session))
     if len(found) != 1:
         fail("%s rollout%s for %s's session %s under %s" % ("no" if not found else str(len(found)),
                                                            "" if len(found) == 1 else "s", endpoint, session,
-                                                           run.codex_home / "sessions"))
+                                                           home / "sessions"))
     return found[0]
 
 
@@ -1419,11 +1438,13 @@ def start_loop(run):
         if key:
             environ[key] = value
     problems = []
-    if environ.get("CODEX_HOME") != str(run.codex_home):
-        problems.append("its CODEX_HOME is %s, not %s" % (environ.get("CODEX_HOME"), run.codex_home))
+    codex_home = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
+    if environ.get("CODEX_HOME") != codex_home:
+        problems.append("its CODEX_HOME is %s, not %s" % (environ.get("CODEX_HOME"), codex_home))
     # The pinned wake passes no env=, so every Claude wake inherits this home from the loop (ADR T2(a) section 3).
-    if run.uses(CLAUDE) and environ.get("CLAUDE_CONFIG_DIR") != str(run.claude_home):
-        problems.append("its CLAUDE_CONFIG_DIR is %s, not %s" % (environ.get("CLAUDE_CONFIG_DIR"), run.claude_home))
+    if run.uses(CLAUDE) and environ.get("CLAUDE_CONFIG_DIR") != run.validated_homes[CLAUDE]:
+        problems.append("its CLAUDE_CONFIG_DIR is %s, not %s" % (environ.get("CLAUDE_CONFIG_DIR"),
+                                                              run.validated_homes[CLAUDE]))
     if cargo_dir is not None and cargo_dir not in environ.get("PATH", "").split(os.pathsep):
         problems.append("its PATH lacks %s, where the recipes' cargo is" % cargo_dir)
     if problems:
@@ -2056,6 +2077,13 @@ def down(run, args):
                                   (args.purge_claude_home, CLAUDE, "--purge-claude-home")):
         if requested and not run.uses(kind):
             refuse("%s requires a plan that uses %s" % (flag, kind))
+    if run.uses(CLAUDE) and load_state(run) is not None:
+        with login_lock(run, busy_message="a login is in progress"):
+            return down_run(run, args)
+    return down_run(run, args)
+
+
+def down_run(run, args):
     state = load_state(run)
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}

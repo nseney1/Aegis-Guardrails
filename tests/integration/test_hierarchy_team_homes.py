@@ -8,6 +8,7 @@ touched: the refusals that need an owner folder replace the password database an
 checked by calling start_loop in this process after a real init (the same function `up` calls), then read back through
 /proc, loop-environ.txt and `status`, and the loop is stopped with `down`.
 """
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -51,7 +52,10 @@ if argv[:2] == ["auth", "login"] and env.get("WRAP_GATE"):
     with open(env["WRAP_GATE"] + "-ready", "wb", buffering=0) as stream:
         stream.write(b"1")
     with open(env["WRAP_GATE"] + "-release", "rb", buffering=0) as stream:
-        if not select.select([stream], [], [], 2)[0] or stream.read(1) != b"1":
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not select.select([stream], [], [], 0.2)[0]:
+            pass
+        if time.monotonic() >= deadline or stream.read(1) != b"1":
             sys.exit(89)
 if argv[:2] == ["auth", "login"] and env.get("WRAP_KEEP_CREDENTIALS"):
     sys.exit(0)
@@ -886,6 +890,8 @@ def test_round2_a_claude_home_swap_is_caught_before_status_or_state_save(make, c
     assert credential.read_bytes() == b"untouched owner credential\n"
     assert not (home / ".credentials.json").exists()
     assert CLAUDE not in state(run).get("logins", {})
+    assert not (run.evidence / "login-claude.json").exists()
+    assert "login-claude.json" not in json.loads((run.evidence / "index.json").read_text())["files"]
     if stage == "login":
         assert [call["argv"][:2] for call in run.claude_calls()] == [["auth", "login"]]
 
@@ -912,6 +918,9 @@ def test_round2_owner_inode_aliases_are_refused_for_every_existing_ancestor(make
     run.config[field] = str(alias / "not-created" / "candidate")
     run.save()
     original = os.stat
+
+    # CPython 3.9/3.10 pathlib retains the os.stat callable it saw at import time.
+    run.monkeypatch.setattr(Path, "stat", lambda path, **kwargs: original(path, **kwargs))
 
     def same_directory(path, *args, **kwargs):
         info = original(path, *args, **kwargs)
@@ -972,6 +981,140 @@ def test_round2_init_rechecks_the_run_destination_immediately_before_its_first_w
     code, answer = in_process(run, "init", capsys=capsys)
     assert code == 2 and answer["error"].startswith("run folder ")
     assert files(owner) == before and sorted(path.name for path in owner.iterdir()) == ["owner.txt"]
+
+
+# -- review round 3: portable imports, loop homes, and concurrent state writers -------------------------------------------
+
+@contextmanager
+def paused_claude_login(run):
+    """Pause the real CLI's fake auth child using FIFOs; always release and reap it, including on assertion failure."""
+    gate = str(run.tmp / "round3-gate")
+    for suffix in ("-ready", "-release"):
+        os.mkfifo(gate + suffix, 0o600)
+    ready = os.open(gate + "-ready", os.O_RDWR | os.O_NONBLOCK)
+    release = os.open(gate + "-release", os.O_RDWR | os.O_NONBLOCK)
+    process = subprocess.Popen([sys.executable, "-I", "-B", str(TEAM), "--config", str(run.config_path), "login"],
+                               env=run.env(WRAP_GATE=gate), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = {}
+    try:
+        assert select.select([ready], [], [], 2)[0], "the auth child did not reach the gate"
+        assert os.read(ready, 1) == b"1"
+        yield result
+    finally:
+        os.write(release, b"1")
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+            result.update(code=process.returncode, stdout=stdout, stderr=stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2)
+            os.close(ready)
+            os.close(release)
+
+
+def test_round3_the_team_module_imports_when_fcntl_is_unavailable(make):
+    run = make()
+    script = ("import sys; sys.modules['fcntl'] = None; sys.path.insert(0, sys.argv[1]); "
+              "import hierarchy_team; print(hierarchy_team.SCHEMA)")
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools")],
+                          capture_output=True, text=True, timeout=2, env=run.env())
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "aegis.team-run/v1"
+
+
+def test_round3_up_keeps_the_loop_with_both_homes_under_safe_ancestor_aliases(make):
+    run = make(CLAUDE, CODEX)
+    _, claude_home, _, _ = home_alias(run, CLAUDE)
+    _, codex_home, _, _ = home_alias(run, CODEX)
+    run.team("init")
+    run.team("login")
+    try:
+        answer = run.team("up")
+        assert [row["endpoint"] for row in answer["roles"]] == ROLE_ORDER
+        assert answer["loop"]["state"] == "started"
+        env = proc_environ(answer["loop"]["pid"])
+        assert env["CODEX_HOME"] == str(codex_home)
+        assert env["CLAUDE_CONFIG_DIR"] == str(claude_home)
+        assert run.team("status")["loop"]["pid_alive"] is True
+    finally:
+        run.team("down")
+
+
+def test_round3_a_root_binding_saved_during_login_is_preserved(make):
+    run = make()
+    run.wrap_claude()
+    run.team("init")
+    with paused_claude_login(run) as login:
+        bound = run.team("root", "--session", "root-during-login")
+        root_record = state(run)["root"]
+        assert root_record["session"] == bound["session"] == "root-during-login"
+    assert login["code"] == 0 and login["stderr"] == ""
+    assert state(run)["root"] == root_record
+    assert state(run)["logins"][CLAUDE]["credentials_sha256"] == sha(run.claude_home / ".credentials.json")
+
+
+def test_round3_down_during_login_refuses_without_writing_or_releasing_resources(make):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    with paused_claude_login(run) as login:
+        before = files(run.run), (run.run / "team-commands.jsonl").read_bytes()
+        assert run.team("down", expect=2) == {"error": "a login is in progress"}
+        assert files(run.run) == before[0]
+        assert (run.run / "team-commands.jsonl").read_bytes() == before[1]
+        assert (run.run / "worktrees" / "f2").is_dir()
+    assert login["code"] == 0 and login["stderr"] == ""
+    assert not state(run)["down"].get("started_at")
+    assert run.team("down")["claude_home"] == "kept"
+
+
+def test_round3_a_login_finishing_after_a_completed_down_refuses_and_keeps_teardown_state(make, capsys):
+    run = make(CLAUDE, CLAUDE)
+    run.team("init")
+    state_path = run.run / "team-state.json"
+    initialized = state_path.read_bytes()
+    run.team("down")
+    completed = state_path.read_bytes()
+    assert state(run)["down"]["done"]["last"]
+    # Replay a down completed by an older command without the login lock while the browser login was active.
+    state_path.write_bytes(initialized)
+    cli_environment(run)
+    original = subprocess.run
+    after_down = {}
+
+    def finish_down_after_auth(argv, *args, **kwargs):
+        result = original(argv, *args, **kwargs)
+        if list(argv[:3]) == ["claude", "auth", "login"]:
+            state_path.write_bytes(completed)
+            after_down.update(files=files(run.run), commands=(run.run / "team-commands.jsonl").read_bytes())
+        return result
+
+    run.monkeypatch.setattr(subprocess, "run", finish_down_after_auth)
+    code, answer = in_process(run, "login", capsys=capsys)
+    assert code == 2 and answer == {"error": "teardown has started; a new run needs a new run folder" + CLEANED}
+    assert state_path.read_bytes() == completed
+    assert not (run.claude_home / ".credentials.json").exists()
+    expected = {name: digest for name, digest in after_down["files"].items()
+                if name != "claude-home/.credentials.json"}
+    assert files(run.run) == expected
+    assert (run.run / "team-commands.jsonl").read_bytes() == after_down["commands"]
+
+
+@pytest.mark.parametrize("existing_lock", [False, True])
+def test_round3_codex_only_login_preserves_the_legacy_lock_file_behaviour(make, existing_lock):
+    run = make(v1=True)
+    run.team("init")
+    lock = run.run / ".login.lock"
+    if existing_lock:
+        lock.write_bytes(b"unrelated legacy file\n")
+        lock.chmod(0o644)
+    answer = run.team("login")
+    assert answer["auth_sha256"] == sha(run.codex_home / "auth.json")
+    if existing_lock:
+        assert lock.read_bytes() == b"unrelated legacy file\n" and stat.S_IMODE(lock.stat().st_mode) == 0o644
+    else:
+        assert not lock.exists()
 
 
 # -- child processes and the loop -----------------------------------------------------------------------------------------
