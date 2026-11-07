@@ -11,9 +11,11 @@ checked by calling start_loop in this process after a real init (the same functi
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import types
 
@@ -21,7 +23,7 @@ import pytest
 
 from tests.integration.hierarchy_fake_claude import BILLING, HERE as FAKE_CLAUDE, install, require_fake
 from tests.integration.test_hierarchy_mailbox import ROOT
-from tests.integration.test_hierarchy_team import ROLE_ORDER, Run, in_process, sha
+from tests.integration.test_hierarchy_team import ROLE_ORDER, TEAM, Run, in_process, sha
 
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
@@ -39,12 +41,18 @@ CLEANED = "; removed credentials written by this login"
 # A `claude` that runs the test fake, then plays what a real login could leave behind: a credentials file looser than
 # 0600, or a stored API key that the status call sees although the guard saw none in the owner's shell.
 WRAPPER = r'''#!%(python)s
-import json, os, subprocess, sys, time
+import json, os, select, subprocess, sys, time
 from pathlib import Path
 argv = sys.argv[1:]
 env = dict(os.environ)
 home = Path(env["CLAUDE_CONFIG_DIR"])
 credentials = home / ".credentials.json"
+if argv[:2] == ["auth", "login"] and env.get("WRAP_GATE"):
+    with open(env["WRAP_GATE"] + "-ready", "wb", buffering=0) as stream:
+        stream.write(b"1")
+    with open(env["WRAP_GATE"] + "-release", "rb", buffering=0) as stream:
+        if not select.select([stream], [], [], 2)[0] or stream.read(1) != b"1":
+            sys.exit(89)
 if argv[:2] == ["auth", "login"] and env.get("WRAP_KEEP_CREDENTIALS"):
     sys.exit(0)
 if argv[:2] == ["auth", "status"] and os.environ.get("WRAP_STATUS_API_KEY"):
@@ -57,10 +65,27 @@ if argv[:2] == ["auth", "status"] and env.get("WRAP_STATUS"):
     answer = json.loads(proc.stdout)
     if mode == "method":
         answer["authMethod"] = "api_key"
+    if mode == "nul":
+        answer["configDirectory"] = "/fixture/\0"
+    if mode == "unicode":
+        sys.stdout.buffer.write(b"\xff")
+        sys.exit(0)
+    if mode == "replaced-credential":
+        credentials.write_text("credential changed after login", encoding="utf-8")
+    if mode == "rehome":
+        alias = Path(env["WRAP_HOME_ALIAS"])
+        alias.unlink()
+        alias.symlink_to(env["WRAP_OWNER_HOME"])
     print("{" if mode == "malformed" else json.dumps(answer))
-    sys.exit(7 if mode == "exit" else proc.returncode)
+    sys.exit(7 if mode in ("exit", "replaced-credential") else proc.returncode)
 code = subprocess.call([sys.executable, %(fake)r, *argv], env=env)
 if argv[:2] == ["auth", "login"]:
+    if env.get("WRAP_REMOVE_EXECUTABLE"):
+        Path(sys.argv[0]).unlink()
+    if env.get("WRAP_REHOME_AFTER_LOGIN"):
+        alias = Path(env["WRAP_HOME_ALIAS"])
+        alias.unlink()
+        alias.symlink_to(env["WRAP_OWNER_HOME"])
     mode = env.get("WRAP_CREDENTIALS")
     if mode in ("missing", "symlink", "hard-link", "fifo"):
         credentials.unlink()
@@ -631,6 +656,324 @@ def test_status_timeout_is_a_cli_failure_and_removes_the_new_credential(make):
     assert CLAUDE not in state(run).get("logins", {})
 
 
+# -- review round 2: login custody and path revalidation -----------------------------------------------------------------
+
+def cli_environment(run, **extra):
+    """Use the subprocess CLI's fake-host environment when exercising main() with an OS boundary hook."""
+    for name, value in run.env(**extra).items():
+        run.monkeypatch.setenv(name, value)
+
+
+def home_alias(run, kind):
+    """An ancestor alias initially pointing to an isolated host home, plus a temporary owner's untouched credentials."""
+    folder, field = (".claude", "claude_home") if kind == CLAUDE else (".codex", "codex_home")
+    backing = run.tmp / (field + "-backing")
+    backing.mkdir()
+    alias = run.tmp / (field + "-alias")
+    alias.symlink_to(backing)
+    configured = alias / folder
+    setattr(run, field, configured)
+    run.config[field] = str(configured)
+    run.save()
+    owner = run.home / folder
+    owner.mkdir(mode=0o700)
+    credential = owner / (".credentials.json" if kind == CLAUDE else "auth.json")
+    credential.write_bytes(b"untouched owner credential\n")
+    credential.chmod(0o600)
+    return alias, backing / folder, owner, credential
+
+
+@pytest.mark.parametrize("outcome", ["success", "refused", "failed"])
+def test_round2_a_second_login_is_refused_without_affecting_the_first(make, outcome):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    gate = str(run.tmp / "login-gate")
+    for suffix in ("-ready", "-release"):
+        os.mkfifo(gate + suffix, 0o600)
+    ready = os.open(gate + "-ready", os.O_RDWR | os.O_NONBLOCK)
+    release = os.open(gate + "-release", os.O_RDWR | os.O_NONBLOCK)
+    first = subprocess.Popen([sys.executable, "-I", "-B", str(TEAM), "--config", str(run.config_path), "login"],
+                             env=run.env(WRAP_GATE=gate, WRAP_STATUS="method" if outcome == "refused" else "",
+                                         FAKE_CLAUDE_LOGIN="fail" if outcome == "failed" else ""),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert select.select([ready], [], [], 2)[0], "the first auth child did not reach the gate"
+        assert os.read(ready, 1) == b"1"
+        before = files(run.run), (run.run / "team-commands.jsonl").read_bytes()
+        extra = {"AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT": "0"} if outcome == "refused" else {}
+        answer = run.team("login", expect=2, **extra)
+        assert answer == {"error": "another login is running for this run"}
+        assert files(run.run) == before[0]
+        assert (run.run / "team-commands.jsonl").read_bytes() == before[1]
+        assert not run.claude_calls() and not (run.claude_home / ".credentials.json").exists()
+    finally:
+        os.write(release, b"1")
+        try:
+            stdout, stderr = first.communicate(timeout=2)
+        finally:
+            if first.poll() is None:
+                first.kill()
+                first.communicate(timeout=2)
+            os.close(ready)
+            os.close(release)
+    assert stderr == ("fake claude: login failed\n" if outcome == "failed" else "")
+    answer = json.loads(stdout.splitlines()[-1])
+    credentials = run.claude_home / ".credentials.json"
+    if outcome == "success":
+        assert first.returncode == 0
+        assert answer["logins"][CLAUDE]["credentials_sha256"] == sha(credentials)
+        assert state(run)["logins"][CLAUDE]["credentials_sha256"] == sha(credentials)
+    elif outcome == "refused":
+        assert first.returncode == 2
+        assert answer == {"error": NOT_TRUSTED + "auth method 'api_key' is not claude.ai" + CLEANED}
+        assert not credentials.exists() and CLAUDE not in state(run).get("logins", {})
+    else:
+        assert first.returncode == 3 and answer == {"error": "claude auth login exited 1"}
+        assert not credentials.exists() and CLAUDE not in state(run).get("logins", {})
+    # A completed or refused login releases its lock.
+    assert run.team("login")["logins"][CLAUDE]["credentials_sha256"] == sha(credentials)
+
+
+@pytest.mark.parametrize("case", ["timeout-zero", "timeout-invalid", "hard-link", "home-symlink"])
+def test_round2_mixed_plan_claude_prechecks_run_before_codex_login(make, case):
+    run = make()
+    run.team("init")
+    credentials = run.claude_home / ".credentials.json"
+    extra = {}
+    if case.startswith("timeout"):
+        extra["AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT"] = "0" if case == "timeout-zero" else "invalid"
+        error = ("AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT must be greater than 0 and at most 60 seconds"
+                 if case == "timeout-zero" else "could not convert string to float: 'invalid'")
+    elif case == "hard-link":
+        target = run.tmp / "owner-credential"
+        target.write_bytes(b"unchanged owner\n")
+        target.chmod(0o600)
+        os.link(target, credentials)
+        error = ".credentials.json in claude_home has 2 hard links: %s" % credentials
+    else:
+        backing = run.tmp / "moved-claude-home"
+        run.claude_home.rename(backing)
+        run.claude_home.symlink_to(backing)
+        error = "unsafe claude_home: it is a symlink"
+    before = files(run.run)
+    assert run.team("login", expect=2, **extra) == {"error": error}
+    assert not run.calls("login") and not run.claude_calls()
+    assert not (run.codex_home / "auth.json").exists()
+    after = files(run.run)
+    # The persistent lock is bookkeeping, never login evidence or an accepted credential.
+    assert {name: digest for name, digest in after.items() if name != ".login.lock"} == before
+    if case == "hard-link":
+        assert target.read_bytes() == b"unchanged owner\n"
+
+
+@pytest.mark.parametrize("mode,code,error", [
+    ("unicode", 2, "'utf-8' codec can't decode byte 0xff"),
+    ("nul", 2, "embedded null byte"),
+    ("missing-executable", 3, "No such file or directory"),
+])
+def test_round2_every_status_exception_cleans_up_the_login_credential(make, mode, code, error):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    extra = {"WRAP_REMOVE_EXECUTABLE": "1"} if mode == "missing-executable" else {"WRAP_STATUS": mode}
+    answer = run.team("login", expect=code, **extra)
+    assert error in answer["error"]
+    assert not (run.claude_home / ".credentials.json").exists()
+    assert CLAUDE not in state(run).get("logins", {})
+    run.wrap_claude()
+    assert run.team("login")["logins"][CLAUDE]["auth"]["loggedIn"] is True
+
+
+@pytest.mark.parametrize("stage", ["evidence", "state"])
+def test_round2_errors_saving_login_evidence_or_state_also_clean_up(make, capsys, stage):
+    run = make(CLAUDE, CLAUDE)
+    run.team("init")
+    cli_environment(run)
+    original = os.replace
+
+    def cannot_save(source, destination, *args, **kwargs):
+        path = Path(destination)
+        if ((stage == "evidence" and path == run.evidence / "login-claude.json") or
+                (stage == "state" and path == run.run / "team-state.json" and
+                 CLAUDE in json.loads(Path(source).read_text()).get("logins", {}))):
+            raise OSError("fixture: login %s write failed" % stage)
+        return original(source, destination, *args, **kwargs)
+
+    run.monkeypatch.setattr(os, "replace", cannot_save)
+    assert in_process(run, "login", capsys=capsys) == (3, {"error": "fixture: login %s write failed" % stage})
+    assert not (run.claude_home / ".credentials.json").exists()
+    assert CLAUDE not in state(run).get("logins", {})
+
+
+def test_round2_cleanup_keeps_a_credential_changed_after_the_login_observation(make):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    assert run.team("login", expect=2, WRAP_STATUS="replaced-credential") == {
+        "error": NOT_TRUSTED + "claude auth status exited 7"}
+    assert (run.claude_home / ".credentials.json").read_text() == "credential changed after login"
+    assert CLAUDE not in state(run).get("logins", {})
+
+
+@pytest.mark.parametrize("kind", [CLAUDE, CODEX])
+def test_round2_a_home_swap_after_the_initial_check_refuses_before_any_host_spawn(make, capsys, kind):
+    run = make()
+    alias, home, owner, credential = home_alias(run, kind)
+    run.team("init")
+    cli_environment(run)
+    original = shutil.disk_usage
+
+    def rehome(path):
+        result = original(path)
+        alias.unlink()
+        alias.symlink_to(run.home)
+        return result
+
+    run.monkeypatch.setattr(shutil, "disk_usage", rehome)
+    code, answer = in_process(run, "login", capsys=capsys)
+    assert code == 2 and "inside ~/%s" % owner.name in answer["error"]
+    assert credential.read_bytes() == b"untouched owner credential\n"
+    assert not run.calls("login") and not run.claude_calls()
+
+
+@pytest.mark.parametrize("kind", [CLAUDE, CODEX])
+def test_round2_a_home_swap_after_codex_login_is_caught_before_evidence_or_claude_spawn(make, capsys, kind):
+    run = make()
+    alias, home, owner, credential = home_alias(run, kind)
+    run.team("init")
+    cli_environment(run)
+    original = subprocess.run
+
+    def rehome(argv, *args, **kwargs):
+        result = original(argv, *args, **kwargs)
+        if list(argv[:2]) == ["codex", "login"]:
+            alias.unlink()
+            alias.symlink_to(run.home)
+        return result
+
+    run.monkeypatch.setattr(subprocess, "run", rehome)
+    code, answer = in_process(run, "login", capsys=capsys)
+    assert code == 2 and "inside ~/%s" % owner.name in answer["error"]
+    assert credential.read_bytes() == b"untouched owner credential\n" and not run.claude_calls()
+    assert not (run.evidence / "login.json").exists()
+
+
+@pytest.mark.parametrize("stage", ["login", "status", "state"])
+def test_round2_a_claude_home_swap_is_caught_before_status_or_state_save(make, capsys, stage):
+    run = make(CLAUDE, CLAUDE)
+    alias, home, owner, credential = home_alias(run, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    extra = {"WRAP_HOME_ALIAS": str(alias), "WRAP_OWNER_HOME": str(run.home)}
+    if stage == "state":
+        cli_environment(run)
+        original = os.replace
+
+        def rehome(source, destination, *args, **kwargs):
+            result = original(source, destination, *args, **kwargs)
+            if Path(destination) == run.evidence / "login-claude.json":
+                alias.unlink()
+                alias.symlink_to(run.home)
+            return result
+
+        run.monkeypatch.setattr(os, "replace", rehome)
+        code, answer = in_process(run, "login", capsys=capsys)
+    else:
+        extra.update({"WRAP_REHOME_AFTER_LOGIN": "1"} if stage == "login" else {"WRAP_STATUS": "rehome"})
+        code, answer = 2, run.team("login", expect=2, **extra)
+    assert code == 2 and "inside ~/.claude" in answer["error"]
+    assert credential.read_bytes() == b"untouched owner credential\n"
+    assert not (home / ".credentials.json").exists()
+    assert CLAUDE not in state(run).get("logins", {})
+    if stage == "login":
+        assert [call["argv"][:2] for call in run.claude_calls()] == [["auth", "login"]]
+
+
+def test_round2_child_environments_use_the_validated_canonical_homes(make):
+    run = make()
+    _, claude_home, _, _ = home_alias(run, CLAUDE)
+    _, codex_home, _, _ = home_alias(run, CODEX)
+    run.team("init")
+    run.team("login")
+    assert [call["config_dir"] for call in run.claude_calls()] == [str(claude_home)] * 2
+    assert run.calls("login")[0]["codex_home"] == str(codex_home)
+
+
+@pytest.mark.parametrize("field", ["run", "claude_home", "codex_home"])
+@pytest.mark.parametrize("tree", [".claude", ".codex"])
+def test_round2_owner_inode_aliases_are_refused_for_every_existing_ancestor(make, capsys, field, tree):
+    run = make()
+    owner = run.home / tree
+    owner.mkdir()
+    identity = owner.stat()
+    alias = run.tmp / "inode-alias"
+    alias.mkdir()
+    run.config[field] = str(alias / "not-created" / "candidate")
+    run.save()
+    original = os.stat
+
+    def same_directory(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if str(path) == str(alias):
+            values = list(info)
+            values[1:3] = [identity.st_ino, identity.st_dev]
+            return os.stat_result(values)
+        return info
+
+    # A bind mount or a case-insensitive alias has the owner's directory identity without a symlink.
+    run.monkeypatch.setattr(os, "stat", same_directory)
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 2 and "inside ~/%s" % tree in answer["error"]
+    assert list(alias.iterdir()) == [] and list(owner.iterdir()) == [] and not run.run.exists()
+
+
+def test_round2_codex_only_owner_checks_do_not_gain_inode_alias_handling(make, capsys):
+    run = make(CODEX, CODEX)
+    owner = run.home / ".codex"
+    owner.mkdir()
+    identity = owner.stat()
+    alias = run.tmp / "inode-alias"
+    alias.mkdir()
+    run.config["codex_home"] = str(alias / "candidate")
+    run.save()
+    original = os.stat
+
+    def same_directory(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if str(path) == str(alias):
+            values = list(info)
+            values[1:3] = [identity.st_ino, identity.st_dev]
+            return os.stat_result(values)
+        return info
+
+    run.monkeypatch.setattr(os, "stat", same_directory)
+    code, answer = in_process(run, "status", capsys=capsys)
+    assert code == 0 and answer["init"]["complete"] is False
+
+
+def test_round2_init_rechecks_the_run_destination_immediately_before_its_first_write(make, capsys):
+    run = make()
+    run.run.mkdir()
+    owner = run.home / ".claude"
+    owner.mkdir()
+    (owner / "owner.txt").write_bytes(b"owner bytes\n")
+    before = files(owner)
+    original = subprocess.run
+
+    def redirect_after_git(argv, *args, **kwargs):
+        result = original(argv, *args, **kwargs)
+        if "--verify" in argv and any(str(word).startswith("refs/heads/") for word in argv):
+            run.run.rename(run.tmp / "original-run")
+            run.run.symlink_to(owner)
+        return result
+
+    run.monkeypatch.setattr(subprocess, "run", redirect_after_git)
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 2 and answer["error"].startswith("run folder ")
+    assert files(owner) == before and sorted(path.name for path in owner.iterdir()) == ["owner.txt"]
+
+
 # -- child processes and the loop -----------------------------------------------------------------------------------------
 
 def test_child_processes_and_the_loop_get_the_runs_claude_home(make):
@@ -779,7 +1122,8 @@ def test_both_homes_are_purged_when_both_preconditions_pass(make):
 
 # -- Codex-only runs ------------------------------------------------------------------------------------------------------
 
-def test_the_existing_codex_only_run_destination_gap_is_unchanged(make):
+@pytest.mark.xfail(strict=True, reason="T2(a) follow-up: Codex-only run folder destination check")
+def test_codex_only_run_destinations_must_not_write_into_an_owner_tree(make):
     run = make(CODEX, CODEX)
     owner = run.home / ".claude"
     owner.mkdir()
@@ -787,9 +1131,9 @@ def test_the_existing_codex_only_run_destination_gap_is_unchanged(make):
     run.config["codex_home"] = str(run.tmp / "isolated-codex")
     run.save()
     answer = run.team("init", expect=2)
-    error = "symlink paths are not supported: %s" % run.run
-    assert answer == {"error": "check-recipes: " + error, "result": {"error": error}, "step": "recipes"}
-    assert (owner / "team-state.json").is_file() and (owner / "recipes.json").is_file()
+    assert list(owner.iterdir()) == []
+    assert "error" in answer
+
 
 @pytest.mark.parametrize("schema", ["v1", "v2"])
 def test_a_codex_only_run_ignores_claude_and_writes_what_it_wrote_before(make, schema):

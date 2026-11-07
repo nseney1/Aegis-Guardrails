@@ -27,6 +27,8 @@ one JSON object on the last line of stdout, except `status --text`.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -105,10 +107,11 @@ PUBLISH_ID = re.compile(r'message_id\\*"?\s*:\s*\\*"([^"\\]+)')
 class Stop(Exception):
     """A refusal or a failure with the exit code it means; detail joins the printed result."""
 
-    def __init__(self, code, message, **detail):
+    def __init__(self, code, message, *, record_command=True, **detail):
         super().__init__(message)
         self.code = code
         self.detail = detail
+        self.record_command = record_command
 
 
 def refuse(message, **detail):
@@ -283,6 +286,8 @@ class Run:
         self.log_path = self.run / "loop.log"
         self.commands_log = self.run / "team-commands.jsonl"
         self.inputs = self.run / "inputs"
+        if self.uses(CLAUDE):
+            self.validated_homes = {CODEX: safe_codex_home(self), CLAUDE: safe_claude_home(self)}
 
     def check_hosts(self):
         if self.raw["schema"] == SCHEMA:
@@ -404,13 +409,35 @@ def nearest(path):
     return path
 
 
+def inside_owner(real, owner, check_identity):
+    """Realpath containment, plus directory aliases such as bind mounts on Claude-bearing plans."""
+    owner_real = os.path.realpath(owner)
+    if real == owner_real or real.startswith(owner_real.rstrip(os.sep) + os.sep):
+        return True
+    if not check_identity:
+        return False
+    try:
+        info = owner.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    identity = (info.st_dev, info.st_ino)
+    candidate = Path(real)
+    for ancestor in (candidate, *candidate.parents):
+        try:
+            info = ancestor.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if (info.st_dev, info.st_ino) == identity:
+            return True
+    return False
+
+
 def safe_home(run, home, label, variable, owners, apart=()):
     """The realpath of a run's host home, or a refusal: never an owner folder or inside one, never holding HOME, the run
     or an owner folder, apart from the run's other folders and from each (label, path) in `apart`, and no symlink."""
     real = os.path.realpath(home)
     for owner in owners:
-        owner_real = os.path.realpath(owner)
-        if real == owner_real or real.startswith(owner_real.rstrip(os.sep) + os.sep):
+        if inside_owner(real, owner, run.uses(CLAUDE)):
             refuse("%s %s is inside ~/%s (%s); a team run uses its own folder" % (variable, home, owner.name, owner))
     candidate = Path(real)
     def contains(parent, child):
@@ -461,11 +488,24 @@ def safe_run_folder(run):
     """Canonicalize safe run aliases, including /tmp on macOS, before any run write can follow them."""
     real = Path(os.path.realpath(run.run))
     for owner in owner_homes(CLAUDE) + owner_homes(CODEX):
-        resolved = Path(os.path.realpath(owner))
-        if real == resolved or resolved in real.parents:
+        if inside_owner(str(real), owner, True):
             refuse("run folder %s is inside ~/%s (%s); a team run uses its own folder" %
                    (run.run, owner.name, owner))
     return real
+
+
+def revalidate_homes(run):
+    """Narrow accidental changes between the start-time checks, host spawns and login persistence (ADR section 3)."""
+    if not run.uses(CLAUDE):
+        return
+    for kind, check, label in ((CODEX, safe_codex_home, "codex_home"), (CLAUDE, safe_claude_home, "claude_home")):
+        if check(run) != run.validated_homes[kind]:
+            refuse("%s changed since it was validated for this command" % label)
+
+
+def revalidate_run(run):
+    if run.uses(CLAUDE) and safe_run_folder(run) != run.run:
+        refuse("run folder changed since it was validated for this command")
 
 
 def guard(run, command):
@@ -575,10 +615,11 @@ def append_evidence(run, name, raw):
 
 
 def child_env(run, path=None):
+    revalidate_homes(run)
     env = dict(os.environ)
-    env["CODEX_HOME"] = str(run.codex_home)
+    env["CODEX_HOME"] = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
     if run.uses(CLAUDE):
-        env["CLAUDE_CONFIG_DIR"] = str(run.claude_home)
+        env["CLAUDE_CONFIG_DIR"] = run.validated_homes[CLAUDE]
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     if path is not None:
         env["PATH"] = path
@@ -976,8 +1017,10 @@ def init(run, args):
                  "custody": custody(run),
                  "init": {"steps": {}, "done": {}, "failed": None, "complete_at": None, "base_tree": tree},
                  "root": None, "up": None, "down": {"done": {}}}
+        revalidate_run(run)
         run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
         save_state(run, state)
+    revalidate_run(run)
     ran = []
     for step in INIT_STEPS:
         if step in state["init"]["steps"]:
@@ -1002,21 +1045,51 @@ def init(run, args):
 
 # -- login and root -------------------------------------------------------------------------------------------------------
 
+@contextmanager
+def login_lock(run):
+    """Keep one lock inode for this run; closing releases it on every success or exception, without unlinking it."""
+    revalidate_run(run)
+    descriptor = os.open(str(run.run / ".login.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) != 0o600):
+            refuse("login lock must be this user's regular file with one link and mode 0600")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            refuse("another login is running for this run", record_command=False)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def claude_login_preconditions(run):
+    """All read-only Claude checks precede either host's interactive login in a mixed plan."""
+    revalidate_homes(run)
+    timeout = float(os.environ.get(CLAUDE_AUTH_STATUS_TIMEOUT, "60"))
+    require(0 < timeout <= 60, CLAUDE_AUTH_STATUS_TIMEOUT + " must be greater than 0 and at most 60 seconds")
+    credentials_digest(run, missing_ok=True)
+    return timeout
+
+
 def login(run, args):
     """Each host the plan uses, logged in to the run's own home. A Codex-only plan answers as it always did."""
     require_init(run)
-    if not run.uses(CLAUDE):
-        return OK, login_codex(run)
-    logins = {}
-    try:
-        if run.uses(CODEX):
-            logins[CODEX] = login_codex(run)
-        logins[CLAUDE] = login_claude(run)
-    except Stop as stop:
-        if logins:
-            stop.detail.setdefault("logins", logins)
-        raise
-    return OK, {"logins": logins}
+    with login_lock(run):
+        if not run.uses(CLAUDE):
+            return OK, login_codex(run)
+        timeout = claude_login_preconditions(run)
+        logins = {}
+        try:
+            if run.uses(CODEX):
+                logins[CODEX] = login_codex(run)
+            logins[CLAUDE] = login_claude(run, timeout)
+        except Stop as stop:
+            if logins:
+                stop.detail.setdefault("logins", logins)
+            raise
+        return OK, {"logins": logins}
 
 
 def login_codex(run):
@@ -1024,20 +1097,23 @@ def login_codex(run):
     proc = subprocess.run(["codex", "login"], env=child_env(run))
     if proc.returncode != 0:
         fail("codex login exited %d" % proc.returncode)
+    revalidate_homes(run)
+    home = Path(run.validated_homes[CODEX]) if run.uses(CLAUDE) else run.codex_home
     # The probe's real-login folder rules, less its own owner mark, with this run's mark and its sessions/ allowed.
     allowed = (set(probe.EXISTING_LOGIN_ENTRIES) - {probe.OWNER_MARK}) | {OWNER_MARK, "sessions"}
-    entries = sorted(os.listdir(run.codex_home))
+    entries = sorted(os.listdir(home))
     extra = [entry for entry in entries if entry not in allowed]
     try:
         if extra:
             raise probe.Refusal("CODEX_HOME holds entries a codex login does not create: " + ", ".join(extra))
         if probe.AUTH_FILE not in entries:
             raise probe.Refusal("CODEX_HOME has no auth.json after codex login")
-        auth = probe.auth_digest(run.codex_home / probe.AUTH_FILE)
-        probe.login_extras(run.codex_home, shutil.which("codex"))
+        auth = probe.auth_digest(home / probe.AUTH_FILE)
+        probe.login_extras(home, shutil.which("codex"))
     except probe.Refusal as exc:
         refuse(str(exc))
     answer = {"codex_home": str(run.codex_home), "auth_sha256": auth, "entries": entries}
+    revalidate_homes(run)
     save(run, "login.json", answer)
     return answer
 
@@ -1045,7 +1121,7 @@ def login_codex(run):
 def credentials_digest(run, missing_ok=False):
     """The sha256 of the Claude home's credentials file, which must be this user's one regular file with mode 0600. The
     file itself is never copied, and only its hash enters evidence."""
-    path = run.claude_home / CLAUDE_CREDENTIALS
+    path = Path(run.validated_homes[CLAUDE]) / CLAUDE_CREDENTIALS
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -1073,68 +1149,91 @@ def credentials_digest(run, missing_ok=False):
         return hashlib.sha256(stream.read()).hexdigest()
 
 
-def credential_version(run):
-    """Identity and modification metadata only: never follow or open an untrusted credential for cleanup."""
+def credential_observation(run):
+    """Observe identity and bytes in the validated home; metadata also detects a rewrite with identical contents."""
+    path = Path(run.validated_homes[CLAUDE]) / CLAUDE_CREDENTIALS
     try:
-        info = os.lstat(run.claude_home / CLAUDE_CREDENTIALS)
+        info = os.lstat(path)
     except FileNotFoundError:
         return None
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
-            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+        return None
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_uid) !=
+                (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid)):
+            refuse("%s in claude_home changed while it was observed: %s" % (CLAUDE_CREDENTIALS, path))
+        digest = hashlib.sha256(stream.read()).hexdigest()
+    return {"identity": (info.st_dev, info.st_ino, digest),
+            "version": (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)}
 
 
-def remove_login_credentials(run, before, written, home_real):
-    """Remove only the unlinked regular file this login created or changed, still inside the checked home."""
-    if written is None or written == before or os.path.realpath(run.claude_home) != home_real:
+def remove_login_credentials(run, before, written):
+    """Within the login lock, remove only the regular file whose device, inode and bytes this login changed."""
+    if written is None or written == before:
         return False
-    if credential_version(run) != written or not stat.S_ISREG(written[2]) or written[3:5] != (1, os.getuid()):
+    home = Path(run.validated_homes[CLAUDE])
+    try:
+        real = safe_home(run, home, "claude_home", "CLAUDE_CONFIG_DIR", owner_homes(CLAUDE) + owner_homes(CODEX))
+    except Stop:
         return False
-    (run.claude_home / CLAUDE_CREDENTIALS).unlink()
+    if real != str(home):
+        return False
+    current = credential_observation(run)
+    if current is None or current["identity"] != written["identity"]:
+        return False
+    (home / CLAUDE_CREDENTIALS).unlink()
     return True
 
 
-def login_claude(run):
+def login_claude(run, timeout):
     """claude auth login in the run's CLAUDE_CONFIG_DIR, which the owner finishes in the browser, then its status. The
     evidence keeps the filtered auth record (no email or organization) and the credentials' hash, never the file."""
-    timeout = float(os.environ.get(CLAUDE_AUTH_STATUS_TIMEOUT, "60"))
-    require(0 < timeout <= 60, CLAUDE_AUTH_STATUS_TIMEOUT + " must be greater than 0 and at most 60 seconds")
+    revalidate_homes(run)
+    credentials_digest(run, missing_ok=True)
     state = require_init(run)
     if CLAUDE in state.get("logins", {}):
         del state["logins"][CLAUDE]
+        revalidate_homes(run)
         save_state(run, state)
     # A CLI may truncate or refresh credentials: refuse unsafe existing files before either auth command sees them.
-    credentials_digest(run, missing_ok=True)
-    before = credential_version(run)
-    home_real = os.path.realpath(run.claude_home)
-    env = child_env(run)
-    proc = subprocess.run(["claude", "auth", "login", "--claudeai"], env=env)
-    written = credential_version(run)
+    before = credential_observation(run)
+    written = None
     try:
+        proc = subprocess.run(["claude", "auth", "login", "--claudeai"], env=child_env(run))
+        written = credential_observation(run)
         if proc.returncode != 0:
             fail("claude auth login exited %d" % proc.returncode)
+        revalidate_homes(run)
         credentials_digest(run)
-        proc = subprocess.run(["claude", "auth", "status", "--json"], env=env, capture_output=True, text=True,
+        proc = subprocess.run(["claude", "auth", "status", "--json"], env=child_env(run), capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=timeout)
         try:
             parsed = strict_json(proc.stdout)
         except (ValueError, RecursionError):
             parsed = None
-        record, problems = hierarchy_hosts.claude_auth_check(proc.returncode, parsed, run.claude_home)
+        revalidate_homes(run)
+        record, problems = hierarchy_hosts.claude_auth_check(proc.returncode, parsed, run.validated_homes[CLAUDE])
         if problems:
             refuse("claude auth status does not show this run's claude.ai login: " + "; ".join(problems))
         digest = credentials_digest(run)
-    except (Stop, subprocess.SubprocessError) as exc:
-        removed = remove_login_credentials(run, before, written, home_real)
+        answer = {"claude_home": str(run.claude_home), "auth": record, "credentials_sha256": digest,
+                  "entries": sorted(os.listdir(run.validated_homes[CLAUDE])),
+                  "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
+        revalidate_homes(run)
+        save(run, "login-claude.json", answer)
+        state.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
+        revalidate_homes(run)
+        save_state(run, state)
+        return answer
+    except Exception as exc:
+        removed = remove_login_credentials(run, before, written)
         if removed and isinstance(exc, Stop):
-            raise Stop(exc.code, str(exc) + "; removed credentials written by this login", **exc.detail) from exc
+            raise Stop(exc.code, str(exc) + "; removed credentials written by this login",
+                       record_command=exc.record_command, **exc.detail) from exc
         # Keep TimeoutExpired intact: main maps subprocess failures to exit 3.
         raise
-    answer = {"claude_home": str(run.claude_home), "auth": record, "credentials_sha256": digest,
-              "entries": sorted(os.listdir(run.claude_home)), "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
-    save(run, "login-claude.json", answer)
-    state.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
-    save_state(run, state)
-    return answer
 
 
 def adapter_tools(run, connection):
@@ -2009,9 +2108,11 @@ COMMANDS = {"init": init, "login": login, "root": root, "up": up, "request": req
 
 def log_command(run, command, code):
     try:
+        # Logging is best effort and must not follow an accidentally redirected run after an init refusal.
+        revalidate_run(run)
         with open(run.commands_log, "a", encoding="utf-8") as stream:
             stream.write(json.dumps({"command": command, "exit": code, "at": timestamp()}, sort_keys=True) + "\n")
-    except OSError:
+    except (Stop, OSError):
         pass
 
 
@@ -2052,6 +2153,7 @@ def main(argv=None):
                          help="Seconds to wait for the loop to stop after SIGTERM (default %d)" % LOOP_WAIT_SECONDS)
     args = parser.parse_args(argv)
     run = None
+    record_command = True
     try:
         run = Run(args.config)
         state = load_state(run)
@@ -2061,11 +2163,12 @@ def main(argv=None):
         code, result = COMMANDS[args.command](run, args)
     except Stop as stop:
         code, result = stop.code, {"error": str(stop), **stop.detail}
+        record_command = stop.record_command
     except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
         code, result = REFUSED, {"error": str(exc)}
     except (OSError, subprocess.SubprocessError) as exc:
         code, result = FAILED, {"error": str(exc)}
-    if run is not None and args.command != "status" and run.run.is_dir():
+    if record_command and run is not None and args.command != "status" and run.run.is_dir():
         log_command(run, args.command, code)
     if result is not None:
         print(json.dumps(result, sort_keys=True))
