@@ -315,7 +315,8 @@ def test_malformed_structured_packet_refuses_instead_of_dropping_dependencies(tm
     packet.write_text('{"schema":"aegis.hierarchy-job-packet/v2","after":')
     invoke(root, "publish", message(recipient="a/root", identifier="broken-job", kind="job_request", brief=ref(packet)))
     before = files(tmp_path)
-    assert compose(root, "a/orchestrator", expect=2)["error"] == "job packet is not valid JSON"
+    error = compose(root, "a/orchestrator", expect=2)["error"]
+    assert str(packet) in error and "JSON" in error
     assert files(tmp_path) == before
 
 
@@ -863,3 +864,152 @@ def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
     code, answer = faulted_cli(root, driver)
     assert code == 2 and "publication directory permission denied" in answer["error"]
     assert "changed" not in answer["error"]
+
+
+def structured_job(tmp_path, changes=None, missing=None):
+    root, _, _ = receipt_fixture(tmp_path)
+    value = {"schema": "aegis.hierarchy-job-packet/v2", "recipe": "tests", "checkout": str(tmp_path),
+             "commit": "a" * 40, "tree": "b" * 40, "recipes_sha256": "c" * 64,
+             "after": {"message_id": "prior", "sha256": "d" * 64}, **(changes or {})}
+    if value["schema"] == "aegis.hierarchy-job-packet/v1":
+        value.pop("after", None)
+        value.pop("recipes_sha256", None)
+    if missing is not None:
+        value.pop(missing)
+    path = tmp_path / "structured-packet.md"
+    path.write_text(json.dumps(value))
+    invoke(root, "publish", message(recipient="a/root", identifier="structured-job", kind="job_request", brief=ref(path)))
+    return root, path, value
+
+
+@pytest.mark.parametrize("changes,missing,field", [
+    ({}, "after", "after"),
+    ({"commit": {"transcript": "DO_NOT_INLINE_PACKET_TRANSCRIPT"}}, None, "commit"),
+    ({"schema": "aegis.hierarchy-job-packet/v99"}, None, "schema"),
+    ({}, "recipes_sha256", "recipes_sha256"),
+    ({}, "tree", "tree"),
+    ({"checkout": {}}, None, "checkout"),
+    ({"tree": []}, None, "tree"),
+    ({"paths": [{"transcript": "DO_NOT_INLINE_PACKET_TRANSCRIPT"}]}, None, "paths"),
+    ({"paths": "tests"}, None, "paths"),
+    ({"paths": ["../escape.py"]}, None, "paths"),
+    ({"dirty_content_sha256": {}}, None, "dirty_content_sha256"),
+    ({"expected_tree": {}}, None, "expected_tree"),
+    ({"merge": {}}, None, "merge"),
+    ({"message": {}}, None, "message"),
+    ({"recipe": {}}, None, "recipe"),
+    ({"after": {"message_id": {}, "sha256": "d" * 64}}, None, "after"),
+    ({"recipes_sha256": []}, None, "recipes_sha256"),
+])
+def test_malformed_structured_packets_refuse_before_extracting_fields(tmp_path, changes, missing, field):
+    root, path, _ = structured_job(tmp_path, changes, missing)
+    before = files(tmp_path)
+    error = compose(root, "a/orchestrator", expect=2)["error"]
+    assert str(path) in error and field in error
+    assert "DO_NOT_INLINE_PACKET_TRANSCRIPT" not in error
+    assert files(tmp_path) == before and not (tmp_path / "briefs").exists()
+
+
+@pytest.mark.parametrize("changes,missing,field", [
+    ({}, "after", "after"),
+    ({"commit": {"transcript": "DO_NOT_INLINE_PACKET_TRANSCRIPT"}}, None, "commit"),
+])
+def test_packet_rejection_agrees_with_the_runners_admission_checks(tmp_path, changes, missing, field):
+    root, path, _ = structured_job(tmp_path, changes, missing)
+    # No standalone schema validator exists. The actual admission API must fail
+    # on these fields before it could reach any checkout or execution boundary.
+    driver = ("import json,sys\nfrom pathlib import Path\n"
+              "source,root,packet,checkout=sys.argv[1:]\n"
+              "sys.path.insert(0,str(Path(source)/'tools'))\n"
+              "from hierarchy_jobs import admit\nfrom hierarchy_mailbox import Mailbox\n"
+              "mailbox=Mailbox(root)\nmessage=mailbox.messages()['structured-job']['message']\n"
+              "try:\n"
+              "    admit(None,{'checkouts':[checkout]},message,mailbox,{'recipes':{'tests':{'kind':'command','steps':[]}}})\n"
+              "except ValueError as error:\n    print(json.dumps({'error':str(error)}))\n"
+              "else:\n    raise AssertionError('malformed packet reached admission')\n")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(ROOT), str(root), str(path), str(tmp_path)],
+                            capture_output=True, text=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+    assert field in json.loads(result.stdout)["error"]
+    assert field in compose(root, "a/orchestrator", expect=2)["error"]
+
+
+@pytest.mark.parametrize("after", [None, []])
+def test_non_object_dependency_names_the_after_field(tmp_path, after):
+    root, path, _ = structured_job(tmp_path, {"after": after})
+    before = files(tmp_path)
+    error = compose(root, "a/orchestrator", expect=2)["error"]
+    assert str(path) in error and ": invalid after:" in error
+    assert files(tmp_path) == before
+
+
+@secure_publication
+@pytest.mark.parametrize("version", [1, 2])
+def test_valid_packet_source_fields_remain_scalar_and_paths_are_strings(tmp_path, version):
+    value = {"schema": "aegis.hierarchy-job-packet/v%d" % version,
+             "paths": ["tests/example.py::test_one"], "dirty_content_sha256": hashlib.sha256(b"").hexdigest()}
+    root, path, packet = structured_job(tmp_path, value)
+    rows = sections(compose(root, "a/orchestrator")["brief"])
+    source = next(row["source"] for row in rows["Source identity"] if row.get("job_id") == "structured-job")
+    assert source["commit"] == packet["commit"] and source["tree"] == packet["tree"]
+    assert source["paths"] == packet["paths"]
+    assert all(isinstance(item, str) for item in source["paths"])
+
+
+FSYNC_DRIVER = ("import fcntl,json,os,runpy,stat,sys\nfrom pathlib import Path\n"
+                "tool,root,fail=sys.argv[1:]\nbase=Path(root).parent\ntrace=base/'fsync-trace.json'\n"
+                "events=[]\nrenamed=False\nalready_published=any((base/'briefs').glob('fresh-*.md'))\n"
+                "real_fsync,real_replace=os.fsync,os.replace\n"
+                "def replacing(*args,**kwargs):\n"
+                "    global renamed\n    result=real_replace(*args,**kwargs)\n    renamed=True\n    return result\n"
+                "def syncing(fd):\n"
+                "    metadata=os.fstat(fd)\n"
+                "    if stat.S_ISDIR(metadata.st_mode):\n"
+                "        assert renamed or already_published,'directory synced before rename'\n"
+                "        flags=fcntl.fcntl(fd,fcntl.F_GETFL)\n"
+                "        assert flags & os.O_ACCMODE == os.O_RDONLY\n"
+                "        assert not flags & getattr(os,'O_PATH',0)\n"
+                "        parent=base.stat()\n"
+                "        kind='parent' if (metadata.st_dev,metadata.st_ino)==(parent.st_dev,parent.st_ino) else 'directory'\n"
+                "    else:\n        assert stat.S_ISREG(metadata.st_mode)\n        kind='file'\n"
+                "    events.append(kind)\n"
+                "    if kind==fail: raise OSError('fixture '+kind+' fsync refused')\n"
+                "    return real_fsync(fd)\n"
+                "os.fsync,os.replace=syncing,replacing\n"
+                "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2','--as-of','2026-11-07T12:00:00Z']\n"
+                "try:\n    runpy.run_path(tool,run_name='__main__')\n"
+                "finally:\n    trace.write_text(json.dumps(events))\n")
+
+
+def traced_publication(root, fail=""):
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", FSYNC_DRIVER, str(TOOL), str(root), fail],
+                          capture_output=True, text=True, timeout=15,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert not proc.stderr, proc.stderr
+    return proc.returncode, json.loads(proc.stdout), json.loads((root.parent / "fsync-trace.json").read_text())
+
+
+@secure_publication
+@pytest.mark.parametrize("existing", ["none", "directory", "brief"])
+def test_publication_syncs_file_then_directory_and_new_parent(pilot, existing):  # noqa: F811
+    root, _ = pilot
+    if existing == "directory":
+        (root.parent / "briefs").mkdir()
+    elif existing == "brief":
+        compose(root, as_of=AS_OF)
+    code, answer, events = traced_publication(root)
+    assert code == 0, answer
+    expected = {"none": ["file", "directory", "parent"], "directory": ["file", "directory"], "brief": ["directory"]}
+    assert events == expected[existing]
+    assert Mailbox(root).brief(answer["brief"])
+
+
+@secure_publication
+@pytest.mark.parametrize("failed", ["directory", "parent"])
+def test_directory_sync_failure_never_reports_publication_success(pilot, failed):  # noqa: F811
+    root, _ = pilot
+    code, answer, events = traced_publication(root, failed)
+    assert code == 3 and "ok" not in answer
+    assert answer["error"] == "brief publication failed: fixture " + failed + " fsync refused"
+    assert events[-1] == failed

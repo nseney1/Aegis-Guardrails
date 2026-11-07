@@ -320,32 +320,80 @@ def lifecycle_records(brief, directory, at):
                   **{key: obligation[key] for key in ("request_id", "request_sha256", "state", "owner", "next_decision")})
 
 
+def validate_packet_declaration(packet, message_id):
+    """Validate the runner's common packet schema without admitting or executing a job.
+
+    The runner has no standalone schema validator: admit() also requires live
+    recipes, checkouts and dependency evidence. Reuse its constants and primitives
+    here; recipe-specific and physical admission remain the runner's responsibility.
+    """
+    from hierarchy_jobs import (DEPENDENT_PACKET_SCHEMA, EMPTY_STATUS, GIT_ID, MAX_PATHS, MAX_PATHS_BYTES,
+                                PACKET_SCHEMA, PATH_ARGUMENT, absolute)
+
+    require(isinstance(packet, dict), "invalid JSON field: packet must be an object")
+    schema = packet.get("schema")
+    require(isinstance(schema, str) and schema in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA), "invalid schema/version")
+    dependent = schema == DEPENDENT_PACKET_SCHEMA
+    fields(packet, {"schema", "recipe", "checkout", "commit", "tree"} |
+           ({"after", "recipes_sha256"} if dependent else set()),
+           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge"})
+    matching(packet["recipe"], SLUG, "recipe")
+    absolute(packet["checkout"], "checkout")
+    for name in ("commit", "tree", "expected_tree", "merge"):
+        if name in packet:
+            matching(packet[name], GIT_ID, name)
+    if "dirty_content_sha256" in packet:
+        matching(packet["dirty_content_sha256"], SHA256, "dirty_content_sha256")
+    if "message" in packet:
+        text(packet["message"], "message", 65536)
+    if "paths" in packet:
+        paths = packet["paths"]
+        require(isinstance(paths, list) and len(paths) <= MAX_PATHS, "invalid paths")
+        for index, path in enumerate(paths):
+            label = "paths[%d]" % index
+            matching(path, PATH_ARGUMENT, label)
+            require(".." not in path.partition("::")[0].split("/"), "invalid " + label)
+        require(len(json.dumps(paths)) <= MAX_PATHS_BYTES, "paths exceed runner byte limit")
+    if dependent:
+        require(isinstance(packet["after"], dict), "invalid after: expected a JSON object")
+        fields(packet["after"], {"message_id", "sha256"})
+        matching(packet["after"]["message_id"], SLUG, "after.message_id")
+        matching(packet["after"]["sha256"], SHA256, "after.sha256")
+        matching(packet["recipes_sha256"], SHA256, "recipes_sha256")
+        require(packet["after"]["message_id"] != message_id, "invalid after: a job cannot depend on itself")
+        require(packet.get("dirty_content_sha256", EMPTY_STATUS) == EMPTY_STATUS,
+                "invalid dirty_content_sha256: dependent jobs require clean source")
+
+
 def job_packet(brief, mailbox, message, origin):
+    from hierarchy_jobs import packet_text
+
     reference = message["brief"]
     raw = mailbox.brief(reference)
-    brief.add("Evidence references", "job_packet", reference, job_id=message["message_id"])
-    content = raw.decode("utf-8")
-    if content.startswith("---\n"):
-        _, separator, content = content[4:].partition("\n---\n\n")
-        require(bool(separator), "job packet message has no body")
+    try:
+        content = packet_text(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid packet %s field JSON: %s" % (reference["path"], exc)) from exc
     if not content.lstrip().startswith(("{", "[")):
         # Legacy prose packets cannot supply structured dependencies; retain the original, never guess.
+        brief.add("Evidence references", "job_packet", reference, job_id=message["message_id"])
         brief.add("Dependencies", "unstructured_job_packet", origin, job_id=message["message_id"],
                   state="dependencies_not_recorded")
         return
     try:
         packet = strict_json(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("job packet is not valid JSON") from exc
-    require(isinstance(packet, dict), "job packet must be a JSON object")
+    except ValueError as exc:
+        raise ValueError("invalid packet %s field JSON: %s" % (reference["path"], exc)) from exc
+    try:
+        validate_packet_declaration(packet, message["message_id"])
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid packet %s: %s" % (reference["path"], exc)) from exc
+    brief.add("Evidence references", "job_packet", reference, job_id=message["message_id"])
     if "after" in packet:
         after = packet["after"]
-        fields(after, {"message_id", "sha256"})
-        matching(after["message_id"], SLUG, "dependency message_id")
-        matching(after["sha256"], SHA256, "dependency sha256")
         brief.add("Dependencies", "job_after", reference, job_id=message["message_id"], after=after)
-    source = {key: packet[key] for key in ("checkout", "commit", "tree", "dirty_sha256", "dirty_state_sha256",
-                                          "dirty_content_sha256", "expected_tree", "recipes_sha256") if key in packet}
+    source = {key: packet[key] for key in ("checkout", "commit", "tree", "paths", "dirty_content_sha256",
+                                          "expected_tree", "merge", "recipes_sha256") if key in packet}
     if source:
         brief.add("Source identity", "job_source", reference, job_id=message["message_id"], source=source)
 
@@ -706,12 +754,27 @@ def remove_written_file(directory_fd, name, identity):
         os.unlink(name, dir_fd=directory_fd)
 
 
+def sync_publication_directory(directory_fd):
+    if os.name == "nt":
+        # Windows does not support fsync on directory handles. Publication also
+        # retains its separate refusal when secure dir_fd operations are absent.
+        return
+    # O_PATH handles permit traversal but cannot be fsynced. Reopen the anchored
+    # directory read-only on POSIX, rather than resolving its pathname again.
+    descriptor = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def publish(raw, reference):
     require_secure_publication()
     path = Path(reference["path"])
     base_fd = open_directory(path.parent.parent)
     directory_fd = None
     pending = None
+    created_directory = False
     try:
         try:
             try:
@@ -719,6 +782,7 @@ def publish(raw, reference):
             except FileNotFoundError:
                 try:
                     os.mkdir(path.parent.name, mode=0o700, dir_fd=base_fd)
+                    created_directory = True
                 except FileExistsError:
                     pass  # Another composer created the same output directory.
                 directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
@@ -749,6 +813,10 @@ def publish(raw, reference):
                     raise PublicationRefused("content-addressed brief already exists with different bytes")
             check_directory(base_fd, directory_fd, path.parent.name)
             check_returned_path(path, file_identity(metadata))
+            sync_publication_directory(directory_fd)
+            if created_directory:
+                sync_publication_directory(base_fd)
+            check_returned_path(path, file_identity(metadata))
             return
         pending = ".fresh-" + uuid.uuid4().hex
         descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
@@ -762,6 +830,10 @@ def publish(raw, reference):
         pending = None
         try:
             check_directory(base_fd, directory_fd, path.parent.name)
+            check_returned_path(path, identity)
+            sync_publication_directory(directory_fd)
+            if created_directory:
+                sync_publication_directory(base_fd)
             check_returned_path(path, identity)
         except (PublicationRefused, RuntimeError):
             remove_written_file(directory_fd, path.name, identity)
