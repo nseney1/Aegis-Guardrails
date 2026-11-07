@@ -26,7 +26,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -629,7 +628,7 @@ def ancestors():
     return mine
 
 
-def process_census():
+def process_census(session):
     """Read Linux argument boundaries directly; ps is the fallback without /proc."""
     proc = Path("/proc")
     if proc.is_dir():
@@ -653,35 +652,23 @@ def process_census():
         words = line.split(None, 3)
         if len(words) < 4 or not (words[0].isdigit() and words[1].isdigit()):
             continue
-        yield int(words[0]), int(words[1]), words[2], shlex.split(words[3])
-
-
-def host_program(argv, host):
-    if argv and Path(argv[0]).name == "env":
-        argv = argv[1:]
-        while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
-            argv = argv[1:]
-    if not argv:
-        return False
-    program = Path(argv[0]).name
-    if host == CLAUDE:
-        if program in ("claude", "claude.exe", ".claude-wrapped"):
-            return True
-        return program == "node" and len(argv) > 1 and (
-            Path(argv[1]).name == "claude" or Path(argv[1]).parts[-3:] == ("@anthropic-ai", "claude-code", "cli.js"))
-    return host == CODEX and (program == "codex" or (
-        program == "node" and len(argv) > 1 and Path(argv[1]).name == "codex"))
+        if not re.search(r"(?<!\S)" + re.escape(session) + r"(?!\S)", words[3]):
+            continue
+        # ps is not shell-escaped: quotes are literal, and paths with spaces cannot be recovered here.
+        # Linux uses the NUL-separated /proc argv above instead.
+        yield int(words[0]), int(words[1]), words[2], words[3].split()
 
 
 def session_processes(session, excluded, host=CODEX, unowned=None):
     """(pid, pgid) of live host programs naming the session as a whole argument."""
+    hierarchy_hosts.entrypoints(host)
     found = []
-    for pid, pgid, state, argv in process_census():
+    for pid, pgid, state, argv in process_census(session):
         # A zombie has already ended; it only waits for its parent to collect it.
         if pid in excluded or state.startswith("Z") or session not in argv:
             continue
         # A diagnostic command naming the session must never be signalled.
-        if host_program(argv, host):
+        if hierarchy_hosts.matches_entrypoint(host, argv):
             found.append((pid, pgid))
         elif unowned is not None:
             unowned.append(pid)

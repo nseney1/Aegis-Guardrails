@@ -69,13 +69,12 @@ with open(junit, "w", encoding="utf-8") as stream:
 sys.exit(1 if failed else 0)
 '''
 CODEX_WRAPPER = r'''
-import json, os, re, subprocess, sys, uuid
+import json, os, re, runpy, subprocess, sys, uuid
 from pathlib import Path
-
-from tests.integration.hierarchy_fake_wrapper import python_argv
 
 FAKE = %(fake)r
 AGENT_RECORD = %(agent)r
+python_argv = runpy.run_path(str(Path(FAKE).with_name("hierarchy_fake_wrapper.py")))["python_argv"]
 
 
 def emit(event):

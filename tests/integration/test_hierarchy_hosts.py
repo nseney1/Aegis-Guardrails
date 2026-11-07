@@ -89,7 +89,7 @@ def test_describe_is_the_json_registry_and_callers_cannot_change_it():
     assert list(described["hosts"]) == list(hierarchy_hosts.HOST_KINDS)
     assert json.loads(json.dumps(described)) == described
     keys = {"kind", "family", "team_start", "home", "billing_variables", "session_variable", "transcripts", "usage",
-            "write_scope", "qualification"}
+            "write_scope", "qualification", "entrypoints"}
     for kind, entry in described["hosts"].items():
         assert set(entry) == keys and entry["kind"] == kind
     claude, codex, native = (described["hosts"][kind] for kind in hierarchy_hosts.HOST_KINDS)
@@ -118,6 +118,39 @@ def test_an_unknown_host_kind_is_refused_with_its_name(kind):
                             (hierarchy_hosts.qualify, (False,)), (hierarchy_hosts.billing_set, ({},))):
         assert refusal(call, kind, *arguments) == expected
     assert refusal(hierarchy_hosts.transcripts, kind, "home", SESSION) == expected
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("claude-code", {"program_basenames": ["claude", "claude.exe", ".claude-wrapped"],
+                     "node_script_basenames": ["claude", ".claude-wrapped"],
+                     "node_script_suffixes": ["@anthropic-ai/claude-code/cli.js"]}),
+    ("codex-cli", {"program_basenames": ["codex"], "node_script_basenames": ["codex"],
+                   "node_script_suffixes": []}),
+    ("codex", {"program_basenames": [], "node_script_basenames": [], "node_script_suffixes": []}),
+])
+def test_host_entrypoints_are_json_data_and_cannot_be_mutated_by_callers(kind, expected):
+    described = json.loads(json.dumps(hierarchy_hosts.describe()))
+    assert described["hosts"][kind]["entrypoints"] == expected
+    described["hosts"][kind]["entrypoints"]["program_basenames"].append("CHANGED")
+    assert hierarchy_hosts.entry(kind)["entrypoints"] == expected
+
+
+@pytest.mark.parametrize("kind,argv,expected", [
+    ("claude-code", ["node", "/nix/store/package/bin/.claude-wrapped"], True),
+    ("claude-code", ["node", "/lib/@anthropic-ai/claude-code/cli.js"], True),
+    ("claude-code", ["node", "/other/cli.js"], False),
+    ("codex-cli", ["/vendor/platform/bin/codex"], True),
+    ("codex-cli", ["node", "/lib/bin/codex"], True),
+    ("codex-cli", ["claude"], False),
+    ("claude-code", [], False),
+])
+def test_registry_matches_only_the_declared_entrypoints(kind, argv, expected):
+    assert hierarchy_hosts.matches_entrypoint(kind, argv) is expected
+
+
+def test_hosts_without_process_entrypoints_are_refused():
+    assert refusal(hierarchy_hosts.matches_entrypoint, "codex", ["codex"]) == "codex has no process entrypoints"
+    assert refusal(hierarchy_hosts.matches_entrypoint, "unknown", []) == "unsupported host kind: 'unknown'"
 
 
 def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():

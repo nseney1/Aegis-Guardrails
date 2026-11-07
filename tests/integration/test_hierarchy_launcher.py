@@ -26,6 +26,10 @@ from tests.integration.test_hierarchy_provision import Setup, provision
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
+LINUX_HOST_PROGRAMS = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="host program names require Linux; framework Python may replace argv[0]",
+)
 LAUNCHER = ROOT / "tools" / "hierarchy_launcher.py"
 FAKE_CODEX = Path(__file__).with_name("hierarchy_fake_codex.py")
 REVIEW = "pilot/lane/review"
@@ -484,6 +488,7 @@ def test_resume_mirrors_a_wake_refusal(launch):
     assert refused["wake_exit_code"] == 2 and refused["wake"]["state"] is None
 
 
+@LINUX_HOST_PROGRAMS
 def test_stop_ends_the_process_group_of_a_hung_session(launch):
     session = launch.start()["session"]
     hung = subprocess.Popen(["sh", "-c", 'sleep 30 & exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
@@ -698,6 +703,7 @@ def owned_pids(session, host="codex-cli"):
     return sorted(pid for pid, _ in launcher_module().session_processes(session, set(), host))
 
 
+@LINUX_HOST_PROGRAMS
 def test_stop_spares_a_caller_that_names_the_session(launch):
     session = launch.start()["session"]
     hung = hold(launch, session, 'exec codex exec --json hold "$0"', session, start_new_session=True)
@@ -721,6 +727,7 @@ def test_stop_spares_a_caller_that_names_the_session(launch):
                 process.wait(timeout=5)
 
 
+@LINUX_HOST_PROGRAMS
 def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
     session = launch.start()["session"]
     leader = hold(launch, session, 'sleep 30 & codex exec --json hold "$HELD_SESSION"; wait', start_new_session=True)
@@ -737,6 +744,7 @@ def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
 
 
 @pytest.mark.parametrize("grace", ["0", "1"])
+@LINUX_HOST_PROGRAMS
 def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace):
     session = launch.start()["session"]
     stubborn = hold(launch, session, 'trap "" TERM; sleep 30; :', session, start_new_session=True)
@@ -826,6 +834,7 @@ def test_an_interrupt_during_the_bind_wait_is_recorded_and_releases_the_start_lo
     assert launch.binding()["session"] == thread
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(launch, monkeypatch, capsys):
     session = launch.start()["session"]
     hung = subprocess.Popen(["sh", "-c", 'exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",

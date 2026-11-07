@@ -3,8 +3,8 @@
 
 A host kind is what runs a session: `claude-code`, `codex-cli` (exec) or `codex` (a native app-server thread).
 For each one the registry names its contract family, team start mode, home folder, billing variables, session
-variable, transcript locator, usage reader, writer scope and qualification per role, and it holds the readers for
-Claude's own output: stream-json events, usage, turn items and `claude auth status --json`.
+variable, transcript locator, process entrypoints, usage reader, writer scope and qualification per role. It also
+holds the readers for Claude's own output: stream-json events, usage, turn items and `claude auth status --json`.
 
 It also holds a team run's host plan (aegis.hierarchy-host-plan/v1, `<base>/host-plan.json`): which host runs ROOT,
 which one runs every role below it, and which bindings are stand-ins that run no host. `require_binding` is the one
@@ -67,6 +67,9 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 _HOSTS = {
     CLAUDE: {
         "family": "claude",
+        "entrypoints": {"program_basenames": ("claude", "claude.exe", ".claude-wrapped"),
+                        "node_script_basenames": ("claude", ".claude-wrapped"),
+                        "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",)},
         "team_start": "print",
         "home": {"variable": "CLAUDE_CONFIG_DIR", "run_folder": "claude-home", "owner_folder": ".claude"},
         "billing_variables": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -81,6 +84,8 @@ _HOSTS = {
     },
     CODEX: {
         "family": "codex",
+        "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex",),
+                        "node_script_suffixes": ()},
         "team_start": "exec",
         "home": {"variable": "CODEX_HOME", "run_folder": "codex-home", "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
@@ -96,6 +101,7 @@ _HOSTS = {
     # start none, so every role is refused.
     NATIVE: {
         "family": "codex",
+        "entrypoints": {"program_basenames": (), "node_script_basenames": (), "node_script_suffixes": ()},
         "team_start": None,
         "home": {"variable": "CODEX_HOME", "run_folder": None, "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
@@ -125,6 +131,32 @@ def describe():
 
 def family(kind):
     return _host(kind)["family"]
+
+
+def entrypoints(kind):
+    """Process entrypoints as JSON data, or an explicit refusal for a host with none."""
+    found = entry(kind)["entrypoints"]
+    require(any(found.values()), "%s has no process entrypoints" % kind)
+    return found
+
+
+def matches_entrypoint(kind, argv):
+    """Whether argv names one of this host's declared programs or node-run scripts."""
+    found = entrypoints(kind)
+    if argv and Path(argv[0]).name == "env":
+        argv = argv[1:]
+        while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
+            argv = argv[1:]
+    if not argv:
+        return False
+    program = Path(argv[0]).name
+    if program in found["program_basenames"]:
+        return True
+    if program != "node" or len(argv) < 2:
+        return False
+    script = Path(argv[1])
+    return script.name in found["node_script_basenames"] or any(
+        script.parts[-len(Path(suffix).parts):] == Path(suffix).parts for suffix in found["node_script_suffixes"])
 
 
 def qualify(kind, writer):

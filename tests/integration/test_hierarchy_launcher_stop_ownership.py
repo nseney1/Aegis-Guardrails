@@ -1,5 +1,6 @@
 """Stop owns a host program naming the session, never a diagnostic naming the same UUID."""
 import os
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -163,6 +164,7 @@ def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program,
     ("claude-code", ".claude-wrapped", None),
     ("claude-code", "host tools/claude", None),
     ("claude-code", "node", "node_modules/@anthropic-ai/claude-code/cli.js"),
+    ("claude-code", "node", "nix/store/claude-code/bin/.claude-wrapped"),
     ("claude-code", "host tools/node", "host scripts/@anthropic-ai/claude-code/cli.js"),
     ("codex-cli", "host tools/codex", None),
     ("codex-cli", "vendor/platform/bin/codex", None),
@@ -224,7 +226,8 @@ def test_linux_matcher_reads_proc_without_a_ps_census(launch, children, monkeypa
     assert module.session_processes(session, set()) == [(held.pid, os.getpgid(held.pid))]
 
 
-def test_ps_fallback_preserves_quoted_executable_paths(monkeypatch):
+@pytest.mark.parametrize("noise", ["Bob's.txt", 'an unmatched " quote', "the other role's contract"])
+def test_ps_fallback_ignores_unrelated_quotes(monkeypatch, noise):
     from types import SimpleNamespace
 
     module = launcher_module()
@@ -232,9 +235,91 @@ def test_ps_fallback_preserves_quoted_executable_paths(monkeypatch):
     is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=0, stdout="123 123 S '/opt/host tools/codex' exec resume %s\n" % session))
+        returncode=0, stdout="99 99 S less %s\n123 123 S /opt/codex exec resume %s %s\n" % (noise, session, noise)))
 
     assert module.session_processes(session, set()) == [(123, 123)]
+
+
+def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
+    from types import SimpleNamespace
+
+    module = launcher_module()
+    session = str(uuid.uuid4())
+    is_dir = Path.is_dir
+    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout="123 123 S /opt/host tools/codex exec resume %s\n" % session))
+    unowned = []
+
+    assert module.session_processes(session, set(), "codex-cli", unowned) == []
+    assert unowned == [123]
+
+
+@pytest.mark.parametrize("argv,matched", [
+    (["claude", "--resume", "<uuid>"], True),
+    (["claude", "-p", "--output-format", "stream-json", "--resume", "<uuid>", "--verbose"], True),
+    (["/home/u/.local/share/fnm/node-versions/v24.21.0/installation/lib/node_modules/"
+      "@anthropic-ai/claude-code/bin/claude.exe", "--session-id", "<uuid>", "--print"], True),
+    (["claude bg-pty-host", "--bg-pty-host", "/tmp/claude.sock"], False),
+    (["claude bg-spare", "--bg-spare"], False),
+    (["node", "/nix/store/claude-code/bin/.claude-wrapped", "--resume", "<uuid>"], True),
+])
+def test_observed_claude_argv_shapes(monkeypatch, argv, matched):
+    # The owner supplied these NUL-split argv shapes from Claude Code 2.1.319, plus the Nix entrypoint.
+    module = launcher_module()
+    session = str(uuid.uuid4())
+    argv = [session if word == "<uuid>" else word for word in argv]
+    monkeypatch.setattr(module, "process_census", lambda _session: iter([(123, 123, "S", argv)]))
+
+    assert module.session_processes(session, set(), "claude-code") == ([(123, 123)] if matched else [])
+
+
+def test_wrapper_symlink_creation_is_safe_when_callers_race(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from tests.integration.hierarchy_fake_wrapper import python_argv
+
+    barrier = Barrier(2)
+    symlink_to = Path.symlink_to
+
+    def simultaneous(path, target, *args, **kwargs):
+        barrier.wait(timeout=5)
+        return symlink_to(path, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "symlink_to", simultaneous)
+    script = tmp_path / "host.py"
+    script.write_text("pass\n", encoding="utf-8")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(python_argv, "codex", script, tmp_path) for _ in range(2)]
+        commands = [call.result(timeout=5) for call in calls]
+
+    binary = tmp_path / ".python" / "codex"
+    assert all(command[0] == str(binary) for command in commands)
+    assert binary.is_symlink() and binary.resolve() == Path(sys.executable).resolve()
+    assert list(binary.parent.iterdir()) == [binary]
+
+
+def test_wrapper_imports_only_its_folder_and_python_libraries(tmp_path, monkeypatch):
+    from tests.integration.hierarchy_fake_wrapper import python_argv
+    from tests.integration.test_hierarchy_mailbox import ROOT
+
+    work, folder = tmp_path / "work", tmp_path / "wrapper"
+    work.mkdir()
+    folder.mkdir()
+    for name in ("runpy.py", "pkgutil.py"):
+        (work / name).write_text('raise RuntimeError("working directory imported")\n', encoding="utf-8")
+    script = folder / "host.py"
+    script.write_text("import json, pkgutil, sys\nprint(json.dumps({'paths': sys.path, 'python': sys.executable}))\n",
+                      encoding="utf-8")
+    monkeypatch.setattr(sys, "path", ["", str(work), *sys.path])
+    command = python_argv("codex", script, tmp_path)
+    ran = subprocess.run(command, cwd=work, capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+
+    assert ran.returncode == 0, ran.stderr
+    found = json.loads(ran.stdout)
+    assert found["paths"][0] == str(folder)
+    assert "" not in found["paths"] and str(work) not in found["paths"] and str(ROOT) not in found["paths"]
+    assert found["python"] == sys.executable
 
 
 @pytest.mark.parametrize("kind", ["probe", "rollout", "team", "direct-rollout"])
