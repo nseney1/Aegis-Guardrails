@@ -1188,6 +1188,19 @@ def main(argv=None):
             # exact reviewed sibling-tool directory, never cwd or PYTHONPATH.
             sys.dont_write_bytecode = True
             sys.path.insert(0, str(Path(__file__).resolve().parent))
+            # Legacy provisioned profiles enter here directly. Verify through the retained bootstrap before
+            # importing even the first peer (including any local bytecode cache). Standalone mailboxes need no helper.
+            provision = root.parent / "provision.json"
+            if provision.is_file() and not getattr(sys, "_aegis_verified_runtime_entry", None):
+                setup = read_json(provision)
+                require(isinstance(setup, dict) and isinstance(setup.get("source"), str) and bool(setup["source"]),
+                        "invalid runtime source provision")
+                verifier = provision.parent / "runtime-source.py"
+                require(verifier.is_file(), "runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+                entry = safe_path(setup["source"]) / "tools" / "hierarchy_mailbox.py"
+                arguments = list(argv) if argv is not None else sys.argv[1:]
+                os.execv(sys.executable, [sys.executable, "-I", "-B", str(verifier), "--provision", str(provision),
+                                         "--entry", str(entry), "--", *arguments])
             from hierarchy_mailbox_mcp import serve
 
             lifecycle = cli_path(args.lifecycle, "--lifecycle") if args.lifecycle is not None else None

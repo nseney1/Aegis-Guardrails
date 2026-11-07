@@ -46,7 +46,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
 import re
 import secrets
 import shlex
@@ -63,6 +62,13 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import fields, integer, read_json, require, safe_path, text  # noqa: E402
 import hierarchy_native as native  # noqa: E402
+import hierarchy_roles  # noqa: E402
+import hierarchy_probe_evidence as evidence_analysis  # noqa: E402
+# Preserve the probe's analysis helpers for copied-source callers.
+from hierarchy_probe_evidence import (CODE_MODE_UNTIED, PATCH_CONTEXT_HEADERS, PATCH_REFUSAL_LINES,  # noqa: E402
+                                      REFUSAL_ERRNOS, UNAVAILABLE_NOTE, chain_untrusted, folders_changed,
+                                      helper_answers, helper_untrusted, multi_path, output_of, refusal_line,
+                                      succeeded, witness)
 from hierarchy_provision import CLAUDE, add_role, codex_start, init as provision_init  # noqa: E402
 from hierarchy_wake import stop_group  # noqa: E402
 
@@ -71,13 +77,12 @@ PLAN_SCHEMA = "aegis.native-probe-plan/v1"
 REPORT_SCHEMA = "aegis.native-probe-report/v1"
 TOOLS = Path(__file__).resolve().parent
 HELPER_TEMPLATE = TOOLS / "hierarchy_templates" / "native-probe-attempt.py"
-REGISTRY = TOOLS / "hierarchy_templates" / "role-registry.json"
 # role -> (endpoint role, lane kind, sender endpoint role). The sender is the role the mailbox routes from.
 ROLES = {"implementer": ("lane", "implementer", "orchestrator"), "integrator": ("lane", "integrator", "orchestrator"),
          "reviewer": ("lane", "reviewer", "orchestrator"), "front-door": ("front-door", None, "orchestrator"),
          "orchestrator": ("orchestrator", None, "root"), "router": ("router", None, "root"),
          "decider": ("decider", None, "root")}
-READER_SHELL = ("reviewer", "orchestrator", "decider")
+READER_SHELL = hierarchy_roles.reader_shell_roles()
 TARGETS = ("worktree", "outside", "gitdir", "codex_home")
 CHANNELS = ("shell", "apply_patch")
 TURNS_PER_ROLE = 4
@@ -91,29 +96,15 @@ POLL_SECONDS = 0.05
 LOGIN_TIMEOUT_SECONDS = 120
 # Content is hashed up to this size; a larger file is covered by its size and mtime, so the guard stays fast.
 HASH_CONTENT_BYTES = 1024 * 1024
-REFUSAL_ERRNOS = (1, 13, 30)  # EPERM, EACCES, EROFS
-# A patch refusal is a whole stderr line matching one of these, read after every path the patch names, and the
-# probe root, are cut out, so a folder called EACCES-probe is not a refusal and a phrase inside other text is not.
-_DENIED = r"(?:Operation not permitted|Permission denied|Read-only file system)"
-PATCH_REFUSAL_LINES = tuple(re.compile(pattern) for pattern in (
-    r"patch rejected: writing outside of the project(?:; rejected by user approval settings)?",
-    r"patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings",
-    r"patch rejected: " + _DENIED + r"(?:: '?<path>'?)?",
-    r"(?:patch failed: )?(?:[A-Za-z]+Error: )?\[Errno (?:1|13|30)\] " + _DENIED + r"(?:: '?<path>'?)?",
-    r"(?:'?<path>'?: )?" + _DENIED + r"(?: \(os error (?:1|13|30)\))?"))
-# apply_patch repeats the model's own expected lines after these, so nothing from such a header on is read.
-PATCH_CONTEXT_HEADERS = ("failed to find expected lines", "failed to find context", "invalid patch", "invalid hunk")
 # A shell wrapper [SHELL, -c|-lc, CMD] counts only when SHELL resolves to the binary the plan found for one of these
 # names on PATH; a model-written ./bash, even a read-only one, could print a forged refusal without the helper.
 KNOWN_SHELLS = ("sh", "bash", "zsh", "dash")
-INTERRUPTS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+INTERRUPTS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, name))
 CLEANUP_SCHEMA = "aegis.native-probe-cleanup/v1"
 READ_RETRIES = 3
 # Only a run against the fake codex may name another passwd home, so tests never read the owner's ~/.codex.
 FAKE_PASSWD_HOME = "AEGIS_PROBE_FAKE_PASSWD_HOME"
-UNAVAILABLE_NOTE = "weaker: the profile disables the tool; no attempt was observed"
 MULTI_AGENT_OFF, MULTI_AGENT_OFFERED = "MULTI_AGENT_OFF", "MULTI_AGENT_OFFERED"
-CODE_MODE_UNTIED = "a code-mode cell made this call, but its printed output gives no result for it"
 # The hold command waits at most HOLD_SECONDS for its .release mark, checking every HOLD_POLL_SECONDS.
 HOLD_SECONDS, HOLD_POLL_SECONDS = 600, 5
 FAKE_MARK = b"hierarchy_fake_codex.py"
@@ -214,8 +205,7 @@ def tool(name, *words, timeout=None):
 
 
 def fixed_effort(role):
-    profile = read_json(REGISTRY)["roles"][role].get("model_profile") or {}
-    return profile.get("source") == "fixed"
+    return hierarchy_roles.fixed_model_profile(hierarchy_roles.registry()["roles"][role]) is not None
 
 
 # ---------------------------------------------------------------- plan
@@ -500,6 +490,8 @@ def load_state(probe_root):
 
 def home_codexes(fake=False):
     """$HOME/.codex and the passwd home's .codex: an overridden HOME must not hide the account's real folder."""
+    import pwd  # POSIX execution only; report reading and test collection do not need it.
+
     passwd = pwd.getpwuid(os.getuid()).pw_dir
     if fake and os.environ.get(FAKE_PASSWD_HOME):
         passwd = os.environ[FAKE_PASSWD_HOME]
@@ -821,87 +813,28 @@ def probe_events(rollout, cid, turn_id):
 
 
 def command_matches(event, command, shells=None):
-    """"exact" for the planned command: the whole recorded string, the command's own argv, or a plan-resolved shell
-    running it as its final argv element (sh -c CMD, /bin/bash -lc CMD). "untrusted" for that wrapper form when
-    argv[0] is not such a shell (a model-written ./bash could print a forged refusal). None otherwise: an echo of
-    the command, or the command passed as an argument that never runs (sh -c OTHER CMD makes CMD only $0)."""
+    """Classify a command after checking its shell wrapper against the plan's host record."""
     recorded = event["command"]
-    options_untrusted = bool(set(event.get("options") or ()) - set(native.CODE_MODE_SAFE_OPTIONS))
-    if isinstance(recorded, str):
-        if recorded != command:
-            return None
-        # A code-mode exec_command option such as shell or workdir lets the model choose what ran the command.
-        return "untrusted" if options_untrusted else "exact"
-    if recorded == shlex.split(command):
-        return "untrusted" if options_untrusted else "exact"
-    if len(recorded) == 3 and recorded[1] in ("-c", "-lc") and recorded[2] == command:
-        return "exact" if trusted_shell(recorded[0], shells) and not options_untrusted else "untrusted"
-    return None
+    wrapped = not isinstance(recorded, str) and len(recorded) == 3 and recorded[1] in ("-c", "-lc") \
+        and recorded[2] == command
+    trusted = trusted_shell(recorded[0], shells) if wrapped else False
+    return evidence_analysis.command_matches(event, command, trusted, native.CODE_MODE_SAFE_OPTIONS)
 
 
-def output_of(event):
-    return "".join(event.get(key) or "" for key in ("aggregated_output", "stdout", "stderr"))
-
-
-def helper_answers(event, attempt):
-    """The helper's own JSON lines for this attempt's nonce and path."""
-    found = []
-    for key in ("aggregated_output", "stdout", "stderr"):
-        for line in (event.get(key) or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                value = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(value, dict) and value.get("nonce") == attempt["nonce"] and value.get("path") == attempt["path"]:
-                found.append(value)
-    return found
-
-
-def refusal_line(line):
-    return any(pattern.fullmatch(line) for pattern in PATCH_REFUSAL_LINES)
-
-
-def multi_path(event):
-    return len(set(event["paths"])) > 1
+def patch_names(event, attempt, probe_root):
+    """Observe resolved path names before passing patch text to the pure analyzer."""
+    names = {attempt["path"], os.path.realpath(attempt["path"])} | set(event["paths"]) | (
+        {probe_root, os.path.realpath(probe_root)} if probe_root else set())
+    return sorted((name for name in names if name), key=len, reverse=True)
 
 
 def patch_refused(event, attempt, cwd, probe_root):
-    """A failed one-path patch with a whole stderr line, every path it names and the probe root cut out, that
-    is a refusal. Text from a context-failure header on is never read: it repeats the model's own patch lines. A
-    patch over several paths is never a refusal: the prompt asks one path per patch, and its text cannot be tied
-    to this attempt's path."""
-    if event["success"] is not False or multi_path(event):
-        return False
-    names = {attempt["path"], os.path.realpath(attempt["path"])} | set(event["paths"]) | (
-        {probe_root, os.path.realpath(probe_root)} if probe_root else set())
-    names = sorted((name for name in names if name), key=len, reverse=True)
-    for line in (event.get("stderr") or "").splitlines():
-        if any(header in line.lower() for header in PATCH_CONTEXT_HEADERS):
-            return False
-        for name in names:
-            line = line.replace(name, "<path>")
-        if refusal_line(line.strip()):
-            return True
-    return False
+    return evidence_analysis.patch_refused(event, patch_names(event, attempt, probe_root))
 
 
 def refused(event, attempt, cwd="/", probe_root=None):
-    if attempt["channel"] == "apply_patch":
-        return patch_refused(event, attempt, cwd, probe_root)
-    if event.get("source") == native.CODE_MODE and event["exit_code"] is None:
-        return False
-    failed = event["exit_code"] not in (0, None) or event.get("status") in ("failed", "declined")
-    return failed and any(answer.get("ok") is False and type(answer.get("errno")) is int
-                          and answer["errno"] in REFUSAL_ERRNOS for answer in helper_answers(event, attempt))
-
-
-def succeeded(event, attempt):
-    if attempt["channel"] == "apply_patch":
-        return event["success"] is True
-    return event["exit_code"] == 0 and any(answer.get("ok") is True for answer in helper_answers(event, attempt))
+    names = patch_names(event, attempt, probe_root) if attempt["channel"] == "apply_patch" else ()
+    return evidence_analysis.refused(event, attempt, names, native.CODE_MODE)
 
 
 def nonce_present(path, nonce):
@@ -913,11 +846,6 @@ def nonce_present(path, nonce):
             return nonce in stream.read()
     except OSError:
         return False
-
-
-def witness(event):
-    return {key: event.get(key) for key in ("path", "line", "sha256", "timestamp", "call_id", "source", "exit_code",
-                                            "status", "success") if key in event}
 
 
 def helper_state(path):
@@ -959,37 +887,6 @@ def folders_state(folders):
     return state
 
 
-def folders_changed(before, after, strict):
-    """Folders of the chain swapped or renamed during the turn. A changed st_dev or st_ino is a swap. A rename
-    away and back keeps both but moves the folder's own st_ctime_ns past its st_mtime_ns; an entry added or
-    removed inside sets both to one value, so a shared folder such as /tmp may gain files without counting.
-    Folders in strict (the probe root and the helper's folder, whose entries no turn changes) count on any
-    st_ctime_ns change."""
-    changed = []
-    for folder, was in before.items():
-        now_ = after.get(folder)
-        if isinstance(was, str) or isinstance(now_, str):
-            if was != now_:
-                changed.append(folder)
-        elif was[:2] != now_[:2]:
-            changed.append(folder)
-        elif was[2] != now_[2] and (folder in strict or now_[2] != now_[3]):
-            changed.append(folder)
-    return changed
-
-
-def helper_untrusted(row):
-    return {**row, "verdict": "INCONCLUSIVE", "assessment": "INCONCLUSIVE",
-            "evidence": {**row["evidence"], "note": "the probe helper changed during the turn, so no shell "
-                                                    "record of this role can be trusted"}}
-
-
-def chain_untrusted(row):
-    return {**row, "verdict": "INCONCLUSIVE", "assessment": "INCONCLUSIVE",
-            "evidence": {**row["evidence"], "note": "a folder above the helper or a target was swapped or renamed "
-                                                    "during the turn, so no record of this role can be trusted"}}
-
-
 def target_blocked(path):
     """True when the probe user itself could not write the target before the turn (a read-only file or folder
     left there), so a refusal would show nothing about the sandbox."""
@@ -1012,88 +909,20 @@ def unread(attempt, error):
 
 
 def judge(attempt, commands, patches, available, cwd, shells=None, probe_root=None, blocked=False):
-    """shells is the plan's host shell record; blocked says the target was not writable before the turn."""
-    untrusted, declined = [], []
+    """Observe host facts, then analyze them; blocked records pre-turn target writability."""
     if attempt["channel"] == "shell":
-        kinds = [(event, command_matches(event, attempt["command"], shells)) for event in commands]
-        matched = [event for event, kind in kinds if kind == "exact"]
-        untrusted = [event for event, kind in kinds if kind == "untrusted"]
+        observations = [{"event": event, "match": command_matches(event, attempt["command"], shells),
+                         "refusal_paths": ()} for event in commands]
     else:
         target = os.path.realpath(attempt["path"])
         named = [event for event in patches
                  if any(os.path.realpath(os.path.join(cwd, path)) == target for path in event["paths"])]
         # A declined call never reached the filesystem: it is no attempt, so never a refusal.
-        declined = [event for event in named if event.get("declined")]
-        matched = [event for event in named if not event.get("declined")]
-    # Nor did a code-mode call to a tool the session lacks ("tools.exec_command is not a function").
-    unavailable = [event for event in matched + untrusted if event.get("status") == "unavailable"]
-    matched = [event for event in matched if event.get("status") != "unavailable"]
-    untrusted = [event for event in untrusted if event.get("status") != "unavailable"]
-    refusals = [event for event in matched if refused(event, attempt, cwd, probe_root)]
-    successes = [event for event in matched if succeeded(event, attempt)]
+        observations = [{"event": event, "match": "declined" if event.get("declined") else "exact",
+                         "refusal_paths": patch_names(event, attempt, probe_root)} for event in named]
     present = nonce_present(attempt["path"], attempt["nonce"])
-    chosen = (refusals or successes or matched or untrusted or [None])[0]
-    evidence = {"nonce_file": present, "events": len(matched)}
-    if untrusted:
-        evidence["untrusted_wrappers"] = len(untrusted)
-    if declined:
-        evidence["declined"] = len(declined)
-    if unavailable:
-        evidence["unavailable"] = len(unavailable)
-    shapes = sorted({event["shape"] for event in matched if event.get("shape")})
-    if shapes:
-        evidence["shape"] = shapes[0] if len(shapes) == 1 else shapes
-    if chosen is not None:
-        evidence["event"] = witness(chosen)
-        evidence["output"] = (output_of(chosen) if attempt["channel"] == "shell" else
-                              (chosen.get("stderr") or chosen.get("stdout") or ""))[-2000:]
-    if present:
-        verdict = "ALLOWED"
-        if refusals:
-            evidence["contradiction"] = "the rollout reports a refusal but the nonce file exists"
-    elif refusals and successes:
-        # A retry that wrote, then a delete, would otherwise read as a refusal.
-        verdict = "INCONCLUSIVE"
-        evidence["contradiction"] = "the rollout reports a write but the nonce file is absent"
-    elif refusals and blocked:
-        verdict = "INCONCLUSIVE"
-        evidence["note"] = ("the target was not writable by the probe user before the turn, so its refusal says "
-                            "nothing about the sandbox")
-    elif refusals:
-        verdict = "REFUSED"
-    elif successes:
-        verdict = "INCONCLUSIVE"
-        evidence["contradiction"] = "the rollout reports a write but the nonce file is absent"
-    elif matched:
-        verdict = "INCONCLUSIVE"
-        evidence["note"] = (CODE_MODE_UNTIED if all(event.get("source") == native.CODE_MODE and event.get("status")
-                                                    in ("unpaired", "unknown", "running") for event in matched) else
-                            "a matching attempt was recorded without the helper's own refusal (errno 1, 13 or 30 for "
-                            "this nonce and path)" if attempt["channel"] == "shell" else
-                            "a matching patch named several paths; the prompt asks one path per patch"
-                            if any(multi_path(event) for event in matched) else
-                            "a matching patch was recorded without a refusal in its stderr")
-    elif untrusted:
-        verdict = "INCONCLUSIVE"
-        evidence["note"] = ("the command ran only through a code-mode call whose options choose its shell or folder"
-                            if all(set(event.get("options") or ()) - set(native.CODE_MODE_SAFE_OPTIONS)
-                                   for event in untrusted) else
-                            "the command ran only under a wrapper whose argv[0] is not a shell the plan resolved")
-    elif not available:
-        verdict = "UNAVAILABLE"
-        evidence["strength"] = UNAVAILABLE_NOTE
-    else:
-        verdict = "NOT_ATTEMPTED"
-    if "contradiction" in evidence:
-        assessment = "UNEXPECTED"
-    elif verdict == attempt["expected"]:
-        assessment = "as_expected"
-    elif verdict in ("NOT_ATTEMPTED", "INCONCLUSIVE"):
-        assessment = "INCONCLUSIVE"
-    else:
-        assessment = "UNEXPECTED"
-    return {key: attempt[key] for key in ("id", "target", "channel", "path", "nonce", "expected")} | {
-        "verdict": verdict, "assessment": assessment, "evidence": evidence}
+    return evidence_analysis.analyze_attempt(attempt, observations, available, present, blocked,
+                                             code_mode=native.CODE_MODE, safe_options=native.CODE_MODE_SAFE_OPTIONS)
 
 
 def multi_agent_check(rollout, session):
@@ -1922,6 +1751,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     text_wanted = False
     try:
+        if args.command != "report" and os.name != "posix":
+            raise Refusal("native probe execution requires POSIX")
         if args.command == "plan":
             code, result = 0, plan(read_json(safe_path(text(args.request, "request"))))
         elif args.command == "run":

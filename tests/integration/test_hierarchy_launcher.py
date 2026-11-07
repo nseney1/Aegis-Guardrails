@@ -591,10 +591,11 @@ def test_an_invalid_reported_session_is_a_failed_start_without_a_session(launch,
     assert launch.binding() is None
 
 
-@pytest.mark.parametrize("mode,number,state", [("hang", signal.SIGTERM, "start_incomplete"),
-                                               ("hang", signal.SIGHUP, "start_incomplete"),
-                                               ("silent-hang", signal.SIGINT, "failed_to_start")])
+@pytest.mark.parametrize("mode,number,state", [("hang", "SIGTERM", "start_incomplete"),
+                                               ("hang", "SIGHUP", "start_incomplete"),
+                                               ("silent-hang", "SIGINT", "failed_to_start")])
 def test_an_interrupted_launcher_stops_its_start_and_records_it(launch, mode, number, state):
+    number = getattr(signal, number)
     thread = "interrupted-" + uuid.uuid4().hex
     logs = launch.base / "launches" / "pilot%2Flane%2Freview" / "logs"
     running = launch.started(mode=mode, thread=thread)
@@ -762,8 +763,12 @@ def test_resume_records_a_wake_tool_that_cannot_run(launch, monkeypatch, capsys)
     launch.start()
     module = launcher_module()
 
+    run = module.subprocess.run
+
     def unrunnable(argv, **options):
-        raise OSError(8, "Exec format error")
+        if any(str(word).endswith("hierarchy_wake.py") for word in argv):
+            raise OSError(8, "Exec format error")
+        return run(argv, **options)
     monkeypatch.setattr(module.subprocess, "run", unrunnable)
     assert module.main(["--base", str(launch.base), "resume", "--endpoint", REVIEW]) == 2
     monkeypatch.undo()

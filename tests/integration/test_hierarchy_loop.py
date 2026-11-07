@@ -4,7 +4,6 @@ Every step is the real tool as a child process. The hosts are the fake host, and
 binaries plus links to the tools the steps need, so no real model binary can start. These tests show the
 tools work together on fixtures, not that real sessions behave this way.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -70,9 +69,6 @@ class World(SealedFleet):
 
     def __init__(self, tmp_path, policy_changes=None):
         super().__init__(tmp_path)
-        found = shutil.which("git")
-        assert found, "run-open inspects the checkout with git"
-        (self.bin / "git").symlink_to(found)
         provision("init", self.init_request(roles=["router"]))
         self.front_door = self.add_role("pilot/front-door", cwd=str(tmp_path))
         self.orchestrator = self.add_role("pilot/orchestrator", cwd=str(tmp_path))
@@ -201,6 +197,8 @@ def test_mail_the_orchestrator_ignored_gets_no_second_turn_from_a_later_pass(wor
 
 
 def test_a_second_instance_is_refused_while_the_first_holds_either_lock(world):
+    import fcntl
+
     for which, guarded in (("lifecycle", world.ledger.path), ("store", world.workspace.store)):
         path = world.lock_path(which)
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -283,6 +281,8 @@ def test_a_run_open_receipt_wakes_the_requester_on_the_next_pass(world):
 
 
 def test_status_reads_not_running_stale_and_running(world):
+    import fcntl
+
     assert world.status(expect=3) == {"schema": "aegis.loop-status/v1", "state": "not_running", "last": None}
     world.once()
     assert world.status(expect=3)["state"] == "not_running"
@@ -605,7 +605,7 @@ def test_a_lock_path_that_is_not_a_regular_file_is_refused(world):
 def test_router_request_rows_and_unresolved_escalations_become_holds(world):
     status = {"router": "router-1", "escalations": [
         {"request_id": "r-esc", "reason": "over budget", "team": "pilot", "root_decision": None},
-        {"request_id": "r-decided", "reason": "over budget", "team": "pilot", "root_decision": {"decision": "deny"}}],
+        {"request_id": "r-decided", "reason": "over budget", "team": "pilot", "root_decision": "deny"}],
         "requests": [
             {"request_id": "r-held", "state": "held", "reason": "approval_expired", "detail": "expired at noon"},
             {"request_id": "r-unrecorded", "state": "delivered_unrecorded", "to": "pilot/orchestrator"},

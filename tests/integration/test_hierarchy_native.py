@@ -42,6 +42,9 @@ def run_tool(path, *args, cid=CID):
     (base / "home").mkdir(exist_ok=True)
     env = {"PATH": str(base / "fake-bin"), "HOME": str(base / "home"), "CODEX_THREAD_ID": CID,
            "CODEX_SESSION_ID": CID, "LANG": os.environ.get("LANG", "C.UTF-8")}
+    # Python 3.9 on Windows needs SYSTEMROOT to initialize its random seed.
+    if os.name == "nt" and "SYSTEMROOT" in os.environ:
+        env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     return subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--rollout", str(path),
                            "--cid", cid, *args], text=True, capture_output=True, timeout=5, env=env)
 
@@ -330,7 +333,7 @@ def test_check_still_refuses_an_unexpected_path_write_in_a_real_profile(tmp_path
     extra = {"path": {"type": "path", "path": WORK + "/.git"}, "access": "write", "missing_path_behavior": "skip"}
     rows = [META, started("t1"), turn("t1", permission_profile=real_profile(extra))]
     result = invoke(rollout(tmp_path, rows), "check", "--model", "gpt-6-astra", "--effort", "ultra",
-                    "--cwd", "/other-workspace", "--allow-special-write", "tmpdir",
+                    "--cwd", str(Path("/other-workspace").absolute()), "--allow-special-write", "tmpdir",
                     "--allow-special-write", "slash_tmp", code=2)
     assert "write root is outside requested scope: " + WORK in result["reasons"]
     assert "write root is outside requested scope: " + WORK + "/.git" in result["reasons"]

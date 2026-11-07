@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -246,7 +247,7 @@ def test_broker_loss_never_rebinds_or_resubmits_original_association(broker):
     (b'\xff\n', "FIXTURE_FRAME_INVALID"),
     (b'{}\n{}\n', "FIXTURE_FRAME_INVALID"),
     (b'x' * (768 * 1024 + 1), "FIXTURE_FRAME_TOO_LARGE"),
-])
+], ids=["empty-object", "duplicate-key", "nan", "invalid-utf8", "multiple-frames", "oversized"])
 def test_invalid_public_client_frame_refuses_before_endpoint_access(tmp_path, raw, code):
     candidate = module()
     with pytest.raises(candidate.BrokerError, match="^" + code + "$"):
@@ -308,10 +309,16 @@ def missing_host_capability(candidate, missing, monkeypatch):
 
 @pytest.mark.parametrize("missing", HOST_CAPABILITIES)
 def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, missing):
-    probe = tmp_path / "test_capability_probe.py"
+    # The child collector must stay inside its owned probe directory, even
+    # when an ancestor has pytest configuration or a Windows junction alias.
+    (tmp_path / "conftest.py").write_text("raise RuntimeError('child pytest loaded an ancestor conftest')\n")
+    directory = tmp_path / "probe"
+    directory.mkdir()
+    probe = directory / "test_capability_probe.py"
     probe.write_text(
         "import pytest\n"
-        "from tests.integration.test_hierarchy_fixture_broker import broker, module, missing_host_capability\n"
+        "from tests.integration.test_hierarchy_fixture_broker import module, missing_host_capability\n"
+        "pytest_plugins = ['tests.integration.test_hierarchy_fixture_broker']\n"
         "@pytest.fixture(autouse=True)\n"
         "def unsupported(monkeypatch):\n"
         "    missing_host_capability(module(), " + repr(missing) + ", monkeypatch)\n"
@@ -319,14 +326,25 @@ def test_positive_fixture_skips_missing_host_capability_before_ledger(tmp_path, 
         "    pass\n"
     )
     fixtures = tmp_path / "fixtures"
+    report = tmp_path / "capability-report.xml"
     result = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "--basetemp", str(fixtures), str(probe)], cwd=ROOT,
+        [sys.executable, "-B", "-m", "pytest", "-q", "-ra", "-p", "no:cacheprovider",
+         "--confcutdir", str(directory), "--basetemp", str(fixtures), "--junitxml", str(report),
+         str(probe) + "::test_positive"], cwd=ROOT,
         env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "1 skipped" in result.stdout, result.stdout + result.stderr
+    # Prove that exactly one target was collected and skipped for the required
+    # host capability, without accepting duplicate alias or teardown reports.
+    cases = ET.parse(report).getroot().findall(".//testcase")
+    evidence = report.read_text(encoding="utf-8") + result.stdout + result.stderr
+    assert len(cases) == 1 and cases[0].get("name") == "test_positive", evidence
+    skipped = cases[0].findall("skipped")
+    assert len(skipped) == 1, evidence
+    assert skipped[0].get("type") == "pytest.skip", evidence
+    assert skipped[0].get("message") == "fixture broker requires POSIX waitid WNOWAIT", evidence
+    assert cases[0].find("failure") is None and cases[0].find("error") is None, evidence
     assert not list(fixtures.rglob("policy.json")), "unsupported fixture created a canonical ledger"
     assert not list(fixtures.rglob("broker-output")), "unsupported fixture launched its broker"
 

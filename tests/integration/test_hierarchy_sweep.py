@@ -585,9 +585,9 @@ class SealedFleet(Fleet):
 
     def __init__(self, tmp_path):
         super().__init__(tmp_path)
-        for tool in ("ps",):
+        for tool in ("ps", "git"):
             found = shutil.which(tool)
-            assert found, "the wake's process census needs " + tool
+            assert found, "wake process census and source verification need " + tool
             (self.bin / tool).symlink_to(found)
 
     def env(self):

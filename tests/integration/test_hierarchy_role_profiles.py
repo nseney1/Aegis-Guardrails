@@ -7,6 +7,11 @@ role gained or lost a tool, a sandbox setting or an option, which the registry m
 M1 item 2 regenerated it once, after checking that the only difference was the new read-only mailbox_self
 tool in every mailbox role's allowlist and Codex enabled_tools. M1 item 9 inserted multi_agent_v2 after multi_agent
 in every Codex disabled_features list and --disable pair, and changed nothing else.
+
+PR259's registry enforcement now refuses the front door's former Read override: that role does not read source.
+The archived golden remains unchanged; the expected successor explicitly names this capability correction.
+Runtime provenance adds an exact retained-bootstrap envelope around every old MCP command, including the inline
+Codex config. Only the expected snapshot gets that reviewed envelope; actual settings and argv remain exact.
 """
 import json
 import os
@@ -37,6 +42,25 @@ def normalized(value, tmp):
         return [normalized(item, tmp) for item in value]
     if isinstance(value, str):
         return value.replace(str(tmp), "<tmp>")
+    return value
+
+
+def with_runtime_bootstrap(value):
+    """The reviewed successor of the historical expected commands; never transform actual output."""
+    legacy = ["-I", "-B", "<tmp>/source/tools/hierarchy_mailbox.py"]
+    successor = ["-I", "-B", "<tmp>/initiatives/pilot/runtime-source.py", "--provision",
+                 "<tmp>/initiatives/pilot/provision.json", "--entry", legacy[2], "--"]
+    if isinstance(value, dict):
+        return {key: with_runtime_bootstrap(item) for key, item in value.items()}
+    if isinstance(value, list):
+        if value[:3] == legacy:
+            return successor + value[3:]
+        return [with_runtime_bootstrap(item) for item in value]
+    if isinstance(value, str) and value.startswith("mcp_servers="):
+        # The Codex wake argv embeds TOML. Replace only this exact legacy args prefix, keeping every suffix byte.
+        before = "args=" + json.dumps(legacy)[:-1] + ", "
+        after = "args=" + json.dumps(successor)[:-1] + ", "
+        return value.replace(before, after, 1)
     return value
 
 
@@ -122,7 +146,9 @@ def team_kinds(tmp_path):
 
 
 def test_every_legacy_role_keeps_its_exact_profile(tmp_path):
-    expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    expected = with_runtime_bootstrap(json.loads(GOLDEN.read_text(encoding="utf-8")))
+    expected["profiles"]['claude-code pilot/front-door {"tools": "Read"}'] = {
+        "error": "the front-door role does not permit file tool: Read"}
     actual = {"profiles": build(tmp_path), "team_kinds": team_kinds(tmp_path)}
     assert set(actual["profiles"]) == set(expected["profiles"])
     for key in sorted(expected["profiles"]):

@@ -156,16 +156,181 @@ def detail(value):
     return text[:DETAIL_LIMIT]
 
 
-def run_child(tool, args):
-    """(exit code, parsed JSON or None, stderr tail)."""
+def _object(value, path):
+    if type(value) is not dict:
+        refuse(path + " must be an object")
+    return value
+
+
+def _field(row, key, kind, path="", *, optional=False, nullable=False):
+    name = path + "." + key if path else key
+    if optional and key not in row:
+        return None
+    if key not in row:
+        refuse(name + " is required")
+    value = row[key]
+    if nullable and value is None:
+        return None
+    if type(value) is not kind or (kind is str and not value) or (kind is int and value < 0):
+        refuse(name + " must be " + kind.__name__)
+    return value
+
+
+def _rows(result, key, *, optional=False):
+    values = _field(result, key, list, optional=optional)
+    for number, row in enumerate(values or []):
+        path = "%s[%d]" % (key, number)
+        yield _object(row, path), path
+
+
+def _request_rows(result):
+    for row, path in _rows(result, "requests"):
+        _field(row, "request_id", str, path)
+        state = _field(row, "state", str, path)
+        if state not in {"ready", "held", "delivered_unrecorded", "routed", "closed", "awaiting_decision",
+                         "denied", "delegation"}:
+            refuse(path + ".state is unknown")
+        for key in ("reason", "detail", "to"):
+            _field(row, key, str, path, optional=True)
+        _field(row, "revoked_after_route", bool, path, optional=True)
+
+
+def _decode_router_status(result):
+    _field(result, "router", str)
+    _request_rows(result)
+    for row, path in _rows(result, "escalations", optional=True):
+        for key in ("request_id", "reason", "team"):
+            _field(row, key, str, path)
+        decision = _field(row, "root_decision", str, path, optional=True, nullable=True)
+        if decision not in (None, "approve", "deny"):
+            refuse(path + ".root_decision is unknown")
+
+
+def _decode_route(result):
+    for row, path in _rows(result, "routed"):
+        _field(row, "request_id", str, path)
+    if "requests" in result and result["requests"] is None:
+        _field(result, "report_error", str)
+        held = _field(result, "held", dict)
+        for key, value in held.items():
+            if type(key) is not str or not key:
+                refuse("held request id must be str")
+            path = "held." + key
+            _field(_object(value, path), "reason", str, path)
+            _field(value, "detail", str, path, optional=True)
+    else:
+        _request_rows(result)
+
+
+def _sweep_row(row, path):
+    state = _field(row, "state", str, path)
+    _field(row, "initiative", str, path)
+    _field(row, "endpoint", str, path, optional=state == "mailbox_error" and "wake_exit" not in row)
+    wake_exit = _field(row, "wake_exit", int, path, optional=True)
+    if wake_exit is not None:
+        expected = {"read": 0, "nothing_unread": 0, "dry_run": 0, "failed_to_start": 3,
+                    "stop_unconfirmed": 3, "needs_owner": 3, "timed_out": 3, "woken_unread": 3}
+        if state not in expected:
+            refuse(path + ".state is unknown for a wake result")
+        if wake_exit != expected[state]:
+            refuse(path + ".wake_exit disagrees with state")
+    _field(row, "error", str, path, optional=True)
+
+
+def _decode_sweep(result):
+    for row, path in _rows(result, "rows"):
+        _sweep_row(row, path)
+    for key in ("still_unread", "root_queue"):
+        for row, path in _rows(result, key):
+            _field(row, "initiative", str, path)
+            _field(row, "endpoint", str, path)
+            _field(row, "unread_count", int, path)
+            if key == "root_queue":
+                _field(row, "open_jobs", int, path)
+    for key in ("silent_roles", "stalled_dispatches"):
+        for row, path in _rows(result, key, optional=True):
+            for name in ("initiative", "endpoint", "wake_id", "finished_at"):
+                _field(row, name, str, path, nullable=key == "stalled_dispatches" and name in {"wake_id", "finished_at"})
+            if key == "silent_roles":
+                for name in ("ended", "silent_since"):
+                    _field(row, name, str, path)
+                if row["ended"] not in {"exited", "timed_out"}:
+                    refuse(path + ".ended is unknown")
+                # A negative exit denotes a signal; unlike counts it is a valid integer here.
+                if "exit_code" not in row or (row["exit_code"] is not None and type(row["exit_code"]) is not int):
+                    refuse(path + ".exit_code must be int or null")
+                child_key, fields = "read", ("type", "message_id", "from")
+            else:
+                child_key, fields = "dispatches", ("dispatch", "accepted_at")
+            for child, child_path in _rows(row, child_key):
+                for name in fields:
+                    _field(child, name, str, path + "." + child_path)
+    for row, path in _rows(result, "root_time"):
+        state = _field(row, "state", str, path)
+        if state not in {"no_transcript", "rotate_now", "rotate_soon", "ok", "meter_error"}:
+            refuse(path + ".state is unknown")
+
+
+def _job_row(row, path):
+    state = _field(row, "state", str, path)
+    if state not in NEEDS_ROOT | {"completed", "failed", "refused"}:
+        refuse(path + ".state is unknown")
+    _field(row, "job", str, path, optional=state in {"mailbox_error", "granted_elsewhere"})
+    _field(row, "error", str, path, optional=True)
+
+
+def _decode_jobs(result):
+    for row, path in _rows(result, "rows"):
+        _job_row(row, path)
+
+
+def _child_diagnostics(tool, result):
+    """Validated identities for inspection only, never evidence of no effect or permission to retry."""
+    key = "routed" if tool == "router" else "rows"
+    rows = result.get(key)
+    if type(rows) is not list:
+        return {}
+    valid = []
+    for number, row in enumerate(rows):
+        path = "%s[%d]" % (key, number)
+        try:
+            _object(row, path)
+            if tool == "router":
+                _field(row, "request_id", str, path)
+                fields = ("request_id",)
+            elif tool == "jobs":
+                _job_row(row, path)
+                fields = ("job", "state")
+            else:
+                _sweep_row(row, path)
+                fields = ("initiative", "endpoint", "state", "wake_exit")
+        except ValueError:
+            continue
+        valid.append({name: row[name] for name in fields if name in row})
+    return {key: valid}
+
+
+def run_child(tool, args, decoder):
+    """Exit, validated result, stderr tail and a contract failure (if any)."""
     proc = subprocess.run([sys.executable, "-I", "-B", str(TOOLS[tool]), *args], stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, start_new_session=True)
     lines = proc.stdout.strip().splitlines()
     try:
         parsed = json.loads(lines[-1]) if lines else None
-    except ValueError:
+    except (ValueError, RecursionError):
         parsed = None
-    return proc.returncode, parsed if isinstance(parsed, dict) else None, proc.stderr.strip()[-DETAIL_LIMIT:]
+    problem = None
+    if type(parsed) is dict and proc.returncode in (0, 2, 3):
+        try:
+            if proc.returncode == 2:
+                _field(parsed, "error", str)
+                _field(parsed, "source", str, optional=True)
+            else:
+                decoder(parsed)
+        except ValueError as exc:
+            problem = {"error": str(exc), "diagnostics": _child_diagnostics(tool, parsed)}
+            parsed = None
+    return proc.returncode, parsed if type(parsed) is dict else None, proc.stderr.strip()[-DETAIL_LIMIT:], problem
 
 
 def silent_detail(row):
@@ -184,13 +349,22 @@ def stalled_detail(row):
             "so no wake will come" % (accepted, row["wake_id"], row["finished_at"]))
 
 
-def child_failure(step, code, stderr):
+def child_failure(step, code, stderr, problem=None):
     """A hold for an exit the tool does not define: a crash, a kill, or output that is not its JSON."""
-    if code < 0:
+    if problem is not None:
+        why = "malformed child result: " + problem["error"] + ("; stderr: " + stderr if stderr else "")
+    elif code < 0:
         why = "killed by signal %d" % -code
     else:
         why = "exit %d with no JSON result" % code + (": " + stderr if stderr else "")
     return {"step": step, "kind": "child_failed", "detail": detail(why), "act": "owner"}
+
+
+def _failed_step(step, code, problem, **where):
+    row = {"step": step, "state": "failed", "exit": code, **where}
+    if problem is not None and problem["diagnostics"]:
+        row["diagnostics"] = problem["diagnostics"]
+    return row
 
 
 class Pass:
@@ -214,7 +388,7 @@ class Pass:
         return ["--store", str(self.args.store), "--recipes", str(self.args.recipes)]
 
     def router_status(self):
-        code, result, stderr = run_child("router", self.common("router") + ["status"])
+        code, result, stderr, problem = run_child("router", self.common("router") + ["status"], _decode_router_status)
         if code == 0 and result is not None:
             self.status_read = True
             self.steps.append({"step": "router_status", "state": "ok", "exit": 0, "router": result.get("router")})
@@ -233,8 +407,8 @@ class Pass:
                 self.hold("router_status", "router_status_error", error, "root")
             self.steps.append({"step": "router_status", "state": "hold", "exit": 2, "source": source})
         else:
-            self.holds.append(child_failure("router_status", code, stderr))
-            self.steps.append({"step": "router_status", "state": "failed", "exit": code})
+            self.holds.append(child_failure("router_status", code, stderr, problem))
+            self.steps.append(_failed_step("router_status", code, problem))
         return None
 
     def route(self, status):
@@ -243,7 +417,8 @@ class Pass:
             self.steps.append({"step": "route", "state": "skipped"})
             return rows if status else None
         actor = status["router"]
-        code, result, stderr = run_child("router", self.common("router") + ["route", "--actor", actor, "--evidence-only"])
+        code, result, stderr, problem = run_child(
+            "router", self.common("router") + ["route", "--actor", actor, "--evidence-only"], _decode_route)
         if code == 0 and result is not None:
             self.steps.append({"step": "route", "state": "ok", "exit": 0, "actor": actor,
                                "routed": [row["request_id"] for row in result["routed"]]})
@@ -258,8 +433,8 @@ class Pass:
             self.hold("route", "route_refused", result.get("error", ""), "router")
             self.steps.append({"step": "route", "state": "hold", "exit": 2, "actor": actor})
         else:
-            self.holds.append(child_failure("route", code, stderr))
-            self.steps.append({"step": "route", "state": "failed", "exit": code, "actor": actor})
+            self.holds.append(child_failure("route", code, stderr, problem))
+            self.steps.append(_failed_step("route", code, problem, actor=actor))
         return rows
 
     def request_holds(self, rows, status):
@@ -280,10 +455,10 @@ class Pass:
         args = self.common("sweep") + ["--rounds", "1", "--durable"]
         for _initiative, endpoint in sorted(self.skipped):
             args += ["--skip", endpoint]
-        code, result, stderr = run_child("sweep", args)
+        code, result, stderr, problem = run_child("sweep", args, _decode_sweep)
         if code not in (0, 2, 3) or result is None:
-            self.holds.append(child_failure("sweep", code, stderr))
-            self.steps.append({"step": "sweep", "state": "failed", "exit": code})
+            self.holds.append(child_failure("sweep", code, stderr, problem))
+            self.steps.append(_failed_step("sweep", code, problem))
             return
         if code == 2:
             self.hold("sweep", "sweep_error", result.get("error", ""), "root")
@@ -346,10 +521,10 @@ class Pass:
         args = self.common("jobs") + ["run-open"]
         if self.args.max_jobs is not None:
             args += ["--max-jobs", str(self.args.max_jobs)]
-        code, result, stderr = run_child("jobs", args)
+        code, result, stderr, problem = run_child("jobs", args, _decode_jobs)
         if code not in (0, 2, 3) or result is None:
-            self.holds.append(child_failure("run_open", code, stderr))
-            self.steps.append({"step": "run_open", "state": "failed", "exit": code})
+            self.holds.append(child_failure("run_open", code, stderr, problem))
+            self.steps.append(_failed_step("run_open", code, problem))
             return
         if code == 2:
             self.hold("run_open", "jobs_error", result.get("error", ""), "root")

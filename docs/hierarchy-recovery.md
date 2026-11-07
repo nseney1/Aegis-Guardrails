@@ -58,6 +58,17 @@ unsupported host boundary.
   settlement. The row stays `evidence_error`; these historical observations do
   not establish stopped processes, acceptance or permission to release capacity.
 
+The loop validates each child tool's response before consuming it. A malformed
+object or row raises an owner `child_failed` hold and leaves independent steps
+running. Any retained `diagnostics` are validated reporting fields for inspection;
+they do not establish that no effect occurred. The next pass consults the tools'
+durable records, so a lost route report does not cause a completed route to replay.
+
+If a later job command cannot launch, the result retains the completed `steps`,
+their logs and a `failed_launch` record naming the attempted step and arguments.
+An uncertain process stop still holds the job without a terminal result. Reading
+the failure report alone never permits release of resources.
+
 ## Crash and reconnect procedure
 
 1. Inspect the original store, mailbox, job claim, source witness and current

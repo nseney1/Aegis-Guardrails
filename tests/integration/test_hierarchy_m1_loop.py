@@ -124,7 +124,6 @@ class Scenario(SealedFleet):
         self.home = tmp_path / "home"
         super().__init__(tmp_path)
         self.home.mkdir()
-        (self.bin / "git").symlink_to(shutil.which("git"))
         (self.bin / "codex").unlink()
         fake_codex(self.bin)
         stub(self.bin, "bwrap", 'echo "bwrap stub: the fixture recipes use sandbox none" >&2\nexit 1\n')

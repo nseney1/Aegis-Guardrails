@@ -211,6 +211,21 @@ def role(endpoint, kind=None):
     return registry()["roles"][role_name(endpoint, kind)]
 
 
+def session_roles():
+    """Registry roles that have a session endpoint, in a stable order."""
+    return tuple(sorted(name for name, entry in registry()["roles"].items() if entry["endpoint"] is not None))
+
+
+def fixed_model_profile(entry):
+    """A fixed effort/tier expectation shared by provisioning and native observation."""
+    profile = entry["model_profile"]
+    return dict(profile) if profile["source"] == "fixed" else None
+
+
+def reader_shell_roles():
+    return tuple(name for name in session_roles() if registry()["roles"][name]["provision"]["reader_shell"])
+
+
 def writer(entry):
     return "source" in entry["writes"]
 
@@ -218,6 +233,13 @@ def writer(entry):
 def file_tools(entry):
     """Host file tools: reading source gives the read tools, and writing it adds the edit tools."""
     return (READ_TOOLS if "source" in entry["reads"] else []) + (WRITE_TOOLS if writer(entry) else [])
+
+
+def require_file_tools(endpoint, kind, names):
+    name = role_name(endpoint, kind)
+    permitted = file_tools(registry()["roles"][name])
+    for tool in names:
+        require(tool in permitted, "the %s role does not permit file tool: %s" % (name, tool))
 
 
 def workspace_tools(entry):
@@ -235,6 +257,11 @@ def decision_tools(entry):
 
 def takes_board(entry):
     return "board" in entry["reads"]
+
+
+def require_board(endpoint, kind=None):
+    name = role_name(endpoint, kind)
+    require(takes_board(registry()["roles"][name]), "the %s role has no board access" % name)
 
 
 # In the order the adapter offers them.

@@ -890,9 +890,9 @@ def live_sessions(probe):
     return [line for session in sessions for line in census(session)]
 
 
-@pytest.mark.parametrize("number", [__import__("signal").SIGTERM, __import__("signal").SIGHUP,
-                                    __import__("signal").SIGINT])
+@pytest.mark.parametrize("number", ["SIGTERM", "SIGHUP", "SIGINT"])
 def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_report(probe, number):
+    number = getattr(__import__("signal"), number)
     plan = probe.plan([{"role": "implementer"}])
     # The hold's context comes late, so the signal lands while the probe still waits on a live turn (not while
     # the launcher is already stopping it).
@@ -2378,6 +2378,37 @@ def rejudged(plan, role):
     return {(attempt["channel"], attempt["target"]): native_probe.judge(
         attempt, commands, patches, role["shell"] or attempt["channel"] != "shell", plan["worktree"], plan["shells"],
         plan["probe_root"]) for attempt in role["attempts"]}
+
+
+def test_run_1_observations_replay_without_filesystem_or_process_access(tmp_path, monkeypatch):
+    """Once host facts are captured, verdicts and evidence survive an offline replay unchanged."""
+    import builtins
+    import copy
+
+    plan = run1(tmp_path)
+    analyze = native_probe.evidence_analysis.analyze_attempt
+    captured = []
+
+    def capture(*args, **kwargs):
+        captured.append(copy.deepcopy((args, kwargs)))
+        return analyze(*args, **kwargs)
+
+    monkeypatch.setattr(native_probe.evidence_analysis, "analyze_attempt", capture)
+    expected = [row for role in plan["roles"] for row in rejudged(plan, role).values()]
+    before = copy.deepcopy(captured)
+
+    def inaccessible(*args, **kwargs):
+        raise AssertionError("evidence analysis accessed the host")
+
+    with monkeypatch.context() as sealed:
+        sealed.setattr(builtins, "open", inaccessible)
+        for name in ("stat", "lstat", "readlink", "access"):
+            sealed.setattr(os, name, inaccessible)
+        for name in ("run", "Popen"):
+            sealed.setattr(subprocess, name, inaccessible)
+        observed = [analyze(*args, **kwargs) for args, kwargs in captured]
+    assert observed == expected
+    assert captured == before
 
 
 def test_run_1_rejudged_from_its_code_mode_records_matches_the_hand_verification(tmp_path):

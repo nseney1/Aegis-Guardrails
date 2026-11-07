@@ -26,17 +26,18 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
 from hierarchy_mailbox import (GIT_ID, encoded, matching, publish_file, require, safe_path, strict_json,  # noqa: E402
                                timestamp)
 
 
 SCHEMA = "aegis.hierarchy-review/v1"
-GIT = ["git", "-c", "core.fsmonitor=false", "--no-optional-locks"]
 SIDES = ("base", "candidate")
 GIT_TIMEOUT_SECONDS = 300
 CHUNK_BYTES = 1048576
@@ -46,14 +47,17 @@ MEANING = ("Exact committed bytes. A symlink is a plain file holding its target,
 
 
 def git(repository, *arguments, **options):
-    return subprocess.run([*GIT, *arguments], cwd=repository, capture_output=True, timeout=GIT_TIMEOUT_SECONDS, **options)
+    return subprocess.run(object_read_argv(*arguments), cwd=repository, env=object_read_env(), capture_output=True,
+                          timeout=GIT_TIMEOUT_SECONDS, **options)
 
 
 def exact_commit(repository, commit, label, expected_tree):
     matching(commit, GIT_ID, label)
     found = git(repository, "rev-parse", "--verify", "-q", commit + "^{commit}")
     require(found.returncode == 0 and found.stdout.decode().strip() == commit, label + " commit is not in the repository: " + commit)
-    tree = git(repository, "rev-parse", commit + "^{tree}").stdout.decode().strip()
+    found = git(repository, "rev-parse", commit + "^{tree}")
+    require(found.returncode == 0, "could not read the tree of " + commit)
+    tree = found.stdout.decode().strip()
     require(expected_tree is None or tree == expected_tree, label + " tree is %s, not the expected %s" % (tree, expected_tree))
     return {"commit": commit, "tree": tree}
 
@@ -79,7 +83,9 @@ def export(repository, entries, folder):
     """Writes raw blobs, because even `git archive` applies attributes such as export-ignore."""
     rows = []
     folder.mkdir()
-    with subprocess.Popen([*GIT, "cat-file", "--batch"], cwd=repository, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+            object_read_argv("cat-file", "--batch"), cwd=repository, env=object_read_env(),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors) as process:
         for mode, kind, oid, path in entries:
             if kind == "commit":
                 rows.append({"path": path, "mode": mode, "commit": oid})
@@ -88,7 +94,8 @@ def export(repository, entries, folder):
             process.stdin.write(oid.encode() + b"\n")
             process.stdin.flush()
             header = process.stdout.readline().split()
-            require(len(header) == 3 and header[1] == b"blob", "could not read object " + oid)
+            require(len(header) == 3 and header[:2] == [oid.encode(), b"blob"] and header[2].isdigit(),
+                    "could not read object " + oid)
             remaining = int(header[2])
             target = folder / path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -100,9 +107,10 @@ def export(repository, entries, folder):
                     stream.write(chunk)
                     digest.update(chunk)
                     remaining -= len(chunk)
-            process.stdout.read(1)
+            require(process.stdout.read(1) == b"\n", "object ended early: " + oid)
             rows.append({"path": path, "mode": mode, "sha256": digest.hexdigest()})
         process.stdin.close()
+        require(process.wait(timeout=GIT_TIMEOUT_SECONDS) == 0, "git failed exporting committed objects")
     return rows
 
 
@@ -133,7 +141,8 @@ def scaffold_digest(folder):
 
 def write_output(repository, path, *arguments):
     with open(path, "xb") as stream:
-        done = subprocess.run([*GIT, *arguments], cwd=repository, stdout=stream, stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SECONDS)
+        done = subprocess.run(object_read_argv(*arguments), cwd=repository, env=object_read_env(), stdout=stream,
+                              stderr=subprocess.PIPE, timeout=GIT_TIMEOUT_SECONDS)
     require(done.returncode == 0, "git failed writing " + path.name + ": " + done.stderr.decode(errors="replace")[:512])
     return file_digest(path)
 

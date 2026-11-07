@@ -452,6 +452,13 @@ def finish_background(mailbox, directory, endpoint, profile, base, wake_id, mark
 
 
 def wake(root, directory, endpoint, profile_path, dry_run=False):
+    root = safe_path(root)
+    provision = root.parent / "provision.json"
+    if provision.exists() or (root.parent / "runtime-source.py").exists():
+        # Sweep calls wake directly, so launcher verification alone cannot fence host list/stop or launch.
+        # Standalone mailbox copies have no provision and keep their existing import contract.
+        import hierarchy_runtime_source
+        hierarchy_runtime_source.verify(read_json(provision), provision.parent)
     mailbox = Mailbox(root)
     mailbox.endpoint(endpoint)
     records = mailbox.messages()

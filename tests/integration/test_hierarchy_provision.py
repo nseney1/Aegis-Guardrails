@@ -609,7 +609,8 @@ ROOT_READS = "loop_state and evidence are only for ROOT's decision adapter, with
 
 def root_args(setup, host, session=ROOT_SESSION, actor="root-1", reads=()):
     # ROOT's own entry, which also carries the read-only --loop-state and --evidence the pinned mailbox CLI cannot.
-    return ["-I", "-B", str(setup.source / "tools" / "hierarchy_mailbox_mcp.py"), "--root", str(setup.root), "serve",
+    return ["-I", "-B", str(setup.base / "runtime-source.py"), "--provision", str(setup.base / "provision.json"),
+            "--entry", str(setup.source / "tools" / "hierarchy_mailbox_mcp.py"), "--", "--root", str(setup.root), "serve",
             "--endpoint", "pilot/root", "--host", host, "--session", session, "--generation", "1",
             "--lifecycle", setup.lifecycle, "--actor", actor, *reads]
 
