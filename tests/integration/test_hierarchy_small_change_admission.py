@@ -77,11 +77,13 @@ def test_plan_approval_and_admission_are_separate_and_never_enable_execution(tmp
     assert row["small_change"]["admission"]["checks"][0]["recipe"] == "focused"
     assert row["intent"] is row["admission"] is None
     assert state["execution_enabled"] is False and state["consumed"] == {}
-    assert state["continuation_holds"][change.value["id"]] == "small-change dispatch is not activated"
+    assert state["continuation_candidates"] == []
+    assert state["small_change_ready"] == [change.value["id"]]
+    assert state["continuation_holds"][change.value["id"]] == "small-change requires the T1 dispatcher"
     before = ledger.files()
-    for action in (ledger.admit, ledger.intent):
-        assert action(change.value, expect=2)["error"] == "small-change dispatch is not activated"
+    assert ledger.admit(change.value, expect=2)["error"] == "small-change requires its separate admission"
     assert ledger.files() == before
+    assert ledger.intent(change.value)["execution_enabled"] is False
 
 
 @pytest.mark.parametrize("field,value,reason", [
@@ -248,7 +250,7 @@ def test_registered_plan_is_held_before_routing_and_cannot_bypass_via_route_even
     assert loop.route()["routed"] == []
     assert loop.inbox("engine") == []
     assert loop.ledger.event("route", actor="router-1", to="engine/orchestrator",
-                             **loop.ledger.target(change.value), expect=2)["error"] == "small-change dispatch is not activated"
+                             **loop.ledger.target(change.value), expect=2)["error"] == "small-change route must target the approved lane"
     assert loop.ledger.files() == before
 
 
