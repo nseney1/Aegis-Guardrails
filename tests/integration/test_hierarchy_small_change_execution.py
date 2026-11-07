@@ -1,5 +1,6 @@
 """Small-change execution evidence through the public journal, without model turns."""
 import copy
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -7,8 +8,11 @@ import os
 import pytest
 
 from tests.integration.test_hierarchy_lifecycle import Ledger, SOURCE, raw_request
-from tests.integration.test_hierarchy_small_change_admission import SmallChange
+from tests.integration.test_hierarchy_small_change_admission import SmallChange, digest
+from tests.integration.test_hierarchy_watch_bridge import Provider
 from tools import hierarchy_lifecycle as lifecycle
+from tools.hierarchy_watch_bridge import OperatorBridge
+from tools.hierarchy_watch_supervisor import Supervisor, initialize
 
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="lifecycle mutation requires POSIX directory fsync")
@@ -20,6 +24,20 @@ def admitted(tmp_path):
     change.decide()
     change.admit()
     return change
+
+
+def reviewer_successor_ledger(tmp_path):
+    seed = Ledger(tmp_path, initialize=False)
+    actors = copy.deepcopy(seed.policy["actors"])
+    actors["reviewer-2"] = {**copy.deepcopy(actors["reviewer-1"]), "generation": 2}
+    return Ledger(tmp_path, policy_changes={"actors": actors,
+                  "successors": {**seed.policy["successors"], "reviewer-1": "reviewer-2"}})
+
+
+def succeed(ledger, role):
+    checkpoint = ledger.cli("checkpoint")
+    ledger.event("succeed", actor=role + "-2", predecessor=role + "-1",
+                 checkpoint_sha256=checkpoint["sha256"])
 
 
 def body(change, kind):
@@ -71,8 +89,9 @@ def test_happy_path_completes_with_base_source_and_new_commit_only_in_evidence(t
     ledger = change.ledger
     before = ledger.status()
     admission = change.row()["small_change"]["admission"]
-    assert before["continuation_candidates"] == [change.value["id"]]
-    assert before["continuation_holds"] == {}
+    assert before["continuation_candidates"] == []
+    assert before["small_change_ready"] == [change.value["id"]]
+    assert before["continuation_holds"] == {change.value["id"]: "small-change requires the T1 dispatcher"}
     assert before["consumed"] == {}
     event(change, "route")
     assert change.row()["routed"]["to"] == "engine/lane/fix"
@@ -99,6 +118,76 @@ def test_happy_path_completes_with_base_source_and_new_commit_only_in_evidence(t
         "publish", "small_change_plan", "small_change_decision", "small_change_admit",
         "route", "intent", "start", "terminal", "review", "delivery", "disposition"]
     assert all("orchestrator" not in item["actor"] and "decider" not in item["actor"] for item in envelopes)
+
+
+@pytest.mark.parametrize("canonical_approval", [False, True])
+def test_evidence_only_watch_retains_a_stable_hold_without_dispatch(tmp_path, canonical_approval):
+    change = admitted(tmp_path)
+    ledger = change.ledger
+    if canonical_approval:
+        ledger.approve(change.value)
+    provider = Provider(ledger)
+    bridge = OperatorBridge(ledger.path, provider, ledger.operator, 1, evidence_only=True)
+    root = tmp_path / "small-change-watch"
+    initialize(root, ledger.path, "small-change-watch", evidence_only=True)
+    before = ledger.files()
+    for iteration in range(1, 4):
+        # Reopen the public supervisor each time to verify the durable hold.
+        state = Supervisor(root).step(1, bridge)
+        assert state["attempts"] == []
+        assert state["history"] == []
+        assert state["holds"] == {change.value["id"]: "small-change requires the T1 dispatcher"}
+        assert state["iterations"] == iteration
+        assert state["work_complete"] is False and state["evidence_only"] is True
+        assert provider.effects == 0 and ledger.files() == before
+    state = ledger.status()
+    assert state["continuation_candidates"] == []
+    assert state["small_change_ready"] == [change.value["id"]]
+
+
+def test_canonical_status_keeps_its_existing_continuation_projection(tmp_path):
+    ledger = Ledger(tmp_path)
+    value = ledger.ready()
+    state = ledger.status()
+    assert state["continuation_candidates"] == [value["id"]]
+    assert state["continuation_holds"] == {}
+    assert "small_change_ready" not in state
+
+
+@pytest.mark.parametrize("stage", ["registered", "started", "reviewer-rotated", "without-canonical-approval"])
+def test_small_change_cannot_enter_the_canonical_provider_contract(tmp_path, stage):
+    ledger = reviewer_successor_ledger(tmp_path)
+    change = SmallChange(ledger)
+    change.register()
+    change.decide()
+    change.admit()
+    if stage != "without-canonical-approval":
+        ledger.approve(change.value)
+    if stage != "registered":
+        event(change, "intent")
+        event(change, "start")
+    if stage == "reviewer-rotated":
+        succeed(ledger, "reviewer")
+    state = ledger.status()
+    row = change.row()
+    decisions = state["decisions"]
+    association = {"schema": "aegis.provider-association/v1", **ledger.target(change.value),
+                   "intent_id": "attempt-1", "source": SOURCE, "authority": change.value["authority"],
+                   "authority_sha256": row["raw"]["sha256"],
+                   "decision_sha256": digest(decisions[-1]) if decisions else "0" * 64,
+                   "admission_sha256": digest(None), "original_actor": ledger.operator,
+                   "original_generation": 1, "original_cap_seconds": 3600,
+                   "authority_expires_at": change.value["continuation"]["expires_at"],
+                   "provider": "fixture", "endpoint_id": "endpoint-1", "thread_id": "thread-1",
+                   "client_id": "client-attempt-1",
+                   "deadline": (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    assert row["admission"] is None
+    before = ledger.files()
+    refused = ledger.event("associate", actor=ledger.operator, association=association,
+                            **ledger.target(change.value), expect=2)
+    assert refused["error"] == "canonical provider association is unavailable for small-change rows"
+    assert ledger.files() == before
+    assert ledger.status() == state
 
 
 @pytest.mark.parametrize("recipient", ["engine/orchestrator", "engine/lane/other", "other/lane/fix", "engine/lane/fix/extra"])
@@ -147,7 +236,7 @@ def test_canonical_denial_vetoes_admitted_execution(tmp_path, kind):
     assert ledger.status()["continuation_candidates"] == []
 
 
-@pytest.mark.parametrize("kind", ["route", "intent", "start", "review"])
+@pytest.mark.parametrize("kind", ["route", "intent", "start"])
 def test_expired_admission_cannot_execute(tmp_path, monkeypatch, kind):
     change = admitted(tmp_path)
     prepare(change, kind)
@@ -172,28 +261,97 @@ def test_expired_admission_cannot_execute(tmp_path, monkeypatch, kind):
 
 
 @pytest.mark.parametrize("participant", ["operator", "reviewer"])
-@pytest.mark.parametrize("kind", ["route", "intent", "start", "review"])
+@pytest.mark.parametrize("kind", ["route", "intent", "start"])
 def test_succession_fences_the_admitted_plan(tmp_path, participant, kind):
     # Include a real registered Reviewer successor, following the policy contract.
-    seed = Ledger(tmp_path, initialize=False)
-    actors = copy.deepcopy(seed.policy["actors"])
-    actors["reviewer-2"] = {**copy.deepcopy(actors["reviewer-1"]), "generation": 2}
-    ledger = Ledger(tmp_path, policy_changes={"actors": actors,
-                    "successors": {**seed.policy["successors"], "reviewer-1": "reviewer-2"}})
+    ledger = reviewer_successor_ledger(tmp_path)
     change = SmallChange(ledger)
     change.register()
     change.decide()
     change.admit()
     prepare(change, kind)
-    checkpoint = ledger.cli("checkpoint")
-    ledger.event("succeed", actor=participant + "-2", predecessor=participant + "-1",
-                 checkpoint_sha256=checkpoint["sha256"])
+    succeed(ledger, participant)
     operation_actor = participant + "-2" if actor(change, kind) == participant + "-1" else actor(change, kind)
     before = ledger.files()
     assert ledger.event(kind, actor=operation_actor, **body(change, kind), **ledger.target(change.value),
                         expect=2)["error"] == "small-change participant is no longer current"
     assert ledger.files() == before
     assert ledger.status()["continuation_candidates"] == []
+
+
+@pytest.mark.parametrize("situation", ["expired", "writer-rotated", "expired-and-writer-rotated"])
+@pytest.mark.parametrize("outcome", ["passed", "unknown"])
+def test_terminal_review_survives_expiry_and_writer_rotation(tmp_path, monkeypatch, situation, outcome):
+    change = admitted(tmp_path)
+    ledger = change.ledger
+    event(change, "intent")
+    event(change, "start")
+    admission = change.row()["small_change"]["admission"]
+    if "expired" in situation:
+        monkeypatch.setattr(lifecycle, "timestamp", lambda: "2099-01-01T00:00:00Z")
+    reader = lifecycle.Lifecycle(ledger.path)
+
+    def record(kind, cid="coordinator-1", **payload):
+        return reader.record({"id": "late-" + kind, "actor": cid, "generation": 1,
+                              "custody": {"cid": ledger.root_actor, "generation": 1},
+                              "event": {"type": kind, **ledger.target(change.value), **payload}})
+
+    # Terminal evidence may arrive after expiry; it never starts new work.
+    result = {"request_sha256": ledger.target(change.value)["request_sha256"], "intent_id": "attempt-1",
+              "outcome": outcome, "exit_code": 0 if outcome == "passed" else None,
+              "source": SOURCE, "evidence": ledger.evidence}
+    record("terminal", ledger.operator, result=raw_request(result))
+    if "rotated" in situation:
+        # Succession binds the exact checkpoint including that terminal.
+        policy, state = reader.load()
+        reader.record({"id": "late-succeed", "actor": "operator-2", "generation": 2,
+                       "custody": {"cid": ledger.root_actor, "generation": 1},
+                       "event": {"type": "succeed", "predecessor": "operator-1",
+                                 "checkpoint_sha256": lifecycle.checkpoint(policy, state)["sha256"]}})
+    record("review", "reviewer-1", **body(change, "review"))
+    record("delivery", evidence=ledger.evidence)
+    before = ledger.files()
+    resolution = {"kind": "complete", "evidence": ledger.evidence}
+    if outcome == "unknown":
+        with pytest.raises(ValueError, match="^unknown effect prevents closure$"):
+            record("disposition", status="FINAL", resolution=resolution)
+        assert ledger.files() == before
+    else:
+        record("disposition", status="FINAL", resolution=resolution)
+    state = reader.status()
+    row = state["requests"][change.value["id"]]
+    assert row["intent"]["actor"] == "operator-1" and row["review"]["actor"] == "reviewer-1"
+    assert row["small_change"]["admission"] == admission
+    assert row["review"]["source"] == row["terminal"]["value"]["source"] == SOURCE
+    assert state["consumed"] == {change.value["id"]: 1}
+    assert state["work_complete"] is (outcome == "passed")
+    if outcome == "unknown":
+        assert state["obligations"][0]["state"] == "unknown_effect" and row["resolution"] is None
+
+
+@pytest.mark.parametrize("reviewer,generation,error", [
+    ("reviewer-2", 2, "small-change participant is no longer current"),
+    ("reviewer-1", 1, "actor generation is fenced"),
+    ("reviewer-2", 1, "stale actor generation"),
+])
+def test_terminal_review_still_requires_the_current_plan_reviewer(tmp_path, reviewer, generation, error):
+    change = SmallChange(reviewer_successor_ledger(tmp_path))
+    change.register()
+    change.decide()
+    change.admit()
+    prepare(change, "review")
+    succeed(change.ledger, "reviewer")
+    before = change.ledger.files()
+    assert change.ledger.event("review", actor=reviewer, generation=generation, **body(change, "review"),
+                               **change.ledger.target(change.value), expect=2)["error"] == error
+    assert change.ledger.files() == before
+
+
+def test_small_change_review_requires_recorded_terminal_evidence(tmp_path):
+    change = admitted(tmp_path)
+    before = change.ledger.files()
+    assert event(change, "review", expect=2)["error"] == "review result sha256 mismatch"
+    assert change.ledger.files() == before
 
 
 @pytest.mark.parametrize("kind", ["intent", "start"])

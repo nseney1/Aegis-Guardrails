@@ -77,7 +77,9 @@ def test_plan_approval_and_admission_are_separate_and_never_enable_execution(tmp
     assert row["small_change"]["admission"]["checks"][0]["recipe"] == "focused"
     assert row["intent"] is row["admission"] is None
     assert state["execution_enabled"] is False and state["consumed"] == {}
-    assert state["continuation_candidates"] == [change.value["id"]]
+    assert state["continuation_candidates"] == []
+    assert state["small_change_ready"] == [change.value["id"]]
+    assert state["continuation_holds"][change.value["id"]] == "small-change requires the T1 dispatcher"
     before = ledger.files()
     assert ledger.admit(change.value, expect=2)["error"] == "small-change requires its separate admission"
     assert ledger.files() == before

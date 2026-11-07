@@ -55,14 +55,22 @@ bytes refuse. An admission cannot be replaced under a new event ID. None of thes
 three events settles an UNKNOWN effect or changes accounting.
 
 Before admission, registered plans remain held from execution. After admission,
-`route` accepts only
-`<request.team>/lane/<plan lane>`; `intent` and `start` accept only the registered
-writer. Intent consumes the single start; a second intent or start refuses.
-`review` accepts only the registered, independent Reviewer. These paths recheck
-plan approval, canonical denial, expiry, prerequisites and participant generations.
+`route` accepts only `<request.team>/lane/<plan lane>`; `intent` and `start` accept
+only the registered writer. Intent consumes the single start; a second intent or
+start refuses. These three paths recheck plan approval, canonical denial, expiry,
+prerequisites and participant generations. `review` requires terminal evidence,
+plan approval/admission and the plan-bound Reviewer in its current generation,
+independent of the writer who recorded the intent. Expiry or writer succession
+after work started does not prevent review of that evidence.
 Legacy `admit` remains refused; small-change admission stays separate from
-canonical authority and admission. Admitted, unstarted rows become lifecycle
-continuation candidates. No Orchestrator or Decider event is needed for `route`
+canonical authority and admission. Canonical `associate` refuses every small-change
+row, including rows also approved canonically, until a separately reviewed provider
+integration exists. Admitted, unstarted rows stay out of `continuation_candidates`:
+the pinned watch/Operator cannot execute them. Their explicit hold is
+`small-change requires the T1 dispatcher`; eligibility appears separately in
+`small_change_ready`. This view-only key appears only in journals containing
+small-change rows and never changes checkpoints or canonical-only status.
+No Orchestrator or Decider event is needed for the evidence sequence `route`
 -> `intent` -> `start` -> `terminal` -> `review` -> `delivery` -> `disposition`
 with resolution `complete`. Terminal and review sources remain the request's
 base source; the writer's new commit appears only in evidence. UNKNOWN blocks
@@ -95,9 +103,9 @@ failure and local Go metadata timeout remain retained; causation is not inferred
 
 | Gate | This slice |
 |---|---|
-| Implementation | Exact-plan registration, decision and admission evidence; dispatch held |
+| Implementation | Registration/admission and the complete lifecycle evidence path; separate `small_change_ready` eligibility, stable canonical watch hold, provider association refused, terminal review survives expiry/writer rotation |
 | Public RED/GREEN | Missing-event RED retained; initial GREEN 33 passed; review found canonical-denial bypass and two public RED regressions reproduced it |
-| Independent frozen-commit review | Exact-commit result recorded on the delivery PR |
+| Independent frozen-commit review | Codex and Claude requested changes on `1d15dc4e`; this follow-up addresses those findings and awaits independent review |
 | Affected / full local verification | First affected: 604 passed in 121.09s; post-revocation-fix affected: 607 passed in 128.12s; first full RED retained: 7 failed, 17,648 passed, 16 skipped, 6 warnings in 1410.71s |
 | Hosted verification | Pending publication |
 | Native / installed runtime / efficiency / Teams acceptance | Open; owner explicitly authorizes this slice's integration under the qualification gaps below |
@@ -117,10 +125,11 @@ Python 3.9 runtime/platform coverage remains a separate hosted result.
 The first full run exposed a missed role-registry vocabulary/projection update
 and the fixture replay reader's exact lifecycle successor pin. All seven failures
 are retained. The registry now names the three evidence events under their
-existing roles without adding provisioned tools. Fixture replay's explicit
-successor hash changes from
-`4827783df0be9f34fa58100785a0b96d84ce9d9c650c5ca508ef220f2bcb4f81` to
-`7b8af38c67c147af82ff8d17ef97658b6666690d97afacab5e7ba810a381d0f0`.
+existing roles without adding provisioned tools. The lifecycle execution seam in
+`1d15dc4e` used replay pin
+`e030d6aa17466837fb69a135b8eaad669b3f58c44d272725001ce8bad8ac7fb9`.
+This review follow-up changes `LIFECYCLE_SHA256` to
+`a7bae191536781004abe8b9cb9a8e5d6380e5a58498c7eb5ae147bf3e95e6dbd`.
 This is a reviewable source change to the replay adapter, not a refresh of any
 active runtime pin. Historical corpus bytes and their original pins remain
 unchanged. Expanded affected checks include registry/provisioning and foundation

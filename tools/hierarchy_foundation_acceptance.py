@@ -17,9 +17,9 @@ import tempfile
 
 MANIFEST_SHA256 = "90260e8fbd15744cc46231dd7e74e46f257f8c28e670f1c37b1b1bb8823df76c"
 MAILBOX_SHA256 = "e657833bd436344d71a97ff52f8d6853959d50e789453fea8ca8656f420f3495"
-# Small-change execution reader successor; historical request/corpus pins are retained.
+# Small-change review/watch safety successor; historical request/corpus pins are retained.
 # This fixture replay pin is separate from every active team's runtime source pin.
-LIFECYCLE_SHA256 = "e030d6aa17466837fb69a135b8eaad669b3f58c44d272725001ce8bad8ac7fb9"
+LIFECYCLE_SHA256 = "a7bae191536781004abe8b9cb9a8e5d6380e5a58498c7eb5ae147bf3e95e6dbd"
 WAKE_SHA256 = "cd5586fb0799c18b217b255fd3cbc455ff98ed2cfff7bb6b7fc813232f569668"
 # Separately reviewed fixture successor; the corpus retains its historical pins.
 WATCH_TEST_SHA256 = "cf5df318f327c2f0b535b4bc9dadbef9d2c730d61aa287f57e95e201071155f9"
