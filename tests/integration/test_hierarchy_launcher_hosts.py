@@ -14,15 +14,17 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 import pytest
 
 from tests.integration import hierarchy_fake_claude as fake
 from tests.integration.test_hierarchy_launcher import (CONTRACT_FILES, REVIEW, START_FOOTER, START_HEADER, Launch,
-                                                       census, contract_path, lane_rules, launcher_module,
+                                                       alive, census, contract_path, lane_rules, launcher_module,
                                                        references, start_prompt as codex_prompt, wait_until)
 from tests.integration.test_hierarchy_mailbox import ROOT
 from tests.integration.test_hierarchy_provision import provision
@@ -39,6 +41,8 @@ IMPLEMENTER = "pilot/lane/f2"
 WAKE = ROOT / "tools" / "hierarchy_wake.py"
 OTHER_SESSION = "0b1f7c52-5d2e-4e07-9a41-3c8e2f9d6a10"
 HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claude home"
+HOME_INVALID = "CLAUDE_CONFIG_DIR must be an absolute path to an existing folder: "
+HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
 NATIVE_START = "a native codex thread is started by its own app, not the launcher"
 CLAUDE_WRITER = "permission rules, not OS-enforced"
 # Today's launch record keys: a Codex record must gain none.
@@ -48,7 +52,8 @@ CODEX_BOUND_KEYS = {"schema", "at", "action", "state", "endpoint", "host", "sess
 CODEX_REFUSED_KEYS = {"schema", "at", "action", "state", "endpoint", "host", "session", "generation", "error"}
 ROLES = {IMPLEMENTER: "implementer", REVIEW: "reviewer"}
 FILE_TOOLS = {"implementer": "Read,Glob,Grep,Edit,Write", "reviewer": "Read,Glob,Grep"}
-ALLOWED = {"implementer": "Edit,Write", "reviewer": ""}
+# A reader has nothing to allow at start, so its start argv carries no --allowedTools at all.
+ALLOWED = {"implementer": ["--allowedTools", "Edit,Write"], "reviewer": []}
 
 
 class Hosts(Launch):
@@ -163,7 +168,7 @@ def test_a_claude_team_starts_each_role_on_claude_with_the_session_the_launcher_
     assert answer["argv"] == [
         "claude", "--restricted", "--tools=" + FILE_TOOLS[role], "--strict-mcp-config", "--mcp-config", str(connection),
         "--permission-mode", "manual", "--permission-prompts", "none", "--session-id", session, "--print",
-        "--output-format", "stream-json", "--verbose", "--disable-slash-commands", "--allowedTools", ALLOWED[role]]
+        "--output-format", "stream-json", "--verbose", "--disable-slash-commands", *ALLOWED[role]]
     [call] = claude_team.claude_calls()
     assert (call["argv"], call["cwd"], call["config_dir"]) == (answer["argv"][1:], str(claude_team.source),
                                                                 str(claude_team.claude_home))
@@ -214,6 +219,42 @@ def test_a_claude_start_without_claude_config_dir_is_refused_before_anything_run
     assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
     assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["refused"]
     assert claude_team.claude_calls() == [] and unbound(claude_team, IMPLEMENTER)
+
+
+@pytest.mark.parametrize("value", ["claude-home", "ABSENT"])
+def test_a_relative_or_missing_claude_config_dir_is_refused_before_anything_runs(claude_team, value):
+    value = str(claude_team.tmp / "absent-claude-home") if value == "ABSENT" else value
+    refused = claude_team.start(expect=2, endpoint=IMPLEMENTER, environment={"CLAUDE_CONFIG_DIR": value})
+    assert refused["error"] == HOME_INVALID + value
+    assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
+    assert claude_team.claude_calls() == [] and unbound(claude_team, IMPLEMENTER)
+
+
+@pytest.mark.parametrize("where", ["itself", "inside", "through a link"])
+def test_the_owners_own_claude_home_is_refused_before_anything_runs(hosts, monkeypatch, capsys, where):
+    # The owner's home comes from the password database, which is patched to a temporary folder: the real ~/.claude
+    # is never named, read or written. HOME points elsewhere, since it must not be what the launcher trusts.
+    write_plan(hosts, CLAUDE)
+    owner = hosts.tmp / "owner"
+    (owner / ".claude" / "inside").mkdir(parents=True)
+    value = {"itself": owner / ".claude", "inside": owner / ".claude" / "inside", "through a link": hosts.tmp / "link"}
+    if where == "through a link":
+        value[where].symlink_to(owner / ".claude", target_is_directory=True)
+    import pwd
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(owner)))
+    for key in [key for key in os.environ if key.startswith(("CLAUDE", "ANTHROPIC"))]:
+        monkeypatch.delenv(key)
+    for key, setting in hosts.env(CLAUDE_CONFIG_DIR=str(value[where]), HOME=str(hosts.tmp)).items():
+        monkeypatch.setenv(key, setting)
+    module = launcher_module()
+    code = module.main(["--base", str(hosts.base), "start", "--request",
+                        str(hosts.start_request(endpoint=IMPLEMENTER))])
+    monkeypatch.undo()
+    refused = json.loads(capsys.readouterr().out)
+    assert code == 2 and refused["error"] == HOME_OWNERS
+    assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
+    assert [row["state"] for row in hosts.records(IMPLEMENTER)] == ["refused"]
+    assert hosts.claude_calls() == [] and unbound(hosts, IMPLEMENTER)
 
 
 def test_a_stand_in_is_refused_at_start(claude_team):
@@ -270,7 +311,54 @@ def test_a_start_whose_transcript_is_not_under_the_runs_claude_home_is_a_failed_
     assert unbound(claude_team, IMPLEMENTER)
 
 
-@pytest.mark.parametrize("mode,timeout,timed_out", [("fail", 300, False), ("hang", 1, True)])
+def test_a_start_whose_output_has_no_init_event_is_a_failed_start(claude_team):
+    # grep by its absolute path: the sealed PATH holds no grep.
+    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\" | %s -v '\"subtype\": \"init\"'"
+                            % shlex.quote(shutil.which("grep")))
+    answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
+    assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
+    assert "error" not in answer and '"type": "result"' in Path(answer["log"]["stdout"]).read_text()
+    assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["failed_to_start"]
+    assert unbound(claude_team, IMPLEMENTER)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes into a read-only folder")
+def test_a_prompt_file_that_cannot_be_written_refuses_the_start_before_anything_runs(claude_team):
+    logs = claude_team.base / "launches" / quoted(IMPLEMENTER) / "logs"
+    logs.mkdir(parents=True, mode=0o700)
+    logs.chmod(0o500)
+    try:
+        refused = claude_team.start(expect=2, endpoint=IMPLEMENTER)
+    finally:
+        logs.chmod(0o700)
+    assert refused["error"].startswith("[Errno 13] Permission denied: ") and refused["error"].endswith(".prompt'")
+    assert (refused["state"], refused["host"], refused["session"]) == ("refused", CLAUDE, None)
+    assert list(logs.iterdir()) == [] and claude_team.claude_calls() == [] and unbound(claude_team, IMPLEMENTER)
+
+
+def test_an_interrupted_claude_start_is_stopped_and_recorded(claude_team):
+    logs = claude_team.base / "launches" / quoted(IMPLEMENTER) / "logs"
+    request = claude_team.start_request(endpoint=IMPLEMENTER)
+    running = subprocess.Popen(claude_team.argv("start", "--request", str(request)), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=claude_team.env(FAKE_CLAUDE_MODE="hang"))
+    try:
+        wait_until(lambda: any('"subtype": "init"' in path.read_text() for path in logs.glob("*.stdout")), 30)
+        [call] = claude_team.claude_calls()
+        running.send_signal(signal.SIGTERM)
+        out, err = running.communicate(timeout=20)
+        assert running.returncode == 3 and err == "", out + err
+        answer = json.loads(out)
+        assert answer["state"] == "start_incomplete" and answer["error"] == "the launcher was interrupted"
+        assert answer["session"] == chosen(answer) and not alive(call["pid"])
+        assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["start_incomplete"]
+        assert not (logs.parent / ".start.lock").exists() and unbound(claude_team, IMPLEMENTER)
+    finally:
+        if running.poll() is None:
+            running.kill()
+            running.wait(timeout=5)
+
+
+@pytest.mark.parametrize("mode,timeout,timed_out", [("fail", 300, False), ("hang", 5, True)])
 def test_a_claude_start_that_reports_its_session_but_does_not_finish_is_incomplete(claude_team, mode, timeout,
                                                                                     timed_out):
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER, start_timeout_seconds=timeout,
@@ -383,6 +471,16 @@ def test_an_invalid_host_plan_refuses_the_start_before_anything_runs(hosts):
     refused = hosts.start(expect=2)
     assert refused["state"] == "refused" and refused["host"] is None
     assert refused["error"].startswith("host plan is missing ")
+    assert not hosts.codex_log.exists() and unbound(hosts, REVIEW)
+
+
+def test_a_host_plan_nested_too_deep_to_read_is_a_recorded_refusal(hosts):
+    depth = 100000
+    (hosts.base / "host-plan.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+    refused = hosts.start(expect=2)
+    assert (refused["state"], refused["host"], refused["session"]) == ("refused", None, None)
+    assert "recursion" in refused["error"]
+    assert [row["state"] for row in hosts.records()] == ["refused"]
     assert not hosts.codex_log.exists() and unbound(hosts, REVIEW)
 
 

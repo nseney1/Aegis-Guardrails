@@ -387,7 +387,11 @@ def claude_argv(session_flags, connection, tools, allowed, request, assistants, 
         argv += ["--add-dir", directory]
     if assistants:
         argv += ["--agents", assistants, "--disallowedTools", ASSISTANT_BLOCKED]
-    argv += ["--allowedTools", ",".join(allowed)]
+    # Left out when there is nothing to allow (a reader's start, which has no MCP servers): no real host has been shown
+    # to accept an empty rule word, and a separate empty --tools value already failed on one. add-role always allows
+    # the mailbox tools, so its argv is unchanged.
+    if allowed:
+        argv += ["--allowedTools", ",".join(allowed)]
     # The variadic --allowedTools swallowed a trailing prompt on a real host. A background start takes its
     # prompt as an argument, so the options end first.
     return argv + (["--"] if name is not None else [])

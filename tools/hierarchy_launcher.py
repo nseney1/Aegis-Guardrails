@@ -87,6 +87,7 @@ ROOT_STOP = "ROOT is the owner's session; the launcher does not stop it"
 STAND_IN_START = "%s is a stand-in and runs no host"
 NATIVE_START = "a native codex thread is started by its own app, not the launcher"
 CLAUDE_HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claude home"
+CLAUDE_HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
 CODEX_START_KEYS = {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"}
 ADD_ROLE_KEYS = CODEX_START_KEYS | {"timeout_seconds", "source_repo", "kind", "lifecycle", "actor"}
 START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn comes from the operator who launched "
@@ -423,7 +424,8 @@ def start_host(launches, endpoint, identifier):
     """
     try:
         plan = hierarchy_hosts.read_plan(launches.base)
-    except (ValueError, OSError, TypeError, KeyError) as exc:
+    # RecursionError: a deeply nested file defeats the JSON parser, and its refusal must be recorded like any other.
+    except (ValueError, OSError, TypeError, KeyError, RecursionError) as exc:
         launches.refuse(endpoint, identifier, "start", str(exc))
     host, stand_in = hierarchy_hosts.plan_host(plan, endpoint)
     return plan, CODEX if host is None else host, stand_in
@@ -437,6 +439,15 @@ def claude_home():
     # Relative, it would resolve against the start's cwd there and the launcher's here.
     require(os.path.isabs(home) and os.path.isdir(home),
             "CLAUDE_CONFIG_DIR must be an absolute path to an existing folder: " + home[:256])
+    import pwd  # POSIX only, like every start; imported here so status still loads on any platform.
+    try:
+        # From the password database, not HOME: a changed HOME must not hide the owner's real folder.
+        owner = os.path.realpath(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude"))
+    except KeyError:
+        raise ValueError("cannot find the owner's home folder, so ~/.claude cannot be kept out") from None
+    # By realpath, so a link to the owner's folder, or to a folder inside it, is refused too.
+    found = os.path.realpath(home)
+    require(found != owner and not found.startswith(owner.rstrip(os.sep) + os.sep), CLAUDE_HOME_OWNERS)
     return home
 
 
