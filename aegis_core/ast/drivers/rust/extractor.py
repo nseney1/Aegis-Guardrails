@@ -438,10 +438,24 @@ class Extractor:
                 self._enum_fields(end)
         return i
 
+    def _skip_attributes(self, lo, hi):
+        while lo < hi and self.t[lo].value == '#':
+            opening = lo + 1
+            if opening < hi and self.t[opening].value == '!':
+                opening += 1
+            if opening >= hi or self.t[opening].value != '[':
+                break
+            lo = self.pairs[opening] + 1
+        return lo
+
     def struct_fields(self, opening):
         result = {}
         parts = list(self.split(opening + 1, self.pairs[opening], expressions=True))
         for index, (lo, hi) in enumerate(parts):
+            start = lo
+            lo = self._skip_attributes(lo, hi)
+            if lo == hi:
+                error('invalid struct field', self.t[start].line)
             if self.t[lo].value == '..':
                 if index != len(parts) - 1:
                     error('invalid struct update position', self.t[lo].line)
@@ -490,8 +504,10 @@ class Extractor:
         result, named, updates = {}, {}, set()
         for index, (lo, hi) in enumerate(self.split(opening + 1, self.pairs[opening], expressions=True)):
             result['#' + str(index)] = self.value(lo, hi)
-            _, at = self.path_at(lo)
-            if at < hi and self.t[at].value == '{' and self.pairs[at] == hi - 1:
+            target, at = self.path_at(lo)
+            if (target and (target not in _CONTROL or self.t[lo].raw)
+                    and at < hi and self.t[at].value == '{' and self.pairs[at] == hi - 1
+                    and self._construct(at)):
                 for key, value in self.struct_fields(at).items():
                     result[key] = UNKNOWN if key in named else value
                     named[key] = index
@@ -553,8 +569,10 @@ class Extractor:
             return False
         if closing == opening + 1:
             return True
-        inner = self.t[opening + 1: min(opening + 3, closing)]
-        return inner[0].value == '..' or (inner[0].kind == 'ident' and (len(inner) == 1 or inner[1].value in (':', ',')))
+        start = self._skip_attributes(opening + 1, closing)
+        inner = self.t[start: min(start + 2, closing)]
+        return bool(inner) and (inner[0].value == '..' or
+                                (inner[0].kind == 'ident' and (len(inner) == 1 or inner[1].value in (':', ','))))
 
     def mutations(self):
         rows = []

@@ -107,6 +107,175 @@ def test_a_malformed_use_statement_fails_closed():
     assert error.value.reason == 'syntax'
 
 
+@pytest.mark.parametrize('expression,targets', [
+    ('rt.block_on(async { let x = 1; tokio::time::sleep(d).await; x })',
+     ['rt.block_on', 'tokio::time::sleep']),
+    ('tokio::time::timeout(d, async { tokio::time::sleep(d).await })',
+     ['tokio::time::timeout', 'tokio::time::sleep']),
+    ('cvt(unsafe { libc::open(p, 0) })', ['cvt', 'libc::open']),
+    ('f(const { 1 })', ['f']),
+    ('f(const { inner() })', ['f', 'inner']),
+    ('f(loop { break 1 })', ['f']),
+    ('f(loop { break inner() })', ['f', 'inner']),
+    ("f('work: loop { break 'work inner() })", ['f', 'inner']),
+    ('f(async move { tokio::time::sleep(d).await })', ['f', 'tokio::time::sleep']),
+    ('f({ inner(); 1 })', ['f', 'inner']),
+    ('f({ x })', ['f']),
+    ('f({})', ['f']),
+])
+def test_rust_block_arguments_preserve_nested_calls(expression, targets):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('fn run() { ' + expression + '; }', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == targets
+    assert all(call.kind != 'construct' for call in tree.call_sites)
+    assert all(call.caller_scope == 'run' for call in tree.call_sites)
+    # Block expressions cannot supply named struct fields to the outer call.
+    assert all(key.startswith('#') for key in tree.call_sites[0].args)
+    if 'libc::open' in targets:
+        assert tree.call_sites[1].args == {'#0': '<expr>', '#1': '0'}
+
+
+@pytest.mark.parametrize('name', ['Point', 'r#async'])
+def test_rust_struct_arguments_preserve_fields_and_construct_calls(name):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('fn run() { f(' + name + ' { x: 1, y: inner() }); }', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == ['f', name.removeprefix('r#'), 'inner']
+    assert tree.call_sites[0].args == {'#0': '<expr>', 'x': '1', 'y': '<expr>'}
+    assert tree.call_sites[1].kind == 'construct'
+    assert tree.call_sites[1].args == {'x': '1', 'y': '<expr>'}
+
+
+@pytest.mark.parametrize('name', ['Point', 'r#async'])
+@pytest.mark.parametrize('argument', [True, False])
+def test_rust_malformed_struct_fields_still_fail_closed(name, argument):
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
+
+    expression = name + ' { x: 1, broken 2 }'
+    if argument:
+        expression = 'f(' + expression + ')'
+    with pytest.raises(ASTDriverError, match='^invalid struct field at line 1$') as raised:
+        parse('fn run() { ' + expression + '; }', 'src/lib.rs')
+    assert raised.value.reason == 'syntax'
+
+
+def test_rust_unrecognised_struct_shape_has_argument_and_statement_parity():
+    from aegis_core.ast.drivers.rust import parse
+
+    for expression, targets in [('f(Point { broken 2 })', ['f']), ('Point { broken 2 }', [])]:
+        tree = parse('fn run() { ' + expression + '; }', 'src/lib.rs')
+        assert [call.target for call in tree.call_sites] == targets
+        assert all(call.kind != 'construct' for call in tree.call_sites)
+
+
+def test_rust_struct_field_attributes_preserve_fields_updates_and_nested_calls():
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('''fn build() {
+    let cfg = Config {
+        name: n,
+        #[cfg(feature = "llm")]
+        planner: Planner::new(),
+        #[allow(unused)] ..Default::default()
+    };
+    run(Config { #[cfg(test)] a: 1, b: 2 });
+}''', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == [
+        'Config', 'Planner::new', 'Default::default', 'run', 'Config']
+    constructs = [call for call in tree.call_sites if call.kind == 'construct']
+    assert [call.args for call in constructs] == [
+        {'name': '<expr>', 'planner': '<expr>', '**': '<expr>'}, {'a': '1', 'b': '2'}]
+    assert tree.call_sites[3].args == {'#0': '<expr>', 'a': '1', 'b': '2'}
+
+
+@pytest.mark.parametrize('attributes', [
+    '#[cfg(any())]',
+    '#[cfg_attr(all(), allow(unused))] #[doc = "hidden()"]',
+    '#![allow(unused)]',
+])
+@pytest.mark.parametrize('argument', [True, False])
+def test_rust_leading_field_attributes_preserve_shorthand_and_update(attributes, argument):
+    from aegis_core.ast.drivers.rust import parse
+
+    expression = 'Config { ' + attributes + ' a, ' + attributes + ' ..Default::default() }'
+    if argument:
+        expression = 'consume(' + expression + ')'
+    tree = parse('fn run() { ' + expression + '; }', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == (
+        ['consume', 'Config', 'Default::default'] if argument else ['Config', 'Default::default'])
+    construct = next(call for call in tree.call_sites if call.kind == 'construct')
+    assert construct.args == {'a': '<expr>', '**': '<expr>'}
+    if argument:
+        assert tree.call_sites[0].args == {'#0': '<expr>', 'a': '<expr>', '**': '<expr>'}
+
+
+@pytest.mark.parametrize('field', ['a', '..Default::default()'])
+def test_rust_attributed_single_field_and_update_are_constructs(field):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse('fn run() { consume(Config { #[allow(unused)] ' + field + ' }); }', 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == (
+        ['consume', 'Config'] if field == 'a' else ['consume', 'Config', 'Default::default'])
+    assert tree.call_sites[1].kind == 'construct'
+    assert tree.call_sites[1].args == ({'a': '<expr>'} if field == 'a' else {'**': '<expr>'})
+
+
+@pytest.mark.parametrize('fields', [
+    '#[cfg(any())] a: 1, #[allow(unused)] broken 2',
+    '#[cfg(any())] a: 1, #[allow(unused)]',
+])
+@pytest.mark.parametrize('argument', [True, False])
+def test_rust_malformed_attributed_struct_fields_fail_closed(fields, argument):
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
+
+    expression = 'Config { ' + fields + ' }'
+    if argument:
+        expression = 'consume(' + expression + ')'
+    with pytest.raises(ASTDriverError, match='^invalid struct field at line 1$') as raised:
+        parse('fn run() { ' + expression + '; }', 'src/lib.rs')
+    assert raised.value.reason == 'syntax'
+
+
+@pytest.mark.parametrize('fields,detail', [
+    ('#[allow(unused)] a: 1, #[allow(unused)] a: 2', 'duplicate field a'),
+    ('#[allow(unused)] ..base, #[allow(unused)] a: 1', 'invalid struct update position'),
+])
+def test_rust_attributed_struct_fields_keep_duplicate_and_update_errors(fields, detail):
+    from aegis_core.ast.driver_errors import ASTDriverError
+    from aegis_core.ast.drivers.rust import parse
+
+    with pytest.raises(ASTDriverError, match='^' + detail + ' at line 1$') as raised:
+        parse('fn run() { consume(Config { ' + fields + ' }); }', 'src/lib.rs')
+    assert raised.value.reason == 'syntax'
+
+
+@pytest.mark.parametrize('source,targets', [
+    ('''fn run(value: Choice) { match value {
+        #[cfg(any())] Choice::Named { #[cfg(any())] hidden, shown, .. }
+            if guard() => handle(shown),
+        #[allow(unused)] Choice::Tuple(a, b) => fallback(a, b),
+        _ => finish()
+    } }''', ['guard', 'handle', 'fallback', 'finish']),
+    ('''fn run(value: Choice) {
+        let Choice::Named { #[cfg(any())] hidden, shown, .. } = value else { fallback(); };
+        handle(shown);
+    }''', ['fallback', 'handle']),
+    ('''fn run() {
+        let values = (#[cfg(any())] first(), #[allow(unused)] second());
+        consume(values);
+    }''', ['first', 'second', 'consume']),
+])
+def test_rust_attributes_in_arms_patterns_and_tuples_preserve_only_body_calls(source, targets):
+    from aegis_core.ast.drivers.rust import parse
+
+    tree = parse(source, 'src/lib.rs')
+    assert [call.target for call in tree.call_sites] == targets
+    assert all(call.kind != 'construct' for call in tree.call_sites)
+
+
 @pytest.mark.parametrize('source', [
     'fn ppm_rgb(bytes: &[u8]) -> Result<([u32; 2], &[u8])> { body() }',
     'fn run() -> Result<[([u8; 2], (u8, u8)); 4]> { body() }',
