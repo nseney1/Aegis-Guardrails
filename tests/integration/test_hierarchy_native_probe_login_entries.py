@@ -6,11 +6,13 @@ the native probe suite's real-login layout and add that file.
 """
 import json
 import os
+import sys
 
 import pytest
 
 from tests.integration.test_hierarchy_native_probe import (  # noqa: F401  (probe is a fixture)
     native_probe, owner_auth, probe, real_login)
+from tests.integration.test_hierarchy_team import run, sha  # noqa: F401  (run is a fixture)
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the probe drives POSIX process groups")
@@ -95,3 +97,26 @@ def test_cleanup_keeps_and_reports_an_auth_json_lock_that_is_not_a_regular_file(
         os.close(fd)
     assert left == ["auth.json.lock"] and lock.is_dir()
     assert not os.path.lexists(probe.codex_home / "auth.lock")
+
+
+# -- the team command's login: the path that refused in dogfood run 1 ----------------------------------------------
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the team command's tests run on Linux")
+def test_team_login_accepts_both_locks_a_codex_0167_login_leaves(run):  # noqa: F811
+    run.team("init")
+    for name, mode in (("auth.lock", 0o664), ("auth.json.lock", 0o600)):
+        (run.codex_home / name).write_bytes(b"")
+        (run.codex_home / name).chmod(mode)
+    answer = run.team("login")
+    assert answer["auth_sha256"] == sha(run.codex_home / "auth.json")
+    assert answer["entries"] == [".aegis-team-run", "auth.json", "auth.json.lock", "auth.lock", "log"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the team command's tests run on Linux")
+def test_team_login_refuses_a_linked_auth_json_lock(run, tmp_path):  # noqa: F811
+    run.team("init")
+    outside = tmp_path / "elsewhere"
+    outside.write_bytes(b"")
+    (run.codex_home / "auth.json.lock").symlink_to(outside)
+    answer = run.team("login", expect=2)
+    assert answer["error"] == "auth.json.lock in CODEX_HOME is a symlink: %s" % (run.codex_home / "auth.json.lock")
