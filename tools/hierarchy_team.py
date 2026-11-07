@@ -5,10 +5,11 @@ One config, `team-run.json` (aegis.team-run/v1, template in hierarchy_templates/
 run's shell guide and its helpers. aegis.team-run/v2 adds `hosts`, ROOT's host and the one host of every role below it;
 v1 means codex-cli for both. init writes them to <base>/host-plan.json, which provision add-role and handoff check
 every binding against. Every subcommand checks path safety: CODEX_HOME is the run's codex_home and
-never ~/.codex or a folder inside it (by realpath). Commands that start work require free disk at least min_free_gb;
-git, bwrap and codex are on
+never ~/.codex or a folder inside it (by realpath), and for a plan that uses claude-code, CLAUDE_CONFIG_DIR is the run's
+claude_home and never ~/.claude or inside it. Commands that start work require free disk at least min_free_gb;
+git, bwrap and each host's command the plan uses (codex, claude) are on
 PATH, and cargo and cargo-nextest on the recipes' path when a kept recipe runs them. A command that spends model
-turns (login, up, approve, turn) also refuses an API key in the environment.
+turns (login, up, approve, turn) also refuses the billing variables of each host the plan uses.
 
 The subcommands orchestrate the existing tools as child processes (`-I -B`), or call their public functions, and
 re-check nothing those tools check: a tool's refusal is passed on with its own text. The run's records are files:
@@ -32,6 +33,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -61,14 +63,18 @@ STATUS_SCHEMA = "aegis.team-run-status/v1"
 LEDGER_SCHEMA = "aegis.team-turn-ledger/v1"
 OK, REFUSED, FAILED = 0, 2, 3
 CODEX = hierarchy_provision.CODEX
+CLAUDE = hierarchy_provision.CLAUDE
 V1_HOSTS = {"root": CODEX, "team": CODEX}
+CLAUDE_CREDENTIALS = ".credentials.json"
+# Managed settings can set an apiKeyHelper that --restricted still reads; login records whether the file exists.
+CLAUDE_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 # A stand-in binding that never runs a host; the host plan lists it so status can say so (spec rule 6).
 FRONT_DOOR_HOST = hierarchy_provision.CLAUDE
 HOME_PLACEHOLDER = "/REPLACE/WITH/your/home/folder"
 PLACEHOLDER = re.compile(r"REPLACE|<[^<>]*>")
 DEFAULT_RECIPES = HERE / "hierarchy_templates" / "job-recipes.json"
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
-# Written into codex_home by init: purge deletes only a folder that carries it.
+# Written into codex_home and claude_home by init: purge deletes only a folder that carries it.
 OWNER_MARK = ".aegis-team-run"
 LANE_KINDS = ("implementer", "reviewer")
 OPTIONAL_ROLES = hierarchy_provision.OPTIONAL_ROLES
@@ -200,12 +206,15 @@ class Run:
         fields(value, {"schema", "run", "project", "base", "branch", "initiative", "roles", "lanes", "recipes", "limits",
                        "preflight", "team"},
                {"codex_home", "source", "live_checkouts", "base_tree", "min_free_gb", "loop", "lease_ttl_seconds",
-                "hosts"})
+                "hosts", "claude_home"})
         require(value["schema"] in (SCHEMA, SCHEMA_V2), "unsupported team-run schema: " + str(value["schema"])[:80])
         self.raw = value
         self.hosts = self.check_hosts()
+        require(value["schema"] == SCHEMA_V2 or "claude_home" not in value, "claude_home needs schema " + SCHEMA_V2)
         self.run = absolute(value["run"], "run")
         self.codex_home = absolute(value.get("codex_home", str(self.run / "codex-home")), "codex_home")
+        # Made and checked only when the plan uses claude-code (ADR T2(a) section 3).
+        self.claude_home = absolute(value.get("claude_home", str(self.run / "claude-home")), "claude_home")
         self.source = absolute(value.get("source", str(REPO)), "source")
         self.project = absolute(value["project"], "project")
         self.live = [absolute(item, "live_checkouts") for item in value.get("live_checkouts", [])]
@@ -283,6 +292,10 @@ class Run:
             require(isinstance(hosts[key], str) and hosts[key] in hierarchy_hosts.TEAM_HOSTS,
                     "hosts.%s must be claude-code or codex-cli, not %s" % (key, repr(hosts[key])[:80]))
         return {"root": hosts["root"], "team": hosts["team"]}
+
+    def uses(self, kind):
+        """Whether ROOT or the team runs on this host kind; a v1 config uses codex-cli alone."""
+        return kind in self.hosts.values()
 
     def check_preflight(self):
         preflight = self.preflight
@@ -385,34 +398,71 @@ def nearest(path):
     return path
 
 
-def safe_codex_home(run):
-    owner = Path.home() / ".codex"
-    real, owner_real = os.path.realpath(run.codex_home), os.path.realpath(owner)
-    if real == owner_real or real.startswith(owner_real.rstrip(os.sep) + os.sep):
-        refuse("CODEX_HOME %s is inside ~/.codex (%s); a team run uses its own folder" % (run.codex_home, owner))
+def safe_home(run, home, label, variable, owners, apart=()):
+    """The realpath of a run's host home, or a refusal: never an owner folder or inside one, never holding HOME, the run
+    or an owner folder, apart from the run's other folders and from each (label, path) in `apart`, and no symlink."""
+    real = os.path.realpath(home)
+    for owner in owners:
+        owner_real = os.path.realpath(owner)
+        if real == owner_real or real.startswith(owner_real.rstrip(os.sep) + os.sep):
+            refuse("%s %s is inside ~/%s (%s); a team run uses its own folder" % (variable, home, owner.name, owner))
     candidate = Path(real)
     def contains(parent, child):
         return parent == child or parent in child.parents
-    for protected in (Path.home(), run.run, owner):
+    for protected in (Path.home(), run.run, *owners):
         if contains(candidate, protected.resolve()):
-            refuse("unsafe codex_home: it contains %s" % protected)
+            refuse("unsafe %s: it contains %s" % (label, protected))
     for protected in (run.project, run.source, run.evidence, *[run.run / name for name in MANAGED]):
         protected = protected.resolve()
         if contains(candidate, protected) or contains(protected, candidate):
-            refuse("unsafe codex_home: it overlaps %s" % protected)
-    if run.codex_home.is_symlink():
-        refuse("unsafe codex_home: it is a symlink")
+            refuse("unsafe %s: it overlaps %s" % (label, protected))
+    for other, path in apart:
+        resolved = Path(os.path.realpath(path))
+        if contains(candidate, resolved) or contains(resolved, candidate):
+            refuse("unsafe %s: it overlaps %s %s" % (label, other, path))
+    if home.is_symlink():
+        refuse("unsafe %s: it is a symlink" % label)
     return real
+
+
+def safe_codex_home(run):
+    return safe_home(run, run.codex_home, "codex_home", "CODEX_HOME", [Path.home() / ".codex"])
+
+
+def owner_homes(kind):
+    """The owner's own folder for a host kind (~/.claude) under HOME and under the home the password database names,
+    once each: a test or a shell that sets HOME must not hide the real one. It can move into the host registry later."""
+    folder = hierarchy_hosts.entry(kind)["home"]["owner_folder"]
+    try:
+        import pwd  # POSIX only, as the rest of this command is
+        real = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, AttributeError, KeyError):
+        refuse("cannot find this user's home folder in the password database, so ~/%s cannot be kept out" % folder)
+    homes = []
+    for home in (Path.home(), Path(real)):
+        if home / folder not in homes:
+            homes.append(home / folder)
+    return homes
+
+
+def safe_claude_home(run):
+    return safe_home(run, run.claude_home, "claude_home", "CLAUDE_CONFIG_DIR", owner_homes(CLAUDE),
+                     apart=[("codex_home", run.codex_home)])
 
 
 def guard(run, command):
     real = safe_codex_home(run)
+    claude_real = safe_claude_home(run) if run.uses(CLAUDE) else None
     if command == "down":
         return {}
     ambient = os.environ.get("CODEX_HOME")
     if ambient and os.path.realpath(ambient) != real:
         refuse("CODEX_HOME in this shell is %s, not this run's codex_home %s; unset it or export the run's"
                % (ambient, run.codex_home))
+    ambient = os.environ.get("CLAUDE_CONFIG_DIR") if claude_real else None
+    if ambient and os.path.realpath(ambient) != claude_real:
+        refuse("CLAUDE_CONFIG_DIR in this shell is %s, not this run's claude_home %s; unset it or export the run's"
+               % (ambient, run.claude_home))
     if command == "status":
         return {}
     probe = nearest(run.run)
@@ -420,7 +470,7 @@ def guard(run, command):
     if free < run.min_free_gb:
         refuse("only %.1f GB free at %s; this run needs min_free_gb %g" % (free, probe, run.min_free_gb))
     tools = {}
-    for name in ("git", "bwrap", "codex"):
+    for name in ("git", "bwrap") + (("codex",) if run.uses(CODEX) else ()) + (("claude",) if run.uses(CLAUDE) else ()):
         found = shutil.which(name)
         if found is None:
             refuse("required tool not found on PATH: " + name)
@@ -434,11 +484,16 @@ def guard(run, command):
             if found is None:
                 refuse("required tool not found on the recipes' path: %s (kept recipe %s runs %s)" % (name, recipe, what))
             tools[name] = found
-    if command in SPENDS_TURNS:
-        keys = [key for key in API_KEYS if key in os.environ]
+    if command in SPENDS_TURNS and run.uses(CODEX):
+        # In API_KEYS order, so the message stays what it was before the registry listed them.
+        keys = [key for key in API_KEYS if key in hierarchy_hosts.billing_set(CODEX, os.environ)]
         if keys:
             refuse("unset OPENAI_API_KEY and CODEX_API_KEY: codex could bill this run to the key instead of the run's "
                    "login (set: %s)" % ", ".join(keys))
+    if command in SPENDS_TURNS and run.uses(CLAUDE):
+        names = hierarchy_hosts.billing_set(CLAUDE, os.environ)
+        if names:
+            refuse("unset %s: claude could bill this run to them instead of the run's login" % ", ".join(names))
     return tools
 
 
@@ -455,6 +510,8 @@ def custody(run):
     # hosts during a run is out of scope (ADR T2(a) §1).
     if "hosts" in run.raw:
         value["hosts"] = run.raw["hosts"]
+    if "claude_home" in run.raw:
+        value["claude_home"] = run.raw["claude_home"]
     return value
 
 
@@ -502,6 +559,8 @@ def append_evidence(run, name, raw):
 def child_env(run, path=None):
     env = dict(os.environ)
     env["CODEX_HOME"] = str(run.codex_home)
+    if run.uses(CLAUDE):
+        env["CLAUDE_CONFIG_DIR"] = str(run.claude_home)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     if path is not None:
         env["PATH"] = path
@@ -571,8 +630,10 @@ def preconditions(run):
     for name in MANAGED:
         if (run.run / name).exists():
             refuse("run folder already holds %s; init needs a fresh run folder" % name)
-    if run.codex_home.exists():
+    if run.uses(CODEX) and run.codex_home.exists():
         refuse("codex_home %s already exists; init needs a new folder" % run.codex_home)
+    if run.uses(CLAUDE) and run.claude_home.exists():
+        refuse("claude_home %s already exists; init needs a new folder" % run.claude_home)
     real = os.path.realpath(run.project)
     for live in run.live:
         mine = os.path.realpath(live)
@@ -611,17 +672,30 @@ def once(run, state, key, action):
     return done[key]
 
 
-def step_codex_home(run, state):
-    safe_codex_home(run)
+def make_home(run, home, label):
+    """A host home with this run's owner mark; one already there must carry the mark (a resumed init)."""
     run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if run.codex_home.exists():
-        ownership(run)
-        return {"codex_home": str(run.codex_home)}
-    run.codex_home.mkdir(parents=True, mode=0o700)
-    os.chmod(run.codex_home, 0o700)
+    if home.exists():
+        ownership(run, home, label)
+        return
+    home.mkdir(parents=True, mode=0o700)
+    os.chmod(home, 0o700)
     mark = {"run": str(run.run), "initiative": run.id, "created_at": timestamp()}
-    write_atomic(run.codex_home / OWNER_MARK, as_json(mark))
-    return {"codex_home": str(run.codex_home)}
+    write_atomic(home / OWNER_MARK, as_json(mark))
+
+
+def step_codex_home(run, state):
+    """Named for Codex, as runs already past it recorded it: it makes each home the plan uses."""
+    detail = {}
+    if run.uses(CODEX):
+        safe_codex_home(run)
+        make_home(run, run.codex_home, "codex_home")
+        detail["codex_home"] = str(run.codex_home)
+    if run.uses(CLAUDE):
+        safe_claude_home(run)
+        make_home(run, run.claude_home, "claude_home")
+        detail["claude_home"] = str(run.claude_home)
+    return detail
 
 
 def step_recipes(run, state):
@@ -862,9 +936,11 @@ def next_step(state):
 
 
 def init(run, args):
-    if run.hosts != V1_HOSTS:
-        refuse("this team command runs codex-cli roles and ROOT until T2(a) PR 6; hosts is %s"
-               % json.dumps(run.hosts, sort_keys=True))
+    if run.hosts["team"] == CLAUDE:
+        # Provision makes tmpdir Codex-only, so a Claude team refuses one here rather than at up (ADR T2(a) section 1).
+        for lane in run.implementers:
+            if lane.tmpdir is not None:
+                refuse("lane %s: tmpdir is only for a Codex writer, and this run's team host is claude-code" % lane.id)
     state = load_state(run)
     if state and (state.get("down", {}).get("started_at") or state.get("down", {}).get("done")):
         refuse("teardown has started; a new run needs a new run folder")
@@ -909,7 +985,23 @@ def init(run, args):
 # -- login and root -------------------------------------------------------------------------------------------------------
 
 def login(run, args):
+    """Each host the plan uses, logged in to the run's own home. A Codex-only plan answers as it always did."""
     require_init(run)
+    if not run.uses(CLAUDE):
+        return OK, login_codex(run)
+    logins = {}
+    try:
+        if run.uses(CODEX):
+            logins[CODEX] = login_codex(run)
+        logins[CLAUDE] = login_claude(run)
+    except Stop as stop:
+        if logins:
+            stop.detail.setdefault("logins", logins)
+        raise
+    return OK, {"logins": logins}
+
+
+def login_codex(run):
     import hierarchy_native_probe as probe
     proc = subprocess.run(["codex", "login"], env=child_env(run))
     if proc.returncode != 0:
@@ -929,7 +1021,57 @@ def login(run, args):
         refuse(str(exc))
     answer = {"codex_home": str(run.codex_home), "auth_sha256": auth, "entries": entries}
     save(run, "login.json", answer)
-    return OK, answer
+    return answer
+
+
+def credentials_digest(run):
+    """The sha256 of the Claude home's credentials file, which must be this user's one regular file with mode 0600. The
+    file itself is never copied, and only its hash enters evidence."""
+    path = run.claude_home / CLAUDE_CREDENTIALS
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        refuse("claude_home has no %s after claude auth login" % CLAUDE_CREDENTIALS)
+    if stat.S_ISLNK(info.st_mode):
+        refuse("%s in claude_home is a symlink: %s" % (CLAUDE_CREDENTIALS, path))
+    if not stat.S_ISREG(info.st_mode):
+        refuse("%s in claude_home is not a regular file: %s" % (CLAUDE_CREDENTIALS, path))
+    # A second link could be the owner's own ~/.claude credentials, which the run would then refresh and use.
+    if info.st_nlink != 1:
+        refuse("%s in claude_home has %d hard links: %s" % (CLAUDE_CREDENTIALS, info.st_nlink, path))
+    if info.st_uid != os.getuid():
+        refuse("%s in claude_home is not owned by this user: %s" % (CLAUDE_CREDENTIALS, path))
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        refuse("%s in claude_home has mode %04o, not 0600: %s" % (CLAUDE_CREDENTIALS, stat.S_IMODE(info.st_mode), path))
+    # O_NONBLOCK: a FIFO swapped in after the lstat would otherwise block this open forever.
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            refuse("%s in claude_home changed while it was checked: %s" % (CLAUDE_CREDENTIALS, path))
+        return hashlib.sha256(stream.read()).hexdigest()
+
+
+def login_claude(run):
+    """claude auth login in the run's CLAUDE_CONFIG_DIR, which the owner finishes in the browser, then its status. The
+    evidence keeps the filtered auth record (no email or organization) and the credentials' hash, never the file."""
+    env = child_env(run)
+    proc = subprocess.run(["claude", "auth", "login"], env=env)
+    if proc.returncode != 0:
+        fail("claude auth login exited %d" % proc.returncode)
+    proc = subprocess.run(["claude", "auth", "status", "--json"], env=env, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=60)
+    try:
+        parsed = strict_json(proc.stdout)
+    except (ValueError, RecursionError):
+        parsed = None
+    record, problems = hierarchy_hosts.claude_auth_check(proc.returncode, parsed, run.claude_home)
+    if problems:
+        refuse("claude auth status does not show this run's claude.ai login: " + "; ".join(problems))
+    answer = {"claude_home": str(run.claude_home), "auth": record, "credentials_sha256": credentials_digest(run),
+              "entries": sorted(os.listdir(run.claude_home)), "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
+    save(run, "login-claude.json", answer)
+    return answer
 
 
 def adapter_tools(run, connection):
@@ -952,6 +1094,8 @@ def current_actor(run, role):
 
 def root(run, args):
     state = require_init(run)
+    if run.hosts["root"] == CLAUDE:
+        refuse("this team command binds a claude-code ROOT from T2(a) PR 6")
     require(hierarchy_provision.SESSION.fullmatch(args.session) is not None, "invalid session: " + args.session[:80])
     request = {"base": str(run.base), "endpoint": run.endpoint("root"), "host": CODEX, "session": args.session,
                "lifecycle": str(run.lifecycle), "actor": current_actor(run, "root"), "loop_state": str(run.loop_state),
@@ -1115,20 +1259,28 @@ def start_loop(run):
     problems = []
     if environ.get("CODEX_HOME") != str(run.codex_home):
         problems.append("its CODEX_HOME is %s, not %s" % (environ.get("CODEX_HOME"), run.codex_home))
+    # The pinned wake passes no env=, so every Claude wake inherits this home from the loop (ADR T2(a) section 3).
+    if run.uses(CLAUDE) and environ.get("CLAUDE_CONFIG_DIR") != str(run.claude_home):
+        problems.append("its CLAUDE_CONFIG_DIR is %s, not %s" % (environ.get("CLAUDE_CONFIG_DIR"), run.claude_home))
     if cargo_dir is not None and cargo_dir not in environ.get("PATH", "").split(os.pathsep):
         problems.append("its PATH lacks %s, where the recipes' cargo is" % cargo_dir)
     if problems:
         process.terminate()
         process.wait(timeout=LOOP_WAIT_SECONDS)
         fail("the loop (pid %d) was stopped: %s" % (process.pid, "; ".join(problems)))
-    save(run, "loop-environ.txt", ("CODEX_HOME=%s\nPATH=%s\n" % (environ["CODEX_HOME"], environ.get("PATH", "")))
-         .encode("utf-8"))
+    lines = "CODEX_HOME=%s\n" % environ["CODEX_HOME"]
+    if run.uses(CLAUDE):
+        lines += "CLAUDE_CONFIG_DIR=%s\n" % environ["CLAUDE_CONFIG_DIR"]
+    save(run, "loop-environ.txt", (lines + "PATH=%s\n" % environ.get("PATH", "")).encode("utf-8"))
     return {"state": "started", "pid": process.pid, "interval": run.interval, "log": str(run.log_path),
             "cargo_on_path": cargo_dir}
 
 
 def up(run, args):
     state = require_init(run)
+    # Before the loop status check, which runs a child: nothing is started or written for a Claude team yet.
+    if run.hosts["team"] == CLAUDE:
+        refuse("this team command starts claude-code team roles from T2(a) PR 6")
     pid, alive, ours = loop_process(run)
     running, _ = loop_state(run)
     if (alive and ours) or running in ("running", "stale"):
@@ -1563,6 +1715,9 @@ def collect(run, state):
                          (run.run / "requests", "requests"), (run.run / "events", "events"),
                          (run.mailbox_root, "mailbox"), (run.store / "events", "store-events"),
                          (run.store / "jobs" / run.id, "jobs"), (run.codex_home / "sessions", "codex-sessions")):
+        # T2(a) PR 6 (down) adds (run.claude_home / "projects", "claude-projects") here for a plan that uses
+        # claude-code, and purge_claude then checks each copy as purge does. Nothing else of claude_home is copied:
+        # never its credentials.
         copy_tree(source, run.evidence / name)
     for source, name in ((run.run / "policy.json", "policy.json"), (run.recipes, "recipes.json"),
                          (run.pid_path, "loop.pid"), (run.log_path, "loop.log"),
@@ -1672,13 +1827,13 @@ def parsed_sums(run):
     return found
 
 
-def ownership(run):
-    mark = run.codex_home / OWNER_MARK
+def ownership(run, home=None, label="codex_home"):
+    mark = (run.codex_home if home is None else home) / OWNER_MARK
     if not mark.is_file() or mark.is_symlink():
-        refuse("codex_home was kept: it has no %s mark, so this run did not make it" % OWNER_MARK)
+        refuse("%s was kept: it has no %s mark, so this run did not make it" % (label, OWNER_MARK))
     record = read_json(mark)
     if not isinstance(record, dict) or record.get("run") != str(run.run) or record.get("initiative") != run.id:
-        refuse("codex_home was kept: ownership record does not match this run")
+        refuse("%s was kept: ownership record does not match this run" % label)
 
 
 def purge(run):
@@ -1702,6 +1857,21 @@ def purge(run):
         if sums.get("codex-sessions/%s" % relative) != digest:
             refuse("codex_home was kept: SHA256SUMS does not list the copy of sessions/%s with its hash" % relative)
     shutil.rmtree(run.codex_home)
+    return "purged"
+
+
+def purge_claude(run):
+    """Deletes claude_home, the run's Claude login, under purge's ownership rules."""
+    safe_claude_home(run)
+    if not run.claude_home.exists():
+        return "already_purged"
+    ownership(run, run.claude_home, "claude_home")
+    # Until down copies projects/ to evidence (T2(a) PR 6, in collect), a transcript there would be lost, so a home
+    # holding any is kept.
+    projects = run.claude_home / "projects"
+    if os.path.lexists(projects) and (projects.is_symlink() or not projects.is_dir() or any(projects.iterdir())):
+        refuse("claude_home was kept: projects/ holds transcripts, which down copies to evidence from T2(a) PR 6")
+    shutil.rmtree(run.claude_home)
     return "purged"
 
 
@@ -1739,7 +1909,10 @@ def down(run, args):
     answer["review_copies"] = remove_review_copies(run)
     if run.evidence.is_dir():
         answer["sha256sums"] = write_sums(run)
-    answer["codex_home"] = purge(run) if args.purge_codex_home else "kept"
+    if run.uses(CODEX):
+        answer["codex_home"] = purge(run) if args.purge_codex_home else "kept"
+    if run.uses(CLAUDE):
+        answer["claude_home"] = purge_claude(run) if args.purge_claude_home else "kept"
     done["last"] = timestamp()
     save_state(run, state)
     return OK, answer
@@ -1765,7 +1938,8 @@ def main(argv=None):
                                                "worktrees, slots, leases and the preflight")
     started.add_argument("--continue", dest="resume", action="store_true", help="Resume a failed init at its first "
                                                                                "incomplete step")
-    commands.add_parser("login", help="codex login in the run's CODEX_HOME, then check the login folder")
+    commands.add_parser("login", help="Log in each host the plan uses in the run's own home (codex login in "
+                                      "CODEX_HOME, claude auth login in CLAUDE_CONFIG_DIR), then check it")
     bound = commands.add_parser("root", help="Bind the owner's existing ROOT session with its decision connection")
     bound.add_argument("--session", required=True)
     raised = commands.add_parser("up", help="Write team.json, start the roles in order, check each, start the loop")
@@ -1787,6 +1961,8 @@ def main(argv=None):
     lowered = commands.add_parser("down", help="Collect evidence, then stop and release everything the run holds")
     lowered.add_argument("--purge-codex-home", action="store_true",
                          help="Delete codex_home once every session file has a verified copy in evidence")
+    lowered.add_argument("--purge-claude-home", action="store_true",
+                         help="Delete claude_home, the run's Claude login, once its owner mark is checked")
     lowered.add_argument("--loop-wait", type=int, default=LOOP_WAIT_SECONDS,
                          help="Seconds to wait for the loop to stop after SIGTERM (default %d)" % LOOP_WAIT_SECONDS)
     args = parser.parse_args(argv)
