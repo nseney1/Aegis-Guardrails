@@ -1,10 +1,11 @@
 # Teams T1 small-change approval and admission evidence
 
-This slice adds durable pre-dispatch contracts through the existing lifecycle
-`record --event FILE --evidence-only` command. It does not activate dispatch.
+The existing lifecycle `record --event FILE --evidence-only` command records
+small-change approval, admission and deterministic execution evidence.
 Configured actor IDs and evidence references do not authenticate a Reviewer,
 verify a recipe artifact or grant native authority. The protected host decision
-ABI remains unchanged. The Orchestrator remains required by routing and jobs.
+ABI remains unchanged. Automated routing, mailbox dispatch and jobs still require
+their separate integration; this lifecycle seam runs no model turn.
 
 ## Closed event contracts
 
@@ -50,14 +51,32 @@ independence remain unverified. This evidence cannot authorize a job.
 
 Registration, decision and admission use the existing idempotent journal receipt
 mechanism. Lost replies recover by the same event ID and exact bytes; changed
-bytes refuse. An admission cannot be replaced under a new event ID. No event
-settles an UNKNOWN effect or changes accounting. Registered plans are held from
-legacy routing, admission and intent until the complete dispatch path exists.
+bytes refuse. An admission cannot be replaced under a new event ID. None of these
+three events settles an UNKNOWN effect or changes accounting.
+
+Before admission, registered plans remain held from execution. After admission,
+`route` accepts only
+`<request.team>/lane/<plan lane>`; `intent` and `start` accept only the registered
+writer. Intent consumes the single start; a second intent or start refuses.
+`review` accepts only the registered, independent Reviewer. These paths recheck
+plan approval, canonical denial, expiry, prerequisites and participant generations.
+Legacy `admit` remains refused; small-change admission stays separate from
+canonical authority and admission. Admitted, unstarted rows become lifecycle
+continuation candidates. No Orchestrator or Decider event is needed for `route`
+-> `intent` -> `start` -> `terminal` -> `review` -> `delivery` -> `disposition`
+with resolution `complete`. Terminal and review sources remain the request's
+base source; the writer's new commit appears only in evidence. UNKNOWN blocks
+closure, preserves accounting and admission, and permits no repeated start or
+resource release. Existing exact-receipt recovery applies to every event.
+
+Plan-decision/admission events still require an untouched request; after routing
+or intent, canonical denial remains the existing revocation path.
 A legacy delivery lost before registration remains visible as
 `delivered_unrecorded`; recovery refuses without resending or discarding it.
 Only new events introduce projection keys, preserving historical checkpoints.
 Old readers refuse these new event types; this opt-in evidence writer does not
 claim mixed-version runtime activation or N/N-1 qualification.
+Readers predating the execution seam also refuse admitted-row execution events.
 
 ## Base and acceptance ledger
 

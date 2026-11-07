@@ -23,6 +23,16 @@ contents, authenticate CIDs, or execute any packet. Mutations require POSIX
 directory fsync; other hosts refuse before mutation. Non-POSIX durability is
 not qualified. The exact policy hash must be independently pinned by an adopter.
 
+An admitted [small-change plan](teams-t1-small-change-admission.md) can now record
+route, writer intent/start, terminal, independent Reviewer acceptance, delivery
+and complete closure without Orchestrator or Decider events. Routing is confined
+to the approved lane; approval, admission, expiry and participant generations are
+rechecked. UNKNOWN retains its obligation and accounting. Terminal/review sources
+remain the request's base source; new commits are evidence only. Mailbox/job
+dispatch and native qualification remain separate gates. The lifecycle replay
+successor pin changes with this seam; historical corpus and checkpoint pins stay
+unchanged.
+
 `hierarchy_sweep.py --store <absolute store> --lifecycle <absolute journal>`
 preflights the supplied journal before any wake and rereads after rounds. A bad
 journal returns HOLD, `work_complete=false`, and starts no turn. An owned blocker
