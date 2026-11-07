@@ -129,7 +129,7 @@ def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():
         "ends_when": "T2(b) qualifies an OS-enforced Claude write scope"}
     assert hierarchy_hosts.qualify("codex-cli", True) == {
         "boundary": "OS sandbox, qualification pending T2(b)", "mechanism": "codex sandbox writable_roots",
-        "os_enforced": True}
+        "os_enforced": None}
     assert refusal(hierarchy_hosts.qualify, "codex", False) == "codex is not qualified for a reader role in a team run"
     assert refusal(hierarchy_hosts.qualify, "codex", True) == "codex is not qualified for a writer role in a team run"
     hierarchy_hosts.qualify("claude-code", True)["boundary"] = "changed"
@@ -306,3 +306,36 @@ def test_claude_auth_check_refuses_status_that_is_not_an_object(tmp_path, found)
     assert problems == ["claude auth status printed no JSON object"]
     assert hierarchy_hosts.claude_auth_check(2, found, tmp_path)[1] == [
         "claude auth status exited 2", "claude auth status printed no JSON object"]
+
+
+@pytest.mark.parametrize("separator", [" ", " ", "\x85"])
+def test_claude_readers_keep_an_event_whose_text_holds_a_unicode_line_separator(separator):
+    # JSON encoders may leave these characters raw inside strings; only "\n" ends a stream-json line.
+    reply = {"type": "assistant", "message": {"content": [{"type": "text", "text": "a" + separator + "b"}]}}
+    result = dict(REAL_RESULT, result="done" + separator + "here")
+    stdout = "\n".join(lines(INIT, reply, result)) + "\n"
+    assert hierarchy_hosts.claude_usage(stdout)["input_tokens"] == 509573
+    assert hierarchy_hosts.claude_turn_items(stdout) == [{"type": "agent_message", "text": "a" + separator + "b"}]
+    assert hierarchy_hosts.claude_init(stdout.encode("utf-8"))["session_id"] == SESSION
+
+
+def test_claude_events_skip_lines_that_are_not_text_or_nest_too_deeply():
+    deep = "[" * 100000 + "]" * 100000
+    assert list(hierarchy_hosts.claude_events([b"\xff", None, 7, deep, json.dumps(INIT)])) == [INIT]
+
+
+def test_codex_usage_is_unknown_when_cached_input_exceeds_input():
+    assert hierarchy_hosts.codex_usage({"input_tokens": 10, "cached_input_tokens": 11, "output_tokens": 0}) is None
+
+
+@pytest.mark.parametrize("code", [False, 0.0, "0", None])
+def test_claude_auth_check_needs_an_integer_zero_exit(tmp_path, code):
+    assert hierarchy_hosts.claude_auth_check(code, status(tmp_path), tmp_path)[1] == [
+        "claude auth status exited %r" % (code,)]
+
+
+@pytest.mark.parametrize("configured", ["", "."])
+def test_claude_auth_check_refuses_a_relative_config_directory(tmp_path, monkeypatch, configured):
+    monkeypatch.chdir(tmp_path)
+    assert hierarchy_hosts.claude_auth_check(0, status(tmp_path, configDirectory=configured), tmp_path)[1] == [
+        "config directory is not the run's claude home"]

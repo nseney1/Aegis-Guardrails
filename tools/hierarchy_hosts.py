@@ -64,8 +64,9 @@ _HOSTS = {
         "session_variable": CODEX_SESSION_VARIABLE,
         "transcripts": CODEX_TRANSCRIPTS,
         "usage": "codex-token-count",
+        # Unknown until T2(b) qualifies it: rule 6 reports what no run has shown as unknown, never as true.
         "write_scope": {"boundary": "OS sandbox, qualification pending T2(b)",
-                        "mechanism": "codex sandbox writable_roots", "os_enforced": True},
+                        "mechanism": "codex sandbox writable_roots", "os_enforced": None},
         "qualification": {"reader": "allowed", "writer": "allowed"},
     },
     # Native threads are owner-created in the owner's shared app-server home: bind and status only, and team runs
@@ -132,13 +133,16 @@ def transcripts(kind, home, session):
 
 def claude_events(lines):
     """The JSON objects in Claude stream-json output; blank, malformed and non-object lines are skipped."""
-    # A whole stdout string would otherwise be read one character at a time and yield nothing.
+    # A whole stdout string would otherwise be read one character at a time and yield nothing. Only "\n" ends a
+    # stream-json line: splitlines() would also cut at U+2028, U+2029 and U+0085, which JSON strings may hold raw.
+    if isinstance(lines, bytes):
+        lines = lines.decode("utf-8", "replace")
     if isinstance(lines, str):
-        lines = lines.splitlines()
+        lines = lines.split("\n")
     for line in lines:
         try:
             event = json.loads(line)
-        except ValueError:
+        except (ValueError, TypeError, RecursionError):
             continue
         if isinstance(event, dict):
             yield event
@@ -191,6 +195,8 @@ def codex_usage(totals):
     # Not summed: Codex reports cached input as a subset of input_tokens, as the turn ledger's
     # all_tokens = input + output assumes.
     total_input, cached, output = found
+    if cached > total_input:
+        return None
     return {"input_tokens": total_input, "cached_input_tokens": cached, "cache_write_input_tokens": None,
             "output_tokens": output, "native": dict(totals)}
 
@@ -208,7 +214,9 @@ def claude_turn_items(lines):
             if part.get("type") == "text":
                 items.append({"type": "agent_message", "text": str(part.get("text"))[:2000]})
             elif part.get("type") == "tool_use" and isinstance(name, str) and name.startswith("mcp__"):
-                # Claude names an MCP tool mcp__<server>__<tool>; Codex items carry the tool alone.
+                # Claude names an MCP tool mcp__<server>__<tool>; Codex items carry the tool alone. A server name
+                # holding "__" would split wrongly; the team's servers (aegis_mailbox, aegis_board, aegis_decision)
+                # have none.
                 _, separator, tool = name[len("mcp__"):].partition("__")
                 if separator and tool:
                     items.append({"type": "mcp_tool_call", "tool": tool, "arguments": part.get("input")})
@@ -218,7 +226,7 @@ def claude_turn_items(lines):
 def claude_auth_check(exit_code, status, home):
     """(record, problems) for `claude auth status --json` run against a run's Claude home; no problems is OK."""
     problems = []
-    if exit_code != 0:
+    if type(exit_code) is not int or exit_code != 0:
         problems.append("claude auth status exited %s" % repr(exit_code)[:80])
     if not isinstance(status, dict):
         problems.append("claude auth status printed no JSON object")
@@ -233,6 +241,8 @@ def claude_auth_check(exit_code, status, home):
     if status.get("apiProvider") != "firstParty":
         problems.append("api provider %s is not firstParty" % repr(status.get("apiProvider"))[:80])
     configured = status.get("configDirectory")
-    if not isinstance(configured, str) or os.path.realpath(configured) != os.path.realpath(os.fspath(home)):
+    # A relative answer would resolve against this process's cwd, not the folder the CLI actually used.
+    if not (isinstance(configured, str) and os.path.isabs(configured)) or \
+            os.path.realpath(configured) != os.path.realpath(os.fspath(home)):
         problems.append("config directory is not the run's claude home")
     return record, problems
