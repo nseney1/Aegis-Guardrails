@@ -8,8 +8,9 @@ Claude's own output: stream-json events, usage, turn items and `claude auth stat
 
 It also holds a team run's host plan (aegis.hierarchy-host-plan/v1, `<base>/host-plan.json`): which host runs ROOT,
 which one runs every role below it, and which bindings are stand-ins that run no host. `require_binding` is the one
-check every team-run path that binds applies (spec rule 1; ADR T2(a) question A, answer A2), and `session_record` is
-the host-neutral record (aegis.team-session/v1) written beside each binding it allows.
+check every team-run path that binds applies (spec rule 1; ADR T2(a) question A, answer A2): with a plan it fails
+closed, and only a base without one keeps today's unchecked binding. `session_record` is the host-neutral record
+(aegis.team-session/v1) that add-role writes beside each binding it allows.
 
 Data and pure functions only. Nothing here starts, stops or writes anything; `transcripts` only lists the folder it is
 given, and `read_plan` and `session_recorded` only read. Starting and stopping processes stay in hierarchy_provision and
@@ -354,6 +355,15 @@ def read_plan(base):
     return validate_plan(value)
 
 
+def base_plan(base, hierarchy):
+    """The plan of a base serving `hierarchy`, or None. A base holds only its initiative's endpoints, so a plan written
+    for another hierarchy is a wrong plan, refused rather than read as covering nothing."""
+    plan = read_plan(base)
+    if plan is not None and plan["hierarchy"] != hierarchy:
+        raise ValueError("host plan is for hierarchy %s, but this base serves %s" % (plan["hierarchy"], hierarchy))
+    return plan
+
+
 def plan_host(plan, endpoint):
     """(host kind, stand-in) the plan assigns this endpoint; (None, False) when no plan covers it."""
     if plan is None:
@@ -367,13 +377,15 @@ def plan_host(plan, endpoint):
 
 
 def require_binding(plan, endpoint, host, writer):
-    """The write scope a session on `host` gets at this endpoint under the plan, None when unconstrained, or a refusal.
+    """The write scope a session on `host` gets at this endpoint under the plan, None without a plan, or a refusal.
 
     Called before anything binds, so a refusal leaves the endpoint as it was.
     """
+    if plan is None:
+        return None
     expected, stand_in = plan_host(plan, endpoint)
     if expected is None:
-        return None
+        raise ValueError("%s is not an endpoint of host plan hierarchy %s" % (endpoint, plan["hierarchy"]))
     if host != expected:
         raise ValueError("%s runs on %s in this run's host plan, not %s" % (endpoint, expected, host))
     if stand_in:
@@ -402,6 +414,8 @@ def session_record(endpoint, role_kind, host_kind, start_mode, session, generati
     integer(generation, "generation")
     require(type(stand_in) is bool, "invalid stand_in")
     require(isinstance(write_scope, dict) and isinstance(write_scope.get("boundary"), str), "invalid write_scope")
+    roots = write_scope.get("roots", [])
+    require(isinstance(roots, list) and all(isinstance(root, str) and root for root in roots), "invalid write_scope")
     return {"schema": SESSION_SCHEMA, "endpoint": endpoint, "role_kind": role_kind, "host_kind": host_kind,
             "start_mode": start_mode, "session": session, "generation": generation, "stand_in": stand_in,
             "write_scope": dict(write_scope)}

@@ -495,9 +495,18 @@ def test_plan_host_maps_root_team_and_stand_ins_and_leaves_other_hierarchies_alo
     assert refusal(hierarchy_hosts.plan_host, found, "m1") == "invalid endpoint"
 
 
-def test_require_binding_is_unconstrained_without_a_plan_or_outside_its_hierarchy():
+def test_require_binding_is_unconstrained_only_without_a_plan():
     assert hierarchy_hosts.require_binding(None, "m1/lane/f2", "codex", True) is None
-    assert hierarchy_hosts.require_binding(plan(), "other/lane/f2", "codex", True) is None
+    assert refusal(hierarchy_hosts.require_binding, plan(), "other/lane/f2", "codex-cli", True) == (
+        "other/lane/f2 is not an endpoint of host plan hierarchy m1")
+
+
+def test_base_plan_refuses_a_plan_written_for_another_hierarchy(tmp_path):
+    assert hierarchy_hosts.base_plan(tmp_path, "m1") is None
+    (tmp_path / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.base_plan(tmp_path, "m1") == plan()
+    assert refusal(hierarchy_hosts.base_plan, tmp_path, "pilot") == (
+        "host plan is for hierarchy m1, but this base serves pilot")
 
 
 @pytest.mark.parametrize("endpoint,host,expected", [
@@ -546,6 +555,8 @@ def test_session_record_is_the_adr_shape():
         "write_scope": CLAUDE_SCOPE}
     for mode in ("background", "exec", None):
         assert hierarchy_hosts.session_record(**record_arguments(start_mode=mode))["start_mode"] == mode
+    roots = dict(CLAUDE_SCOPE, roots=["/work/lane"])
+    assert hierarchy_hosts.session_record(**record_arguments(write_scope=roots))["write_scope"] == roots
     stand_in = hierarchy_hosts.session_record(**record_arguments(
         endpoint="m1/front-door", role_kind="front-door", start_mode=None, stand_in=True, write_scope=STAND_IN))
     assert (stand_in["stand_in"], stand_in["write_scope"]) == (True, STAND_IN)
@@ -567,6 +578,9 @@ def test_session_record_is_the_adr_shape():
     ({"stand_in": 0}, "invalid stand_in"),
     ({"write_scope": None}, "invalid write_scope"),
     ({"write_scope": {"mechanism": "x"}}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots="/work")}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots=["/work", ""])}, "invalid write_scope"),
+    ({"write_scope": dict(CLAUDE_SCOPE, roots=[7])}, "invalid write_scope"),
 ])
 def test_session_record_refuses_each_malformed_field(change, error):
     with pytest.raises(ValueError) as caught:
