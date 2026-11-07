@@ -2,7 +2,9 @@
 """The owner's one command for a team run: init, login, root, up, request, approve, turn, status and down.
 
 One config, `team-run.json` (aegis.team-run/v1, template in hierarchy_templates/team-run.json), replaces the real
-run's shell guide and its helpers. Every subcommand checks path safety: CODEX_HOME is the run's codex_home and
+run's shell guide and its helpers. aegis.team-run/v2 adds `hosts`, ROOT's host and the one host of every role below it;
+v1 means codex-cli for both. init writes them to <base>/host-plan.json, which provision add-role and handoff check
+every binding against. Every subcommand checks path safety: CODEX_HOME is the run's codex_home and
 never ~/.codex or a folder inside it (by realpath). Commands that start work require free disk at least min_free_gb;
 git, bwrap and codex are on
 PATH, and cargo and cargo-nextest on the recipes' path when a kept recipe runs them. A command that spends model
@@ -42,6 +44,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 from hierarchy_mailbox import (GIT_ID, SLUG, Mailbox, endpoint_parts, fields, matching, read_json, require,  # noqa: E402
                                strict_json, text, timestamp)
+import hierarchy_hosts  # noqa: E402
 import hierarchy_lifecycle  # noqa: E402
 import hierarchy_native  # noqa: E402
 import hierarchy_provision  # noqa: E402
@@ -51,12 +54,16 @@ import hierarchy_team_view  # noqa: E402
 
 
 SCHEMA = "aegis.team-run/v1"
+SCHEMA_V2 = "aegis.team-run/v2"
 STATE_SCHEMA = "aegis.team-run-state/v1"
 INDEX_SCHEMA = "aegis.team-evidence-index/v1"
 STATUS_SCHEMA = "aegis.team-run-status/v1"
 LEDGER_SCHEMA = "aegis.team-turn-ledger/v1"
 OK, REFUSED, FAILED = 0, 2, 3
 CODEX = hierarchy_provision.CODEX
+V1_HOSTS = {"root": CODEX, "team": CODEX}
+# A stand-in binding that never runs a host; the host plan lists it so status can say so (spec rule 6).
+FRONT_DOOR_HOST = hierarchy_provision.CLAUDE
 HOME_PLACEHOLDER = "/REPLACE/WITH/your/home/folder"
 PLACEHOLDER = re.compile(r"REPLACE|<[^<>]*>")
 DEFAULT_RECIPES = HERE / "hierarchy_templates" / "job-recipes.json"
@@ -192,9 +199,11 @@ class Run:
         placeholders(value)
         fields(value, {"schema", "run", "project", "base", "branch", "initiative", "roles", "lanes", "recipes", "limits",
                        "preflight", "team"},
-               {"codex_home", "source", "live_checkouts", "base_tree", "min_free_gb", "loop", "lease_ttl_seconds"})
-        require(value["schema"] == SCHEMA, "unsupported team-run schema: " + str(value["schema"])[:80])
+               {"codex_home", "source", "live_checkouts", "base_tree", "min_free_gb", "loop", "lease_ttl_seconds",
+                "hosts"})
+        require(value["schema"] in (SCHEMA, SCHEMA_V2), "unsupported team-run schema: " + str(value["schema"])[:80])
         self.raw = value
+        self.hosts = self.check_hosts()
         self.run = absolute(value["run"], "run")
         self.codex_home = absolute(value.get("codex_home", str(self.run / "codex-home")), "codex_home")
         self.source = absolute(value.get("source", str(REPO)), "source")
@@ -259,6 +268,21 @@ class Run:
         self.log_path = self.run / "loop.log"
         self.commands_log = self.run / "team-commands.jsonl"
         self.inputs = self.run / "inputs"
+
+    def check_hosts(self):
+        if self.raw["schema"] == SCHEMA:
+            require("hosts" not in self.raw, "hosts needs schema " + SCHEMA_V2)
+            return dict(V1_HOSTS)
+        require("hosts" in self.raw, SCHEMA_V2 + " needs hosts: the root and team host kinds")
+        hosts = self.raw["hosts"]
+        part("hosts", lambda: fields(hosts, {"root", "team"}))
+        for key in ("root", "team"):
+            # Named apart from an unknown kind: provision knows native threads, and team runs start none.
+            require(hosts[key] != hierarchy_hosts.NATIVE,
+                    "hosts.%s is codex (native): team runs start no native threads" % key)
+            require(isinstance(hosts[key], str) and hosts[key] in hierarchy_hosts.TEAM_HOSTS,
+                    "hosts.%s must be claude-code or codex-cli, not %s" % (key, repr(hosts[key])[:80]))
+        return {"root": hosts["root"], "team": hosts["team"]}
 
     def check_preflight(self):
         preflight = self.preflight
@@ -425,8 +449,13 @@ def load_state(run):
 
 
 def custody(run):
-    return {key: run.raw.get(key) for key in ("run", "project", "source", "codex_home", "base", "branch",
-                                             "initiative", "lanes", "roles")}
+    value = {key: run.raw.get(key) for key in ("run", "project", "source", "codex_home", "base", "branch",
+                                              "initiative", "lanes", "roles")}
+    # Only when given, so a v1 run's recorded custody still matches. The plan is written once at init, and changing
+    # hosts during a run is out of scope (ADR T2(a) §1).
+    if "hosts" in run.raw:
+        value["hosts"] = run.raw["hosts"]
+    return value
 
 
 def save_state(run, state):
@@ -619,13 +648,23 @@ def step_provision(run, state):
     request = {"store": str(run.store), "base": str(run.base), "source": str(run.source), "python": run.python,
                "roles": run.roles, "lanes": {lane.id: lane.kind for lane in run.lanes},
                "initiative": initiative_record(run)}
-    save(run, "provision-init.json", checked(run, "provision init", "provision", "init", "--request",
-                                             request_file(run, "provision-init.json", request)))
+    # Provision init refuses an initiative it already registered, so a failure after it (the evidence save or the plan
+    # write) resumes past it on --continue instead of running it again.
+    answer = once(run, state, "provision-init", lambda: checked(run, "provision init", "provision", "init", "--request",
+                                                               request_file(run, "provision-init.json", request)))
+    save(run, "provision-init.json", answer)
+    # Here rather than as a step of its own, so a run already past this step keeps today's unchecked bindings. Provision
+    # init refuses an existing base, so the plan can only follow it, before the first add-role.
+    plan = hierarchy_hosts.plan_record(hierarchy=run.id, root=run.hosts["root"], team=run.hosts["team"],
+                                       stand_ins={run.endpoint("front-door"): FRONT_DOOR_HOST},
+                                       config_sha256=sha_file(run.config_path))
+    write_atomic(run.base / hierarchy_hosts.PLAN_FILE, as_json(plan))
+    save(run, hierarchy_hosts.PLAN_FILE, plan)
 
 
 def step_front_door(run, state):
     # A stand-in binding that never runs a host: the owner's front-door mail goes through the mailbox CLI.
-    request = {"base": str(run.base), "endpoint": run.endpoint("front-door"), "host": "claude-code",
+    request = {"base": str(run.base), "endpoint": run.endpoint("front-door"), "host": FRONT_DOOR_HOST,
                "session": str(uuid.uuid4()), "cwd": str(run.run)}
     save(run, "front-door.json", checked(run, "front-door add-role", "provision", "add-role", "--request",
                                          request_file(run, "front-door.json", request)))
@@ -823,6 +862,9 @@ def next_step(state):
 
 
 def init(run, args):
+    if run.hosts != V1_HOSTS:
+        refuse("this team command runs codex-cli roles and ROOT until T2(a) PR 6; hosts is %s"
+               % json.dumps(run.hosts, sort_keys=True))
     state = load_state(run)
     if state and (state.get("down", {}).get("started_at") or state.get("down", {}).get("done")):
         refuse("teardown has started; a new run needs a new run folder")
@@ -1717,7 +1759,7 @@ def log_command(run, command, code):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", required=True, help="Absolute path to team-run.json (aegis.team-run/v1)")
+    parser.add_argument("--config", required=True, help="Absolute path to team-run.json (aegis.team-run/v1 or v2)")
     commands = parser.add_subparsers(dest="command", required=True)
     started = commands.add_parser("init", help="Every non-model setup step: recipes, store, provision, journal, "
                                                "worktrees, slots, leases and the preflight")
