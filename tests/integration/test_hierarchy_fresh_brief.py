@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
 SECTIONS = ("Role contract", "Approved scope", "Source identity", "Open obligations",
             "Dependencies", "Unread work", "Evidence references")
 ENDPOINT = "a/lane/f2"
+AS_OF = "2026-11-07T12:00:00Z"
 secure_publication = pytest.mark.skipif(os.name != "posix", reason="secure brief publication requires POSIX dir_fd support")
 
 
@@ -141,12 +143,12 @@ def test_unknown_effects_and_woken_unread_are_never_dropped(records):
 def test_determinism_and_no_store_mutations(records):
     root, _, _, _ = records
     before = files(root.parent)
-    first = compose(root)
+    first = compose(root, as_of=AS_OF)
     raw = Path(first["brief"]["path"]).read_bytes()
     after = files(root.parent)
     assert after.pop(str(Path(first["brief"]["path"]).relative_to(root.parent))) == raw
     assert after == before
-    assert compose(root) == first
+    assert compose(root, as_of=AS_OF) == first
     assert Path(first["brief"]["path"]).read_bytes() == raw
 
 
@@ -269,7 +271,8 @@ def test_recorded_reads_are_excluded_but_no_delivery_history_is_conservative(tmp
     invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True,
            host="host-one", session="a/root", generation=1)
     brief = compose(root, "a/root")["brief"]
-    assert sections(brief)["Unread work"] == []
+    aggregate = sections(brief)["Unread work"]
+    assert len(aggregate) == 1 and aggregate[0]["state"] == "read_by_predecessor" and aggregate[0]["count"] == 1
     assert "receipt-note" not in json.dumps(sections(brief)["Unread work"])
     assert any(row.get("kind") == "delivery_read" for row in sections(brief)["Evidence references"])
 
@@ -421,7 +424,7 @@ def test_expired_scope_is_history_but_its_unsettled_obligation_remains(pilot, tm
 @secure_publication
 def test_closed_dispatch_lease_and_missing_brief_are_history(pilot, tmp_path):  # noqa: F811
     root, old_brief, ready = active_writer(pilot, tmp_path)
-    invoke(root, "publish", message("a/lane/f2", "a/orchestrator", identifier="done", kind="result",
+    completion = invoke(root, "publish", message("a/lane/f2", "a/orchestrator", identifier="done", kind="result",
                                     in_reply_to="dispatch-1", result={"source_revision": ready["base_revision"],
                                     "source_tree": "b" * 40, "checks": [{"check": "tests", "outcome": "pass", "reference": "retained"}],
                                     "lane_check": "retained"}))
@@ -430,7 +433,10 @@ def test_closed_dispatch_lease_and_missing_brief_are_history(pilot, tmp_path):  
     rows = sections(answer["brief"])
     assert ready["lease_ref"] not in json.dumps(rows["Approved scope"])
     assert not rows["Open obligations"]
-    assert any(row.get("state") == "unverified" for row in rows["Evidence references"])
+    history = [row for row in rows["Evidence references"] if row["kind"] == "mailbox_history"]
+    assert len(history) == 1 and history[0]["ref"] == ref(completion["path"])
+    assert history[0]["historical_briefs"] == "not_reverified"
+    assert not any(row["ref"]["path"] == old_brief["path"] for row in rows["Evidence references"])
 
 
 def job_history(tmp_path):
@@ -472,7 +478,7 @@ def test_later_unknown_survives_an_earlier_terminal_until_a_correlated_later_ter
 @secure_publication
 @pytest.mark.parametrize("damage", ["missing", "changed"])
 def test_historical_packets_do_not_block_but_uncertain_packets_do(tmp_path, damage):
-    root, packet, _, unknown, terminal = job_history(tmp_path)
+    root, packet, original, unknown, terminal = job_history(tmp_path)
     set_record_time(unknown, "2026-01-01T00:00:00Z")
     set_record_time(terminal, "2026-01-02T00:00:00Z")
     if damage == "missing":
@@ -480,7 +486,10 @@ def test_historical_packets_do_not_block_but_uncertain_packets_do(tmp_path, dama
     else:
         packet.write_text("changed\n")
     rows = sections(compose(root, "a/orchestrator")["brief"])
-    assert any(row.get("state") == "unverified" for row in rows["Evidence references"])
+    history = [row for row in rows["Evidence references"] if row["kind"] == "mailbox_history"]
+    assert len(history) == 1 and history[0]["ref"] == ref(original["path"])
+    assert history[0]["historical_briefs"] == "not_reverified"
+    assert not any(row["ref"]["path"] == str(packet) for row in rows["Evidence references"])
     set_record_time(unknown, "2026-01-03T00:00:00Z")
     before = files(tmp_path)
     error = compose(root, "a/orchestrator", expect=2)["error"]
@@ -503,11 +512,14 @@ def test_old_read_and_wake_history_is_bounded_and_successor_reads_are_generation
         (wakes / ("history-%03d.json" % index)).write_text(json.dumps(
             {**receipt, "wake_id": "wake-%03d" % index, "state": "started"}))
     answer = compose(root, "a/root")
-    assert answer["entries"] < 20 and sections(answer["brief"])["Unread work"] == []
+    assert answer["entries"] < 20
+    before_bind = sections(answer["brief"])["Unread work"]
+    assert len(before_bind) == 1 and before_bind[0]["state"] == "read_by_predecessor"
     invoke(root, "bind", {"endpoint": "a/root", "host": "host-two", "session": "successor", "expected_generation": 1,
                           "checkpoint": checkpoint})
     rows = sections(compose(root, "a/root")["brief"])
-    assert [row["message_id"] for row in rows["Unread work"]] == ["receipt-note"]
+    assert len(rows["Unread work"]) == 1
+    assert rows["Unread work"][0]["state"] == "read_by_predecessor" and rows["Unread work"][0]["count"] == 1
 
 
 @secure_publication
@@ -516,9 +528,9 @@ def test_json_answer_reports_absent_lifecycle_coverage(pilot):  # noqa: F811
     assert compose(root)["coverage"]["lifecycle"] == "absent"
 
 
-def faulted_cli(root, driver):
+def faulted_cli(root, driver, timeout=30):
     proc = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(TOOL), str(root)],
-                          capture_output=True, text=True, timeout=30,
+                          capture_output=True, text=True, timeout=timeout,
                           env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert not proc.stderr, proc.stderr
     return proc.returncode, json.loads(proc.stdout)
@@ -594,3 +606,260 @@ def test_verify_portable_brief_without_a_journal_or_publication(tmp_path):
     brief.write_text("\n".join(body) + "\n")
     reference = ref(brief)
     assert cli("verify", "--path", brief, "--sha256", reference["sha256"])["ok"] is True
+
+
+def provision_record(root, **changes):
+    value = {"initiative": "a", "source": str(ROOT), "mailbox_root": str(root),
+             "delivery_dir": str(root.parent / "delivery"), **changes}
+    (root.parent / "provision.json").write_text(json.dumps(value))
+    return value
+
+
+@secure_publication
+def test_output_cannot_be_the_mailbox_store(pilot):  # noqa: F811
+    root, _ = pilot
+    destination = root.parent / "briefs"
+    root.rename(destination)
+    before = files(destination.parent)
+    assert "output directory overlaps coordination store" in compose(destination, expect=2)["error"]
+    assert files(destination.parent) == before
+
+
+@pytest.mark.parametrize("store_kind", ["delivery", "store", "board", pytest.param("lifecycle", marks=lifecycle_only)])
+@pytest.mark.parametrize("relation", ["equal", "inside", "around"])
+def test_output_refuses_overlap_with_every_declared_coordination_store(pilot, tmp_path, store_kind, relation):  # noqa: F811
+    root, _ = pilot
+    output = tmp_path / "briefs"
+    store = {"equal": output, "inside": tmp_path, "around": output / "nested-store"}[relation]
+    flags = {}
+    if store_kind == "lifecycle":
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        ledger = Ledger(staging)
+        shutil.copytree(ledger.path, store, dirs_exist_ok=True)
+        flags["lifecycle"] = str(store)
+    else:
+        store.mkdir(parents=True, exist_ok=True)
+        provision_record(root, **{("delivery_dir" if store_kind == "delivery" else store_kind): str(store)})
+        # A command-line override must not stop protecting the provisioned delivery store.
+        flags["delivery_dir"] = str(tmp_path / "safe-delivery")
+    before = files(tmp_path)
+    assert "output directory overlaps coordination store" in compose(root, expect=2, **flags)["error"]
+    assert files(tmp_path) == before
+
+
+@secure_publication
+@pytest.mark.parametrize("record_path", ["initiatives/other/provision.json", "evidence/provision-init.json"])
+def test_store_named_by_another_run_record_is_also_protected(pilot, tmp_path, record_path):  # noqa: F811
+    root, _ = pilot
+    path = tmp_path / record_path
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"store": str(tmp_path / "briefs")}))
+    before = files(tmp_path)
+    assert "output directory overlaps coordination store" in compose(root, expect=2)["error"]
+    assert files(tmp_path) == before and not (tmp_path / "briefs").exists()
+
+
+FROZEN_COMPOSE = ("import datetime,runpy,sys\n"
+                  "class Frozen(datetime.datetime):\n"
+                  "    @classmethod\n"
+                  "    def now(cls,tz=None): return cls(2026,11,7,12,tzinfo=tz)\n"
+                  "datetime.datetime=Frozen\n"
+                  "tool,root=sys.argv[1:]\n"
+                  "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
+                  "runpy.run_path(tool,run_name='__main__')\n")
+
+
+@secure_publication
+@pytest.mark.parametrize("special", ["fifo", "directory"])
+def test_special_destination_refuses_without_hanging_or_writing(pilot, special):  # noqa: F811
+    root, _ = pilot
+    code, first = faulted_cli(root, FROZEN_COMPOSE)
+    assert code == 0
+    path = Path(first["brief"]["path"])
+    path.unlink()
+    if special == "fifo":
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+    before = files(root.parent)
+    code, answer = faulted_cli(root, FROZEN_COMPOSE, timeout=2)
+    assert code == 2 and answer["error"] == "brief must be a regular file"
+    assert files(root.parent) == before
+    assert stat.S_ISFIFO(path.stat().st_mode) if special == "fifo" else path.is_dir()
+
+
+@secure_publication
+def test_returned_path_must_identify_the_written_inode_after_an_ancestor_moves(pilot):  # noqa: F811
+    root, _ = pilot
+    base = root.parent
+    moved = base.with_name(base.name + "-moved")
+    driver = ("import os,runpy,sys\nfrom pathlib import Path\n"
+              "tool,root=sys.argv[1:]\nbase=Path(root).parent\nreal_open=os.open\nmoved=False\n"
+              "def opening(path,flags,*args,**kwargs):\n"
+              "    global moved\n"
+              "    if str(path).startswith('.fresh-') and flags & os.O_CREAT and not moved:\n"
+              "        moved=True\n"
+              "        base.rename(base.with_name(base.name+'-moved'))\n"
+              "        base.mkdir()\n"
+              "    return real_open(path,flags,*args,**kwargs)\n"
+              "os.open=opening\n"
+              "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
+              "runpy.run_path(tool,run_name='__main__')\n")
+    code, answer = faulted_cli(root, driver)
+    assert code == 3 and "published brief pathname no longer identifies written file" in answer["error"]
+    assert list(base.iterdir()) == [] and list((moved / "briefs").iterdir()) == []
+
+
+@secure_publication
+def test_initiative_named_serve_composes_without_operational_import_side_effects(tmp_path):
+    root = tmp_path / "mailbox"
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {"serve/front-door": {}, "serve/orchestrator": {}},
+                          "counterparts": [], "writer_limit": 1})
+    provision_record(root, initiative="serve")
+    answer = cli("compose", "--root", root, "--initiative", "serve", "--endpoint", "serve/orchestrator")
+    assert answer["ok"] is True and sections(answer["brief"])["Role contract"][0]["role"] == "orchestrator"
+
+
+@secure_publication
+@pytest.mark.parametrize("family", ["claude", "codex"])
+@pytest.mark.parametrize("role", ["front-door", "orchestrator", "router", "decider", "implementer", "integrator", "reviewer"])
+def test_template_rendering_exactly_matches_launcher_in_a_separate_process(tmp_path, role, family):
+    endpoint = "a/lane/" + role if role in {"implementer", "integrator", "reviewer"} else "a/" + role
+    root = tmp_path / "mailbox"
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {"a/front-door": {}, "a/orchestrator": {},
+        endpoint: {"kind": role} if "/lane/" in endpoint else {}}, "counterparts": [], "writer_limit": 1})
+    write_plan(SimpleNamespace(base=tmp_path), hierarchy="a", team="claude-code" if family == "claude" else "codex-cli", stand_ins={})
+    answer = compose(root, endpoint)
+    text = Path(answer["brief"]["path"]).read_text()
+    inline = "\n".join(line[2:] for line in text.splitlines() if line.startswith("> "))
+    driver = ("import json,sys\nfrom types import SimpleNamespace\n"
+              "from pathlib import Path\nsource,root,endpoint,family=sys.argv[1:]\n"
+              "sys.argv=[str(Path(source)/'tools/hierarchy_launcher.py')]\n"
+              "sys.path.insert(0,str(Path(source)/'tools'))\n"
+              "from hierarchy_launcher import start_prompt\nfrom hierarchy_mailbox import Mailbox\n"
+              "prompt,contracts=start_prompt(SimpleNamespace(mailbox=Mailbox(root),setup={'source':source}),endpoint,family)\n"
+              "print(json.dumps({'text':prompt.partition('\\n\\n')[2].rpartition('\\n\\n')[0],'contracts':contracts}))\n")
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(ROOT), str(root), endpoint, family],
+                          capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    expected = json.loads(proc.stdout)
+    assert inline == expected["text"]
+    assert [row["ref"] for row in sections(answer["brief"])["Role contract"]] == expected["contracts"]
+
+
+@lifecycle_only
+def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pilot, tmp_path):  # noqa: F811
+    root, _ = pilot
+    ledger = Ledger(tmp_path)
+    paths = [str(tmp_path / "declared" / str(index)) + "/" + "/".join(["p" * 100] * 22) for index in range(128)]
+    value = request("large-history", paths=paths)
+    receipt = ledger.publish(value)
+    record = ledger.path / "events" / ("%06d.json" % receipt["sequence"])
+    assert 262144 < len(record.read_bytes()) < 1048576
+    ledger.event("disposition", status="FINAL", resolution={"kind": "next", "request": raw_request(request("pending")),
+                 "evidence": ledger.evidence}, **ledger.target(value))
+    before = files(tmp_path)
+    answer = compose(root)
+    assert answer["entries"] < 20
+    after = files(tmp_path)
+    after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
+    assert after == before
+
+
+@lifecycle_only
+def test_expiry_decisions_are_reproducible_from_explicit_as_of(pilot, tmp_path):  # noqa: F811
+    root, _ = pilot
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("timed", continuation={"members": [], "max_starts": 1, "expires_at": "2026-11-07T12:00:00Z"}))
+    before = compose(root, as_of="2026-11-07T11:59:59Z")
+    after = compose(root, as_of="2026-11-07T12:00:01Z")
+    assert any(row.get("request_id") == "timed" for row in sections(before["brief"])["Approved scope"])
+    assert not any(row.get("request_id") == "timed" for row in sections(after["brief"])["Approved scope"])
+    assert compose(root, as_of="2026-11-07T11:59:59Z") == before
+    body = Path(before["brief"]["path"]).read_text()
+    assert "2026-11-07T11:59:59" in body and "validate expiry live" in body
+
+
+@pytest.mark.parametrize("value", ["yesterday", "2026-11-07T12:00:00-05:00"])
+def test_as_of_requires_rfc3339_utc_without_writes(pilot, value):  # noqa: F811
+    root, _ = pilot
+    before = files(root.parent)
+    assert "invalid --as-of" in compose(root, as_of=value, expect=2)["error"]
+    assert files(root.parent) == before
+
+
+@secure_publication
+@pytest.mark.parametrize("order", ["compose-then-bind", "bind-then-compose"])
+def test_successor_lifetime_reads_use_one_predecessor_aggregate(tmp_path, order):
+    root, delivery, checkpoint = receipt_fixture(tmp_path, endpoint="a/root")
+    for index in range(248):
+        invoke(root, "publish", message(recipient="a/root", identifier="lifetime-%03d" % index))
+    invoke(root, "publish", message(recipient="a/root", identifier="esc-7", kind="escalation"))
+    cursor = None
+    for _ in range(4):
+        flags = {"after": cursor} if cursor else {}
+        page = invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True,
+                      host="host-one", session="a/root", generation=1, limit=100, **flags)
+        cursor = page["next_after"]
+        if cursor is None:
+            break
+    assert cursor is None
+    binding = {"endpoint": "a/root", "host": "host-two", "session": "successor", "expected_generation": 1,
+               "checkpoint": checkpoint}
+    if order == "bind-then-compose":
+        invoke(root, "bind", binding)
+    answer = compose(root, "a/root")
+    rows = sections(answer["brief"])["Unread work"]
+    assert answer["entries"] < 20 and len(rows) == 1
+    aggregate = rows[0]
+    assert aggregate["state"] == "read_by_predecessor" and aggregate["count"] == 250
+    assert aggregate["generation"] == 2 and aggregate["message_types"]["escalation"] == 1
+    assert aggregate["ref"] == ref(aggregate["ref"]["path"])
+    assert "esc-7" in json.loads(Path(aggregate["ref"]["path"]).read_text())["message_ids"]
+    if order == "compose-then-bind":
+        binding["checkpoint"]["briefs"].append(answer["brief"])
+        invoke(root, "bind", binding)
+    own = compose(root, "a/root", target_generation=1, expect=2)
+    assert "target generation precedes current binding" in own["error"]
+
+
+@secure_publication
+def test_explicit_current_target_generation_applies_its_own_reads(tmp_path):
+    root, delivery, _ = receipt_fixture(tmp_path, endpoint="a/root")
+    invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True,
+           host="host-one", session="a/root", generation=1)
+    answer = compose(root, "a/root", target_generation=1)
+    assert sections(answer["brief"])["Unread work"] == []
+    assert "Target generation: 1" in Path(answer["brief"]["path"]).read_text()
+
+
+@secure_publication
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="search-only traversal uses Linux O_PATH")
+def test_search_only_parent_directories_allow_publication(pilot):  # noqa: F811
+    root, _ = pilot
+    base = root.parent
+    (base / "briefs").mkdir()
+    mode = stat.S_IMODE(base.stat().st_mode)
+    base.chmod(0o111)
+    try:
+        answer = compose(root)
+    finally:
+        base.chmod(mode)
+    assert Mailbox(root).brief(answer["brief"])
+
+
+@secure_publication
+def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
+    root, _ = pilot
+    driver = ("import errno,os,runpy,sys\n"
+              "tool,root=sys.argv[1:]\nreal_open=os.open\n"
+              "def opening(path,flags,*args,**kwargs):\n"
+              "    if str(path)=='briefs': raise PermissionError(errno.EACCES,'fixture directory denied')\n"
+              "    return real_open(path,flags,*args,**kwargs)\n"
+              "os.open=opening\n"
+              "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
+              "runpy.run_path(tool,run_name='__main__')\n")
+    code, answer = faulted_cli(root, driver)
+    assert code == 2 and "publication directory permission denied" in answer["error"]
+    assert "changed" not in answer["error"]

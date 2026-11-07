@@ -9,18 +9,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
-from types import SimpleNamespace
 import uuid
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, SHA256, SLUG, TERMINAL_JOB_STATES, cli_path, digest, encoded,  # noqa: E402
-                               endpoint_parts, fields, matching, parse_time, read_bytes, read_json, require,
+                               endpoint_parts, fields, integer, matching, parse_time, read_bytes, read_json, require,
                                safe_path, strict_json, text)
-from hierarchy_lifecycle import Lifecycle, raw_value  # noqa: E402
-from hierarchy_launcher import start_prompt  # noqa: E402
+from hierarchy_lifecycle import Lifecycle, load_json as lifecycle_json, raw_value  # noqa: E402
 from hierarchy_roles import role_name  # noqa: E402
 import hierarchy_hosts  # noqa: E402
 
@@ -88,12 +87,14 @@ class Brief:
             for item in value:
                 self.evidence(item, origin)
 
-    def render(self, endpoint):
-        lines = ["# Fresh thread brief", "<!-- " + SCHEMA + " -->", "", "Endpoint: " + endpoint, "",
+    def render(self, endpoint, as_of, generation):
+        lines = ["# Fresh thread brief", "<!-- " + SCHEMA + " -->", "", "Endpoint: " + endpoint,
+                 "As of: " + as_of, "Target generation: " + str(generation), "",
                  "Resume path: First verify this brief and its references, then read the current binding and checkpoint; "
                  "acknowledge a successor checkpoint through your own connection, page the inbox from your own "
                  "generation's cursor (from the beginning for a new generation), and "
                  "reconcile unknown effects and original job IDs before considering new work. "
+                 "Before resuming, validate expiry live; this snapshot grants no continuing authority. "
                  "Missing records require a hold; this brief grants no authority."]
         for name, items in self.sections.items():
             lines += ["", "## " + name, ""]
@@ -128,6 +129,73 @@ def locate(root, initiative):
     return Mailbox(mailbox_root), base, run, setup
 
 
+def tidy_contract(lines):
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def template_view(content, family, origin):
+    """Pure template rendering, pinned against launcher.start_prompt by subprocess tests.
+
+    Importing the launcher also imports executable MCP startup guards. Keep this
+    small reader local while the allowed change scope excludes the launcher.
+    Marker examples inside Markdown fences remain literal, as in the launcher.
+    """
+    kept, opened, fence = [], None, None
+    for number, line in enumerate(content.splitlines(), 1):
+        if fence is not None:
+            if opened is None or opened[1] == family:
+                kept.append(line)
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + r"{%d,}\s*" % len(fence), line):
+                fence = None
+            continue
+        opening = re.fullmatch(r" {0,3}(`{3,}|~{3,})(.*)", line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence = opening.group(1)
+            if opened is None or opened[1] == family:
+                kept.append(line)
+            continue
+        marker = re.fullmatch(r"<!-- host:([a-z]+) -->", line.strip())
+        if marker:
+            require(opened is None, "unbalanced host markers in %s: line %d opens a nested block" % (origin, number))
+            require(marker.group(1) in {"claude", "codex"}, "invalid host marker in %s: line %d" % (origin, number))
+            opened = (number, marker.group(1))
+        elif line.strip() == "<!-- /host -->":
+            require(opened is not None, "unbalanced host markers in %s: line %d closes no block" % (origin, number))
+            opened = None
+        else:
+            require(re.search(r"<!--\s*/?\s*host\b", line, re.IGNORECASE) is None,
+                    "invalid host marker in %s: line %d" % (origin, number))
+            if opened is None or opened[1] == family:
+                kept.append(line)
+    require(opened is None, "unbalanced host markers in " + str(origin))
+    return tidy_contract(kept)
+
+
+def contract_text(source, role, family):
+    folder = source / "tools/hierarchy_templates/roles"
+    path = folder / ("lane.md" if role == "implementer" else role + ".md")
+    files = ([folder / "lane.md"] if role in {"reviewer", "integrator"} else []) + [path]
+    parts, contracts = [], []
+    for each in files:
+        require(each.is_file(), "no role contract for %s: %s" % (role, each))
+        raw = safe_path(each).read_bytes()
+        contracts.append({"path": str(each), "sha256": hashlib.sha256(raw).hexdigest()})
+        parts.append(template_view(raw.decode("utf-8"), family, each))
+    if len(parts) > 1:
+        headings = ("## Assignments", "## Protocol checklist")
+        require(all(heading in parts[-1].splitlines() for heading in headings),
+                "%s must restate lane.md's %s for its kind" % (path, " and ".join(headings)))
+        headings += ("## Writing rules",) if role == "reviewer" else ()
+        kept, skipping = [], False
+        for line in parts[0].splitlines():
+            if line.startswith(("# ", "## ")):
+                skipping = line.strip() in headings
+            if not skipping:
+                kept.append(line)
+        parts[0] = tidy_contract(kept)
+    return "\n\n".join(parts), contracts
+
+
 def role_contract(brief, mailbox, base, setup, endpoint):
     role = role_name(endpoint, mailbox.endpoint(endpoint).get("kind"))
     plan = hierarchy_hosts.base_plan(base, endpoint_parts(endpoint)[0])
@@ -140,9 +208,7 @@ def role_contract(brief, mailbox, base, setup, endpoint):
         # ROOT never starts through the launcher, so its contract is referenced, not inlined.
         contracts = [file_ref(source / "tools/hierarchy_templates/roles/root.md")]
     else:
-        prompt, contracts = start_prompt(SimpleNamespace(mailbox=mailbox, setup={"source": str(source)}), endpoint, family)
-        # The launcher header asserts it started the actor; a composition cannot make that assertion.
-        brief.inline = prompt.partition("\n\n")[2].rpartition("\n\n")[0]
+        brief.inline, contracts = contract_text(source, role, family)
     for contract in contracts:
         check_ref(contract)
         brief.add("Role contract", "role_contract", contract, role=role, family=family)
@@ -160,7 +226,7 @@ def lifecycle_records(brief, directory, at):
     events, created, latest = [], {}, {}
     for sequence in range(1, status["sequence"] + 1):
         path = directory / "events" / ("%06d.json" % sequence)
-        record = read_json(path)
+        record = lifecycle_json(path)
         event = record["envelope"]["event"]
         events.append(record)
         identifier = event.get("request_id")
@@ -175,7 +241,7 @@ def lifecycle_records(brief, directory, at):
     if events:
         brief.add("Evidence references", "lifecycle_head", file_ref(directory / "events" / ("%06d.json" % status["sequence"])),
                   sequence=status["sequence"], journal_head_sha256=status["head"])
-    brief.evidence(read_json(directory / "policy.json")["authority"], policy_ref)
+    brief.evidence(lifecycle_json(directory / "policy.json")["authority"], policy_ref)
 
     def reference(record):
         return file_ref(directory / "events" / ("%06d.json" % record["sequence"]))
@@ -315,10 +381,9 @@ def job_state(receipts):
     return state, witness
 
 
-def unread_records(brief, mailbox, endpoint, delivery, records, binding):
+def unread_records(brief, mailbox, endpoint, delivery, records, generation):
     mailbox.delivery_directory(delivery)
-    generation = binding["generation"] if binding else None
-    read_ids, wakes = set(), {}
+    read_ids, own_reads, predecessor_reads, wakes = set(), set(), set(), {}
     receipts = {}
     for kind in ("reads", "wakes"):
         values = mailbox.delivery_receipts(delivery, kind, endpoint, records)
@@ -330,14 +395,29 @@ def unread_records(brief, mailbox, endpoint, delivery, records, binding):
             path, _ = max(receipts[kind], key=lambda item: (parse_time(item[1]["at"]), str(item[0])))
             brief.add("Evidence references", "delivery_" + ("read" if kind == "reads" else "wake"), file_ref(path))
     for _, receipt in receipts["reads"]:
+        read_ids.update(receipt["message_ids"])
         if receipt["generation"] == generation:
-            read_ids.update(receipt["message_ids"])
-    failed = {value["wake_id"] for _, value in receipts["wakes"] if value["state"] == "failed_to_start"}
+            own_reads.update(receipt["message_ids"])
+        elif receipt["generation"] < generation:
+            predecessor_reads.update(receipt["message_ids"])
+    predecessor_reads -= own_reads
+    if predecessor_reads:
+        candidates = [(path, value) for path, value in receipts["reads"]
+                      if value["generation"] < generation and predecessor_reads.intersection(value["message_ids"])]
+        path, _ = max(candidates, key=lambda item: (parse_time(item[1]["at"]), str(item[0])))
+        counts = {}
+        for identifier in sorted(predecessor_reads):
+            kind = records[identifier]["message"]["type"]
+            counts[kind] = counts.get(kind, 0) + 1
+        brief.add("Unread work", "predecessor_reads", file_ref(path), state="read_by_predecessor",
+                  count=len(predecessor_reads), generation=generation, message_types=counts)
+    failed = {(value["generation"], value["wake_id"]) for _, value in receipts["wakes"] if value["state"] == "failed_to_start"}
     for path, receipt in receipts["wakes"]:
-        if receipt["generation"] == generation and receipt["state"] == "started" and receipt["wake_id"] not in failed:
+        if receipt["state"] == "started" and (receipt["generation"], receipt["wake_id"]) not in failed:
             for identifier in receipt["message_ids"]:
                 wakes[identifier] = path
-    brief.notes["Unread work"].append("Read coverage is for binding generation %s; a successor starts its own inbox cursor." % generation)
+    brief.notes["Unread work"].append("Reads were applied for target generation %s. Predecessor-only reads are aggregated; "
+                                      "never-read messages are listed individually." % generation)
     unread, after = set(), None
     while True:
         page = mailbox.inbox(endpoint, limit=100, after=after)
@@ -354,20 +434,18 @@ def unread_records(brief, mailbox, endpoint, delivery, records, binding):
         after = page["next_after"]
 
 
-def mailbox_records(brief, mailbox, endpoint, initiative, delivery, at):
+def mailbox_records(brief, mailbox, endpoint, initiative, delivery, at, generation, binding):
     records = mailbox.messages()
     relevant = {key: row for key, row in records.items()
                 if initiative in (endpoint_parts(row["message"]["from"])[0], endpoint_parts(row["message"]["to"])[0])}
     closed, accepted = mailbox.dispatch_history(records)
-    history = mailbox.bindings(endpoint)
-    binding = history[-1] if history else None
     if binding:
         origin = file_ref(mailbox.root / "bindings" / endpoint / ("%06d.json" % binding["generation"]))
         brief.add("Evidence references", "binding", origin, generation=binding["generation"])
         if binding["checkpoint"]:
             # Old checkpoints remain records, not a source of currently held leases.
             brief.add("Evidence references", "checkpoint_history", origin, state="unverified")
-    unread = unread_records(brief, mailbox, endpoint, delivery, records, binding)
+    unread = unread_records(brief, mailbox, endpoint, delivery, records, generation)
     historical = []
 
     def evidence(record):
@@ -469,13 +547,65 @@ def inspect(raw):
     return count
 
 
+def composition_time(value):
+    if value is None:
+        value = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2})(?:\.(\d+))?(?:[Zz]|\+00:00)", value)
+    require(match is not None, "invalid --as-of: expected RFC3339 UTC")
+    seconds = match.group(1).upper()
+    fraction = (match.group(2) or "").rstrip("0")
+    try:
+        # Expiry records have microsecond precision. Retain the full input time
+        # in the brief; truncation cannot cross an expiry on that precision grid.
+        at = parse_time(seconds + "." + fraction[:6].ljust(6, "0") + "Z")
+    except ValueError as exc:
+        raise ValueError("invalid --as-of: expected RFC3339 UTC") from exc
+    return at, seconds + ("." + fraction if fraction else "") + "Z"
+
+
+def protect_stores(output, mailbox, base, run, lifecycle, delivery, setup):
+    """Reject overlap in either direction, including stores declared by other run provisions."""
+    output = safe_path(output)
+    stores = {mailbox.root, lifecycle, delivery, run / "lifecycle", run / "store", base / "delivery"}
+    provisions = {base / "provision.json", run / "evidence/provision-init.json", run / "inputs/provision-init.json"}
+    folder = safe_path(run / "initiatives")
+    if folder.is_dir():
+        provisions.update(safe_path(path) / "provision.json" for path in sorted(folder.iterdir()) if path.is_dir())
+    values = [setup] if setup is not None else []
+    for path in sorted(provisions):
+        path = safe_path(path)
+        if path.exists():
+            values.append(read_json(path))
+    for record in values:
+        require(isinstance(record, dict), "invalid provision record")
+        for key in ("store", "board", "mailbox_root", "delivery_dir"):
+            if key in record:
+                stores.add(safe_path(text(record[key], "provision " + key)))
+    for store in sorted(stores):
+        store = safe_path(store)
+        require(output != store and store not in output.parents and output not in store.parents,
+                "output directory overlaps coordination store: " + str(store))
+
+
 def prepare(args):
     matching(args.initiative, SLUG, "initiative")
     require(endpoint_parts(args.endpoint)[0] == args.initiative, "endpoint is outside initiative " + args.initiative)
     mailbox, base, run, setup = locate(cli_path(args.root, "--root"), args.initiative)
     mailbox.endpoint(args.endpoint)
+    at, as_of = composition_time(args.as_of)
+    history = mailbox.bindings(args.endpoint)
+    binding = history[-1] if history else None
+    current = binding["generation"] if binding else 1
+    generation = args.target_generation
+    if generation is None:
+        generation = current + 1 if binding and mailbox.ready(binding) else current
+    integer(generation, "target generation")
+    require(generation >= current, "target generation precedes current binding")
+    lifecycle = cli_path(args.lifecycle, "--lifecycle") if args.lifecycle else safe_path(run / "lifecycle")
+    delivery = cli_path(args.delivery_dir, "--delivery-dir") if args.delivery_dir else safe_path(
+        setup["delivery_dir"] if setup else base / "delivery")
+    protect_stores(base / "briefs", mailbox, base, run, lifecycle, delivery, setup)
     brief = Brief()
-    at = datetime.now(timezone.utc)
     role_contract(brief, mailbox, base, setup, args.endpoint)
     brief.add("Source identity", "mailbox_identity", file_ref(mailbox.root / "manifest.json"))
     if setup:
@@ -483,25 +613,22 @@ def prepare(args):
                   **{key: setup[key] for key in ("source", "source_commit", "source_tree") if key in setup})
     else:
         brief.notes["Source identity"].append("No provisioned runtime pin recorded; contracts come from the composer's checkout.")
-    lifecycle = cli_path(args.lifecycle, "--lifecycle") if args.lifecycle else safe_path(run / "lifecycle")
     if args.lifecycle or lifecycle.exists():
         lifecycle_records(brief, lifecycle, at)
         lifecycle_coverage = "journal_wide_registered_requests"
     else:
         lifecycle_coverage = "absent"
         brief.notes["Open obligations"].append("No lifecycle journal recorded at the default location; supply --lifecycle for an external journal.")
-    delivery = cli_path(args.delivery_dir, "--delivery-dir") if args.delivery_dir else safe_path(
-        setup["delivery_dir"] if setup else base / "delivery")
     brief.notes["Unread work"].append("Messages without a recorded read remain unread; a wake is not a read.")
-    mailbox_records(brief, mailbox, args.endpoint, args.initiative, delivery, at)
-    raw = brief.render(args.endpoint)
+    mailbox_records(brief, mailbox, args.endpoint, args.initiative, delivery, at, generation, binding)
+    raw = brief.render(args.endpoint, as_of, generation)
     inspect(raw)  # All validation precedes mkdir or creation of a temporary file.
     sha = hashlib.sha256(raw).hexdigest()
     reference = {"path": str(base / "briefs" / ("fresh-" + sha + ".md")), "sha256": sha}
     mailbox.brief(reference, verify=False)
     require_secure_publication()
     return raw, {"ok": True, "brief": reference, "entries": len(brief.seen),
-                 "coverage": {"lifecycle": lifecycle_coverage}}
+                 "coverage": {"lifecycle": lifecycle_coverage}, "as_of": as_of, "target_generation": generation}
 
 
 class PublicationRefused(ValueError):
@@ -520,27 +647,63 @@ def require_secure_publication():
 
 def open_directory(path):
     """Traverse from the filesystem root, opening every component without following links."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptor = os.open(path.anchor, flags)
+    flags = directory_flags()
+    descriptor = None
     try:
+        descriptor = os.open(path.anchor, flags)
         for component in path.parts[1:]:
             child = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
         return descriptor
     except OSError as exc:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        if exc.errno == errno.EACCES:
+            raise PublicationRefused("publication directory permission denied: " + str(path)) from exc
         raise PublicationRefused("publication directory changed or unavailable") from exc
+
+
+def directory_flags():
+    # Linux O_PATH needs search permission only. Other supported POSIX hosts
+    # retain O_RDONLY where no search-only directory handle is exposed.
+    return getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def check_directory(base_fd, directory_fd, name):
     try:
         current = os.stat(name, dir_fd=base_fd, follow_symlinks=False)
     except OSError as exc:
+        if exc.errno == errno.EACCES:
+            raise PublicationRefused("publication directory permission denied: " + name) from exc
         raise PublicationRefused("publication directory changed") from exc
     opened = os.fstat(directory_fd)
     if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
         raise PublicationRefused("publication directory changed")
+
+
+def file_identity(value):
+    return value.st_dev, value.st_ino
+
+
+def check_returned_path(path, identity):
+    try:
+        returned = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError("published brief pathname no longer identifies written file: " + str(path)) from exc
+    if file_identity(returned) != identity:
+        raise RuntimeError("published brief pathname no longer identifies written file: " + str(path))
+
+
+def remove_written_file(directory_fd, name, identity):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    # Another composer can have replaced the same content address. Remove only
+    # our inode; never delete the other tool's publication during cleanup.
+    if file_identity(current) == identity:
+        os.unlink(name, dir_fd=directory_fd)
 
 
 def publish(raw, reference):
@@ -551,34 +714,46 @@ def publish(raw, reference):
     pending = None
     try:
         try:
-            os.mkdir(path.parent.name, mode=0o700, dir_fd=base_fd)
-        except FileExistsError:
-            pass
-        try:
-            directory_fd = os.open(path.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
+            try:
+                directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(path.parent.name, mode=0o700, dir_fd=base_fd)
+                except FileExistsError:
+                    pass  # Another composer created the same output directory.
+                directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
         except OSError as exc:
+            if exc.errno == errno.EACCES:
+                raise PublicationRefused("publication directory permission denied: " + str(path.parent)) from exc
             if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
                 raise PublicationRefused("publication directory changed") from exc
             raise
         check_directory(base_fd, directory_fd, path.parent.name)
         try:
-            existing = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            existing = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
         except FileNotFoundError:
             existing = None
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise PublicationRefused("content-addressed brief is a symlink") from exc
+            if not stat.S_ISREG(os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
+                raise PublicationRefused("brief must be a regular file") from exc
             raise
         if existing is not None:
+            metadata = os.fstat(existing)
+            if not stat.S_ISREG(metadata.st_mode):
+                os.close(existing)
+                raise PublicationRefused("brief must be a regular file")
             with os.fdopen(existing, "rb") as stream:
-                require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "brief must be a regular file")
                 if stream.read(MAX_BYTES + 1) != raw:
                     raise PublicationRefused("content-addressed brief already exists with different bytes")
             check_directory(base_fd, directory_fd, path.parent.name)
+            check_returned_path(path, file_identity(metadata))
             return
         pending = ".fresh-" + uuid.uuid4().hex
         descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
         with os.fdopen(descriptor, "wb") as stream:
+            identity = file_identity(os.fstat(stream.fileno()))
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
@@ -587,8 +762,9 @@ def publish(raw, reference):
         pending = None
         try:
             check_directory(base_fd, directory_fd, path.parent.name)
-        except PublicationRefused:
-            os.unlink(path.name, dir_fd=directory_fd)
+            check_returned_path(path, identity)
+        except (PublicationRefused, RuntimeError):
+            remove_written_file(directory_fd, path.name, identity)
             raise
     finally:
         if directory_fd is not None:
@@ -611,6 +787,9 @@ def main(argv=None):
     compose.add_argument("--endpoint", required=True)
     compose.add_argument("--lifecycle", help="External lifecycle journal; default <run>/lifecycle")
     compose.add_argument("--delivery-dir", help="Read/wake receipts; default provisioned or <base>/delivery")
+    compose.add_argument("--as-of", help="RFC3339 UTC snapshot time for expiry decisions; default now")
+    compose.add_argument("--target-generation", type=int,
+                         help="Read generation; default the next generation for a ready binding, otherwise the current one")
     verify = commands.add_parser("verify")
     verify.add_argument("--path", required=True)
     verify.add_argument("--sha256", required=True)

@@ -9,15 +9,35 @@ reconciliation of uncertain effects before new work.
 
 `--root` also accepts the initiative base or the mailbox root used by handoff
 entries. The output is `<mailbox-parent>/briefs/fresh-<sha256>.md`, published with
-a temporary file and `os.replace`. Publication opens every directory component
-with `O_DIRECTORY|O_NOFOLLOW`, then creates and replaces files relative to the
-opened directory descriptors. A swapped directory is refused; its symlink target
-is never written. Platforms without these operations refuse before writing.
+a temporary file and `os.replace`. Publication uses directory descriptors,
+`O_DIRECTORY|O_NOFOLLOW`, and Linux `O_PATH` where available so ancestors need
+only search permission (`O_RDONLY` otherwise). Special destinations are opened
+nonblocking and refused before reading unless their descriptor is a regular file.
+The returned pathname must identify the written `(st_dev, st_ino)` after rename;
+on mismatch the composer removes its own inode through the descriptor and exits 3.
+Platforms without the required descriptor operations refuse before writing.
+
+The threat model covers misconfiguration, accidents, concurrent tools and other
+users. It does **not** cover a hostile process of the same user swapping path
+components mid-command, matching the team command's ADR sections 3 and 7. The
+composer does not retain and revalidate every ancestor identity. Before creating
+anything, it rejects output-directory overlap in either direction with the
+mailbox, lifecycle journals, delivery directories, workspace/board stores and the
+stores named in the run's provision records (including other initiatives and
+retained provision inputs/evidence). An override does not unprotect a recorded store.
+
 The JSON answer's `brief` object has exactly
-`path` and `sha256`, for the existing handoff `briefs` field. Identical records
-produce identical bytes and paths. Every entry has a durable path and byte hash;
-only the role contract is inlined, using the launcher's role-kind and host-family
-rendering. ROOT's contract is referenced only, since the launcher never starts it.
+`path` and `sha256`, for the existing handoff `briefs` field. Identical records,
+`--as-of` and target generation produce identical bytes and paths. Every entry has
+a durable path and byte hash. Role contracts are read directly from the same
+templates; subprocess tests pin text equality with `launcher.start_prompt` for
+every launched role and host family. The composer imports no operational prompt
+renderer. ROOT's contract is referenced only, since the launcher never starts it.
+
+`--as-of <RFC3339 UTC>` accepts `Z` or `+00:00`, defaults to now, and is recorded
+in the brief and JSON answer. It supplies every expiry comparison. This is an
+explicit snapshot input, not ongoing authority: a resume must validate expiry
+live, as the resume line requires. Supply the same time when reproducing a brief.
 
 The global bound is **256 entries**, counting each JSON bullet across all seven
 sections, including evidence and contract references. Individual entries describe
@@ -35,15 +55,26 @@ order, bound and primary references. Exit codes are 0 success, 2 refusal before
 writing, and 3 publication/internal error.
 
 Lifecycle data comes from `<run>/lifecycle`; use `--lifecycle` for an external
-journal. It is journal-wide because requests do not identify a mailbox endpoint.
+journal. Events and policy use the lifecycle reader's 1 MiB record limit, not the
+mailbox reader's 256 KiB limit. Coverage is journal-wide because requests do not
+identify a mailbox endpoint.
 The JSON answer reports `coverage.lifecycle` as `journal_wide_registered_requests`
 or `absent`. Successor requests created inside `disposition`/`resolve` with a
 `next` resolution refer to that creating event, even without a later publish.
 Read/wake receipts come from the provisioned delivery directory or `<base>/delivery`
 (override with `--delivery-dir`). The composer pages `Mailbox.inbox` and retains
-every message without a read by the current binding generation, including woken
-messages. A predecessor's read does not count for a successor. The resume line
-also directs a new generation to begin paging at the start of its own inbox.
+every message read by no generation individually, including woken messages.
+Messages read only by predecessors form one `read_by_predecessor` entry: a count,
+counts by message type (including escalations), and the latest applicable read
+receipt's path and sha256. That receipt locates read history; it does not
+authenticate every earlier receipt. A target generation's own reads are excluded.
+`--target-generation N` selects which generation's reads apply and is recorded in
+the brief and JSON answer. The default is current + 1 for a ready binding (compose
+before succession), or current for an unacknowledged successor (compose after
+bind); an unbound endpoint targets generation 1. Override the default when
+composing for an already acknowledged current generation. Targets older than the
+current binding refuse. The resume line directs each new generation to start its
+own inbox cursor. This keeps both compose-then-bind and bind-then-compose bounded.
 Only the latest read/wake receipt is a standalone evidence entry; unread messages
 can reference their wake receipt directly. Missing receipt history cannot
 establish that anything was read. Unknown lifecycle effects and open jobs retain
