@@ -323,8 +323,9 @@ def validate_plan(value):
         parts = _endpoint(name)
         require(parts is not None and parts[0] == hierarchy,
                 "host plan stand-in %s is not an endpoint of %s" % (str(name)[:256], hierarchy))
-        # ROOT decides for the run, so it can never be a binding that runs nothing.
-        require(parts[1] != "root", "host plan stand-in %s is ROOT, which always runs a host" % name)
+        # The front door's binding is the only one that never runs a host (the owner's mail goes through the mailbox
+        # CLI); any other stand-in would bind a role that does run, unqualified.
+        require(parts[1] == "front-door", "only the front door may be a stand-in, not %s" % name)
         # Any host kind: a stand-in never runs, so its label is recorded, not qualified (ADR T2(a) §1).
         require(isinstance(kind, str) and kind in HOST_KINDS,
                 "host plan stand-in %s has unknown host kind %s" % (name, repr(kind)[:80]))
@@ -364,6 +365,20 @@ def base_plan(base, hierarchy):
     return plan
 
 
+def governing_plan(base, mailbox_root, hierarchy):
+    """The plan for bindings made through `base` into `mailbox_root`, or None when neither the base nor the mailbox's own
+    base has one. A provision.json copied elsewhere still names the original mailbox, so both are read; two plans must
+    agree."""
+    base, home = Path(base), Path(mailbox_root).parent
+    plan = base_plan(base, hierarchy)
+    if base.exists() and home.exists() and base.samefile(home):
+        return plan
+    other = base_plan(home, hierarchy)
+    if plan is not None and other is not None and plan != other:
+        raise ValueError("host plans in %s and %s differ" % (base, home))
+    return plan if plan is not None else other
+
+
 def plan_host(plan, endpoint):
     """(host kind, stand-in) the plan assigns this endpoint; (None, False) when no plan covers it."""
     if plan is None:
@@ -389,6 +404,9 @@ def require_binding(plan, endpoint, host, writer):
     if host != expected:
         raise ValueError("%s runs on %s in this run's host plan, not %s" % (endpoint, expected, host))
     if stand_in:
+        # validate_plan admits only the front door, which writes no source; this holds for a plan that skipped it.
+        require(type(writer) is bool, "writer must be a bool")
+        require(not writer, "%s cannot be a stand-in: its role writes source" % endpoint)
         return dict(STAND_IN_SCOPE)
     return qualify(host, writer)
 
