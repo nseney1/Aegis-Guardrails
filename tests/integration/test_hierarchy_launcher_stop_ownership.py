@@ -246,8 +246,8 @@ def test_ps_fallback_ignores_unrelated_quotes(monkeypatch, noise):
     is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=0, stdout=("99 99 {uid} S Sat Nov 7 12:00:00 2026 less {noise}\n"
-                             "123 123 {uid} S Sat Nov 7 12:00:00 2026 /opt/codex exec resume {session} {noise}\n").format(
+        returncode=0, stdout=("99 99 1 {uid} {uid} S Sat Nov 7 12:00:00 2026 less {noise}\n"
+                             "123 123 1 {uid} {uid} S Sat Nov 7 12:00:00 2026 /opt/codex exec resume {session} {noise}\n").format(
                                  uid=os.geteuid(), noise=noise, session=session)))
 
     assert module.session_processes(session, set()) == [(123, 123)]
@@ -261,8 +261,8 @@ def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
     is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=0, stdout="123 123 %d S Sat Nov 7 12:00:00 2026 /opt/host tools/codex exec resume %s\n" %
-                            (os.geteuid(), session)))
+        returncode=0, stdout="123 123 1 %d %d S Sat Nov 7 12:00:00 2026 /opt/host tools/codex exec resume %s\n" %
+                            (os.geteuid(), os.geteuid(), session)))
     unowned = []
 
     assert module.session_processes(session, set(), "codex-cli", unowned) == []
@@ -283,7 +283,8 @@ def test_observed_claude_argv_shapes(monkeypatch, argv, matched):
     module = launcher_module()
     session = str(uuid.uuid4())
     argv = [session if word == "<uuid>" else word for word in argv]
-    row = module.ProcessSnapshot(123, 123, "S", os.geteuid(), "1", b"\0".join(os.fsencode(a) for a in argv), tuple(argv))
+    row = module.ProcessSnapshot(123, 123, "S", os.geteuid(), "1", b"\0".join(os.fsencode(a) for a in argv), tuple(argv),
+                                 1, os.geteuid())
     monkeypatch.setattr(module, "process_census", lambda _session: module.ProcessCensus([row], "proven"))
 
     assert module.session_processes(session, set(), "claude-code") == ([(123, 123)] if matched else [])
@@ -388,19 +389,18 @@ def test_stop_spares_another_sessions_prompt(launch, children):
 
 
 def test_stop_spares_another_users_matching_process(launch, children, monkeypatch, capsys):
-    from types import SimpleNamespace
-
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
     held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    module, stat = launcher_module(), os.stat
+    module, read = launcher_module(), Path.read_bytes
 
-    def other_uid(path, *args, **kwargs):
-        if os.fspath(path) == "/proc/%d" % held.pid:
-            return SimpleNamespace(st_uid=os.geteuid() + 1)
-        return stat(path, *args, **kwargs)
+    def other_uid(path):
+        value = read(path)
+        if str(path) == "/proc/%d/status" % held.pid:
+            return status_uids(value, os.geteuid() + 1, os.geteuid() + 1)
+        return value
 
-    monkeypatch.setattr(os, "stat", other_uid)
+    monkeypatch.setattr(Path, "read_bytes", other_uid)
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert held.poll() is None
@@ -432,7 +432,7 @@ def test_stop_rechecks_the_census_before_signalling(launch, children, monkeypatc
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert held.poll() is None
-    assert held.pid in stopped["unowned_pids"] and stopped["pids"] == []
+    assert "unowned_pids" not in stopped and stopped["pids"] == []
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"),
@@ -494,8 +494,8 @@ def test_ps_fallback_checks_uid_and_positional_selectors(monkeypatch, uid_offset
     module, session, is_dir = launcher_module(), str(uuid.uuid4()), Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0,
-        stdout="123 123 %d S Sat Nov 7 12:00:00 2026 %s\n" %
-               (os.geteuid() + uid_offset, arguments.format(session=session))))
+        stdout="123 123 1 %d %d S Sat Nov 7 12:00:00 2026 %s\n" %
+               (os.geteuid() + uid_offset, os.geteuid() + uid_offset, arguments.format(session=session))))
     unowned = []
     assert module.session_processes(session, set(), "claude-code", unowned) == ([(123, 123)] if matched else [])
     assert unowned == ([] if matched else [123])
@@ -542,3 +542,246 @@ def test_stop_records_a_signal_permission_failure(launch, children, monkeypatch,
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
     assert held.poll() is None
+
+
+def status_uids(value, real, effective):
+    return b"\n".join(b"Uid:\t%d\t%d\t%d\t%d" % (real, effective, effective, effective)
+                      if line.startswith(b"Uid:") else line for line in value.split(b"\n"))
+
+
+def present_argv(monkeypatch, process, argv):
+    """Keep a real held child, replacing only its kernel argv at the OS boundary."""
+    read = Path.read_bytes
+
+    def shown(path):
+        if str(path) == "/proc/%d/cmdline" % process.pid:
+            return b"\0".join(os.fsencode(word) for word in argv) + b"\0"
+        return read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", shown)
+
+
+@pytest.mark.parametrize("host,other", [("codex-cli", False), ("codex-cli", True),
+                                       ("claude-code", False), ("claude-code", True)])
+def test_fallback_matches_the_launchers_real_argv(launch, children, monkeypatch, capsys, host, other):
+    from types import SimpleNamespace
+    from hierarchy_provision import codex_argv
+
+    session = str(uuid.uuid4())
+    role = launch.add_role(REVIEW, host, session=session)
+    selected = str(uuid.uuid4()) if other else session
+    if host == "codex-cli":
+        profile = json.loads(Path(role["codex_profile"]).read_text())
+        argv = codex_argv(profile, ["resume", selected, session])
+    else:
+        argv = [selected if word == session else word for word in role["start_argv"]] + [session]
+    held = children(sys.executable, "-c", CHILD)
+    module, is_dir = launcher_module(), Path.is_dir
+    monkeypatch.setattr(module, "ancestors", lambda: {os.getpid()})
+    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+
+    def ps(command, **options):
+        if held.poll() is not None:
+            return SimpleNamespace(returncode=1 if "-p" in command else 0, stdout="")
+        columns = command[command.index("-o") + 1].replace("=", "").split(",")
+        values = {"pid": str(held.pid), "pgid": str(held.pid), "ppid": str(os.getpid()),
+                  "uid": str(os.geteuid()), "ruid": str(os.geteuid()), "stat": "S",
+                  "lstart": "Sat Nov 7 12:00:00 2026", "args": " ".join(argv)}
+        return SimpleNamespace(returncode=0, stdout=" ".join(values[column] for column in columns) + "\n")
+
+    monkeypatch.setattr(module.subprocess, "run", ps)
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["argv_boundaries"] == "unproven"
+    assert stopped["state"] == ("not_running" if other else "stopped")
+    assert stopped["pids"] == ([] if other else [held.pid])
+    if other:
+        assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
+    else:
+        assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_stop_matches_codex_after_an_option_terminator(launch, children):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "codex-cli", session=session)
+    held = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", "--", session, "prompt")
+    stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
+    assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("option", ["--loader", "--experimental-loader", "--import", "-r", "--require",
+                                  "--env-file", "--conditions", "-C", "--title", "--input-type"])
+def test_stop_matches_node_options_with_separate_values(launch, children, monkeypatch, capsys, option):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    held = children(sys.executable, "-c", CHILD)
+    present_argv(monkeypatch, held, ["node", option, "/opt/l.mjs", "/lib/@anthropic-ai/claude-code/cli.js",
+                                    "--resume", session])
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_stop_spares_an_unknown_node_option_value(launch, children, monkeypatch, capsys):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    held = children(sys.executable, "-c", CHILD)
+    present_argv(monkeypatch, held, ["node", "--unknown-option", "/lib/@anthropic-ai/claude-code/cli.js",
+                                    "--resume", session])
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == [] and stopped["unowned_pids"] == [held.pid]
+    assert held.poll() is None
+
+
+@pytest.mark.parametrize("error", [1, 38, 5])
+def test_stop_falls_back_when_pidfd_open_is_unavailable(launch, children, monkeypatch, capsys, error):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+
+    def unavailable(pid):
+        raise OSError(error, "pidfd unavailable")
+
+    monkeypatch.setattr(os, "pidfd_open", unavailable, raising=False)
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"), raising=False)
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_stop_spares_a_forked_claude_session(launch, children):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, "--fork-session")
+    stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
+    assert stopped["pids"] == [] and stopped["unowned_pids"] == [held.pid]
+    assert held.poll() is None
+
+
+@pytest.mark.parametrize("changed", ["directory", "real", "effective", "missing"])
+def test_stop_uses_real_and_effective_status_uids(launch, children, monkeypatch, capsys, changed):
+    from types import SimpleNamespace
+
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    read, stat = Path.read_bytes, os.stat
+
+    def status(path):
+        value = read(path)
+        if str(path) == "/proc/%d/status" % held.pid:
+            if changed == "missing":
+                return b"\n".join(line for line in value.split(b"\n") if not line.startswith(b"Uid:"))
+            return status_uids(value, os.geteuid() + (changed == "real"), os.geteuid() + (changed == "effective"))
+        return value
+
+    def owner(path, *args, **kwargs):
+        if changed == "directory" and os.fspath(path) == "/proc/%d" % held.pid:
+            return SimpleNamespace(st_uid=os.geteuid() + 1)
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", status)
+    monkeypatch.setattr(os, "stat", owner)
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == ([held.pid] if changed == "directory" else [])
+    if changed == "directory":
+        assert held.wait(timeout=5) == -signal.SIGTERM
+    else:
+        assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
+
+
+def present_family(monkeypatch, family, change=None):
+    """Real children, with group and parent relationships supplied by the kernel boundary."""
+    read, counts = Path.read_bytes, {}
+
+    def stat(path):
+        value = read(path)
+        if path.name == "stat" and path.parent.name.isdigit() and int(path.parent.name) in family:
+            pid = int(path.parent.name)
+            pgid, ppid = family[pid]
+            counts[pid] = counts.get(pid, 0) + 1
+            prefix, _, tail = value.rpartition(b")")
+            fields = tail.split()
+            fields[1], fields[2] = str(ppid).encode(), str(pgid).encode()
+            if change is not None and counts[pid] > 1:
+                change(pid, fields)
+            return prefix + b") " + b" ".join(fields)
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", stat)
+
+
+@pytest.mark.parametrize("parent_owned", [False, True])
+def test_stop_spares_a_group_member_selecting_another_session(launch, children, monkeypatch, capsys, parent_owned):
+    session, other_session = str(uuid.uuid4()), str(uuid.uuid4())
+    launch.add_role(REVIEW, "codex-cli", session=session)
+    leader = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", session)
+    shell = children(str(launch.tmp / "sh"), "-c", CHILD)
+    other = children(str(launch.tmp / "other-host" / "codex"), "-c", CHILD, "exec", "resume", other_session)
+    present_family(monkeypatch, {other.pid: (leader.pid, leader.pid if parent_owned else shell.pid)})
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
+    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert other.poll() is None and shell.poll() is None
+
+
+@pytest.mark.parametrize("changed", [None, "ppid", "birth"])
+def test_stop_checks_the_descendants_entire_parent_chain(launch, children, monkeypatch, capsys, changed):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    middle = children(sys.executable, "-c", CHILD)
+    worker = children(sys.executable, "-c", CHILD)
+
+    def retarget(pid, fields):
+        if pid == middle.pid and changed == "ppid":
+            fields[1] = str(os.getpid()).encode()
+        if pid == middle.pid and changed == "birth":
+            fields[19] = str(int(fields[19]) + 1).encode()
+
+    present_family(monkeypatch, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)}, retarget)
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
+    assert leader.wait(timeout=5) == -signal.SIGTERM
+    if changed is None:
+        assert middle.wait(timeout=5) == worker.wait(timeout=5) == -signal.SIGTERM
+    else:
+        assert middle.poll() is None and worker.poll() is None
+
+
+@pytest.mark.parametrize("changed", ["cmdline", "uid"])
+def test_stop_does_not_report_non_session_group_members_as_unowned(launch, children, monkeypatch, capsys, changed):
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    member = children(sys.executable, "-c", CHILD)
+    present_family(monkeypatch, {member.pid: (leader.pid, leader.pid)})
+    read, counts = Path.read_bytes, []
+    target = "/proc/%d/%s" % (member.pid, "status" if changed == "uid" else "cmdline")
+
+    def replaced(path):
+        value = read(path)
+        if str(path) == target:
+            counts.append(value)
+            if len(counts) > 1:
+                return status_uids(value, os.geteuid() + 1, os.geteuid() + 1) if changed == "uid" else value + b"changed\0"
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", replaced)
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
+    assert leader.wait(timeout=5) == -signal.SIGTERM
+    assert member.poll() is None

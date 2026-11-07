@@ -747,7 +747,8 @@ def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
 @LINUX_HOST_PROGRAMS
 def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace):
     session = launch.start()["session"]
-    stubborn = hold(launch, session, 'trap "" TERM; sleep 30; :', session, start_new_session=True)
+    # Keep the host alive after its worker ends, until cleanup signals the host itself.
+    stubborn = hold(launch, session, 'trap "" TERM; sleep 30; while :; do :; done', session, start_new_session=True)
     try:
         # The sleep starts after the trap is set, so a SIGTERM now is known to be ignored.
         wait_until(lambda: stubborn.pid in owned_pids(session) and len(group(stubborn.pid)) == 2)

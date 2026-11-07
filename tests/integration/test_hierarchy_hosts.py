@@ -22,6 +22,9 @@ import hierarchy_team  # noqa: E402
 
 
 SESSION = "4f1c2b9e-8d7a-4c3b-9a1e-2f6d5c4b3a21"
+NODE_ARITIES = {"--loader": 1, "--experimental-loader": 1, "--import": 1, "-r": 1, "--require": 1,
+                "--env-file": 1, "--conditions": 1, "-C": 1, "--title": 1, "--input-type": 1,
+                "--no-warnings": 0, "--trace-warnings": 0}
 # Claude 2.1.316 print mode, values from a real wake log.
 REAL_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 13, "session_id": SESSION,
                "total_cost_usd": 0.820714,
@@ -129,6 +132,7 @@ def test_an_unknown_host_kind_is_refused_with_its_name(kind):
     ("codex", {"program_basenames": [], "node_script_basenames": [], "node_script_suffixes": []}),
 ])
 def test_host_entrypoints_are_json_data_and_cannot_be_mutated_by_callers(kind, expected):
+    expected["node_option_arities"] = {} if kind == "codex" else dict(NODE_ARITIES)
     described = json.loads(json.dumps(hierarchy_hosts.describe()))
     assert described["hosts"][kind]["entrypoints"] == expected
     described["hosts"][kind]["entrypoints"]["program_basenames"].append("CHANGED")
@@ -157,7 +161,7 @@ def test_hosts_without_process_entrypoints_are_refused():
     ("claude-code", ["node", "--no-warnings", "/nix/store/p/bin/.claude-wrapped"]),
     ("claude-code", ["node", "--no-warnings", "/lib/@anthropic-ai/claude-code/cli.js"]),
     ("claude-code", ["node", "-r", "preload", "--import", "module", "/lib/@anthropic-ai/claude-code/cli.js"]),
-    ("claude-code", ["node", "--require=preload", "-x", "--flag", "--flag=value", "/bin/claude"]),
+    ("claude-code", ["node", "--require=preload", "--no-warnings", "--trace-warnings", "--flag=value", "/bin/claude"]),
     ("codex-cli", ["node", "--require", "module", "/lib/@openai/codex/bin/codex.js"]),
 ])
 def test_node_interpreter_options_precede_the_script(kind, argv):

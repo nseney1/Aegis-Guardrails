@@ -63,14 +63,19 @@ SESSION_SCHEMA = "aegis.team-session/v1"
 STAND_IN_SCOPE = {"boundary": "stand-in: runs no host"}
 START_MODES = ("print", "background", "exec", None)
 SHA256 = re.compile(r"[0-9a-f]{64}")
+NODE_ARITIES = {"--loader": 1, "--experimental-loader": 1, "--import": 1, "-r": 1, "--require": 1,
+                "--env-file": 1, "--conditions": 1, "-C": 1, "--title": 1, "--input-type": 1,
+                "--no-warnings": 0, "--trace-warnings": 0}
 
 _HOSTS = {
     CLAUDE: {
         "family": "claude",
         "entrypoints": {"program_basenames": ("claude", "claude.exe", ".claude-wrapped"),
                         "node_script_basenames": ("claude", ".claude-wrapped"),
-                        "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",)},
+                        "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",),
+                        "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": ("--resume", "--session-id"), "commands": (),
+                              "conflicting_flags": ("--fork-session",),
                               "value_options": ("--model", "--settings", "--permission-mode", "--output-format",
                                                 "--input-format", "--system-prompt", "--append-system-prompt",
                                                 "--mcp-config", "--agent", "--agents", "--tools", "--allowedTools",
@@ -91,8 +96,9 @@ _HOSTS = {
     CODEX: {
         "family": "codex",
         "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex", "codex.js"),
-                        "node_script_suffixes": ()},
+                        "node_script_suffixes": (), "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": (), "commands": (("resume",), ("exec", "resume")),
+                              "conflicting_flags": (),
                               "value_options": ("-c", "--config", "--disable", "--enable", "--sandbox", "-s",
                                                 "-C", "--cd", "--add-dir", "--model", "-m", "--profile", "-p",
                                                 "--output-last-message", "-o", "--output-schema"),
@@ -112,8 +118,10 @@ _HOSTS = {
     # start none, so every role is refused.
     NATIVE: {
         "family": "codex",
-        "entrypoints": {"program_basenames": (), "node_script_basenames": (), "node_script_suffixes": ()},
-        "session_selectors": {"options": (), "commands": (), "value_options": (), "prompt_options": ()},
+        "entrypoints": {"program_basenames": (), "node_script_basenames": (), "node_script_suffixes": (),
+                        "node_option_arities": {}},
+        "session_selectors": {"options": (), "commands": (), "value_options": (), "prompt_options": (),
+                              "conflicting_flags": ()},
         "team_start": None,
         "home": {"variable": "CODEX_HOME", "run_folder": None, "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
@@ -175,8 +183,11 @@ def _host_arguments(kind, argv):
             break
         if option in ("--eval", "--print") or word.startswith(("-e", "-p")):
             return None  # These execute source text rather than a host script.
-        if not equal and option in ("-r", "--require", "--import"):
-            index += 1
+        if not equal:
+            arity = found["node_option_arities"].get(option)
+            if arity is None:
+                return None  # Without a declared arity, the next word might be an option value, not a script.
+            index += arity
     if index >= len(argv):
         return None
     script = Path(argv[index])
@@ -191,19 +202,42 @@ def matches_entrypoint(kind, argv):
     return _host_arguments(kind, argv) is not None
 
 
-def matches_session(kind, argv, session):
-    """A host's own positional selector must name this session, without a conflicting selector."""
-    arguments = _host_arguments(kind, argv)
-    if arguments is None:
-        return False
-    selectors = _host(kind)["session_selectors"]
-    selected, positional, index = [], [], 0
+def _adjacent_selectors(selectors, arguments):
+    """Conservative selectors for ps text, whose configuration values lost their argument boundaries."""
+    selected, conflicting, index = [], False, 0
+    commands = {command[-1] for command in selectors["commands"]}
     while index < len(arguments):
         word = arguments[index]
-        if word == "--":
-            break
         option, equal, value = word.partition("=")
-        if option in selectors["options"]:
+        if option in selectors["conflicting_flags"]:
+            conflicting = True
+        if option in selectors["options"] or word in commands:
+            if not equal:
+                index += 1
+                if word in commands and index < len(arguments) and arguments[index] == "--":
+                    index += 1
+                value = arguments[index] if index < len(arguments) else ""
+            selected.append(value)
+        index += 1
+    return selected, conflicting
+
+
+def _session_values(selectors, arguments, argv_boundaries):
+    if argv_boundaries == "unproven":
+        return _adjacent_selectors(selectors, arguments)
+    selected, positional, index, options = [], [], 0, True
+    while index < len(arguments):
+        word = arguments[index]
+        if options and word == "--":
+            options = False
+            index += 1
+            continue
+        option, equal, value = word.partition("=")
+        if not options:
+            positional.append(word)
+        elif option in selectors["conflicting_flags"]:
+            return selected, True
+        elif option in selectors["options"]:
             if not equal:
                 index += 1
                 value = arguments[index] if index < len(arguments) else ""
@@ -225,7 +259,25 @@ def matches_session(kind, argv, session):
                 tail = positional[len(command) + 1:]
                 selected.extend(tail[i + 1] for i, word in enumerate(tail[:-1]) if word == command[-1])
                 break
-    return bool(selected) and all(value == session for value in selected)
+    return selected, False
+
+
+def matches_session(kind, argv, session, argv_boundaries="proven"):
+    """A host's own selector must name this session, without a conflict or a new-session flag."""
+    arguments = _host_arguments(kind, argv)
+    if arguments is None:
+        return False
+    selected, conflicting = _session_values(_host(kind)["session_selectors"], arguments, argv_boundaries)
+    return bool(selected) and not conflicting and all(value == session for value in selected)
+
+
+def selects_other_session(argv, session):
+    """Even a descendant cannot be cleaned up when its argv selects another host session."""
+    for kind in TEAM_HOSTS:
+        selected, conflicting = _adjacent_selectors(_host(kind)["session_selectors"], argv[1:])
+        if conflicting or any(value != session for value in selected):
+            return True
+    return False
 
 
 def qualify(kind, writer):

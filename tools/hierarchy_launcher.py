@@ -8,8 +8,8 @@ integrator also gets lane.md's shared rules. A codex-cli start takes the prompt 
 session in its first `thread.started` event. A claude-code start runs under a session the launcher chooses, takes
 the prompt on stdin, and is bound only once its stream-json init event reports that session and its transcript is
 under CLAUDE_CONFIG_DIR. A stand-in runs no host, and a native thread belongs to its app: neither is started.
-`resume` runs the pinned wake tool with the bound wake profile, unchanged. `stop` signals the process groups of
-the bound host's programs that name the bound session. `status` reads the
+`resume` runs the pinned wake tool with the bound wake profile, unchanged. `stop` signals the bound host's programs
+that select the bound session and verified descendants in their groups. `status` reads the
 records back.
 ROOT is the owner's session and a native thread belongs to its app: the launcher starts and stops neither.
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -637,6 +638,8 @@ class ProcessSnapshot(NamedTuple):
     start_time: str
     cmdline: bytes
     argv: tuple
+    ppid: int
+    euid: int
 
 
 class ProcessCensus(list):
@@ -647,18 +650,19 @@ class ProcessCensus(list):
 
 def ps_census(pid=None):
     command = ["ps", "-p", str(pid)] if pid is not None else ["ps", "-ax"]
-    shown = subprocess.run([*command, "-ww", "-o", "pid=,pgid=,uid=,stat=,lstart=,args="],
+    shown = subprocess.run([*command, "-ww", "-o", "pid=,pgid=,ppid=,ruid=,uid=,stat=,lstart=,args="],
                            capture_output=True, text=True, timeout=10)
     require(shown.returncode == 0 or (pid is not None and shown.returncode == 1), "process census failed")
     rows = []
     for line in shown.stdout.splitlines():
-        words = line.split(None, 9)
-        if len(words) < 10 or not all(word.isdigit() for word in words[:3]):
+        words = line.split(None, 11)
+        if len(words) < 12 or not all(word.isdigit() for word in words[:5]):
             continue
         # ps is not shell-escaped: quotes are literal, and paths with spaces cannot be recovered here.
         # Linux uses the NUL-separated /proc argv instead; lstart is the fallback's coarser birth timestamp.
-        rows.append(ProcessSnapshot(int(words[0]), int(words[1]), words[3], int(words[2]),
-                                    " ".join(words[4:9]), os.fsencode(words[9]), tuple(words[9].split())))
+        rows.append(ProcessSnapshot(int(words[0]), int(words[1]), words[5], int(words[3]),
+                                    " ".join(words[6:11]), os.fsencode(words[11]), tuple(words[11].split()),
+                                    int(words[2]), int(words[4])))
     return rows
 
 
@@ -668,19 +672,21 @@ def read_process(pid, argv_boundaries="proven"):
         return next(iter(ps_census(pid)), None)
     folder = Path("/proc") / str(pid)
     try:
-        uid = os.stat(folder).st_uid
         fields = (folder / "stat").read_bytes().rpartition(b")")[2].split()
+        status = (folder / "status").read_bytes()
         cmdline = (folder / "cmdline").read_bytes()
     except (FileNotFoundError, ProcessLookupError, PermissionError):
         # A process can end during the census; inaccessible argv cannot establish ownership.
         return None
-    if not cmdline or len(fields) < 20 or not fields[2].isdigit() or not fields[19].isdigit():
+    if not cmdline or len(fields) < 20 or not all(fields[index].isdigit() for index in (1, 2, 19)):
         return None
+    uids = next((line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")), [])
+    uid, euid = (int(uids[0]), int(uids[1])) if len(uids) >= 2 and all(v.isdigit() for v in uids[:2]) else (-1, -1)
     arguments = cmdline.split(b"\0")
     if arguments[-1] == b"":
         arguments.pop()
     return ProcessSnapshot(pid, int(fields[2]), fields[0].decode("ascii"), uid, fields[19].decode("ascii"),
-                           cmdline, tuple(os.fsdecode(a) for a in arguments))
+                           cmdline, tuple(os.fsdecode(a) for a in arguments), int(fields[1]), euid)
 
 
 def process_census(session):
@@ -697,8 +703,12 @@ def names_session(row, session):
     return any(word == session or word.partition("=")[2] == session for word in row.argv)
 
 
-def owns_process(row, session, host):
-    return row.uid == os.geteuid() and hierarchy_hosts.matches_session(host, row.argv, session)
+def our_uid(row):
+    return row.uid == row.euid == os.geteuid()
+
+
+def owns_process(row, session, host, boundaries):
+    return our_uid(row) and hierarchy_hosts.matches_session(host, row.argv, session, boundaries)
 
 
 def session_processes(session, excluded, host=CODEX, unowned=None, observed=None):
@@ -713,33 +723,49 @@ def session_processes(session, excluded, host=CODEX, unowned=None, observed=None
         if row.pid in excluded or row.state.startswith("Z") or not names_session(row, session):
             continue
         # A diagnostic command naming the session must never be signalled.
-        if owns_process(row, session, host):
+        if owns_process(row, session, host, census.argv_boundaries):
             found.append((row.pid, row.pgid))
         elif unowned is not None:
             unowned.append(row.pid)
     return found
 
 
-def unchanged_process(expected, boundaries, session, host, unowned, require_host=True):
+def unchanged_process(expected, boundaries, session, host, unowned, require_host=True, parent=None):
     current = read_process(expected.pid, boundaries)
     if current is None or current.state.startswith("Z"):
         return False
     if (current.start_time != expected.start_time or current.cmdline != expected.cmdline or
-            current.pgid != expected.pgid or current.uid != os.geteuid() or
-            (require_host and not owns_process(current, session, host))):
-        unowned.append(expected.pid)
+            current.pgid != expected.pgid or not our_uid(current) or
+            (current.uid, current.euid) != (expected.uid, expected.euid) or
+            (parent is not None and current.ppid != parent) or
+            (require_host and not owns_process(current, session, host, boundaries))):
+        # A replacement PID, or an unrelated changed group member, is not a process naming this session.
+        if current.start_time == expected.start_time and names_session(current, session):
+            unowned.append(current.pid)
         return False
     return True
 
 
-def signal_process(expected, number, boundaries, session, host, unowned, require_host=True):
-    handle = None
+def signal_process(chain, number, boundaries, session, host, unowned):
+    handles = {}
     try:
-        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-            # Open before verification: this descriptor cannot be retargeted by PID reuse after the check.
-            handle = os.pidfd_open(expected.pid)
-        if not unchanged_process(expected, boundaries, session, host, unowned, require_host):
-            return False
+        for expected in chain:
+            if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+                try:
+                    # Pin every process in the parent chain before rechecking it.
+                    handles[expected.pid] = os.pidfd_open(expected.pid)
+                except OSError as exc:
+                    if exc.errno == errno.ESRCH:
+                        return False
+                    # Older kernels and seccomp may reject pidfds while ordinary signalling still works.
+        for index in reversed(range(len(chain))):
+            expected = chain[index]
+            parent = chain[index + 1].pid if index + 1 < len(chain) else None
+            if not unchanged_process(expected, boundaries, session, host, unowned, parent is None, parent):
+                return False
+            if parent is not None and hierarchy_hosts.selects_other_session(expected.argv, session):
+                return False
+        expected, handle = chain[0], handles.get(chain[0].pid)
         if handle is None:
             os.kill(expected.pid, number)
         else:
@@ -751,32 +777,51 @@ def signal_process(expected, number, boundaries, session, host, unowned, require
         # Retain the attempted host PID so a live process denied by the OS still produces stop_failed.
         return "denied"
     finally:
-        if handle is not None:
+        for handle in handles.values():
             os.close(handle)
+
+
+def descendant_chain(member, census, owners, session):
+    chain, seen = [], set()
+    while member.pid not in seen:
+        seen.add(member.pid)
+        chain.append(member)
+        if member.pid in owners:
+            return chain
+        if not our_uid(member) or hierarchy_hosts.selects_other_session(member.argv, session):
+            return []
+        member = census.get(member.ppid)
+        if member is None:
+            return []
+    return []
+
+
+def process_depth(member, census):
+    seen = set()
+    while member.pid not in seen:
+        seen.add(member.pid)
+        member = census.get(member.ppid)
+        if member is None:
+            break
+    return len(seen)
 
 
 def signal_all(found, number, observed, session, host, unowned, attempted=None):
     census, boundaries = observed["census"], observed["argv_boundaries"]
     attempted = set() if attempted is None else attempted
-    handled = set()
     pids = {pid for pid, _ in found}
-    for pid, pgid in sorted(found, key=lambda pair: (pair[0] != pair[1], pair[0])):
-        if pid in handled:
-            continue
-        handled.add(pid)
-        result = signal_process(census[pid], number, boundaries, session, host, unowned)
-        if not result:
-            continue
-        attempted.add(pid)
-        if result == "sent" and pid == pgid and pgid != os.getpgrp():
-            # Only a verified host leader authorizes group cleanup. Signal retained members individually so
-            # PID reuse and a different user's group member cannot turn killpg into collateral damage.
-            for member in census.values():
-                if member.pgid == pgid and member.pid not in handled and member.pid not in unowned:
-                    handled.add(member.pid)
-                    if signal_process(member, number, boundaries, session, host, unowned, member.pid in pids):
-                        if member.pid in pids:
-                            attempted.add(member.pid)
+    groups = {pgid for _, pgid in found if pgid != os.getpgrp()}
+    targets = [[census[pid]] for pid in pids]
+    for member in census.values():
+        if member.pid not in pids and member.pid not in unowned and member.pgid in groups:
+            chain = descendant_chain(member, census, pids, session)
+            if chain:
+                targets.append(chain)
+    # Children go first so their owned ancestors can still be rechecked at each signal.
+    for chain in sorted(targets, key=lambda rows: process_depth(rows[0], census), reverse=True):
+        result = signal_process(chain, number, boundaries, session, host, unowned)
+        if result and chain[0].pid in pids:
+            attempted.add(chain[0].pid)
     return attempted
 
 
