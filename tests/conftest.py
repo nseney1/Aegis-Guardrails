@@ -156,6 +156,20 @@ def _no_developer_aegis_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+# pytest stores "<node id> (teardown)" in PYTEST_CURRENT_TEST, and Windows refuses an
+# environment value over 32767 characters, so a longer id errors only on Windows. A bytes
+# parameter without ids= once put 64 KiB in an id; failing here reports it on every platform.
+_WINDOWS_ENVIRONMENT_VALUE_LIMIT = 32767
+
+
+@pytest.fixture(autouse=True)
+def _node_id_fits_a_windows_environment_value(request):
+    length = len(request.node.nodeid)
+    if length + len(" (teardown)") > _WINDOWS_ENVIRONMENT_VALUE_LIMIT:
+        pytest.fail("test id is %d characters, too long for PYTEST_CURRENT_TEST on Windows; "
+                    "name long parameters with ids=" % length, pytrace=False)
+
+
 @pytest.fixture(autouse=True)
 def hermetic_environment_and_mcp_isolation():
     """Restore os.environ and reset MCP server singletons between tests."""
