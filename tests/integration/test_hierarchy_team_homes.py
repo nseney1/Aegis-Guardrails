@@ -35,17 +35,43 @@ MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 # The fake's account values: evidence must never hold them.
 IDENTITY = (b"fake@example.invalid", b"fake-org-id", b"Fake Org (test fake)", b"fake-subscription")
 NOT_TRUSTED = "claude auth status does not show this run's claude.ai login: "
+CLEANED = "; removed credentials written by this login"
 # A `claude` that runs the test fake, then plays what a real login could leave behind: a credentials file looser than
 # 0600, or a stored API key that the status call sees although the guard saw none in the owner's shell.
 WRAPPER = r'''#!%(python)s
-import os, subprocess, sys
+import json, os, subprocess, sys, time
+from pathlib import Path
 argv = sys.argv[1:]
 env = dict(os.environ)
+home = Path(env["CLAUDE_CONFIG_DIR"])
+credentials = home / ".credentials.json"
+if argv[:2] == ["auth", "login"] and env.get("WRAP_KEEP_CREDENTIALS"):
+    sys.exit(0)
 if argv[:2] == ["auth", "status"] and os.environ.get("WRAP_STATUS_API_KEY"):
     env["ANTHROPIC_API_KEY"] = "sk-ant-fixture"
+if argv[:2] == ["auth", "status"] and env.get("WRAP_STATUS"):
+    mode = env["WRAP_STATUS"]
+    if mode == "timeout":
+        time.sleep(0.5)
+    proc = subprocess.run([sys.executable, %(fake)r, *argv], env=env, capture_output=True, text=True)
+    answer = json.loads(proc.stdout)
+    if mode == "method":
+        answer["authMethod"] = "api_key"
+    print("{" if mode == "malformed" else json.dumps(answer))
+    sys.exit(7 if mode == "exit" else proc.returncode)
 code = subprocess.call([sys.executable, %(fake)r, *argv], env=env)
-if argv[:2] == ["auth", "login"] and os.environ.get("WRAP_LOOSE_CREDENTIALS"):
-    os.chmod(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".credentials.json"), 0o644)
+if argv[:2] == ["auth", "login"]:
+    mode = env.get("WRAP_CREDENTIALS")
+    if mode in ("missing", "symlink", "hard-link", "fifo"):
+        credentials.unlink()
+        if mode == "symlink":
+            credentials.symlink_to(env["WRAP_TARGET"])
+        elif mode == "hard-link":
+            os.link(env["WRAP_TARGET"], credentials)
+        elif mode == "fifo":
+            os.mkfifo(credentials, 0o600)
+    if mode in ("group-readable", "world-readable") or env.get("WRAP_LOOSE_CREDENTIALS"):
+        credentials.chmod({"group-readable": 0o640, "world-readable": 0o604}.get(mode, 0o644))
 sys.exit(code)
 '''
 
@@ -182,6 +208,113 @@ def test_init_refuses_an_existing_claude_home(make):
     assert run.team("init", expect=2) == {"error": "claude_home %s already exists; init needs a new folder"
                                                    % run.claude_home}
     assert list(run.claude_home.iterdir()) == [] and not (run.run / "team-state.json").exists()
+
+
+def test_claude_only_init_refuses_an_existing_codex_home(make):
+    run = make(CLAUDE, CLAUDE)
+    run.codex_home.mkdir(parents=True)
+    transcript = run.codex_home / "sessions" / "prior.jsonl"
+    transcript.parent.mkdir()
+    transcript.write_bytes(b"prior run\n")
+    before = files(run.run)
+    assert run.team("init", expect=2) == {
+        "error": "codex_home %s already exists; init needs a new folder" % run.codex_home}
+    assert files(run.run) == before and not run.claude_home.exists()
+
+
+@pytest.mark.parametrize("root,team", [(CLAUDE, CLAUDE), (CLAUDE, CODEX), (CODEX, CLAUDE)])
+@pytest.mark.parametrize("tree", [".claude", ".codex"])
+@pytest.mark.parametrize("where", ["exact", "inside", "ancestor-alias", "owner-alias"])
+def test_run_destination_in_either_owner_tree_is_refused_without_writes(make, root, team, tree, where):
+    run = make(root, team)
+    owner = run.home / tree
+    owner.mkdir()
+    (owner / "owner.txt").write_bytes(b"owner bytes\n")
+    alias = run.tmp / "alias"
+    alias.symlink_to(owner)
+    if where == "owner-alias":
+        backing = run.tmp / "owner-backing"
+        owner.rename(backing)
+        owner.symlink_to(backing)
+        destination = backing / "run"
+    else:
+        destination = {"exact": alias, "inside": alias / "run", "ancestor-alias": alias / "new" / "run"}[where]
+    run.config.update(run=str(destination), codex_home=str(run.tmp / "isolated-codex"),
+                      claude_home=str(run.tmp / "isolated-claude"))
+    run.save()
+    before = files(owner)
+    for words in (("init",), ("login",), ("down",), ("status",)):
+        assert run.team(*words, expect=2) == {
+            "error": "run folder %s is inside ~/%s (%s); a team run uses its own folder" %
+                     (destination, tree, owner)}
+    assert files(owner) == before and not (owner / "team-commands.jsonl").exists()
+    assert not (run.tmp / "isolated-codex").exists() and not (run.tmp / "isolated-claude").exists()
+
+
+@pytest.mark.parametrize("tree", [".claude", ".codex"])
+def test_run_destination_checks_the_password_database_home(make, capsys, tree):
+    run = make()
+    import pwd
+    password_home = run.tmp / "password-home"
+    owner = password_home / tree
+    owner.mkdir(parents=True)
+    alias = run.tmp / "password-alias"
+    alias.symlink_to(password_home)
+    run.monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(alias)))
+    run.config.update(run=str(owner / "run"), codex_home=str(run.tmp / "isolated-codex"),
+                      claude_home=str(run.tmp / "isolated-claude"))
+    run.save()
+    assert in_process(run, "init", capsys=capsys) == (2, {
+        "error": "run folder %s is inside ~/%s (%s); a team run uses its own folder" %
+                 (owner / "run", tree, alias / tree)})
+    assert list(owner.iterdir()) == []
+
+
+def test_a_safe_symlink_ancestor_of_the_run_still_works(make):
+    run = make(CLAUDE, CLAUDE)
+    backing = run.tmp / "private-tmp"
+    backing.mkdir()
+    alias = run.tmp / "tmp-alias"
+    alias.symlink_to(backing)
+    run.run = alias / "run"
+    run.claude_home = run.run / "claude-home"
+    run.codex_home = run.run / "codex-home"
+    run.config["run"] = str(run.run)
+    run.save()
+    assert run.team("init")["init"] == "complete"
+    assert run.team("login")["logins"][CLAUDE]["credentials_sha256"] == sha(run.claude_home / ".credentials.json")
+    assert run.team("down", "--purge-claude-home")["claude_home"] == "purged"
+
+
+@pytest.mark.parametrize("source", ["HOME", "password database"])
+@pytest.mark.parametrize("field,tree,variable", [("claude_home", ".codex", "CLAUDE_CONFIG_DIR"),
+                                                ("codex_home", ".claude", "CODEX_HOME"),
+                                                ("codex_home", ".codex", "CODEX_HOME")])
+@pytest.mark.parametrize("where", ["exact", "inside", "alias", "owner-alias"])
+def test_both_homes_exclude_both_owner_trees_on_claude_plans(make, capsys, source, field, tree, variable, where):
+    run = make()
+    import pwd
+    password_home = run.tmp / "password-home"
+    password_home.mkdir()
+    run.monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(password_home)))
+    owner = (run.home if source == "HOME" else password_home) / tree
+    owner.mkdir()
+    home = owner if where == "exact" else owner / "run-home"
+    if where == "alias":
+        alias = run.tmp / "home-alias"
+        alias.symlink_to(owner)
+        home = alias / "run-home"
+    elif where == "owner-alias":
+        backing = run.tmp / "owner-backing"
+        owner.rename(backing)
+        owner.symlink_to(backing)
+        home = backing / "run-home"
+    run.config[field] = str(home)
+    run.save()
+    for words in (("init",), ("login",), ("down",), ("status",)):
+        assert in_process(run, *words, capsys=capsys) == (2, {
+            "error": "%s %s is inside ~/%s (%s); a team run uses its own folder" % (variable, home, tree, owner)})
+    assert list(owner.iterdir()) == [] and not run.run.exists()
 
 
 def test_init_refuses_an_implementer_tmpdir_in_a_claude_team_and_writes_nothing(make):
@@ -324,7 +457,9 @@ def test_login_logs_claude_in_to_the_runs_home_and_records_no_identity(make):
                       "entries": [MARK, ".claude.json", ".credentials.json"],
                       "managed_settings": MANAGED_SETTINGS.exists()}
     assert [(call["argv"], call["config_dir"], call["billing"]) for call in run.claude_calls()] == [
-        (["auth", "login"], str(run.claude_home), []), (["auth", "status", "--json"], str(run.claude_home), [])]
+        (["auth", "login", "--claudeai"], str(run.claude_home), []),
+        (["auth", "status", "--json"], str(run.claude_home), [])]
+    assert state(run)["logins"][CLAUDE]["credentials_sha256"] == sha(credentials)
     index = json.loads((run.evidence / "index.json").read_text(encoding="utf-8"))["files"]
     assert index["login-claude.json"]["sha256"] == sha(run.evidence / "login-claude.json")
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
@@ -361,18 +496,139 @@ def test_login_refuses_a_claude_login_the_run_cannot_trust(make):
 
     elsewhere = run.tmp / "other-claude-home"
     answer = run.team("login", expect=2, FAKE_CLAUDE_STATUS_DIR=str(elsewhere))
-    assert answer == {"error": NOT_TRUSTED + "config directory is not the run's claude home"}
+    assert answer == {"error": NOT_TRUSTED + "config directory is not the run's claude home" + CLEANED}
+    assert not credentials.exists()
 
     # A key the owner's shell does not hold, which the guard cannot see: the auth method still catches it.
     answer = run.team("login", expect=2, WRAP_STATUS_API_KEY="1")
-    assert answer == {"error": NOT_TRUSTED + "auth method 'api_key' is not claude.ai"}
+    assert answer == {"error": NOT_TRUSTED + "auth method 'api_key' is not claude.ai" + CLEANED}
+    assert not credentials.exists()
     assert run.claude_calls()[-1]["billing"] == ["ANTHROPIC_API_KEY"]
 
     answer = run.team("login", expect=2, WRAP_LOOSE_CREDENTIALS="1")
-    assert answer == {"error": ".credentials.json in claude_home has mode 0644, not 0600: %s" % credentials}
+    assert answer == {"error": ".credentials.json in claude_home has mode 0644, not 0600: %s" % credentials + CLEANED}
     assert not (run.evidence / "login-claude.json").exists()
 
     assert run.team("login")["logins"][CLAUDE]["auth"]["authMethod"] == "claude.ai"
+
+
+def credential_cases():
+    return [
+        ("symlink", ".credentials.json in claude_home is a symlink: {credentials}"),
+        ("hard-link", ".credentials.json in claude_home has 2 hard links: {credentials}"),
+        ("fifo", ".credentials.json in claude_home is not a regular file: {credentials}"),
+        ("directory", ".credentials.json in claude_home is not a regular file: {credentials}"),
+        ("group-readable", ".credentials.json in claude_home has mode 0640, not 0600: {credentials}"),
+        ("world-readable", ".credentials.json in claude_home has mode 0604, not 0600: {credentials}"),
+    ]
+
+
+@pytest.mark.parametrize("case,error", credential_cases())
+def test_existing_unsafe_credentials_refuse_before_auth_and_preserve_link_targets(make, case, error):
+    run = make(CLAUDE, CLAUDE)
+    run.team("init")
+    credentials = run.claude_home / ".credentials.json"
+    target = run.tmp / "owner-credentials"
+    target.write_bytes(b"untouched owner credentials\n")
+    target.chmod(0o600)
+    if case == "symlink":
+        credentials.symlink_to(target)
+    elif case == "hard-link":
+        os.link(target, credentials)
+    elif case == "fifo":
+        os.mkfifo(credentials, 0o600)
+        # A stand-in login leaves the FIFO alone, so a missing precheck fails promptly rather than blocking open().
+        run.wrap_claude()
+    elif case == "directory":
+        credentials.mkdir()
+    else:
+        credentials.write_bytes(b"old credentials\n")
+        credentials.chmod(0o640 if case == "group-readable" else 0o604)
+    assert run.team("login", expect=2, WRAP_KEEP_CREDENTIALS="1" if case == "fifo" else "") == {
+        "error": error.format(credentials=credentials)}
+    assert target.read_bytes() == b"untouched owner credentials\n" and run.claude_calls() == []
+    assert not (run.evidence / "login-claude.json").exists()
+
+
+def test_existing_credentials_owned_by_another_user_are_refused_before_auth(make, capsys):
+    run = make(CLAUDE, CLAUDE)
+    run.team("init")
+    credentials = run.claude_home / ".credentials.json"
+    credentials.write_bytes(b"other user's credentials\n")
+    credentials.chmod(0o600)
+    original = os.lstat
+
+    def other_owner(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if Path(path) == credentials:
+            values = list(info)
+            values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        return info
+
+    run.monkeypatch.setattr(os, "lstat", other_owner)
+    assert in_process(run, "login", capsys=capsys) == (2, {
+        "error": ".credentials.json in claude_home is not owned by this user: %s" % credentials})
+    assert credentials.read_bytes() == b"other user's credentials\n" and run.claude_calls() == []
+
+
+@pytest.mark.parametrize("case,error", [("missing", "claude_home has no .credentials.json after claude auth login")]
+                         + [row for row in credential_cases() if row[0] != "directory"])
+def test_credentials_are_checked_again_before_status(make, case, error):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    target = run.tmp / "owner-credentials"
+    target.write_bytes(b"owner bytes\n")
+    target.chmod(0o600)
+    answer = run.team("login", expect=2, WRAP_CREDENTIALS=case, WRAP_TARGET=str(target))
+    suffix = CLEANED if case in ("group-readable", "world-readable") else ""
+    assert answer == {"error": error.format(credentials=run.claude_home / ".credentials.json") + suffix}
+    assert [call["argv"] for call in run.claude_calls()] == [["auth", "login", "--claudeai"]]
+    assert target.read_bytes() == b"owner bytes\n"
+    assert not (run.evidence / "login-claude.json").exists()
+
+
+@pytest.mark.parametrize("mode,error", [
+    ("malformed", "claude auth status printed no JSON object"),
+    ("exit", "claude auth status exited 7"),
+    ("method", "auth method 'api_key' is not claude.ai"),
+])
+@pytest.mark.parametrize("existing", [False, True])
+def test_status_refusals_remove_only_credentials_written_by_this_login(make, mode, error, existing):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    credentials = run.claude_home / ".credentials.json"
+    if existing:
+        run.team("login")
+        # A failed re-login must invalidate the previously accepted state digest too.
+        assert state(run)["logins"][CLAUDE]["credentials_sha256"] == sha(credentials)
+    answer = run.team("login", expect=2, WRAP_STATUS=mode)
+    assert answer == {"error": NOT_TRUSTED + error + CLEANED}
+    assert not os.path.lexists(credentials) and CLAUDE not in state(run).get("logins", {})
+
+
+def test_status_refusal_preserves_a_credential_the_login_did_not_change(make):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    run.team("login")
+    credentials = run.claude_home / ".credentials.json"
+    before = credentials.read_bytes()
+    assert run.team("login", expect=2, WRAP_KEEP_CREDENTIALS="1", WRAP_STATUS="method") == {
+        "error": NOT_TRUSTED + "auth method 'api_key' is not claude.ai"}
+    assert credentials.read_bytes() == before and CLAUDE not in state(run).get("logins", {})
+
+
+def test_status_timeout_is_a_cli_failure_and_removes_the_new_credential(make):
+    run = make(CLAUDE, CLAUDE)
+    run.wrap_claude()
+    run.team("init")
+    answer = run.team("login", expect=3, WRAP_STATUS="timeout", AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT="0.1")
+    assert "timed out after 0.1 seconds" in answer["error"]
+    assert not (run.claude_home / ".credentials.json").exists()
+    assert CLAUDE not in state(run).get("logins", {})
 
 
 # -- child processes and the loop -----------------------------------------------------------------------------------------
@@ -475,7 +731,65 @@ def test_down_purges_the_claude_home_only_with_this_runs_mark_and_copies_no_cred
     assert_no_secrets(run, credentials)
 
 
+@pytest.mark.parametrize("case,error", [
+    ("claude-mark", "claude_home was kept: ownership record does not match this run"),
+    ("claude-projects", "claude_home was kept: projects/ holds transcripts, which down copies to evidence from T2(a) PR 6"),
+    ("codex-mark", "codex_home was kept: ownership record does not match this run"),
+    ("codex-sessions", "codex_home was kept: the copy of sessions/session.jsonl in evidence/codex-sessions does not match it"),
+])
+def test_both_purges_are_validated_before_either_home_is_deleted(make, case, error):
+    run = make()
+    run.team("init")
+    if case.endswith("mark"):
+        home = run.claude_home if case.startswith("claude") else run.codex_home
+        (home / MARK).write_text(json.dumps({"run": "other", "initiative": "pilot"}))
+    elif case == "claude-projects":
+        projects = run.claude_home / "projects"
+        projects.mkdir()
+        (projects / "session.jsonl").write_bytes(b"transcript\n")
+    else:
+        sessions = run.codex_home / "sessions"
+        sessions.mkdir()
+        (sessions / "session.jsonl").write_bytes(b"transcript\n")
+        run.team("down")
+        (run.evidence / "codex-sessions" / "session.jsonl").write_bytes(b"bad copy\n")
+    before = files(run.codex_home), files(run.claude_home)
+    assert run.team("down", "--purge-codex-home", "--purge-claude-home", expect=2) == {"error": error}
+    assert run.codex_home.is_dir() and run.claude_home.is_dir()
+    assert (files(run.codex_home), files(run.claude_home)) == before
+
+
+@pytest.mark.parametrize("host,flag", [(CLAUDE, "--purge-codex-home"), (CODEX, "--purge-claude-home")])
+def test_a_purge_flag_for_an_unused_host_is_refused_before_teardown(make, host, flag):
+    run = make(host, host)
+    run.team("init")
+    before = files(run.run)
+    assert run.team("down", flag, expect=2) == {"error": "%s requires a plan that uses %s" %
+                                               (flag, CODEX if host == CLAUDE else CLAUDE)}
+    assert files(run.run) == before
+
+
+def test_both_homes_are_purged_when_both_preconditions_pass(make):
+    run = make()
+    run.team("init")
+    answer = run.team("down", "--purge-codex-home", "--purge-claude-home")
+    assert answer["codex_home"] == answer["claude_home"] == "purged"
+    assert not run.codex_home.exists() and not run.claude_home.exists()
+
+
 # -- Codex-only runs ------------------------------------------------------------------------------------------------------
+
+def test_the_existing_codex_only_run_destination_gap_is_unchanged(make):
+    run = make(CODEX, CODEX)
+    owner = run.home / ".claude"
+    owner.mkdir()
+    run.run.symlink_to(owner)
+    run.config["codex_home"] = str(run.tmp / "isolated-codex")
+    run.save()
+    answer = run.team("init", expect=2)
+    error = "symlink paths are not supported: %s" % run.run
+    assert answer == {"error": "check-recipes: " + error, "result": {"error": error}, "step": "recipes"}
+    assert (owner / "team-state.json").is_file() and (owner / "recipes.json").is_file()
 
 @pytest.mark.parametrize("schema", ["v1", "v2"])
 def test_a_codex_only_run_ignores_claude_and_writes_what_it_wrote_before(make, schema):

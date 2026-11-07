@@ -6,7 +6,8 @@ run's shell guide and its helpers. aegis.team-run/v2 adds `hosts`, ROOT's host a
 v1 means codex-cli for both. init writes them to <base>/host-plan.json, which provision add-role and handoff check
 every binding against. Every subcommand checks path safety: CODEX_HOME is the run's codex_home and
 never ~/.codex or a folder inside it (by realpath), and for a plan that uses claude-code, CLAUDE_CONFIG_DIR is the run's
-claude_home and never ~/.claude or inside it. Commands that start work require free disk at least min_free_gb;
+claude_home. On a Claude plan both homes and the resolved run folder exclude ~/.claude and ~/.codex under HOME and
+the password-database home. Commands that start work require free disk at least min_free_gb;
 git, bwrap and each host's command the plan uses (codex, claude) are on
 PATH, and cargo and cargo-nextest on the recipes' path when a kept recipe runs them. A command that spends model
 turns (login, up, approve, turn) also refuses the billing variables of each host the plan uses.
@@ -66,6 +67,8 @@ CODEX = hierarchy_provision.CODEX
 CLAUDE = hierarchy_provision.CLAUDE
 V1_HOSTS = {"root": CODEX, "team": CODEX}
 CLAUDE_CREDENTIALS = ".credentials.json"
+# Seconds, lowerable for CLI timeout tests; never extended past the normal 60-second status deadline.
+CLAUDE_AUTH_STATUS_TIMEOUT = "AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT"
 # Managed settings can set an apiKeyHelper that --restricted still reads; login records whether the file exists.
 CLAUDE_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 # A stand-in binding that never runs a host; the host plan lists it so status can say so (spec rule 6).
@@ -212,6 +215,9 @@ class Run:
         self.hosts = self.check_hosts()
         require(value["schema"] == SCHEMA_V2 or "claude_home" not in value, "claude_home needs schema " + SCHEMA_V2)
         self.run = absolute(value["run"], "run")
+        if self.uses(CLAUDE):
+            # Before state reads or command logging, and before deriving paths passed to tools that reject symlinks.
+            self.run = safe_run_folder(self)
         self.codex_home = absolute(value.get("codex_home", str(self.run / "codex-home")), "codex_home")
         # Made and checked only when the plan uses claude-code (ADR T2(a) section 3).
         self.claude_home = absolute(value.get("claude_home", str(self.run / "claude-home")), "claude_home")
@@ -426,7 +432,8 @@ def safe_home(run, home, label, variable, owners, apart=()):
 
 
 def safe_codex_home(run):
-    return safe_home(run, run.codex_home, "codex_home", "CODEX_HOME", [Path.home() / ".codex"])
+    owners = owner_homes(CODEX) + owner_homes(CLAUDE) if run.uses(CLAUDE) else [Path.home() / ".codex"]
+    return safe_home(run, run.codex_home, "codex_home", "CODEX_HOME", owners)
 
 
 def owner_homes(kind):
@@ -446,8 +453,19 @@ def owner_homes(kind):
 
 
 def safe_claude_home(run):
-    return safe_home(run, run.claude_home, "claude_home", "CLAUDE_CONFIG_DIR", owner_homes(CLAUDE),
+    return safe_home(run, run.claude_home, "claude_home", "CLAUDE_CONFIG_DIR", owner_homes(CLAUDE) + owner_homes(CODEX),
                      apart=[("codex_home", run.codex_home)])
+
+
+def safe_run_folder(run):
+    """Canonicalize safe run aliases, including /tmp on macOS, before any run write can follow them."""
+    real = Path(os.path.realpath(run.run))
+    for owner in owner_homes(CLAUDE) + owner_homes(CODEX):
+        resolved = Path(os.path.realpath(owner))
+        if real == resolved or resolved in real.parents:
+            refuse("run folder %s is inside ~/%s (%s); a team run uses its own folder" %
+                   (run.run, owner.name, owner))
+    return real
 
 
 def guard(run, command):
@@ -630,7 +648,7 @@ def preconditions(run):
     for name in MANAGED:
         if (run.run / name).exists():
             refuse("run folder already holds %s; init needs a fresh run folder" % name)
-    if run.uses(CODEX) and run.codex_home.exists():
+    if run.codex_home.exists():
         refuse("codex_home %s already exists; init needs a new folder" % run.codex_home)
     if run.uses(CLAUDE) and run.claude_home.exists():
         refuse("claude_home %s already exists; init needs a new folder" % run.claude_home)
@@ -1024,13 +1042,15 @@ def login_codex(run):
     return answer
 
 
-def credentials_digest(run):
+def credentials_digest(run, missing_ok=False):
     """The sha256 of the Claude home's credentials file, which must be this user's one regular file with mode 0600. The
     file itself is never copied, and only its hash enters evidence."""
     path = run.claude_home / CLAUDE_CREDENTIALS
     try:
         info = os.lstat(path)
     except FileNotFoundError:
+        if missing_ok:
+            return None
         refuse("claude_home has no %s after claude auth login" % CLAUDE_CREDENTIALS)
     if stat.S_ISLNK(info.st_mode):
         refuse("%s in claude_home is a symlink: %s" % (CLAUDE_CREDENTIALS, path))
@@ -1047,30 +1067,73 @@ def credentials_digest(run):
     descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+        if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_uid) !=
+                (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid)):
             refuse("%s in claude_home changed while it was checked: %s" % (CLAUDE_CREDENTIALS, path))
         return hashlib.sha256(stream.read()).hexdigest()
+
+
+def credential_version(run):
+    """Identity and modification metadata only: never follow or open an untrusted credential for cleanup."""
+    try:
+        info = os.lstat(run.claude_home / CLAUDE_CREDENTIALS)
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def remove_login_credentials(run, before, written, home_real):
+    """Remove only the unlinked regular file this login created or changed, still inside the checked home."""
+    if written is None or written == before or os.path.realpath(run.claude_home) != home_real:
+        return False
+    if credential_version(run) != written or not stat.S_ISREG(written[2]) or written[3:5] != (1, os.getuid()):
+        return False
+    (run.claude_home / CLAUDE_CREDENTIALS).unlink()
+    return True
 
 
 def login_claude(run):
     """claude auth login in the run's CLAUDE_CONFIG_DIR, which the owner finishes in the browser, then its status. The
     evidence keeps the filtered auth record (no email or organization) and the credentials' hash, never the file."""
+    timeout = float(os.environ.get(CLAUDE_AUTH_STATUS_TIMEOUT, "60"))
+    require(0 < timeout <= 60, CLAUDE_AUTH_STATUS_TIMEOUT + " must be greater than 0 and at most 60 seconds")
+    state = require_init(run)
+    if CLAUDE in state.get("logins", {}):
+        del state["logins"][CLAUDE]
+        save_state(run, state)
+    # A CLI may truncate or refresh credentials: refuse unsafe existing files before either auth command sees them.
+    credentials_digest(run, missing_ok=True)
+    before = credential_version(run)
+    home_real = os.path.realpath(run.claude_home)
     env = child_env(run)
-    proc = subprocess.run(["claude", "auth", "login"], env=env)
-    if proc.returncode != 0:
-        fail("claude auth login exited %d" % proc.returncode)
-    proc = subprocess.run(["claude", "auth", "status", "--json"], env=env, capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=60)
+    proc = subprocess.run(["claude", "auth", "login", "--claudeai"], env=env)
+    written = credential_version(run)
     try:
-        parsed = strict_json(proc.stdout)
-    except (ValueError, RecursionError):
-        parsed = None
-    record, problems = hierarchy_hosts.claude_auth_check(proc.returncode, parsed, run.claude_home)
-    if problems:
-        refuse("claude auth status does not show this run's claude.ai login: " + "; ".join(problems))
-    answer = {"claude_home": str(run.claude_home), "auth": record, "credentials_sha256": credentials_digest(run),
+        if proc.returncode != 0:
+            fail("claude auth login exited %d" % proc.returncode)
+        credentials_digest(run)
+        proc = subprocess.run(["claude", "auth", "status", "--json"], env=env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+        try:
+            parsed = strict_json(proc.stdout)
+        except (ValueError, RecursionError):
+            parsed = None
+        record, problems = hierarchy_hosts.claude_auth_check(proc.returncode, parsed, run.claude_home)
+        if problems:
+            refuse("claude auth status does not show this run's claude.ai login: " + "; ".join(problems))
+        digest = credentials_digest(run)
+    except (Stop, subprocess.SubprocessError) as exc:
+        removed = remove_login_credentials(run, before, written, home_real)
+        if removed and isinstance(exc, Stop):
+            raise Stop(exc.code, str(exc) + "; removed credentials written by this login", **exc.detail) from exc
+        # Keep TimeoutExpired intact: main maps subprocess failures to exit 3.
+        raise
+    answer = {"claude_home": str(run.claude_home), "auth": record, "credentials_sha256": digest,
               "entries": sorted(os.listdir(run.claude_home)), "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
     save(run, "login-claude.json", answer)
+    state.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
+    save_state(run, state)
     return answer
 
 
@@ -1836,10 +1899,10 @@ def ownership(run, home=None, label="codex_home"):
         refuse("%s was kept: ownership record does not match this run" % label)
 
 
-def purge(run):
+def check_codex_purge(run):
     safe_codex_home(run)
     if not run.codex_home.exists():
-        return "already_purged"
+        return False
     ownership(run)
     sessions, copies, sums = run.codex_home / "sessions", run.evidence / "codex-sessions", parsed_sums(run)
     for path in sorted(sessions.rglob("*")) if sessions.is_dir() else []:
@@ -1856,27 +1919,44 @@ def purge(run):
             refuse("codex_home was kept: the copy of sessions/%s in evidence/codex-sessions does not match it" % relative)
         if sums.get("codex-sessions/%s" % relative) != digest:
             refuse("codex_home was kept: SHA256SUMS does not list the copy of sessions/%s with its hash" % relative)
-    shutil.rmtree(run.codex_home)
-    return "purged"
+    return True
 
 
-def purge_claude(run):
-    """Deletes claude_home, the run's Claude login, under purge's ownership rules."""
+def check_claude_purge(run):
+    """Check Claude ownership and transcript retention before either host home is deleted."""
     safe_claude_home(run)
     if not run.claude_home.exists():
-        return "already_purged"
+        return False
     ownership(run, run.claude_home, "claude_home")
     # Until down copies projects/ to evidence (T2(a) PR 6, in collect), a transcript there would be lost, so a home
     # holding any is kept.
     projects = run.claude_home / "projects"
     if os.path.lexists(projects) and (projects.is_symlink() or not projects.is_dir() or any(projects.iterdir())):
         refuse("claude_home was kept: projects/ holds transcripts, which down copies to evidence from T2(a) PR 6")
+    return True
+
+
+def purge(run):
+    if not check_codex_purge(run):
+        return "already_purged"
+    shutil.rmtree(run.codex_home)
+    return "purged"
+
+
+def purge_claude(run):
+    """Deletes claude_home, the run's Claude login, under purge's ownership rules."""
+    if not check_claude_purge(run):
+        return "already_purged"
     shutil.rmtree(run.claude_home)
     return "purged"
 
 
 def down(run, args):
     require(args.loop_wait >= 1, "--loop-wait must be at least 1 second")
+    for requested, kind, flag in ((args.purge_codex_home, CODEX, "--purge-codex-home"),
+                                  (args.purge_claude_home, CLAUDE, "--purge-claude-home")):
+        if requested and not run.uses(kind):
+            refuse("%s requires a plan that uses %s" % (flag, kind))
     state = load_state(run)
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}
@@ -1909,6 +1989,11 @@ def down(run, args):
     answer["review_copies"] = remove_review_copies(run)
     if run.evidence.is_dir():
         answer["sha256sums"] = write_sums(run)
+    # Validate every requested home before deleting either: one host's refusal must keep both homes intact.
+    if args.purge_codex_home:
+        check_codex_purge(run)
+    if args.purge_claude_home:
+        check_claude_purge(run)
     if run.uses(CODEX):
         answer["codex_home"] = purge(run) if args.purge_codex_home else "kept"
     if run.uses(CLAUDE):
