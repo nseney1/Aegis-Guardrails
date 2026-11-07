@@ -27,10 +27,13 @@ An admitted [small-change plan](teams-t1-small-change-admission.md) can now reco
 route, writer intent/start, terminal, independent Reviewer acceptance, delivery
 and complete closure without Orchestrator or Decider events. Routing is confined
 to the approved lane; approval, admission, expiry and participant generations are
-rechecked before route, intent and start. Terminal review retains the current,
-plan-bound Reviewer and original-writer independence checks, while allowing
-expiry and writer succession after work started. UNKNOWN retains its obligation
-and accounting. Terminal/review sources
+rechecked before route, intent and start. Terminal evidence requires a matching
+recorded start and the starting writer's CID and generation; a successor cannot
+settle it. Review requires that start and terminal, the current plan-bound Reviewer
+and original-writer independence. It permits expiry after a valid start and writer
+succession after terminal evidence was recorded. An interrupted writer with an
+unresolved effect stays held by CID and generation for T1's dispatcher resume path.
+UNKNOWN retains its obligation and accounting. Terminal/review sources
 remain the request's base source; new commits are evidence only. Mailbox/job
 dispatch and native qualification remain separate gates. Small-change rows remain
 held from the canonical watch/Operator with `small-change requires the T1 dispatcher`;

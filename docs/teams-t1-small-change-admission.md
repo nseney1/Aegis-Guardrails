@@ -58,10 +58,15 @@ Before admission, registered plans remain held from execution. After admission,
 `route` accepts only `<request.team>/lane/<plan lane>`; `intent` and `start` accept
 only the registered writer. Intent consumes the single start; a second intent or
 start refuses. These three paths recheck plan approval, canonical denial, expiry,
-prerequisites and participant generations. `review` requires terminal evidence,
-plan approval/admission and the plan-bound Reviewer in its current generation,
-independent of the writer who recorded the intent. Expiry or writer succession
-after work started does not prevent review of that evidence.
+prerequisites and participant generations. `terminal` requires a recorded start
+matching the intent and the same writer CID and generation that recorded that
+start. A successor cannot publish terminal evidence for the original writer.
+`review` requires that start and terminal evidence, plan approval/admission and
+the plan-bound Reviewer in its current generation, independent of the original
+writer. Expiry after a valid start does not prevent terminal evidence or review.
+Writer succession after terminal evidence was recorded does not prevent review;
+an interrupted writer with an unresolved effect stays held by CID and generation
+for the T1 dispatcher to resume. Succession grants no new start or settlement.
 Legacy `admit` remains refused; small-change admission stays separate from
 canonical authority and admission. Canonical `associate` refuses every small-change
 row, including rows also approved canonically, until a separately reviewed provider
@@ -104,11 +109,17 @@ failure and local Go metadata timeout remain retained; causation is not inferred
 | Gate | This slice |
 |---|---|
 | Implementation | Registration/admission and the complete lifecycle evidence path; separate `small_change_ready` eligibility, stable canonical watch hold, provider association refused, terminal review survives expiry/writer rotation |
-| Public RED/GREEN | Missing-event RED retained; initial GREEN 33 passed; review found canonical-denial bypass and two public RED regressions reproduced it |
-| Independent frozen-commit review | Codex and Claude requested changes on `1d15dc4e`; this follow-up addresses those findings and awaits independent review |
-| Affected / full local verification | First affected: 604 passed in 121.09s; post-revocation-fix affected: 607 passed in 128.12s; first full RED retained: 7 failed, 17,648 passed, 16 skipped, 6 warnings in 1410.71s |
+| Public RED/GREEN | Per-commit lane runs in the [slice evidence folder][t1-evidence] |
+| Independent frozen-commit review | Round 2 on `e94fa2ec`: Codex ACCEPT, Claude REQUEST CHANGES; this start/terminal fix awaits review |
+| Affected / full local verification | Per-commit lane runs, container A/B and full-suite records in the [slice evidence folder][t1-evidence] |
 | Hosted verification | Pending publication |
 | Native / installed runtime / efficiency / Teams acceptance | Open; owner explicitly authorizes this slice's integration under the qualification gaps below |
+
+The workspace evidence folder is
+`aegis-guides/v5.0-teams-t2a-evidence-20261107/t1-lifecycle-seam/`.
+Use its per-commit records rather than treating historical counts as head results.
+
+[t1-evidence]: /home/nseney/Documents/workspace/aegis-guides/v5.0-teams-t2a-evidence-20261107/t1-lifecycle-seam/
 
 The registered-workspace Aegis scan supplied repository guidance from the
 reviewed merge-base with `origin/HEAD`, not host authentication or execution
@@ -125,11 +136,11 @@ Python 3.9 runtime/platform coverage remains a separate hosted result.
 The first full run exposed a missed role-registry vocabulary/projection update
 and the fixture replay reader's exact lifecycle successor pin. All seven failures
 are retained. The registry now names the three evidence events under their
-existing roles without adding provisioned tools. The lifecycle execution seam in
-`1d15dc4e` used replay pin
-`e030d6aa17466837fb69a135b8eaad669b3f58c44d272725001ce8bad8ac7fb9`.
-This review follow-up changes `LIFECYCLE_SHA256` to
+existing roles without adding provisioned tools. The preceding review fix in
+`e94fa2ec` used replay pin
 `a7bae191536781004abe8b9cb9a8e5d6380e5a58498c7eb5ae147bf3e95e6dbd`.
+This start and terminal provenance fix changes `LIFECYCLE_SHA256` to
+`c941520a185de54a2e8e3419689220cd627aab5d80ea97ea36fb09f965d28ebf`.
 This is a reviewable source change to the replay adapter, not a refresh of any
 active runtime pin. Historical corpus bytes and their original pins remain
 unchanged. Expanded affected checks include registry/provisioning and foundation

@@ -349,8 +349,106 @@ def test_terminal_review_still_requires_the_current_plan_reviewer(tmp_path, revi
 
 def test_small_change_review_requires_recorded_terminal_evidence(tmp_path):
     change = admitted(tmp_path)
+    event(change, "intent")
+    event(change, "start")
     before = change.ledger.files()
     assert event(change, "review", expect=2)["error"] == "review result sha256 mismatch"
+    assert change.ledger.files() == before
+
+
+def test_intent_before_expiry_cannot_become_terminal_after_expiry_without_start(tmp_path, monkeypatch):
+    change = admitted(tmp_path)
+    ledger = change.ledger
+    reader = lifecycle.Lifecycle(ledger.path)
+
+    def record(kind, cid="coordinator-1", **payload):
+        return reader.record({"id": "unstarted-" + kind, "actor": cid, "generation": 1,
+                              "custody": {"cid": ledger.root_actor, "generation": 1},
+                              "event": {"type": kind, **ledger.target(change.value), **payload}})
+
+    monkeypatch.setattr(lifecycle, "timestamp", lambda: "2098-12-31T23:59:59Z")
+    record("intent", ledger.operator, intent_id="attempt-1")
+    before = ledger.files()
+    monkeypatch.setattr(lifecycle, "timestamp", lambda: "2099-01-01T00:00:01Z")
+    result = {"request_sha256": ledger.target(change.value)["request_sha256"], "intent_id": "attempt-1",
+              "outcome": "passed", "exit_code": 0, "source": SOURCE, "evidence": ledger.evidence}
+    with pytest.raises(ValueError, match="^small-change evidence requires a recorded matching start$"):
+        record("terminal", ledger.operator, result=raw_request(result))
+    with pytest.raises(ValueError, match="^small-change evidence requires a recorded matching start$"):
+        record("review", "reviewer-1", **body(change, "review"))
+    with pytest.raises(ValueError, match="^delivery requires independent acceptance$"):
+        record("delivery", evidence=ledger.evidence)
+    with pytest.raises(ValueError, match="^unknown effect prevents closure$"):
+        record("disposition", status="FINAL", resolution={"kind": "complete", "evidence": ledger.evidence})
+    assert ledger.files() == before
+    state = reader.status()
+    row = state["requests"][change.value["id"]]
+    assert row["start"] is row["terminal"] is row["review"] is row["resolution"] is None
+    assert state["work_complete"] is False and state["obligations"][0]["state"] == "unknown_effect"
+    assert state["consumed"] == {change.value["id"]: 1}
+    assert state["continuation_candidates"] == state["small_change_ready"] == []
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_writer_successor_cannot_publish_terminal_for_the_original_intent(tmp_path, started):
+    change = admitted(tmp_path)
+    ledger = change.ledger
+    event(change, "intent")
+    if started:
+        event(change, "start")
+    succeed(ledger, "operator")
+    ledger.operator = "operator-2"
+    before = ledger.files()
+    error = ("small-change terminal requires starting writer operator-1 generation 1" if started
+             else "small-change evidence requires a recorded matching start")
+    assert ledger.terminal(change.value, expect=2)["error"] == error
+    review_error = "review result sha256 mismatch" if started else "small-change evidence requires a recorded matching start"
+    assert event(change, "review", expect=2)["error"] == review_error
+    assert ledger.event("delivery", evidence=ledger.evidence, **ledger.target(change.value),
+                        expect=2)["error"] == "delivery requires independent acceptance"
+    assert complete(change, expect=2)["error"] == "unknown effect prevents closure"
+    assert ledger.files() == before
+    state = ledger.status()
+    row = state["requests"][change.value["id"]]
+    assert row["terminal"] is row["review"] is row["resolution"] is None
+    assert state["work_complete"] is False and state["obligations"][0]["state"] == "unknown_effect"
+    assert state["consumed"] == {change.value["id"]: 1}
+    assert state["continuation_candidates"] == state["small_change_ready"] == []
+    assert state["continuation_holds"][change.value["id"]] == (
+        "small-change interrupted writer operator-1 generation 1; T1 dispatcher resume required")
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_interrupted_writer_hold_is_visible_before_a_successor_attempts_terminal(tmp_path, started):
+    change = admitted(tmp_path)
+    ledger = change.ledger
+    event(change, "intent")
+    if started:
+        event(change, "start")
+    succeed(ledger, "operator")
+    before = ledger.files()
+    state = ledger.status()
+    assert state["continuation_holds"].get(change.value["id"]) == (
+        "small-change interrupted writer operator-1 generation 1; T1 dispatcher resume required")
+    assert state["continuation_candidates"] == state["small_change_ready"] == []
+    assert state["obligations"][0]["state"] == "unknown_effect" and state["work_complete"] is False
+    assert ledger.files() == before
+
+
+def test_small_change_review_requires_the_start_even_before_terminal(tmp_path):
+    change = admitted(tmp_path)
+    event(change, "intent")
+    before = change.ledger.files()
+    assert event(change, "review", expect=2)["error"] == "small-change evidence requires a recorded matching start"
+    assert change.ledger.files() == before
+
+
+def test_small_change_terminal_requires_the_starting_writers_generation(tmp_path):
+    change = admitted(tmp_path)
+    event(change, "intent")
+    event(change, "start")
+    before = change.ledger.files()
+    assert change.ledger.terminal(change.value, generation=2, expect=2)["error"] == "stale actor generation"
     assert change.ledger.files() == before
 
 

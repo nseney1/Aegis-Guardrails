@@ -544,9 +544,18 @@ def small_change_execution(policy, state, row, at):
     return plan
 
 
+def small_change_started(row):
+    """Terminal evidence and review require the same recorded start."""
+    intent, start = row["intent"], row["start"]
+    require(intent is not None and start is not None and start["intent_id"] == intent["id"],
+            "small-change evidence requires a recorded matching start")
+    return start
+
+
 def small_change_review(policy, state, row, cid):
     """Review finished evidence without renewing expiry or the writer binding."""
     registration = small_change_approval(state, row)
+    small_change_started(row)
     plan = raw_value(registration["proposal"])["plan"]
     small_change_participant(policy, state, registration["participants"]["reviewer"],
                              plan["reviewer"], "reviewer", "reviewer")
@@ -833,6 +842,11 @@ def reduce_event(policy, state, envelope, at):
                     "bounded authority expired")
         row["start"] = {**mark, "intent_id": event["intent_id"]}
     elif kind == "terminal":
+        if "small_change" in row:
+            start = small_change_started(row)
+            require((cid, actor["generation"]) == (start["actor"], start["generation"]),
+                    "small-change terminal requires starting writer %s generation %s"
+                    % (start["actor"], start["generation"]))
         result = raw_value(event["result"])
         fields(result, {"request_sha256", "intent_id", "outcome", "exit_code", "source", "evidence"})
         require(row["intent"] is not None and result["intent_id"] == row["intent"]["id"]
@@ -996,6 +1010,12 @@ class Lifecycle:
             obligations.append({"request_id": identifier, "request_sha256": row["raw"]["sha256"], "state": stage,
                                 "owner": owner["owner"], "next_decision": owner["next_decision"],
                                 "blocker": resolution if resolution and resolution["kind"] == "blocked" else None})
+            if "small_change" in row and unknown_effect(row):
+                writer = row["start"] or row["intent"]
+                current = state["current"]["operator"]
+                if (writer["actor"], writer["generation"]) != (current, policy["actors"][current]["generation"]):
+                    holds[identifier] = ("small-change interrupted writer %s generation %s; T1 dispatcher resume required"
+                                         % (writer["actor"], writer["generation"]))
             if not resolution and row["intent"] is None:
                 try:
                     operator = state["current"]["operator"]
