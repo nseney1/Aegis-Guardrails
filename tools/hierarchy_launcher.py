@@ -678,7 +678,7 @@ def read_process(pid, argv_boundaries="proven"):
     except (FileNotFoundError, ProcessLookupError, PermissionError):
         # A process can end during the census; inaccessible argv cannot establish ownership.
         return None
-    if not cmdline or len(fields) < 20 or not all(fields[index].isdigit() for index in (1, 2, 19)):
+    if len(fields) < 20 or not all(fields[index].isdigit() for index in (1, 2, 19)):
         return None
     uids = next((line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")), [])
     uid, euid = (int(uids[0]), int(uids[1])) if len(uids) >= 2 and all(v.isdigit() for v in uids[:2]) else (-1, -1)
@@ -730,23 +730,42 @@ def session_processes(session, excluded, host=CODEX, unowned=None, observed=None
     return found
 
 
-def unchanged_process(expected, boundaries, session, host, unowned, require_host=True, parent=None):
-    current = read_process(expected.pid, boundaries)
+def process_state(expected, current, boundaries, session, host, unowned, require_host=True, parent=None,
+                  retained=False):
     if current is None or current.state.startswith("Z"):
-        return False
+        return "gone"
     if (current.start_time != expected.start_time or current.cmdline != expected.cmdline or
-            current.pgid != expected.pgid or not our_uid(current) or
+            (not retained and current.pgid != expected.pgid) or not our_uid(current) or
             (current.uid, current.euid) != (expected.uid, expected.euid) or
             (parent is not None and current.ppid != parent) or
             (require_host and not owns_process(current, session, host, boundaries))):
         # A replacement PID, or an unrelated changed group member, is not a process naming this session.
         if current.start_time == expected.start_time and names_session(current, session):
             unowned.append(current.pid)
-        return False
-    return True
+        return "changed"
+    return "authorized"
 
 
-def signal_process(chain, number, boundaries, session, host, unowned):
+def unchanged_process(expected, boundaries, session, host, unowned, require_host=True, parent=None, retained=False):
+    return process_state(expected, read_process(expected.pid, boundaries), boundaries, session, host, unowned,
+                         require_host, parent, retained) == "authorized"
+
+
+def retained_state(expected, boundaries, session, host, unowned):
+    current = read_process(expected.pid, boundaries)
+    if current is None:
+        # Missing permission/evidence is not proof of exit. Zombies are returned by read_process and skipped below.
+        try:
+            os.kill(expected.pid, 0)
+        except ProcessLookupError:
+            return "gone"
+        except PermissionError:
+            return "changed"
+        return "changed"
+    return process_state(expected, current, boundaries, session, host, unowned, require_host=False, retained=True)
+
+
+def signal_process(chain, number, boundaries, session, host, unowned, retained=False):
     handles = {}
     try:
         for expected in chain:
@@ -761,7 +780,8 @@ def signal_process(chain, number, boundaries, session, host, unowned):
         for index in reversed(range(len(chain))):
             expected = chain[index]
             parent = chain[index + 1].pid if index + 1 < len(chain) else None
-            if not unchanged_process(expected, boundaries, session, host, unowned, parent is None, parent):
+            if not unchanged_process(expected, boundaries, session, host, unowned, parent is None and not retained,
+                                     parent, retained):
                 return False
             if parent is not None and hierarchy_hosts.selects_other_session(expected.argv, session):
                 return False
@@ -820,16 +840,24 @@ def signal_all(found, number, observed, session, host, unowned, attempted=None):
     # Children go first so their owned ancestors can still be rechecked at each signal.
     for chain in sorted(targets, key=lambda rows: process_depth(rows[0], census), reverse=True):
         result = signal_process(chain, number, boundaries, session, host, unowned)
-        if result and chain[0].pid in pids:
+        if result:
             attempted.add(chain[0].pid)
     return attempted
+
+
+def signal_retained(pids, number, observed, session, host, unowned):
+    # The first pass proved ancestry. Reparenting after SIGTERM must not erase that authorization; every target
+    # still needs its own unchanged birth time, cmdline and real/effective uid before an individual signal.
+    for pid in sorted(pids):
+        signal_process([observed["census"][pid]], number, observed["argv_boundaries"], session, host, unowned,
+                       retained=True)
 
 
 def gone_within(session, excluded, pids, seconds, host, observed, unowned):
     deadline = time.monotonic() + seconds
     while True:
-        left = {pid for pid in pids if pid not in excluded and unchanged_process(
-            observed["census"][pid], observed["argv_boundaries"], session, host, unowned)}
+        left = {pid for pid in pids if pid not in excluded and retained_state(
+            observed["census"][pid], observed["argv_boundaries"], session, host, unowned) != "gone"}
         if not left or time.monotonic() >= deadline:
             return not left
         time.sleep(POLL_SECONDS)
@@ -867,8 +895,7 @@ def stop(launches, endpoint, grace):
             signal_all(found, signal.SIGTERM, observed, known["session"], known["host"], unowned, pids)
             stopped = gone_within(known["session"], excluded, pids, grace, known["host"], observed, unowned)
             if not stopped:
-                signal_all([pair for pair in found if pair[0] in pids], signal.SIGKILL, observed,
-                           known["session"], known["host"], unowned)
+                signal_retained(pids, signal.SIGKILL, observed, known["session"], known["host"], unowned)
                 stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"], observed, unowned)
             # The marker belongs to the wake that made it; whoever inspects it decides whether that turn has ended.
             marker["wake_marker_present"] = launches.mailbox.wake_marker(endpoint).exists()

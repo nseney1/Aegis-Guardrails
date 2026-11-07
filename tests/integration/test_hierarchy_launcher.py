@@ -498,7 +498,7 @@ def test_stop_ends_the_process_group_of_a_hung_session(launch):
         children = [int(pid) for pid in subprocess.run(["pgrep", "-g", str(hung.pid)], capture_output=True, text=True,
                                                        timeout=10).stdout.split() if int(pid) != hung.pid]
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "2")
-        assert answer["action"] == "stop" and answer["state"] == "stopped" and answer["pids"] == [hung.pid]
+        assert answer["action"] == "stop" and answer["state"] == "stopped" and answer["pids"] == sorted([hung.pid, *children])
         assert answer["wake_marker_present"] is False
         assert hung.wait(timeout=5) < 0
         wait_until(lambda: not any(alive(pid) for pid in children))
@@ -752,8 +752,9 @@ def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace
     try:
         # The sleep starts after the trap is set, so a SIGTERM now is known to be ignored.
         wait_until(lambda: stubborn.pid in owned_pids(session) and len(group(stubborn.pid)) == 2)
+        members = sorted(group(stubborn.pid))
         answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", grace)
-        assert answer["state"] == "stopped" and answer["pids"] == [stubborn.pid] and answer["grace_seconds"] == int(grace)
+        assert answer["state"] == "stopped" and answer["pids"] == members and answer["grace_seconds"] == int(grace)
         assert stubborn.wait(timeout=5) == -signal.SIGKILL
     finally:
         if stubborn.poll() is None:

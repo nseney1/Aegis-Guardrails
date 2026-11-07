@@ -37,6 +37,9 @@ NATIVE = "codex"
 HOST_KINDS = (CLAUDE, CODEX, NATIVE)
 # Sessions go into glob patterns, so anything that could widen one is refused. Same pattern as hierarchy_provision.
 SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# UUID-shaped conflicts are distinct from the wider legacy session names accepted by provision.
+SESSION_UUID = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 CODEX_TRANSCRIPTS = ("sessions/**/rollout-*{session}.jsonl", "archived_sessions/**/rollout-*{session}.jsonl")
 CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
 # Spec rule 3 is not enforced in T2(a) (owner decision B): no MCP child has been shown to carry either variable.
@@ -202,12 +205,29 @@ def matches_entrypoint(kind, argv):
     return _host_arguments(kind, argv) is not None
 
 
-def _adjacent_selectors(selectors, arguments):
+def _uuid_values(arguments):
+    for argument in arguments:
+        for word in argument.split():
+            value = word.split("=", 1)[-1]
+            if SESSION_UUID.fullmatch(value):
+                yield value
+
+
+def _adjacent_selectors(selectors, arguments, session):
     """Conservative selectors for ps text, whose configuration values lost their argument boundaries."""
-    selected, conflicting, index = [], False, 0
+    selected, conflicting, index, options = [], False, 0, True
     commands = {command[-1] for command in selectors["commands"]}
     while index < len(arguments):
         word = arguments[index]
+        if word == "--":
+            options = False
+            index += 1
+            continue
+        if not options and selectors["options"]:
+            # Claude's remaining words are prompt text: they cannot establish ownership.
+            conflicting = conflicting or any(value != session for value in _uuid_values([word]))
+            index += 1
+            continue
         option, equal, value = word.partition("=")
         if option in selectors["conflicting_flags"]:
             conflicting = True
@@ -215,16 +235,18 @@ def _adjacent_selectors(selectors, arguments):
             if not equal:
                 index += 1
                 if word in commands and index < len(arguments) and arguments[index] == "--":
+                    options = False
                     index += 1
                 value = arguments[index] if index < len(arguments) else ""
-            selected.append(value)
+            if value == session or SESSION_UUID.fullmatch(value):
+                selected.append(value)
         index += 1
     return selected, conflicting
 
 
-def _session_values(selectors, arguments, argv_boundaries):
+def _session_values(selectors, arguments, argv_boundaries, session):
     if argv_boundaries == "unproven":
-        return _adjacent_selectors(selectors, arguments)
+        return _adjacent_selectors(selectors, arguments, session)
     selected, positional, index, options = [], [], 0, True
     while index < len(arguments):
         word = arguments[index]
@@ -267,14 +289,16 @@ def matches_session(kind, argv, session, argv_boundaries="proven"):
     arguments = _host_arguments(kind, argv)
     if arguments is None:
         return False
-    selected, conflicting = _session_values(_host(kind)["session_selectors"], arguments, argv_boundaries)
+    selected, conflicting = _session_values(_host(kind)["session_selectors"], arguments, argv_boundaries, session)
     return bool(selected) and not conflicting and all(value == session for value in selected)
 
 
 def selects_other_session(argv, session):
-    """Even a descendant cannot be cleaned up when its argv selects another host session."""
+    """A descendant naming another UUID is spared even when its selector is unknown to the registry."""
+    if any(value != session for value in _uuid_values(argv)):
+        return True
     for kind in TEAM_HOSTS:
-        selected, conflicting = _adjacent_selectors(_host(kind)["session_selectors"], argv[1:])
+        selected, conflicting = _adjacent_selectors(_host(kind)["session_selectors"], argv[1:], session)
         if conflicting or any(value != session for value in selected):
             return True
     return False

@@ -198,6 +198,18 @@ def test_session_selector_is_positional_and_unambiguous(kind, argv, expected):
     assert hierarchy_hosts.matches_session(kind, argv, SESSION) is expected
 
 
+@pytest.mark.parametrize("value,expected", [(SESSION, True), (SESSION.upper(), True),
+                                         (SESSION.replace("-", ""), True), ("the", False),
+                                         ("review", False), ("prefix-" + SESSION, False)])
+def test_session_uuid_shape_distinguishes_ids_from_prompt_words(value, expected):
+    assert bool(hierarchy_hosts.SESSION_UUID.fullmatch(value)) is expected
+
+
+def test_unproven_selector_still_accepts_its_bound_legacy_session_id():
+    session = "modelled-legacy-session"
+    assert hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
+
+
 def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():
     assert hierarchy_hosts.qualify("claude-code", False) == {"boundary": "no write tools"}
     assert hierarchy_hosts.qualify("codex-cli", False) == {"boundary": "no write tools"}
