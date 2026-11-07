@@ -768,6 +768,50 @@ def codex_start(request):
     return {**answer, "team": team} if team is not None else answer
 
 
+def claude_start(request):
+    """A claude-code team role's start argv: print mode under the session the caller chose, no MCP servers, and the
+    prompt on stdin. Like codex_start it binds nothing: the caller confirms the session started, then runs add-role."""
+    # Codex-only options are named here so that they are refused with check_codex_options' reasons, not as unknown keys.
+    fields(request, {"base", "endpoint", "session"}, {"cwd", "model", "effort", "reader_shell", "writable_roots", "tmpdir",
+                                                      "skip_git_repo_check", "add_dirs"})
+    base = safe_path(text(request["base"], "base"))
+    setup = read_json(base / "provision.json")
+    hierarchy_runtime_source.verify(setup, base)
+    mailbox = Mailbox(setup["mailbox_root"])
+    endpoint = request["endpoint"]
+    mailbox.endpoint(endpoint)
+    session = request["session"]
+    require(isinstance(session, str) and UUID.fullmatch(session) is not None,
+            "claude sessions need a UUID, which --session-id requires")
+    check_codex_options(request, mailbox, endpoint, CLAUDE)
+    # ADR T2(a) §4: the worktree is a Claude role's only writable folder.
+    require("add_dirs" not in request, "%s: a claude-code start takes no add_dirs" % endpoint)
+    for name in ("model", "effort"):
+        if name in request:
+            text(request[name], name, 128)
+    request, fixed = fixed_profile(request, mailbox, endpoint, CLAUDE)
+    options, team = team_settings(base, CLAUDE, request, role_kind(mailbox, endpoint))
+    tools, _ = role_tools(endpoint, mailbox, None)
+    cwd = safe_path(text(request.get("cwd", setup["source"]), "cwd"))
+    # Codex's requirement, kept so both hosts start a role in the same kind of folder.
+    require(git(cwd, "rev-parse", "--is-inside-work-tree").returncode == 0,
+            "a claude-code start needs a cwd inside a git checkout")
+    connection = base / "connections" / (endpoint.replace("/", "%2F") + ".start.json")
+    connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    connection.write_text(json.dumps({"mcpServers": {}}, indent=2) + "\n", encoding="utf-8")
+    # No mailbox tools to allow, since the start has no servers: only a writer's edit tools.
+    allowed = [name for name in tools if name in WRITE_TOOLS]
+    answer = {"start_argv": claude_argv(["--session-id", session], str(connection), tools, allowed, options, None, None),
+              "cwd": str(cwd),
+              "prompt_via": "stdin",
+              "session": session,
+              "next": "Send the prompt on stdin, confirm the session from the init event and its transcript, then run "
+                      "add-role with that session."}
+    if fixed is not None:
+        answer["model_profile"] = fixed
+    return {**answer, "team": team} if team is not None else answer
+
+
 def old_root_state(old_root, hierarchy):
     """Everything read from a live root, which this never writes to. A held lock means unsure, so it refuses."""
     old = Mailbox(safe_path(text(old_root, "old_root")))
