@@ -294,7 +294,8 @@ def test_claude_auth_check_refuses_a_config_directory_other_than_the_run_home(tm
     _, problems = hierarchy_hosts.claude_auth_check(0, status(other), home)
     assert problems == ["config directory is not the run's claude home"]
     _, problems = hierarchy_hosts.claude_auth_check(0, status(home, configDirectory=None), home)
-    assert problems == ["config directory is not the run's claude home"]
+    assert problems == ["claude auth status field configDirectory has an unexpected type",
+                        "config directory is not the run's claude home"]
     spelled = str(home) + os.sep + "." + os.sep
     assert hierarchy_hosts.claude_auth_check(0, status(home, configDirectory=spelled), home)[1] == []
 
@@ -339,3 +340,44 @@ def test_claude_auth_check_refuses_a_relative_config_directory(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     assert hierarchy_hosts.claude_auth_check(0, status(tmp_path, configDirectory=configured), tmp_path)[1] == [
         "config directory is not the run's claude home"]
+
+
+@pytest.mark.parametrize("key, value", [
+    ("loginExpiresAt", {"email": "owner@example.com", "orgId": "org-1"}),
+    ("configDirectory", ["owner@example.com"]),
+    ("authMethod", {"name": "claude.ai"}),
+    ("loggedIn", "true"),
+    ("projectsDirectory", 7)])
+def test_claude_auth_check_records_only_scalar_values_of_the_expected_type(tmp_path, key, value):
+    record, problems = hierarchy_hosts.claude_auth_check(0, status(tmp_path, **{key: value}), tmp_path)
+    assert key not in record
+    assert "owner@example.com" not in json.dumps(record)
+    assert "claude auth status field %s has an unexpected type" % key in problems
+
+
+def _symlink_or_skip(link, target):
+    try:
+        os.symlink(str(target), str(link), target_is_directory=Path(target).is_dir())
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip("symlinks unavailable here: %s" % exc)
+
+
+def test_transcripts_stay_inside_the_home_and_skip_symlinks(tmp_path):
+    home, outside = tmp_path / "home", tmp_path / "outside"
+    touch(outside / "elsewhere" / (SESSION + ".jsonl"))
+    real = touch(home / "projects" / "mine" / (SESSION + ".jsonl"))
+    (home / "projects").mkdir(exist_ok=True)
+    _symlink_or_skip(home / "projects" / "linked", outside / "elsewhere")
+    _symlink_or_skip(home / "projects" / "mine2", outside / "elsewhere")
+    file_link = home / "projects" / "files"
+    file_link.mkdir()
+    _symlink_or_skip(file_link / (SESSION + ".jsonl"), outside / "elsewhere" / (SESSION + ".jsonl"))
+    assert hierarchy_hosts.transcripts("claude-code", home, SESSION) == [real]
+
+
+def test_transcripts_refuse_a_symlinked_home_component(tmp_path):
+    home, outside = tmp_path / "home", tmp_path / "outside"
+    touch(outside / "p" / (SESSION + ".jsonl"))
+    home.mkdir()
+    _symlink_or_skip(home / "projects", outside)
+    assert hierarchy_hosts.transcripts("claude-code", home, SESSION) == []

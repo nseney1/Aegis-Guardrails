@@ -39,6 +39,9 @@ CLAUDE_INIT_KEYS = (("session_id", "session_id"), ("tools", "tools"), ("model", 
 # The real status also carries email, orgId, orgName, planTier, subscriptionType and storedClaudeAiLogin. Evidence
 # must not hold account identity, so only these keys are recorded.
 CLAUDE_AUTH_KEYS = ("loggedIn", "authMethod", "apiProvider", "configDirectory", "projectsDirectory", "loginExpiresAt")
+# Exact types, so a retained key cannot smuggle identity inside a nested value (and bool is not an int here).
+CLAUDE_AUTH_TYPES = {"loggedIn": (bool,), "authMethod": (str,), "apiProvider": (str,), "configDirectory": (str,),
+                     "projectsDirectory": (str,), "loginExpiresAt": (str, int, type(None))}
 READER_SCOPE = {"boundary": "no write tools"}
 
 _HOSTS = {
@@ -128,7 +131,23 @@ def transcripts(kind, home, session):
     home = Path(home)
     if not home.is_dir():
         return []
-    return sorted({path for template in templates for path in home.glob(template.format(session=session))})
+    found = {path for template in templates for path in home.glob(template.format(session=session))}
+    return sorted(path for path in found if _confined(home, path))
+
+
+def _confined(home, path):
+    """A transcript counts only as a regular file reached through no symlink below the home: a linked `projects`
+    folder or rollout would otherwise point the meter, evidence and session checks at another account's history."""
+    current = path
+    while current != home:
+        if current.is_symlink() or current == current.parent:
+            return False
+        current = current.parent
+    try:
+        path.resolve().relative_to(home.resolve())
+    except ValueError:
+        return False
+    return path.is_file()
 
 
 def claude_events(lines):
@@ -231,7 +250,15 @@ def claude_auth_check(exit_code, status, home):
     if not isinstance(status, dict):
         problems.append("claude auth status printed no JSON object")
         return None, problems
-    record = {key: status[key] for key in CLAUDE_AUTH_KEYS if key in status}
+    record = {}
+    for key in CLAUDE_AUTH_KEYS:
+        if key not in status:
+            continue
+        if type(status[key]) in CLAUDE_AUTH_TYPES[key]:
+            record[key] = status[key]
+        else:
+            # The value is left out of the message too: it may be the identity this record must never hold.
+            problems.append("claude auth status field %s has an unexpected type" % key)
     if status.get("loggedIn") is not True:
         problems.append("not logged in")
     # A subscription login. Any other method, including an apiKeyHelper the billing variables miss, could bill
