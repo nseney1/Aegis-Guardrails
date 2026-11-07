@@ -13,6 +13,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -31,13 +33,22 @@ ACCOUNT_KEYS = {"email", "orgId", "orgName", "planTier", "subscriptionType", "st
 SESSION = "0b1f7c52-5d2e-4e07-9a41-3c8e2f9d6a10"
 NO_CONFIG = "fake claude: CLAUDE_CONFIG_DIR must name an existing folder\n"
 ONE_SESSION = "fake claude: give exactly one of --session-id or --resume\n"
-# A stdio MCP server that records the environment it was started with and offers a comma list of tools. Later words
-# are ignored, so a case can add the --endpoint the fake host looks for.
+# What a real outer Claude Code session puts in its children's environment. None of it may reach the fake's children.
+OUTER_SESSION = {"CLAUDECODE": "1", "CLAUDE_PID": "4242", "CLAUDE_CODE_SESSION_ID": "outer-session",
+                 "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_BRIDGE_SESSION_ID": "outer-bridge",
+                 "CLAUDE_CODE_MESSAGING_TOKEN": "outer-token", "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/outer.sock",
+                 "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_EXECPATH": "/outer/claude",
+                 "CLAUDE_CODE_SESSION_ATTENDED": "1"}
+# A server that appends its pid to the file named first, then never answers. Later words are ignored.
+SLEEPER = "import os, sys, time; open(sys.argv[1], 'a').write(str(os.getpid()) + '\\n'); time.sleep(30)"
+# A stdio MCP server that appends the environment of each start as a JSON line and offers a comma list of tools. It
+# answers any tool call with an empty object, enough for the fake host's inbox read. Later words are ignored, so a case
+# can add the --endpoint the fake host looks for.
 PROBE = r'''
 import json, os, sys
 record, tools = sys.argv[1], [name for name in sys.argv[2].split(",") if name]
-with open(record, "w", encoding="utf-8") as stream:
-    json.dump(dict(os.environ), stream)
+with open(record, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(dict(os.environ)) + "\n")
 for line in sys.stdin:
     request = json.loads(line)
     if "id" not in request:
@@ -45,8 +56,10 @@ for line in sys.stdin:
     if request["method"] == "initialize":
         result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                   "serverInfo": {"name": "probe", "version": "1"}}
-    else:
+    elif request["method"] == "tools/list":
         result = {"tools": [{"name": name, "inputSchema": {"type": "object"}} for name in tools]}
+    else:
+        result = {"content": [{"type": "text", "text": "{}"}]}
     print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
 '''
 
@@ -70,8 +83,8 @@ class Run:
     def command(self):
         return fake.require_fake(str(self.bin))
 
-    def claude(self, *argv, expect=0, stdin="Do the work.", cwd=None, **changes):
-        result = subprocess.run([self.command(), *argv], input=stdin, capture_output=True, text=True, timeout=60,
+    def claude(self, *argv, expect=0, stdin="Do the work.", cwd=None, timeout=60, **changes):
+        result = subprocess.run([self.command(), *argv], input=stdin, capture_output=True, text=True, timeout=timeout,
                                 cwd=str(cwd or self.cwd), env=self.env(**changes))
         assert result.returncode == expect, (result.returncode, result.stdout, result.stderr)
         return result
@@ -133,6 +146,20 @@ def provision_argv(session_flags, connection, tools=READER, *, allowed=("mcp__ae
     return argv[argv.index("claude") + 1:]
 
 
+def gone(pid, wait=5.0):
+    """True once the process is reaped or a zombie, so it can no longer act."""
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            state = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def print_argv(*extra, session=SESSION):
     return ["-p", "--session-id", session, "--output-format", "stream-json", "--verbose", *extra]
 
@@ -177,6 +204,33 @@ def test_every_command_needs_an_existing_absolute_config_dir(fresh, kind):
     assert not (fresh.home / ".claude").exists() and not (fresh.cwd / "relative-home" / ".credentials.json").exists()
 
 
+@pytest.mark.parametrize("where", ["exact", "inside", "symlink"])
+def test_the_real_users_claude_folder_is_refused_even_under_a_test_home(tmp_path, monkeypatch, capsys, where):
+    import pwd
+    owner = tmp_path / "owner"
+    real = owner / ".claude"
+    (real / "nested").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real)
+    # The seam is pwd in this process, so the fake runs in-process here; never the real folder.
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(owner)))
+    monkeypatch.setenv("HOME", str(tmp_path / "test-home"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str({"exact": real, "inside": real / "nested", "symlink": tmp_path / "link"}[where]))
+    monkeypatch.delenv("FAKE_CLAUDE_LOG", raising=False)
+    monkeypatch.setattr(sys, "argv", ["claude", "auth", "status", "--json"])
+    assert fake.main() == 2
+    assert capsys.readouterr() == ("", "fake claude: CLAUDE_CONFIG_DIR is the real ~/.claude\n")
+    assert [path.name for path in real.iterdir()] == ["nested"]
+
+
+def test_a_folder_beside_the_real_users_claude_folder_is_allowed(tmp_path, monkeypatch):
+    import pwd
+    beside = tmp_path / "owner" / ".claude-work"
+    beside.mkdir(parents=True)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "owner")))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(beside))
+    assert fake.config_dir() == beside
+
+
 # auth
 
 def test_status_on_an_empty_config_dir_says_not_logged_in_and_creates_the_state_file(fresh):
@@ -197,6 +251,14 @@ def test_login_writes_private_credentials_and_status_then_reports_a_claude_ai_lo
     assert ACCOUNT_KEYS <= set(status) and status["email"] == "fake@example.invalid"
     for flags in (["--console"], ["--sso"], ["--email", "someone@example.invalid"], []):
         fresh.claude("auth", "login", *flags)
+    assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
+
+
+def test_a_login_over_a_loose_credentials_file_makes_it_private(fresh):
+    credentials = fresh.config / ".credentials.json"
+    credentials.write_text("{}", encoding="utf-8")
+    credentials.chmod(0o644)
+    fresh.claude("auth", "login")
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
 
 
@@ -329,8 +391,12 @@ def test_resume_looks_only_in_the_cwd_project_folder(run):
     refused = run.claude(*provision_argv(["--resume", unknown], connection), expect=1)
     assert refused.stderr == "fake claude: no conversation found for session %s in %s\n" % (
         unknown, run.config / "projects" / slug(run.cwd))
-    escape = run.claude(*provision_argv(["--resume", "../" + SESSION], connection), expect=1)
-    assert escape.stderr.startswith("fake claude: no conversation found for session ../")
+    # From another cwd, a relative climb into the first cwd's folder would reach the real transcript.
+    traversal = "../%s/%s" % (slug(run.cwd), SESSION)
+    refused = run.claude(*provision_argv(["--resume", traversal], connection), expect=1, cwd=other)
+    assert refused.stderr == "fake claude: no conversation found for session %s in %s\n" % (
+        traversal, run.config / "projects" / slug(other))
+    assert not (run.config / "projects" / slug(other)).exists()
     assert len(lines(run.transcript(SESSION))) == 2
 
 
@@ -350,7 +416,7 @@ def test_a_print_turn_needs_exactly_one_well_formed_session(run, flags, stderr):
 
 def test_print_mode_needs_a_login_and_writes_nothing_without_one(fresh):
     refused = fresh.claude(*provision_argv(["--session-id", SESSION], fresh.connection({})), expect=1)
-    assert refused.stderr.strip() and refused.stdout == ""
+    assert refused.stderr == "fake claude: not logged in\n" and refused.stdout == ""
     assert not (fresh.config / "projects").exists()
 
 
@@ -371,6 +437,8 @@ def test_stream_json_without_verbose_is_refused(run):
     (lambda argv: [("text" if word == "stream-json" else word) for word in argv],
      "fake claude: only --output-format stream-json is modelled\n"),
     (lambda argv: ["--background"] + argv, "fake claude: background mode is not modelled\n"),
+    (lambda argv: argv + ["--name", "pilot/orchestrator-g1"], "fake claude: --name is not modelled\n"),
+    (lambda argv: argv + ["-n", "pilot/orchestrator-g1"], "fake claude: -n is not modelled\n"),
 ])
 def test_unmodelled_print_options_are_refused(run, change, stderr):
     refused = run.claude(*change(provision_argv(["--session-id", SESSION], run.connection({}))), expect=2)
@@ -395,6 +463,22 @@ def test_words_after_a_bare_double_dash_are_the_prompt_and_variadic_lists_stop_a
     run.claude(*argv, "--allowed-tools", "Edit", "--disallowedTools", "Bash", "--disallowed-tools", "Write",
                stdin="From stdin.")
     assert lines(run.transcript(second))[0]["message"]["content"] == "From stdin."
+
+
+def test_variadic_lists_stop_at_any_option_word(run):
+    argv = ["--session-id", SESSION, "--output-format", "stream-json", "--verbose", "--allowedTools", "Read", "Edit",
+            "-p", "--disallowedTools", "Bash", "-r"]
+    refused = run.claude(*argv, expect=2)
+    assert refused.stderr == "fake claude: -r needs a value\n", "-p and -r were options, not tool names"
+    started = events(run.claude(*argv[:-1]))
+    assert [event["type"] for event in started] == ["system", "assistant", "result"]
+
+
+@pytest.mark.parametrize("stdin,words", [("", []), (" \n", []), ("ignored", ["--"]), ("ignored", ["--", " "])])
+def test_an_empty_prompt_is_refused(run, stdin, words):
+    refused = run.claude(*provision_argv(["--session-id", SESSION], run.connection({})), *words, stdin=stdin, expect=2)
+    assert refused.stderr == "fake claude: empty prompt\n" and refused.stdout == ""
+    assert not (run.config / "projects").exists()
 
 
 # init event
@@ -432,9 +516,34 @@ def test_mcp_tools_are_listed_and_mcp_children_never_see_a_session_variable(run)
     assert init["mcp_servers"] == [{"name": "probe", "status": "connected"}, {"name": "broken", "status": "failed"},
                                    {"name": "remote", "status": "failed"}]
     assert init["tools"] == READER + ["mcp__probe__echo", "mcp__probe__ping"]
-    seen = json.loads(record.read_text(encoding="utf-8"))
+    [seen] = lines(record)
     assert "CLAUDE_CODE_SESSION_ID" not in seen and "CLAUDECODE" not in seen
     assert seen["FAKE_PROBE_PASSTHROUGH"] == "kept" and seen["CLAUDE_CONFIG_DIR"] == str(run.config)
+
+
+def test_no_outer_session_variable_reaches_an_mcp_child_or_the_fake_host(run, tmp_path):
+    server, record = run.probe("aegis_mailbox", ("mailbox_inbox",))
+    server["args"] += ["--endpoint", "pilot/x"]
+    plan, host_log = tmp_path / "plan.json", tmp_path / "host.jsonl"
+    plan.write_text(json.dumps({"pilot/x": {}}), encoding="utf-8")
+    run.claude(*provision_argv(["--session-id", SESSION], run.connection({"aegis_mailbox": server})),
+               FAKE_HOST_PLAN=str(plan), FAKE_HOST_LOG=str(host_log), FAKE_PROBE_PASSTHROUGH="kept", **OUTER_SESSION)
+    assert lines(host_log)[0]["endpoint"] == "pilot/x"
+    # The fake's own tools/list start, then the adapter the fake host started with the environment it was given.
+    probed, hosted = lines(record)
+    for seen in (probed, hosted):
+        assert not set(OUTER_SESSION) & set(seen), sorted(set(OUTER_SESSION) & set(seen))
+        assert seen["FAKE_PROBE_PASSTHROUGH"] == "kept" and seen["CLAUDE_CONFIG_DIR"] == str(run.config)
+
+
+def test_an_mcp_server_that_never_answers_is_failed_after_the_probe_timeout(run):
+    pids = run.tmp / "silent.pids"
+    connection = run.connection({"silent": {"command": sys.executable, "args": ["-c", SLEEPER, str(pids)]}})
+    started = time.monotonic()
+    init = events(run.claude(*provision_argv(["--session-id", SESSION], connection), FAKE_CLAUDE_MCP_TIMEOUT="0.5"))[0]
+    assert init["mcp_servers"] == [{"name": "silent", "status": "failed"}]
+    assert time.monotonic() - started < 10, "the probe waited longer than its timeout"
+    assert all(gone(int(pid)) for pid in pids.read_text().split())
 
 
 @pytest.mark.parametrize("body", [None, "not json", '{"servers": {}}'])
@@ -464,6 +573,13 @@ def test_reply_and_usage_come_from_the_environment(run):
      "fake claude: FAKE_CLAUDE_USAGE must be a JSON object with exactly input_tokens, cache_creation_input_tokens, "
      "cache_read_input_tokens, output_tokens\n"),
     ({"FAKE_CLAUDE_MODE": "explode"}, "fake claude: unknown FAKE_CLAUDE_MODE explode\n"),
+    ({"FAKE_CLAUDE_MCP_TIMEOUT": "0"}, "fake claude: FAKE_CLAUDE_MCP_TIMEOUT must be a positive number of seconds\n"),
+    ({"FAKE_CLAUDE_MCP_TIMEOUT": "soon"},
+     "fake claude: FAKE_CLAUDE_MCP_TIMEOUT must be a positive number of seconds\n"),
+    ({"FAKE_CLAUDE_TURN_TIMEOUT": "-1"},
+     "fake claude: FAKE_CLAUDE_TURN_TIMEOUT must be a positive number of seconds\n"),
+    ({"FAKE_CLAUDE_TURN_TIMEOUT": "nan"},
+     "fake claude: FAKE_CLAUDE_TURN_TIMEOUT must be a positive number of seconds\n"),
 ])
 def test_malformed_knobs_are_refused_before_the_turn(run, variables, stderr):
     refused = run.claude(*print_argv(), expect=2, **variables)
@@ -551,3 +667,47 @@ def test_a_failing_fake_host_turn_sets_the_exit_code_after_the_events(run, tmp_p
     # Without a plan there is no mailbox turn at all.
     run.claude(*provision_argv(["--session-id", str(uuid.uuid4())], connection), FAKE_HOST_LOG=str(host_log))
     assert len(lines(host_log)) == 1
+
+
+def hanging_turn(run, tmp_path):
+    """A connection whose adapter never answers, and a plan that sends the fake host to it."""
+    pids, plan, host_log = tmp_path / "adapter.pids", tmp_path / "plan.json", tmp_path / "host.jsonl"
+    server = {"command": sys.executable, "args": ["-c", SLEEPER, str(pids), "--endpoint", "pilot/x"]}
+    plan.write_text(json.dumps({"pilot/x": {}}), encoding="utf-8")
+    argv = provision_argv(["--session-id", SESSION], run.connection({"aegis_mailbox": server}))
+    return argv, pids, {"FAKE_HOST_PLAN": str(plan), "FAKE_HOST_LOG": str(host_log), "FAKE_CLAUDE_MCP_TIMEOUT": "0.5"}
+
+
+def test_a_fake_host_turn_that_overruns_is_killed_with_its_process_group(run, tmp_path):
+    argv, pids, knobs = hanging_turn(run, tmp_path)
+    started = time.monotonic()
+    refused = run.claude(*argv, expect=1, timeout=20, FAKE_CLAUDE_TURN_TIMEOUT="1", **knobs)
+    assert refused.stderr == "fake claude: turn timed out\n"
+    assert [event["type"] for event in events(refused)] == ["system"]
+    assert time.monotonic() - started < 15
+    # The probe's start, then the host's adapter, which the kill of the host's group must have taken too.
+    assert len(pids.read_text().split()) == 2
+    assert all(gone(int(pid)) for pid in pids.read_text().split())
+
+
+def test_a_stop_sent_to_the_fake_reaches_the_fake_host_in_its_own_group(run, tmp_path):
+    argv, pids, knobs = hanging_turn(run, tmp_path)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Wait.", encoding="utf-8")
+    with open(prompt, encoding="utf-8") as stdin:
+        process = subprocess.Popen([run.command(), *argv], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, cwd=str(run.cwd), start_new_session=True, env=run.env(**knobs))
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (not pids.exists() or len(pids.read_text().split()) < 2):
+            time.sleep(0.05)
+        assert len(pids.read_text().split()) == 2, "the fake host never started its adapter"
+        # As the wake stops a turn: a SIGTERM to the fake's own group, which the host has left.
+        os.killpg(process.pid, 15)
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+        process.communicate(timeout=10)
+    assert process.returncode == -15
+    assert all(gone(int(pid)) for pid in pids.read_text().split())

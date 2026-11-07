@@ -1,27 +1,36 @@
 """Test fake of the `claude` command (hierarchy_fake_claude.py), installed on PATH by tests. Never a real host.
 
-Modelled on what Claude 2.1.316/2.1.319 was seen to do:
-- `auth status [--json|--text]`: exit 1 with loggedIn false and authMethod "none" on an empty CLAUDE_CONFIG_DIR,
-  creating its .claude.json; exit 0 with authMethod "claude.ai" and fake account keys after a login. The --text
-  wording is the fake's own.
-- `auth login [--claudeai|--console|--sso|--email E]` writes <CLAUDE_CONFIG_DIR>/.credentials.json, mode 0600. The
-  flags are accepted, not told apart.
-- Print mode (-p) with the options hierarchy_provision.claude_argv writes: stream-json `system` init, `assistant` and
-  one `result` per invocation (usage summed over that invocation), and a transcript at
-  <CLAUDE_CONFIG_DIR>/projects/<cwd, each non-alphanumeric as "-">/<session>.jsonl with a user and an assistant record.
-Modelled on the docs, never seen here: auth precedence (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY give "third_party",
-then ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY give "api_key", then CLAUDE_CODE_OAUTH_TOKEN gives "oauth_token", then
-the stored login), and that --output-format stream-json with --print needs --verbose.
+Observed on Claude 2.1.316/2.1.319, and modelled as seen:
+- `auth status --json` on an empty CLAUDE_CONFIG_DIR: exit 1, loggedIn false, authMethod "none", and it creates
+  .claude.json. After a claude.ai login: exit 0, authMethod "claude.ai" and account keys (fake values here).
+- After a claude.ai login, <CLAUDE_CONFIG_DIR>/.credentials.json exists with mode 0600 (2.1.319 on the owner's
+  machine; only existence and mode were checked, so the fake writes a marker, not real contents).
+- The shapes of print mode's stream-json `system` init, `assistant` and `result` events, one result per invocation
+  with usage summed over it, and the transcript at <CLAUDE_CONFIG_DIR>/projects/<cwd, each non-alphanumeric as
+  "-">/<session>.jsonl.
+Modelled, not observed:
+- From the docs: auth precedence (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY give "third_party", then
+  ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY give "api_key", then CLAUDE_CODE_OAUTH_TOKEN gives "oauth_token", then the
+  stored login), and that --output-format stream-json with --print needs --verbose.
+- The fake's own choices: a reused --session-id is refused, and it must be a canonical UUID; --resume keeps the same
+  id and appends to the same transcript; init's `cwd` is the process cwd; MCP servers are "connected" or "failed"; a
+  failed turn's result is `error_during_execution` with `is_error`; a print turn without a login exits 1 with a
+  "fake claude:" line; MCP children and the fake host get the caller's environment minus the outer session's
+  variables (below); the --text status wording; login flags are accepted, not told apart.
 Not modelled: a model (the reply is FAKE_CLAUDE_REPLY), permission enforcement (--restricted, --permission-*, allowed
-and disallowed tools are parsed, never applied), the real default tool set, background sessions (--bg), interactive
-mode, other output formats, a positional prompt, apiKeyHelper or profiles, MCP servers kept alive for the session (each
-is asked for its tools once and closed), resume lookup beyond the cwd's own project folder (kept conservative), and a
-session variable in MCP children: no real host has shown one there (owner decision B), so children get none.
+and disallowed tools are parsed, never applied), the real default tool set, background sessions (--bg) and session
+names (--name), interactive mode, other output formats, a positional or empty prompt, apiKeyHelper or profiles, MCP
+servers kept alive for the session (each is asked for its tools once and closed), resume lookup beyond the cwd's own
+project folder (kept conservative), and a session variable in MCP children: no real host has shown one there (owner
+decision B). So every child the fake starts loses CLAUDECODE, CLAUDE_PID and every CLAUDE_CODE_* variable;
+CLAUDE_CONFIG_DIR stays.
 
+Every command refuses a CLAUDE_CONFIG_DIR that is missing, relative, or the real user's ~/.claude or inside it.
 Knobs: FAKE_CLAUDE_LOG (one JSON line per call), FAKE_CLAUDE_STATUS_DIR (the configDirectory status reports),
 FAKE_CLAUDE_LOGIN=fail, FAKE_CLAUDE_EXTRA_TOOLS, FAKE_CLAUDE_SERVED_MODEL, FAKE_CLAUDE_REPLY, FAKE_CLAUDE_USAGE,
-FAKE_CLAUDE_MODE ("no-result", "fail" or "hang"), and FAKE_HOST_PLAN, which runs hierarchy_fake_host.py inside the
-turn as the Codex fake does.
+FAKE_CLAUDE_MCP_TIMEOUT (seconds per MCP probe, default 20), FAKE_CLAUDE_MODE ("no-result": a turn whose result event
+never arrived, exit 0; "fail"; "hang"), and FAKE_HOST_PLAN, which runs hierarchy_fake_host.py inside the turn as the
+Codex fake does, for at most FAKE_CLAUDE_TURN_TIMEOUT seconds (default 60).
 """
 from datetime import datetime, timezone
 import json
@@ -30,6 +39,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -54,7 +64,7 @@ MODES = ("", "no-result", "fail", "hang")
 VALUES = {"--session-id": "session_id", "--resume": "resume", "-r": "resume", "--mcp-config": "mcp_config",
           "--tools": "tools", "--model": "model", "--effort": "effort", "--permission-mode": "permission_mode",
           "--permission-prompts": "permission_prompts", "--output-format": "output_format", "--settings": "settings",
-          "--add-dir": "add_dir", "--agents": "agents", "--name": "name", "-n": "name"}
+          "--add-dir": "add_dir", "--agents": "agents"}
 REPEATED = ("mcp_config", "add_dir")
 LISTS = {"--allowedTools": "allowed", "--allowed-tools": "allowed", "--disallowedTools": "disallowed",
          "--disallowed-tools": "disallowed"}
@@ -99,7 +109,20 @@ def config_dir():
     # Never fall back to a real ~/.claude, whatever HOME says.
     if not (os.path.isabs(value) and os.path.isdir(value)):
         refuse(2, "fake claude: CLAUDE_CONFIG_DIR must name an existing folder")
+    real, resolved = real_claude_dir(), Path(value).resolve()
+    if resolved == real or real in resolved.parents:
+        refuse(2, "fake claude: CLAUDE_CONFIG_DIR is the real ~/.claude")
     return Path(value)
+
+
+def real_claude_dir():
+    """The account's own ~/.claude, from the password database: a test sets HOME, which must not hide it."""
+    import pwd  # POSIX only; the test module imports this file on every platform
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        refuse(2, "fake claude: cannot find the real home folder, so ~/.claude cannot be kept out")
+    return (Path(home) / ".claude").resolve()
 
 
 def auth(home, argv):
@@ -181,6 +204,9 @@ def parse(argv):
             break
         if word in ("--bg", "--background"):
             refuse(2, "fake claude: background mode is not modelled")
+        if word in ("--name", "-n"):
+            # claude_argv names only background sessions.
+            refuse(2, "fake claude: %s is not modelled" % word)
         if word.startswith("--tools="):
             options["tools"] = word[len("--tools="):]
         elif word in FLAGS:
@@ -198,7 +224,7 @@ def parse(argv):
             # Variadic: it takes every word up to the next option, which is how a trailing prompt was lost on a real
             # host and why claude_argv sends the prompt on stdin.
             index += 1
-            while index < len(argv) and not argv[index].startswith("--"):
+            while index < len(argv) and not argv[index].startswith("-"):
                 options[LISTS[word]].append(argv[index])
                 index += 1
             continue
@@ -220,15 +246,18 @@ def print_mode(home, argv):
     folder = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
     session = session_for(home, folder, options)
     if auth_method(home)[0] == "none":
-        refuse(1, "Not logged in · Please run /login")
+        refuse(1, "fake claude: not logged in")
     mode = os.environ.get("FAKE_CLAUDE_MODE", "")
     if mode not in MODES:
         refuse(2, "fake claude: unknown FAKE_CLAUDE_MODE " + mode)
     usage = usage_from_env()
+    probe_timeout, turn_timeout = seconds("FAKE_CLAUDE_MCP_TIMEOUT", 20.0), seconds("FAKE_CLAUDE_TURN_TIMEOUT", 60.0)
     prompt = options["prompt"] if options["prompt"] is not None else sys.stdin.read()
+    if not prompt.strip():
+        refuse(2, "fake claude: empty prompt")
     model = os.environ.get("FAKE_CLAUDE_SERVED_MODEL") or options["model"] or "claude-fake-default"
     env = child_env()
-    servers, mcp_tools = probe_servers(options["mcp_config"], env)
+    servers, mcp_tools = probe_servers(options["mcp_config"], env, probe_timeout)
     emit({"type": "system", "subtype": "init", "cwd": cwd, "session_id": session,
           "tools": offered_tools(options) + mcp_tools, "mcp_servers": servers, "model": model,
           "permissionMode": options["permission_mode"] or "default", "apiKeySource": "none",
@@ -245,10 +274,7 @@ def print_mode(home, argv):
         return 1
     code = 0
     if os.environ.get("FAKE_HOST_PLAN") and any(server["name"] == "aegis_mailbox" for server in servers):
-        # The fake host finds the mailbox in --mcp-config and drives the real adapter, as the Codex fake's turn does.
-        # Its stdout goes to stderr so the stream stays JSON lines.
-        code = subprocess.run([sys.executable, str(HOST), *argv], input=prompt, text=True, env=env,
-                              stdout=sys.stderr).returncode
+        code = run_host(argv, prompt, env, turn_timeout)
     message = {"model": model, "id": "msg_fake_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
                "content": [{"type": "text", "text": os.environ.get("FAKE_CLAUDE_REPLY") or "done"}], "usage": usage}
     emit({"type": "assistant", "message": message, "session_id": session})
@@ -294,10 +320,57 @@ def usage_from_env():
     return usage
 
 
+def run_host(argv, prompt, env, timeout):
+    """The fake host finds the mailbox in --mcp-config and drives the real adapter, as the Codex fake's turn does."""
+    # Its own group, so a timeout stops the host and the adapters it started together. Its stdout goes to stderr so
+    # the stream stays JSON lines.
+    host = subprocess.Popen([sys.executable, str(HOST), *argv], stdin=subprocess.PIPE, stdout=sys.stderr, text=True,
+                            env=env, start_new_session=True)
+
+    def forward(number, frame):
+        # The wake stops a turn with SIGTERM to the fake's group, which the host has left: pass the stop on, then die
+        # of the same signal. No wait here, since the interrupted communicate may hold the wait lock.
+        kill_group(host)
+        signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)
+
+    signal.signal(signal.SIGTERM, forward)
+    try:
+        host.communicate(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(host)
+        host.wait()
+        refuse(1, "fake claude: turn timed out")
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    return host.returncode
+
+
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def seconds(name, default):
+    text = os.environ.get(name)
+    if not text:
+        return default
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if not 0 < value < float("inf"):  # NaN fails both comparisons
+        refuse(2, "fake claude: %s must be a positive number of seconds" % name)
+    return value
+
+
 def child_env():
     # No real host has shown a session variable in an MCP child (owner decision B; spec rule 3 waits for T2(b)), and a
-    # test run inside Claude Code must not hand its own session to the fake's children.
-    return {key: value for key, value in os.environ.items() if key not in ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE")}
+    # test run inside Claude Code must not hand its outer session's variables to the fake's children.
+    return {key: value for key, value in os.environ.items()
+            if not (key in ("CLAUDECODE", "CLAUDE_PID") or key.startswith("CLAUDE_CODE_"))}
 
 
 def offered_tools(options):
@@ -309,7 +382,7 @@ def offered_tools(options):
     return tools + [name for name in os.environ.get("FAKE_CLAUDE_EXTRA_TOOLS", "").split(",") if name]
 
 
-def probe_servers(paths, env):
+def probe_servers(paths, env, timeout):
     servers, tools = [], []
     for path in paths:
         try:
@@ -318,13 +391,13 @@ def probe_servers(paths, env):
         except (OSError, ValueError, KeyError, TypeError):
             refuse(1, "fake claude: cannot read --mcp-config " + path)
         for name in names:
-            listed = list_tools(definitions[name], env)
+            listed = list_tools(definitions[name], env, timeout)
             servers.append({"name": name, "status": "failed" if listed is None else "connected"})
             tools += ["mcp__%s__%s" % (name, tool) for tool in listed or []]
     return servers, tools
 
 
-def list_tools(definition, env):
+def list_tools(definition, env, timeout):
     """The server's tool names from initialize and tools/list over stdio JSON lines, or None if it fails."""
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -333,7 +406,7 @@ def list_tools(definition, env):
               {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}]
     try:
         done = subprocess.run([definition["command"], *definition.get("args", [])], env=env, capture_output=True,
-                              input="".join(json.dumps(frame) + "\n" for frame in frames), text=True, timeout=20)
+                              input="".join(json.dumps(frame) + "\n" for frame in frames), text=True, timeout=timeout)
         answers = {}
         for line in done.stdout.splitlines():
             if line.strip():
