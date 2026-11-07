@@ -648,8 +648,11 @@ def step_provision(run, state):
     request = {"store": str(run.store), "base": str(run.base), "source": str(run.source), "python": run.python,
                "roles": run.roles, "lanes": {lane.id: lane.kind for lane in run.lanes},
                "initiative": initiative_record(run)}
-    save(run, "provision-init.json", checked(run, "provision init", "provision", "init", "--request",
-                                             request_file(run, "provision-init.json", request)))
+    # Provision init refuses an initiative it already registered, so a failure after it (the evidence save or the plan
+    # write) resumes past it on --continue instead of running it again.
+    answer = once(run, state, "provision-init", lambda: checked(run, "provision init", "provision", "init", "--request",
+                                                               request_file(run, "provision-init.json", request)))
+    save(run, "provision-init.json", answer)
     # Here rather than as a step of its own, so a run already past this step keeps today's unchecked bindings. Provision
     # init refuses an existing base, so the plan can only follow it, before the first add-role.
     plan = hierarchy_hosts.plan_record(hierarchy=run.id, root=run.hosts["root"], team=run.hosts["team"],

@@ -552,19 +552,37 @@ def check_role_request(request, setup):
     return cwd, timeout, assistants
 
 
-def check_host_plan(plan, request, mailbox, endpoint):
-    """(write scope, stand-in) under the run's host plan; the scope is None when the plan does not cover the endpoint.
+def write_roots(cwd, request):
+    """The folders a writer's host is told it may write, as real paths, once each and in order. Claude gets no
+    writable_roots or tmpdir (check_codex_options), so for it this is the cwd alone."""
+    roots = []
+    for folder in [cwd, *request.get("writable_roots", []), *([request["tmpdir"]] if "tmpdir" in request else [])]:
+        real = str(Path(folder).resolve())
+        if real not in roots:
+            roots.append(real)
+    return roots
 
-    Before binding, so a refusal leaves the endpoint unbound.
-    """
+
+def check_host_plan(plan, request, mailbox, endpoint, cwd):
+    """(write scope, stand-in) under the run's host plan, before binding, so a refusal leaves the endpoint unbound."""
     host = request["host"]
     writer = hierarchy_roles.writer(registry_role(mailbox, endpoint))
     scope = hierarchy_hosts.require_binding(plan, endpoint, host, writer)
     stand_in = hierarchy_hosts.plan_host(plan, endpoint)[1]
-    if scope is not None and host == CLAUDE and not stand_in:
+    if host == CLAUDE and not stand_in:
         for key in TEAM_CLAUDE_REFUSED:
             require(not request.get(key), "%s: a claude-code role in a team run takes no %s" % (endpoint, key))
+    if writer and not stand_in:
+        scope["roots"] = write_roots(cwd, request)
     return scope, stand_in
+
+
+def session_folder(base):
+    """<base>/sessions, made before anything binds: a record that cannot be written must not leave a bound endpoint."""
+    folder = base / "sessions"
+    if not folder.exists() and not folder.is_symlink():
+        folder.mkdir(mode=0o700)
+    require(folder.is_dir() and not folder.is_symlink(), "session records need a real folder: " + str(folder))
 
 
 def add_role(request):
@@ -576,8 +594,8 @@ def add_role(request):
     mailbox.endpoint(endpoint)
     cwd, timeout, assistants = check_role_request(request, setup)
     host = request["host"]
-    plan = hierarchy_hosts.read_plan(base)
-    scope, stand_in = check_host_plan(plan, request, mailbox, endpoint) if plan is not None else (None, False)
+    plan = hierarchy_hosts.base_plan(base, setup["initiative"])
+    scope, stand_in = check_host_plan(plan, request, mailbox, endpoint, cwd) if plan is not None else (None, False)
     team = None
     fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
@@ -596,8 +614,10 @@ def add_role(request):
                     "endpoint is bound to another session; hand it off first")
         record = recorded = None
         if scope is not None:
-            # A new binding is generation 1 (expected_generation 0). Compared before binding, so a conflicting record
-            # leaves a new endpoint unbound; under the mailbox lock, which handoff also holds while it records.
+            # A new binding is generation 1 (expected_generation 0). Checked before binding, so a sessions path that is
+            # not a real folder, or a conflicting record, leaves a new endpoint unbound. A handed-off successor is
+            # recorded here too, by the add-role that builds its connection and profile.
+            session_folder(base)
             record = hierarchy_hosts.session_record(
                 endpoint, hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")), host,
                 hierarchy_hosts.team_start_mode(host, stand_in, request.get("background", False)), session,
@@ -916,6 +936,10 @@ def move(request):
     require(isinstance(request["root"]["session"], str) and UUID.fullmatch(request["root"]["session"]) is not None,
             "root needs the actual session ID of the active root")
     old = Mailbox(safe_path(text(request["old_root"], "old_root")))
+    old_plan = old.root.parent / hierarchy_hosts.PLAN_FILE
+    # A moved base would carry no plan, so its sessions would bind unchecked: a team run starts over instead.
+    require(not old_plan.exists() and not old_plan.is_symlink(),
+            "a planned team hierarchy cannot be moved; start a new team run")
     endpoints = {name: spec for name, spec in old.manifest["endpoints"].items() if name.split("/")[0] == hierarchy}
     require(bool(endpoints), "the old root has no such hierarchy: " + str(hierarchy))
     roles, replaced = request.get("roles", {}), request.get("replaced", {})

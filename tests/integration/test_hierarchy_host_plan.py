@@ -14,7 +14,7 @@ import pytest
 
 from tests.integration.test_hierarchy_handoff import handoff
 from tests.integration.test_hierarchy_mailbox import ROOT, invoke
-from tests.integration.test_hierarchy_provision import Setup
+from tests.integration.test_hierarchy_provision import Setup, provision
 from tests.integration.test_hierarchy_team import Run as TeamRun, in_process, sha
 
 
@@ -59,6 +59,14 @@ def unbound(setup, endpoint):
     return invoke(setup.root, "status")["bindings"][endpoint] is None
 
 
+def real(path):
+    return os.path.realpath(str(path))
+
+
+def writer_scope(scope, *roots):
+    return dict(scope, roots=[real(root) for root in roots])
+
+
 @pytest.fixture
 def setup(tmp_path):
     built = Setup(tmp_path)
@@ -74,7 +82,7 @@ def test_a_claude_team_binds_on_claude_and_records_each_sessions_write_scope(set
     writer = setup.add_role("pilot/lane/f2", CLAUDE, cwd=str(setup.tmp))
     reviewer = setup.add_role("pilot/lane/review", CLAUDE, cwd=str(setup.tmp))
     assert record(setup, "pilot/lane/f2") == expected("pilot/lane/f2", "implementer", CLAUDE, "print",
-                                                      writer["session"], CLAUDE_WRITER)
+                                                      writer["session"], writer_scope(CLAUDE_WRITER, setup.tmp))
     assert record(setup, "pilot/lane/review") == expected("pilot/lane/review", "reviewer", CLAUDE, "print",
                                                           reviewer["session"], READER)
 
@@ -84,8 +92,20 @@ def test_a_codex_team_records_the_pending_sandbox_boundary(setup):
     write_plan(setup)
     setup.add_role("pilot/lane/f2", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
     found = record(setup, "pilot/lane/f2")
-    assert found == expected("pilot/lane/f2", "implementer", CODEX, "exec", CODEX_SESSION, CODEX_WRITER)
+    assert found == expected("pilot/lane/f2", "implementer", CODEX, "exec", CODEX_SESSION,
+                             writer_scope(CODEX_WRITER, setup.source))
     assert found["write_scope"]["boundary"] == "OS sandbox, qualification pending T2(b)"
+
+
+@posix
+def test_a_codex_writer_records_its_cwd_writable_roots_and_tmpdir_as_real_paths_once_each(setup):
+    write_plan(setup)
+    extra, scratch = setup.tmp / "integration", setup.tmp / "private-tmp"
+    extra.mkdir()
+    scratch.mkdir()
+    setup.add_role("pilot/lane/f2", CODEX, session=CODEX_SESSION, cwd=str(setup.source),
+                   writable_roots=[str(setup.source), str(extra)], tmpdir=str(scratch))
+    assert record(setup, "pilot/lane/f2")["write_scope"] == writer_scope(CODEX_WRITER, setup.source, extra, scratch)
 
 
 @posix
@@ -149,11 +169,45 @@ def test_root_is_checked_against_the_plans_root_host(setup):
 
 
 @posix
-def test_an_endpoint_of_another_hierarchy_is_unconstrained(setup):
+def test_a_plan_for_another_hierarchy_is_refused_before_anything_binds(setup):
     write_plan(setup, hierarchy="other", stand_ins={})
-    role = setup.add_role("pilot/lane/f2", CLAUDE, cwd=str(setup.tmp))
-    assert role["generation"] == 1
+    refused = setup.add_role("pilot/lane/f2", CLAUDE, cwd=str(setup.tmp), expect=2)
+    assert refused["error"] == "host plan is for hierarchy other, but this base serves pilot"
+    assert unbound(setup, "pilot/lane/f2")
     assert not (setup.base / "sessions").exists()
+
+
+@posix
+@pytest.mark.parametrize("shape", ["file", "symlink"])
+def test_a_sessions_path_that_is_not_a_real_folder_refuses_before_binding(setup, shape):
+    write_plan(setup, team=CLAUDE)
+    folder = setup.base / "sessions"
+    if shape == "file":
+        folder.write_text("not a folder\n", encoding="utf-8")
+    else:
+        (setup.tmp / "elsewhere").mkdir()
+        folder.symlink_to(setup.tmp / "elsewhere")
+    refused = setup.add_role("pilot/orchestrator", CLAUDE, cwd=str(setup.tmp), expect=2)
+    assert refused["error"] == "session records need a real folder: %s" % folder
+    assert unbound(setup, "pilot/orchestrator")
+    if shape == "symlink":
+        assert not list((setup.tmp / "elsewhere").iterdir())
+    else:
+        assert folder.read_text(encoding="utf-8") == "not a folder\n"
+
+
+@posix
+def test_add_role_fills_in_a_missing_record_on_an_existing_binding(setup):
+    first = setup.add_role("pilot/lane/f2", CLAUDE, cwd=str(setup.tmp))
+    assert not (setup.base / "sessions").exists(), "bound before the run had a plan"
+    write_plan(setup, team=CLAUDE)
+    again = setup.add_role("pilot/lane/f2", CLAUDE, session=first["session"], cwd=str(setup.tmp))
+    assert again["generation"] == 1
+    assert record(setup, "pilot/lane/f2") == expected("pilot/lane/f2", "implementer", CLAUDE, "print",
+                                                      first["session"], writer_scope(CLAUDE_WRITER, setup.tmp))
+    (setup.base / "sessions" / "pilot%2Flane%2Ff2-g1.json").unlink()
+    setup.add_role("pilot/lane/f2", CLAUDE, session=first["session"], cwd=str(setup.tmp))
+    assert record(setup, "pilot/lane/f2")["session"] == first["session"]
 
 
 @posix
@@ -238,6 +292,11 @@ def spec(setup, host, session, endpoint="pilot/orchestrator"):
             "entries": [{"root": str(setup.root), "endpoint": endpoint, "briefs": [brief(setup)]}]}
 
 
+def handed(setup, endpoint, session, generation):
+    binding = invoke(setup.root, "status")["bindings"][endpoint]
+    return binding["session"] == session and binding["generation"] == generation
+
+
 @posix
 def test_a_handoff_to_a_host_the_plan_does_not_assign_is_refused_per_entry_and_binds_nothing(setup):
     write_plan(setup)
@@ -246,29 +305,70 @@ def test_a_handoff_to_a_host_the_plan_does_not_assign_is_refused_per_entry_and_b
     assert result["entries"] == [{"root": str(setup.root), "endpoint": "pilot/orchestrator", "ok": False,
                                   "error": "pilot/orchestrator runs on codex-cli in this run's host plan, not "
                                            "claude-code"}]
-    assert invoke(setup.root, "status")["bindings"]["pilot/orchestrator"]["generation"] == 1
-    assert not (setup.base / "sessions" / "pilot%2Forchestrator-g2.json").exists()
+    assert handed(setup, "pilot/orchestrator", CODEX_SESSION, 1)
 
 
 @posix
-def test_a_handoff_on_the_planned_host_writes_the_successors_record_and_add_role_agrees(setup):
+def test_a_handoff_on_the_planned_host_binds_and_the_successors_add_role_writes_its_record(setup):
     write_plan(setup)
     setup.add_role("pilot/orchestrator", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
     successor = "01a19a29-d635-7411-8529-9efedafc0891"
     result = handoff(setup.tmp, spec(setup, CODEX, successor), 0)
     assert result["entries"][0]["ok"] is True and result["entries"][0]["generation"] == 2
-    written = record(setup, "pilot/orchestrator", 2)
-    assert written == expected("pilot/orchestrator", "orchestrator", CODEX, "exec", successor, READER, generation=2)
+    assert not (setup.base / "sessions" / "pilot%2Forchestrator-g2.json").exists(), "add-role writes it"
     again = handoff(setup.tmp, spec(setup, CODEX, successor), 0)
     assert again["entries"][0]["already_bound"] is True
-    # The successor's profile comes from add-role, which must find the same record, not a conflict.
+    assert not (setup.base / "sessions" / "pilot%2Forchestrator-g2.json").exists()
     role = setup.add_role("pilot/orchestrator", CODEX, session=successor, cwd=str(setup.source))
-    assert role["generation"] == 2 and record(setup, "pilot/orchestrator", 2) == written
+    assert role["generation"] == 2
+    assert record(setup, "pilot/orchestrator", 2) == expected("pilot/orchestrator", "orchestrator", CODEX, "exec",
+                                                              successor, READER, generation=2)
     assert record(setup, "pilot/orchestrator", 1)["session"] == CODEX_SESSION
 
 
 @posix
-def test_a_handoff_in_a_base_without_a_plan_writes_no_record(setup):
+def test_add_role_on_a_handed_off_writer_records_the_next_generation_with_its_roots(setup):
+    write_plan(setup)
+    extra = setup.tmp / "integration"
+    extra.mkdir()
+    setup.add_role("pilot/lane/f2", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
+    successor = "01a19a29-d635-7411-8529-9efedafc0892"
+    assert handoff(setup.tmp, spec(setup, CODEX, successor, "pilot/lane/f2"), 0)["entries"][0]["generation"] == 2
+    setup.add_role("pilot/lane/f2", CODEX, session=successor, cwd=str(setup.source), writable_roots=[str(extra)])
+    assert record(setup, "pilot/lane/f2", 2) == expected("pilot/lane/f2", "implementer", CODEX, "exec", successor,
+                                                         writer_scope(CODEX_WRITER, setup.source, extra), generation=2)
+    assert record(setup, "pilot/lane/f2", 1)["write_scope"] == writer_scope(CODEX_WRITER, setup.source)
+
+
+@posix
+def test_a_handoff_of_the_front_door_stand_in_is_checked_against_its_listed_host(setup):
+    write_plan(setup)
+    door = setup.add_role("pilot/front-door", CLAUDE, cwd=str(setup.tmp))
+    refused = handoff(setup.tmp, spec(setup, CODEX, CODEX_SESSION, "pilot/front-door"), 3)["entries"][0]
+    assert refused["error"] == "pilot/front-door runs on claude-code in this run's host plan, not codex-cli"
+    assert handed(setup, "pilot/front-door", door["session"], 1)
+    successor = str(uuid.uuid4())
+    assert handoff(setup.tmp, spec(setup, CLAUDE, successor, "pilot/front-door"), 0)["entries"][0]["generation"] == 2
+    setup.add_role("pilot/front-door", CLAUDE, session=successor, cwd=str(setup.tmp))
+    assert record(setup, "pilot/front-door", 2) == expected("pilot/front-door", "front-door", CLAUDE, None, successor,
+                                                            STAND_IN, generation=2, stand_in=True)
+
+
+@posix
+def test_a_handoff_of_root_is_checked_against_the_plans_root_host(setup):
+    write_plan(setup, root=CLAUDE, team=CODEX)
+    setup.add_role("pilot/root", CLAUDE, session=ROOT_SESSION)
+    refused = handoff(setup.tmp, spec(setup, CODEX, "root-session-2", "pilot/root"), 3)["entries"][0]
+    assert refused["error"] == "pilot/root runs on claude-code in this run's host plan, not codex-cli"
+    assert handed(setup, "pilot/root", ROOT_SESSION, 1)
+    assert handoff(setup.tmp, spec(setup, CLAUDE, "root-session-2", "pilot/root"), 0)["entries"][0]["generation"] == 2
+    setup.add_role("pilot/root", CLAUDE, session="root-session-2")
+    assert record(setup, "pilot/root", 2) == expected("pilot/root", "root", CLAUDE, "print", "root-session-2", READER,
+                                                      generation=2)
+
+
+@posix
+def test_a_handoff_in_a_base_without_a_plan_is_unchanged(setup):
     setup.add_role("pilot/orchestrator", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
     result = handoff(setup.tmp, spec(setup, "host-two", "successor"), 0)
     assert result["entries"][0]["generation"] == 2
@@ -276,15 +376,45 @@ def test_a_handoff_in_a_base_without_a_plan_writes_no_record(setup):
 
 
 @posix
-def test_a_handoff_ignores_a_plan_whose_provision_names_another_mailbox(setup, tmp_path):
+def test_a_handoff_under_a_plan_for_another_hierarchy_is_refused_per_entry(setup):
+    setup.add_role("pilot/orchestrator", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
+    write_plan(setup, hierarchy="other", stand_ins={})
+    refused = handoff(setup.tmp, spec(setup, CODEX, str(uuid.uuid4())), 3)["entries"][0]
+    assert refused["error"] == "host plan is for hierarchy other, but this base serves pilot"
+    assert handed(setup, "pilot/orchestrator", CODEX_SESSION, 1)
+
+
+@posix
+@pytest.mark.parametrize("change", ["another mailbox", "no provision"])
+def test_a_plan_beside_a_mailbox_its_provision_does_not_name_refuses_the_entry(setup, tmp_path, change):
     write_plan(setup)
     setup.add_role("pilot/orchestrator", CODEX, session=CODEX_SESSION, cwd=str(setup.source))
-    provision = setup.base / "provision.json"
-    moved = {**json.loads(provision.read_text(encoding="utf-8")), "mailbox_root": str(tmp_path / "other" / "mailbox")}
-    provision.write_text(json.dumps(moved), encoding="utf-8")
-    result = handoff(setup.tmp, spec(setup, CLAUDE, str(uuid.uuid4())), 0)
-    assert result["entries"][0]["generation"] == 2, "this mailbox is not the base's, so the base's plan is not its"
-    assert not (setup.base / "sessions" / "pilot%2Forchestrator-g2.json").exists()
+    provision_path = setup.base / "provision.json"
+    if change == "no provision":
+        provision_path.unlink()
+    else:
+        other = tmp_path / "other" / "mailbox"
+        other.mkdir(parents=True)
+        moved = {**json.loads(provision_path.read_text(encoding="utf-8")), "mailbox_root": str(other)}
+        provision_path.write_text(json.dumps(moved), encoding="utf-8")
+    refused = handoff(setup.tmp, spec(setup, CODEX, str(uuid.uuid4())), 3)["entries"][0]
+    assert refused["error"] == ("host plan %s does not cover mailbox %s: its base's provision.json does not name that "
+                                "mailbox" % (setup.base / "host-plan.json", setup.root))
+    assert handed(setup, "pilot/orchestrator", CODEX_SESSION, 1)
+
+
+# -- move ---------------------------------------------------------------------------------------------------------------
+
+@posix
+def test_a_planned_team_hierarchy_cannot_be_moved(setup):
+    write_plan(setup)
+    new_base = setup.tmp / "initiatives" / "moved" / "pilot"
+    refused = provision("move", setup.request(
+        store=str(setup.workspace.store), base=str(new_base), source=str(setup.source), old_root=str(setup.root),
+        hierarchy="pilot", note="The owner approved this move.", root={"host": CODEX, "session": str(uuid.uuid4())},
+        initiative={"project": "aegis", "repository": "aegis", "priority": 5, "target_branch": "develop"}), expect=2)
+    assert refused == {"error": "a planned team hierarchy cannot be moved; start a new team run"}
+    assert not new_base.exists()
 
 
 # -- the team command ---------------------------------------------------------------------------------------------------
@@ -367,3 +497,25 @@ def test_init_writes_the_host_plan_with_the_front_door_stand_in_and_leaves_the_p
     from hierarchy_mailbox import Mailbox
     bindings = Mailbox(preflight / "mailbox").status()["bindings"]
     assert bindings["pilotpre/root"]["host"] == bindings["pilotpre/orchestrator"]["host"] == CLAUDE
+
+
+@linux
+def test_init_continue_resumes_after_the_plan_write_fails_without_running_provision_init_again(team, monkeypatch,
+                                                                                               capsys):
+    def broken(*arguments, **options):
+        raise OSError("disk full while writing the host plan")
+
+    working = hierarchy_hosts.plan_record
+    monkeypatch.setattr(hierarchy_hosts, "plan_record", broken)
+    code, answer = in_process(team, "init", capsys=capsys)
+    assert (code, answer["step"], answer["error"]) == (3, "provision", "disk full while writing the host plan")
+    state = json.loads((team.run / "team-state.json").read_text(encoding="utf-8"))
+    assert "provision-init" in state["init"]["done"] and "pending" not in state["init"]
+    assert not (team.base_dir / "host-plan.json").exists()
+    # Only this patch: undo() would also drop the sealed PATH and HOME the team fixture set.
+    monkeypatch.setattr(hierarchy_hosts, "plan_record", working)
+    # Provision init refuses an initiative it already registered, so this completes only if it is not run again.
+    answer = team.team("init", "--continue")
+    assert answer["init"] == "complete" and answer["ran"][0] == "provision"
+    assert json.loads((team.base_dir / "host-plan.json").read_text(encoding="utf-8"))["hierarchy"] == "pilot"
+
