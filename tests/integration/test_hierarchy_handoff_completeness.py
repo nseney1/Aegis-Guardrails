@@ -21,11 +21,13 @@ def brief_at(path, text):
 
 def publish_notes(root, count):
     identifiers = ["note-%03d" % index for index in range(count)]
-    # Use the public scoped adapter in bounded batches; no hand-written mailbox history.
-    for start in range(0, count, 32):
+    # Use the public scoped adapter in bounded batches; no hand-written mailbox history. Each publish re-validates the
+    # stored history, so a batch's cost grows with the mailbox: 32 per exchange outran exchange()'s 15 s timeout near
+    # note-191 on hosted Windows 3.12 (run 42412233402). Batches of 8 stay well inside it.
+    for start in range(0, count, 8):
         calls = [("mailbox_publish", {"message_id": identifier, "to": TARGET, "type": "info",
                                       "body": "Pending work reference."})
-                 for identifier in identifiers[start:start + 32]]
+                 for identifier in identifiers[start:start + 8]]
         responses = exchange(root, calls, endpoint="a/orchestrator")[2:]
         assert len(responses) == len(calls)
         for response in responses:
