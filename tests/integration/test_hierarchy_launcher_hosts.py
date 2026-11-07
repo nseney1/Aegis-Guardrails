@@ -44,7 +44,7 @@ HOME_UNSET = "a claude-code start needs CLAUDE_CONFIG_DIR set to the run's claud
 HOME_INVALID = "CLAUDE_CONFIG_DIR must be an absolute path to an existing folder: "
 HOME_OWNERS = "CLAUDE_CONFIG_DIR is the owner's ~/.claude; a team run uses its own claude home"
 HOME_LINK = "%s is a symlink; a team run's claude home keeps its own files"
-TRANSCRIPT_OUTSIDE = "the transcript for session %s is a symlink or lies outside CLAUDE_CONFIG_DIR %s: %s"
+NO_TRANSCRIPT = "no transcript for session %s under CLAUDE_CONFIG_DIR %s"
 # Moves the newest start's transcript (or its project folder) out of the home and links it back, as a host following a
 # link planted after the launcher looked would leave it.
 RELINK = r"""
@@ -369,10 +369,14 @@ def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_co
                             "exit $code" % (shlex.quote(str(relink)), shlex.quote(str(outside)), what))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     session = chosen(answer)
-    [found] = hierarchy_hosts.transcripts(CLAUDE, claude_team.claude_home, session)
+    # Found by a plain glob, which follows links: the shared locator, hierarchy_hosts.transcripts, skips them.
+    [found] = claude_team.claude_home.glob("projects/*/%s.jsonl" % session)
     assert (found.is_symlink(), found.parent.is_symlink()) == (what == "file", what == "folder")
+    assert found.is_file() and claude_team.claude_home.resolve() not in found.resolve().parents
+    assert hierarchy_hosts.transcripts(CLAUDE, claude_team.claude_home, session) == []
+    # So the run's home holds no transcript that counts, and the start is not confirmed.
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
-    assert answer["error"] == TRANSCRIPT_OUTSIDE % (session, claude_team.claude_home, found)
+    assert answer["error"] == NO_TRANSCRIPT % (session, claude_team.claude_home)
     assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["failed_to_start"]
     assert unbound(claude_team, IMPLEMENTER)
 
