@@ -156,18 +156,27 @@ def _no_developer_aegis_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-# pytest stores "<node id> (teardown)" in PYTEST_CURRENT_TEST, and Windows refuses an
-# environment value over 32767 characters, so a longer id errors only on Windows. A bytes
-# parameter without ids= once put 64 KiB in an id; failing here reports it on every platform.
-_WINDOWS_ENVIRONMENT_VALUE_LIMIT = 32767
+# pytest sets PYTEST_CURRENT_TEST to "<node id> (teardown)" (NUL shown as "(null)"), and
+# CPython on Windows refuses the whole "NAME=value" string beyond 32767 UTF-16 units
+# (_MAX_ENV in win32_putenv), so a longer id errors only on Windows. A bytes parameter
+# without ids= once put 64 KiB in an id. Checking at collection reports it on every platform,
+# including for tests that a mark skips before any fixture runs.
+_WINDOWS_ENVIRONMENT_LIMIT = 32767
 
 
-@pytest.fixture(autouse=True)
-def _node_id_fits_a_windows_environment_value(request):
-    length = len(request.node.nodeid)
-    if length + len(" (teardown)") > _WINDOWS_ENVIRONMENT_VALUE_LIMIT:
-        pytest.fail("test id is %d characters, too long for PYTEST_CURRENT_TEST on Windows; "
-                    "name long parameters with ids=" % length, pytrace=False)
+def _windows_environment_units(nodeid):
+    entry = "PYTEST_CURRENT_TEST=%s (teardown)" % nodeid.replace("\x00", "(null)")
+    return len(entry.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def pytest_collection_modifyitems(config, items):
+    too_long = [(item.nodeid[:120], units) for item in items
+                for units in (_windows_environment_units(item.nodeid),)
+                if units > _WINDOWS_ENVIRONMENT_LIMIT]
+    if too_long:
+        raise pytest.UsageError(
+            "test ids too long for PYTEST_CURRENT_TEST on Windows (name long parameters with ids=): "
+            + "; ".join("%s... (%d units)" % row for row in too_long))
 
 
 @pytest.fixture(autouse=True)
