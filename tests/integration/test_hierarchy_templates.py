@@ -132,10 +132,12 @@ def test_the_lane_brief_asks_for_binding_kind_worktree_and_owner_decisions():
                                      "unless the push-exception field names an owner decision"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
-def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name):
+@pytest.mark.parametrize("name, host_note", [("roles/lane.md", None),
+                                             ("lane-brief.md", "a SendMessage is a notice, not the acceptance"),
+                                             ("lane-brief-claude.md", "only that `ack` is the acceptance")])
+def test_lanes_accept_a_dispatch_by_a_mailbox_ack_and_a_received_message_is_optional(name, host_note):
     assert missing(name, ["publishing a mailbox `ack` in reply to the dispatch, with readiness for a writing lane",
-                          "received message is optional"]) == []
+                          "received message is optional"] + ([host_note] if host_note else [])) == []
     assert "Send separate received and accepted messages" not in words(name)
 
 
@@ -146,10 +148,18 @@ def test_deadlines_count_from_the_dispatch_and_lanes_ask_when_they_differ():
                                      "ask your orchestrator before you start"]) == []
 
 
-@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief.md"])
+@pytest.mark.parametrize("name", ["roles/lane.md", "lane-brief-claude.md"])
 def test_a_lane_with_open_items_ends_its_turn_and_a_reply_starts_the_next(name):
     assert missing(name, ["open items for your manager", "still ends your turn", "an \"accept\" message",
                           "fix-round dispatch"]) == []
+
+
+def test_the_codex_era_lane_brief_keeps_its_open_items_timer_wording():
+    """lane-brief.md stays byte-identical to the T2(a) base; Claude lanes get lane-brief-claude.md instead."""
+    assert missing("lane-brief.md", ["open items for your manager",
+                                     "`sleep 600` run in the background, capped by your deadline",
+                                     "an \"accept\" message", "when the timer fires", "fix-round dispatch",
+                                     "no open items stops at once"]) == []
 
 
 def test_lanes_route_cross_initiative_traffic_through_their_orchestrator():

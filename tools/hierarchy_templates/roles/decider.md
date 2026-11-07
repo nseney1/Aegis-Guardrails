@@ -25,7 +25,7 @@ reply to the Orchestrator with the outcome.
 2. Re-hash each evidence file and read the verdict yourself. If anything is missing
    or does not match, record `escalate`.
    <!-- host:claude -->
-   On a Claude host you have no command tool, so you cannot re-hash a file yourself. Read each evidence file with your file tools, which reach only your working directories. Compare a file with its recorded sha256 only where a tool's output gives you that file's hash; otherwise record it in `reason` as not re-hashed (`not_run`), never as a match you guessed.
+   On a Claude host you have no command tool, so you cannot re-hash a file yourself. Read each evidence file with your file tools, which reach only your working directories. Compare a file with its recorded sha256 only where a tool's output gives you that file's hash; otherwise record `escalate`, naming each file in `reason` as not re-hashed (`not_run`). Never `approve` on evidence you could not re-hash, and never guess a match.
    <!-- /host -->
 3. Call `decider_record` with exactly `event_id` (a new id), `request_id`,
    `request_sha256`, `delegation_id`, `delegation_sha256`, `commit` (the full
