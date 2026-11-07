@@ -434,7 +434,9 @@ def test_plan_record_is_the_validated_adr_shape():
     (plan(stand_ins=["m1/front-door"]), "host plan stand_ins must be a JSON object"),
     (plan(stand_ins={"other/front-door": "claude-code"}), "host plan stand-in other/front-door is not an endpoint of m1"),
     (plan(stand_ins={"m1/nowhere": "claude-code"}), "host plan stand-in m1/nowhere is not an endpoint of m1"),
-    (plan(stand_ins={"m1/root": "codex-cli"}), "host plan stand-in m1/root is ROOT, which always runs a host"),
+    (plan(stand_ins={"m1/root": "codex-cli"}), "only the front door may be a stand-in, not m1/root"),
+    (plan(stand_ins={"m1/orchestrator": "claude-code"}), "only the front door may be a stand-in, not m1/orchestrator"),
+    (plan(stand_ins={"m1/lane/f2": "claude-code"}), "only the front door may be a stand-in, not m1/lane/f2"),
     (plan(stand_ins={"m1/front-door": "gemini"}), "host plan stand-in m1/front-door has unknown host kind 'gemini'"),
     (plan(config_sha256="AB" * 32), "host plan config_sha256 must be 64 lowercase hex characters"),
     (plan(config_sha256="ab" * 31), "host plan config_sha256 must be 64 lowercase hex characters"),
@@ -534,11 +536,39 @@ def test_require_binding_returns_the_qualified_write_scope():
 
 def test_a_stand_in_gets_the_stand_in_scope_without_qualification():
     native = plan(stand_ins={"m1/front-door": "codex"})
-    scope = hierarchy_hosts.require_binding(native, "m1/front-door", "codex", True)
+    scope = hierarchy_hosts.require_binding(native, "m1/front-door", "codex", False)
     assert scope == STAND_IN
     scope["boundary"] = "changed"
     assert hierarchy_hosts.STAND_IN_SCOPE == STAND_IN, "callers get a copy"
     assert hierarchy_hosts.require_binding(plan(), "m1/front-door", "claude-code", False) == STAND_IN
+
+
+def test_a_stand_in_whose_role_writes_source_is_refused_even_past_validation():
+    # validate_plan admits only the front door; this plan skips it, as a hand-edited file read elsewhere might.
+    unchecked = dict(plan(), stand_ins={"m1/lane/f2": "claude-code"})
+    assert refusal(hierarchy_hosts.require_binding, unchecked, "m1/lane/f2", "claude-code", True) == (
+        "m1/lane/f2 cannot be a stand-in: its role writes source")
+
+
+def test_governing_plan_reads_the_request_base_and_the_mailboxs_own_base(tmp_path):
+    own, copy = tmp_path / "own", tmp_path / "copy"
+    (own / "mailbox").mkdir(parents=True)
+    copy.mkdir()
+    mailbox = own / "mailbox"
+    assert hierarchy_hosts.governing_plan(own, mailbox, "m1") is None
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") is None
+    (own / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.governing_plan(own, mailbox, "m1") == plan()
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan(), "a copied provision.json still answers to it"
+    (copy / "host-plan.json").write_text(json.dumps(plan()), encoding="utf-8")
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan()
+    (copy / "host-plan.json").write_text(json.dumps(plan(team="codex-cli")), encoding="utf-8")
+    assert refusal(hierarchy_hosts.governing_plan, copy, mailbox, "m1") == (
+        "host plans in %s and %s differ" % (copy, own))
+    (own / "host-plan.json").unlink()
+    assert hierarchy_hosts.governing_plan(copy, mailbox, "m1") == plan(team="codex-cli")
+    assert refusal(hierarchy_hosts.governing_plan, copy, mailbox, "pilot") == (
+        "host plan is for hierarchy m1, but this base serves pilot")
 
 
 def record_arguments(**change):

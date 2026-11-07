@@ -66,6 +66,17 @@ def check_successor(plan, mailbox, endpoint, spec):
                                     hierarchy_roles.writer(hierarchy_roles.role(endpoint, kind)))
 
 
+def check_successor_record(base, endpoint, generation, spec):
+    """A record already on file for the generation this handoff binds must be this successor's, or add-role would later
+    find the binding and its record disagreeing."""
+    path = hierarchy_hosts.session_record_path(base, endpoint, generation)
+    if not path.exists() and not path.is_symlink():
+        return
+    found = read_json(path)
+    require(isinstance(found, dict) and found.get("session") == spec["session"] and found.get("host_kind") == spec["host"],
+            "session record for %s generation %d belongs to another session or host" % (endpoint, generation))
+
+
 def hand_off(spec, entry):
     fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir", "kind"})
     root = safe_path(text(entry["root"], "root"))
@@ -84,6 +95,9 @@ def hand_off(spec, entry):
         if current["host"] == spec["host"] and current["session"] == spec["session"]:
             return {"already_bound": True, "generation": current["generation"], "ready": mailbox.ready(current),
                     "checkpoint_sha256": current["checkpoint_sha256"], "acknowledge": acknowledgment(current)}
+        if plan is not None:
+            # host_plan has shown the base's provision names this root, so its records sit beside it.
+            check_successor_record(root.parent, entry["endpoint"], current["generation"] + 1, spec)
         optional = {key: entry[key] for key in ("completed_checks", "briefs", "evidence_dir", "delivery_dir")
                     if key in entry}
         binding = mailbox.bind(mailbox.draft_handoff({
