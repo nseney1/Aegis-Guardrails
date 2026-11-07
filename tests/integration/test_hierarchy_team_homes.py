@@ -1117,6 +1117,122 @@ def test_round3_codex_only_login_preserves_the_legacy_lock_file_behaviour(make, 
         assert not lock.exists()
 
 
+# -- review round 4: serialize state reload/mutate/save without blocking browser or model work ----------------------------
+
+# Run ROOT through the public CLI. Report either a completed legacy write or contention on the new state lock,
+# so login's test hook can resume without a sleep or a deadlock while it holds the transaction lock.
+ROOT_TRANSACTION = r'''
+import fcntl, os, runpy, sys
+team, config, state, event = sys.argv[1:]
+lock = os.path.join(os.path.dirname(state), ".state.lock")
+state_descriptors = set()
+open_file, flock, replace = os.open, fcntl.flock, os.replace
+
+def signal(value):
+    with open(event, "wb", buffering=0) as stream:
+        stream.write(value)
+
+def opened(path, *args, **kwargs):
+    descriptor = open_file(path, *args, **kwargs)
+    if str(path) == lock:
+        state_descriptors.add(descriptor)
+    return descriptor
+
+def locked(descriptor, operation):
+    if descriptor in state_descriptors and operation == fcntl.LOCK_EX:
+        try:
+            return flock(descriptor, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            signal(b"B")
+    return flock(descriptor, operation)
+
+def replaced(source, destination, *args, **kwargs):
+    result = replace(source, destination, *args, **kwargs)
+    if str(destination) == state:
+        signal(b"S")
+    return result
+
+os.open, fcntl.flock, os.replace = opened, locked, replaced
+sys.argv = [team, "--config", config, "root", "--session", "root-after-login-read"]
+runpy.run_path(team, run_name="__main__")
+'''
+
+
+@pytest.mark.parametrize("fail_login_save", [False, True])
+def test_round4_root_competing_after_logins_final_reload_keeps_both_bindings(make, capsys, fail_login_save):
+    run = make()
+    run.team("init")
+    cli_environment(run)
+    state_path = run.run / "team-state.json"
+    event_path = run.tmp / "root-state-event"
+    os.mkfifo(event_path, 0o600)
+    event = os.open(event_path, os.O_RDWR | os.O_NONBLOCK)
+    original = os.replace
+    roots = []
+    signals = []
+
+    def root_after_reload(source, destination, *args, **kwargs):
+        if (Path(destination) == state_path and not roots and
+                CLAUDE in json.loads(Path(source).read_text()).get("logins", {})):
+            process = subprocess.Popen([sys.executable, "-I", "-B", "-c", ROOT_TRANSACTION,
+                                        str(TEAM), str(run.config_path), str(state_path), str(event_path)],
+                                       env=run.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            roots.append(process)
+            assert select.select([event], [], [], 2)[0], "ROOT neither saved nor reached the state lock"
+            signals.append(os.read(event, 1))
+            assert signals[-1] in (b"B", b"S")
+            if fail_login_save:
+                raise OSError("fixture: final login state write failed")
+        return original(source, destination, *args, **kwargs)
+
+    run.monkeypatch.setattr(os, "replace", root_after_reload)
+    try:
+        code, answer = in_process(run, "login", capsys=capsys)
+        assert roots, "login did not reach its final state write"
+        stdout, stderr = roots[0].communicate(timeout=2)
+        assert roots[0].returncode == 0 and stderr == "", stdout + stderr
+        assert json.loads(stdout.splitlines()[-1])["session"] == "root-after-login-read"
+    finally:
+        for process in roots:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=2)
+        os.close(event)
+    current = state(run)
+    assert current["root"] is not None, "login overwrote the ROOT binding saved after its final state reload"
+    assert current["root"]["session"] == "root-after-login-read"
+    if fail_login_save:
+        assert code == 3 and answer == {"error": "fixture: final login state write failed"}
+        assert CLAUDE not in current.get("logins", {})
+        assert not (run.claude_home / ".credentials.json").exists()
+        assert not (run.evidence / "login-claude.json").exists()
+    else:
+        assert code == 0
+        assert current["logins"][CLAUDE]["credentials_sha256"] == sha(run.claude_home / ".credentials.json")
+        assert answer["logins"][CLAUDE]["credentials_sha256"] == current["logins"][CLAUDE]["credentials_sha256"]
+
+
+@pytest.mark.parametrize("existing_lock", [False, True])
+def test_round4_codex_only_commands_do_not_create_or_consult_a_state_lock(make, existing_lock):
+    run = make(v1=True)
+    run.team("init")
+    lock = run.run / ".state.lock"
+    if existing_lock:
+        lock.write_bytes(b"unrelated legacy state file\n")
+        lock.chmod(0o644)
+    answer = run.team("login")
+    assert answer == {"codex_home": str(run.codex_home), "auth_sha256": sha(run.codex_home / "auth.json"),
+                      "entries": [MARK, "auth.json", "log"]}
+    assert run.team("root", "--session", "legacy-root")["session"] == "legacy-root"
+    assert state(run)["root"]["session"] == "legacy-root"
+    assert run.team("down")["codex_home"] == "kept"
+    assert not (run.run / ".login.lock").exists()
+    if existing_lock:
+        assert lock.read_bytes() == b"unrelated legacy state file\n" and stat.S_IMODE(lock.stat().st_mode) == 0o644
+    else:
+        assert not lock.exists()
+
+
 # -- child processes and the loop -----------------------------------------------------------------------------------------
 
 def test_child_processes_and_the_loop_get_the_runs_claude_home(make):

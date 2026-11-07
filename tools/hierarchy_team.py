@@ -576,12 +576,55 @@ def save_state(run, state):
     write_atomic(run.state_path, as_json(state))
 
 
+def update_state(run, mutate):
+    """Reload/mutate/save in a short transaction; mutate must not run a child or wait for browser/model work."""
+    if not run.uses(CLAUDE):
+        state = load_state(run)
+        mutate(state)
+        save_state(run, state)
+        return state
+    # Lock order: .login.lock (when held), then .state.lock. Never acquire the login lock inside a transaction.
+    revalidate_run(run)
+    path = run.run / ".state.lock"
+    require(not path.is_symlink(), "state lock must not be a symlink")
+    descriptor = os.open(str(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    windows, locked = os.name == "nt", False
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                (not windows and (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600))):
+            refuse("state lock must be this user's regular file with one link and private permissions")
+        if windows:
+            import msvcrt
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            # Windows permits locking a byte past EOF, so the empty lock file needs no unsynchronized seed write.
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        state = load_state(run)
+        mutate(state)
+        save_state(run, state)
+        return state
+    finally:
+        try:
+            if locked:
+                if windows:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def init_complete(state):
     return bool(state and state["init"].get("complete_at"))
 
 
-def require_init(run, *, record_command=True):
-    state = load_state(run)
+def require_init(run, *, record_command=True, state=None):
+    state = load_state(run) if state is None else state
     if not init_complete(state):
         refuse("init has not completed; run init first", record_command=record_command)
     if state.get("down", {}).get("started_at") or state.get("down", {}).get("done"):
@@ -1207,9 +1250,11 @@ def login_claude(run, timeout):
     credentials_digest(run, missing_ok=True)
     state = require_init(run)
     if CLAUDE in state.get("logins", {}):
-        del state["logins"][CLAUDE]
-        revalidate_homes(run)
-        save_state(run, state)
+        def invalidate(current):
+            require_init(run, state=current)
+            current.get("logins", {}).pop(CLAUDE, None)
+            revalidate_homes(run)
+        update_state(run, invalidate)
     # A CLI may truncate or refresh credentials: refuse unsafe existing files before either auth command sees them.
     before = credential_observation(run)
     written = None
@@ -1238,11 +1283,11 @@ def login_claude(run, timeout):
                   "managed_settings": CLAUDE_MANAGED_SETTINGS.exists()}
         revalidate_homes(run)
         save(run, "login-claude.json", answer)
-        # ROOT can bind while the browser is open: merge only login's fields into the latest state under the lock.
-        state = require_init(run, record_command=False)
-        state.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
-        revalidate_homes(run)
-        save_state(run, state)
+        def accept(current):
+            require_init(run, record_command=False, state=current)
+            current.setdefault("logins", {})[CLAUDE] = {"credentials_sha256": digest}
+            revalidate_homes(run)
+        update_state(run, accept)
         return answer
     except Exception as exc:
         removed = remove_login_credentials(run, before, written)
@@ -1285,9 +1330,16 @@ def root(run, args):
         (refuse if code == REFUSED else fail)(answer.get("error", "provision add-role exited %d" % code))
     tools = adapter_tools(run, answer["connection"])
     save(run, "root-binding.json", {**answer, "tools": tools})
-    state["root"] = {"session": args.session, "generation": answer["generation"], "connection": answer["connection"],
-                     "mcp_config": answer["mcp_config"], "tools": tools, "at": timestamp()}
-    save_state(run, state)
+    binding = {"session": args.session, "generation": answer["generation"], "connection": answer["connection"],
+               "mcp_config": answer["mcp_config"], "tools": tools, "at": timestamp()}
+    if run.uses(CLAUDE):
+        def bind(current):
+            require_init(run, state=current)
+            current["root"] = binding
+        update_state(run, bind)
+    else:
+        state["root"] = binding
+        save_state(run, state)
     return OK, {"endpoint": answer["endpoint"], "session": args.session, "generation": answer["generation"],
                 "connection": answer["connection"], "mcp_config": answer["mcp_config"], "tools": tools}
 
@@ -2087,16 +2139,23 @@ def down_run(run, args):
     state = load_state(run)
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}
+
+    def persist():
+        if run.uses(CLAUDE):
+            return update_state(run, lambda current: current.update(down=state["down"]))
+        save_state(run, state)
+        return state
+
     done = state.setdefault("down", {"done": {}})["done"]
     state["down"].setdefault("started_at", timestamp())
-    save_state(run, state)
+    state = persist()
     answer = {"loop": stop_loop(run, args.loop_wait), "roles": stop_roles(run)}
     if "evidence" in done:
         answer["evidence"] = "already_collected"
     else:
         answer["evidence"] = collect(run, state)
         done["evidence"] = {"at": timestamp(), **answer["evidence"]}
-        save_state(run, state)
+        state = persist()
     if state["init"].get("pending"):
         fail("init has an unresolved outcome; resources were kept for inspection")
     if "workspace" in state["init"]["steps"] and (not run.store.is_dir() or not run.recipes.is_file()):
@@ -2126,7 +2185,7 @@ def down_run(run, args):
     if run.uses(CLAUDE):
         answer["claude_home"] = purge_claude(run) if args.purge_claude_home else "kept"
     done["last"] = timestamp()
-    save_state(run, state)
+    state = persist()
     return OK, answer
 
 
