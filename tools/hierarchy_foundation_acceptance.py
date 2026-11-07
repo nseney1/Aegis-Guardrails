@@ -17,6 +17,8 @@ import tempfile
 
 MANIFEST_SHA256 = "90260e8fbd15744cc46231dd7e74e46f257f8c28e670f1c37b1b1bb8823df76c"
 MAILBOX_SHA256 = "e657833bd436344d71a97ff52f8d6853959d50e789453fea8ca8656f420f3495"
+# Separately reviewed current reader; historical request/corpus pins are retained.
+LIFECYCLE_SHA256 = "4827783df0be9f34fa58100785a0b96d84ce9d9c650c5ca508ef220f2bcb4f81"
 WAKE_SHA256 = "cd5586fb0799c18b217b255fd3cbc455ff98ed2cfff7bb6b7fc813232f569668"
 # Separately reviewed fixture successor; the corpus retains its historical pins.
 WATCH_TEST_SHA256 = "cf5df318f327c2f0b535b4bc9dadbef9d2c730d61aa287f57e95e201071155f9"
@@ -192,6 +194,7 @@ class _VerifiedSourceLoader(importlib.abc.SourceLoader):
 def verify_source(expected):
     root = checked_root(Path(__file__).resolve().parents[1])
     pins = {**expected, "tools/hierarchy_mailbox.py": MAILBOX_SHA256, "tools/hierarchy_wake.py": WAKE_SHA256,
+            "tools/hierarchy_lifecycle.py": LIFECYCLE_SHA256,
             "tests/integration/test_hierarchy_watch_bridge.py": WATCH_TEST_SHA256}
     sources = {}
     try:

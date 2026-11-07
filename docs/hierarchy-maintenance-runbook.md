@@ -14,6 +14,10 @@ No parent/child source preparation, fixture pass or review closes native gates.
 `record --event <absolute JSON>` require `--evidence-only`. The policy and event
 schemas are closed and tested in `tests/integration/test_hierarchy_lifecycle.py`.
 Use those fixture constructors as examples, never as real identity/authority.
+`inspect-request --file <absolute JSON>` needs no `--root` and reads declarations
+without loading or changing a journal. Its [small-change contract](teams-t1-small-change-reader.md)
+separates declared eligibility from approval, admitted checks and authenticated
+Reviewer independence. Existing drafting, publication, admission and replay stay v1.
 Evidence refs are inert path/hash claims; this tool does not read/verify their
 contents, authenticate CIDs, or execute any packet. Mutations require POSIX
 directory fsync; other hosts refuse before mutation. Non-POSIX durability is
