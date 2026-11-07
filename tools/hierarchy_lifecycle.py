@@ -26,6 +26,8 @@ from hierarchy_mailbox import (GIT_ID, SHA256, SLUG, digest, encoded, fields, in
 
 POLICY = "aegis.lifecycle-policy/v1"
 REQUEST = "aegis.lifecycle-request/v1"
+SMALL_CHANGE_PLAN = "aegis.small-change-plan/v1"
+REQUEST_INSPECTION = "aegis.request-inspection/v1"
 JOURNAL = "aegis.lifecycle-event/v1"
 ZERO = "0" * 64
 MAX_EVENTS = 10000
@@ -186,6 +188,84 @@ def validate_request(raw):
         known.add(member["id"])
     require(value["authority"] == value["id"] or not scope["members"], "only authority request can extend continuation")
     return value
+
+
+def inspect_request(value):
+    """Classify inert declarations, without loading a journal or conferring authority.
+
+    The plan is separate from the unchanged v1 request, and names its exact raw
+    hash. Neither the declared approved scope nor distinct actor names establish
+    approval, admitted checks, authenticated identity or execution authority.
+    """
+    plan = None
+    if isinstance(value, dict) and "schema" in value:
+        fields(value, {"schema", "request", "plan"})
+        require(value["schema"] == SMALL_CHANGE_PLAN, "unsupported small-change plan schema")
+        raw, plan = value["request"], value["plan"]
+    else:
+        raw = value
+    request = validate_request(raw)
+    reasons = []
+    independence = "not_declared"
+    if plan is None:
+        # An explicit null plan is malformed; only a bare v1 raw envelope lacks
+        # declarations. Old requests remain readable without inventing a plan.
+        require(value is raw, "expected a JSON object")
+        reasons.append("plan_missing")
+    else:
+        flags = ("shared_interface_change", "migration", "governance_change", "budget_expansion", "scope_certain")
+        fields(plan, {"request_sha256", "projects", "writing_lanes", "path_scopes", "checks", "reviewer", *flags})
+        matching(plan["request_sha256"], SHA256, "plan request sha256")
+        require(plan["request_sha256"] == raw["sha256"], "plan request sha256 mismatch")
+        for name in flags:
+            require(type(plan[name]) is bool, "invalid plan " + name)
+        for name in ("projects", "checks"):
+            items = plan[name]
+            require(isinstance(items, list) and len(items) <= 256, "invalid plan " + name)
+            for item in items:
+                matching(item, SLUG, "plan " + name)
+            require(len(set(items)) == len(items), "duplicate plan " + name)
+        lanes = plan["writing_lanes"]
+        require(isinstance(lanes, list) and len(lanes) <= 256, "invalid plan writing lanes")
+        lane_ids, writers = set(), set()
+        for lane in lanes:
+            fields(lane, {"lane", "writer"})
+            matching(lane["lane"], SLUG, "plan lane")
+            matching(lane["writer"], SLUG, "plan writer")
+            require(lane["lane"] not in lane_ids, "duplicate plan lane")
+            require(lane["writer"] not in writers, "duplicate plan writer")
+            lane_ids.add(lane["lane"])
+            writers.add(lane["writer"])
+        scopes = plan["path_scopes"]
+        require(isinstance(scopes, list) and len(scopes) <= 256, "invalid plan path scopes")
+        for paths in scopes:
+            require(isinstance(paths, list) and 0 < len(paths) <= 256, "invalid plan path scope")
+            for path in paths:
+                safe_path(text(path, "plan path"))
+            require(len(set(paths)) == len(paths), "duplicate plan path")
+        matching(plan["reviewer"], SLUG, "plan reviewer")
+        for name, items in (("project_count", plan["projects"]), ("writing_lane_count", lanes),
+                            ("path_scope_count", scopes)):
+            if len(items) != 1:
+                reasons.append(name)
+        if len(scopes) == 1 and set(scopes[0]) != set(request["paths"]):
+            reasons.append("path_scope_mismatch")
+        if not plan["checks"]:
+            reasons.append("checks_missing")
+        independence = "declared_distinct"
+        if plan["reviewer"] in writers:
+            reasons.append("writer_reviewer_conflict")
+            independence = "conflict"
+        for name in flags[:-1]:
+            if plan[name]:
+                reasons.append(name)
+        if not plan["scope_certain"]:
+            reasons.append("uncertain_scope")
+    return {"schema": REQUEST_INSPECTION, "request_id": request["id"], "request_sha256": raw["sha256"],
+            "request_schema": request["schema"],
+            "classification": "full_planning_required" if reasons else "declared_eligible",
+            "escalation_reasons": reasons, "approval": "not_evaluated", "checks_admission": "not_evaluated",
+            "reviewer_independence": independence, "reviewer_authenticated": False, "execution_enabled": False}
 
 
 def validate_policy(value):
@@ -1201,7 +1281,7 @@ def initialize(root, policy):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True)
+    parser.add_argument("--root")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
     init.add_argument("--policy", required=True)
@@ -1211,8 +1291,16 @@ def main(argv=None):
     record.add_argument("--evidence-only", action="store_true")
     commands.add_parser("status")
     commands.add_parser("checkpoint")
+    inspect = commands.add_parser("inspect-request", help="Read declaration eligibility; grants no authority")
+    inspect.add_argument("--file", required=True)
     args = parser.parse_args(argv)
+    if args.command != "inspect-request" and args.root is None:
+        parser.error("the following arguments are required: --root")
     try:
+        if args.command == "inspect-request":
+            result = inspect_request(load_json(args.file))
+            print(encoded(result).decode())
+            return 0
         root = safe_path(args.root)
         if args.command in {"init", "record"}:
             require(args.evidence_only, "mutation requires --evidence-only; native adapter is unqualified")
