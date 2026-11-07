@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -10,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from tests.integration.test_hierarchy_mailbox import ROOT, invoke, message, pilot, receipt_fixture  # noqa: F401
-from tests.integration.test_hierarchy_handoff import handoff
+from tests.integration.test_hierarchy_handoff import active_writer, handoff
 from tests.integration.test_hierarchy_host_plan import write_plan
-from tests.integration.test_hierarchy_lifecycle import Ledger, SOURCE, raw_request, request
+from tests.integration.test_hierarchy_lifecycle import Ledger, SOURCE, raw_request, request, pytestmark as lifecycle_only
 from tests.integration.test_hierarchy_small_change_admission import SmallChange
 from tools.hierarchy_mailbox import Mailbox
 
@@ -21,6 +22,7 @@ TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
 SECTIONS = ("Role contract", "Approved scope", "Source identity", "Open obligations",
             "Dependencies", "Unread work", "Evidence references")
 ENDPOINT = "a/lane/f2"
+secure_publication = pytest.mark.skipif(os.name != "posix", reason="secure brief publication requires POSIX dir_fd support")
 
 
 def cli(*args, expect=0):
@@ -90,6 +92,7 @@ def records(pilot, tmp_path):  # noqa: F811
     return root, ledger, change, wake
 
 
+@lifecycle_only
 def test_all_seven_items_reference_reverifiable_durable_records(records):
     root, ledger, change, wake = records
     answer = compose(root)
@@ -123,6 +126,7 @@ def test_all_seven_items_reference_reverifiable_durable_records(records):
     assert cli("verify", "--path", brief["path"], "--sha256", brief["sha256"])["ok"] is True
 
 
+@lifecycle_only
 def test_unknown_effects_and_woken_unread_are_never_dropped(records):
     root, _, _, wake = records
     rows = sections(compose(root)["brief"])
@@ -133,6 +137,7 @@ def test_unknown_effects_and_woken_unread_are_never_dropped(records):
     assert ref(wake) in [row["ref"] for row in rows["Evidence references"]]
 
 
+@lifecycle_only
 def test_determinism_and_no_store_mutations(records):
     root, _, _, _ = records
     before = files(root.parent)
@@ -145,6 +150,7 @@ def test_determinism_and_no_store_mutations(records):
     assert Path(first["brief"]["path"]).read_bytes() == raw
 
 
+@secure_publication
 def test_exact_entry_bound_and_overflow_leave_no_partial_output(pilot):  # noqa: F811
     root, _ = pilot
     initial = compose(root)
@@ -160,6 +166,7 @@ def test_exact_entry_bound_and_overflow_leave_no_partial_output(pilot):  # noqa:
     assert files(root.parent) == before
 
 
+@secure_publication
 def test_corruption_refuses_verify_and_mailbox_read(pilot):  # noqa: F811
     root, _ = pilot
     brief = compose(root)["brief"]
@@ -169,6 +176,7 @@ def test_corruption_refuses_verify_and_mailbox_read(pilot):  # noqa: F811
         Mailbox(root).brief(brief, verify=True)
 
 
+@secure_publication
 def test_handoff_carries_brief_and_successor_pages_inbox_losslessly(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     identifiers = ["note-%03d" % i for i in range(105)]
@@ -193,6 +201,7 @@ def test_handoff_carries_brief_and_successor_pages_inbox_losslessly(pilot, tmp_p
 
 
 @pytest.mark.parametrize("endpoint", [ENDPOINT, "a/lane/review", "a/orchestrator", "a/front-door"])
+@secure_publication
 def test_contract_matches_role_kind_and_host_family(pilot, endpoint):  # noqa: F811
     root, _ = pilot
     write_plan(SimpleNamespace(base=root.parent), hierarchy="a", team="claude-code", stand_ins={})
@@ -209,15 +218,18 @@ def test_contract_matches_role_kind_and_host_family(pilot, endpoint):  # noqa: F
 
 @pytest.mark.parametrize("flags,error", [
     ({"endpoint": "b/front-door"}, "endpoint is outside initiative a"),
-    ({"lifecycle": "/missing-fresh-brief-lifecycle"}, "lifecycle directory unavailable"),
+    ({"lifecycle": "missing"}, "lifecycle directory unavailable"),
 ])
 def test_invalid_inputs_refuse_without_writing(pilot, flags, error):  # noqa: F811
     root, _ = pilot
+    if flags.get("lifecycle") == "missing":
+        flags = {"lifecycle": str(root.parent / "missing-lifecycle")}
     before = files(root.parent)
     assert error in compose(root, expect=2, **flags)["error"]
     assert files(root.parent) == before
 
 
+@secure_publication
 def test_verify_detects_changed_reference_even_with_unchanged_brief(pilot):  # noqa: F811
     root, _ = pilot
     brief = compose(root)["brief"]
@@ -226,6 +238,7 @@ def test_verify_detects_changed_reference_even_with_unchanged_brief(pilot):  # n
     assert "reference sha256 mismatch" in cli("verify", "--path", brief["path"], "--sha256", brief["sha256"], expect=2)["error"]
 
 
+@secure_publication
 def test_uncertain_jobs_keep_ids_hashes_and_v2_dependencies(tmp_path):
     root, _, _ = receipt_fixture(tmp_path)
     packet = tmp_path / "packet.md"
@@ -250,6 +263,7 @@ def test_uncertain_jobs_keep_ids_hashes_and_v2_dependencies(tmp_path):
     assert after == before
 
 
+@secure_publication
 def test_recorded_reads_are_excluded_but_no_delivery_history_is_conservative(tmp_path):
     root, delivery, _ = receipt_fixture(tmp_path, endpoint="a/root")
     invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True,
@@ -260,6 +274,7 @@ def test_recorded_reads_are_excluded_but_no_delivery_history_is_conservative(tmp
     assert any(row.get("kind") == "delivery_read" for row in sections(brief)["Evidence references"])
 
 
+@secure_publication
 def test_run_root_resolves_initiative_base_and_runtime_pin(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     base = tmp_path / "initiatives" / "a"
@@ -274,6 +289,7 @@ def test_run_root_resolves_initiative_base_and_runtime_pin(pilot, tmp_path):  # 
     assert any(row.get("source_commit") == "e" * 40 and row["ref"] == ref(base / "provision.json") for row in sources)
 
 
+@lifecycle_only
 def test_malformed_journal_refuses_without_creating_a_briefs_folder(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     ledger = Ledger(tmp_path)
@@ -300,11 +316,12 @@ def test_malformed_structured_packet_refuses_instead_of_dropping_dependencies(tm
     assert files(tmp_path) == before
 
 
+@secure_publication
 def test_failed_atomic_publication_leaves_no_brief_or_temporary_file(pilot):  # noqa: F811
     root, _ = pilot
     # Inject only at the OS boundary, then enter the actual CLI. No composer internals are replaced.
     driver = ("import os,runpy,sys\n"
-              "def refuse(*args):\n    raise OSError('fixture replace refused')\n"
+              "def refuse(*args,**kwargs):\n    raise OSError('fixture replace refused')\n"
               "os.replace=refuse\n"
               "sys.argv=sys.argv[1:]\n"
               "runpy.run_path(sys.argv[0],run_name='__main__')\n")
@@ -315,3 +332,265 @@ def test_failed_atomic_publication_leaves_no_brief_or_temporary_file(pilot):  # 
     assert json.loads(proc.stdout)["error"] == "brief publication failed: fixture replace refused"
     assert files(root.parent) == before
     assert list((root.parent / "briefs").iterdir()) == []
+
+
+@lifecycle_only
+@pytest.mark.parametrize("transition", ["disposition", "resolve"])
+def test_next_request_origin_and_pending_obligation_are_the_creating_event(pilot, tmp_path, transition):  # noqa: F811
+    root, _ = pilot
+    ledger = Ledger(tmp_path)
+    first, following = request("first"), request("successor")
+    ledger.publish(first)
+    if transition == "resolve":
+        ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "coordinator-1",
+                     "next_decision": "resume", "condition": "ready", "evidence": ledger.evidence}, **ledger.target(first))
+        blocker = ledger.status()["requests"]["first"]["resolution"]
+        extra = {"blocker_sha256": hashlib.sha256(json.dumps(blocker, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+    else:
+        extra = {"status": "FINAL"}
+    receipt = ledger.event(transition, resolution={"kind": "next", "request": raw_request(following),
+                           "evidence": ledger.evidence}, **ledger.target(first), **extra)
+    origin = ref(ledger.path / "events" / ("%06d.json" % receipt["sequence"]))
+    before = files(tmp_path)
+    answer = compose(root)
+    rows = sections(answer["brief"])
+    for section in ("Approved scope", "Source identity", "Open obligations"):
+        items = [row for row in rows[section] if row.get("request_id") == "successor"]
+        assert items and all(item["ref"] == origin for item in items)
+    assert not any(row.get("request_id") == "first" for row in rows["Approved scope"])
+    after = files(tmp_path)
+    after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
+    assert after == before
+
+
+def completed_request(ledger, identifier):
+    value = ledger.ready(request(identifier))
+    intent = identifier + "-intent"
+    ledger.intent(value, intent_id=intent)
+    result = {"request_sha256": ledger.target(value)["request_sha256"], "intent_id": intent,
+              "outcome": "passed", "exit_code": 0, "source": SOURCE, "evidence": ledger.evidence}
+    terminal = raw_request(result)
+    ledger.event("terminal", actor=ledger.operator, result=terminal, **ledger.target(value))
+    ledger.event("review", actor="reviewer-1", result_sha256=terminal["sha256"], source=SOURCE,
+                 verdict="accept", evidence=ledger.evidence, **ledger.target(value))
+    ledger.event("delivery", evidence=ledger.evidence, **ledger.target(value))
+    ledger.event("disposition", status="FINAL", resolution={"kind": "complete", "evidence": ledger.evidence},
+                 **ledger.target(value))
+    return value
+
+
+@lifecycle_only
+def test_forty_completed_requests_are_covered_by_one_head_without_consuming_the_bound(pilot, tmp_path):  # noqa: F811
+    root, _ = pilot
+    ledger = Ledger(tmp_path)
+    for index in range(40):
+        completed_request(ledger, "done-%02d" % index)
+    before = files(tmp_path)
+    answer = compose(root)
+    rows = sections(answer["brief"])
+    assert answer["entries"] < 20
+    assert rows["Approved scope"] == rows["Open obligations"] == []
+    heads = [row for row in rows["Evidence references"] if row["kind"] == "lifecycle_head"]
+    assert len(heads) == 1
+    assert heads[0]["ref"] == ref(ledger.path / "events" / ("%06d.json" % ledger.status()["sequence"]))
+    after = files(tmp_path)
+    after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
+    assert after == before
+
+
+@secure_publication
+def test_257_genuinely_unread_messages_refuse_without_writing(pilot):  # noqa: F811
+    root, _ = pilot
+    for index in range(257):
+        invoke(root, "publish", message(identifier="open-%03d" % index))
+    before = files(root.parent)
+    assert compose(root, expect=2)["error"] == "fresh brief exceeds 256 entries"
+    assert files(root.parent) == before and not (root.parent / "briefs").exists()
+
+
+@lifecycle_only
+def test_expired_scope_is_history_but_its_unsettled_obligation_remains(pilot, tmp_path):  # noqa: F811
+    root, _ = pilot
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("expired", continuation={"members": [], "max_starts": 1, "expires_at": "2000-01-01T00:00:00Z"}))
+    rows = sections(compose(root)["brief"])
+    assert not any(row.get("request_id") == "expired" for row in rows["Approved scope"])
+    assert any(row.get("request_id") == "expired" for row in rows["Open obligations"])
+
+
+@secure_publication
+def test_closed_dispatch_lease_and_missing_brief_are_history(pilot, tmp_path):  # noqa: F811
+    root, old_brief, ready = active_writer(pilot, tmp_path)
+    invoke(root, "publish", message("a/lane/f2", "a/orchestrator", identifier="done", kind="result",
+                                    in_reply_to="dispatch-1", result={"source_revision": ready["base_revision"],
+                                    "source_tree": "b" * 40, "checks": [{"check": "tests", "outcome": "pass", "reference": "retained"}],
+                                    "lane_check": "retained"}))
+    Path(old_brief["path"]).unlink()
+    answer = compose(root)
+    rows = sections(answer["brief"])
+    assert ready["lease_ref"] not in json.dumps(rows["Approved scope"])
+    assert not rows["Open obligations"]
+    assert any(row.get("state") == "unverified" for row in rows["Evidence references"])
+
+
+def job_history(tmp_path):
+    root, _, _ = receipt_fixture(tmp_path)
+    packet = tmp_path / "packet.md"
+    packet.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "tests",
+                                 "checkout": str(tmp_path), "commit": "a" * 40, "tree": "b" * 40}))
+    original = invoke(root, "publish", message(recipient="a/root", identifier="job", kind="job_request", brief=ref(packet)))
+    unknown = invoke(root, "publish", message("a/root", "a/orchestrator", identifier="unknown", kind="job_receipt",
+                                              in_reply_to="job", receipt={"state": "unknown", "reason": "lost reply"}))
+    evidence = tmp_path / "job-result.json"
+    evidence.write_text("{}\n")
+    terminal = invoke(root, "publish", message("a/root", "a/orchestrator", identifier="terminal", kind="job_receipt",
+                                               in_reply_to="job", receipt={"state": "completed", "exit_code": 0, "evidence": [ref(evidence)]}))
+    return root, packet, original, unknown, terminal
+
+
+def set_record_time(record, at):
+    # Stored histories may order differently from publication; the reader validates this supported input.
+    header = {**record["message"], "created_at": at}
+    body = header.pop("body")
+    Path(record["path"]).write_bytes(b"---\n" + json.dumps(header, sort_keys=True).encode() + b"\n---\n\n" + body.encode())
+
+
+@secure_publication
+def test_later_unknown_survives_an_earlier_terminal_until_a_correlated_later_terminal(tmp_path):
+    root, packet, original, unknown, terminal = job_history(tmp_path)
+    set_record_time(terminal, "2026-01-01T00:00:00Z")
+    set_record_time(unknown, "2026-01-02T00:00:00Z")
+    rows = sections(compose(root, "a/orchestrator")["brief"])
+    assert any(row.get("job_id") == "a/job" and row.get("state") == "unknown" and row["ref"] == ref(original["path"])
+               for row in rows["Open obligations"])
+    # The same correlated terminal only settles the job when its durable timestamp is later.
+    set_record_time(terminal, "2026-01-03T00:00:00Z")
+    rows = sections(compose(root, "a/orchestrator")["brief"])
+    assert not any(row.get("job_id") == "a/job" for row in rows["Open obligations"])
+
+
+@secure_publication
+@pytest.mark.parametrize("damage", ["missing", "changed"])
+def test_historical_packets_do_not_block_but_uncertain_packets_do(tmp_path, damage):
+    root, packet, _, unknown, terminal = job_history(tmp_path)
+    set_record_time(unknown, "2026-01-01T00:00:00Z")
+    set_record_time(terminal, "2026-01-02T00:00:00Z")
+    if damage == "missing":
+        packet.unlink()
+    else:
+        packet.write_text("changed\n")
+    rows = sections(compose(root, "a/orchestrator")["brief"])
+    assert any(row.get("state") == "unverified" for row in rows["Evidence references"])
+    set_record_time(unknown, "2026-01-03T00:00:00Z")
+    before = files(tmp_path)
+    error = compose(root, "a/orchestrator", expect=2)["error"]
+    assert ("file unavailable" if damage == "missing" else "brief sha256 mismatch") in error
+    assert files(tmp_path) == before
+
+
+@secure_publication
+def test_old_read_and_wake_history_is_bounded_and_successor_reads_are_generation_scoped(tmp_path):
+    root, delivery, checkpoint = receipt_fixture(tmp_path, endpoint="a/root")
+    invoke(root, "inbox", endpoint="a/root", delivery_dir=delivery, mark_read=True,
+           host="host-one", session="a/root", generation=1)
+    folder = delivery / "reads" / "a/root"
+    receipt = json.loads(next(folder.iterdir()).read_text())
+    for index in range(300):
+        (folder / ("history-%03d.json" % index)).write_text(json.dumps(receipt))
+    wakes = delivery / "wakes" / "a/root"
+    wakes.mkdir(parents=True)
+    for index in range(300):
+        (wakes / ("history-%03d.json" % index)).write_text(json.dumps(
+            {**receipt, "wake_id": "wake-%03d" % index, "state": "started"}))
+    answer = compose(root, "a/root")
+    assert answer["entries"] < 20 and sections(answer["brief"])["Unread work"] == []
+    invoke(root, "bind", {"endpoint": "a/root", "host": "host-two", "session": "successor", "expected_generation": 1,
+                          "checkpoint": checkpoint})
+    rows = sections(compose(root, "a/root")["brief"])
+    assert [row["message_id"] for row in rows["Unread work"]] == ["receipt-note"]
+
+
+@secure_publication
+def test_json_answer_reports_absent_lifecycle_coverage(pilot):  # noqa: F811
+    root, _ = pilot
+    assert compose(root)["coverage"]["lifecycle"] == "absent"
+
+
+def faulted_cli(root, driver):
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(TOOL), str(root)],
+                          capture_output=True, text=True, timeout=30,
+                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert not proc.stderr, proc.stderr
+    return proc.returncode, json.loads(proc.stdout)
+
+
+@secure_publication
+@pytest.mark.parametrize("boundary", ["create", "rename"])
+def test_publication_directory_swap_never_writes_into_a_store(pilot, boundary):  # noqa: F811
+    root, _ = pilot
+    briefs, held, store = root.parent / "briefs", root.parent / "held-briefs", root.parent / "store"
+    briefs.mkdir()
+    store.mkdir()
+    sentinel = store / "sentinel"
+    sentinel.write_text("store must stay unchanged")
+    driver = ("import os,runpy,sys\nfrom pathlib import Path\n"
+              "tool,root=sys.argv[1:]\nbase=Path(root).parent\n"
+              "real_open,real_replace=os.open,os.replace\nswapped=False\n"
+              "def swap():\n"
+              "    global swapped\n"
+              "    if not swapped:\n"
+              "        swapped=True\n"
+              "        os.rename(base/'briefs',base/'held-briefs')\n"
+              "        os.symlink(base/'store',base/'briefs',target_is_directory=True)\n"
+              "def opening(path,flags,*args,**kwargs):\n"
+              + ("    if str(path).split('/')[-1].startswith('.fresh-') and flags & os.O_CREAT: swap()\n" if boundary == "create" else "")
+              + "    return real_open(path,flags,*args,**kwargs)\n"
+              "def replacing(src,dst,*args,**kwargs):\n"
+              + ("    swap()\n" if boundary == "rename" else "")
+              + "    return real_replace(src,dst,*args,**kwargs)\n"
+              "os.open,os.replace=opening,replacing\n"
+              "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
+              "runpy.run_path(tool,run_name='__main__')\n")
+    before = files(store)
+    code, answer = faulted_cli(root, driver)
+    assert files(store) == before, "publication followed the swapped symlink into a store"
+    assert code == 2 and "publication directory changed" in answer["error"]
+    assert list(held.iterdir()) == []
+
+
+def test_unsupported_dir_fd_refuses_cleanly_before_creating_any_output(pilot):  # noqa: F811
+    root, _ = pilot
+    driver = ("import os,runpy,sys\n"
+              "tool,root=sys.argv[1:]\nos.supports_dir_fd=set()\n"
+              "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
+              "runpy.run_path(tool,run_name='__main__')\n")
+    before = files(root.parent)
+    code, answer = faulted_cli(root, driver)
+    assert code == 2 and answer["error"] == "secure brief publication requires directory descriptor support"
+    assert files(root.parent) == before and not (root.parent / "briefs").exists()
+
+
+def test_byte_limit_refuses_without_writing(pilot):  # noqa: F811
+    root, _ = pilot
+    source = root.parent / "source"
+    templates = source / "tools/hierarchy_templates"
+    (templates / "roles").mkdir(parents=True)
+    shutil.copyfile(ROOT / "tools/hierarchy_templates/lane-brief.md", templates / "lane-brief.md")
+    (templates / "roles/lane.md").write_text("# Role\n" + "x" * 262144)
+    (root.parent / "provision.json").write_text(json.dumps({"initiative": "a", "source": str(source),
+        "mailbox_root": str(root), "delivery_dir": str(root.parent / "delivery")}))
+    before = files(root.parent)
+    assert compose(root, expect=2)["error"] == "fresh brief exceeds mailbox brief byte limit (262144)"
+    assert files(root.parent) == before and not (root.parent / "briefs").exists()
+
+
+def test_verify_portable_brief_without_a_journal_or_publication(tmp_path):
+    manifest = tmp_path / "record.json"
+    manifest.write_text("{}\n")
+    brief = tmp_path / "brief.md"
+    body = ["# Fresh thread brief", "<!-- aegis.hierarchy-fresh-brief/v1 -->", "Resume path: Verify first."]
+    for name in SECTIONS:
+        body += ["## " + name, "- " + json.dumps({"kind": "record", "ref": ref(manifest)})]
+    brief.write_text("\n".join(body) + "\n")
+    reference = ref(brief)
+    assert cli("verify", "--path", brief, "--sha256", reference["sha256"])["ok"] is True
