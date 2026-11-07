@@ -70,6 +70,12 @@ _HOSTS = {
         "entrypoints": {"program_basenames": ("claude", "claude.exe", ".claude-wrapped"),
                         "node_script_basenames": ("claude", ".claude-wrapped"),
                         "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",)},
+        "session_selectors": {"options": ("--resume", "--session-id"), "commands": (),
+                              "value_options": ("--model", "--settings", "--permission-mode", "--output-format",
+                                                "--input-format", "--system-prompt", "--append-system-prompt",
+                                                "--mcp-config", "--agent", "--agents", "--tools", "--allowedTools",
+                                                "--disallowedTools", "--add-dir", "--plugin-dir"),
+                              "prompt_options": ("-p", "--print")},
         "team_start": "print",
         "home": {"variable": "CLAUDE_CONFIG_DIR", "run_folder": "claude-home", "owner_folder": ".claude"},
         "billing_variables": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -84,8 +90,13 @@ _HOSTS = {
     },
     CODEX: {
         "family": "codex",
-        "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex",),
+        "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex", "codex.js"),
                         "node_script_suffixes": ()},
+        "session_selectors": {"options": (), "commands": (("resume",), ("exec", "resume")),
+                              "value_options": ("-c", "--config", "--disable", "--enable", "--sandbox", "-s",
+                                                "-C", "--cd", "--add-dir", "--model", "-m", "--profile", "-p",
+                                                "--output-last-message", "-o", "--output-schema"),
+                              "prompt_options": ()},
         "team_start": "exec",
         "home": {"variable": "CODEX_HOME", "run_folder": "codex-home", "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
@@ -102,6 +113,7 @@ _HOSTS = {
     NATIVE: {
         "family": "codex",
         "entrypoints": {"program_basenames": (), "node_script_basenames": (), "node_script_suffixes": ()},
+        "session_selectors": {"options": (), "commands": (), "value_options": (), "prompt_options": ()},
         "team_start": None,
         "home": {"variable": "CODEX_HOME", "run_folder": None, "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
@@ -140,23 +152,80 @@ def entrypoints(kind):
     return found
 
 
-def matches_entrypoint(kind, argv):
-    """Whether argv names one of this host's declared programs or node-run scripts."""
+def _host_arguments(kind, argv):
+    """Host arguments after env and an optional Node interpreter, or None for another program."""
     found = entrypoints(kind)
     if argv and Path(argv[0]).name == "env":
         argv = argv[1:]
         while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
             argv = argv[1:]
     if not argv:
-        return False
+        return None
     program = Path(argv[0]).name
     if program in found["program_basenames"]:
-        return True
+        return argv[1:]
     if program != "node" or len(argv) < 2:
+        return None
+    index = 1
+    while index < len(argv) and argv[index].startswith("-"):
+        word = argv[index]
+        option, equal, _ = word.partition("=")
+        index += 1
+        if option == "--":
+            break
+        if option in ("--eval", "--print") or word.startswith(("-e", "-p")):
+            return None  # These execute source text rather than a host script.
+        if not equal and option in ("-r", "--require", "--import"):
+            index += 1
+    if index >= len(argv):
+        return None
+    script = Path(argv[index])
+    if script.name in found["node_script_basenames"] or any(
+            script.parts[-len(Path(suffix).parts):] == Path(suffix).parts for suffix in found["node_script_suffixes"]):
+        return argv[index + 1:]
+    return None
+
+
+def matches_entrypoint(kind, argv):
+    """Whether argv names one of this host's declared programs or node-run scripts."""
+    return _host_arguments(kind, argv) is not None
+
+
+def matches_session(kind, argv, session):
+    """A host's own positional selector must name this session, without a conflicting selector."""
+    arguments = _host_arguments(kind, argv)
+    if arguments is None:
         return False
-    script = Path(argv[1])
-    return script.name in found["node_script_basenames"] or any(
-        script.parts[-len(Path(suffix).parts):] == Path(suffix).parts for suffix in found["node_script_suffixes"])
+    selectors = _host(kind)["session_selectors"]
+    selected, positional, index = [], [], 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word == "--":
+            break
+        option, equal, value = word.partition("=")
+        if option in selectors["options"]:
+            if not equal:
+                index += 1
+                value = arguments[index] if index < len(arguments) else ""
+            selected.append(value)
+        elif option in selectors["value_options"]:
+            if not equal:
+                index += 1
+        elif option in selectors["prompt_options"]:
+            if not equal and index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+                index += 1
+        elif not word.startswith("-"):
+            positional.append(word)
+        index += 1
+    if selectors["commands"]:
+        for command in selectors["commands"]:
+            if tuple(positional[:len(command)]) == command and len(positional) > len(command):
+                selected.append(positional[len(command)])
+                # A second resume selector cannot retarget the process to another session.
+                tail = positional[len(command) + 1:]
+                selected.extend(tail[i + 1] for i, word in enumerate(tail[:-1]) if word == command[-1])
+                break
+    return bool(selected) and all(value == session for value in selected)
 
 
 def qualify(kind, writer):

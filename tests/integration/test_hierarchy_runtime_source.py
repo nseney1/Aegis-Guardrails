@@ -12,7 +12,7 @@ import pytest
 
 from tests.integration.test_hierarchy_mailbox import git, invoke
 from tests.integration.test_hierarchy_provision import Setup, provision, start_connection
-from tests.integration.test_hierarchy_launcher import Launch, REVIEW, census, wait_until
+from tests.integration.test_hierarchy_launcher import Launch, REVIEW, LINUX_HOST_PROGRAMS, owned_pids, wait_until
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="provisioned runtime profiles are POSIX only")
 
@@ -159,16 +159,17 @@ def test_ignored_importable_directory_symlink_refuses_startup(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["commit", "module"])
+@LINUX_HOST_PROGRAMS
 def test_trusted_control_checkout_can_stop_owned_session_after_pinned_source_drift(tmp_path, kind):
     """Recovery uses the trusted operator tools, never executes the drifted runtime as a stop implementation."""
     built = Launch(tmp_path)
     built.init()
     session = built.start()["session"]
-    process = subprocess.Popen(["sh", "-c", 'exec codex exec --json hold "$0"', session],
+    process = subprocess.Popen(["sh", "-c", 'exec codex exec --json resume "$0"', session],
                                env=built.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session),
                                stdout=subprocess.DEVNULL, start_new_session=True)
     try:
-        wait_until(lambda: census(session) == [process.pid])
+        wait_until(lambda: owned_pids(session) == [process.pid])
         drift(built, kind, tmp_path / "executed")
         stopped = built.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1")
         assert stopped["state"] == "stopped" and stopped["pids"] == [process.pid]

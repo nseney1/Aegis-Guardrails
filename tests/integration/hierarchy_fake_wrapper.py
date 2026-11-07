@@ -31,12 +31,13 @@ def python_argv(program, script, directory, entrypoint=None):
     libraries = [path for path in sys.path if path and Path(path).is_absolute() and Path(path).resolve() in roots]
     paths = [os.path.dirname(os.path.abspath(str(script))), *libraries]
     bootstrap = ("import sys; sys.executable = %r; sys.prefix = %r; sys.exec_prefix = %r; sys.path[:] = %r; "
-                 "import runpy; sys.argv = sys.argv[1:]; " % (sys.executable, sys.prefix, sys.exec_prefix, paths))
+                 "import runpy; sys.argv = [%r, *sys.argv[1:]]; " %
+                 (sys.executable, sys.prefix, sys.exec_prefix, paths, str(script)))
     if entrypoint is None:
         bootstrap += "runpy.run_path(sys.argv[0], run_name='__main__')"
     else:
         bootstrap += "sys.exit(runpy.run_path(sys.argv[0])[%r](sys.argv[1:]))" % entrypoint
-    return [str(binary), "-I", "-B", "-c", bootstrap, str(script)]
+    return [str(binary), "-I", "-B", "-c", bootstrap]
 
 
 def shell_exec(program, script, directory):

@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import NamedTuple
 import uuid
 
 # Provisioned CLI actions must enter through the retained verifier before importing any peer module.
@@ -628,72 +629,162 @@ def ancestors():
     return mine
 
 
-def process_census(session):
-    """Read Linux argument boundaries directly; ps is the fallback without /proc."""
-    proc = Path("/proc")
-    if proc.is_dir():
-        for folder in proc.iterdir():
-            if not folder.name.isdigit():
-                continue
-            try:
-                fields = (folder / "stat").read_bytes().rpartition(b")")[2].split()
-                arguments = (folder / "cmdline").read_bytes().split(b"\0")
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                # A process can end during the census; inaccessible argv cannot establish ownership.
-                continue
-            if arguments[-1] == b"":
-                arguments.pop()
-            if len(fields) >= 3 and fields[2].isdigit():
-                yield int(folder.name), int(fields[2]), fields[0].decode("ascii"), [os.fsdecode(a) for a in arguments]
-        return
-    census = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,pgid=,stat=,args="], capture_output=True, text=True, timeout=10)
-    require(census.returncode == 0, "process census failed")
-    for line in census.stdout.splitlines():
-        words = line.split(None, 3)
-        if len(words) < 4 or not (words[0].isdigit() and words[1].isdigit()):
-            continue
-        if not re.search(r"(?<!\S)" + re.escape(session) + r"(?!\S)", words[3]):
+class ProcessSnapshot(NamedTuple):
+    pid: int
+    pgid: int
+    state: str
+    uid: int
+    start_time: str
+    cmdline: bytes
+    argv: tuple
+
+
+class ProcessCensus(list):
+    def __init__(self, rows, argv_boundaries):
+        super().__init__(rows)
+        self.argv_boundaries = argv_boundaries
+
+
+def ps_census(pid=None):
+    command = ["ps", "-p", str(pid)] if pid is not None else ["ps", "-ax"]
+    shown = subprocess.run([*command, "-ww", "-o", "pid=,pgid=,uid=,stat=,lstart=,args="],
+                           capture_output=True, text=True, timeout=10)
+    require(shown.returncode == 0 or (pid is not None and shown.returncode == 1), "process census failed")
+    rows = []
+    for line in shown.stdout.splitlines():
+        words = line.split(None, 9)
+        if len(words) < 10 or not all(word.isdigit() for word in words[:3]):
             continue
         # ps is not shell-escaped: quotes are literal, and paths with spaces cannot be recovered here.
-        # Linux uses the NUL-separated /proc argv above instead.
-        yield int(words[0]), int(words[1]), words[2], words[3].split()
+        # Linux uses the NUL-separated /proc argv instead; lstart is the fallback's coarser birth timestamp.
+        rows.append(ProcessSnapshot(int(words[0]), int(words[1]), words[3], int(words[2]),
+                                    " ".join(words[4:9]), os.fsencode(words[9]), tuple(words[9].split())))
+    return rows
 
 
-def session_processes(session, excluded, host=CODEX, unowned=None):
-    """(pid, pgid) of live host programs naming the session as a whole argument."""
+def read_process(pid, argv_boundaries="proven"):
+    """Read a process snapshot, also used immediately before signalling it."""
+    if argv_boundaries == "unproven":
+        return next(iter(ps_census(pid)), None)
+    folder = Path("/proc") / str(pid)
+    try:
+        uid = os.stat(folder).st_uid
+        fields = (folder / "stat").read_bytes().rpartition(b")")[2].split()
+        cmdline = (folder / "cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        # A process can end during the census; inaccessible argv cannot establish ownership.
+        return None
+    if not cmdline or len(fields) < 20 or not fields[2].isdigit() or not fields[19].isdigit():
+        return None
+    arguments = cmdline.split(b"\0")
+    if arguments[-1] == b"":
+        arguments.pop()
+    return ProcessSnapshot(pid, int(fields[2]), fields[0].decode("ascii"), uid, fields[19].decode("ascii"),
+                           cmdline, tuple(os.fsdecode(a) for a in arguments))
+
+
+def process_census(session):
+    """Retain birth time and exact Linux argv; ps is an explicitly unproven fallback without /proc."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return ProcessCensus(ps_census(), "unproven")
+    rows = (read_process(int(folder.name)) for folder in proc.iterdir() if folder.name.isdigit())
+    return ProcessCensus((row for row in rows if row is not None), "proven")
+
+
+def names_session(row, session):
+    # Equals selectors still carry a whole session value, never an arbitrary substring of a prompt.
+    return any(word == session or word.partition("=")[2] == session for word in row.argv)
+
+
+def owns_process(row, session, host):
+    return row.uid == os.geteuid() and hierarchy_hosts.matches_session(host, row.argv, session)
+
+
+def session_processes(session, excluded, host=CODEX, unowned=None, observed=None):
+    """(pid, pgid) of live processes with our UID and the bound host's session selector."""
     hierarchy_hosts.entrypoints(host)
     found = []
-    for pid, pgid, state, argv in process_census(session):
+    census = process_census(session)
+    if observed is not None:
+        observed.update(census={row.pid: row for row in census}, argv_boundaries=census.argv_boundaries)
+    for row in census:
         # A zombie has already ended; it only waits for its parent to collect it.
-        if pid in excluded or state.startswith("Z") or session not in argv:
+        if row.pid in excluded or row.state.startswith("Z") or not names_session(row, session):
             continue
         # A diagnostic command naming the session must never be signalled.
-        if hierarchy_hosts.matches_entrypoint(host, argv):
-            found.append((pid, pgid))
+        if owns_process(row, session, host):
+            found.append((row.pid, row.pgid))
         elif unowned is not None:
-            unowned.append(pid)
+            unowned.append(row.pid)
     return found
 
 
-def signal_all(found, number):
-    own_group = os.getpgrp()
+def unchanged_process(expected, boundaries, session, host, unowned, require_host=True):
+    current = read_process(expected.pid, boundaries)
+    if current is None or current.state.startswith("Z"):
+        return False
+    if (current.start_time != expected.start_time or current.cmdline != expected.cmdline or
+            current.pgid != expected.pgid or current.uid != os.geteuid() or
+            (require_host and not owns_process(current, session, host))):
+        unowned.append(expected.pid)
+        return False
+    return True
+
+
+def signal_process(expected, number, boundaries, session, host, unowned, require_host=True):
+    handle = None
+    try:
+        if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            # Open before verification: this descriptor cannot be retargeted by PID reuse after the check.
+            handle = os.pidfd_open(expected.pid)
+        if not unchanged_process(expected, boundaries, session, host, unowned, require_host):
+            return False
+        if handle is None:
+            os.kill(expected.pid, number)
+        else:
+            signal.pidfd_send_signal(handle, number)
+        return "sent"
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Retain the attempted host PID so a live process denied by the OS still produces stop_failed.
+        return "denied"
+    finally:
+        if handle is not None:
+            os.close(handle)
+
+
+def signal_all(found, number, observed, session, host, unowned, attempted=None):
+    census, boundaries = observed["census"], observed["argv_boundaries"]
+    attempted = set() if attempted is None else attempted
+    handled = set()
     pids = {pid for pid, _ in found}
-    for group in sorted({pgid for _, pgid in found}):
-        targets = [pid for pid, pgid in found if pgid == group]
-        try:
-            if group in pids and group != own_group:
-                os.killpg(group, number)
-            else:
-                for pid in targets:
-                    os.kill(pid, number)
-        except (ProcessLookupError, PermissionError):
+    for pid, pgid in sorted(found, key=lambda pair: (pair[0] != pair[1], pair[0])):
+        if pid in handled:
             continue
+        handled.add(pid)
+        result = signal_process(census[pid], number, boundaries, session, host, unowned)
+        if not result:
+            continue
+        attempted.add(pid)
+        if result == "sent" and pid == pgid and pgid != os.getpgrp():
+            # Only a verified host leader authorizes group cleanup. Signal retained members individually so
+            # PID reuse and a different user's group member cannot turn killpg into collateral damage.
+            for member in census.values():
+                if member.pgid == pgid and member.pid not in handled and member.pid not in unowned:
+                    handled.add(member.pid)
+                    if signal_process(member, number, boundaries, session, host, unowned, member.pid in pids):
+                        if member.pid in pids:
+                            attempted.add(member.pid)
+    return attempted
 
 
-def gone_within(session, excluded, pids, seconds, host):
+def gone_within(session, excluded, pids, seconds, host, observed, unowned):
     deadline = time.monotonic() + seconds
     while True:
-        left = {pid for pid, _ in session_processes(session, excluded, host)} & pids
+        left = {pid for pid in pids if pid not in excluded and unchanged_process(
+            observed["census"][pid], observed["argv_boundaries"], session, host, unowned)}
         if not left or time.monotonic() >= deadline:
             return not left
         time.sleep(POLL_SECONDS)
@@ -720,28 +811,33 @@ def stop(launches, endpoint, grace):
     signalled = False
     try:
         excluded = ancestors()
-        unowned = []
-        found = session_processes(known["session"], excluded, known["host"], unowned)
+        unowned, observed = [], {}
+        found = session_processes(known["session"], excluded, known["host"], unowned, observed)
         marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
-        if unowned:
-            marker["unowned_pids"] = sorted(unowned)
-        pids, stopped = {pid for pid, _ in found}, True
+        if observed["argv_boundaries"] == "unproven":
+            marker["argv_boundaries"] = "unproven"
+        pids, stopped = set(), True
         if found:
             signalled = True
-            signal_all(found, signal.SIGTERM)
-            stopped = gone_within(known["session"], excluded, pids, grace, known["host"])
+            signal_all(found, signal.SIGTERM, observed, known["session"], known["host"], unowned, pids)
+            stopped = gone_within(known["session"], excluded, pids, grace, known["host"], observed, unowned)
             if not stopped:
-                signal_all(session_processes(known["session"], excluded, known["host"]), signal.SIGKILL)
-                stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"])
+                signal_all([pair for pair in found if pair[0] in pids], signal.SIGKILL, observed,
+                           known["session"], known["host"], unowned)
+                stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"], observed, unowned)
             # The marker belongs to the wake that made it; whoever inspects it decides whether that turn has ended.
             marker["wake_marker_present"] = launches.mailbox.wake_marker(endpoint).exists()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         if not signalled:
             launches.refuse(endpoint, identifier, "stop", str(exc), **known)
         # Signals were already sent, so "refused" would claim nothing was done.
+        if unowned:
+            marker["unowned_pids"] = sorted(set(unowned))
         return 3, launches.record(endpoint, identifier, "stop", "stop_failed", **known, pids=sorted(pids),
                                   error=str(exc), **marker)
-    if not found:
+    if unowned:
+        marker["unowned_pids"] = sorted(set(unowned))
+    if not pids:
         return 0, launches.record(endpoint, identifier, "stop", "not_running", **known, pids=[], **marker)
     state = "stopped" if stopped else "stop_failed"
     return (0 if stopped else 3), launches.record(endpoint, identifier, "stop", state, **known, pids=sorted(pids), **marker)

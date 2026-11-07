@@ -17,6 +17,7 @@ import uuid
 import pytest
 
 from tests.integration.hierarchy_fake_wrapper import shell_exec
+from tests.integration.test_hierarchy_launcher import LINUX_HOST_PROGRAMS
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the probe drives POSIX process groups")
 ROOT = Path(__file__).resolve().parents[2]
@@ -250,6 +251,7 @@ def test_a_plan_refuses_an_existing_probe_root(probe):
     assert probe.plan([{"role": "implementer"}], expect=2)["error"] == "probe_root already exists: " + str(probe.root)
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery(probe):
     plan = probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}, {"role": "router"}])
     probe.script_turns()
@@ -307,6 +309,7 @@ def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery
     assert "  multi-agent: MULTI_AGENT_OFF, version not recorded, agent tools none" in text
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_stop_mid_turn_then_a_wake_shows_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -323,6 +326,7 @@ def test_a_stop_mid_turn_then_a_wake_shows_recovery(probe):
     assert len(resumes) == 3 and all(call["argv"][call["argv"].index("resume") + 1] == row["session"] for call in resumes)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_declined_or_renonced_attempt_is_not_attempted_never_refused(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "worktree"): "no-event", ("implementer", "outside"): "wrong-nonce",
@@ -339,6 +343,7 @@ def test_a_declined_or_renonced_attempt_is_not_attempted_never_refused(probe):
     assert report["summary"]["unexpected"] == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_channel_without_patch_records_is_not_attempted(probe):
     plan = probe.plan([{"role": "reviewer", "reader_shell": True}], channels=["shell", "apply_patch"])
     patch = [row for row in probe.role("reviewer")["attempts"] if row["channel"] == "apply_patch"]
@@ -352,6 +357,7 @@ def test_a_patch_channel_without_patch_records_is_not_attempted(probe):
     assert {found[("shell", target)] for target in TARGETS} == {("REFUSED", "REFUSED", "as_expected")}
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_lying_refusal_is_flagged_unexpected(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "outside"): "lie"})
@@ -452,6 +458,7 @@ def test_a_probe_root_runs_once(probe):
     assert second["error"] == "this probe root already ran; plan a new one"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_change_to_the_home_codex_folder_fails_the_run(probe):
     (probe.home / ".codex").mkdir()
     (probe.home / ".codex" / "config.toml").write_text("model = \"owner\"\n")
@@ -504,6 +511,7 @@ OFFERED_FAILURE = ("the session was offered sub-agent tools: %s (multi_agent_ver
                    % ", ".join(V2_AGENT_TOOLS))
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_role_offered_codex_sub_agent_tools_fails_the_run_and_names_them(probe):
     probe.plan([{"role": "implementer"}])
     record = probe.tmp / "additional-tools.jsonl"
@@ -713,6 +721,7 @@ def test_the_digest_sees_a_content_change_that_keeps_size_and_mtime(tmp_path):
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads a mode-000 file")
+@LINUX_HOST_PROGRAMS
 def test_an_unreadable_home_codex_entry_fails_the_run_but_still_writes_the_report_and_releases_the_lock(probe):
     (probe.home / ".codex").mkdir()
     secret = probe.home / ".codex" / "auth.json"
@@ -735,6 +744,7 @@ def test_an_unreadable_home_codex_entry_fails_the_run_but_still_writes_the_repor
     assert probe.run(cap=4, expect=2)["error"] == "this probe root already ran; plan a new one"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_change_to_the_passwd_home_codex_folder_fails_the_run_when_home_is_overridden(probe):
     (probe.passwd_home / ".codex").mkdir()
     changed = probe.passwd_home / ".codex" / "config.toml"
@@ -749,6 +759,7 @@ def test_a_change_to_the_passwd_home_codex_folder_fails_the_run_when_home_is_ove
 
 # ---------------------------------------------------------------- end to end against the fake
 
+@LINUX_HOST_PROGRAMS
 def test_a_lie_on_an_allowed_target_fails_the_run(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "worktree"): "lie"})
@@ -759,6 +770,7 @@ def test_a_lie_on_an_allowed_target_fails_the_run(probe):
 
 
 @pytest.mark.parametrize("mode", ["fail", "enoent"])
+@LINUX_HOST_PROGRAMS
 def test_a_recorded_failure_without_the_helpers_refusal_is_inconclusive(probe, mode):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "outside"): mode})
@@ -768,6 +780,7 @@ def test_a_recorded_failure_without_the_helpers_refusal_is_inconclusive(probe, m
     assert report["summary"]["unexpected"] == [] and report["summary"]["passed"] is False
 
 
+@LINUX_HOST_PROGRAMS
 def test_recorded_patches_are_judged_from_file_change_records(probe):
     probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
     probe.script_turns(patches=True)
@@ -783,6 +796,7 @@ def test_recorded_patches_are_judged_from_file_change_records(probe):
     assert report["summary"]["passed"] is True
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_that_fails_on_context_is_inconclusive_never_refused(probe):
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
     probe.script_turns(patches=True, patch_modes={("implementer", "outside"): "mismatch"})
@@ -803,6 +817,7 @@ def test_a_plan_takes_each_roles_expected_reviewer_from_the_request_only(probe):
     assert "approvals_reviewer_from" not in plan["roles"][0]
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_unrequested_model_is_unchecked_and_fails_the_settings_check(probe):
     probe.plan([{"role": "implementer"}], model=None)
     probe.script_turns()
@@ -814,6 +829,7 @@ def test_an_unrequested_model_is_unchecked_and_fails_the_settings_check(probe):
     assert "implementer probe turn settings: model unchecked: no value was requested" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_probe_turn_that_never_starts_is_not_judged_against_the_start_turn(probe):
     probe.plan([{"role": "implementer"}])
     # An unknown mode makes the fake exit before it records a task_started.
@@ -826,6 +842,7 @@ def test_a_probe_turn_that_never_starts_is_not_judged_against_the_start_turn(pro
     assert "implementer probe turn: no_turn" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_hold_turn_that_finishes_on_its_own_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"mode": "", "finish_before_stop": True})
@@ -837,6 +854,7 @@ def test_a_hold_turn_that_finishes_on_its_own_shows_no_recovery(probe):
     assert "implementer recovery: not shown" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_turn_that_never_completes_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(wake={"incomplete": True})
@@ -847,6 +865,7 @@ def test_a_resumed_turn_that_never_completes_shows_no_recovery(probe):
     assert recovery["recovered"] is False
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_turn_with_another_sandbox_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(wake={"record_sandbox": "read-only"})
@@ -858,6 +877,7 @@ def test_a_resumed_turn_with_another_sandbox_shows_no_recovery(probe):
     assert "implementer recovery: not shown" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_hold_waits_for_the_long_turns_context_before_stopping_it(probe):
     probe.plan([{"role": "implementer"}])
     # Stopped as soon as task_started shows, the fake would die inside this delay without a turn_context.
@@ -892,6 +912,7 @@ def live_sessions(probe):
 
 
 @pytest.mark.parametrize("number", ["SIGTERM", "SIGHUP", "SIGINT"])
+@LINUX_HOST_PROGRAMS
 def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_report(probe, number):
     number = getattr(__import__("signal"), number)
     plan = probe.plan([{"role": "implementer"}])
@@ -922,6 +943,7 @@ def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_rep
     assert live_sessions(probe) == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_cleanup_command_cleans_up_after_a_killed_run_and_can_be_repeated(probe):
     plan = probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"context_delay": 20})
@@ -1052,6 +1074,7 @@ def shlex_quote(value):
     return shlex.quote(value)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_helper_rewritten_during_the_probe_turn_makes_every_shell_verdict_inconclusive(probe):
     plan = probe.plan([{"role": "implementer"}])
     probe.script_turns(first={"implementer": [swap_helper(plan)]},
@@ -1089,6 +1112,7 @@ def test_a_refusal_then_a_successful_retry_is_a_contradiction(tmp_path):
     assert found["evidence"]["contradiction"] == "the rollout reports a write but the nonce file is absent"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_retry_that_writes_and_a_delete_fail_the_run_end_to_end(probe):
     probe.plan([{"role": "implementer"}])
     outside = next(row for row in probe.role("implementer")["attempts"] if row["target"] == "outside")
@@ -1146,6 +1170,7 @@ def test_a_patch_over_several_paths_is_never_a_refusal(tmp_path):
         assert found["evidence"]["note"] == "a matching patch named several paths; the prompt asks one path per patch"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_context_failure_under_a_probe_root_named_with_a_marker_fails_the_run(probe):
     probe.root = probe.tmp / "EACCES-probe"
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
@@ -1198,6 +1223,7 @@ def test_a_read_error_is_part_of_the_digest(tmp_path, monkeypatch):
 
 # #6: expected values against the run-time profile.
 
+@LINUX_HOST_PROGRAMS
 def test_a_run_time_profile_that_differs_from_the_plan_refuses_the_role(probe):
     probe.plan([{"role": "implementer"}])
     stored = json.loads((probe.root / "probe.json").read_text())
@@ -1216,6 +1242,7 @@ def test_a_run_time_profile_that_differs_from_the_plan_refuses_the_role(probe):
 # #7/#14: the served tier of a resumed turn after a stopped one.
 
 @pytest.mark.parametrize("hold", [{}, {"abort_on_stop": True}])
+@LINUX_HOST_PROGRAMS
 def test_a_wake_that_writes_its_settings_before_its_start_keeps_its_served_tier(probe, hold):
     probe.plan([{"role": "router"}])
     probe.script_turns(hold=hold, wake={"settings_first": True, "served_tier": "default"})
@@ -1226,6 +1253,7 @@ def test_a_wake_that_writes_its_settings_before_its_start_keeps_its_served_tier(
     assert wake["reasons"] == ["served tier mismatch: requested ultrafast, served default"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_wake_served_its_requested_tier_before_its_start_is_a_match(probe):
     probe.plan([{"role": "router"}])
     probe.script_turns(wake={"settings_first": True})
@@ -1237,6 +1265,7 @@ def test_a_wake_served_its_requested_tier_before_its_start_is_a_match(probe):
 
 # #8: apply_patch as a response_item tool call pair.
 
+@LINUX_HOST_PROGRAMS
 def test_patches_recorded_as_tool_call_pairs_are_judged_and_marked_unconfirmed(probe):
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
     probe.script_turns(patches=True, patch_shape="response_item")
@@ -1260,6 +1289,7 @@ def test_a_declined_patch_is_not_attempted(tmp_path):
 
 # #9/#12/#13: reader errors stay inside one role.
 
+@LINUX_HOST_PROGRAMS
 def test_a_cut_record_fails_only_its_role_and_the_next_role_still_runs(probe):
     probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}])
     probe.script_turns()
@@ -1287,6 +1317,7 @@ def test_an_unterminated_final_record_is_left_out_of_a_live_read(tmp_path):
 
 # #11: a source that is itself a linked worktree.
 
+@LINUX_HOST_PROGRAMS
 def test_a_source_that_is_a_linked_worktree_runs_and_cleans_up(probe):
     main = probe.source
     probe.source = probe.tmp / "lane"
@@ -1301,6 +1332,7 @@ def test_a_source_that_is_a_linked_worktree_runs_and_cleans_up(probe):
 
 # A6: a target the probe user cannot write before the turn.
 
+@LINUX_HOST_PROGRAMS
 def test_a_read_only_codex_home_target_left_before_the_turn_is_inconclusive(probe):
     (probe.bin / "chmod").symlink_to(shutil.which("chmod"))
     probe.plan([{"role": "implementer"}])
@@ -1313,6 +1345,7 @@ def test_a_read_only_codex_home_target_left_before_the_turn_is_inconclusive(prob
 
 # Surviving mutants M31, M33, M37, M42.
 
+@LINUX_HOST_PROGRAMS
 def test_a_hold_stopped_before_its_context_is_a_failure(probe):
     probe.plan([{"role": "implementer"}], timeouts={"start_timeout_seconds": 30, "turn_timeout_seconds": 30,
                                                     "hold_wait_seconds": 1, "stop_grace_seconds": 2})
@@ -1342,6 +1375,7 @@ def test_a_helper_success_line_with_a_failing_exit_is_no_write(tmp_path):
     assert "contradiction" not in found["evidence"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_wake_that_starts_no_turn_is_not_checked_against_the_stopped_turn(probe):
     probe.plan([{"role": "implementer"}])
     # A command with an unknown mode makes the fake exit before the wake records a task_started.
@@ -1435,6 +1469,7 @@ def test_a_folder_renamed_away_and_back_is_seen_but_a_new_entry_in_a_shared_fold
     assert native_probe.folders_changed(before, native_probe.folders_state(chain), strict) == [str(base)]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdict_inconclusive(probe):
     (probe.tmp / "deep").mkdir()
     probe.root = probe.tmp / "deep" / "probe"
@@ -1464,6 +1499,7 @@ def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdi
                for failure in report["summary"]["failures"])
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_untouched_probe_turn_changes_no_folder(probe):
     probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
     probe.script_turns(patches=True)
@@ -1514,6 +1550,7 @@ def test_a_reader_error_of_any_kind_fails_only_its_role(tmp_path, monkeypatch, e
     assert runner.failures == ["implementer: rollout reader error: " + row["reader_error"]["error"]]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_call_nested_too_deep_to_parse_fails_only_its_attempts_and_the_run_goes_on(probe):
     probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}],
                channels=["shell", "apply_patch"])
@@ -1549,6 +1586,7 @@ def strays(probe):
     return [line for line in rows.splitlines() if str(probe.tmp) in line and not line.split()[1].startswith("Z")]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_signal_during_the_probe_turn_stops_it_before_the_cleanup(probe):
     plan = probe.plan([{"role": "implementer"}])
     probe.script_turns(probe={"context_delay": 20})
@@ -1627,6 +1665,7 @@ def test_a_signal_during_the_preflight_stops_the_run_before_anything_starts(prob
     clean_after(probe, plan)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_reader_error_during_the_hold_still_stops_the_live_turn_through_the_launcher(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"malformed_record": True, "context_delay": 20})
@@ -1638,6 +1677,7 @@ def test_a_reader_error_during_the_hold_still_stops_the_live_turn_through_the_la
     assert census(row["session"]) == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_reader_error_after_the_probe_turn_asks_the_launcher_to_stop_the_session(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(probe={"malformed_record": True})
@@ -1687,6 +1727,7 @@ def owner_auth(probe):
     return real
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_existing_sso_login_runs_without_a_key_or_codex_login_and_is_deleted_at_cleanup(probe):
     import hashlib
     real = owner_auth(probe)
@@ -1711,6 +1752,7 @@ def test_an_existing_sso_login_runs_without_a_key_or_codex_login_and_is_deleted_
     assert "login: existing auth.json (codex login not called); deleted at cleanup" in text
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_explicit_api_key_auth_keeps_the_key_login(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -1837,6 +1879,7 @@ def test_the_plan_and_help_name_both_login_routes_and_warn_about_codex_login_wit
     assert "auth.json is deleted at cleanup" in " ".join(helped.split())
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_codex_home_spelled_with_a_trailing_slash_still_runs(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -2050,6 +2093,7 @@ def real_login(probe):
 ARG0_LINKS = ("apply_patch", "applypatch", "codex-linux-sandbox")
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_real_codex_login_layout_runs_and_its_cleanup_removes_the_lock_log_and_tmp(probe):
     real = owner_auth(probe)
     probe.plan([{"role": "implementer"}])
@@ -2535,6 +2579,7 @@ def test_the_plan_gives_each_hold_a_nonce_and_a_read_only_one_shot_command(probe
     assert (done.returncode, done.stdout, done.stderr) == (0, "already held\n", "")
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_writer_that_reruns_the_hold_sees_its_done_mark_and_runs_nothing(probe):
     probe.plan([{"role": "implementer"}])
     hold = probe.role("implementer")["hold"]

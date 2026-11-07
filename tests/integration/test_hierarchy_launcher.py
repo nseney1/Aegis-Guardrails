@@ -491,7 +491,7 @@ def test_resume_mirrors_a_wake_refusal(launch):
 @LINUX_HOST_PROGRAMS
 def test_stop_ends_the_process_group_of_a_hung_session(launch):
     session = launch.start()["session"]
-    hung = subprocess.Popen(["sh", "-c", 'sleep 30 & exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
+    hung = subprocess.Popen(["sh", "-c", 'sleep 30 & exec codex exec --json resume "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
                             FAKE_CODEX_THREAD=session), stdout=subprocess.DEVNULL, start_new_session=True)
     try:
         wait_until(lambda: owned_pids(session) == [hung.pid])
@@ -689,7 +689,7 @@ def test_stop_refuses_root_and_a_native_thread_and_signals_nothing(launch):
 
 def hold(launch, session, script, *words, **popen):
     """A process naming the session, kept running the way a hung codex turn is."""
-    return subprocess.Popen(["codex", "-c", script, *words], executable="sh",
+    return subprocess.Popen(["codex", "-c", script, *(["resume", *words] if words else [])], executable="sh",
                             env=launch.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session,
                             HELD_SESSION=session), stdout=subprocess.DEVNULL, **popen)
 
@@ -706,10 +706,10 @@ def owned_pids(session, host="codex-cli"):
 @LINUX_HOST_PROGRAMS
 def test_stop_spares_a_caller_that_names_the_session(launch):
     session = launch.start()["session"]
-    hung = hold(launch, session, 'exec codex exec --json hold "$0"', session, start_new_session=True)
+    hung = hold(launch, session, 'exec codex exec --json resume "$1"', session, start_new_session=True)
     wait_until(lambda: owned_pids(session) == [hung.pid])
-    caller = subprocess.Popen(["codex", "-c", '"$1" -I "$2" --base "$3" stop --endpoint "$4" --grace-seconds 2; echo "exit=$?"',
-                               session, sys.executable, str(LAUNCHER), str(launch.base), REVIEW], stdout=subprocess.PIPE,
+    caller = subprocess.Popen(["codex", "-c", '"$2" -I "$3" --base "$4" stop --endpoint "$5" --grace-seconds 2; echo "exit=$?"',
+                               "resume", session, sys.executable, str(LAUNCHER), str(launch.base), REVIEW], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, env=launch.env(), executable="sh", start_new_session=True)
     try:
         wait_until(lambda: hung.pid in owned_pids(session))
@@ -730,7 +730,7 @@ def test_stop_spares_a_caller_that_names_the_session(launch):
 @LINUX_HOST_PROGRAMS
 def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
     session = launch.start()["session"]
-    leader = hold(launch, session, 'sleep 30 & codex exec --json hold "$HELD_SESSION"; wait', start_new_session=True)
+    leader = hold(launch, session, 'sleep 30 & codex exec --json resume "$HELD_SESSION"; wait', start_new_session=True)
     try:
         wait_until(lambda: len(owned_pids(session)) == 1 and len(group(leader.pid)) == 3)
         [named] = census(session)
@@ -760,9 +760,14 @@ def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace
             stubborn.wait(timeout=5)
 
 
-def test_stop_records_a_failed_process_census(launch):
+def test_stop_records_a_failed_process_census(launch, monkeypatch, capsys):
     launch.start()
-    refused = launch.run("stop", "--endpoint", REVIEW, expect=2, PATH=str(launch.bin))
+    module, is_dir = launcher_module(), Path.is_dir
+    monkeypatch.setattr(module, "ancestors", lambda: set())
+    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    monkeypatch.setenv("PATH", str(launch.bin))
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 2
+    refused = json.loads(capsys.readouterr().out)
     assert refused["error"] == "[Errno 2] No such file or directory: 'ps'" and refused["state"] == "refused"
     assert [row["state"] for row in launch.records()] == ["bound", "refused"]
 
@@ -837,19 +842,20 @@ def test_an_interrupt_during_the_bind_wait_is_recorded_and_releases_the_start_lo
 @LINUX_HOST_PROGRAMS
 def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(launch, monkeypatch, capsys):
     session = launch.start()["session"]
-    hung = subprocess.Popen(["sh", "-c", 'exec codex exec --json hold "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
+    hung = subprocess.Popen(["sh", "-c", 'exec codex exec --json resume "$0"', session], env=launch.env(FAKE_CODEX_MODE="hang",
                             FAKE_CODEX_THREAD=session), stdout=subprocess.DEVNULL, start_new_session=True)
     try:
         wait_until(lambda: owned_pids(session) == [hung.pid])
         module = launcher_module()
-        real, calls = module.session_processes, []
+        real, calls = module.read_process, []
 
         def failing_after_the_first(*args):
-            calls.append(args)
-            if len(calls) > 1:
-                raise OSError(2, "No such file or directory: 'ps'")
+            if args[0] == hung.pid:
+                calls.append(args)
+                if len(calls) > 2:  # Initial census, verification, then the post-signal census fails.
+                    raise OSError(2, "No such file or directory: 'ps'")
             return real(*args)
-        monkeypatch.setattr(module, "session_processes", failing_after_the_first)
+        monkeypatch.setattr(module, "read_process", failing_after_the_first)
         assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
         monkeypatch.undo()
         answer = json.loads(capsys.readouterr().out)

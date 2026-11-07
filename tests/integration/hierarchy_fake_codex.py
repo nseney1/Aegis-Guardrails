@@ -62,7 +62,7 @@ def main():
             sys.exit(rollout_main(argv))
         command = python_argv("codex", __file__, Path(os.environ["CODEX_HOME"]).parent, "rollout_main")
         os.execv(command[0], [*command, *argv])
-    if "resume" in argv:
+    if "resume" in argv and os.environ.get("FAKE_CODEX_MODE") != "hang":
         command = python_argv("codex", HOST, Path(os.environ["FAKE_HOST_LOG"]).parent)
         os.execv(command[0], [*command, *argv])
     log_call(argv)

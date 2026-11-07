@@ -89,7 +89,7 @@ def test_describe_is_the_json_registry_and_callers_cannot_change_it():
     assert list(described["hosts"]) == list(hierarchy_hosts.HOST_KINDS)
     assert json.loads(json.dumps(described)) == described
     keys = {"kind", "family", "team_start", "home", "billing_variables", "session_variable", "transcripts", "usage",
-            "write_scope", "qualification", "entrypoints"}
+            "write_scope", "qualification", "entrypoints", "session_selectors"}
     for kind, entry in described["hosts"].items():
         assert set(entry) == keys and entry["kind"] == kind
     claude, codex, native = (described["hosts"][kind] for kind in hierarchy_hosts.HOST_KINDS)
@@ -124,7 +124,7 @@ def test_an_unknown_host_kind_is_refused_with_its_name(kind):
     ("claude-code", {"program_basenames": ["claude", "claude.exe", ".claude-wrapped"],
                      "node_script_basenames": ["claude", ".claude-wrapped"],
                      "node_script_suffixes": ["@anthropic-ai/claude-code/cli.js"]}),
-    ("codex-cli", {"program_basenames": ["codex"], "node_script_basenames": ["codex"],
+    ("codex-cli", {"program_basenames": ["codex"], "node_script_basenames": ["codex", "codex.js"],
                    "node_script_suffixes": []}),
     ("codex", {"program_basenames": [], "node_script_basenames": [], "node_script_suffixes": []}),
 ])
@@ -151,6 +151,47 @@ def test_registry_matches_only_the_declared_entrypoints(kind, argv, expected):
 def test_hosts_without_process_entrypoints_are_refused():
     assert refusal(hierarchy_hosts.matches_entrypoint, "codex", ["codex"]) == "codex has no process entrypoints"
     assert refusal(hierarchy_hosts.matches_entrypoint, "unknown", []) == "unsupported host kind: 'unknown'"
+
+
+@pytest.mark.parametrize("kind,argv", [
+    ("claude-code", ["node", "--no-warnings", "/nix/store/p/bin/.claude-wrapped"]),
+    ("claude-code", ["node", "--no-warnings", "/lib/@anthropic-ai/claude-code/cli.js"]),
+    ("claude-code", ["node", "-r", "preload", "--import", "module", "/lib/@anthropic-ai/claude-code/cli.js"]),
+    ("claude-code", ["node", "--require=preload", "-x", "--flag", "--flag=value", "/bin/claude"]),
+    ("codex-cli", ["node", "--require", "module", "/lib/@openai/codex/bin/codex.js"]),
+])
+def test_node_interpreter_options_precede_the_script(kind, argv):
+    assert hierarchy_hosts.matches_entrypoint(kind, argv)
+
+
+@pytest.mark.parametrize("option", ["-e", "--eval", "--eval=source", "--print=source", "-psource"])
+def test_node_source_text_does_not_make_a_host_script(option):
+    argv = ["node", option, "/lib/@anthropic-ai/claude-code/cli.js", "--resume", SESSION]
+    assert not hierarchy_hosts.matches_session("claude-code", argv, SESSION)
+
+
+@pytest.mark.parametrize("kind,argv,expected", [
+    ("claude-code", ["claude", "--resume", SESSION], True),
+    ("claude-code", ["claude", "--resume=" + SESSION], True),
+    ("claude-code", ["claude", "--session-id", SESSION, "--print", "prompt"], True),
+    ("claude-code", ["claude", "--session-id", "other", "--print", SESSION], False),
+    ("claude-code", ["claude", "--resume", SESSION, "--session-id", "other"], False),
+    ("claude-code", ["claude", "--resume", SESSION, "--session-id=" + SESSION], True),
+    ("claude-code", ["claude", "--print", SESSION], False),
+    ("claude-code", ["claude", "--", "--resume", SESSION], False),
+    ("claude-code", ["claude", "--resume"], False),
+    ("claude-code", ["node", "--no-warnings", "/nix/store/p/bin/.claude-wrapped", "--resume", SESSION], True),
+    ("claude-code", ["node", "--no-warnings", "/lib/@anthropic-ai/claude-code/cli.js", "--resume", SESSION], True),
+    ("codex-cli", ["codex", "resume", SESSION], True),
+    ("codex-cli", ["codex", "exec", "resume", SESSION], True),
+    ("codex-cli", ["node", "--require", "module", "/lib/@openai/codex/bin/codex.js", "exec", "resume", SESSION], True),
+    ("codex-cli", ["codex", "--disable", "apps", "exec", "--json", "-c", "model=\"fake\"", "resume", SESSION], True),
+    ("codex-cli", ["codex", "exec", SESSION], False),
+    ("codex-cli", ["codex", "exec", "--json", "prompt", "resume", SESSION], False),
+    ("codex-cli", ["codex", "resume", SESSION, "resume", "other"], False),
+])
+def test_session_selector_is_positional_and_unambiguous(kind, argv, expected):
+    assert hierarchy_hosts.matches_session(kind, argv, SESSION) is expected
 
 
 def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():
