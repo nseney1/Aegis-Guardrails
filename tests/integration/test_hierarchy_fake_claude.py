@@ -38,9 +38,14 @@ OUTER_SESSION = {"CLAUDECODE": "1", "CLAUDE_PID": "4242", "CLAUDE_CODE_SESSION_I
                  "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_BRIDGE_SESSION_ID": "outer-bridge",
                  "CLAUDE_CODE_MESSAGING_TOKEN": "outer-token", "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/outer.sock",
                  "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_EXECPATH": "/outer/claude",
-                 "CLAUDE_CODE_SESSION_ATTENDED": "1"}
+                 "CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_JOB_DIR": "/tmp/outer-job",
+                 "CLAUDE_SOME_LATER_VARIABLE": "1"}
 # A server that appends its pid to the file named first, then never answers. Later words are ignored.
 SLEEPER = "import os, sys, time; open(sys.argv[1], 'a').write(str(os.getpid()) + '\\n'); time.sleep(30)"
+# A server that starts a sleeping child, appends both pids to the file named first, then never answers.
+SPAWNER = ("import os, subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', 'import time; "
+           "time.sleep(30)']); open(sys.argv[1], 'a').write('%d\\n%d\\n' % (os.getpid(), child.pid)); time.sleep(30)")
+SYMLINK = "fake claude: refusing to write through a symlink: %s\n"
 # A stdio MCP server that appends the environment of each start as a JSON line and offers a comma list of tools. It
 # answers any tool call with an empty object, enough for the fake host's inbox read. Later words are ignored, so a case
 # can add the --endpoint the fake host looks for.
@@ -160,8 +165,40 @@ def gone(pid, wait=5.0):
     return False
 
 
-def print_argv(*extra, session=SESSION):
-    return ["-p", "--session-id", session, "--output-format", "stream-json", "--verbose", *extra]
+def pids_in(path, count, wait=10.0):
+    """The pids written to path, polled until there are count of them or the wait ends: never assume the file exists."""
+    deadline = time.monotonic() + wait
+    while True:
+        found = path.read_text().split() if path.exists() else []
+        if len(found) >= count or time.monotonic() >= deadline:
+            return [int(pid) for pid in found]
+        time.sleep(0.05)
+
+
+def wait_for(path, wait=10.0):
+    """Whether path holds data within the wait. Data, not existence: the fake may create a file before writing it."""
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if path.exists() and path.stat().st_size:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def print_argv(*extra, flags=("--session-id", SESSION)):
+    """The smallest argv that keeps the team contract claude_argv writes."""
+    return ["-p", "--restricted", "--strict-mcp-config", "--permission-mode", "manual", "--permission-prompts", "none",
+            *flags, "--output-format", "stream-json", "--verbose", *extra]
+
+
+def without(argv, flag, values=0):
+    index = argv.index(flag)
+    return argv[:index] + argv[index + 1 + values:]
+
+
+def replaced(argv, flag, value):
+    index = argv.index(flag)
+    return argv[:index + 1] + [value] + argv[index + 2:]
 
 
 # PATH guard
@@ -301,6 +338,33 @@ def test_unmodelled_auth_commands_and_options_are_refused(run):
     assert run.claude("auth", "logout", expect=2).stderr == "fake claude: auth logout is not modelled\n"
     assert run.claude("auth", "status", "--all", expect=2).stderr == "fake claude: unknown option --all\n"
     assert run.claude("auth", "login", "--email", expect=2).stderr == "fake claude: --email needs a value\n"
+
+
+# writes never leave the config dir
+
+@pytest.mark.parametrize("where", ["credentials", "state", "projects", "folder", "transcript"])
+def test_no_write_follows_a_symlink_out_of_the_config_dir(fresh, where):
+    owner_file, owner_dir = fresh.tmp / "owner-credentials.json", fresh.tmp / "owner-dir"
+    owner_file.write_text("the owner's real file", encoding="utf-8")
+    owner_file.chmod(0o640)
+    owner_dir.mkdir()
+    if where in ("projects", "folder", "transcript"):
+        fresh.login()
+    folder = fresh.config / "projects" / slug(fresh.cwd)
+    link, target, argv = {
+        "credentials": (fresh.config / ".credentials.json", owner_file, ["auth", "login"]),
+        "state": (fresh.config / ".claude.json", owner_file, ["auth", "status", "--json"]),
+        "projects": (fresh.config / "projects", owner_dir, print_argv()),
+        "folder": (folder, owner_dir, print_argv()),
+        "transcript": (folder / (SESSION + ".jsonl"), owner_file, print_argv(flags=("--resume", SESSION))),
+    }[where]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    refused = fresh.claude(*argv, expect=2)
+    assert refused.stderr == SYMLINK % link and refused.stdout == ""
+    assert owner_file.read_text(encoding="utf-8") == "the owner's real file"
+    assert stat.S_IMODE(owner_file.stat().st_mode) == 0o640
+    assert list(owner_dir.iterdir()) == []
 
 
 # print mode with the argv provision builds
@@ -465,9 +529,26 @@ def test_words_after_a_bare_double_dash_are_the_prompt_and_variadic_lists_stop_a
     assert lines(run.transcript(second))[0]["message"]["content"] == "From stdin."
 
 
+@pytest.mark.parametrize("change,stderr", [
+    (lambda argv: without(argv, "--restricted"), "fake claude: team argv is missing --restricted\n"),
+    (lambda argv: without(argv, "--strict-mcp-config"), "fake claude: team argv is missing --strict-mcp-config\n"),
+    (lambda argv: without(argv, "--permission-mode", 1), "fake claude: team argv is missing --permission-mode\n"),
+    (lambda argv: without(argv, "--permission-prompts", 1), "fake claude: team argv is missing --permission-prompts\n"),
+    (lambda argv: replaced(argv, "--permission-prompts", "ask"),
+     "fake claude: team argv --permission-prompts must be none\n"),
+])
+def test_a_team_argv_that_drifted_from_claude_argv_is_refused(run, change, stderr):
+    argv = provision_argv(["--session-id", SESSION], run.connection({}))
+    run.claude(*argv, stdin="Unchanged.")
+    refused = run.claude(*change(provision_argv(["--session-id", str(uuid.uuid4())], run.connection({}))), expect=2)
+    assert refused.stderr == stderr and refused.stdout == ""
+    assert [path.name for path in (run.config / "projects").glob("*/*.jsonl")] == [SESSION + ".jsonl"]
+
+
 def test_variadic_lists_stop_at_any_option_word(run):
-    argv = ["--session-id", SESSION, "--output-format", "stream-json", "--verbose", "--allowedTools", "Read", "Edit",
-            "-p", "--disallowedTools", "Bash", "-r"]
+    argv = ["--session-id", SESSION, "--restricted", "--strict-mcp-config", "--permission-mode", "manual",
+            "--permission-prompts", "none", "--output-format", "stream-json", "--verbose", "--allowedTools", "Read",
+            "Edit", "-p", "--disallowedTools", "Bash", "-r"]
     refused = run.claude(*argv, expect=2)
     assert refused.stderr == "fake claude: -r needs a value\n", "-p and -r were options, not tool names"
     started = events(run.claude(*argv[:-1]))
@@ -484,8 +565,7 @@ def test_an_empty_prompt_is_refused(run, stdin, words):
 # init event
 
 @pytest.mark.parametrize("extra,tools", [
-    (["--restricted"], ["Edit", "Glob", "Grep", "Read", "Write"]),
-    ([], ["Bash", "Edit", "Glob", "Grep", "Read", "Write"]),
+    ([], ["Edit", "Glob", "Grep", "Read", "Write"]),
     (["--tools", "Read,Grep"], ["Read", "Grep"]),
     (["--tools=Read,Grep"], ["Read", "Grep"]),
     (["--tools="], []),
@@ -502,9 +582,9 @@ def test_extra_tools_and_a_served_model_show_in_init(run):
     init, reply = started[0], started[1]
     assert init["tools"] == ["Read", "Bash", "Agent"]
     assert init["model"] == reply["message"]["model"] == "claude-other"
-    assert init["permissionMode"] == "default"
+    assert init["permissionMode"] == "manual"
     session = str(uuid.uuid4())
-    assert events(run.claude(*print_argv(session=session)))[0]["model"] == "claude-fake-default"
+    assert events(run.claude(*print_argv(flags=("--session-id", session))))[0]["model"] == "claude-fake-default"
 
 
 def test_mcp_tools_are_listed_and_mcp_children_never_see_a_session_variable(run):
@@ -543,7 +623,20 @@ def test_an_mcp_server_that_never_answers_is_failed_after_the_probe_timeout(run)
     init = events(run.claude(*provision_argv(["--session-id", SESSION], connection), FAKE_CLAUDE_MCP_TIMEOUT="0.5"))[0]
     assert init["mcp_servers"] == [{"name": "silent", "status": "failed"}]
     assert time.monotonic() - started < 10, "the probe waited longer than its timeout"
-    assert all(gone(int(pid)) for pid in pids.read_text().split())
+    [server] = pids_in(pids, 1)
+    assert gone(server)
+
+
+def test_a_probe_timeout_stops_the_server_and_everything_it_started(run):
+    pids = run.tmp / "spawner.pids"
+    connection = run.connection({"spawner": {"command": sys.executable, "args": ["-c", SPAWNER, str(pids)]}})
+    started = time.monotonic()
+    init = events(run.claude(*provision_argv(["--session-id", SESSION], connection), timeout=20,
+                             FAKE_CLAUDE_MCP_TIMEOUT="0.5"))[0]
+    assert init["mcp_servers"] == [{"name": "spawner", "status": "failed"}]
+    assert time.monotonic() - started < 10, "the probe waited for a child that holds its output"
+    found = pids_in(pids, 2)
+    assert len(found) == 2 and all(gone(pid) for pid in found), found
 
 
 @pytest.mark.parametrize("body", [None, "not json", '{"servers": {}}'])
@@ -601,15 +694,24 @@ def test_fail_mode_reports_an_error_result_and_no_reply(run):
     assert [record["type"] for record in lines(run.transcript(SESSION))] == ["user"]
 
 
-def test_hang_mode_emits_init_and_then_waits_until_killed(run):
-    process = subprocess.Popen([run.command(), *print_argv()], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, cwd=str(run.cwd),
-                               env=run.env(FAKE_CLAUDE_MODE="hang"))
+def start(run, argv, tmp_path, **changes):
+    """The fake in its own process group with the prompt from a file, so the test can wait on it and stop it."""
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Wait.", encoding="utf-8")
+    with open(prompt, encoding="utf-8") as stdin:
+        return subprocess.Popen([run.command(), *argv], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=str(run.cwd), start_new_session=True, env=run.env(**changes))
+
+
+def test_hang_mode_emits_init_and_then_waits_until_killed(run, tmp_path):
+    process = start(run, print_argv(), tmp_path, FAKE_CLAUDE_MODE="hang")
     try:
+        # Ready once the prompt is on record, which comes after init; only then does staying alive mean hanging.
+        assert wait_for(run.transcript(SESSION)), "the fake never reached its turn"
         with pytest.raises(subprocess.TimeoutExpired):
-            process.communicate("Wait.", timeout=2)
+            process.wait(timeout=0.5)
     finally:
-        process.kill()
+        os.killpg(process.pid, 9)
     stdout, _ = process.communicate(timeout=10)
     assert process.returncode == -9
     assert [event["type"] for event in events(stdout)] == ["system"]
@@ -662,7 +764,12 @@ def test_a_failing_fake_host_turn_sets_the_exit_code_after_the_events(run, tmp_p
     plan.write_text(json.dumps({"pilot/x": {"exit": 5}}), encoding="utf-8")
     result = run.claude(*provision_argv(["--session-id", SESSION], connection), expect=5,
                         FAKE_HOST_PLAN=str(plan), FAKE_HOST_LOG=str(host_log))
-    assert [event["type"] for event in events(result)] == ["system", "assistant", "result"]
+    # A failed host turn ends like FAKE_CLAUDE_MODE=fail: an error result, no reply, and an unanswered prompt.
+    started = events(result)
+    assert [event["type"] for event in started] == ["system", "result"]
+    assert (started[1]["subtype"], started[1]["is_error"], started[1]["session_id"]) == (
+        "error_during_execution", True, SESSION)
+    assert [record["type"] for record in lines(run.transcript(SESSION))] == ["user"]
     assert lines(host_log)[0]["endpoint"] == "pilot/x"
     # Without a plan there is no mailbox turn at all.
     run.claude(*provision_argv(["--session-id", str(uuid.uuid4())], connection), FAKE_HOST_LOG=str(host_log))
@@ -681,28 +788,29 @@ def hanging_turn(run, tmp_path):
 def test_a_fake_host_turn_that_overruns_is_killed_with_its_process_group(run, tmp_path):
     argv, pids, knobs = hanging_turn(run, tmp_path)
     started = time.monotonic()
-    refused = run.claude(*argv, expect=1, timeout=20, FAKE_CLAUDE_TURN_TIMEOUT="1", **knobs)
+    # Three seconds leave the host time to start its adapter even on a loaded machine.
+    refused = run.claude(*argv, expect=1, timeout=30, FAKE_CLAUDE_TURN_TIMEOUT="3", **knobs)
     assert refused.stderr == "fake claude: turn timed out\n"
     assert [event["type"] for event in events(refused)] == ["system"]
-    assert time.monotonic() - started < 15
+    assert time.monotonic() - started < 20
     # The probe's start, then the host's adapter, which the kill of the host's group must have taken too.
-    assert len(pids.read_text().split()) == 2
-    assert all(gone(int(pid)) for pid in pids.read_text().split())
+    found = pids_in(pids, 2)
+    assert len(found) == 2 and all(gone(pid) for pid in found), found
 
 
-def test_a_stop_sent_to_the_fake_reaches_the_fake_host_in_its_own_group(run, tmp_path):
-    argv, pids, knobs = hanging_turn(run, tmp_path)
-    prompt = tmp_path / "prompt.txt"
-    prompt.write_text("Wait.", encoding="utf-8")
-    with open(prompt, encoding="utf-8") as stdin:
-        process = subprocess.Popen([run.command(), *argv], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, cwd=str(run.cwd), start_new_session=True, env=run.env(**knobs))
+@pytest.mark.parametrize("stage", ["probe", "host"])
+def test_a_stop_sent_to_the_fake_reaches_children_in_their_own_groups(run, tmp_path, stage):
+    if stage == "probe":
+        pids = tmp_path / "spawner.pids"
+        server = {"command": sys.executable, "args": ["-c", SPAWNER, str(pids)]}
+        argv, knobs = provision_argv(["--session-id", SESSION], run.connection({"stalled": server})), {}
+    else:
+        argv, pids, knobs = hanging_turn(run, tmp_path)
+    process = start(run, argv, tmp_path, **knobs)
     try:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and (not pids.exists() or len(pids.read_text().split()) < 2):
-            time.sleep(0.05)
-        assert len(pids.read_text().split()) == 2, "the fake host never started its adapter"
-        # As the wake stops a turn: a SIGTERM to the fake's own group, which the host has left.
+        found = pids_in(pids, 2)
+        assert len(found) == 2, "the %s stage never started its children" % stage
+        # As the wake stops a turn: a SIGTERM to the fake's own group, which these children have left.
         os.killpg(process.pid, 15)
         process.wait(timeout=10)
     finally:
@@ -710,4 +818,4 @@ def test_a_stop_sent_to_the_fake_reaches_the_fake_host_in_its_own_group(run, tmp
             os.killpg(process.pid, 9)
         process.communicate(timeout=10)
     assert process.returncode == -15
-    assert all(gone(int(pid)) for pid in pids.read_text().split())
+    assert all(gone(pid) for pid in found), found

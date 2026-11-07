@@ -14,7 +14,8 @@ Modelled, not observed:
   stored login), and that --output-format stream-json with --print needs --verbose.
 - The fake's own choices: a reused --session-id is refused, and it must be a canonical UUID; --resume keeps the same
   id and appends to the same transcript; init's `cwd` is the process cwd; MCP servers are "connected" or "failed"; a
-  failed turn's result is `error_during_execution` with `is_error`; a print turn without a login exits 1 with a
+  failed turn's result is `error_during_execution` with `is_error`, and a failed fake-host turn ends the same way,
+  with no reply, so its prompt stays unanswered in the transcript; a print turn without a login exits 1 with a
   "fake claude:" line; MCP children and the fake host get the caller's environment minus the outer session's
   variables (below); the --text status wording; login flags are accepted, not told apart.
 Not modelled: a model (the reply is FAKE_CLAUDE_REPLY), permission enforcement (--restricted, --permission-*, allowed
@@ -22,10 +23,13 @@ and disallowed tools are parsed, never applied), the real default tool set, back
 names (--name), interactive mode, other output formats, a positional or empty prompt, apiKeyHelper or profiles, MCP
 servers kept alive for the session (each is asked for its tools once and closed), resume lookup beyond the cwd's own
 project folder (kept conservative), and a session variable in MCP children: no real host has shown one there (owner
-decision B). So every child the fake starts loses CLAUDECODE, CLAUDE_PID and every CLAUDE_CODE_* variable;
-CLAUDE_CONFIG_DIR stays.
+decision B). So every child the fake starts loses CLAUDECODE and every CLAUDE_* variable but CLAUDE_CONFIG_DIR.
 
-Every command refuses a CLAUDE_CONFIG_DIR that is missing, relative, or the real user's ~/.claude or inside it.
+Guards, not modelled behaviour: every command refuses a CLAUDE_CONFIG_DIR that is missing, relative, or the real
+user's ~/.claude or inside it, and no write follows a symlink at or below it. Print mode refuses an argv without
+--restricted, --strict-mcp-config, --permission-mode, or --permission-prompts none, which claude_argv always writes;
+these are checked, never enforced. Each MCP probe and the fake host run in their own process group, killed when they
+end, time out, or the fake gets SIGTERM.
 Knobs: FAKE_CLAUDE_LOG (one JSON line per call), FAKE_CLAUDE_STATUS_DIR (the configDirectory status reports),
 FAKE_CLAUDE_LOGIN=fail, FAKE_CLAUDE_EXTRA_TOOLS, FAKE_CLAUDE_SERVED_MODEL, FAKE_CLAUDE_REPLY, FAKE_CLAUDE_USAGE,
 FAKE_CLAUDE_MCP_TIMEOUT (seconds per MCP probe, default 20), FAKE_CLAUDE_MODE ("no-result": a turn whose result event
@@ -33,6 +37,7 @@ never arrived, exit 0; "fail"; "hang"), and FAKE_HOST_PLAN, which runs hierarchy
 Codex fake does, for at most FAKE_CLAUDE_TURN_TIMEOUT seconds (default 60).
 """
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -71,6 +76,12 @@ LISTS = {"--allowedTools": "allowed", "--allowed-tools": "allowed", "--disallowe
 FLAGS = {"--restricted": "restricted", "--strict-mcp-config": "strict_mcp_config", "--verbose": "verbose",
          "--disable-slash-commands": "disable_slash_commands", "-p": "print", "--print": "print"}
 PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SYMLINK = "fake claude: refusing to write through a symlink: %s"
+# What claude_argv always writes for a team print turn, as (flag, option key).
+CONTRACT = (("--restricted", "restricted"), ("--strict-mcp-config", "strict_mcp_config"),
+            ("--permission-mode", "permission_mode"), ("--permission-prompts", "permission_prompts"))
+# Process groups of the children running now, for the SIGTERM handler.
+GROUPS = set()
 
 
 class Refusal(Exception):
@@ -162,9 +173,11 @@ def auth_method(home):
 
 
 def status(home, as_text):
-    state = home / ".claude.json"
-    if not state.exists():
-        state.write_text("{}\n", encoding="utf-8")
+    try:
+        write_closing(open_inside(home, [".claude.json"], os.O_WRONLY | os.O_CREAT | os.O_EXCL), "{}\n")
+    except FileExistsError:
+        if (home / ".claude.json").is_symlink():
+            refuse(2, SYMLINK % (home / ".claude.json"))
     method, provider = auth_method(home)
     shown = Path(os.environ.get("FAKE_CLAUDE_STATUS_DIR") or home)
     answer = {"loggedIn": method != "none", "authMethod": method, "apiProvider": provider, "analyticsDisabled": False,
@@ -182,14 +195,53 @@ def status(home, as_text):
 def login(home):
     if os.environ.get("FAKE_CLAUDE_LOGIN") == "fail":
         refuse(1, "fake claude: login failed")
-    path = home / ".credentials.json"
-    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-        json.dump({"fake": "written by hierarchy_fake_claude.py; not a credential"}, stream)
+    descriptor = open_inside(home, [".credentials.json"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     # O_CREAT's mode only applies to a new file; a login over an older, looser file still ends at 0600.
-    os.chmod(str(path), 0o600)
+    os.fchmod(descriptor, 0o600)
+    write_closing(descriptor, json.dumps({"fake": "written by hierarchy_fake_claude.py; not a credential"}))
     print("Login successful.")
     return 0
+
+
+def open_inside(home, names, flags):
+    """A descriptor for home/names..., making missing folders and following no symlink at or below home.
+
+    A symlink planted in a test's config dir must never carry a write to a real file, such as the owner's credentials.
+    """
+    path = home
+    folder = os.open(str(home), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for index, name in enumerate(names):
+            if name in ("", ".", "..") or "/" in name or "\0" in name:
+                refuse(2, "fake claude: refusing to write outside the config dir: %s" % (path / name))
+            path = path / name
+            try:
+                if index == len(names) - 1:
+                    return os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=folder)
+                except FileExistsError:
+                    pass
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+            except OSError as exc:
+                # The open has already refused; lstat only picks the message (O_DIRECTORY on a link gives ENOTDIR).
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EISDIR):
+                    refuse(2, SYMLINK % path if os.path.islink(str(path))
+                           else "fake claude: refusing to write: %s is not a plain file or folder" % path)
+                raise
+            os.close(folder)
+            folder = child
+    finally:
+        os.close(folder)
+
+
+def write_closing(descriptor, text):
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(text)
+
+
+def append(descriptor, row):
+    os.write(descriptor, (json.dumps(row) + "\n").encode("utf-8"))
 
 
 def parse(argv):
@@ -242,9 +294,16 @@ def print_mode(home, argv):
         refuse(2, "fake claude: only --output-format stream-json is modelled")
     if not options["verbose"]:
         refuse(1, "fake claude: --output-format stream-json with --print needs --verbose")
+    # Contract drift must fail loudly; these are checked here, never enforced.
+    for flag, key in CONTRACT:
+        if options[key] in (None, False):
+            refuse(2, "fake claude: team argv is missing " + flag)
+    if options["permission_prompts"] != "none":
+        refuse(2, "fake claude: team argv --permission-prompts must be none")
+    signal.signal(signal.SIGTERM, stop_children)
     cwd = os.getcwd()
-    folder = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
-    session = session_for(home, folder, options)
+    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    session = session_for(home, home / "projects" / slug, options)
     if auth_method(home)[0] == "none":
         refuse(1, "fake claude: not logged in")
     mode = os.environ.get("FAKE_CLAUDE_MODE", "")
@@ -258,32 +317,43 @@ def print_mode(home, argv):
     model = os.environ.get("FAKE_CLAUDE_SERVED_MODEL") or options["model"] or "claude-fake-default"
     env = child_env()
     servers, mcp_tools = probe_servers(options["mcp_config"], env, probe_timeout)
-    emit({"type": "system", "subtype": "init", "cwd": cwd, "session_id": session,
-          "tools": offered_tools(options) + mcp_tools, "mcp_servers": servers, "model": model,
-          "permissionMode": options["permission_mode"] or "default", "apiKeySource": "none",
-          "claude_code_version": "0.0.0-fake"})
-    transcript = folder / (session + ".jsonl")
-    record(transcript, {"type": "user", "message": {"role": "user", "content": prompt}, "sessionId": session,
-                        "timestamp": now(), "cwd": cwd, "uuid": str(uuid.uuid4())})
-    if mode == "hang":
-        while True:
-            time.sleep(3600)
-    if mode == "fail":
-        emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1,
-              "session_id": session, "total_cost_usd": 0.0, "usage": usage})
-        return 1
-    code = 0
-    if os.environ.get("FAKE_HOST_PLAN") and any(server["name"] == "aegis_mailbox" for server in servers):
-        code = run_host(argv, prompt, env, turn_timeout)
-    message = {"model": model, "id": "msg_fake_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
-               "content": [{"type": "text", "text": os.environ.get("FAKE_CLAUDE_REPLY") or "done"}], "usage": usage}
-    emit({"type": "assistant", "message": message, "session_id": session})
-    record(transcript, {"type": "assistant", "message": message, "sessionId": session, "timestamp": now(),
-                        "cwd": cwd, "uuid": str(uuid.uuid4())})
-    if mode != "no-result":
-        emit({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "session_id": session,
-              "total_cost_usd": 0.0, "usage": usage})
-    return code
+    transcript = open_inside(home, ["projects", slug, session + ".jsonl"], os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        emit({"type": "system", "subtype": "init", "cwd": cwd, "session_id": session,
+              "tools": offered_tools(options) + mcp_tools, "mcp_servers": servers, "model": model,
+              "permissionMode": options["permission_mode"], "apiKeySource": "none",
+              "claude_code_version": "0.0.0-fake"})
+        append(transcript, {"type": "user", "message": {"role": "user", "content": prompt}, "sessionId": session,
+                            "timestamp": now(), "cwd": cwd, "uuid": str(uuid.uuid4())})
+        if mode == "hang":
+            while True:
+                time.sleep(3600)
+        if mode == "fail":
+            emit(result(session, usage, error=True))
+            return 1
+        if os.environ.get("FAKE_HOST_PLAN") and any(server["name"] == "aegis_mailbox" for server in servers):
+            code = run_host(argv, prompt, env, turn_timeout)
+            if code != 0:
+                # Ends like FAKE_CLAUDE_MODE=fail: no reply is recorded, so the meter keeps the prompt as unknown.
+                if mode != "no-result":
+                    emit(result(session, usage, error=True))
+                return code
+        message = {"model": model, "id": "msg_fake_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
+                   "content": [{"type": "text", "text": os.environ.get("FAKE_CLAUDE_REPLY") or "done"}],
+                   "usage": usage}
+        emit({"type": "assistant", "message": message, "session_id": session})
+        append(transcript, {"type": "assistant", "message": message, "sessionId": session, "timestamp": now(),
+                            "cwd": cwd, "uuid": str(uuid.uuid4())})
+        if mode != "no-result":
+            emit(result(session, usage))
+        return 0
+    finally:
+        os.close(transcript)
+
+
+def result(session, usage, error=False):
+    return {"type": "result", "subtype": "error_during_execution" if error else "success", "is_error": error,
+            "num_turns": 1, "session_id": session, "total_cost_usd": 0.0, "usage": usage}
 
 
 def session_for(home, folder, options):
@@ -326,31 +396,39 @@ def run_host(argv, prompt, env, timeout):
     # the stream stays JSON lines.
     host = subprocess.Popen([sys.executable, str(HOST), *argv], stdin=subprocess.PIPE, stdout=sys.stderr, text=True,
                             env=env, start_new_session=True)
-
-    def forward(number, frame):
-        # The wake stops a turn with SIGTERM to the fake's group, which the host has left: pass the stop on, then die
-        # of the same signal. No wait here, since the interrupted communicate may hold the wait lock.
-        kill_group(host)
-        signal.signal(number, signal.SIG_DFL)
-        os.kill(os.getpid(), number)
-
-    signal.signal(signal.SIGTERM, forward)
+    GROUPS.add(host.pid)
     try:
         host.communicate(prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
-        kill_group(host)
-        host.wait()
         refuse(1, "fake claude: turn timed out")
     finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        stop_group(host)
     return host.returncode
 
 
-def kill_group(process):
+def stop_group(process):
+    """Kill the child's whole process group, then reap the child within a bound."""
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    GROUPS.discard(process.pid)
+
+
+def stop_children(number, frame):
+    # The wake stops a turn with SIGTERM to the fake's group, which the probes and the fake host have left: pass the
+    # stop on, then die of the same signal. No wait here, since an interrupted communicate may hold the wait lock.
+    for group in list(GROUPS):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    signal.signal(number, signal.SIG_DFL)
+    os.kill(os.getpid(), number)
 
 
 def seconds(name, default):
@@ -368,14 +446,15 @@ def seconds(name, default):
 
 def child_env():
     # No real host has shown a session variable in an MCP child (owner decision B; spec rule 3 waits for T2(b)), and a
-    # test run inside Claude Code must not hand its outer session's variables to the fake's children.
+    # test run inside Claude Code must not hand its outer session's variables to the fake's children. Every CLAUDE_*
+    # name goes, so a variable a later host adds cannot leak either; only the config dir is the fake's to pass on.
     return {key: value for key, value in os.environ.items()
-            if not (key in ("CLAUDECODE", "CLAUDE_PID") or key.startswith("CLAUDE_CODE_"))}
+            if key == "CLAUDE_CONFIG_DIR" or not (key == "CLAUDECODE" or key.startswith("CLAUDE_"))}
 
 
 def offered_tools(options):
     if options["tools"] is None:
-        tools = list(FILE_TOOLS) if options["restricted"] else ["Bash"] + FILE_TOOLS
+        tools = list(FILE_TOOLS)  # --restricted is part of the contract, so never Bash
     else:
         tools = [name.strip() for name in options["tools"].split(",") if name.strip()]
     # A host may offer more than it was asked for; the start check must catch that.
@@ -405,28 +484,35 @@ def list_tools(definition, env, timeout):
               {"jsonrpc": "2.0", "method": "notifications/initialized"},
               {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}]
     try:
-        done = subprocess.run([definition["command"], *definition.get("args", [])], env=env, capture_output=True,
-                              input="".join(json.dumps(frame) + "\n" for frame in frames), text=True, timeout=timeout)
+        server = subprocess.Popen([definition["command"], *definition.get("args", [])], env=env, text=True,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    GROUPS.add(server.pid)
+    try:
+        stdout, _ = server.communicate("".join(json.dumps(frame) + "\n" for frame in frames), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        # Its own group: run(timeout=...) would kill only the server and then wait on any child holding its output.
+        # A server that answered may have left children too.
+        stop_group(server)
+    try:
         answers = {}
-        for line in done.stdout.splitlines():
+        for line in stdout.splitlines():
             if line.strip():
                 answer = json.loads(line)
                 answers[answer.get("id")] = answer
-        if done.returncode != 0 or "result" not in answers.get(1, {}):
+        if server.returncode != 0 or "result" not in answers.get(1, {}):
             return None
         return [tool["name"] for tool in answers[2]["result"]["tools"]]
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-
-
-def record(path, row):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps(row) + "\n")
 
 
 def emit(event):
