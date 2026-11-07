@@ -13,17 +13,21 @@ from tests.integration.test_hierarchy_mailbox_mcp import exchange, mcp_inbox_wir
 
 
 def brief_at(path, text):
-    path.write_text(text, encoding="utf-8")
+    # Bytes, not write_text: on Windows write_text stores "\r\n", which the mailbox returns
+    # losslessly and which then differs from the "\n" text the tests expect.
+    path.write_bytes(text.encode("utf-8"))
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def publish_notes(root, count):
     identifiers = ["note-%03d" % index for index in range(count)]
-    # Use the public scoped adapter in bounded batches; no hand-written mailbox history.
-    for start in range(0, count, 32):
+    # Use the public scoped adapter in bounded batches; no hand-written mailbox history. Each publish re-validates the
+    # stored history, so a batch's cost grows with the mailbox: 32 per exchange outran exchange()'s 15 s timeout near
+    # note-191 on hosted Windows 3.12 (run 42412233402). Batches of 8 stay well inside it.
+    for start in range(0, count, 8):
         calls = [("mailbox_publish", {"message_id": identifier, "to": TARGET, "type": "info",
                                       "body": "Pending work reference."})
-                 for identifier in identifiers[start:start + 32]]
+                 for identifier in identifiers[start:start + 8]]
         responses = exchange(root, calls, endpoint="a/orchestrator")[2:]
         assert len(responses) == len(calls)
         for response in responses:
@@ -188,4 +192,13 @@ def test_large_unread_briefs_remain_losslessly_pageable_after_handoff(pilot, tmp
             break
         assert page["next_after"] == received[-1][0] and page["next_after"] != cursor
         cursor = page["next_after"]
+
+    # Compare digests first: with CI set, pytest prints a failed comparison of these 20
+    # 250 kB texts in full (about 6 MB per parameter), and the hosted runner took about two
+    # minutes per such line, so one mismatch outlasted the test-windows timeout.
+    def digest(rows):
+        return [(identifier, brief, len(text), hashlib.sha256(text.encode("utf-8")).hexdigest())
+                for identifier, brief, text in rows]
+
+    assert digest(received) == digest(expected)
     assert received == expected

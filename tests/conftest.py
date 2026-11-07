@@ -156,6 +156,29 @@ def _no_developer_aegis_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+# pytest sets PYTEST_CURRENT_TEST to "<node id> (teardown)" (NUL shown as "(null)"), and
+# CPython on Windows refuses the whole "NAME=value" string beyond 32767 UTF-16 units
+# (_MAX_ENV in win32_putenv), so a longer id errors only on Windows. A bytes parameter
+# without ids= once put 64 KiB in an id. Checking at collection reports it on every platform,
+# including for tests that a mark skips before any fixture runs.
+_WINDOWS_ENVIRONMENT_LIMIT = 32767
+
+
+def _windows_environment_units(nodeid):
+    entry = "PYTEST_CURRENT_TEST=%s (teardown)" % nodeid.replace("\x00", "(null)")
+    return len(entry.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def pytest_collection_modifyitems(config, items):
+    too_long = [(item.nodeid[:120], units) for item in items
+                for units in (_windows_environment_units(item.nodeid),)
+                if units > _WINDOWS_ENVIRONMENT_LIMIT]
+    if too_long:
+        raise pytest.UsageError(
+            "test ids too long for PYTEST_CURRENT_TEST on Windows (name long parameters with ids=): "
+            + "; ".join("%s... (%d units)" % row for row in too_long))
+
+
 @pytest.fixture(autouse=True)
 def hermetic_environment_and_mcp_isolation():
     """Restore os.environ and reset MCP server singletons between tests."""
