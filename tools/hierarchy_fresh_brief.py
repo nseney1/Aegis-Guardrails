@@ -346,7 +346,9 @@ def validate_packet_declaration(packet, message_id):
         matching(packet["dirty_content_sha256"], SHA256, "dirty_content_sha256")
     if "message" in packet:
         text(packet["message"], "message", 65536)
-    if "paths" in packet:
+    # checked_paths() accepts falsy values for recipes that take no paths.
+    # Live recipe-specific admission remains with the runner.
+    if packet.get("paths"):
         paths = packet["paths"]
         require(isinstance(paths, list) and len(paths) <= MAX_PATHS, "invalid paths")
         for index, path in enumerate(paths):
@@ -394,6 +396,8 @@ def job_packet(brief, mailbox, message, origin):
         brief.add("Dependencies", "job_after", reference, job_id=message["message_id"], after=after)
     source = {key: packet[key] for key in ("checkout", "commit", "tree", "paths", "dirty_content_sha256",
                                           "expected_tree", "merge", "recipes_sha256") if key in packet}
+    if "paths" in source and not source["paths"]:
+        source["paths"] = []  # The runner's effective no-paths value, never an object.
     if source:
         brief.add("Source identity", "job_source", reference, job_id=message["message_id"], source=source)
 
@@ -774,7 +778,6 @@ def publish(raw, reference):
     base_fd = open_directory(path.parent.parent)
     directory_fd = None
     pending = None
-    created_directory = False
     try:
         try:
             try:
@@ -782,7 +785,6 @@ def publish(raw, reference):
             except FileNotFoundError:
                 try:
                     os.mkdir(path.parent.name, mode=0o700, dir_fd=base_fd)
-                    created_directory = True
                 except FileExistsError:
                     pass  # Another composer created the same output directory.
                 directory_fd = os.open(path.parent.name, directory_flags(), dir_fd=base_fd)
@@ -814,8 +816,7 @@ def publish(raw, reference):
             check_directory(base_fd, directory_fd, path.parent.name)
             check_returned_path(path, file_identity(metadata))
             sync_publication_directory(directory_fd)
-            if created_directory:
-                sync_publication_directory(base_fd)
+            sync_publication_directory(base_fd)
             check_returned_path(path, file_identity(metadata))
             return
         pending = ".fresh-" + uuid.uuid4().hex
@@ -832,8 +833,7 @@ def publish(raw, reference):
             check_directory(base_fd, directory_fd, path.parent.name)
             check_returned_path(path, identity)
             sync_publication_directory(directory_fd)
-            if created_directory:
-                sync_publication_directory(base_fd)
+            sync_publication_directory(base_fd)
             check_returned_path(path, identity)
         except (PublicationRefused, RuntimeError):
             remove_written_file(directory_fd, path.name, identity)

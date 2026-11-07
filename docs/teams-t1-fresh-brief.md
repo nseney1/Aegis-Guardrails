@@ -17,12 +17,15 @@ The returned pathname must identify the written `(st_dev, st_ino)` after rename;
 on mismatch the composer removes its own inode through the descriptor and exits 3.
 Platforms without the required descriptor operations refuse before writing.
 On POSIX the temporary file is fsynced before rename, then the destination
-directory is fsynced through an anchored `O_RDONLY` handle. Creation of a new
-`briefs` directory is also persisted by fsyncing its parent, in that order, before
-success is reported. Reusing an identical brief still syncs its directory.
-Directory syncing requires read permission on that directory, and on its parent
-when newly created; more distant ancestors still need only search permission on
-Linux. A sync failure exits 3 and may leave the published file; it is not success.
+directory and its parent are fsynced through anchored `O_RDONLY` handles, in that
+order, before every successful return. Reuse, retries after a failed sync, and
+concurrent directory creation all repeat both directory syncs; an existing
+directory alone is not proof that its pathname was persisted.
+Directory syncing requires read permission on both `briefs` and its immediate
+parent on every composition; more distant ancestors still need only search
+permission on Linux. A sync failure exits 3 and may leave the published file; it
+is not success. If a filesystem rejects directory fsync (for example with
+`EINVAL`), composition fails with exit 3 rather than claiming durability.
 Windows cannot fsync directory handles, so that sync step is explicitly skipped
 there; the separate secure-publication capability guard continues to apply.
 
@@ -114,6 +117,10 @@ standalone schema validator: full `admit()` additionally checks recipes, live
 checkouts and dependency evidence. Those execution checks remain with the runner;
 structural validation here is not job admission. Regression tests compare the
 missing-`after` and malformed-`commit` refusals with the runner's admission API.
+For no-paths packets, the runner's falsy `paths` values are accepted and represented
+as an effective empty list in the brief; empty objects are never copied into it.
+Truthy paths still require a bounded list of valid path strings. Merge packets
+without a `paths` key are preserved, with live merge admission left to the runner.
 
 The composer does not publish messages, record reads/events, replay work, release
 resources, settle jobs, change leases or advance accounting. It grants no new

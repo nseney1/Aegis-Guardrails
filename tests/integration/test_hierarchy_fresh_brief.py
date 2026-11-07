@@ -839,14 +839,17 @@ def test_explicit_current_target_generation_applies_its_own_reads(tmp_path):
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="search-only traversal uses Linux O_PATH")
 def test_search_only_parent_directories_allow_publication(pilot):  # noqa: F811
     root, _ = pilot
-    base = root.parent
-    (base / "briefs").mkdir()
-    mode = stat.S_IMODE(base.stat().st_mode)
-    base.chmod(0o111)
+    ancestor = root.parent / "search-only"
+    base = ancestor / "run"
+    base.mkdir(parents=True)
+    root.rename(base / "mailbox")
+    root = base / "mailbox"
+    mode = stat.S_IMODE(ancestor.stat().st_mode)
+    ancestor.chmod(0o111)
     try:
         answer = compose(root)
     finally:
-        base.chmod(mode)
+        ancestor.chmod(mode)
     assert Mailbox(root).brief(answer["brief"])
 
 
@@ -957,10 +960,16 @@ def test_valid_packet_source_fields_remain_scalar_and_paths_are_strings(tmp_path
     assert all(isinstance(item, str) for item in source["paths"])
 
 
-FSYNC_DRIVER = ("import fcntl,json,os,runpy,stat,sys\nfrom pathlib import Path\n"
-                "tool,root,fail=sys.argv[1:]\nbase=Path(root).parent\ntrace=base/'fsync-trace.json'\n"
+FSYNC_DRIVER = ("import errno,fcntl,json,os,runpy,stat,sys\nfrom pathlib import Path\n"
+                "tool,root,fail,peer=sys.argv[1:]\nbase=Path(root).parent\ntrace=base/'fsync-trace.json'\n"
                 "events=[]\nrenamed=False\nalready_published=any((base/'briefs').glob('fresh-*.md'))\n"
-                "real_fsync,real_replace=os.fsync,os.replace\n"
+                "real_fsync,real_replace,real_mkdir=os.fsync,os.replace,os.mkdir\n"
+                "def making(path,*args,**kwargs):\n"
+                "    result=real_mkdir(path,*args,**kwargs)\n"
+                "    if peer=='yes' and str(path)=='briefs':\n"
+                "        events.append('peer_created')\n"
+                "        raise FileExistsError(errno.EEXIST,'peer created the directory without syncing its parent')\n"
+                "    return result\n"
                 "def replacing(*args,**kwargs):\n"
                 "    global renamed\n    result=real_replace(*args,**kwargs)\n    renamed=True\n    return result\n"
                 "def syncing(fd):\n"
@@ -976,14 +985,15 @@ FSYNC_DRIVER = ("import fcntl,json,os,runpy,stat,sys\nfrom pathlib import Path\n
                 "    events.append(kind)\n"
                 "    if kind==fail: raise OSError('fixture '+kind+' fsync refused')\n"
                 "    return real_fsync(fd)\n"
-                "os.fsync,os.replace=syncing,replacing\n"
+                "os.fsync,os.replace,os.mkdir=syncing,replacing,making\n"
                 "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2','--as-of','2026-11-07T12:00:00Z']\n"
                 "try:\n    runpy.run_path(tool,run_name='__main__')\n"
                 "finally:\n    trace.write_text(json.dumps(events))\n")
 
 
-def traced_publication(root, fail=""):
-    proc = subprocess.run([sys.executable, "-I", "-B", "-c", FSYNC_DRIVER, str(TOOL), str(root), fail],
+def traced_publication(root, fail="", peer_creation=False):
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", FSYNC_DRIVER, str(TOOL), str(root), fail,
+                           "yes" if peer_creation else "no"],
                           capture_output=True, text=True, timeout=15,
                           env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert not proc.stderr, proc.stderr
@@ -992,7 +1002,7 @@ def traced_publication(root, fail=""):
 
 @secure_publication
 @pytest.mark.parametrize("existing", ["none", "directory", "brief"])
-def test_publication_syncs_file_then_directory_and_new_parent(pilot, existing):  # noqa: F811
+def test_publication_syncs_directory_and_parent_on_every_success(pilot, existing):  # noqa: F811
     root, _ = pilot
     if existing == "directory":
         (root.parent / "briefs").mkdir()
@@ -1000,7 +1010,8 @@ def test_publication_syncs_file_then_directory_and_new_parent(pilot, existing): 
         compose(root, as_of=AS_OF)
     code, answer, events = traced_publication(root)
     assert code == 0, answer
-    expected = {"none": ["file", "directory", "parent"], "directory": ["file", "directory"], "brief": ["directory"]}
+    expected = {"none": ["file", "directory", "parent"], "directory": ["file", "directory", "parent"],
+                "brief": ["directory", "parent"]}
     assert events == expected[existing]
     assert Mailbox(root).brief(answer["brief"])
 
@@ -1013,3 +1024,81 @@ def test_directory_sync_failure_never_reports_publication_success(pilot, failed)
     assert code == 3 and "ok" not in answer
     assert answer["error"] == "brief publication failed: fixture " + failed + " fsync refused"
     assert events[-1] == failed
+
+
+@secure_publication
+def test_parent_sync_failure_is_not_forgotten_on_retry(pilot):  # noqa: F811
+    root, _ = pilot
+    code, _, events = traced_publication(root, "parent")
+    assert code == 3 and events == ["file", "directory", "parent"]
+    published = list((root.parent / "briefs").glob("fresh-*.md"))
+    assert len(published) == 1
+    reference = ref(published[0])
+    contents = published[0].read_bytes()
+    code, _, events = traced_publication(root, "parent")
+    assert code == 3 and events == ["directory", "parent"]
+    code, answer, events = traced_publication(root)
+    assert code == 0 and events == ["directory", "parent"]
+    assert answer["brief"] == reference and Mailbox(root).brief(reference) == contents
+
+
+@secure_publication
+def test_peer_creation_without_parent_sync_is_completed_by_this_composer(pilot):  # noqa: F811
+    root, _ = pilot
+    code, answer, events = traced_publication(root, peer_creation=True)
+    assert code == 0, answer
+    assert events == ["peer_created", "file", "directory", "parent"]
+    assert Mailbox(root).brief(answer["brief"])
+
+
+@secure_publication
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="search-only traversal uses Linux O_PATH")
+def test_unreadable_output_parent_cannot_report_durable_success(pilot):  # noqa: F811
+    root, _ = pilot
+    compose(root, as_of=AS_OF)
+    base = root.parent
+    mode = stat.S_IMODE(base.stat().st_mode)
+    base.chmod(0o111)
+    try:
+        error = compose(root, as_of=AS_OF, expect=3)["error"]
+    finally:
+        base.chmod(mode)
+    assert "brief publication failed" in error and "Permission denied" in error
+
+
+@secure_publication
+@pytest.mark.parametrize("paths", [None, "", 0, False, {}, []])
+def test_no_paths_packets_match_the_runners_falsy_path_handling(tmp_path, paths):
+    root, path, _ = structured_job(tmp_path, {"paths": paths})
+    driver = ("import json,sys\nfrom pathlib import Path\nsource,packet,checkout=sys.argv[1:]\n"
+              "sys.path.insert(0,str(Path(source)/'tools'))\nfrom hierarchy_jobs import checked_paths\n"
+              "print(json.dumps(checked_paths(json.loads(Path(packet).read_text()),"
+              "{'kind':'command','steps':[['$python','-c','pass']]},checkout)))\n")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(ROOT), str(path), str(tmp_path)],
+                            capture_output=True, text=True, timeout=15,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+    expected = json.loads(result.stdout)
+    assert expected == []
+    before = files(tmp_path)
+    answer = compose(root, "a/orchestrator")
+    source = next(row["source"] for row in sections(answer["brief"])["Source identity"] if row.get("job_id") == "structured-job")
+    assert source["paths"] == expected
+    after = files(tmp_path)
+    after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
+    assert after == before
+
+
+@secure_publication
+def test_valid_merge_packet_composes_without_admitting_or_executing_it(tmp_path):
+    root, path, packet = structured_job(tmp_path, {"schema": "aegis.hierarchy-job-packet/v1", "recipe": "merge",
+        "merge": "c" * 40, "expected_tree": "d" * 40, "message": "Merge reviewed candidate"})
+    before = files(tmp_path)
+    answer = compose(root, "a/orchestrator")
+    row = next(row for row in sections(answer["brief"])["Source identity"] if row.get("job_id") == "structured-job")
+    assert row["ref"] == ref(path)
+    assert row["source"]["merge"] == packet["merge"] and row["source"]["expected_tree"] == packet["expected_tree"]
+    assert "paths" not in row["source"]
+    after = files(tmp_path)
+    after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
+    assert after == before
