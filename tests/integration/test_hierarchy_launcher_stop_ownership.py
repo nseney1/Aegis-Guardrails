@@ -11,6 +11,7 @@ import pytest
 
 from tests.integration.test_hierarchy_launcher import Launch, REVIEW, launcher_module, wait_until
 from tests.integration.test_hierarchy_launcher_hosts import Hosts
+from tests.integration.test_hierarchy_mailbox import git
 
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="these process argv tests need Linux")
@@ -73,8 +74,16 @@ def children(tmp_path):
     ("claude-code", ("env", "K=V", "node", "claude")),
 ])
 def test_stop_matches_the_bound_hosts_program(launch, children, host, program):
+    # The role owns this checkout; no ancestor repository may supply its cwd validation.
+    role_cwd = launch.tmp / "role-cwd"
+    role_cwd.mkdir()
+    git(role_cwd, "init", "-q", "-b", "test")
+    git(role_cwd, "config", "--local", "user.name", "Test")
+    git(role_cwd, "config", "--local", "user.email", "test@example.invalid")
+    git(role_cwd, "commit", "--allow-empty", "-qm", "role cwd")
+    assert Path(git(role_cwd, "rev-parse", "--show-toplevel")).resolve() == role_cwd.resolve()
     session = str(uuid.uuid4())
-    launch.add_role(REVIEW, host, session=session, cwd=str(launch.tmp))
+    launch.add_role(REVIEW, host, session=session, cwd=str(role_cwd))
     argv = [str(launch.tmp / word) if "=" not in word else word for word in program]
     owned = children(*argv, "--resume", session)
 
