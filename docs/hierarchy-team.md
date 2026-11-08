@@ -275,10 +275,12 @@ also reported separately, and the native usage and cost fields are retained. Mis
 deadline expiry, record usage as null. Reconciliation does not append a second invocation row. Aggregation into
 `usage-ledger.json` belongs to PR7. Codex retains its existing event rows and argv.
 
-All team child environments use an allowlist: PATH, HOME, LANG, LC_*, TERM, TMPDIR, USER, LOGNAME and the run's host
-home variables. The command sets its own Python bytecode flag. Ambient provider keys, session variables and
-SSH_AUTH_SOCK are dropped, including on Codex-only runs. `evidence/child-environment.json` records every dropped
-variable's name, never its value. Refusals do not update this evidence or the command log.
+Governed team child environments use an allowlist: PATH, HOME, LANG, LC_*, TERM, TMPDIR, USER, LOGNAME and the run's
+host home variables. Historical v1 Codex bases without a host plan retain inherited settings such as HTTPS_PROXY
+and SSL_CERT_FILE. Provider credential names, Claude session variables, SSH_AUTH_SOCK and test-control variables
+are still excluded. A missing v2 plan refuses binding and owner turns; it never enables legacy inheritance.
+The command sets its own Python bytecode flag. `evidence/child-environment.json` records every dropped variable's
+name, never its value. Refusals do not update this evidence or the command log.
 
 If launcher stop reports nonempty `unowned_pids`, teardown carries those pids into its result and returns 3 while
 keeping resources. It cannot report that endpoint as cleanly stopped merely because the owned host was not found.

@@ -106,15 +106,43 @@ class LaneRun(HomesRun):
         team = team_module()
         request = self.write("role.json", {"base": str(self.base_dir), "endpoint": REVIEWER, "host": CLAUDE,
                                            "session": session, "cwd": str(self.project)})
-        proc = subprocess.run([sys.executable, "-I", "-B", str(team.HERE / "hierarchy_provision.py"), "add-role",
-                               "--request", str(request)], env=self.env(), capture_output=True, text=True, timeout=2)
+        argv = [sys.executable, "-I", "-B", str(team.HERE / "hierarchy_provision.py"), "add-role", "--request", str(request)]
+        # Setup verifies a committed runtime and durably publishes a binding. A two-second total command cap
+        # killed a valid staged publication under load. Observe this one process in waits of at most two seconds;
+        # never retry provisioning or a model call. Owner-turn/ROOT concurrency deadlines stay unchanged.
+        output, errors = self.tmp / "fixture-add-role.stdout", self.tmp / "fixture-add-role.stderr"
+        with output.open("wb") as stdout, errors.open("wb") as stderr:
+            process = subprocess.Popen(argv, env=self.env(), stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+            deadline = time.monotonic() + 60
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, 60)
+                    try:
+                        process.wait(timeout=min(2, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass  # Wait for the same test-owned setup process, without replaying any effects.
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+        tails = []
+        for path in (output, errors):
+            with path.open("rb") as stream:
+                stream.seek(max(0, path.stat().st_size - 65536))
+                tails.append(stream.read(65536).decode("utf-8", "replace"))
+        proc = subprocess.CompletedProcess(argv, process.returncode, *tails)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return session
 
 
 @pytest.fixture
-def make(tmp_path, monkeypatch):
+def make(tmp_path, monkeypatch, request):
     built = []
+    if request.node.name.startswith("test_fix6_"):
+        (tmp_path / ".keep").touch()
 
     def factory(root=CLAUDE, team=CODEX):
         run = LaneRun(tmp_path, monkeypatch, root, team)
@@ -144,6 +172,206 @@ def make(tmp_path, monkeypatch):
 
 def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("message", ["tool_result", None, [], 7])
+def test_fix6_claude_transcript_user_shapes(make, message):
+    run = make(CODEX, CLAUDE)
+    operation, gate = held_after_supported_reply(run)
+    finish_fake(run, operation, gate)
+    events = rows(run.seed_path)
+    if message == "tool_result":
+        events.insert(-1, {"type": "user", "sessionId": operation["session"], "uuid": str(uuid.uuid4()),
+                           "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}})
+    else:
+        events[-2]["message"] = message
+    run.seed_path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    before = files(run.run)
+    answer = run.team("turn", REVIEWER, "--reconcile", expect=0 if message == "tool_result" else 2)
+    if message == "tool_result":
+        assert answer["reconciled"] == operation["id"] and answer["replayed"] is False
+        assert not run.mailbox().wake_marker(REVIEWER).exists()
+    else:
+        assert answer["error"] == ("operation %s transcript cannot prove this session's submitted turn; "
+                                   "retain the hold and do not replay" % operation["id"])
+        assert files(run.run) == before and state(run)["operations"][REVIEWER] == operation
+        assert run.mailbox().wake_marker(REVIEWER).exists()
+    assert len([call for call in run.claude_calls() if "--resume" in call["argv"]]) == 1
+
+
+def test_fix6_forged_birth_cannot_release_live_original(make):
+    run = make(CODEX, CLAUDE)
+    operation, gate = held_after_supported_reply(run)
+    saved = state(run)
+    saved["operations"][REVIEWER]["pid_start"] = "1"
+    (run.run / "team-state.json").write_text(json.dumps(saved))
+    before = files(run.run)
+    answer = run.team("turn", REVIEWER, "--reconcile", expect=2)
+    assert answer["process_observation"] == {"state": "UNAVAILABLE", "reason": "launch identity differs from its durable witness"}
+    assert files(run.run) == before and run.mailbox().wake_marker(REVIEWER).exists()
+    assert team_module().process_alive(operation["pid"])
+    assert run.team("turn", REVIEWER, "Again.", expect=2)["operation"] == saved["operations"][REVIEWER]
+    assert len([call for call in run.claude_calls() if "--resume" in call["argv"]]) == 1
+    finish_fake(run, operation, gate)
+
+
+def test_fix6_accounting_cannot_escape_after_caller_cancellation(make):
+    run = make(CODEX, CLAUDE)
+    run.role()
+    gate = run.tmp / "fix6-cancel-gate"
+    caller = subprocess.Popen([sys.executable, "-I", "-B", str(TEAM), "--config", str(run.config_path),
+                               "turn", REVIEWER, "Check in."], env=run.env(FAKE_CLAUDE_GATE=str(gate)),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        gate_ready(gate)
+        deadline = time.monotonic() + 2
+        while state(run)["operations"][REVIEWER].get("pid") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        operation = state(run)["operations"][REVIEWER]
+        assert operation["pid"] is not None
+        caller.terminate()
+        caller.communicate(timeout=2)
+        assert caller.returncode == -signal.SIGTERM
+        assert not (run.evidence / ("turn-%s.accounting.json" % operation["id"])).exists()
+        finish_fake(run, operation, gate)
+        outside = run.tmp / "outside-accounting.jsonl"
+        outside.write_bytes(b"")
+        saved = state(run)
+        saved["operations"][REVIEWER]["turn_log"] = str(outside)
+        (run.run / "team-state.json").write_text(json.dumps(saved))
+        before = files(run.run)
+        answer = run.team("turn", REVIEWER, "--reconcile", expect=2)
+        assert answer["error"] == "operation evidence paths differ from the run's canonical paths; retain the hold"
+        assert outside.read_bytes() == b"" and files(run.run) == before
+        assert run.mailbox().wake_marker(REVIEWER).exists()
+        assert run.team("turn", REVIEWER, "Again.", expect=2)["operation"] == saved["operations"][REVIEWER]
+    finally:
+        if caller.poll() is None:
+            caller.terminate()
+            caller.communicate(timeout=2)
+
+
+@pytest.mark.parametrize("field", ["python", "source", "bootstrap"])
+def test_fix6_mcp_bootstrap_is_checked_before_probe(make, field):
+    run = make()
+    run.prepare()
+    setup_path = run.base_dir / "provision.json"
+    setup = json.loads(setup_path.read_text())
+    connection = Path(state(run)["root"]["connection"])
+    servers = json.loads(connection.read_text())
+    marker = run.tmp / "untrusted-probe-executed"
+    attacker = run.tmp / "untrusted-python"
+    attacker.write_text("#!%s\nfrom pathlib import Path\nPath(%r).write_text('executed')\n" % (sys.executable, str(marker)))
+    attacker.chmod(0o700)
+    if field == "python":
+        setup["python"] = str(attacker)
+        servers["mcpServers"]["aegis_decision"]["command"] = str(attacker)
+    elif field == "source":
+        setup["source"] = str(run.tmp)
+        args = servers["mcpServers"]["aegis_decision"]["args"]
+        args[args.index("--entry") + 1] = str(run.tmp / "tools" / "hierarchy_mailbox_mcp.py")
+    else:
+        (run.base_dir / "runtime-source.py").write_text("raise RuntimeError('untrusted bootstrap')\n")
+    setup_path.write_text(json.dumps(setup))
+    connection.write_text(json.dumps(servers))
+    before = files(run.run)
+    answer = run.team("approve", "feature-1", "--reason", "agreed", expect=2)
+    assert "runtime" in answer["error"] or "bootstrap" in answer["error"]
+    assert not marker.exists() and files(run.run) == before
+    assert len([call for call in run.claude_calls() if "--resume" in call["argv"]]) == 0
+
+
+def test_fix6_root_bind_checks_runtime_before_binding_or_probe(make):
+    run = make()
+    run.team("init")
+    run.team("login")
+    session = str(uuid.uuid4())
+    run.seed(session)
+    path = run.base_dir / "provision.json"
+    setup = json.loads(path.read_text())
+    setup["python"] = str(run.tmp / "untrusted-interpreter")
+    path.write_text(json.dumps(setup))
+    before = files(run.run)
+    answer = run.team("root", "--session", session, expect=2)
+    assert answer["error"] == "Claude runtime differs from team-run.json"
+    assert files(run.run) == before and run.mailbox().bindings("pilot/root") == []
+
+
+@pytest.mark.parametrize("change", ["missing", "assignment"])
+def test_fix6_v2_requires_main_host_plan(make, change):
+    run = make()
+    run.prepare()
+    path = run.base_dir / "host-plan.json"
+    if change == "missing":
+        path.unlink()
+    else:
+        plan = json.loads(path.read_text())
+        plan["team"] = CLAUDE
+        path.write_text(json.dumps(plan))
+    before = files(run.run)
+    answer = run.team("approve", "feature-1", "--reason", "agreed", expect=2)
+    assert answer["error"] == "v2 MAIN host plan is missing or differs from team-run.json"
+    assert files(run.run) == before
+    assert len([call for call in run.claude_calls() if "--resume" in call["argv"]]) == 0
+
+
+def test_fix6_legacy_no_plan_preserves_proxy_and_certificate_settings(make, monkeypatch, capsys):
+    run, words, _endpoint = legacy_owner_without_plan(make, "turn")
+    captured = []
+    original = subprocess.Popen.__init__
+
+    def initialize(process, argv, *args, **kwargs):
+        if argv[0] == "codex":
+            captured.append(dict(kwargs["env"]))
+        return original(process, argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", initialize)
+    for name, value in {"HTTPS_PROXY": "http://fixture.invalid:8080", "SSL_CERT_FILE": str(run.tmp / "ca.pem"),
+                        "LEGACY_OWNER_SETTING": "fixture-value"}.items():
+        monkeypatch.setenv(name, value)
+    protected = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_TOKEN", "GROQ_API_KEY", "SSH_AUTH_SOCK", "WRAP_SECRET")
+    for name in protected:
+        monkeypatch.setenv(name, "fixture-protected-value")
+    code, _answer = in_process(run, *words, capsys=capsys)
+    assert code == 0 and len(captured) == 1
+    for name in ("HTTPS_PROXY", "SSL_CERT_FILE", "LEGACY_OWNER_SETTING"):
+        assert captured[0][name] == os.environ[name]
+    assert not set(protected).intersection(captured[0])
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_fix6_codex_accounting_grows_after_deadline(make, prefix):
+    run = make(CODEX, CODEX)
+    run.ready("--no-loop")
+    # Gate actual fake output before its first event, or after thread.started. No timing assumption about how
+    # quickly the owner CLI returns, and no production fixture switch. The fake executes exactly once.
+    gate = run.tmp / "fix6-output-gate"
+    staged = ("    native = subprocess.Popen([sys.executable, FAKE, *argv], env=env, stdout=subprocess.PIPE)\n"
+              "    first = native.stdout.readline()\n"
+              "    if %r:\n        sys.stdout.buffer.write(first)\n        sys.stdout.flush()\n"
+              "    import time\n    gate = Path(%r)\n"
+              "    gate.with_name(gate.name + '.ready').write_text('ready')\n"
+              "    deadline = time.monotonic() + 20\n"
+              "    while not gate.exists() and time.monotonic() < deadline:\n        time.sleep(0.01)\n"
+              "    if not %r:\n        sys.stdout.buffer.write(first)\n"
+              "    sys.stdout.buffer.write(native.stdout.read())\n    sys.stdout.flush()\n"
+              "    code = native.wait(timeout=2)" % (prefix, str(gate), prefix))
+    run.codex_script = run.codex_script.replace(
+        "    code = subprocess.run([sys.executable, FAKE, *argv], env=env).returncode", staged)
+    answer = run.team("turn", REVIEWER, "Check in.", expect=3, AEGIS_TEAM_TURN_TIMEOUT="0.2")
+    operation = answer["operation"]
+    gate_ready(gate)
+    initial = Path(operation["stdout"]).read_bytes()
+    assert bool(initial) is prefix
+    finish_fake(run, operation, gate)
+    final = Path(operation["stdout"]).read_bytes()
+    assert len(final) > len(initial)
+    result = run.team("turn", REVIEWER, "--reconcile")
+    assert result["reconciled"] == operation["id"] and result["replayed"] is False
+    assert (run.evidence / operation["turn_log"]).read_bytes() == final
+    receipt = json.loads((run.evidence / ("turn-%s.accounting.json" % operation["id"])).read_text())
+    assert receipt["log_span"]["length"] == len(final) and receipt["usage"] == {"input_tokens": 1, "output_tokens": 1}
+    assert run.team("turn", REVIEWER, "--reconcile", expect=2)["error"] == REVIEWER + " has no unresolved operation"
 
 
 def gate_ready(gate):
@@ -625,6 +853,13 @@ def test_completion_never_discards_a_different_unresolved_operation(make, monkey
 def test_codex_up_cannot_overwrite_an_owner_operation(make, monkeypatch, capsys, phase):
     run = make(CODEX, CODEX)
     run.prepare("root-with-up-race")
+    # The nested public up command must finish while this exact fake is still live. A fixed model delay is
+    # insufficient on a loaded machine; gate only this test executable until all original custody checks finish.
+    gate = run.tmp / "finish-codex-up-interleave"
+    run.codex_script = run.codex_script.replace("def root(argv, server):", (
+        "def root(argv, server):\n    import time\n    gate = Path(%r)\n"
+        "    deadline = time.monotonic() + 20\n"
+        "    while not gate.exists() and time.monotonic() < deadline:\n        time.sleep(0.01)" % str(gate)))
     original = os.replace
     competing = []
 
@@ -646,6 +881,7 @@ def test_codex_up_cannot_overwrite_an_owner_operation(make, monkeypatch, capsys,
     run.team("approve", "feature-1", "--reason", "again", expect=2)
     assert "unresolved model operations" in run.team("down", expect=3)["error"]
     assert not (run.run / ".state.lock").exists()
+    gate.write_text("finish")
 
 
 def finish_fake(run, operation, gate):

@@ -663,10 +663,16 @@ def append_evidence(run, name, raw):
 
 def child_env(run, path=None):
     revalidate_homes(run)
-    # A host's home is the registry's only required ambient setting. Session tokens, agent settings, provider
-    # credentials and SSH sockets must not cross this boundary, including on historical Codex-only runs.
-    env = {name: value for name, value in os.environ.items()
-           if name in CHILD_ENVIRONMENT or name.startswith("LC_")}
+    # Historical, unplanned Codex bases inherit owner settings such as proxies and trust stores. Keep the
+    # credential/session exclusions even there; a missing v2 plan never opts a governed run into inheritance.
+    legacy = run.raw["schema"] == SCHEMA and hierarchy_hosts.read_plan(run.base) is None
+    if legacy:
+        env = {name: value for name, value in os.environ.items() if not (
+            name.startswith(("CLAUDE", "ANTHROPIC_", "FAKE_", "WRAP_", "AWS_", "AZURE_", "GOOGLE_", "GEMINI_")) or
+            name == "SSH_AUTH_SOCK" or re.search(r"(?:^|_)(?:API_KEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS)(?:_|$)", name))}
+    else:
+        env = {name: value for name, value in os.environ.items()
+               if name in CHILD_ENVIRONMENT or name.startswith("LC_")}
     env["CODEX_HOME"] = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
     if run.uses(CLAUDE):
         env["CLAUDE_CONFIG_DIR"] = run.validated_homes[CLAUDE]
@@ -1364,13 +1370,30 @@ def planned_binding(run, endpoint, host):
     mailbox = Mailbox(run.mailbox_root)
     entry = hierarchy_provision.registry_role(mailbox, endpoint)
     plan = hierarchy_hosts.governing_plan(run.base, run.mailbox_root, run.id)
+    if run.raw["schema"] == SCHEMA_V2:
+        expected = hierarchy_hosts.plan_record(run.id, run.hosts["root"], run.hosts["team"],
+            {run.endpoint("front-door"): FRONT_DOOR_HOST}, sha_file(run.config_path))
+        require(plan == expected, "v2 MAIN host plan is missing or differs from team-run.json")
     hierarchy_hosts.require_binding(plan, endpoint, host, hierarchy_roles.writer(entry))
     return mailbox
 
 
+def claude_runtime(run):
+    """Validate interpreter and bootstrap authority before binding or probing a Claude connection."""
+    setup = read_json(run.base / "provision.json")
+    # provision.json and the connection are mutable records, not interpreter/bootstrap authority. The owner
+    # configuration selects those paths; the runtime verifier checks committed source and the retained bootstrap.
+    require(setup.get("python") == run.python and setup.get("source") == str(run.source) and
+            setup.get("mailbox_root") == str(run.mailbox_root) and setup.get("delivery_dir") == str(run.delivery) and
+            setup.get("store") == str(run.store) and setup.get("initiative") == run.id,
+            "Claude runtime differs from team-run.json")
+    hierarchy_provision.hierarchy_runtime_source.verify(setup, run.base)
+    return setup
+
+
 def claude_connection(run, binding, connection):
     """Only provision's own team servers may enter a restricted Claude invocation."""
-    setup = read_json(run.base / "provision.json")
+    setup = claude_runtime(run)
     endpoint = binding["endpoint"]
     servers = read_json(Path(connection))
     require(set(servers) == {"mcpServers"}, "Claude connection has unexpected fields")
@@ -1460,8 +1483,7 @@ def root(run, args):
         claude_transcript(run, args.session)
         offered = (hierarchy_provision.DECISION_TOOL, *hierarchy_roles.decision_tools(hierarchy_roles.role(request["endpoint"])))
         require(offered == ROOT_TOOLS, "ROOT tools mismatch: expected " + ", ".join(ROOT_TOOLS))
-        setup = read_json(run.base / "provision.json")
-        hierarchy_provision.hierarchy_runtime_source.verify(setup, run.base)
+        setup = claude_runtime(run)
         hierarchy_provision.check_role_request(request, setup)
         # Provision stages its session record and validates the request before binding. Avoid a request-file write
         # on this path: an unconfirmed conversation or mismatched binding must leave no files behind.
@@ -1858,13 +1880,19 @@ def operation_process_scope():
             "effective_uid": os.geteuid()}
 
 
-def operation_process_observation(operation):
+def operation_process_observation(run, operation):
     """Only positive evidence in the original observer scope can establish that the original instance exited.
 
     Linux stat field 22 is birth time since boot. Require complete current-Linux records (through field 52),
     and two consistent observations. Missing/unreadable/torn identity is unavailable, never absence.
     """
     unavailable = {"state": "UNAVAILABLE"}
+    try:
+        witness = read_json(run.evidence / ("turn-%s.launch.json" % operation["id"]))
+    except (OSError, ValueError):
+        return {**unavailable, "reason": "durable launch witness is missing or unreadable"}
+    if witness != launch_identity(operation):
+        return {**unavailable, "reason": "launch identity differs from its durable witness"}
     original_scope = operation.get("process_scope")
     if isinstance(original_scope, dict) and original_scope.get("state") == "UNAVAILABLE":
         reason = original_scope.get("reason")
@@ -1947,11 +1975,37 @@ def accounting_lines(raw):
     return rows
 
 
+def operation_paths(run, operation):
+    """Validate persisted paths before any read or write, including recovery after a lost caller."""
+    error = "operation evidence paths differ from the run's canonical paths; retain the hold"
+    identifier, endpoint = operation.get("id"), operation.get("endpoint")
+    require(isinstance(identifier, str) and re.fullmatch(r"[0-9a-f]{32}", identifier) is not None, error)
+    hierarchy, role = endpoint_parts(endpoint)[:2]
+    require(hierarchy == run.id, error)
+    log = "root-turns.jsonl" if role == "root" else "role-turns-%s.jsonl" % endpoint.replace("/", "%2F")
+    require(operation.get("turn_log") == log and
+            operation.get("stdout") == str(run.evidence / ("turn-%s.stdout.jsonl" % identifier)) and
+            operation.get("stderr") == str(run.evidence / ("turn-%s.stderr.txt" % identifier)) and
+            operation.get("marker") == (None if role == "root" else str(Mailbox(run.mailbox_root).wake_marker(endpoint))), error)
+    from hierarchy_mailbox import safe_path
+    for path in (run.evidence / log, Path(operation["stdout"]), Path(operation["stderr"]),
+                 run.evidence / ("turn-%s.accounting.json" % identifier),
+                 run.evidence / ("turn-%s.launch.json" % identifier)):
+        safe_path(path)
+
+
+def launch_identity(operation):
+    # Release bookkeeping is the only mutable part of an invocation. Retain the complete original intent and
+    # observed launch identity independently of team-state, so editing one birth field cannot prove PID reuse.
+    return {key: value for key, value in operation.items() if key != "release"}
+
+
 def record_turn(run, operation, stdout, code):
     """One durable invocation receipt per id, with an idempotent provider log. A null pending usage may become
     known, but a recorded charge cannot be reset or changed. Raw output remains in the invocation's own file.
     """
     error = "operation accounting is incomplete or conflicting; retain the hold"
+    operation_paths(run, operation)
     log = run.evidence / operation["turn_log"]
     receipt_path = run.evidence / ("turn-%s.accounting.json" % operation["id"])
     require(not log.is_symlink() and not receipt_path.is_symlink(), error)
@@ -2005,27 +2059,26 @@ def record_turn(run, operation, stdout, code):
         if raw != before:
             durable_write(log, raw)
     else:
-        # Keep the historical Codex event bytes. Persist an append intent first, then recognize its exact bytes
-        # after a lost reply. A partial/conflicting append is never guessed at or appended a second time.
+        # Keep the historical Codex event bytes, extending the same invocation as its output grows. A receipt
+        # can precede its log write: only an exact, complete-line prefix of this stdout can finish that append.
+        raw = stdout[:stdout.rfind(b"\n") + 1]
         span = receipt.get("log_span") if receipt else None
         if span is None:
-            raw = stdout if not stdout or stdout.endswith(b"\n") else b""
             span = {"offset": len(before), "prefix_sha256": digest_bytes(before),
-                    "length": len(raw), "sha256": digest_bytes(raw)}
-            desired["log_span"] = span
-            durable_write(receipt_path, as_json(desired))
+                    "length": 0, "sha256": digest_bytes(b"")}
         else:
-            raw = stdout[:span["length"]]
-            require(len(raw) == span["length"] and digest_bytes(raw) == span["sha256"], error)
+            require(isinstance(span, dict) and set(span) == {"offset", "prefix_sha256", "length", "sha256"} and
+                    type(span["offset"]) is int and span["offset"] >= 0 and type(span["length"]) is int and
+                    0 <= span["length"] <= len(raw) and digest_bytes(raw[:span["length"]]) == span["sha256"], error)
         offset = span["offset"]
         require(len(before) >= offset and digest_bytes(before[:offset]) == span["prefix_sha256"], error)
-        end = offset + span["length"]
-        if len(before) == offset:
-            if raw:
-                durable_write(log, before + raw)
-        else:
-            require(len(before) >= end and before[offset:end] == raw, error)
+        require(raw.startswith(before[offset:]), error)
+        span = {**span, "length": len(raw), "sha256": digest_bytes(raw)}
         desired["log_span"] = span
+        if receipt != desired:
+            durable_write(receipt_path, as_json(desired))
+        if not log.exists() or before[offset:] != raw:
+            durable_write(log, before[:offset] + raw)
     if receipt != desired:
         durable_write(receipt_path, as_json(desired))
     return code
@@ -2033,6 +2086,7 @@ def record_turn(run, operation, stdout, code):
 
 def record_unresolved_turn(run, operation):
     try:
+        operation_paths(run, operation)
         record_turn(run, operation, Path(operation["stdout"]).read_bytes(), None)
     except (Stop, ValueError, OSError) as exc:
         fail("operation %s is unresolved and accounting failed: %s; team-state, marker and output retained" %
@@ -2114,8 +2168,17 @@ def terminal_proof(run, operation, stdout):
             relevant = [event for event in events if event.get("type") in ("user", "assistant", "system")]
             require(all(event.get("sessionId") == operation["session"] for event in relevant), error)
             users = [event for event in relevant if event.get("type") == "user"]
-            require(len(users) == 1 and relevant[0] == users[0] and isinstance(users[0].get("uuid"), str), error)
-            prompt = message_text(users[0].get("message", {}).get("content"))
+            require(all(isinstance(event.get("message"), dict) for event in users), error)
+            prompts = []
+            for event in users:
+                content = event["message"].get("content")
+                if message_text(content) is not None:
+                    prompts.append(event)
+                else:
+                    require(isinstance(content, list) and bool(content) and
+                            all(isinstance(item, dict) and item.get("type") == "tool_result" for item in content), error)
+            require(len(prompts) == 1 and relevant[0] == prompts[0] and isinstance(prompts[0].get("uuid"), str), error)
+            prompt = message_text(prompts[0]["message"].get("content"))
             require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
             terminals = [event for event in relevant if event.get("type") == "assistant" and
                          isinstance(event.get("message"), dict) and
@@ -2175,6 +2238,7 @@ def operation_record(state, operation, *, pending_pid=False):
 
 def finish_operation(run, operation, stdout, code):
     from hierarchy_mailbox import writer_lock
+    operation_paths(run, operation)
     # Lock order: owner directory -> mailbox -> short Claude state transaction. Never acquire a mailbox lock
     # from a state callback, or keep a state lock over provider/accounting I/O or any child wait.
     with writer_lock(run.mailbox_root):
@@ -2186,7 +2250,7 @@ def finish_operation(run, operation, stdout, code):
         remove = require_owned_marker(operation) if operation.get("marker") else False
         code = record_turn(run, operation, stdout, code)
         index(run, Path(operation["stdout"]).name, Path(operation["stderr"]).name,
-              "turn-%s.accounting.json" % operation["id"], operation["turn_log"])
+              "turn-%s.accounting.json" % operation["id"], "turn-%s.launch.json" % operation["id"], operation["turn_log"])
         releasing = dict(operation)
         releasing["release"] = {"accounting_sha256": sha_file(run.evidence / ("turn-%s.accounting.json" % operation["id"]))}
         def release(current):
@@ -2259,6 +2323,12 @@ def model_turn(run, endpoint, binding, argv, cwd, prompt, timeout, marker=None, 
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if prompt is not None else subprocess.DEVNULL,
                                        stdout=stdout, stderr=stderr, start_new_session=True)
             operation.update(pid=process.pid, pid_start=process_identity(process.pid))
+            launch_path = run.evidence / ("turn-%s.launch.json" % identifier)
+            # Publish before team-state's PID transaction; a caller loss before publication remains unknown.
+            # The owner operation lock serializes writers and an invocation id never reuses an existing witness.
+            if launch_path.exists() or launch_path.is_symlink():
+                raise OSError("operation launch witness already exists")
+            durable_write(launch_path, as_json(launch_identity(operation)))
             def record_pid(current):
                 require_init(run, state=current)
                 recorded = operation_record(current, operation, pending_pid=True)
@@ -2289,7 +2359,12 @@ def reconcile(run, endpoint):
     state = require_init(run)
     operation = state.get("operations", {}).get(endpoint)
     require(operation is not None, "%s has no unresolved operation" % endpoint)
-    observation = operation_process_observation(operation)
+    require(operation.get("endpoint") == endpoint, "operation endpoint differs from its custody slot; retain the hold")
+    operation_paths(run, operation)
+    binding = Mailbox(run.mailbox_root).current_binding(endpoint)
+    require(all(operation.get(key) == binding.get(key) for key in ("host", "session", "generation")),
+            "operation binding changed; retain the hold")
+    observation = operation_process_observation(run, operation)
     require(observation["state"] != "PRESENT", "operation %s is unresolved: its process is still running" % operation["id"])
     if observation["state"] != "CONFIRMED_ABSENT":
         refuse("operation %s is unresolved: its process exit cannot be confirmed; retain the hold" % operation["id"],
