@@ -168,6 +168,11 @@ folder and the evidence folder for its read tools). It lists the tools the conne
 `team_status`, `team_pending`, `team_request`) and records the session and connection in `team-state.json`.
 Another session for a bound ROOT refuses: `endpoint is bound to another session; hand it off first`.
 
+With a host plan that puts ROOT on `claude-code`, this binds an existing conversation confirmed by its session id
+inside the run's `claude-home/projects`. Login must already have recorded the current private credentials file's
+sha256. The four decision tools above are the complete ROOT catalog. Provision writes the host-neutral
+`aegis.team-session/v1` record beside the binding. `up` for Claude roles remains unavailable in PR6 part 1.
+
 ### `up [--accept-agent-tools] [--no-loop]`
 
 Writes `<base>/team.json` (`<run>/initiatives/<initiative id>/team.json`) from the config's `team`, then starts the
@@ -212,6 +217,10 @@ for inspection. Read-tool text is untrusted data, never permission to decide ano
 Otherwise `approve` exits 3 with ROOT's last message. The reason is 1 to 512 characters, with
 no double quotes or line breaks.
 
+For Claude ROOT, the command instead uses provision's restricted print resume argv: no file tools, manual
+permissions, no permission prompts, strict MCP configuration containing only ROOT's decision connection, and
+stream-json output. The prompt travels on stdin. No model override is applied to ROOT.
+
 ### `turn <endpoint> <prompt>`
 
 One trusted owner turn in a role's own session, with its current wake-profile argv. This is how the owner answers a
@@ -222,6 +231,57 @@ stop the loop. The output is appended to `evidence/role-turns-<endpoint>.jsonl`,
 as `%2F`.
 The command claims the wake marker under the mailbox lock and rechecks the binding before launching. It retains
 the marker after an uncertain interruption so another turn cannot silently overlap it.
+
+An existing Claude role can also receive an owner turn. Its host, session and generation must match the binding
+and host plan; its print profile carries the restricted flags and its team's MCP connection. Before every Claude
+model invocation the credentials hash must equal the value recorded by `login`, or the command refuses with
+"the run's Claude login changed since `login`". A new login records the new hash.
+
+Both hosts use a one-hour owner-turn deadline (`TURN_TIMEOUT_SECONDS`); tests may lower it with
+`AEGIS_TEAM_TURN_TIMEOUT`. Expiry returns 3 and **leaves the model process running**. A durable operation in
+`team-state.json` records its id, endpoint, start time, pid and process start identity, transcript offsets, and
+file-backed stdout/stderr. `status` reports the hold; another approve or turn on the endpoint refuses before
+launching anything. Teardown also retains resources while a model operation is unresolved.
+
+Use `approve <request-id> --reconcile` for ROOT, or `turn <endpoint> --reconcile` for a role. These commands never
+replay a prompt. They require the recorded process to have exited and fresh transcript entries to show a completed
+or failed turn. Process exit alone, an older completed turn, or missing transcript evidence keeps the hold.
+Reconciliation releases the operation's wake marker once the outcome is known; a failed turn returns 3.
+
+Owner operations retain one identity from intent through launch, accounting and release. Codex-only state writers
+(including `init` and `up`) share the owner-operation directory lock without creating `.state.lock`. Claude state
+changes use the existing short transactions; browser login remains independent, so ROOT can bind while it waits.
+The lock order is owner operation, login when teardown needs it, mailbox writer, then the short state transaction.
+No state transaction waits for a browser or model process.
+
+Reconciliation checks the original transcript inode, complete-line boundary and unchanged prefix, then requires
+the submitted prompt and a terminal event associated with that invocation. Claude terminal messages must match the
+message id in its own stream; Codex completion must match the fresh native turn id and submitted user record.
+These checks detect discontinuity and association errors, not authenticated provider outcomes. Unsupported evidence
+keeps the operation unknown. A Claude system `turn_failed` or `turn_aborted` row is not supported native terminal
+proof; a session-only error result without a matching supported terminal also keeps the hold. An observed nonzero
+process exit remains recorded separately and cannot substitute for that proof. The wake marker carries the operation's
+unique token, and release verifies its content
+and metadata under the mailbox writer lock. A replacement wake is never removed by an older operation.
+
+Before releasing custody, the command ensures a durable `turn-<operation-id>.accounting.json` invocation receipt and
+its provider log. Cancellation and lost replies reconcile these records without sending another prompt. The same
+operation cannot append or charge twice; a missing usage value may become known, but a recorded value cannot be
+reset or replaced. Incomplete or conflicting accounting keeps the hold. Raw provider output remains separate.
+
+Claude invocations append one usage row to `root-turns.jsonl` or `role-turns-<endpoint>.jsonl`, alongside separate raw
+stream-json output. Input counts include fresh input, cache writes and cache reads once; cache reads and writes are
+also reported separately, and the native usage and cost fields are retained. Missing `result` events, including
+deadline expiry, record usage as null. Reconciliation does not append a second invocation row. Aggregation into
+`usage-ledger.json` belongs to PR7. Codex retains its existing event rows and argv.
+
+All team child environments use an allowlist: PATH, HOME, LANG, LC_*, TERM, TMPDIR, USER, LOGNAME and the run's host
+home variables. The command sets its own Python bytecode flag. Ambient provider keys, session variables and
+SSH_AUTH_SOCK are dropped, including on Codex-only runs. `evidence/child-environment.json` records every dropped
+variable's name, never its value. Refusals do not update this evidence or the command log.
+
+If launcher stop reports nonempty `unowned_pids`, teardown carries those pids into its result and returns 3 while
+keeping resources. It cannot report that endpoint as cleanly stopped merely because the owned host was not found.
 
 ### `status [--text]`
 

@@ -612,7 +612,7 @@ def test_a_host_plan_outside_the_v2_schema_is_refused(team, capsys, change, erro
 @linux
 @pytest.mark.parametrize("hosts", [{"root": CODEX, "team": CLAUDE}, {"root": CLAUDE, "team": CODEX}])
 def test_claude_plans_init_but_root_and_up_refuse_until_pr6_and_write_nothing(team, hosts):
-    # PR 5 lifted this test's interim init refusal; starting or binding a Claude role waits for T2(a) PR 6.
+    # Claude ROOT binding requires the run's login; starting Claude team roles remains deferred.
     from tests.integration.hierarchy_fake_claude import BILLING, install, require_fake
     install(team.bin)
     require_fake(str(team.bin))
@@ -640,7 +640,7 @@ def test_claude_plans_init_but_root_and_up_refuse_until_pr6_and_write_nothing(te
     before = files()
     if hosts["root"] == CLAUDE:
         assert team.team("root", "--session", ROOT_SESSION, expect=2) == {
-            "error": "this team command binds a claude-code ROOT from T2(a) PR 6"}
+            "error": "the run's Claude login changed since `login`; run login again before starting Claude"}
         assert team.mailbox().status()["bindings"]["pilot/root"] is None
     if hosts["team"] == CLAUDE:
         assert team.team("up", expect=2) == {"error": "this team command starts claude-code team roles from T2(a) PR 6"}

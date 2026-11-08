@@ -24,7 +24,7 @@ import pytest
 
 from tests.integration.hierarchy_fake_claude import BILLING, HERE as FAKE_CLAUDE, install, require_fake
 from tests.integration.test_hierarchy_mailbox import ROOT
-from tests.integration.test_hierarchy_team import ROLE_ORDER, TEAM, Run, in_process, sha
+from tests.integration.test_hierarchy_team import FAKE_CONTROL_LOADER, ROLE_ORDER, TEAM, Run, in_process, sha
 
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
@@ -44,6 +44,7 @@ CLEANED = "; removed credentials written by this login"
 WRAPPER = r'''#!%(python)s
 import json, os, select, subprocess, sys, time
 from pathlib import Path
+%(controls)s
 argv = sys.argv[1:]
 env = dict(os.environ)
 home = Path(env["CLAUDE_CONFIG_DIR"])
@@ -112,6 +113,9 @@ class HomesRun(Run):
     def __init__(self, tmp_path, monkeypatch, root, team):
         super().__init__(tmp_path, monkeypatch)
         install(self.bin)
+        (self.bin / "claude").write_text(
+            "#!%s\nimport json, os, runpy\nfrom pathlib import Path\n%s\nrunpy.run_path(%r, run_name='__main__')\n"
+            % (sys.executable, FAKE_CONTROL_LOADER, str(FAKE_CLAUDE)), encoding="utf-8")
         require_fake(str(self.bin))
         for name in BILLING + ("CLAUDE_CONFIG_DIR",):
             monkeypatch.delenv(name, raising=False)
@@ -136,7 +140,8 @@ class HomesRun(Run):
 
     def wrap_claude(self):
         path = self.bin / "claude"
-        path.write_text(WRAPPER % {"python": sys.executable, "fake": str(FAKE_CLAUDE)}, encoding="utf-8")
+        path.write_text(WRAPPER % {"python": sys.executable, "fake": str(FAKE_CLAUDE),
+                                  "controls": FAKE_CONTROL_LOADER}, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         require_fake(str(self.bin))
 
@@ -1123,6 +1128,8 @@ def test_round3_codex_only_login_preserves_the_legacy_lock_file_behaviour(make, 
 # so login's test hook can resume without a sleep or a deadlock while it holds the transaction lock.
 ROOT_TRANSACTION = r'''
 import fcntl, os, runpy, sys
+# Python 3.9's pathlib accessor must capture native os.open, before the hook becomes a bound method.
+from pathlib import Path
 team, config, state, event = sys.argv[1:]
 lock = os.path.join(os.path.dirname(state), ".state.lock")
 state_descriptors = set()
@@ -1170,15 +1177,39 @@ def test_round4_root_competing_after_logins_final_reload_keeps_both_bindings(mak
     original = os.replace
     roots = []
     signals = []
+    child_evidence = run.tmp / "root-child-evidence"
+    child_evidence.mkdir(mode=0o700)
+    (child_evidence / ".keep").touch(mode=0o600)
+    stdout_path, stderr_path = child_evidence / "stdout", child_evidence / "stderr"
+    diagnostic_path = child_evidence / "diagnostics.json"
+    diagnostic_path.touch(mode=0o600)
+    observations = []
+
+    def child_diagnostic(process, phase):
+        detail = {"phase": phase, "pid": process.pid, "exit_status": process.poll(),
+                  "signals": [value.decode("ascii") for value in signals]}
+        for name, path in (("stdout", stdout_path), ("stderr", stderr_path)):
+            # A separate reader leaves the live child's output descriptor offset untouched.
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 4096))
+                detail[name + "_tail"] = stream.read(4096).decode("utf-8", "replace")
+        observations.append(detail)
+        diagnostic_path.write_text(json.dumps(observations, indent=2), encoding="utf-8")
+        return json.dumps(detail, sort_keys=True)
 
     def root_after_reload(source, destination, *args, **kwargs):
         if (Path(destination) == state_path and not roots and
                 CLAUDE in json.loads(Path(source).read_text()).get("logins", {})):
-            process = subprocess.Popen([sys.executable, "-I", "-B", "-c", ROOT_TRANSACTION,
-                                        str(TEAM), str(run.config_path), str(state_path), str(event_path)],
-                                       env=run.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            with os.fdopen(os.open(stdout_path, flags, 0o600), "wb") as stdout, \
+                    os.fdopen(os.open(stderr_path, flags, 0o600), "wb") as stderr:
+                process = subprocess.Popen([sys.executable, "-I", "-B", "-c", ROOT_TRANSACTION,
+                                            str(TEAM), str(run.config_path), str(state_path), str(event_path)],
+                                           env=run.env(), stdout=stdout, stderr=stderr, text=True)
             roots.append(process)
-            assert select.select([event], [], [], 2)[0], "ROOT neither saved nor reached the state lock"
+            assert select.select([event], [], [], 2)[0], (
+                "ROOT neither saved nor reached the state lock; " + child_diagnostic(process, "readiness"))
             signals.append(os.read(event, 1))
             assert signals[-1] in (b"B", b"S")
             if fail_login_save:
@@ -1189,14 +1220,20 @@ def test_round4_root_competing_after_logins_final_reload_keeps_both_bindings(mak
     try:
         code, answer = in_process(run, "login", capsys=capsys)
         assert roots, "login did not reach its final state write"
-        stdout, stderr = roots[0].communicate(timeout=2)
-        assert roots[0].returncode == 0 and stderr == "", stdout + stderr
+        try:
+            roots[0].wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pytest.fail("ROOT did not finish within two seconds; " + child_diagnostic(roots[0], "completion-timeout"))
+        detail = child_diagnostic(roots[0], "completed")
+        stdout, stderr = stdout_path.read_text(encoding="utf-8"), stderr_path.read_text(encoding="utf-8")
+        assert roots[0].returncode == 0 and stderr == "", detail
         assert json.loads(stdout.splitlines()[-1])["session"] == "root-after-login-read"
     finally:
         for process in roots:
             if process.poll() is None:
                 process.kill()
-                process.communicate(timeout=2)
+                process.wait(timeout=2)
+            child_diagnostic(process, "cleanup")
         os.close(event)
     current = state(run)
     assert current["root"] is not None, "login overwrote the ROOT binding saved after its final state reload"
@@ -1231,6 +1268,7 @@ def test_round4_codex_only_commands_do_not_create_or_consult_a_state_lock(make, 
         assert lock.read_bytes() == b"unrelated legacy state file\n" and stat.S_IMODE(lock.stat().st_mode) == 0o644
     else:
         assert not lock.exists()
+
 
 
 # -- child processes and the loop -----------------------------------------------------------------------------------------
@@ -1274,12 +1312,17 @@ def test_child_processes_and_the_loop_get_the_runs_claude_home(make):
 def test_root_refuses_a_claude_root_without_writing_and_up_still_starts_a_codex_team(make):
     run = make(CLAUDE, CODEX)
     run.team("init")
-    before = files(run.run)
+    run.team("login")
+    transcript = run.claude_home / "projects" / "fixture-root" / "root-session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({"type": "assistant", "sessionId": "root-session",
+                                      "message": {"stop_reason": "end_turn"}}) + "\n")
 
-    answer = run.team("root", "--session", "root-session", expect=2)
+    answer = run.team("root", "--session", "root-session")
 
-    assert answer == {"error": "this team command binds a claude-code ROOT from T2(a) PR 6"}
-    assert files(run.run) == before and run.mailbox().status()["bindings"]["pilot/root"] is None
+    assert answer["endpoint"] == "pilot/root" and answer["session"] == "root-session"
+    assert answer["tools"] == ["root_decide", "team_status", "team_pending", "team_request"]
+    assert run.mailbox().status()["bindings"]["pilot/root"]["host"] == CLAUDE
     started = run.team("up", "--no-loop")
     assert [row["endpoint"] for row in started["roles"]] == ROLE_ORDER
     down = run.team("down")
@@ -1419,10 +1462,12 @@ def test_a_codex_only_run_ignores_claude_and_writes_what_it_wrote_before(make, s
 
     team = team_module()
     parsed = team.Run(str(run.config_path))
-    assert team.child_env(parsed)["CLAUDE_CONFIG_DIR"] == elsewhere, "left as the shell has it"
+    assert "CLAUDE_CONFIG_DIR" not in team.child_env(parsed)
+    assert "CLAUDE_CONFIG_DIR" in json.loads((run.evidence / "child-environment.json").read_text())["dropped_names"]
     loop = team.start_loop(parsed)
     environ = proc_environ(loop["pid"])
-    assert environ["CLAUDE_CONFIG_DIR"] == elsewhere
+    assert "CLAUDE_CONFIG_DIR" not in environ
+    assert elsewhere not in (run.evidence / "child-environment.json").read_text()
     assert (run.evidence / "loop-environ.txt").read_text() == "CODEX_HOME=%s\nPATH=%s\n" % (run.codex_home,
                                                                                            environ["PATH"])
     down = run.team("down", CLAUDE_CONFIG_DIR=elsewhere)

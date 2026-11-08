@@ -1,5 +1,6 @@
 """Team teardown retains custody when job completion or configuration is uncertain."""
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -134,7 +135,7 @@ def test_down_keeps_resources_when_job_cleanup_reporting_is_malformed(run, monke
 
 def test_owner_turn_retains_its_marker_after_a_lost_reply(run, monkeypatch, capsys):
     run.ready("--no-loop")
-    original = subprocess.run
+    original = subprocess.Popen
     executed = []
     marker = run.mailbox().wake_marker(REVIEWER)
 
@@ -142,18 +143,42 @@ def test_owner_turn_retains_its_marker_after_a_lost_reply(run, monkeypatch, caps
         result = original(argv, *args, **kwargs)
         if argv[0] == "codex":
             executed.append(list(argv))
-            assert result.returncode == 0
-            raise OSError("fixture: owner turn reply lost")
+            wait = result.wait
+
+            def lost_reply(*args, **kwargs):
+                wait(*args, **kwargs)
+                assert result.returncode == 0
+                raise OSError("fixture: owner turn reply lost")
+
+            result.wait = lost_reply
         return result
 
-    monkeypatch.setattr(subprocess, "run", lose_reply)
+    monkeypatch.setattr(subprocess, "Popen", lose_reply)
     for key, value in run.env().items():
         monkeypatch.setenv(key, value)
     code, answer = in_process(run, "turn", REVIEWER, "Check in.", capsys=capsys)
-    assert code == 3 and answer["error"] == "fixture: owner turn reply lost"
+    assert code == 3
+    operation = answer["operation"]
+    assert isinstance(operation["id"], str) and operation["id"]
+    state_path = run.run / "team-state.json"
+    retained_state = state_path.read_bytes()
+    assert json.loads(retained_state)["operations"][REVIEWER] == operation
+    assert answer["error"] == (
+        "operation %s is unresolved: fixture: owner turn reply lost; "
+        "team-state and output retained; inspect before reconciliation" % operation["id"])
     assert len(executed) == 1
     assert marker.exists(), "a lost reply cannot establish that the turn never ran"
+    retained_marker = marker.read_bytes()
+    paths = [Path(operation["stdout"]), Path(operation["stderr"]), run.evidence / operation["turn_log"]]
+    assert all(path.parent == run.evidence for path in paths)
+    retained_output = {path: path.read_bytes() for path in paths}
     code, answer = in_process(run, "turn", REVIEWER, "Check in again.", capsys=capsys)
     assert code == 2
-    assert answer["error"] == "a wake is running for %s (%s); try again after it ends" % (REVIEWER, marker)
+    assert answer["error"] == (
+        "%s has unresolved operation %s; inspect status, then use approve/turn --reconcile; "
+        "never replay an unknown turn" % (REVIEWER, operation["id"]))
+    assert answer["operation"] == operation
     assert len(executed) == 1
+    assert marker.exists() and marker.read_bytes() == retained_marker
+    assert state_path.read_bytes() == retained_state
+    assert {path: path.read_bytes() for path in paths} == retained_output

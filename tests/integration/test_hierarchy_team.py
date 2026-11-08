@@ -21,6 +21,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -45,6 +46,34 @@ TEAM_SETTINGS = {"model": "gpt-6.1-sol", "reasoning": "high",
 DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2", "memories", "computer_use",
             "browser_use", "browser_use_external", "browser_use_full_cdp_access", "goals", "shell_tool", "unified_exec"]
 EMPTY = hashlib.sha256(b"").hexdigest()
+# Only test executables read this file. Each invocation has its own TMPDIR, which the real child allowlist already
+# carries, so a second command cannot replace a paused login's controls. No production code knows this filename.
+FAKE_CONTROLS_FILE = "aegis-team-fake-controls.json"
+FAKE_CONTROL_LOADER = r'''
+_fake_tmp = os.environ.get("TMPDIR")
+if _fake_tmp:
+    _fake_control_file = Path(_fake_tmp) / "aegis-team-fake-controls.json"
+    if _fake_control_file.is_file():
+        _fake_controls = json.loads(_fake_control_file.read_text(encoding="utf-8"))
+        if not isinstance(_fake_controls, dict) or any(
+                not isinstance(name, str) or not name.startswith(("FAKE_", "WRAP_")) or not isinstance(value, str)
+                for name, value in _fake_controls.items()):
+            raise SystemExit("invalid staged fake controls")
+        os.environ.update(_fake_controls)
+'''
+
+
+def fake_environment(tmp, env):
+    """Stage only fake controls for one invocation; production children keep their normal environment allowlist."""
+    controls = {name: value for name, value in env.items() if name.startswith(("FAKE_", "WRAP_"))}
+    folder = Path(tempfile.mkdtemp(prefix="host-controls-", dir=str(tmp)))
+    descriptor = os.open(str(folder / FAKE_CONTROLS_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(controls, stream)
+    env["TMPDIR"] = str(folder)
+    return env
+
+
 # The targeted-tests recipe's step: each named file's test_* functions, counted into junit. A stand-in for pytest.
 RUNNER = r'''
 import importlib.util, os, sys
@@ -70,6 +99,7 @@ sys.exit(1 if failed else 0)
 CODEX_WRAPPER = r'''
 import json, os, re, subprocess, sys, uuid
 from pathlib import Path
+%(controls)s
 
 FAKE = %(fake)r
 AGENT_RECORD = %(agent)r
@@ -246,7 +276,8 @@ def seal_spawns(monkeypatch, folder):
 def fake_codex(folder, log=None):
     """The test's `codex`: the wrapper above around the repo's fake codex."""
     path = folder / "codex"
-    path.write_text("#!" + sys.executable + "\n" + CODEX_WRAPPER % {"fake": str(FAKE_CODEX), "agent": str(AGENT_TOOLS)},
+    path.write_text("#!" + sys.executable + "\n" + CODEX_WRAPPER % {
+        "fake": str(FAKE_CODEX), "agent": str(AGENT_TOOLS), "controls": FAKE_CONTROL_LOADER},
                     encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
@@ -366,9 +397,10 @@ class Run:
         return self.run / "evidence"
 
     def env(self, **extra):
-        return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FAKE_CODEX_ROLLOUT": "1", "FAKE_TEAM_LOG": str(self.log),
-                "FAKE_HOST_LOG": str(self.host_log), "FAKE_HOST_PLAN": str(self.plan_path),
-                "CLAUDE_CONFIG_DIR": str(self.tmp / "claude-home"), **extra}
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "FAKE_CODEX_ROLLOUT": "1", "FAKE_TEAM_LOG": str(self.log),
+               "FAKE_HOST_LOG": str(self.host_log), "FAKE_HOST_PLAN": str(self.plan_path),
+               "CLAUDE_CONFIG_DIR": str(self.tmp / "claude-home"), **extra}
+        return fake_environment(self.tmp, env)
 
     def team(self, *words, expect=0, stderr="", **extra):
         proc = subprocess.run([sys.executable, "-I", "-B", str(TEAM), "--config", str(self.config_path), *words],
@@ -916,14 +948,14 @@ def test_deny_can_revoke_a_previously_approved_request(run):
 
 def test_owner_turn_holds_the_wake_marker_until_its_process_finishes(run, capsys):
     run.ready("--no-loop")
-    original = subprocess.run
+    original = subprocess.Popen
     marker = run.mailbox().wake_marker(REVIEWER)
     seen = []
-    def inspect(argv, **kwargs):
+    def inspect(argv, *args, **kwargs):
         if argv[0] == "codex":
             seen.append(marker.exists())
-        return original(argv, **kwargs)
-    run.monkeypatch.setattr(subprocess, "run", inspect)
+        return original(argv, *args, **kwargs)
+    run.monkeypatch.setattr(subprocess, "Popen", inspect)
     for key, value in run.env().items():
         run.monkeypatch.setenv(key, value)
     code, answer = in_process(run, "turn", REVIEWER, "Check in.", capsys=capsys)

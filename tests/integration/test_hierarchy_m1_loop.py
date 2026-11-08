@@ -51,7 +51,7 @@ from tests.integration.test_hierarchy_loop import World, holds
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, mailbox_snapshot
 from tests.integration.test_hierarchy_mailbox_mcp import payload
 from tests.integration.test_hierarchy_sweep import SealedFleet
-from tests.integration.test_hierarchy_team import TEAM, TEAM_SETTINGS, fake_codex, seal_spawns, stub
+from tests.integration.test_hierarchy_team import TEAM, TEAM_SETTINGS, fake_codex, fake_environment, seal_spawns, stub
 from tests.integration.test_hierarchy_workspace import Workspace
 
 
@@ -173,9 +173,9 @@ class Scenario(SealedFleet):
 
     # -- fixture plumbing -------------------------------------------------------------------------------------------
 
-    def env(self):
-        return {**super().env(), "HOME": str(self.home), "TMPDIR": "/tmp", "FAKE_CODEX_ROLLOUT": "1",
-                "FAKE_TEAM_LOG": str(self.tmp / "fake-team.log")}
+    def env(self, **extra):
+        return fake_environment(self.tmp, {**super().env(), "HOME": str(self.home), "FAKE_CODEX_ROLLOUT": "1",
+                                          "FAKE_TEAM_LOG": str(self.tmp / "fake-team.log"), **extra})
 
     def team(self, *words, expect=0, text=False):
         """`hierarchy_team.py` with this scenario's config, in the sealed environment."""
@@ -217,7 +217,7 @@ class Scenario(SealedFleet):
         return self.head()
 
     def launcher(self, *words, expect=0, thread=None):
-        env = {**self.env(), "FAKE_CODEX_THREAD": thread or "", "FAKE_CODEX_LOG": str(self.tmp / "fake-codex.log")}
+        env = self.env(FAKE_CODEX_THREAD=thread or "", FAKE_CODEX_LOG=str(self.tmp / "fake-codex.log"))
         proc = subprocess.run([sys.executable, "-I", str(LAUNCHER), "--base", str(self.base), *words],
                               capture_output=True, text=True, timeout=30, env=env)
         assert not proc.stderr, proc.stderr

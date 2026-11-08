@@ -38,6 +38,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -70,6 +71,10 @@ V1_HOSTS = {"root": CODEX, "team": CODEX}
 CLAUDE_CREDENTIALS = ".credentials.json"
 # Seconds, lowerable for CLI timeout tests; never extended past the normal 60-second status deadline.
 CLAUDE_AUTH_STATUS_TIMEOUT = "AEGIS_CLAUDE_AUTH_STATUS_TIMEOUT"
+TURN_TIMEOUT_SECONDS = 3600
+TURN_TIMEOUT_VARIABLE = "AEGIS_TEAM_TURN_TIMEOUT"
+ROOT_TOOLS = ("root_decide", "team_status", "team_pending", "team_request")
+CHILD_ENVIRONMENT = frozenset(("PATH", "HOME", "LANG", "TERM", "TMPDIR", "USER", "LOGNAME"))
 # Managed settings can set an apiKeyHelper that --restricted still reads; login records whether the file exists.
 CLAUDE_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 # A stand-in binding that never runs a host; the host plan lists it so status can say so (spec rule 6).
@@ -458,7 +463,7 @@ def safe_home(run, home, label, variable, owners, apart=()):
 
 
 def safe_codex_home(run):
-    owners = owner_homes(CODEX) + owner_homes(CLAUDE) if run.uses(CLAUDE) else [Path.home() / ".codex"]
+    owners = owner_homes(CODEX) + owner_homes(CLAUDE)
     return safe_home(run, run.codex_home, "codex_home", "CODEX_HOME", owners)
 
 
@@ -658,14 +663,28 @@ def append_evidence(run, name, raw):
 
 def child_env(run, path=None):
     revalidate_homes(run)
-    env = dict(os.environ)
+    # A host's home is the registry's only required ambient setting. Session tokens, agent settings, provider
+    # credentials and SSH sockets must not cross this boundary, including on historical Codex-only runs.
+    env = {name: value for name, value in os.environ.items()
+           if name in CHILD_ENVIRONMENT or name.startswith("LC_")}
     env["CODEX_HOME"] = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
     if run.uses(CLAUDE):
         env["CLAUDE_CONFIG_DIR"] = run.validated_homes[CLAUDE]
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     if path is not None:
         env["PATH"] = path
+    run.dropped_names = getattr(run, "dropped_names", set()) | (os.environ.keys() - env.keys())
     return env
+
+
+def environment_evidence(run):
+    names = getattr(run, "dropped_names", None)
+    if names is not None:
+        name = "child-environment.json"
+        previous = read_json(run.evidence / name) if (run.evidence / name).is_file() else {}
+        value = {"dropped_names": sorted(set(previous.get("dropped_names", [])) | names)}
+        if value != previous:
+            save(run, name, value)
 
 
 def last_json(stdout):
@@ -1061,6 +1080,11 @@ def init(run, args):
                  "root": None, "up": None, "down": {"done": {}}}
         revalidate_run(run)
         run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not getattr(run, "owner_operation_locked", False):
+            # The first init creates the directory that owns the lock. Reload everything under that lock before
+            # its first state save too, so two initializers cannot outlive one another and erase later operations.
+            with operation_lock(run):
+                return init(run, args)
         save_state(run, state)
     revalidate_run(run)
     ran = []
@@ -1317,18 +1341,151 @@ def current_actor(run, role):
     return read_json(run.run / "policy.json")["current"].get(role)
 
 
+def claude_pin(run):
+    revalidate_homes(run)
+    pinned = (require_init(run).get("logins", {}).get(CLAUDE) or {}).get("credentials_sha256")
+    require(pinned is not None and credentials_digest(run) == pinned,
+            "the run's Claude login changed since `login`; run login again before starting Claude")
+    for folder, directories, names in os.walk(run.validated_homes[CLAUDE], followlinks=False):
+        for name in directories + names:
+            require(not (Path(folder) / name).is_symlink(), "claude_home contains a symlink: " + str(Path(folder) / name))
+
+
+def claude_transcript(run, session):
+    found = hierarchy_hosts.transcripts(CLAUDE, run.validated_homes[CLAUDE], session)
+    require(len(found) == 1, "Claude session is not confirmed by one transcript in the run's claude_home/projects")
+    events = list(hierarchy_hosts.claude_events(found[0].read_bytes()))
+    identities = {event["sessionId"] for event in events if "sessionId" in event and isinstance(event["sessionId"], str)}
+    require(identities == {session}, "Claude session is not confirmed by its transcript sessionId")
+    return found[0]
+
+
+def planned_binding(run, endpoint, host):
+    mailbox = Mailbox(run.mailbox_root)
+    entry = hierarchy_provision.registry_role(mailbox, endpoint)
+    plan = hierarchy_hosts.governing_plan(run.base, run.mailbox_root, run.id)
+    hierarchy_hosts.require_binding(plan, endpoint, host, hierarchy_roles.writer(entry))
+    return mailbox
+
+
+def claude_connection(run, binding, connection):
+    """Only provision's own team servers may enter a restricted Claude invocation."""
+    setup = read_json(run.base / "provision.json")
+    endpoint = binding["endpoint"]
+    servers = read_json(Path(connection))
+    require(set(servers) == {"mcpServers"}, "Claude connection has unexpected fields")
+    if endpoint_parts(endpoint)[1] == "root":
+        request = {"lifecycle": str(run.lifecycle), "actor": current_actor(run, "root"),
+                   "loop_state": str(run.loop_state), "evidence": str(run.evidence)}
+        arguments = hierarchy_provision.decision_args(setup, endpoint, CLAUDE, binding["session"], binding["generation"], request)
+        expected = {"aegis_decision": {"command": setup["python"], "args": arguments}}
+        allowed = ["mcp__aegis_decision__" + name for name in ROOT_TOOLS]
+    else:
+        mailbox = Mailbox(run.mailbox_root)
+        entry = hierarchy_provision.registry_role(mailbox, endpoint)
+        actual = servers["mcpServers"].get("aegis_mailbox", {}).get("args", [])
+        options = {}
+        for flag, key in (("--lifecycle", "lifecycle"), ("--actor", "actor"), ("--source-repo", "source_repo")):
+            if flag in actual:
+                offset = actual.index(flag)
+                require(offset + 1 < len(actual), "incomplete Claude connection argument: " + flag)
+                options[key] = actual[offset + 1]
+        if "lifecycle" in options:
+            require(options["lifecycle"] == str(run.lifecycle), "Claude connection names another lifecycle")
+        if "actor" in options:
+            require(options["actor"] == current_actor(run, endpoint_parts(endpoint)[1]), "Claude connection names another actor")
+        if "source_repo" in options:
+            hierarchy_roles.require_source_views(endpoint, mailbox.endpoint(endpoint).get("kind"))
+        arguments = hierarchy_provision.adapter_args(setup, endpoint, CLAUDE, binding["session"], binding["generation"],
+                                                       options.get("source_repo"), hierarchy_provision.lifecycle_args(options))
+        expected = {"aegis_mailbox": {"command": setup["python"], "args": arguments}}
+        tools = hierarchy_provision.MAILBOX_TOOLS + list(hierarchy_provision.role_workspace_tools(mailbox, endpoint))
+        if "lifecycle" in options:
+            tools += list(hierarchy_roles.lifecycle_tools(entry))
+        if "source_repo" in options:
+            tools += list(hierarchy_roles.SOURCE_VIEW_TOOLS)
+        allowed = ["mcp__aegis_mailbox__" + name for name in tools]
+        if hierarchy_provision.takes_board(setup, mailbox, endpoint):
+            expected["aegis_board"] = {"command": setup["python"], "args": hierarchy_provision.board_args(
+                setup, endpoint, CLAUDE, binding["session"], binding["generation"])}
+            allowed += ["mcp__aegis_board__" + name for name in hierarchy_provision.BOARD_TOOL_SPECS]
+    require(servers["mcpServers"] == expected, "Claude connection differs from the team's provisioned servers")
+    return allowed
+
+
+def claude_resume_profile(run, binding, profile):
+    start = next((request for endpoint, request in plan_roles(run) if endpoint == binding["endpoint"]), None)
+    require(start is not None and profile["cwd"] == str(Path(start["cwd"]).resolve()),
+            "Claude print profile cwd differs from the configured worktree")
+    argv = profile["argv"]
+    require(isinstance(argv, list) and all(isinstance(word, str) for word in argv), "invalid Claude print argv")
+    connection = str(run.base / "connections" / ("%s-g%d.json" % (binding["endpoint"].replace("/", "%2F"), binding["generation"])))
+    allowed = claude_connection(run, binding, connection)
+    mailbox = Mailbox(run.mailbox_root)
+    tool_words = [word[len("--tools="):] for word in argv if word.startswith("--tools=")]
+    require(len(tool_words) == 1, "Claude print profile differs from the registry argv")
+    tools, _writer = hierarchy_provision.role_tools(binding["endpoint"], mailbox, tool_words[0])
+    allowed += [name for name in tools if name in hierarchy_provision.WRITE_TOOLS]
+    options = {}
+    for flag, key in (("--model", "model"), ("--effort", "effort")):
+        if flag in argv:
+            offset = argv.index(flag)
+            require(offset + 1 < len(argv), "incomplete Claude print argument: " + flag)
+            options[key] = argv[offset + 1]
+    options, _fixed = hierarchy_provision.fixed_profile(options, mailbox, binding["endpoint"], CLAUDE)
+    options, _team = hierarchy_provision.team_settings(run.base, CLAUDE, options,
+                                                      hierarchy_provision.role_kind(mailbox, binding["endpoint"]))
+    # The registry builder has one supported --settings payload. Never pass a profile's arbitrary JSON through.
+    if "--settings" in argv and options.get("effort") == "max":
+        options = {**options, "ultracode": True}
+    expected = hierarchy_provision.claude_argv(["--resume", binding["session"]], connection, tools, allowed, options, None)
+    require(argv == expected, "Claude print profile differs from the registry argv")
+    return expected
+
+
 def root(run, args):
     state = require_init(run)
-    if run.hosts["root"] == CLAUDE:
-        refuse("this team command binds a claude-code ROOT from T2(a) PR 6")
     require(hierarchy_provision.SESSION.fullmatch(args.session) is not None, "invalid session: " + args.session[:80])
-    request = {"base": str(run.base), "endpoint": run.endpoint("root"), "host": CODEX, "session": args.session,
+    host = run.hosts["root"]
+    mailbox = planned_binding(run, run.endpoint("root"), host)
+    request = {"base": str(run.base), "endpoint": run.endpoint("root"), "host": host, "session": args.session,
                "lifecycle": str(run.lifecycle), "actor": current_actor(run, "root"), "loop_state": str(run.loop_state),
                "evidence": str(run.evidence)}
-    code, answer, _ = tool(run, "provision", "add-role", "--request", request_file(run, "root.json", request))
-    if code != 0:
-        (refuse if code == REFUSED else fail)(answer.get("error", "provision add-role exited %d" % code))
-    tools = adapter_tools(run, answer["connection"])
+    history = mailbox.bindings(request["endpoint"])
+    require(not history or (history[-1]["session"] == args.session and history[-1]["host"] == host),
+            "endpoint is bound to another session; hand it off first")
+    hierarchy_roles.require_independent_session(mailbox, request["endpoint"], host, args.session)
+    if host == CLAUDE:
+        claude_pin(run)
+        claude_transcript(run, args.session)
+        offered = (hierarchy_provision.DECISION_TOOL, *hierarchy_roles.decision_tools(hierarchy_roles.role(request["endpoint"])))
+        require(offered == ROOT_TOOLS, "ROOT tools mismatch: expected " + ", ".join(ROOT_TOOLS))
+        setup = read_json(run.base / "provision.json")
+        hierarchy_provision.hierarchy_runtime_source.verify(setup, run.base)
+        hierarchy_provision.check_role_request(request, setup)
+        # Provision stages its session record and validates the request before binding. Avoid a request-file write
+        # on this path: an unconfirmed conversation or mismatched binding must leave no files behind.
+        try:
+            answer = hierarchy_provision.add_role(request)
+        except (ValueError, OSError) as exc:
+            fail("ROOT provisioning failed: %s; inspect the retained binding, connection and session records" % exc)
+        answer["mcp_config"] = answer["connection"]
+    else:
+        # Stage the input outside the run until provision accepts it. A refusal (for example runtime source drift)
+        # cannot leave inputs/root.json behind. The accepted run retains exactly the same request bytes as before.
+        with tempfile.TemporaryDirectory() as folder:
+            staged = Path(folder) / "root.json"
+            staged.write_bytes(as_json(request))
+            code, answer, _ = tool(run, "provision", "add-role", "--request", staged)
+        if code != 0:
+            (refuse if code == REFUSED else fail)(answer.get("error", "provision add-role exited %d" % code))
+        request_file(run, "root.json", request)
+    try:
+        tools = adapter_tools(run, answer["connection"])
+    except (Stop, ValueError, OSError, subprocess.SubprocessError) as exc:
+        fail("ROOT was bound but its tool probe failed: %s; binding, connection and session record retained" % exc)
+    if host == CLAUDE and tuple(tools) != ROOT_TOOLS:
+        fail("ROOT tools mismatch after binding; binding and session record retained for inspection", tools=tools)
     save(run, "root-binding.json", {**answer, "tools": tools})
     binding = {"session": args.session, "generation": answer["generation"], "connection": answer["connection"],
                "mcp_config": answer["mcp_config"], "tools": tools, "at": timestamp()}
@@ -1512,7 +1669,7 @@ def start_loop(run):
 
 
 def up(run, args):
-    state = require_init(run)
+    require_init(run)
     # Before the loop status check, which runs a child: nothing is started or written for a Claude team yet.
     if run.hosts["team"] == CLAUDE:
         refuse("this team command starts claude-code team roles from T2(a) PR 6")
@@ -1556,8 +1713,11 @@ def up(run, args):
     save(run, "up-roles.json", rows)
     save(run, "launcher-status-start.json", checked(run, "launcher status", "launcher", "--base", run.base, "status"))
     loop = {"state": "not_started", "reason": "--no-loop"} if args.no_loop else start_loop(run)
-    state["up"] = {"at": timestamp(), "roles": [row["endpoint"] for row in rows], "loop": loop}
-    save_state(run, state)
+    raised = {"at": timestamp(), "roles": [row["endpoint"] for row in rows], "loop": loop}
+    def record(current):
+        require_init(run, state=current)
+        current["up"] = raised
+    update_state(run, record)
     note = None
     if "router" in run.roles:
         profile = hierarchy_roles.role(run.endpoint("router"))["model_profile"]
@@ -1622,14 +1782,566 @@ def agent_items(stdout):
     return items
 
 
+@contextmanager
+def operation_lock(run, busy_message="another team command is running for this run"):
+    """Serialize binding, owner turns and teardown without creating a lock file on a refusal.
+
+    Lock the stable run directory inode: team-state.json is replaced atomically, so locking that file would allow
+    a second writer to lock its replacement. Browser login holds only its login lock; state transactions stay short.
+    """
+    import fcntl
+    descriptor = os.open(str(run.run), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            refuse(busy_message, record_command=False)
+        run.owner_operation_locked = True
+        yield
+    finally:
+        run.owner_operation_locked = False
+        os.close(descriptor)
+
+
+def turn_deadline():
+    timeout = float(os.environ.get(TURN_TIMEOUT_VARIABLE, str(TURN_TIMEOUT_SECONDS)))
+    require(0 < timeout <= TURN_TIMEOUT_SECONDS,
+            TURN_TIMEOUT_VARIABLE + " must be greater than 0 and at most %d seconds" % TURN_TIMEOUT_SECONDS)
+    return timeout
+
+
+def require_resolved(run, endpoint, *, state=None):
+    operation = require_init(run, state=state).get("operations", {}).get(endpoint)
+    if operation:
+        refuse("%s has unresolved operation %s; inspect status, then use approve/turn --reconcile; never replay an "
+               "unknown turn" % (endpoint, operation["id"]), operation=operation)
+
+
+def process_identity(pid):
+    try:
+        return Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+OPERATION_SCOPE_REASONS = frozenset(component + " is " + problem
+    for component in ("observer_pid", "boot_id", "pid_namespace", "proc_identity")
+    for problem in ("unreadable", "invalid"))
+
+
+def operation_process_scope():
+    """Capture once before Popen, including unavailable evidence. Scope is not a native-wait prerequisite."""
+    values = {}
+    for name, read in (
+            ("observer_pid", lambda: Path("/proc/self/stat").read_text(encoding="ascii").split(" ", 1)[0]),
+            ("boot_id", lambda: Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()),
+            ("pid_namespace", lambda: os.readlink("/proc/self/ns/pid")),
+            ("proc_identity", lambda: Path("/proc").stat())):
+        try:
+            values[name] = read()
+        except (OSError, ValueError, UnicodeError):
+            return {"state": "UNAVAILABLE", "reason": name + " is unreadable"}
+    if values["observer_pid"] != str(os.getpid()):
+        return {"state": "UNAVAILABLE", "reason": "observer_pid is invalid"}
+    boot, namespace, info = values["boot_id"], values["pid_namespace"], values["proc_identity"]
+    try:
+        valid_boot = str(uuid.UUID(boot)) == boot
+    except (ValueError, TypeError, AttributeError):
+        valid_boot = False
+    if not valid_boot:
+        return {"state": "UNAVAILABLE", "reason": "boot_id is invalid"}
+    if not isinstance(namespace, str) or re.fullmatch(r"pid:\[\d+\]", namespace) is None:
+        return {"state": "UNAVAILABLE", "reason": "pid_namespace is invalid"}
+    if not stat.S_ISDIR(info.st_mode):
+        return {"state": "UNAVAILABLE", "reason": "proc_identity is invalid"}
+    return {"boot_id": boot, "pid_namespace": namespace, "proc_device": info.st_dev, "proc_inode": info.st_ino,
+            "effective_uid": os.geteuid()}
+
+
+def operation_process_observation(operation):
+    """Only positive evidence in the original observer scope can establish that the original instance exited.
+
+    Linux stat field 22 is birth time since boot. Require complete current-Linux records (through field 52),
+    and two consistent observations. Missing/unreadable/torn identity is unavailable, never absence.
+    """
+    unavailable = {"state": "UNAVAILABLE"}
+    original_scope = operation.get("process_scope")
+    if isinstance(original_scope, dict) and original_scope.get("state") == "UNAVAILABLE":
+        reason = original_scope.get("reason")
+        return {**unavailable, "reason": "original process scope unavailable: " + reason
+                if set(original_scope) == {"state", "reason"} and isinstance(reason, str) and
+                   reason in OPERATION_SCOPE_REASONS else "original process scope capture is invalid"}
+    pid, start = operation.get("pid"), operation.get("pid_start")
+    if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start.isdigit() or int(start) <= 0:
+        return {**unavailable, "reason": "original process identity is missing or invalid"}
+    try:
+        scope = operation_process_scope()
+        if scope.get("state") == "UNAVAILABLE":
+            return {**unavailable, "reason": "current process scope unavailable: " + scope["reason"]}
+        if operation.get("process_scope") != scope:
+            return {**unavailable, "reason": "original process scope is missing or changed"}
+        observed = []
+        for _ in range(2):
+            try:
+                raw = Path("/proc/%d/stat" % pid).read_text(encoding="ascii")
+            except FileNotFoundError:
+                try:
+                    Path("/proc/%d" % pid).stat()
+                except FileNotFoundError:
+                    try:
+                        os.kill(pid, 0)  # Signal zero is only a kernel existence/permission probe; nothing is sent.
+                    except ProcessLookupError:
+                        observed.append(("absent", None))
+                        continue
+                    return {**unavailable, "reason": "the kernel still sees the PID despite missing proc metadata"}
+                return {**unavailable, "reason": "stat is missing while the PID directory is present"}
+            prefix, separator, tail = raw.rpartition(")")
+            fields = tail.split()
+            require(separator and prefix.startswith(str(pid) + " (") and raw.endswith("\n") and len(fields) >= 50 and
+                    fields[0] in ("R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I") and
+                    all(re.fullmatch(r"-?\d+", field) is not None for field in fields[1:]) and
+                    fields[19].isdigit() and int(fields[19]) > 0, "malformed operation process stat")
+            birth = fields[19]
+            if birth == start:
+                observed.append(("zombie" if fields[0] == "Z" else "present", birth))
+            elif int(birth) > int(start):
+                observed.append(("later_instance", birth))
+            else:
+                return {**unavailable, "reason": "process birth precedes the recorded original instance"}
+        if operation_process_scope() != scope or observed[0] != observed[1]:
+            return {**unavailable, "reason": "process identity or scope changed during observation"}
+    except (OSError, ValueError, UnicodeError, IndexError):
+        return {**unavailable, "reason": "process metadata is unreadable or malformed"}
+    return {"state": "PRESENT" if observed[0][0] == "present" else "CONFIRMED_ABSENT", "reason": observed[0][0]}
+
+
+def digest_bytes(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def durable_write(path, raw):
+    """Accounting is a release prerequisite: sync the contents and rename before reporting it durable."""
+    path = Path(path)
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
+    with open(temporary, "xb") as stream:
+        os.chmod(temporary, 0o600)
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    descriptor = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def accounting_lines(raw):
+    error = "operation accounting is incomplete or conflicting; retain the hold"
+    require(not raw or raw.endswith(b"\n"), error)
+    try:
+        rows = [strict_json(line) for line in raw.split(b"\n") if line]
+    except (ValueError, UnicodeError):
+        refuse(error)
+    require(all(isinstance(row, dict) for row in rows), error)
+    return rows
+
+
+def record_turn(run, operation, stdout, code):
+    """One durable invocation receipt per id, with an idempotent provider log. A null pending usage may become
+    known, but a recorded charge cannot be reset or changed. Raw output remains in the invocation's own file.
+    """
+    error = "operation accounting is incomplete or conflicting; retain the hold"
+    log = run.evidence / operation["turn_log"]
+    receipt_path = run.evidence / ("turn-%s.accounting.json" % operation["id"])
+    require(not log.is_symlink() and not receipt_path.is_symlink(), error)
+    before = log.read_bytes() if log.exists() else b""
+    rows = accounting_lines(before)
+    receipt = read_json(receipt_path) if receipt_path.exists() else None
+    require(code is None or type(code) is int, error)
+    identity = {"operation_id": operation["id"], "endpoint": operation["endpoint"], "host": operation["host"],
+                "session": operation["session"], "generation": operation["generation"],
+                "started_at": operation["started_at"], "stdout": operation["stdout"]}
+    usage = hierarchy_hosts.claude_usage(stdout) if operation["host"] == CLAUDE else next(
+        (event.get("usage") for event in reversed(list(hierarchy_hosts.claude_events(stdout)))
+         if event.get("type") == "turn.completed"), None)
+    if receipt is not None:
+        require(isinstance(receipt, dict) and set(receipt) == {
+                    "operation_id", "identity", "usage", "output_sha256", "output_bytes", "exit_code"} |
+                    ({"log_span"} if operation["host"] == CODEX else set()) and
+                receipt.get("operation_id") == operation["id"] and receipt.get("identity") == identity and
+                type(receipt.get("output_bytes")) is int and 0 <= receipt["output_bytes"] <= len(stdout) and
+                digest_bytes(stdout[:receipt["output_bytes"]]) == receipt["output_sha256"] and
+                (receipt.get("exit_code") is None or (type(receipt["exit_code"]) is int and
+                 (code is None or receipt["exit_code"] == code))) and
+                (receipt.get("usage") is None or receipt["usage"] == usage), error)
+        if code is None:
+            code = receipt["exit_code"]
+    desired = {"operation_id": operation["id"], "identity": identity, "usage": usage,
+               "output_sha256": digest_bytes(stdout), "output_bytes": len(stdout), "exit_code": code}
+    if operation["host"] == CLAUDE:
+        row = {key: identity[key] for key in ("operation_id", "endpoint", "host", "session", "started_at", "stdout")}
+        row.update(exit_code=code, usage=usage)
+        keys = set(row)
+        require(all(set(item) == keys and isinstance(item["operation_id"], str) for item in rows), error)
+        matches = [i for i, item in enumerate(rows) if item["operation_id"] == operation["id"]]
+        require(len(matches) <= 1, error)
+        if matches:
+            old = rows[matches[0]]
+            require(all(old[key] == value for key, value in row.items() if key not in ("exit_code", "usage")) and
+                    (old["usage"] is None or old["usage"] == usage) and
+                    (old["exit_code"] is None or (type(old["exit_code"]) is int and
+                     (code is None or old["exit_code"] == code))), error)
+            # A row may have been durably published before its receipt reply was lost. Keep a known native
+            # status immutable; neither an unknown caller exit nor a transcript verdict can replace it.
+            if code is None:
+                code = old["exit_code"]
+                row["exit_code"] = desired["exit_code"] = code
+            rows[matches[0]] = row
+        else:
+            require(receipt is None, error)
+            rows.append(row)
+        raw = b"".join(as_json_line(item) for item in rows)
+        if raw != before:
+            durable_write(log, raw)
+    else:
+        # Keep the historical Codex event bytes. Persist an append intent first, then recognize its exact bytes
+        # after a lost reply. A partial/conflicting append is never guessed at or appended a second time.
+        span = receipt.get("log_span") if receipt else None
+        if span is None:
+            raw = stdout if not stdout or stdout.endswith(b"\n") else b""
+            span = {"offset": len(before), "prefix_sha256": digest_bytes(before),
+                    "length": len(raw), "sha256": digest_bytes(raw)}
+            desired["log_span"] = span
+            durable_write(receipt_path, as_json(desired))
+        else:
+            raw = stdout[:span["length"]]
+            require(len(raw) == span["length"] and digest_bytes(raw) == span["sha256"], error)
+        offset = span["offset"]
+        require(len(before) >= offset and digest_bytes(before[:offset]) == span["prefix_sha256"], error)
+        end = offset + span["length"]
+        if len(before) == offset:
+            if raw:
+                durable_write(log, before + raw)
+        else:
+            require(len(before) >= end and before[offset:end] == raw, error)
+        desired["log_span"] = span
+    if receipt != desired:
+        durable_write(receipt_path, as_json(desired))
+    return code
+
+
+def record_unresolved_turn(run, operation):
+    try:
+        record_turn(run, operation, Path(operation["stdout"]).read_bytes(), None)
+    except (Stop, ValueError, OSError) as exc:
+        fail("operation %s is unresolved and accounting failed: %s; team-state, marker and output retained" %
+             (operation["id"], exc), operation=operation)
+
+
+def marker_witness(path):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and
+                stat.S_IMODE(info.st_mode) == 0o600, "unsafe owner wake marker")
+        raw = stream.read()
+    return {"device": info.st_dev, "inode": info.st_ino, "ctime_ns": info.st_ctime_ns,
+            "sha256": digest_bytes(raw), "operation_id": json.loads(raw)["operation_id"]}
+
+
+def require_owned_marker(operation):
+    path = Path(operation["marker"])
+    error = "operation %s wake marker changed; retain the hold and do not clear another wake" % operation["id"]
+    if not path.exists() and operation.get("release"):
+        return False  # A durable release intent follows terminal proof and durable accounting, never a model retry.
+    try:
+        observed = marker_witness(path)
+    except (OSError, ValueError, KeyError, Stop):
+        refuse(error)
+    require(observed == operation.get("marker_witness") and observed["operation_id"] == operation["id"], error)
+    return True
+
+
+def transcript_witness(path):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "unsafe operation transcript")
+        raw = stream.read()
+    require(not raw or raw.endswith(b"\n"), "operation transcript has an incomplete boundary; retain the hold")
+    return {"device": info.st_dev, "inode": info.st_ino, "offset": len(raw), "prefix_sha256": digest_bytes(raw)}
+
+
+def message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(isinstance(item, dict) and item.get("type") in ("text", "input_text") and
+                                         isinstance(item.get("text"), str) for item in content):
+        return "".join(item["text"] for item in content)
+    return None
+
+
+def terminal_proof(run, operation, stdout):
+    """Continuity hashes detect file changes; they do not authenticate provider outcomes. Require the submitted
+    user text and the invocation's stream message/turn evidence too. Unsupported or ambiguous layouts stay unknown.
+    """
+    error = "operation %s transcript cannot prove this session's submitted turn; retain the hold and do not replay" % operation["id"]
+    stream = list(hierarchy_hosts.claude_events(stdout))
+    answers = [event for event in stream if event.get("type") == "assistant" and
+               event.get("session_id") == operation["session"] and isinstance(event.get("message"), dict)]
+    proofs = []
+    for filename, witness in operation["transcripts"].items():
+        path = Path(filename)
+        home = run.validated_homes[CLAUDE] if operation["host"] == CLAUDE else run.codex_home
+        require(path in hierarchy_hosts.transcripts(operation["host"], home, operation["session"]), error)
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as transcript:
+            info = os.fstat(transcript.fileno())
+            raw = transcript.read()
+        offset = witness["offset"]
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                (info.st_dev, info.st_ino) == (witness["device"], witness["inode"]) and len(raw) >= offset and
+                digest_bytes(raw[:offset]) == witness["prefix_sha256"] and (not raw or raw.endswith(b"\n")), error)
+        try:
+            events = [strict_json(line) for line in raw[offset:].split(b"\n") if line]
+        except (ValueError, UnicodeError):
+            refuse(error)
+        require(all(isinstance(event, dict) for event in events), error)
+        if not events:
+            continue
+        if operation["host"] == CLAUDE:
+            relevant = [event for event in events if event.get("type") in ("user", "assistant", "system")]
+            require(all(event.get("sessionId") == operation["session"] for event in relevant), error)
+            users = [event for event in relevant if event.get("type") == "user"]
+            require(len(users) == 1 and relevant[0] == users[0] and isinstance(users[0].get("uuid"), str), error)
+            prompt = message_text(users[0].get("message", {}).get("content"))
+            require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
+            terminals = [event for event in relevant if event.get("type") == "assistant" and
+                         isinstance(event.get("message"), dict) and
+                         event["message"].get("stop_reason") in ("end_turn", "max_tokens", "stop_sequence")]
+            # These fixture-era rows are not a supported native Claude terminal shape. Neither their presence
+            # nor a session-only error result proves that this invocation's submitted turn ended.
+            require(not any(event.get("type") == "system" and event.get("subtype") in ("turn_failed", "turn_aborted")
+                            for event in relevant), error)
+            if terminals:
+                require(len(terminals) == 1 and relevant[-1] == terminals[0], error)
+                message_id = terminals[0]["message"].get("id")
+                require(isinstance(message_id, str) and any(event["message"].get("id") == message_id for event in answers), error)
+                proofs.append(False)
+        else:
+            prefix = list(hierarchy_hosts.claude_events(raw[:offset]))
+            metadata = [event["payload"] for event in prefix if event.get("type") == "session_meta"]
+            require(len(metadata) == 1 and metadata[0].get("id") == operation["session"], error)
+            users = [event.get("payload") for event in events if event.get("type") == "response_item" and
+                     isinstance(event.get("payload"), dict) and event["payload"].get("role") == "user"]
+            require(len(users) == 1, error)
+            prompt = message_text(users[0].get("content"))
+            require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
+            messages = [event["payload"] for event in events if event.get("type") == "event_msg" and
+                        isinstance(event.get("payload"), dict)]
+            starts = [event for event in messages if event.get("type") == "task_started"]
+            require(len(starts) == 1 and isinstance(starts[0].get("turn_id"), str), error)
+            turn = starts[0]["turn_id"]
+            contexts = [event["payload"] for event in events if event.get("type") == "turn_context"]
+            require(len(contexts) == 1 and contexts[0].get("turn_id") == turn and
+                    contexts[0].get("cwd") == operation["cwd"], error)
+            terminals = [event for event in messages if event.get("type") in ("task_complete", "task_failed", "turn_aborted")]
+            if terminals:
+                require(len(terminals) == 1 and terminals[0].get("turn_id") == turn, error)
+                proofs.append(terminals[0]["type"] != "task_complete")
+    require(len(proofs) == 1, "operation %s is unresolved: the transcript has no completed or failed turn; "
+            "retain the hold and do not replay" % operation["id"])
+    return proofs[0]
+
+
+def as_json_line(value):
+    return (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
+
+
+def operation_record(state, operation, *, pending_pid=False):
+    operations = state.get("operations")
+    recorded = operations.get(operation["endpoint"]) if isinstance(operations, dict) else None
+    expected = dict(operation)
+    if pending_pid:
+        # Only the PID transaction may replace the unpublished PID fields after Popen returns.
+        expected["pid"] = None
+        expected.pop("pid_start", None)
+    if recorded != expected:
+        fail("operation %s on %s is no longer current; team-state, output and wake marker were retained" %
+             (operation["id"], operation["endpoint"]), operation=operation)
+    return recorded
+
+
+def finish_operation(run, operation, stdout, code):
+    from hierarchy_mailbox import writer_lock
+    # Lock order: owner directory -> mailbox -> short Claude state transaction. Never acquire a mailbox lock
+    # from a state callback, or keep a state lock over provider/accounting I/O or any child wait.
+    with writer_lock(run.mailbox_root):
+        operation_record(require_init(run), operation)
+        if operation.get("release"):
+            require(sha_file(run.evidence / ("turn-%s.accounting.json" % operation["id"])) ==
+                    operation["release"]["accounting_sha256"],
+                    "operation accounting changed after release intent; retain the hold")
+        remove = require_owned_marker(operation) if operation.get("marker") else False
+        code = record_turn(run, operation, stdout, code)
+        index(run, Path(operation["stdout"]).name, Path(operation["stderr"]).name,
+              "turn-%s.accounting.json" % operation["id"], operation["turn_log"])
+        releasing = dict(operation)
+        releasing["release"] = {"accounting_sha256": sha_file(run.evidence / ("turn-%s.accounting.json" % operation["id"]))}
+        def release(current):
+            require_init(run, state=current)
+            operation_record(current, operation)
+            current["operations"][operation["endpoint"]] = releasing
+        update_state(run, release)
+        if remove:
+            Path(operation["marker"]).unlink()
+        def finish(current):
+            require_init(run, state=current)
+            operation_record(current, releasing)
+            current["operations"].pop(operation["endpoint"])
+        update_state(run, finish)
+    return code
+
+
+def model_turn(run, endpoint, binding, argv, cwd, prompt, timeout, marker=None, approval=None,
+               operation_id=None, owned_marker=None):
+    """Bound the owner's wait, never the host's life. Files survive this command and cannot fill a pipe or SIGPIPE
+    the host after a deadline. Persist intent before Popen and the pid immediately afterwards; lost replies hold.
+    """
+    try:
+        env = child_env(run)
+        if binding["host"] == CLAUDE:
+            claude_pin(run)
+        home = run.validated_homes[CLAUDE] if binding["host"] == CLAUDE else run.codex_home
+        transcripts = {str(path): transcript_witness(path) for path in
+                       hierarchy_hosts.transcripts(binding["host"], home, binding["session"])}
+        process_scope = operation_process_scope()
+    except (Stop, ValueError):
+        if marker:
+            from hierarchy_mailbox import writer_lock
+            with writer_lock(run.mailbox_root):
+                if require_owned_marker({"id": operation_id, "marker": str(marker), "marker_witness": owned_marker}):
+                    marker.unlink()
+        raise
+    identifier = operation_id or uuid.uuid4().hex
+    operation = {"id": identifier, "endpoint": endpoint, "host": binding["host"], "session": binding["session"],
+                 "generation": binding["generation"], "started_at": timestamp(), "pid": None,
+                 "process_scope": process_scope,
+                 "stdout": str(run.evidence / ("turn-%s.stdout.jsonl" % identifier)),
+                 "stderr": str(run.evidence / ("turn-%s.stderr.txt" % identifier)),
+                 "transcripts": transcripts,
+                 "prompt_sha256": digest_bytes((prompt if prompt is not None else argv[-1]).encode("utf-8")), "cwd": cwd,
+                 "turn_log": "root-turns.jsonl" if endpoint_parts(endpoint)[1] == "root" else
+                             "role-turns-%s.jsonl" % endpoint.replace("/", "%2F"),
+                 "marker": str(marker) if marker else None, "marker_witness": owned_marker}
+    if approval is not None:
+        operation["approval"] = approval
+    def intend(current):
+        require_init(run, state=current)
+        require_resolved(run, endpoint, state=current)
+        current.setdefault("operations", {})[endpoint] = operation
+    try:
+        update_state(run, intend)
+    except Stop as stop:
+        if stop.code == REFUSED and marker:
+            from hierarchy_mailbox import writer_lock
+            with writer_lock(run.mailbox_root):
+                if require_owned_marker(operation):
+                    marker.unlink()
+        raise
+    # Input is a private anonymous file too; writing a long prompt to a pipe could consume the deadline before wait.
+    with tempfile.TemporaryFile() as stdin, open(operation["stdout"], "wb") as stdout, open(operation["stderr"], "wb") as stderr:
+        if prompt is not None:
+            stdin.write(prompt.encode("utf-8"))
+            stdin.seek(0)
+        try:
+            process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if prompt is not None else subprocess.DEVNULL,
+                                       stdout=stdout, stderr=stderr, start_new_session=True)
+            operation.update(pid=process.pid, pid_start=process_identity(process.pid))
+            def record_pid(current):
+                require_init(run, state=current)
+                recorded = operation_record(current, operation, pending_pid=True)
+                recorded.update(pid=operation["pid"], pid_start=operation["pid_start"])
+            update_state(run, record_pid)
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            record_unresolved_turn(run, operation)
+            fail("operation %s on %s is unresolved after its deadline; process pid %d was left running, output and "
+                 "team-state were retained. Inspect status, then use approve/turn --reconcile; do not replay" %
+                 (identifier, endpoint, process.pid), operation=operation)
+        except (OSError, subprocess.SubprocessError) as exc:
+            record_unresolved_turn(run, operation)
+            fail("operation %s is unresolved: %s; team-state and output retained; inspect before reconciliation" %
+                 (identifier, exc), operation=operation)
+    raw, errors = Path(operation["stdout"]).read_bytes(), Path(operation["stderr"]).read_bytes()
+    try:
+        finish_operation(run, operation, raw, process.returncode)
+    except (Stop, ValueError, OSError) as exc:
+        if isinstance(exc, Stop) and exc.code == FAILED:
+            raise
+        fail("operation %s finished but custody release failed: %s; state, marker and output retained" %
+             (identifier, exc), operation=operation)
+    return subprocess.CompletedProcess(argv, process.returncode, raw, errors)
+
+
+def reconcile(run, endpoint):
+    state = require_init(run)
+    operation = state.get("operations", {}).get(endpoint)
+    require(operation is not None, "%s has no unresolved operation" % endpoint)
+    observation = operation_process_observation(operation)
+    require(observation["state"] != "PRESENT", "operation %s is unresolved: its process is still running" % operation["id"])
+    if observation["state"] != "CONFIRMED_ABSENT":
+        refuse("operation %s is unresolved: its process exit cannot be confirmed; retain the hold" % operation["id"],
+               operation=operation, process_observation=observation)
+    stdout = Path(operation["stdout"]).read_bytes()
+    failed = terminal_proof(run, operation, stdout)
+    events = hierarchy_hosts.claude_events(stdout)
+    failed |= any(event.get("type") == "result" and event.get("is_error") is True for event in events)
+    approval = operation.get("approval")
+    if approval:
+        _policy, journal = hierarchy_router.locked_load(hierarchy_lifecycle.Lifecycle(run.lifecycle), 5.0)
+        previous = approval["previous"]
+        added = journal["decisions"][len(previous):]
+        failed |= journal["decisions"][:len(previous)] != previous or len(added) != 1 or any(
+            entry["request_id"] != approval["request_id"] or entry["decision"] != approval["decision"] or
+            entry["request_sha256"] != approval["request_sha256"] for entry in added)
+    receipt_path = run.evidence / ("turn-%s.accounting.json" % operation["id"])
+    receipt = read_json(receipt_path) if receipt_path.exists() else {}
+    require(isinstance(receipt, dict) and (receipt.get("exit_code") is None or type(receipt["exit_code"]) is int),
+            "operation accounting has an invalid exit code; retain the hold")
+    native_exit = receipt.get("exit_code")
+    failed |= native_exit is not None and native_exit != 0
+    # A known native exit (for example 1) is immutable even though reconciliation's public failure exit is 3.
+    native_exit = finish_operation(run, operation, stdout, native_exit)
+    failed |= native_exit is not None and native_exit != 0
+    return (FAILED if failed else OK), {"endpoint": endpoint, "reconciled": operation["id"],
+                                       "outcome": "failed" if failed else "completed", "replayed": False}
+
+
 def approve(run, args):
     state = require_init(run)
     bound = state.get("root")
     if not bound:
         refuse("ROOT is not bound; run root --session <id> first")
+    endpoint = run.endpoint("root")
+    binding = Mailbox(run.mailbox_root).current_binding(endpoint)
+    planned_binding(run, endpoint, binding["host"])
+    require(binding["host"] == run.hosts["root"], "ROOT's host differs from team-run.json")
+    require(all(bound[key] == binding[key] for key in ("session", "generation")), "ROOT's recorded binding changed")
+    if args.reconcile:
+        return reconcile(run, endpoint)
+    require_resolved(run, endpoint)
+    timeout = turn_deadline()
+    if binding["host"] == CLAUDE:
+        claude_pin(run)
+        claude_transcript(run, binding["session"])
+        require(tuple(bound["tools"]) == ROOT_TOOLS, "ROOT tools mismatch")
+        claude_connection(run, binding, bound["connection"])
+        require(tuple(adapter_tools(run, bound["connection"])) == ROOT_TOOLS, "ROOT tools mismatch")
     reason = args.reason
-    require(not set('"\r\n') & set(reason), "the reason may not contain double quotes or line breaks")
     text(reason, "reason", 512)
+    require(not set('"\r\n') & set(reason), "the reason may not contain double quotes or line breaks")
     decision = "deny" if args.deny else "approve"
     lifecycle = hierarchy_lifecycle.Lifecycle(run.lifecycle)
     _policy, before = hierarchy_router.locked_load(lifecycle, 5.0)
@@ -1651,11 +2363,17 @@ def approve(run, args):
              "-c", bound["mcp_config"], "--json", "-C", str(run.project), "resume", bound["session"],
              (ROOT_PROMPT if not args.deny else ROOT_PROMPT.replace("Call team_pending", "Call team_status"))
              % (args.id, decision, reason)]
-    proc = subprocess.run(argv, cwd=str(run.project), env=child_env(run), stdin=subprocess.DEVNULL,
-                          capture_output=True)
+    prompt = None
+    if binding["host"] == CLAUDE:
+        prompt = argv[-1]
+        argv = hierarchy_provision.claude_argv(["--resume", binding["session"]], bound["connection"], [],
+                                              ["mcp__aegis_decision__" + name for name in ROOT_TOOLS], {}, None)
+    proc = model_turn(run, endpoint, binding, argv, str(run.project), prompt, timeout,
+                      approval={"request_id": args.id, "decision": decision, "request_sha256": row["request_sha256"],
+                                "previous": before["decisions"]})
     stdout = proc.stdout.decode("utf-8", "replace")
-    append_evidence(run, "root-turns.jsonl", proc.stdout)
-    messages = [item["text"] for item in agent_items(stdout) if item["type"] == "agent_message"]
+    items = hierarchy_hosts.claude_turn_items(stdout) if binding["host"] == CLAUDE else agent_items(stdout)
+    messages = [item["text"] for item in items if item["type"] == "agent_message"]
     last = messages[-1] if messages else None
     _policy, journal = hierarchy_router.locked_load(lifecycle, 5.0)
     previous = before["decisions"]
@@ -1672,6 +2390,10 @@ def approve(run, args):
                                                                                  row["request_sha256"], last),
              root_last_message=last, codex_exit=proc.returncode,
              stderr=proc.stderr.decode("utf-8", "replace")[-800:])
+    if binding["host"] == CLAUDE and (proc.returncode != 0 or any(
+            event.get("type") == "result" and event.get("is_error") is True
+            for event in hierarchy_hosts.claude_events(stdout))):
+        fail("Claude ROOT turn failed; journal decisions, transcript and output were retained", claude_exit=proc.returncode)
     return OK, {"request_id": args.id, "decision": decision, "request_sha256": row["request_sha256"],
                 "event_id": row["root_decide"]["event_id_" + decision], "root_last_message": last}
 
@@ -1686,6 +2408,14 @@ def turn(run, args):
     history = mailbox.bindings(endpoint)
     if not history:
         refuse("%s is not bound; start it with up first" % endpoint)
+    binding = history[-1]
+    planned_binding(run, endpoint, binding["host"])
+    if args.reconcile:
+        require(args.prompt is None, "--reconcile does not accept a prompt")
+        return reconcile(run, endpoint)
+    require_resolved(run, endpoint)
+    timeout = turn_deadline()
+    require(isinstance(args.prompt, str) and bool(args.prompt.strip()) and "\0" not in args.prompt, "invalid prompt")
     quoted = endpoint.replace("/", "%2F")
     generation = history[-1]["generation"]
     profile_path = run.base / "profiles" / ("%s-g%d.wake.json" % (quoted, generation))
@@ -1700,26 +2430,42 @@ def turn(run, args):
         refuse("%s has %d unread message%s; the loop's wake reads %s, so an owner turn now would race it"
                % (endpoint, unread, "" if unread == 1 else "s", "it" if unread == 1 else "them"))
     profile = read_json(profile_path)
+    require(all(profile[key] == binding[key] for key in ("host", "session", "generation")),
+            "binding changed before owner turn; the outgoing session was not started")
+    if binding["host"] == CLAUDE:
+        from hierarchy_wake import load_profile
+        profile = load_profile(profile_path, endpoint, binding)
+        claude_pin(run)
+        claude_transcript(run, binding["session"])
+        require(profile.get("mode", "print") == "print" and profile["prompt_via"] == "stdin",
+                "a Claude owner turn requires a print profile")
+        claude_resume_profile(run, binding, profile)
     by_argv = profile["prompt_via"] == "argv"
     argv = profile["argv"] + ([args.prompt] if by_argv else [])
     from hierarchy_mailbox import writer_lock
     from hierarchy_wake import claim_wake
+    identifier = uuid.uuid4().hex
     with writer_lock(mailbox.root):
         current = Mailbox(mailbox.root).current_binding(endpoint)
         require(all(profile[key] == current[key] for key in ("host", "session", "generation")),
                 "binding changed before owner turn; the outgoing session was not started")
         marker = claim_wake(mailbox, endpoint)
-    proc = subprocess.run(argv, cwd=profile["cwd"], env=child_env(run), capture_output=True,
-                          input=None if by_argv else args.prompt.encode("utf-8"),
-                          stdin=subprocess.DEVNULL if by_argv else None)
-    # An interrupted or uncertain launch retains the marker for inspection.
-    marker.unlink()
-    log = append_evidence(run, "role-turns-%s.jsonl" % quoted, proc.stdout)
-    answer = {"endpoint": endpoint, "exit_code": proc.returncode, "items": agent_items(proc.stdout.decode("utf-8",
-                                                                                                          "replace")),
+        value = read_json(marker)
+        value["operation_id"] = identifier
+        durable_write(marker, as_json(value))
+        owned_marker = marker_witness(marker)
+    proc = model_turn(run, endpoint, binding, argv, profile["cwd"], None if by_argv else args.prompt, timeout, marker,
+                      operation_id=identifier, owned_marker=owned_marker)
+    log = run.evidence / ("role-turns-%s.jsonl" % quoted)
+    items = hierarchy_hosts.claude_turn_items if binding["host"] == CLAUDE else agent_items
+    answer = {"endpoint": endpoint, "exit_code": proc.returncode, "items": items(proc.stdout.decode("utf-8", "replace")),
               "log": str(log)}
     if proc.stderr:
         answer["stderr"] = proc.stderr.decode("utf-8", "replace")[-800:]
+    if binding["host"] == CLAUDE and (proc.returncode != 0 or any(
+            event.get("type") == "result" and event.get("is_error") is True
+            for event in hierarchy_hosts.claude_events(proc.stdout))):
+        return FAILED, {**answer, "error": "Claude owner turn failed; transcript and output were retained"}
     return (OK if proc.returncode == 0 else FAILED), answer
 
 
@@ -1747,6 +2493,8 @@ def status(run, args):
               "root": (state or {}).get("root"),
               "loop": {"state": running, "pid": pid if alive and ours else None, "pid_alive": bool(alive and ours)},
               "roles": launcher_roles(run) if complete else {}, "team": None, "pending": []}
+    if (state or {}).get("operations"):
+        answer["unresolved_operations"] = state["operations"]
     if complete:
         lifecycle = hierarchy_lifecycle.Lifecycle(run.lifecycle)
         answer["team"] = hierarchy_team_view.status(lifecycle, loop_state=run.loop_state, evidence=run.evidence)
@@ -1772,6 +2520,9 @@ def status_text(run, answer):
         if last.get("current_step"):
             head += ", step %s since %s" % (last["current_step"], last.get("step_started_at"))
     lines.append(head)
+    for endpoint, operation in sorted(answer.get("unresolved_operations", {}).items()):
+        lines.append("unresolved: %s operation %s pid %s since %s; inspect, then approve/turn --reconcile; do not replay" %
+                     (endpoint, operation["id"], operation.get("pid"), operation["started_at"]))
     if answer["roles"]:
         lines.append("roles:")
         for endpoint, row in sorted(answer["roles"].items()):
@@ -1827,10 +2578,16 @@ def stop_roles(run):
     for endpoint in names:
         binding = started[endpoint]["binding"]
         # ROOT is the owner's session and the launcher never stops it; a refused ROOT start still leaves a record.
-        if not binding or binding["host"] != CODEX or endpoint_parts(endpoint)[1] == "root":
+        if not binding or binding["host"] not in (CODEX, CLAUDE) or endpoint_parts(endpoint)[1] == "root":
             continue
         code, answer, _ = tool(run, "launcher", "--base", run.base, "stop", "--endpoint", endpoint)
         rows.append({"endpoint": endpoint, "state": answer.get("state"), "pids": answer.get("pids", [])})
+        if "unowned_pids" in answer:
+            rows[-1]["unowned_pids"] = answer["unowned_pids"]
+            if not isinstance(answer["unowned_pids"], list) or any(type(pid) is not int or pid <= 0 for pid in answer["unowned_pids"]):
+                fail("%s returned invalid unowned_pids; resources were kept" % endpoint, roles=rows)
+        if answer.get("unowned_pids"):
+            fail("%s has unowned_pids; host ownership is unresolved and resources were kept" % endpoint, roles=rows)
         if code != 0:
             fail("%s could not be stopped: %s" % (endpoint, answer.get("error") or answer.get("state")), roles=rows)
     return rows
@@ -2140,6 +2897,10 @@ def down_run(run, args):
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}
 
+    if state.get("operations"):
+        fail("unresolved model operations retain this run's resources; inspect status and reconcile before down",
+             operations=state["operations"])
+
     def persist():
         if run.uses(CLAUDE):
             return update_state(run, lambda current: current.update(down=state["down"]))
@@ -2225,10 +2986,12 @@ def main(argv=None):
     decided = commands.add_parser("approve", help="One ROOT turn that decides the pending request, then a journal check")
     decided.add_argument("id")
     decided.add_argument("--deny", action="store_true")
-    decided.add_argument("--reason", required=True)
+    decided.add_argument("--reason")
+    decided.add_argument("--reconcile", action="store_true", help="Reconcile the unresolved ROOT turn without replaying it")
     owned = commands.add_parser("turn", help="One trusted owner turn with the role's current wake argv")
     owned.add_argument("endpoint")
-    owned.add_argument("prompt")
+    owned.add_argument("prompt", nargs="?")
+    owned.add_argument("--reconcile", action="store_true", help="Reconcile this endpoint's unresolved turn without replaying it")
     commands.add_parser("status", help="Team view, loop liveness and launcher records").add_argument(
         "--text", action="store_true", help="Holds grouped by who must act, and pending ROOT decisions")
     lowered = commands.add_parser("down", help="Collect evidence, then stop and release everything the run holds")
@@ -2247,7 +3010,16 @@ def main(argv=None):
         if args.command != "status" and state and "custody" in state and state["custody"] != custody(run):
             refuse("run custody changed since init; restore the recorded configuration")
         guard(run, args.command)
-        code, result = COMMANDS[args.command](run, args)
+        # All direct state writers on an initialized Codex-only run share the stable directory lock. Claude
+        # login/up merge through short state transactions instead, keeping browser-login ROOT concurrency.
+        serialized = args.command in ("init", "root", "approve", "turn", "down") or (
+            not run.uses(CLAUDE) and args.command == "up")
+        if serialized and run.run.is_dir():
+            busy = {"login": "another login is running for this run", "down": "a login is in progress"}
+            with operation_lock(run, busy.get(args.command, "another team command is running for this run")):
+                code, result = COMMANDS[args.command](run, args)
+        else:
+            code, result = COMMANDS[args.command](run, args)
     except Stop as stop:
         code, result = stop.code, {"error": str(stop), **stop.detail}
         record_command = stop.record_command
@@ -2255,7 +3027,12 @@ def main(argv=None):
         code, result = REFUSED, {"error": str(exc)}
     except (OSError, subprocess.SubprocessError) as exc:
         code, result = FAILED, {"error": str(exc)}
-    if record_command and run is not None and args.command != "status" and run.run.is_dir():
+    if code != REFUSED and record_command and run is not None and args.command != "status" and run.run.is_dir():
+        try:
+            environment_evidence(run)
+        except (ValueError, OSError) as exc:
+            code, result = FAILED, {"error": "child environment evidence failed: %s; command effects were retained" % exc,
+                                    "partial_result": result}
         log_command(run, args.command, code)
     if result is not None:
         print(json.dumps(result, sort_keys=True))

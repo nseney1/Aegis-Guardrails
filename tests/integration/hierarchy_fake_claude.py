@@ -18,6 +18,8 @@ Modelled, not observed:
   with no reply, so its prompt stays unanswered in the transcript; a print turn without a login exits 1 with a
   "fake claude:" line; MCP children and the fake host get the caller's environment minus the outer session's
   variables (below); the --text status wording; login flags are accepted, not told apart.
+  PR6 also models final assistant stop_reason=end_turn, a bounded
+  FAKE_CLAUDE_DELAY before completion, and ROOT following an approve/deny prompt through the real decision adapter.
 Not modelled: a model (the reply is FAKE_CLAUDE_REPLY), permission enforcement (--restricted, --permission-*, allowed
 and disallowed tools are parsed, never applied), the real default tool set, background sessions (--bg) and session
 names (--name), interactive mode, other output formats, a positional or empty prompt, apiKeyHelper or profiles, MCP
@@ -112,7 +114,8 @@ def log_call(argv):
         with open(os.environ["FAKE_CLAUDE_LOG"], "a", encoding="utf-8") as log:
             log.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
                                   "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
-                                  "billing": sorted(name for name in BILLING if name in os.environ)}) + "\n")
+                                  "billing": sorted(name for name in BILLING if name in os.environ),
+                                  "environment_names": sorted(os.environ)}) + "\n")
 
 
 def config_dir():
@@ -325,12 +328,24 @@ def print_mode(home, argv):
               "claude_code_version": "0.0.0-fake"})
         append(transcript, {"type": "user", "message": {"role": "user", "content": prompt}, "sessionId": session,
                             "timestamp": now(), "cwd": cwd, "uuid": str(uuid.uuid4())})
+        if os.environ.get("FAKE_CLAUDE_GATE"):
+            gate = Path(os.environ["FAKE_CLAUDE_GATE"])
+            gate.with_name(gate.name + ".ready").write_text("ready")
+            deadline = time.monotonic() + turn_timeout
+            while not gate.exists():
+                if time.monotonic() >= deadline:
+                    refuse(1, "fake claude: completion gate timed out")
+                time.sleep(0.01)
         if mode == "hang":
             while True:
                 time.sleep(3600)
+        if os.environ.get("FAKE_CLAUDE_DELAY"):
+            time.sleep(seconds("FAKE_CLAUDE_DELAY", 0.5))
         if mode == "fail":
             emit(result(session, usage, error=True))
             return 1
+        if any(server["name"] == "aegis_decision" for server in servers):
+            decide(options["mcp_config"], prompt, env, probe_timeout)
         if os.environ.get("FAKE_HOST_PLAN") and any(server["name"] == "aegis_mailbox" for server in servers):
             code = run_host(argv, prompt, env, turn_timeout)
             if code != 0:
@@ -340,7 +355,7 @@ def print_mode(home, argv):
                 return code
         message = {"model": model, "id": "msg_fake_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant",
                    "content": [{"type": "text", "text": os.environ.get("FAKE_CLAUDE_REPLY") or "done"}],
-                   "usage": usage}
+                   "usage": usage, "stop_reason": "end_turn"}
         emit({"type": "assistant", "message": message, "session_id": session})
         append(transcript, {"type": "assistant", "message": message, "sessionId": session, "timestamp": now(),
                             "cwd": cwd, "uuid": str(uuid.uuid4())})
@@ -354,6 +369,30 @@ def print_mode(home, argv):
 def result(session, usage, error=False):
     return {"type": "result", "subtype": "error_during_execution" if error else "success", "is_error": error,
             "num_turns": 1, "session_id": session, "total_cost_usd": 0.0, "usage": usage}
+
+
+def decide(paths, prompt, env, timeout):
+    """Model ROOT following the owner's approve prompt through the real decision adapter, with no model involved."""
+    server = next(json.loads(Path(path).read_text())["mcpServers"]["aegis_decision"]
+                  for path in paths if "aegis_decision" in json.loads(Path(path).read_text())["mcpServers"])
+
+    def call(name, arguments):
+        frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                  {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}}]
+        proc = subprocess.run([server["command"], *server["args"]], env=env, capture_output=True, text=True,
+                              input="".join(json.dumps(frame) + "\n" for frame in frames), timeout=timeout)
+        reply = next(json.loads(line) for line in proc.stdout.splitlines() if json.loads(line).get("id") == 2)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    wanted = re.search(r"find request (\S+), then", prompt).group(1)
+    decision = re.search(r"decision=(approve|deny)", prompt).group(1)
+    reason = re.search(r'reason="(.*)"\. Do nothing else\.$', prompt).group(1)
+    view = call("team_pending" if decision == "approve" else "team_status", {})
+    row = next(row for row in view["pending" if decision == "approve" else "requests"] if row["request_id"] == wanted)
+    answer = call("root_decide", {"event_id": "root-%s-%s" % (wanted, decision), "request_id": wanted,
+                                  "request_sha256": row["request_sha256"], "decision": decision, "reason": reason})
+    if "error" in answer:
+        refuse(1, "fake claude: root_decide failed: " + answer["error"])
 
 
 def session_for(home, folder, options):
