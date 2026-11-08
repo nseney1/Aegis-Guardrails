@@ -210,6 +210,43 @@ def test_unproven_selector_still_accepts_its_bound_legacy_session_id():
     assert hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
 
 
+@pytest.mark.parametrize("evidence", ["proven", "unproven"])
+@pytest.mark.parametrize("kind,arguments", [
+    pytest.param("claude-code", ["--resume", "--", "--resume", SESSION], id="modelled-consumed-terminator"),
+    pytest.param("claude-code", ["--resume", "unknown", "--resume", SESSION], id="modelled-unknown-selection"),
+    pytest.param("claude-code", ["--resume", SESSION, "--session-id"], id="modelled-missing-selection"),
+    pytest.param("claude-code", ["--resume", SESSION, "--resume=--print"], id="modelled-equals-option-value"),
+    pytest.param("claude-code", ["--resume", "--print", "please", "--resume", SESSION],
+                 id="modelled-option-valued-selection"),
+    pytest.param("codex-cli", ["exec", "resume", "--last", "resume", SESSION],
+                 id="modelled-codex-option-valued-selection"),
+])
+def test_ambiguous_selection_cannot_be_replaced_by_a_later_match(kind, arguments, evidence):
+    program = "claude" if kind == "claude-code" else "codex"
+    assert not hierarchy_hosts.matches_session(kind, [program, *arguments], SESSION, evidence)
+    assert hierarchy_hosts.selects_other_session([program, *arguments], SESSION)
+
+
+@pytest.mark.parametrize("word", [
+    pytest.param("-r<T>", id="modelled-attached-short-alias"),
+    pytest.param("-a<T>", id="modelled-attached-hex-letter-alias"),
+    pytest.param("--unlisted=<T>", id="equals"),
+    pytest.param("prefix/<T>/suffix", id="bounded-path-occurrence"),
+    pytest.param("<T>", id="whole"),
+])
+def test_bounded_uuid_occurrences_only_spare_descendants(word):
+    other = "00000000-0000-0000-0000-000000000001"
+    argv = ["claude", word.replace("<T>", other)]
+    assert hierarchy_hosts.selects_other_session(argv, SESSION)
+    assert not hierarchy_hosts.matches_session("claude-code", argv, other)
+
+
+@pytest.mark.parametrize("word", ["-r<S>", "--unlisted=<S>", "a" * 64, "a<S>b"])
+def test_bound_uuid_and_longer_hex_values_do_not_claim_another_session(word):
+    word = word.replace("<S>", SESSION.replace("-", "") if word == "a<S>b" else SESSION)
+    assert not hierarchy_hosts.selects_other_session(["worker", word], SESSION)
+
+
 def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():
     assert hierarchy_hosts.qualify("claude-code", False) == {"boundary": "no write tools"}
     assert hierarchy_hosts.qualify("codex-cli", False) == {"boundary": "no write tools"}

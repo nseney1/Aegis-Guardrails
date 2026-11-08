@@ -40,6 +40,10 @@ SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 # UUID-shaped conflicts are distinct from the wider legacy session names accepted by provision.
 SESSION_UUID = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
                           r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+# Sparing descendants may inspect embedded IDs, including modelled short options. Never use this as ownership
+# evidence. Hex boundaries avoid finding a compact UUID inside a longer hash; a short option may be a hex letter.
+SESSION_UUID_OCCURRENCE = re.compile(r"(?:(?<![0-9a-fA-F])|(?<=-[A-Za-z]))" + SESSION_UUID.pattern +
+                                     r"(?![0-9a-fA-F])")
 CODEX_TRANSCRIPTS = ("sessions/**/rollout-*{session}.jsonl", "archived_sessions/**/rollout-*{session}.jsonl")
 CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
 # Spec rule 3 is not enforced in T2(a) (owner decision B): no MCP child has been shown to carry either variable.
@@ -213,75 +217,97 @@ def _uuid_values(arguments):
                 yield value
 
 
-def _adjacent_selectors(selectors, arguments, session):
-    """Conservative selectors for ps text, whose configuration values lost their argument boundaries."""
-    selected, conflicting, index, options = [], False, 0, True
-    commands = {command[-1] for command in selectors["commands"]}
-    while index < len(arguments):
-        word = arguments[index]
-        if word == "--":
-            options = False
-            index += 1
-            continue
-        if not options and selectors["options"]:
-            # Claude's remaining words are prompt text: they cannot establish ownership.
-            conflicting = conflicting or any(value != session for value in _uuid_values([word]))
-            index += 1
-            continue
-        option, equal, value = word.partition("=")
-        if option in selectors["conflicting_flags"]:
-            conflicting = True
-        if option in selectors["options"] or word in commands:
-            if not equal:
-                index += 1
-                if word in commands and index < len(arguments) and arguments[index] == "--":
-                    options = False
-                    index += 1
-                value = arguments[index] if index < len(arguments) else ""
-            if value == session or SESSION_UUID.fullmatch(value):
-                selected.append(value)
-        index += 1
-    return selected, conflicting
+def _selector_value(value, session):
+    """Classify a complete selector value identically for ownership and descendant refusal."""
+    if value is None or not value or value.startswith("-"):
+        return "ambiguous"
+    if value == session:
+        return "bound"
+    return "other" if SESSION_UUID.fullmatch(value) else "unknown"
 
 
 def _session_values(selectors, arguments, argv_boundaries, session):
-    if argv_boundaries == "unproven":
-        return _adjacent_selectors(selectors, arguments, session)
-    selected, positional, index, options = [], [], 0, True
-    while index < len(arguments):
+    """One selector-state scan; proven argv skips complete values, ps retains its weaker evidence.
+
+    scan -> value leaves i at the prospective value. Ambiguity blocks permanently and an option-shaped value
+    stays at i so -- always reaches the terminator transition. prompt only relaxes ordinary non-UUID ps words
+    after a bound selection; it cannot repair an earlier invalid selection. terminated never establishes one.
+    """
+    flat = argv_boundaries == "unproven"
+    selected, conflicting, index, options = [], False, 0, True
+    state, after_value, command_value, positional = "scan", "scan", False, []
+    commands = {command[-1] for command in selectors["commands"]}
+
+    def record(value, incidental=False):
+        nonlocal conflicting
+        shape = _selector_value(value, session)
+        if shape in ("bound", "other"):
+            selected.append(value)
+        if shape in ("ambiguous", "other") or (shape == "unknown" and not incidental):
+            conflicting = True
+        return shape
+
+    while index < len(arguments) or state == "value":
+        if state == "value":
+            value = arguments[index] if index < len(arguments) else None
+            if value == "--" and command_value and options:
+                # The established Codex resume -- S form disables options before its positional value.
+                options = False
+                index += 1
+                continue
+            shape = record(value, flat and after_value == "prompt")
+            state = after_value
+            if value is None:
+                break
+            if shape != "ambiguous":
+                index += 1
+                continue
+            # Do not consume an option-shaped value. In particular, Claude's -- must still terminate scanning.
         word = arguments[index]
         if options and word == "--":
             options = False
+            if selectors["options"]:
+                state = "terminated"
+            index += 1
+            continue
+        if state == "terminated":
+            if flat:
+                # ps cannot prove the prompt boundary; only another UUID counts as conflicting evidence here.
+                conflicting = conflicting or any(value != session for value in _uuid_values([word]))
             index += 1
             continue
         option, equal, value = word.partition("=")
-        if not options:
-            positional.append(word)
-        elif option in selectors["conflicting_flags"]:
-            return selected, True
-        elif option in selectors["options"]:
+        if options and option in selectors["conflicting_flags"]:
+            conflicting = True
+        elif options and option in selectors["options"]:
+            if equal:
+                record(value, flat and state == "prompt")
+            else:
+                after_value, state, command_value = state, "value", False
+        elif options and option in selectors["value_options"]:
             if not equal:
-                index += 1
-                value = arguments[index] if index < len(arguments) else ""
-            selected.append(value)
-        elif option in selectors["value_options"]:
-            if not equal:
-                index += 1
-        elif option in selectors["prompt_options"]:
+                # Proven argv keeps a declared value opaque, even if it looks like a selector. ps cannot prove
+                # that boundary and must block on an option-shaped value. Neither mode may swallow --.
+                next_word = arguments[index + 1] if index + 1 < len(arguments) else None
+                if next_word is not None and next_word != "--" and (not flat or not next_word.startswith("-")):
+                    index += 1
+                elif flat:
+                    conflicting = True
+        elif options and option in selectors["prompt_options"]:
             if not equal and index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
                 index += 1
-        elif not word.startswith("-"):
+                if flat and selected:
+                    state = "prompt"
+        elif word in commands:
             positional.append(word)
+            if flat or selected or tuple(positional) in selectors["commands"]:
+                after_value, state, command_value = state, "value", True
+        elif not word.startswith("-") or not options:
+            positional.append(word)
+            if flat and selected:
+                state = "prompt"
         index += 1
-    if selectors["commands"]:
-        for command in selectors["commands"]:
-            if tuple(positional[:len(command)]) == command and len(positional) > len(command):
-                selected.append(positional[len(command)])
-                # A second resume selector cannot retarget the process to another session.
-                tail = positional[len(command) + 1:]
-                selected.extend(tail[i + 1] for i, word in enumerate(tail[:-1]) if word == command[-1])
-                break
-    return selected, False
+    return selected, conflicting
 
 
 def matches_session(kind, argv, session, argv_boundaries="proven"):
@@ -295,10 +321,10 @@ def matches_session(kind, argv, session, argv_boundaries="proven"):
 
 def selects_other_session(argv, session):
     """A descendant naming another UUID is spared even when its selector is unknown to the registry."""
-    if any(value != session for value in _uuid_values(argv)):
+    if any(found.group() != session for word in argv for found in SESSION_UUID_OCCURRENCE.finditer(word)):
         return True
     for kind in TEAM_HOSTS:
-        selected, conflicting = _adjacent_selectors(_host(kind)["session_selectors"], argv[1:], session)
+        selected, conflicting = _session_values(_host(kind)["session_selectors"], argv[1:], "unproven", session)
         if conflicting or any(value != session for value in selected):
             return True
     return False

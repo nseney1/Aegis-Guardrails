@@ -739,8 +739,9 @@ def process_state(expected, current, boundaries, session, host, unowned, require
             (current.uid, current.euid) != (expected.uid, expected.euid) or
             (parent is not None and current.ppid != parent) or
             (require_host and not owns_process(current, session, host, boundaries))):
+        # Retained targets were already attempted and cannot be recorded as spared.
         # A replacement PID, or an unrelated changed group member, is not a process naming this session.
-        if current.start_time == expected.start_time and names_session(current, session):
+        if not retained and current.start_time == expected.start_time and names_session(current, session):
             unowned.append(current.pid)
         return "changed"
     return "authorized"

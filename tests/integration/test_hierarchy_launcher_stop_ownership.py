@@ -22,6 +22,42 @@ with open(os.environ["STOP_OWNERSHIP_READY"], "w") as ready:
 time.sleep(5)
 """
 
+# Bounded selector-state table from the registry/builders and round6 modelled cases.
+# i indexes argv after the program. OPTIONS -> VALUE does not consume the next token;
+# an option-shaped value blocks, leaving that token (especially --) for the next transition.
+# BLOCKED is sticky. A Claude -- ends options; Codex's registered resume -- S remains valid.
+# Each row gives proven and flattened outcomes separately: prompt text has stronger boundaries in /proc.
+SELECTOR_STATE_CASES = [
+    pytest.param("claude-code", ["--print", "--system-prompt", "Explain --resume", "--", "--resume <S>"],
+                 False, False, id="modelled-system-prompt-consumed-terminator"),
+    pytest.param("claude-code", ["--resume", "--", "--resume <S>"],
+                 False, False, id="modelled-selector-consumed-terminator"),
+    pytest.param("claude-code", ["--resume", "--print", "please --resume <S>"],
+                 False, False, id="modelled-claude-option-valued-selection"),
+    pytest.param("codex-cli", ["exec", "resume", "--last", "resume <S> prompt"],
+                 False, False, id="modelled-codex-option-valued-selection"),
+    pytest.param("claude-code", ["--resume", "unknown", "--resume", "<S>"],
+                 False, False, id="modelled-unknown-value-cannot-recover"),
+    pytest.param("claude-code", ["--resume", "<S>", "--session-id"],
+                 False, False, id="modelled-missing-value-after-bound-selection"),
+    pytest.param("claude-code", ["--resume", "<S>", "--resume", "--print", "wait"],
+                 False, False, id="modelled-option-value-after-bound-selection"),
+    pytest.param("claude-code", ["--resume", "<S>", "--resume", "unknown"],
+                 False, False, id="modelled-unknown-selection-after-bound-selection"),
+    pytest.param("codex-cli", ["exec", "resume", "--", "<S>", "prompt"],
+                 True, True, id="established-codex-positional-terminator"),
+    pytest.param("codex-cli", ["exec", "resume", "<S>", "please resume the review"],
+                 True, True, id="builder-codex-ordinary-prompt"),
+    pytest.param("claude-code", ["--session-id", "<S>", "--print", "please --resume the review"],
+                 True, True, id="modelled-claude-ordinary-prompt"),
+    pytest.param("claude-code", ["--resume", "<S>", "--", "--resume <T>"],
+                 True, False, id="modelled-proven-prompt-versus-flat-conflict"),
+    pytest.param("claude-code", ["--system-prompt", "--resume", "<S>"],
+                 False, False, id="modelled-opaque-configuration-value"),
+    pytest.param("claude-code", ["--system-prompt", "--resume", "--session-id", "<S>"],
+                 True, False, id="modelled-proven-configuration-versus-flat-ambiguity"),
+]
+
 
 @pytest.fixture
 def launch(tmp_path):
@@ -862,7 +898,7 @@ def test_stop_spares_descendants_naming_another_uuid(launch, children, monkeypat
 
 
 @pytest.mark.parametrize("use_pidfds", [True, False], ids=["pidfds", "start-time-evidence"])
-@pytest.mark.parametrize("change", [None, "cmdline", "unreadable"])
+@pytest.mark.parametrize("change", [None, "cmdline", "unreadable", "named-session"])
 def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, children, monkeypatch, capsys,
                                                                 use_pidfds, change):
     import errno
@@ -917,6 +953,8 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
                 raise PermissionError("worker evidence unavailable")
             if change == "cmdline":
                 return read(path) + b"changed\0"
+            if change == "named-session":
+                return read(path) + b"--session-id=" + session.encode() + b"\0"
         return read(path)
 
     monkeypatch.setattr(Path, "read_bytes", changed)
@@ -932,4 +970,72 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
         assert code == 3 and stopped["state"] == "stop_failed"
         assert worker.poll() is None and (worker.pid, signal.SIGKILL) not in events
     assert stopped["pids"] == sorted([leader.pid, middle.pid, worker.pid])
+    assert not set(stopped["pids"]) & set(stopped.get("unowned_pids", []))
     assert leader.wait(timeout=5) == -signal.SIGKILL
+
+
+@pytest.mark.parametrize("evidence", ["proven", "unproven"])
+@pytest.mark.parametrize("host,arguments,proven,flattened", SELECTOR_STATE_CASES)
+def test_selector_state_table_through_public_stop(launch, children, monkeypatch, capsys, evidence,
+                                                host, arguments, proven, flattened):
+    session, other = str(uuid.uuid4()), str(uuid.uuid4())
+    launch.add_role(REVIEW, host, session=session)
+    held = children(sys.executable, "-c", CHILD)
+    program = "codex" if host == "codex-cli" else "claude"
+    argv = [program, *(word.replace("<S>", session).replace("<T>", other) for word in arguments)]
+    module = launcher_module()
+    if evidence == "unproven":
+        fallback_process(monkeypatch, module, held, argv)
+    else:
+        present_argv(monkeypatch, held, argv)
+    owned = proven if evidence == "proven" else flattened
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["state"] == ("stopped" if owned else "not_running")
+    assert stopped["pids"] == ([held.pid] if owned else [])
+    if evidence == "unproven":
+        assert stopped["argv_boundaries"] == "unproven"
+        if not owned:
+            assert stopped["unowned_pids"] == [held.pid]
+    if owned:
+        assert held.wait(timeout=5) == -signal.SIGTERM
+    else:
+        assert held.poll() is None
+
+
+@pytest.mark.parametrize("host,arguments", [
+    pytest.param("codex-cli", ["exec", "resume", "--last", "resume <S> prompt"],
+                 id="modelled-codex-option-value"),
+    pytest.param("claude-code", ["--resume", "--print", "please --resume <S>"],
+                 id="modelled-claude-option-value"),
+    pytest.param("claude-code", ["-r<T>", "-p", "wait"], id="modelled-attached-alias-not-observed"),
+])
+def test_group_descendants_with_ambiguous_selection_are_spared(launch, children, monkeypatch, capsys, host, arguments):
+    session, other = str(uuid.uuid4()), str(uuid.uuid4())
+    launch.add_role(REVIEW, "claude-code", session=session)
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    worker = children(sys.executable, "-c", CHILD)
+    argv = ["codex" if host == "codex-cli" else "claude",
+            *(word.replace("<S>", session).replace("<T>", other) for word in arguments)]
+    present_argv(monkeypatch, worker, argv)
+    present_family(monkeypatch, {worker.pid: (leader.pid, leader.pid)})
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["pids"] == [leader.pid]
+    assert worker.poll() is None
+    assert leader.wait(timeout=5) == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("command", [["resume"], ["exec", "resume"]])
+def test_proven_codex_terminator_keeps_option_shaped_positionals(launch, children, monkeypatch, capsys, command):
+    # Modelled argv: --json after -- is a literal positional, not an option to skip before a registered command.
+    session = str(uuid.uuid4())
+    launch.add_role(REVIEW, "codex-cli", session=session)
+    held = children(sys.executable, "-c", CHILD)
+    present_argv(monkeypatch, held, ["codex", "--", "--json", *command, session])
+    module = launcher_module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["state"] == "not_running" and stopped["pids"] == []
+    assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
