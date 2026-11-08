@@ -18,7 +18,9 @@ ROOT (`tools/hierarchy_jobs.py:1271-1274`); the router borrows its own role's bi
 attribution through a dedicated dispatcher service with exactly mailbox:dispatch and mailbox:job_request; no ADR-only waiver.
 
 Read lifecycle rows/events/policy including `small_change_ready` and closed-row audits, validated mailbox/binding/acceptance history, delivery
-receipts, initiative registry, recipes and retained job evidence. Ready disappears after intent (`tools/hierarchy_lifecycle.py:999-1042`), so
+receipts, initiative registry, recipes and retained job evidence. Provision data must be an object, validated once and reused for delivery
+selection; malformed provision data is a per-row small_change_configuration hold while independent canonical jobs continue.
+Ready disappears after intent (`tools/hierarchy_lifecycle.py:999-1042`), so
 inspect all rows; retain the pinned watch exclusion (`:1031-1035`). Write initiative briefs/check packets, existing mailbox messages, route
 events and derived status. No descriptors, saved route envelopes, recipe snapshots or second authority ledger.
 
@@ -37,7 +39,10 @@ endpoint. Missing/ambiguous/wrong kinds hold before work. Resolve both with `Mai
 (`tools/hierarchy_mailbox.py:470-473`, `:868-871`). Lifecycle participants must independently match registered
 CID/generation/role/currency/independence (`tools/hierarchy_lifecycle.py:495-514`). No CID-to-session authentication exists; generations are
 separate namespaces. Dispatch metadata and the composed brief name endpoint/target generation; original acceptance/result bindings must match
-that target's historical binding. No free endpoint mapping or undefined dispatcher configuration is introduced.
+that target's historical binding. For owned scw/scr assignments, fence the dispatch sender and each acceptance/completion by the binding's
+creation and supersession interval and recorded handoff acknowledgment. Require dispatch <= acceptance <= completion while retaining strict
+target-generation equality. Valid generation-1 replies published before a later rotation remain usable; retired senders cannot answer afterward.
+No free endpoint mapping or undefined dispatcher configuration is introduced.
 
 ```mermaid
 sequenceDiagram
@@ -151,9 +156,12 @@ hash == result hash at settlement; any mismatch is a per-row small_change_recipe
 retained-result settlement already prevent runner replay (`tools/hierarchy_jobs.py:1177-1190`, `:1955-1982`).
 
 Retained-artifact successor to the denied whole-candidate review: receipt validation consumes one private, descriptor-anchored snapshot of
-all step-* and derivation candidates plus result/claim/process/packet metadata. Preflight original paths before discovery; retain validated
-ancestor and file descriptors, refuse symlinks/nonregular entries before reading, and detect identity, content metadata or membership change
-before publication. Evidence hashes, original-path references, result validation, process-stop checks and exact receipt body use captured data;
+all step-* and derivation candidates plus result/claim/process/packet metadata. Preflight original paths before discovery; use temporary
+validated ancestor handles and one artifact descriptor at a time, refusing symlinks/nonregular entries before reading. Close capture handles
+before processing another job; retain captured bytes and identity witnesses, not batch-wide open descriptors. Before publication, reopen one
+anchored path at a time and revalidate ancestor/artifact identity, content metadata and membership without rereading artifact contents.
+Descriptor use depends on path depth, not the admitted check count. Evidence hashes, original-path references, result validation,
+process-stop checks and exact receipt body use captured data;
 never return the folder to unchecked Job readers. This fixed-v1 path refuses the exact reserved names execution.json, derivation.json and
 admitted.json at anchored directory discovery, before any content open, regardless of file type or apparent execution liveness. Surface
 small_change_receipt_invalid with the unsupported retained v1 metadata filename. The current qualification-base runner may prefer execution

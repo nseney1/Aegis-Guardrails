@@ -2869,3 +2869,182 @@ def test_r3_malformed_foreign_job_packet_is_a_row_hold_and_run_open_continues(tm
     row = world.projection()
     assert (row["state"], row["reason"], row["detail"]) == ("held", "small_change_mixed_queue", detail), row
     assert [r["message"]["message_id"] for r in world.messages("job_request")] == ["r3-foreign-job"]
+
+
+# R4: owned-assignment fences, bounded snapshot descriptors and provision-object validation.
+def r4_rotate_endpoint(world, endpoint):
+    note = world.root.parent / "r4-outgoing-stopped.md"
+    note.write_text("modelled owner stopped the outgoing endpoint\n")
+    checkpoint = {"outgoing_stopped": True, "sources": [], "lease_refs": [], "completed_checks": [],
+                  "pending_message_ids": [], "last_acknowledgment_ids": [], "briefs": [
+                      {"path": str(note), "sha256": hashlib.sha256(note.read_bytes()).hexdigest()}]}
+    binding = invoke(world.root, "bind", {"endpoint": endpoint, "host": "r4-successor",
+        "session": "r4-successor-session", "expected_generation": 1, "checkpoint": checkpoint})
+    invoke(world.root, "ack-handoff", {"endpoint": endpoint, "session": "r4-successor-session",
+        "generation": 2, "checkpoint_sha256": binding["checkpoint_sha256"]})
+
+
+@pytest.mark.parametrize("lane", ["fix", "review0"])
+@pytest.mark.parametrize("case", ["completion-after-handoff", "acceptance-after-handoff",
+    "dispatch-sender-after-handoff", "acceptance-before-dispatch", "completion-before-acceptance",
+    "valid-before-handoff"])
+def test_r4_owned_assignment_uses_binding_intervals_and_chronology(tmp_path, lane, case):
+    (tmp_path / ".keep").write_text("R4 owned assignment interval and ordering evidence\n")
+    world = DispatchWorld(tmp_path)
+    if lane == "fix":
+        world.dispatch()
+        world.finish_writer()
+    else:
+        reviewer = ready_reviewer(world)
+        review_result(world, reviewer)
+    dispatch = next(r for r in world.messages("dispatch") if r["message"]["to"] == "engine/lane/" + lane)
+    parent = dispatch["message"]["message_id"]
+    replies = [r for r in world.messages() if r["message"].get("in_reply_to") == parent]
+    acceptance = next(r for r in replies if r["message"].get("acknowledgment") == "accepted")
+    completion = next(r for r in replies if r["message"]["type"] in {"result", "review"})
+    if case in {"completion-after-handoff", "acceptance-after-handoff", "valid-before-handoff"}:
+        r3_rebind(world, lane)
+        after = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        if case != "valid-before-handoff":
+            record = completion if case == "completion-after-handoff" else acceptance
+            rewrite_message(record, lambda m: m.update(created_at=after))
+    elif case == "dispatch-sender-after-handoff":
+        r4_rotate_endpoint(world, "engine/orchestrator")
+        after = datetime.now(timezone.utc)
+        for index, record in enumerate([dispatch, acceptance, completion]):
+            stamp = (after + timedelta(microseconds=index)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            rewrite_message(record, lambda m, stamp=stamp: m.update(created_at=stamp))
+    else:
+        origin = datetime.fromisoformat(dispatch["message"]["created_at"].replace("Z", "+00:00"))
+        stamp = (origin + timedelta(microseconds=-1 if case == "acceptance-before-dispatch" else 1))
+        stamp = stamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        rewrite_message(acceptance if case == "acceptance-before-dispatch" else completion,
+                        lambda m: m.update(created_at=stamp))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    if case == "valid-before-handoff":
+        row = world.dispatch()["small_changes"][0]
+        assert row["state"] == ("checking" if lane == "fix" else "held"), row
+        if lane == "fix":
+            assert len(world.messages("job_request")) == 1
+        else:
+            assert row["reason"] == "small_change_close_due"
+    else:
+        reason = ("small_change_result_invalid" if case in {
+            "acceptance-before-dispatch", "completion-before-acceptance"} else "small_change_binding_changed")
+        for command in ("status", "dispatch"):
+            row = world.dispatch(command=command)["small_changes"][0]
+            assert (row["state"], row.get("reason")) == ("held", reason), row
+            assert row["drafts"] == [] or all(
+                d["event"].get("status") != "FINAL" for d in row["drafts"]), row
+            assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def r4_limited_dispatch(world, *, checks, tamper=None):
+    script = r"""
+import importlib.util, json, os, pwd, resource, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+home, limit, first, last, tamper = sys.argv[2:7]
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], home, user.pw_shell))
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (int(limit), hard))
+listed = os.listdir
+changed = False
+def listdir(directory):
+    global changed
+    names = listed(directory)
+    actual = Path(os.readlink('/proc/self/fd/%d' % directory)) if type(directory) is int else Path(directory)
+    if tamper and not changed and actual == Path(last):
+        changed = True
+        target = Path(first)
+        if tamper == 'file':
+            with (target / 'step-1.log').open('ab') as stream: stream.write(b'changed after capture')
+        else:
+            target.rename(target.with_name(target.name + '.retained'))
+            target.mkdir()
+    return names
+os.listdir = listdir
+sys.exit(router.main(sys.argv[7:]))
+"""
+    requests = sorted(world.messages("job_request"), key=lambda r: json.loads(r["message"]["body"])["check"])
+    assert len(requests) == checks
+    folders = [world.workspace.store / "jobs/engine" / r["message"]["message_id"] for r in requests]
+    limit = 128 if tamper else 64
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(world.tmp / "home"),
+        str(limit), str(folders[0]), str(folders[-1]), tamper or "",
+        "--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store),
+        "dispatch", "--recipes", str(world.recipes_path), "--wait", "0.1", "--evidence-only"],
+        env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    (world.tmp / "r4-limited-result.json").write_text(p.stdout)
+    return json.loads(p.stdout)["small_changes"][0]
+
+
+def test_r4_valid_check_batch_progresses_under_low_descriptor_limit(tmp_path):
+    (tmp_path / ".keep").write_text("R4 real retained jobs under RLIMIT_NOFILE64\n")
+    world = DispatchWorld(tmp_path, checks=16)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    assert len(world.run_jobs()["rows"]) == 16
+    receipts = world.messages("job_receipt")
+    row = r4_limited_dispatch(world, checks=16)
+    assert row["state"] == "reviewing", row
+    assert len(world.messages("dispatch")) == 2
+    assert world.messages("job_receipt") == receipts
+
+
+@pytest.mark.parametrize("tamper", ["file", "directory"])
+def test_r4_bounded_descriptors_keep_publication_time_snapshot_checks(tmp_path, tamper):
+    (tmp_path / ".keep").write_text("R4 identity revalidation after earlier job capture\n")
+    world = DispatchWorld(tmp_path, checks=2)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    assert len(world.run_jobs()["rows"]) == 2
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    messages = world.messages()
+    row = r4_limited_dispatch(world, checks=2, tamper=tamper)
+    assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+    after = mailbox_snapshot(world.root)
+    assert world.ledger.files() == before[0] and world.messages() == messages
+    assert all(after.get(name) == value for name, value in before[1].items())
+    # Existing publication staging may leave an inert content-addressed brief before revalidation refuses.
+    for name in after.keys() - before[1].keys():
+        assert name.startswith("briefs/") and hashlib.sha256(after[name][0]).hexdigest() in name
+
+
+@pytest.mark.parametrize("provision", [[], "not-an-object"], ids=["list", "string"])
+def test_r4_nonobject_provision_is_a_row_hold_and_canonical_job_runs(tmp_path, provision):
+    from tests.integration.test_hierarchy_loop import EMPTY_SWEEP
+    (tmp_path / ".keep").write_text("R4 malformed provision and independent canonical job\n")
+    world = DispatchWorld(tmp_path)
+    (world.root.parent / "provision.json").write_text(json.dumps(provision))
+    docs = world.team("docs")
+    world.workspace.run("update", {"initiative": "docs", "source": "owner", "checkouts": [str(world.checkout)]})
+    packet = tmp_path / "docs/r4-canonical.md"
+    packet.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+        "checkout": str(world.checkout), "commit": world.revision, "tree": world.tree}))
+    invoke(docs, "publish", {"message_id": "r4-canonical-check", "from": "docs/orchestrator", "to": "docs/root",
+        "host": "host-one", "session": "docs-orchestrator", "binding_generation": 1,
+        "type": "job_request", "body": "independent canonical check", "brief": {
+            "path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}})
+    sweep = tmp_path / "r4-sweep.py"
+    sweep.write_text("import json\nprint(json.dumps(%r))\n" % (EMPTY_SWEEP,))
+    state = tmp_path / "r4-loop-state"
+    state.mkdir()
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", R3_LOOP_PASS, str(ROOT / "tools/hierarchy_loop.py"),
+        str(sweep), str(tmp_path / "home"), str(world.ledger.path), str(world.workspace.store),
+        str(world.recipes_path), str(state)], env=os.environ.copy(), capture_output=True, text=True, timeout=60)
+    assert p.returncode == 3 and p.stderr == "", p.stdout + p.stderr
+    report = json.loads(p.stdout.splitlines()[-1])
+    steps = {r["step"]: r for r in report["steps"]}
+    assert steps["run_open"]["state"] == "ok"
+    assert {"job": "docs/r4-canonical-check", "state": "completed"} in steps["run_open"]["rows"], report
+    assert any(h["kind"] == "small_change_configuration" and h.get("request_id") == world.change.value["id"]
+               and h["detail"] == "provision record must be an object" for h in report["holds"]), report
+    assert world.messages("dispatch") == []

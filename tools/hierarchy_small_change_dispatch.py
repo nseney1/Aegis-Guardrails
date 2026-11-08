@@ -7,6 +7,7 @@ are never recorded here. All state is reconstructed from existing public records
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -151,7 +152,7 @@ def _artifact_mark(info):
 
 
 class _RetainedJob:
-    """One descriptor-anchored snapshot; downstream validation never reopens its paths."""
+    """Captured bytes plus identity witnesses; temporary anchored handles validate publication safety."""
 
     def __init__(self, store, initiative, message):
         self.id = initiative["id"] + "/" + message["message_id"]
@@ -161,98 +162,125 @@ class _RetainedJob:
         router.preflight_paths(self.folder)
         require(self.folder.is_absolute() and ".." not in self.folder.parts, "invalid retained job path")
         require(os.name == "posix", "retained descriptor capture requires POSIX")
-        self._fds, self._links, self.entries = [], [], {}
-        self._missing = None
-        self._dir = None
-        try:
-            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-            parent = os.open("/", flags)
-            self._fds.append(parent)
-            for part in self.folder.parts[1:]:
-                try:
-                    child = os.open(part, flags, dir_fd=parent)
-                except FileNotFoundError:
-                    self._missing = (parent, part)
-                    break
-                self._fds.append(child)
-                info = os.fstat(child)
-                require(stat.S_ISDIR(info.st_mode), "retained job ancestor is not a directory")
-                self._links.append((parent, part, child, (info.st_dev, info.st_ino, info.st_mode)))
-                parent = child
-            if self._missing is None:
-                self._dir = parent
-                self._directory = _artifact_mark(os.fstat(parent))
-                self._members = tuple(os.listdir(parent))
+        self.entries = {}
+        with self._directories() as (directory, links, missing):
+            self._ancestors = tuple((name, identity) for _parent, name, _child, identity in links)
+            self._missing = missing
+            if missing is None:
+                self._directory = _artifact_mark(os.fstat(directory))
+                self._members = tuple(os.listdir(directory))
                 for name in ("execution.json", "derivation.json", "admitted.json"):
                     require(name not in self._members, "unsupported retained v1 metadata: " + name)
                 for name in self._members:
                     if name.startswith("step-") or name.startswith("derivation") or name in {
                             "claim.json", "process.json", "result.json", "packet.md"}:
-                        self._capture(name)
-            self.validate()
-            self.claim = self._json("claim.json")
-            self.process = self._json("process.json")
-            require("claim.json" not in self.entries or isinstance(self.claim, dict), "retained claim must be an object")
-            require("process.json" not in self.entries or isinstance(self.process, dict), "retained process must be an object")
-            self.result = self._result()
-        except BaseException:
-            self.close()
-            raise
+                        self._capture(directory, name)
+            self._validate_snapshot(directory, links, missing)
+        self.claim = self._json("claim.json")
+        self.process = self._json("process.json")
+        require("claim.json" not in self.entries or isinstance(self.claim, dict), "retained claim must be an object")
+        require("process.json" not in self.entries or isinstance(self.process, dict), "retained process must be an object")
+        self.result = self._result()
 
-    def _capture(self, name):
-        before = os.stat(name, dir_fd=self._dir, follow_symlinks=False)
+    @contextmanager
+    def _directories(self, *, expected=False):
+        """Keep only one path's temporary anchors open, independent of the number of jobs."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        descriptors, links, missing = [], [], None
+        try:
+            parent = os.open("/", flags)
+            descriptors.append(parent)
+            for index, part in enumerate(self.folder.parts[1:]):
+                try:
+                    child = os.open(part, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    missing = part
+                    break
+                descriptors.append(child)
+                info = os.fstat(child)
+                identity = (info.st_dev, info.st_ino, info.st_mode)
+                require(stat.S_ISDIR(info.st_mode), "retained job ancestor is not a directory")
+                if expected:
+                    require(index < len(self._ancestors) and (part, identity) == self._ancestors[index],
+                            "retained job directory identity changed")
+                links.append((parent, part, child, identity))
+                parent = child
+            yield parent, links, missing
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _capture(self, directory, name):
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
         require(stat.S_ISREG(before.st_mode), "retained artifact is not a regular file: " + name)
         limit = (jobs.MAX_RESULT_BYTES if name == "result.json" else
                  MAX_BYTES if name in {"claim.json", "process.json", "packet.md"} else None)
         require(limit is None or before.st_size <= limit, "retained metadata exceeds its limit: " + name)
-        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=self._dir)
-        self._fds.append(descriptor)
-        opened = os.fstat(descriptor)
-        require(stat.S_ISREG(opened.st_mode) and _artifact_mark(opened) == _artifact_mark(before),
-                "retained artifact changed at open: " + name)
-        sha, total, tail, chunks = hashlib.sha256(), 0, b"", []
-        remaining = before.st_size
-        while remaining:
-            requested = min(1048576, remaining)
-            chunk = os.read(descriptor, requested)
-            require(len(chunk) == requested, "retained artifact changed while reading: " + name)
-            remaining -= len(chunk)
-            total += len(chunk)
-            require(limit is None or total <= limit, "retained metadata grew beyond its limit: " + name)
-            sha.update(chunk)
-            tail = (tail + chunk)[-jobs.TAIL_BYTES:]
-            if limit is not None:
-                chunks.append(chunk)
-        require(_artifact_mark(os.fstat(descriptor)) == _artifact_mark(before) and total == before.st_size,
-                "retained artifact changed while reading: " + name)
-        self.entries[name] = {"fd": descriptor, "mark": _artifact_mark(before), "sha256": sha.hexdigest(),
-                              "tail": tail, "raw": b"".join(chunks) if limit is not None else None}
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        try:
+            opened = os.fstat(descriptor)
+            require(stat.S_ISREG(opened.st_mode) and _artifact_mark(opened) == _artifact_mark(before),
+                    "retained artifact changed at open: " + name)
+            sha, total, tail, chunks = hashlib.sha256(), 0, b"", []
+            remaining = before.st_size
+            while remaining:
+                requested = min(1048576, remaining)
+                chunk = os.read(descriptor, requested)
+                require(len(chunk) == requested, "retained artifact changed while reading: " + name)
+                remaining -= len(chunk)
+                total += len(chunk)
+                require(limit is None or total <= limit, "retained metadata grew beyond its limit: " + name)
+                sha.update(chunk)
+                tail = (tail + chunk)[-jobs.TAIL_BYTES:]
+                if limit is not None:
+                    chunks.append(chunk)
+            require(_artifact_mark(os.fstat(descriptor)) == _artifact_mark(before) and total == before.st_size,
+                    "retained artifact changed while reading: " + name)
+            self.entries[name] = {"mark": _artifact_mark(before), "sha256": sha.hexdigest(),
+                                  "tail": tail, "raw": b"".join(chunks) if limit is not None else None}
+        finally:
+            os.close(descriptor)
+
+    def _validate_snapshot(self, directory, links, missing):
+        require(tuple((name, identity) for _parent, name, _child, identity in links) == self._ancestors
+                and missing == self._missing, "retained job directory identity changed")
+
+        def validate_links():
+            for parent, name, child, identity in links:
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                opened = os.fstat(child)
+                require((current.st_dev, current.st_ino, current.st_mode) == identity
+                        == (opened.st_dev, opened.st_ino, opened.st_mode),
+                        "retained job directory identity changed")
+
+        def validate_directory():
+            require(_artifact_mark(os.fstat(directory)) == self._directory
+                    and sorted(os.listdir(directory)) == sorted(self._members),
+                    "retained job directory membership changed")
+
+        validate_links()
+        if missing is not None:
+            return
+        validate_directory()
+        for name, entry in self.entries.items():
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            require(stat.S_ISREG(current.st_mode) and _artifact_mark(current) == entry["mark"],
+                    "retained artifact identity/content metadata changed: " + name)
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                 dir_fd=directory)
+            try:
+                require(_artifact_mark(os.fstat(descriptor)) == entry["mark"]
+                        == _artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                        "retained artifact identity/content metadata changed: " + name)
+            finally:
+                os.close(descriptor)
+        validate_directory()
+        validate_links()
 
     def validate(self):
-        for parent, name, child, identity in self._links:
-            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            require((current.st_dev, current.st_ino, current.st_mode) == identity
-                    == (os.fstat(child).st_dev, os.fstat(child).st_ino, os.fstat(child).st_mode),
-                    "retained job directory identity changed")
-        if self._missing is not None:
-            parent, name = self._missing
-            try:
-                os.stat(name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-            raise ValueError("retained job appeared during capture")
-        require(_artifact_mark(os.fstat(self._dir)) == self._directory
-                and sorted(os.listdir(self._dir)) == sorted(self._members),
-                "retained job directory membership changed")
-        for name, entry in self.entries.items():
-            require(_artifact_mark(os.fstat(entry["fd"])) == entry["mark"]
-                    == _artifact_mark(os.stat(name, dir_fd=self._dir, follow_symlinks=False)),
-                    "retained artifact identity/content metadata changed: " + name)
-
-    def close(self):
-        for descriptor in reversed(self._fds):
-            os.close(descriptor)
-        self._fds = []
+        # Reopen only anchored metadata handles. Captured result/body/evidence bytes are never reread.
+        with self._directories(expected=True) as (directory, links, missing):
+            self._validate_snapshot(directory, links, missing)
 
     def _json(self, name):
         entry = self.entries.get(name)
@@ -324,7 +352,7 @@ class _RetainedJob:
         if missed:
             lines.append("Kept files not copied: " + "; ".join(missed))
         logs = sorted((n for n in self._members if n.startswith("step-") and n.endswith(".log")),
-                      key=lambda n: int(n.split("-")[1].split(".")[0])) if self._dir is not None else []
+                      key=lambda n: int(n.split("-")[1].split(".")[0])) if self._missing is None else []
         for name in reversed(logs):
             entry = self.entries[name]
             if entry["mark"][4]:
@@ -382,6 +410,7 @@ class Row:
         self.records = {}
         self.proofs = []
         self._retained_jobs = []
+        self.setup = {}
 
     def recheck_jobs(self):
         try:
@@ -424,10 +453,12 @@ class Row:
         provision = checked_path(self.mailbox.root.parent / "provision.json")
         if provision.exists():
             setup = read_json(provision)
+            require(isinstance(setup, dict), "provision record must be an object")
             protect_references(setup)
             for key in ("source", "delivery_dir", "store", "board", "mailbox_root"):
                 if key in setup:
                     checked_path(setup[key])
+            self.setup = setup
 
     def live(self, *, writing=False, expiry=False):
         check(self.team not in mixed_teams(self.state), "small_change_mixed_queue", "mixed initiative queues are held")
@@ -621,17 +652,26 @@ class Row:
                     or r["message"].get("acknowledgment") == "completed"]
         check(len(accepted) <= 1 and len(complete) <= 1, "small_change_result_invalid", "duplicate acceptance/completion")
         target_generation = strict_json(dispatch["message"]["body"])["target_generation"]
+        try:
+            in_force(self.mailbox, dispatch["message"])
+        except ValueError as exc:
+            raise Hold("small_change_binding_changed", str(exc)) from exc
         for record in accepted + complete:
             m = record["message"]
             try:
-                historical(self.mailbox, m)
+                in_force(self.mailbox, m)
             except ValueError as exc:
                 raise Hold("small_change_binding_changed", str(exc)) from exc
             check(m["from"] == endpoint and m["binding_generation"] == target_generation,
                   "small_change_binding_changed", "lane result/acceptance binding changed")
+        if accepted:
+            check(parse_time(dispatch["message"]["created_at"]) <= parse_time(accepted[0]["message"]["created_at"]),
+                  "small_change_result_invalid", "dispatch/acceptance/completion chronology differs")
         if not complete:
             return None, accepted[0] if accepted else None
         check(bool(accepted), "small_change_result_invalid", "completion without acceptance")
+        check(parse_time(accepted[0]["message"]["created_at"]) <= parse_time(complete[0]["message"]["created_at"]),
+              "small_change_result_invalid", "dispatch/acceptance/completion chronology differs")
         m = complete[0]["message"]
         try:
             self.mailbox.completion(m.get("result"), self.mailbox.endpoint(endpoint)["kind"])
@@ -855,9 +895,7 @@ class Row:
         if self.change["admission"]:
             parents.update(identifier("scj", self.row, c["check"]) for c in self.change["admission"]["checks"])
         delivery = self.mailbox.root.parent / "delivery"
-        setup = self.mailbox.root.parent / "provision.json"
-        if setup.exists():
-            delivery = checked_path(read_json(setup).get("delivery_dir", str(delivery)))
+        delivery = checked_path(self.setup.get("delivery_dir", str(delivery)))
         read_ids = set()
         if delivery.exists():
             for receipt in self.mailbox.delivery_receipts(delivery, "reads", self.team + "/orchestrator", self.records):
@@ -1025,9 +1063,6 @@ class Row:
                 self.view["drafts"] = self.drafts(reason)
             except (ValueError, OSError, TypeError, KeyError) as draft_error:
                 self.view["draft_error"] = str(draft_error)[:1024]
-        finally:
-            for job in self._retained_jobs:
-                job.close()
         return self.view
 
 
