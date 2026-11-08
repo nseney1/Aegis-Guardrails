@@ -115,6 +115,7 @@ def test_protocol_failure_poisoned_session_fails_every_remaining_file(tmp_path, 
         with pytest.raises(ASTDriverError, match=reason) as first:
             driver.parse(tmp_path / 'a.go')
         assert not isinstance(first.value, ASTDriverTimeoutError)
+        assert 'cleanup failed' not in str(first.value), str(first.value)
         with pytest.raises(ASTDriverError) as remaining:
             driver.parse(tmp_path / 'b.go')
         assert str(remaining.value) == str(first.value)
@@ -142,10 +143,20 @@ def test_timeout_in_requested_phase_poisons_every_remaining_file(tmp_path, mode,
         driver.timeout = 3.0
         with pytest.raises(ASTDriverTimeoutError, match=f'waiting for {operation}') as first:
             driver.parse(target)
+        assert str(first.value) == (
+            f"AST driver 'fixture': timed out after 3.0s waiting for {operation}"
+        ), str(first.value)
         # The child records receipt before stalling: startup delay alone cannot pass.
+        receipt = tmp_path / 'requests.jsonl'
+        if operation == 'hello':
+            assert receipt.is_file(), (
+                'No hello request receipt within the 3.0s hello window; interpreter startup '
+                'can consume this window. Inspect subprocess startup, Windows job setup '
+                'and host-load diagnostics before changing the deadline.'
+            )
         received = [
             json.loads(line)
-            for line in (tmp_path / 'requests.jsonl').read_text(encoding='utf-8').splitlines()
+            for line in receipt.read_text(encoding='utf-8').splitlines()
         ]
         assert received == expected
         with pytest.raises(ASTDriverTimeoutError, match=f'waiting for {operation}') as remaining:
