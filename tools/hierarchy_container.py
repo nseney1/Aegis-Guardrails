@@ -683,22 +683,22 @@ def _mount_option_witness(kind, options, rw, *, complete):
     return _scratch_options(options, complete=complete) if kind == "tmpfs" else False
 
 
-def _inspected_mounts(value, host):
-    """Merge the three engine representations; identical cross-references agree, conflicts refuse."""
-    declarations = {}
-    scratch_witnesses = set()
-    scratch_flags = {}
+def _inspected_mounts(value, host, planned, requests=()):
+    """Actual declarations must prove the plan first; requests only constrain established actual facts."""
+    actual_declarations = {}
+    actual_safety = set()
+    actual_flags = {}
 
-    def observe(kind, destination, options, rw, *, complete):
+    def observe_actual(kind, destination, options, rw, *, complete):
         safe = _mount_option_witness(kind, options, rw, complete=complete)
         if kind == "tmpfs":
-            flags = scratch_flags.setdefault(destination, set())
+            flags = actual_flags.setdefault(destination, set())
             flags.update(options.split(","))
             _scratch_options(",".join(sorted(flags)), complete=False)
             if safe:
-                scratch_witnesses.add(destination)
+                actual_safety.add(destination)
 
-    def put(kind, source, destination, rw, options=None):
+    def declaration(kind, source, destination, rw):
         require(isinstance(source, str) and isinstance(destination, str) and type(rw) is bool,
                 "invalid mount declaration")
         path = _absolute(destination, "mount destination")
@@ -710,17 +710,22 @@ def _inspected_mounts(value, host):
         else:
             require(kind == "bind", "unexpected mount type")
             _absolute(source, "mount source")
+        return kind, source, rw
+
+    def put_actual(kind, source, destination, rw, options=None):
+        row = declaration(kind, source, destination, rw)
         if options is not None:
-            observe(kind, destination, options, rw, complete=True)
-        row = (kind, source, rw)
-        require(destination not in declarations or declarations[destination] == row, "conflicting mounts")
-        declarations[destination] = row
+            observe_actual(kind, destination, options, rw, complete=True)
+        require(destination not in actual_declarations or actual_declarations[destination] == row,
+                "conflicting mounts")
+        actual_declarations[destination] = row
 
     try:
         require(isinstance(value, list), "invalid Mounts")
         seen = set()
         for row in value:
             require(isinstance(row, dict), "invalid mount")
+            kind = row.get("Type")  # Missing kind is not affirmative evidence of a bind.
             dest = row.get("Destination")
             require(isinstance(dest, str) and dest not in seen, "duplicate mount destination")
             seen.add(dest)
@@ -730,12 +735,12 @@ def _inspected_mounts(value, host):
                         "invalid mount Options")
                 options = ",".join(row["Options"])
             if "Mode" in row:
-                observe(row.get("Type", "bind"), dest, row["Mode"], row.get("RW"), complete=False)
-            put(row.get("Type", "bind"), row.get("Source"), dest, row.get("RW"), options)
+                observe_actual(kind, dest, row["Mode"], row.get("RW"), complete=False)
+            put_actual(kind, row.get("Source"), dest, row.get("RW"), options)
         tmpfs = {} if host.get("Tmpfs") is None else host["Tmpfs"]
         require(isinstance(tmpfs, dict), "invalid Tmpfs")
         for dest, options in tmpfs.items():
-            put("tmpfs", "tmpfs", dest, _access(options), options)
+            put_actual("tmpfs", "tmpfs", dest, _access(options), options)
         binds = [] if host.get("Binds") is None else host["Binds"]
         require(isinstance(binds, list), "invalid Binds")
         seen = set()
@@ -746,13 +751,31 @@ def _inspected_mounts(value, host):
             source, dest = parts[:2]
             require(dest not in seen, "duplicate bind destination")
             seen.add(dest)
-            put("bind", source, dest, _access(parts[2] if len(parts) == 3 else "rw"))
-        require(declarations.get("/tmp") == ("tmpfs", "tmpfs", True), "missing declared /tmp tmpfs")
-        require(declarations.get("/dev/shm") == ("tmpfs", "tmpfs", True), "missing declared /dev/shm tmpfs")
-        require(scratch_witnesses == {"/tmp", "/dev/shm"}, "missing scratch tmpfs safety options")
+            put_actual("bind", source, dest, _access(parts[2] if len(parts) == 3 else "rw"))
+
+        # Stage 1: only actual representations may establish coverage, writable scratch and safety.
+        actual_binds = sorted((source, dest, rw) for dest, (kind, source, rw) in actual_declarations.items()
+                              if kind == "bind")
+        require(actual_binds == planned, "actual bind coverage differs from plan")
+        require(actual_declarations.get("/tmp") == ("tmpfs", "tmpfs", True), "missing declared /tmp tmpfs")
+        require(actual_declarations.get("/dev/shm") == ("tmpfs", "tmpfs", True), "missing declared /dev/shm tmpfs")
+        require(actual_safety == {"/tmp", "/dev/shm"}, "missing actual scratch tmpfs safety options")
+
+        # Stage 2: requests never enter actual declarations or positive safety witnesses. Copy flags only
+        # for contradiction checks across actual/request and request/request observations.
+        constraint_flags = {dest: set(flags) for dest, flags in actual_flags.items()}
+        for kind, source, dest, rw, options in requests:
+            row = declaration(kind, source, dest, rw)
+            require(actual_declarations.get(dest) == row, "request differs from established actual mount")
+            if options is not None:
+                _mount_option_witness(kind, options, rw, complete=True)
+                if kind == "tmpfs":
+                    flags = constraint_flags[dest]
+                    flags.update(options.split(","))
+                    _scratch_options(",".join(sorted(flags)), complete=False)
     except (ValueError, TypeError):
-        return None
-    return sorted((source, dest, rw) for dest, (kind, source, rw) in declarations.items() if kind == "bind")
+        return False
+    return True
 
 
 def _image_matches(actual, config, expected):
@@ -862,19 +885,101 @@ def _recorded_options(config, image):
     return None
 
 
-def _unmask_requested(config, host, image):
+def _unmask_requested(recorded, host):
     """Check recorded security/env/tmpfs intent, not effective unmasking or hidden automatic mounts."""
     reported = host.get("SecurityOpt")
     if not isinstance(reported, list) or any(item != "unmask=/proc/*" for item in reported):
         return False
-    recorded = _recorded_options(config, image)
     required = {"--security-opt": ["unmask=/proc/*"], "--env-host": ["false"], "--http-proxy": ["false"],
                 "--read-only-tmpfs": ["false"]}
     return recorded is not None and all(recorded.get(key) == values for key, values in required.items())
 
 
-def _namespace_witnesses(host, expected, recorded):
-    """Actual domains and every supplied recorded request conjoin; missing optional intent is not proof."""
+def _recorded_bind(value):
+    """Only the C1 emitted bind grammar; retain all supplied fields instead of last-value overwriting."""
+    fields, access = {}, []
+    for word in value.split(","):
+        key, separator, content = word.partition("=")
+        if separator:
+            require(key in ("type", "src", "dst"), "unsupported recorded bind field")
+            fields.setdefault(key, []).append(content)
+        else:
+            require(word == "readonly", "unsupported recorded bind option")
+            access.append("ro")
+    require(fields.keys() == {"type", "src", "dst"}, "missing recorded bind field")
+    require(all(all(value == values[0] for value in values) for values in fields.values()),
+            "conflicting recorded bind fields")
+    require(fields["type"][0] == "bind", "unsupported recorded mount type")
+    row = _mount_rows([{"source": fields["src"][0], "destination": fields["dst"][0],
+                        "rw": _access_mode(",".join(access)) is not False}])[0]
+    return "bind", row["source"], row["destination"], row["rw"], None
+
+
+def _recorded_requests(config, host, expected):
+    """Finite request contract, not full argv equality. Absence/subsets and existing duplicate rules persist.
+
+    Parse only existing option arities. Validate each supplied supported witness, then merge mount subsets
+    through the actual mount checker. No raw values leave this comparison as normalized records or errors.
+    """
+    if expected["engine"] != "podman":
+        return set(), []  # Docker has no normative CreateCommand witness.
+    recorded = _recorded_options(config, expected["image"])
+    security_ok = _unmask_requested(recorded, host)
+    bad = set() if security_ok else {"security_opt"}
+    if recorded is None:
+        return bad, []
+    # Keep the established security-failure gating: malformed/missing intent already refuses as security_opt.
+    if security_ok:
+        values = _env_values(recorded.get("--env", []))
+        if values is None or _env_fingerprints(values) != expected["environment"]:
+            bad.add("environment")
+    exact = {flag: (label, request) for flag, _, label, request in NAMESPACE_REQUESTS}
+    exact["--name"] = ("name", container_name(expected["run"]))
+    labels = {flag: label for flag, (label, _) in exact.items()}
+    labels.update({"--cpus": "cpus", "--memory": "memory", "--pids-limit": "pids", "--user": "user",
+                   "--label": "label", "--mount": "mounts", "--tmpfs": "mounts"})
+    mounts = []
+    for flag, values in recorded.items():
+        if flag in ("--env", "--security-opt", "--env-host", "--http-proxy", "--read-only-tmpfs"):
+            continue  # These complete request families were checked above, with their existing rules.
+        for value in values:
+            try:
+                if flag in exact:
+                    require(value == exact[flag][1], "contradictory recorded request")
+                elif flag == "--cpus":
+                    require(re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", value)
+                            is not None, "invalid recorded CPU number")
+                    cpus = _cpus_limit(float(value))
+                    require(_cpus_match(host, cpus, expected["engine"]), "contradictory recorded CPU limit")
+                elif flag == "--memory":
+                    require(_memory_bytes(value) == expected["memory"], "contradictory recorded memory limit")
+                elif flag == "--pids-limit":
+                    require(re.fullmatch(r"[+-]?[0-9]+", value) is not None, "invalid recorded PID integer")
+                    require(_pids_limit(int(value)) == expected["pids"], "contradictory recorded PID limit")
+                elif flag == "--user":
+                    require(_valid_user_record(value), "invalid recorded user")
+                    require(tuple(map(int, value.split(":"))) == tuple(map(int, expected["user"].split(":"))),
+                            "contradictory recorded user")
+                elif flag == "--label":
+                    key, separator, content = value.partition("=")
+                    require(key != "aegis.team.run" or (separator and content == expected["run"]),
+                            "contradictory recorded run label")
+                elif flag == "--mount":
+                    mounts.append(_recorded_bind(value))
+                elif flag == "--tmpfs":
+                    parts = value.split(":")
+                    require(len(parts) == 2, "invalid recorded tmpfs")
+                    dest, options = parts
+                    mounts.append(("tmpfs", "tmpfs", dest, _access(options), options))
+                else:
+                    require(False, "unsupported recorded request")
+            except (ValueError, TypeError):
+                bad.add(labels.get(flag, "security_opt"))
+    return bad, mounts
+
+
+def _namespace_witnesses(host, expected, requested_bad):
+    """Actual namespace domains conjoin with the finite validator's recorded request errors."""
     bad = []
     podman = expected["engine"] == "podman"
     for flag, key, label, request in NAMESPACE_REQUESTS:
@@ -884,13 +989,12 @@ def _namespace_witnesses(host, expected, recorded):
             actual_ok = host.get(key) == NETWORK_MODE
         else:
             actual_ok = host.get(key) in ("", "private")
-        request_ok = recorded is None or all(value == request for value in recorded.get(flag, []))
-        if not actual_ok or not request_ok:
+        if not actual_ok or label in requested_bad:
             bad.append(label)
     return bad
 
 
-def _name_witnesses(actual, expected, recorded):
+def _name_witnesses(actual, expected):
     wanted = container_name(expected["run"])
     observed = actual.get("Name")
     if not isinstance(observed, str):
@@ -898,10 +1002,10 @@ def _name_witnesses(actual, expected, recorded):
     # Moby v27.5.1 daemon/names.go reserveName adds exactly one slash. Podman capture names are plain.
     if expected["engine"] == "docker" and observed.startswith("/"):
         observed = observed[1:]
-    return observed == wanted and (recorded is None or all(value == wanted for value in recorded.get("--name", [])))
+    return observed == wanted
 
 
-def _environment_matches(config, expected, recorded_env):
+def _environment_matches(config, expected):
     values = _env_values(config.get("Env"))
     if values is None:
         return False
@@ -913,10 +1017,6 @@ def _environment_matches(config, expected, recorded_env):
     if (not required.keys() <= observed.keys() or any(observed[key] != required[key] for key in required)
             or observed.keys() - required.keys() - ENGINE_ENV_KEYS):
         return False
-    if recorded_env is not None:
-        recorded = _env_values(recorded_env)
-        if recorded is None or _env_fingerprints(recorded) != create:
-            return False
     return True
 
 
@@ -935,41 +1035,38 @@ def verify(inspect_json, expected):
     config = _object(actual.get("Config"))
     host = _object(actual.get("HostConfig"))
     podman = expected["engine"] == "podman"
-    recorded = _recorded_options(config, expected["image"]) if podman else None
+    requested_bad, requested_mounts = _recorded_requests(config, host, expected)
     mismatches = []
-    if _object(config.get("Labels")).get("aegis.team.run") != expected["run"]:
+    if _object(config.get("Labels")).get("aegis.team.run") != expected["run"] or "label" in requested_bad:
         mismatches.append("label")
-    if not _name_witnesses(actual, expected, recorded):
+    if not _name_witnesses(actual, expected) or "name" in requested_bad:
         mismatches.append("name")
     if not _image_matches(actual, config, expected):
         mismatches.append("image")
     planned = sorted((row["source"], row["destination"], row["rw"]) for row in expected["mounts"])
-    if _inspected_mounts(actual.get("Mounts"), host) != planned:
+    if not _inspected_mounts(actual.get("Mounts"), host, planned, requested_mounts) or "mounts" in requested_bad:
         mismatches.append("mounts")
     if host.get("ReadonlyRootfs") is not True:
         mismatches.append("read_only")
-    if config.get("User") != expected["user"]:
+    if config.get("User") != expected["user"] or "user" in requested_bad:
         mismatches.append("user")
     if host.get("Privileged") is not False:
         mismatches.append("privileged")
     if host.get("CapAdd") not in (None, []):
         mismatches.append("cap_add")
-    mismatches.extend(_namespace_witnesses(host, expected, recorded))
+    mismatches.extend(_namespace_witnesses(host, expected, requested_bad))
     if host.get("Devices") not in (None, []):
         mismatches.append("devices")
-    security_ok = (_unmask_requested(config, host, expected["image"]) if podman else
+    security_ok = ("security_opt" not in requested_bad if podman else
                    host.get("SecurityOpt") == ["systempaths=unconfined"])
     if not security_ok:
         mismatches.append("security_opt")
-    if not _cpus_match(host, expected["cpus"], expected["engine"]):
+    if not _cpus_match(host, expected["cpus"], expected["engine"]) or "cpus" in requested_bad:
         mismatches.append("cpus")
     for key, name in (("Memory", "memory"), ("PidsLimit", "pids")):
-        if type(host.get(key)) is not int or host[key] != expected[name]:
+        if type(host.get(key)) is not int or host[key] != expected[name] or name in requested_bad:
             mismatches.append(name)
-    # An invalid/missing Podman command already refuses as security_opt. When structurally valid, its env
-    # declarations must also agree. Docker's primary inspect schema supplies no CreateCommand witness.
-    recorded_env = recorded.get("--env", []) if podman and security_ok else None
-    if not _environment_matches(config, expected, recorded_env):
+    if not _environment_matches(config, expected) or "environment" in requested_bad:
         mismatches.append("environment")
     return mismatches
 

@@ -222,6 +222,31 @@ Every supplied Podman recorded namespace request must also agree with the plan: 
 cannot waive a recorded host/shared request. These optional recorded requests add no effective proof when
 absent; actual namespace witnesses and the existing mandatory recorded security/false flags still apply.
 
+One finite validator checks the supported Podman recorded request families. Matching safe actual fields cannot
+waive a contradictory request. It uses the existing option arities, not full argv equality or a general Podman
+CLI parser. Docker gains no CreateCommand requirement. The existing required security declarations and
+environment rules remain required, including the established environment-check gating after a security failure.
+
+| Supplied request | Agreement rule |
+| --- | --- |
+| `--cpus` | Finite decimal/exponent text in the existing CPU domain; effective quota/NanoCpus must agree, preserving Podman rounding |
+| `--memory` | Existing positive integer lowercase `k`/`m`/`g` grammar, compared in bytes; `1g`, `1024m` and `1048576k` are equivalent |
+| `--pids-limit` | Integer text in the existing domain, compared numerically; zero/unlimited values refuse |
+| `--mount` | C1-emitted `type=bind,src=ABS,dst=SAME[,readonly]` grammar; existing structural row rules and exact source/destination/access agreement apply |
+| `--tmpfs` | C1-emitted `DEST:OPTIONS` grammar; constrain independently established actual destination/access/safety facts |
+| `--user` | Both IDs satisfy the existing Linux bounds and numerically equal the planned UID:GID |
+| `--label` | Every supplied `aegis.team.run` label equals run; unrelated labels remain metadata |
+| Name, namespace, environment and security | The preceding finite witness rules still apply to every applicable declaration |
+
+Optional request absence stays permitted. A supplied mount subset is enough when each row agrees; full recorded
+coverage is not required. Agreeing repeated optional requests are accepted. Contradictory values refuse in
+either order, including repeated bind fields; no parser overwrites an earlier value with the last one. Existing
+duplicate access-flag and required security/environment rules remain unchanged. Recorded tmpfs options join
+actual options for contradiction checks only, so `exec` versus `noexec` across representations also refuses.
+They supply no actual coverage or positive safety evidence. Either alone remains allowed;
+there is no new noexec requirement. This comparison verifies recorded intent and metadata agreement, not
+effective mount enforcement or an authenticated host.
+
 Both numeric UID/GID arguments must be in `0..4294967294` before either engine's create argv or expected plan
 can be returned. Types, booleans and negatives retain `user must be a numeric uid:gid`; reserved/larger IDs
 refuse with `user uid and gid must be < 4294967295`. Verification also revalidates the expected numeric
@@ -239,6 +264,21 @@ Docker's `Image` is a config hash, not a manifest digest. Both NanoCpus and quot
 supported. Podman uses `quota=int(float(cpus)*100000)` and derives NanoCpus from that quota: the capture's
 `cpus=0.29` yields `CpuQuota=28999`, `CpuPeriod=100000`, `NanoCpus=289990000`. Either representation suffices;
 when both are present they must agree. `Mounts`, `HostConfig.Tmpfs` and `HostConfig.Binds` are normalized together.
+These actual inspect representations must independently establish the exact planned bind set and both scratch
+mounts' writable `nosuid,nodev` safety. Only after that succeeds are recorded mount requests checked against the
+established actual declarations. Requests cannot add an actual declaration or a positive safety witness.
+Matching complete CreateCommand mounts cannot repair an empty actual mount set, one missing bind or a missing
+actual safety flag. Absent, partial or unknown actual evidence refuses as `mounts`, regardless of matching intent.
+
+This does not require all three actual representations to duplicate every fact. Supported combinations include
+Mounts binds with HostConfig.Tmpfs, or HostConfig.Binds with Tmpfs and an empty Mounts list. Explicit Mounts rows
+can supply the facts too, under their existing kind/access/safety rules. Actual cross-representation conflicts
+still refuse. Recorded request subsets and absences remain optional constraints. Joint option sets are copied
+for contradiction checks, keeping request flags separate from actual positive safety evidence. These are checks
+of inspect metadata, not authentication or effective mount-enforcement proof.
+Each `Mounts` row must explicitly supply a supported `Type` (`bind` or `tmpfs`). Missing, null, malformed or
+unsupported kinds refuse even when Binds/Tmpfs corroborate the remaining row fields. The verifier never invents
+a bind kind. Optional Mode/Options representations retain their existing rules below.
 Captured Podman bind options include `rprivate,rbind`, and tmpfs options include `rprivate,tmpcopyup`.
 For binds and tmpfs, supplied `Mode` strings and Podman `Options` lists must be well typed. Any explicit `ro`/`rw` flag
 must agree with `RW`, the planned access and `HostConfig.Binds`. Conflicting or duplicate access flags refuse.

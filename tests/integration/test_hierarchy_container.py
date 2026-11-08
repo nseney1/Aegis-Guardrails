@@ -2086,3 +2086,409 @@ def test_real_podman_opt_in(adapter, layout, monkeypatch):
         stopped = call(adapter.stop_argv("podman", layout.run, timeout=5))
         removed = call(adapter.rm_argv("podman", layout.run))
         assert stopped.returncode == removed.returncode == 0, stopped.stderr + removed.stderr
+
+
+def assert_request_witness(adapter, layout, expected, value, surface, labels):
+    if surface == "pure":
+        assert adapter.verify(value, expected) == labels
+        return
+    path = layout.run.parent / "request-inspect.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    isolation = {**ISOLATION, "cpus": expected["cpus"], "pids": expected["pids"],
+                 "memory": str(expected["memory"] // 1024) + "k"}
+    result = cli(layout, {**config_for(layout), "isolation": isolation}, "verify", "--inspect", str(path))
+    assert result.returncode == (2 if labels else 0), result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"mismatches": labels}
+
+
+def add_recorded(value, flag, requests):
+    value[0]["Config"]["CreateCommand"][-1:-1] = [word for request in requests for word in (flag, request)]
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("flag,label,bad", [
+    ("--cpus", "cpus", bad) for bad in
+    ("0", "-1", "0.001", "NaN", "inf", "1e9999", "malformed", "", "0.5", "1_0", " 1 ")
+] + [("--memory", "memory", bad) for bad in
+     ("0", "-1", "0g", "NaN", "1", "1G", "2g", "", "1.5g", "true")
+] + [("--pids-limit", "pids", bad) for bad in
+     ("-1", "0", "63", "nan", "65", "64.0", "true", "", "1e3")])
+def test_recorded_resource_request_refuses(adapter, layout, surface, flag, label, bad):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    add_recorded(value, flag, [bad])
+    assert_request_witness(adapter, layout, expected, value, surface, [label])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("flag,label,good,bad", [("--cpus", "cpus", "1", "0"),
+                                                ("--memory", "memory", "1g", "0"),
+                                                ("--pids-limit", "pids", "64", "-1")])
+@pytest.mark.parametrize("bad_first", [False, True])
+def test_recorded_resource_duplicates_conjoin(adapter, layout, surface, flag, label, good, bad, bad_first):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    add_recorded(value, flag, [bad, good] if bad_first else [good, bad])
+    assert_request_witness(adapter, layout, expected, value, surface, [label])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", ["absent", "matching", "equivalent", "agreeing-duplicates"])
+def test_recorded_resource_request_admitted(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    if case != "absent":
+        for flag, good, equivalent in (("--cpus", "1", "+1.0"), ("--memory", "1g", "1024m"),
+                                        ("--pids-limit", "64", "+064")):
+            requests = [good] if case == "matching" else [equivalent]
+            add_recorded(value, flag, [good, equivalent] if case == "agreeing-duplicates" else requests)
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("representation", ["both", "quota", "nano"])
+@pytest.mark.parametrize("cpus,cpu_request,equal", [(0.29, "0.290", True), (0.5, "0.500000001", True),
+                                              (0.29, "0.29000000000000004", False), (0.5, "0.50002", False)])
+def test_recorded_cpu_request_uses_observed_rounding(adapter, layout, surface, representation, cpus, cpu_request, equal):
+    expected = expected_for(adapter, {**ISOLATION, "cpus": cpus}, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    quota = int(float(cpus) * 100000)  # Model the captured conversion; this does not execute Podman.
+    value[0]["HostConfig"].update(CpuPeriod=100000, CpuQuota=quota, NanoCpus=quota * 10000)
+    if representation == "quota":
+        value[0]["HostConfig"]["NanoCpus"] = 0
+    elif representation == "nano":
+        value[0]["HostConfig"].update(CpuQuota=0, CpuPeriod=0)
+    add_recorded(value, "--cpus", [cpu_request])
+    assert_request_witness(adapter, layout, expected, value, surface, [] if equal else ["cpus"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+def test_recorded_cpu_domain_cannot_be_waived_by_rounding(adapter, layout, surface):
+    available = os.cpu_count()
+    expected = expected_for(adapter, {**ISOLATION, "cpus": available}, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    quota = available * 100000
+    value[0]["HostConfig"].update(CpuPeriod=100000, CpuQuota=quota, NanoCpus=quota * 10000)
+    cpu_request = str(available) + ".000000001"
+    assert float(cpu_request) > available and int(float(cpu_request) * 100000) == quota
+    add_recorded(value, "--cpus", [cpu_request])
+    assert_request_witness(adapter, layout, expected, value, surface, ["cpus"])
+
+
+def recorded_bind(row):
+    return "type=bind,src={source},dst={destination}".format(**row) + ("" if row["rw"] else ",readonly")
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("case", ["source", "destination", "access", "extra", "malformed", "missing-kind",
+                                  "wrong-kind", "conflicting-src-before", "conflicting-src-after",
+                                  "bad-good", "good-bad"])
+def test_recorded_bind_request_refuses(adapter, layout, surface, rw, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    row = next(row for row in expected["mounts"] if row["rw"] == rw)
+    good = recorded_bind(row)
+    bad = {"source": recorded_bind({**row, "source": "/wrong"}),
+           "destination": recorded_bind({**row, "destination": "/wrong"}),
+           "access": recorded_bind({**row, "rw": not rw}),
+           "extra": "type=bind,src=/extra,dst=/extra", "malformed": "type=bind,src=",
+           "missing-kind": good.removeprefix("type=bind,"), "wrong-kind": good.replace("type=bind", "type=volume"),
+           "conflicting-src-before": "src=/wrong," + good, "conflicting-src-after": good + ",src=/wrong",
+           "bad-good": recorded_bind({**row, "rw": not rw}),
+           "good-bad": recorded_bind({**row, "rw": not rw})}[case]
+    requests = [bad, good] if case == "bad-good" else [good, bad] if case == "good-bad" else [bad]
+    add_recorded(value, "--mount", requests)
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("case", ["absent", "matching-subset", "emitted-all", "matching-duplicate", "matching-fields"])
+def test_recorded_bind_request_admitted(adapter, layout, surface, rw, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    row = next(row for row in expected["mounts"] if row["rw"] == rw)
+    good = recorded_bind(row)
+    requests = {"absent": [], "matching-subset": [good],
+                "emitted-all": [recorded_bind(row) for row in expected["mounts"]], "matching-duplicate": [good, good],
+                "matching-fields": [good + ",type=bind,src=" + row["source"] + ",dst=" + row["destination"]]}[case]
+    add_recorded(value, "--mount", requests)
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("dest", ["/tmp", "/dev/shm"])
+@pytest.mark.parametrize("case", ["wrong-destination", "ro", "suid", "dev", "access-conflict", "duplicate-rw",
+                                  "exec-conflict", "exec-noexec", "noexec-exec", "actual-conflict",
+                                  "missing-safety", "missing-options", "malformed", "bad-good", "good-bad"])
+def test_recorded_tmpfs_request_refuses(adapter, layout, surface, dest, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    safe = dest + ":rw,nosuid,nodev"
+    bad = {"wrong-destination": "/run:rw,nosuid,nodev", "ro": dest + ":ro,nosuid,nodev",
+           "suid": safe + ",suid", "dev": safe + ",dev", "access-conflict": safe + ",ro",
+           "duplicate-rw": safe + ",rw", "exec-conflict": safe + ",exec,noexec",
+           "actual-conflict": safe + ",exec", "missing-safety": dest + ":rw,nodev",
+           "missing-options": dest, "malformed": dest + ":rw:nosuid,nodev",
+           "bad-good": dest + ":rw,suid,dev", "good-bad": dest + ":rw,suid,dev"}.get(case)
+    if case in ("exec-noexec", "noexec-exec"):
+        requests = [safe + ",exec", safe + ",noexec"]
+        if case == "noexec-exec":
+            requests.reverse()
+    else:
+        requests = [bad, safe] if case == "bad-good" else [safe, bad] if case == "good-bad" else [bad]
+    if case == "actual-conflict":
+        value[0]["HostConfig"]["Tmpfs"][dest] += ",noexec"
+    add_recorded(value, "--tmpfs", requests)
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", ["absent", "safe", "both", "agreeing-duplicates", "exec", "noexec"])
+def test_recorded_tmpfs_request_admitted(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    good = "/tmp:rw,nosuid,nodev"
+    requests = {"absent": [], "safe": [good], "both": [good, "/dev/shm:rw,nosuid,nodev"],
+                "agreeing-duplicates": [good, good], "exec": [good + ",exec"], "noexec": [good + ",noexec"]}[case]
+    add_recorded(value, "--tmpfs", requests)
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", ["malformed", "empty", "negative", "reserved-uid", "reserved-gid", "huge",
+                                  "wrong", "bad-good", "good-bad"])
+def test_recorded_user_request_refuses(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    uid, gid = map(int, expected["user"].split(":"))
+    wrong = "%d:%d" % ((uid + 1) % 4294967295, gid)
+    bad = {"malformed": "1:2:3", "empty": "", "negative": "-1:0", "reserved-uid": "4294967295:0",
+           "reserved-gid": "0:4294967295", "huge": "4294967296:0", "wrong": wrong,
+           "bad-good": wrong, "good-bad": wrong}[case]
+    add_recorded(value, "--user", [bad, expected["user"]] if case == "bad-good" else [
+        expected["user"], bad] if case == "good-bad" else [bad])
+    assert_request_witness(adapter, layout, expected, value, surface, ["user"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", ["absent", "matching", "leading-zeros", "agreeing-duplicates"])
+def test_recorded_user_request_admitted(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    user = expected["user"]
+    requests = {"absent": [], "matching": [user], "leading-zeros": ["0" + user.replace(":", ":0")],
+                "agreeing-duplicates": [user, user]}[case]
+    add_recorded(value, "--user", requests)
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", ["wrong", "missing-equals", "empty", "bad-good", "good-bad",
+                                  "absent", "matching", "unrelated", "unrelated-no-equals", "agreeing-duplicates"])
+def test_recorded_run_label_request(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    good = "aegis.team.run=" + expected["run"]
+    bad = "aegis.team.run=/wrong"
+    requests = {"wrong": [bad], "missing-equals": ["aegis.team.run"], "empty": ["aegis.team.run="],
+                "bad-good": [bad, good], "good-bad": [good, bad], "absent": [], "matching": [good],
+                "unrelated": ["unrelated=/wrong", "aegis.team.runner=/wrong"],
+                "unrelated-no-equals": ["unrelated"], "agreeing-duplicates": [good, good]}[case]
+    add_recorded(value, "--label", requests)
+    assert_request_witness(adapter, layout, expected, value, surface,
+                           ["label"] if case in ("wrong", "missing-equals", "empty", "bad-good", "good-bad") else [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("kind", ["bind", "tmpfs"])
+@pytest.mark.parametrize("bad", ["missing", None, False, 1, [], {}, "", "volume"])
+def test_mount_kind_requires_explicit_supported_witness(adapter, layout, surface, kind, bad):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["Binds"] = [row["source"] + ":" + row["destination"] + ":" + (
+        "rw" if row["rw"] else "ro") + ",rprivate,rbind" for row in expected["mounts"]]
+    row = value[0]["Mounts"][0]
+    if kind == "tmpfs":
+        row = {"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True}
+        value[0]["Mounts"].append(row)
+    if bad == "missing":
+        del row["Type"]
+    else:
+        row["Type"] = bad
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("kind", ["bind", "tmpfs"])
+@pytest.mark.parametrize("optional", ["absent", "empty-mode", "neutral-mode", "options"])
+def test_explicit_mount_kind_preserves_optional_metadata(adapter, layout, surface, kind, optional):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    row = value[0]["Mounts"][0]
+    if kind == "tmpfs":
+        row = {"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True}
+        value[0]["Mounts"].append(row)
+    if optional in ("empty-mode", "neutral-mode"):
+        row["Mode"] = "" if optional == "empty-mode" else "rprivate"
+    elif optional == "options":
+        row["Options"] = ["rbind"] if kind == "bind" else ["rw", "nosuid", "nodev"]
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("arity", ["separate", "equals"])
+def test_recorded_request_mismatch_order_is_stable(adapter, layout, surface, arity):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    for flag, request in (("--pids-limit", "-1"), ("--memory", "0"), ("--cpus", "0"),
+                          ("--user", "invalid"), ("--tmpfs", "/tmp:rw,suid,dev"),
+                          ("--label", "aegis.team.run=/wrong")):
+        if arity == "separate":
+            add_recorded(value, flag, [request])
+        else:
+            value[0]["Config"]["CreateCommand"].insert(-1, flag + "=" + request)
+    assert_request_witness(adapter, layout, expected, value, surface,
+                           ["label", "mounts", "user", "cpus", "memory", "pids"])
+
+
+def select_recorded_mount_requests(value, selection):
+    # The adapter emits these two flags as separate flag/value pairs; retain every other emitted word.
+    original = value[0]["Config"]["CreateCommand"]
+    argv, pairs = [], []
+    index = 0
+    while index < len(original):
+        if original[index] in ("--mount", "--tmpfs"):
+            pairs.append(original[index:index + 2])
+            index += 2
+        else:
+            argv.append(original[index])
+            index += 1
+    if selection == "partial":
+        pairs = [next(pair for pair in pairs if pair[0] == flag) for flag in ("--mount", "--tmpfs")]
+    elif selection == "absent":
+        pairs = []
+    if selection == "conflicting":
+        pairs.append(["--tmpfs", "/tmp:rw,suid,dev"])
+    # Insert before the image, using its emitted position rather than treating command arguments as options.
+    image_index = argv.index(value[0]["Config"]["Image"])
+    argv[image_index:image_index] = [word for pair in pairs for word in pair]
+    value[0]["Config"]["CreateCommand"] = argv
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("requests", ["absent", "partial", "matching", "conflicting"])
+def test_requests_never_reconstruct_all_actual_mount_evidence(adapter, layout, surface, requests):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    select_recorded_mount_requests(value, requests)
+    value[0]["Mounts"] = []
+    value[0]["HostConfig"].update(Binds=None, Tmpfs=None)
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("requests", ["absent", "partial", "matching", "conflicting"])
+@pytest.mark.parametrize("missing", ["run", "project", "source", "prefix", "live"])
+def test_request_never_replaces_one_actual_bind(adapter, layout, surface, requests, missing):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    select_recorded_mount_requests(value, requests)
+    dest = str(getattr(layout, missing))
+    value[0]["Mounts"] = [row for row in value[0]["Mounts"] if row["Destination"] != dest]
+    value[0]["HostConfig"]["Binds"] = [row for row in value[0]["HostConfig"]["Binds"] if row.split(":")[1] != dest]
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("requests", ["absent", "partial", "matching", "conflicting"])
+@pytest.mark.parametrize("dest", ["/tmp", "/dev/shm"])
+@pytest.mark.parametrize("actual", ["no-declaration", "no-safety", "missing-nosuid", "missing-nodev", "malformed"])
+def test_recorded_flags_never_supply_actual_scratch_safety(adapter, layout, surface, requests, dest, actual):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    select_recorded_mount_requests(value, requests)
+    del value[0]["HostConfig"]["Tmpfs"][dest]
+    if actual != "no-declaration":
+        # Model supported explicit tmpfs rows, already covered by the public actual-mount contract.
+        # The fake's native-derived baseline supplies all other fields; this is not fresh native evidence.
+        mode = {"no-safety": "", "missing-nosuid": "rw,nodev", "missing-nodev": "rw,nosuid",
+                "malformed": None}[actual]
+        value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": dest,
+                                   "RW": True, "Mode": mode})
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("requests", ["absent", "partial", "matching", "conflicting"])
+@pytest.mark.parametrize("field,bad", [("Mounts", None), ("Binds", {}), ("Tmpfs", [])])
+def test_matching_requests_never_replace_unknown_actual_mount_metadata(adapter, layout, surface, requests, field, bad):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    select_recorded_mount_requests(value, requests)
+    if field == "Mounts":
+        value[0][field] = bad
+    else:
+        value[0]["HostConfig"][field] = bad
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("requests", ["absent", "partial", "matching"])
+@pytest.mark.parametrize("representations", ["captured", "mounts-plus-tmpfs", "binds-plus-tmpfs", "mounts-only", "mixed"])
+def test_actual_mount_evidence_combinations_remain_sufficient(adapter, layout, surface, requests, representations):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    select_recorded_mount_requests(value, requests)
+    host = value[0]["HostConfig"]
+    if representations == "mounts-plus-tmpfs":
+        host["Binds"] = None
+    elif representations == "binds-plus-tmpfs":
+        value[0]["Mounts"] = []
+    elif representations in ("mounts-only", "mixed"):
+        # Alternate supported representations are modelled from the existing inspect schema, not native claims.
+        destinations = ("/tmp", "/dev/shm")
+        if representations == "mixed":
+            host["Binds"] = host["Binds"][3:]
+            value[0]["Mounts"] = value[0]["Mounts"][:3]
+            del host["Tmpfs"]["/dev/shm"]
+            destinations = ("/dev/shm",)
+        else:
+            host.update(Binds=None, Tmpfs=None)
+        for dest in destinations:
+            value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": dest, "RW": True,
+                                       "Mode": "", "Options": ["rw", "nosuid", "nodev", "rprivate", "tmpcopyup"]})
+    assert_request_witness(adapter, layout, expected, value, surface, [])
+
+
+def test_actual_evidence_supports_a_declared_empty_bind_plan(adapter, layout):
+    # The pure record API permits an empty bind plan; this prevents replacing exact coverage with count > 0.
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=[])
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("field,label", [("cpu", "cpus"), ("memory", "memory"), ("pids", "pids"),
+                                        ("user", "user"), ("label", "label"), ("name", "name"),
+                                        ("env", "environment"), ("image", "image"), ("namespace", "userns_mode"),
+                                        ("readonly", "read_only"), ("security", "security_opt")])
+def test_other_requests_cannot_supply_missing_actual_facts(adapter, layout, surface, field, label):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    actual, config, host = value[0], value[0]["Config"], value[0]["HostConfig"]
+    if field == "cpu":
+        host.update(NanoCpus=0, CpuQuota=0, CpuPeriod=0)
+    elif field in ("memory", "pids"):
+        host["Memory" if field == "memory" else "PidsLimit"] = None
+    elif field == "user":
+        config["User"] = None
+    elif field == "label":
+        config["Labels"] = {}
+    elif field == "name":
+        actual["Name"] = None
+    elif field == "env":
+        config["Env"] = []
+    elif field == "image":
+        actual["Image"] = None
+    elif field == "namespace":
+        host["IDMappings"] = None
+    elif field == "readonly":
+        host["ReadonlyRootfs"] = None
+    else:
+        host["SecurityOpt"] = None
+    assert_request_witness(adapter, layout, expected, value, surface, [label])
