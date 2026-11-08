@@ -3,32 +3,51 @@
 
 One front door can hold an endpoint in several mailbox roots, and rotating them by
 hand took a checkpoint per root. This drafts each checkpoint from the record and
-binds it. A failure on one entry is reported without hiding or blocking the others,
-and running the same spec again leaves finished entries alone.
+binds it. A stop preflight refusal exits 2 before any entry writes. After that,
+entries are processed independently: each rechecks stop evidence under its mailbox
+writer lock. Evidence that changes after preflight refuses that entry with "stop
+evidence changed during handoff" and exits 3, retaining earlier successful bindings
+and processing the remaining entries. Running the same spec again leaves finished
+entries alone and retries the others once their stop evidence is ready.
 
-The caller asserts outgoing_stopped after verifying that the old session has really
-stopped. That stays a claim, as it is for a hand-written checkpoint. Binding grants
-no sender authority: each successor must still read its checkpoint and acknowledge
-it through its own connection, so acknowledgments are not batched here.
+For launcher-managed bindings, every entry's stop record, wake marker and session
+process census are checked before any entry is processed. A non-refused launcher
+record manages the matching endpoint, session and generation; a generation-less
+record can cover generation 1 only. The latest such record must be a successful
+stop after the latest start or resume, if any. Stop-only histories have a null
+launch reference, and already-bound re-runs have null stop evidence. Other sessions
+retain the caller's outgoing_stopped assertion. Binding grants no sender authority:
+each successor must still read its checkpoint and acknowledge it through its own
+connection, so acknowledgments are not batched here.
+
+Background-mode wake profiles also use the caller's assertion, because launcher
+stop refuses them, but still require no wake marker and no live session process.
+Other launch histories at the launcher's record cap require owner archive/recovery
+before handoff; the maintenance runbook has no archive procedure yet.
 
 A mailbox root beside a team run's host plan binds only a successor on the host
 the plan assigns, and refuses the entry when the plan is not that root's own. The
 successor's session record comes from the add-role that builds its connection and
-profile. Any other root keeps today's unchecked handoff.
+profile. Roots without a host plan keep today's unchecked host choice.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import Mailbox, cli_path, fields, read_json, require, safe_path, text, writer_lock  # noqa: E402
+from hierarchy_mailbox import (Mailbox, cli_path, fields, parse_time, read_bytes, read_json, require,  # noqa: E402
+                               safe_path, strict_json, text, writer_lock)
 import hierarchy_hosts  # noqa: E402
+import hierarchy_launcher  # noqa: E402
 import hierarchy_roles  # noqa: E402
 
 
@@ -77,6 +96,111 @@ def check_successor_record(base, endpoint, generation, spec):
             "session record for %s generation %d belongs to another session or host" % (endpoint, generation))
 
 
+def stop_evidence(mailbox, current):
+    """Read the launcher's records and matching processes; never stop or reconcile anything here."""
+    base, endpoint = mailbox.root.parent, current["endpoint"]
+    command = shlex.join(["hierarchy_launcher.py", "--base", str(base), "stop", "--endpoint", endpoint])
+    guidance = "obtain evidence with: " + command
+    try:
+        profile = base / "profiles" / ("%s-g%d.wake.json" % (hierarchy_launcher.quoted(endpoint), current["generation"]))
+        guidance = "inspect %s; %s will not change this wake profile; correct the profile and retry" % (profile, command)
+        # Same path and predicate as hierarchy_launcher.bound_session()/stop(); no exported predicate exists.
+        background = profile.is_file() and read_json(profile).get("mode") == "background"
+        evidence = "caller_asserted"
+        if background:
+            guidance = ("%s refuses background sessions; stop the background session through claude stop or the "
+                        "wake tool's control and retry after it has ended" % command)
+        else:
+            guidance = "obtain evidence with: " + command
+            folder = safe_path(base / "launches" / hierarchy_launcher.quoted(endpoint))
+            if not folder.exists():
+                return evidence
+            guidance = ("inspect %s mailbox_root and %s; %s will not change this setup; "
+                        "correct the mailbox association and retry" % (base / "provision.json", mailbox.root, command))
+            launches = hierarchy_launcher.Launches(str(base))
+            require(os.path.samefile(launches.mailbox.root, mailbox.root),
+                    "launch records do not cover this mailbox")
+            paths = launches.paths(endpoint)
+            limit, count = hierarchy_launcher.MAX_RECORDS, len(paths)
+            guidance = ("inspect %s; %s cannot append a stop record at this limit; "
+                        "docs/hierarchy-maintenance-runbook.md has no launch-record archive procedure yet; "
+                        "owner must preserve the history and arrange an archive/recovery procedure before retrying"
+                        % (folder, command))
+            require(count < limit, "launch record limit %d reached (%d records)" % (limit, count))
+            records = []
+            for path in paths:
+                guidance = ("inspect %s and its retained evidence; %s will not change this record; "
+                            "owner must reconcile the invalid data before retrying" % (path, command))
+                # Hash the exact bytes parsed, so the evidence cannot describe a different read of the file.
+                try:
+                    raw = read_bytes(path)
+                    record = strict_json(raw.decode("utf-8"))
+                except (ValueError, OSError, UnicodeError, RecursionError) as exc:
+                    raise ValueError("invalid launch record: %s; error: %s" % (path, exc)) from exc
+                require(isinstance(record, dict) and record.get("schema") == hierarchy_launcher.SCHEMA,
+                        "invalid launch record: " + str(path))
+                generation = record.get("generation")
+                if (record.get("state") != "refused"
+                        and all(record.get(key) == current[key] for key in ("endpoint", "session"))
+                        and (generation == current["generation"] or generation is None and current["generation"] == 1)):
+                    records.append((path, record, hashlib.sha256(raw).hexdigest()))
+            if not records:
+                return evidence
+            guidance = "obtain evidence with: " + command
+            # The launcher orders its immutable records by their timestamp-prefixed filenames, including status().
+            status_path, status, status_hash = records[-1]
+            require(status.get("action") == "stop" and status.get("state") in ("stopped", "not_running"),
+                    "latest launch status is %s (%s); a stopped or not_running stop record is required"
+                    % (status.get("state"), status.get("action")))
+            activities = [row for row in records if row[1].get("action") in ("start", "resume")]
+            launch_path, launch_hash = None, None
+            if activities:
+                launch_path, launch, launch_hash = activities[-1]
+                require(status_path > launch_path and parse_time(status.get("at")) > parse_time(launch.get("at")),
+                        "stop record must be recorded after the latest start or resume")
+            evidence = {"launch": str(launch_path) if launch_path is not None else None, "launch_sha256": launch_hash,
+                        "status": str(status_path), "status_sha256": status_hash, "state": status["state"]}
+        marker = mailbox.wake_marker(endpoint)
+        if marker.exists() or marker.is_symlink():
+            if background:
+                guidance = ("inspect %s; %s refuses background sessions; stop the background session through "
+                            "claude stop or the wake tool's control; once it has ended, remove the marker and retry"
+                            % (marker, command))
+            else:
+                guidance = "inspect %s; once %s reports not_running, remove the marker and retry" % (marker, command)
+            raise ValueError("wake marker is held: " + str(marker))
+        # Unlike stop(), we signal nothing, so exclude no ancestors that could still be the outgoing writer.
+        try:
+            found = hierarchy_launcher.session_processes(current["session"], set())
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            guidance = command + " cannot fix it; repair the process census and retry"
+            raise ValueError("process census failed; error: " + str(exc)) from exc
+        require(not found, "live process remains for session %s: %s"
+                % (current["session"], ", ".join(str(pid) for pid, _ in found)))
+        return evidence
+    except (ValueError, OSError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError,
+            subprocess.SubprocessError) as exc:
+        raise ValueError("stop evidence for %s: %s; %s" % (endpoint, exc, guidance)) from exc
+
+
+def preflight_stops(spec):
+    """A missing launcher stop refuses the whole spec before locks, drafts or bindings are written."""
+    for entry in spec["entries"]:
+        if not isinstance(entry, dict) or not {"root", "endpoint"} <= entry.keys():
+            continue
+        try:
+            root = safe_path(text(entry["root"], "root"))
+            mailbox = Mailbox(root)
+            history = mailbox.bindings(entry["endpoint"])
+        except (ValueError, OSError, TypeError, UnicodeError, RecursionError):
+            # Invalid entries still get their existing per-entry errors; they cannot bind a replacement.
+            continue
+        if history:
+            current = history[-1]
+            if current["host"] != spec["host"] or current["session"] != spec["session"]:
+                stop_evidence(mailbox, current)
+
+
 def hand_off(spec, entry):
     fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir", "kind"})
     root = safe_path(text(entry["root"], "root"))
@@ -94,7 +218,13 @@ def hand_off(spec, entry):
             check_successor(plan, mailbox, entry["endpoint"], spec)
         if current["host"] == spec["host"] and current["session"] == spec["session"]:
             return {"already_bound": True, "generation": current["generation"], "ready": mailbox.ready(current),
-                    "checkpoint_sha256": current["checkpoint_sha256"], "acknowledge": acknowledgment(current)}
+                    "checkpoint_sha256": current["checkpoint_sha256"], "acknowledge": acknowledgment(current),
+                    "stop_evidence": None}
+        # Recheck under the bind/wake writer lock as well as in the whole-spec preflight.
+        try:
+            evidence = stop_evidence(mailbox, current)
+        except ValueError as exc:
+            raise ValueError("stop evidence changed during handoff: " + str(exc)) from exc
         if plan is not None:
             # host_plan has shown the base's provision names this root, so its records sit beside it.
             check_successor_record(root.parent, entry["endpoint"], current["generation"] + 1, spec)
@@ -104,7 +234,8 @@ def hand_off(spec, entry):
             "endpoint": entry["endpoint"], "host": spec["host"], "session": spec["session"],
             "outgoing_stopped": spec["outgoing_stopped"], **optional}))
     return {"generation": binding["generation"], "ready": binding["ready"],
-            "checkpoint_sha256": binding["checkpoint_sha256"], "acknowledge": acknowledgment(binding)}
+            "checkpoint_sha256": binding["checkpoint_sha256"], "acknowledge": acknowledgment(binding),
+            "stop_evidence": evidence}
 
 
 def run(path):
@@ -116,6 +247,7 @@ def run(path):
     text(spec["session"], "session", 256)
     require(isinstance(spec["entries"], list) and 0 < len(spec["entries"]) <= MAX_ENTRIES,
             "handoff spec requires entries")
+    preflight_stops(spec)
     rows = []
     for entry in spec["entries"]:
         labels = {key: entry.get(key) for key in ("root", "endpoint")} if isinstance(entry, dict) else {}
