@@ -2629,3 +2629,243 @@ def test_snapshot_v1_growing_log_has_initial_size_io_budget_and_holds(tmp_path, 
         assert remaining == 0
         assert snapshot_v1_unchanged(world) == before
         assert world.inbox("engine") == retained_inbox
+
+
+# R3 formal-review repairs: binding validity intervals, successor completion, receipt history and foreign packets.
+
+
+def r3_rebind(world, lane, *, pending=None, readiness=None):
+    """Acknowledged generation-2 handoff through the public mailbox CLI, which refuses a checkpoint omitting open work."""
+    endpoint = "engine/lane/" + lane
+    note = world.root.parent / ("r3-handoff-" + lane + ".md")
+    note.write_text("modelled owner stopped the outgoing lane session\n")
+    checkpoint = {"outgoing_stopped": True, "sources": [], "lease_refs": [], "completed_checks": [],
+                  "pending_message_ids": [], "last_acknowledgment_ids": [],
+                  "briefs": [{"path": str(note), "sha256": hashlib.sha256(note.read_bytes()).hexdigest()}]}
+    if pending is not None:
+        checkpoint["pending_message_ids"] = [pending["message_id"]]
+        checkpoint["briefs"].append(pending["brief"])
+    if readiness is not None:
+        checkpoint["lease_refs"] = [readiness["lease_ref"]]
+        checkpoint["sources"] = [{"worktree": readiness["worktree"], "source_revision": world.revision,
+                                  "source_tree": world.tree, "dirty_state": "clean"}]
+    binding = invoke(world.root, "bind", {"endpoint": endpoint, "host": "next-host", "session": "next-session",
+                                          "expected_generation": 1, "checkpoint": checkpoint})
+    invoke(world.root, "ack-handoff", {"endpoint": endpoint, "session": "next-session", "generation": 2,
+                                       "checkpoint_sha256": binding["checkpoint_sha256"]})
+
+
+def r3_identity(lane, generation):
+    if generation == 1:
+        return {"host": "host-one", "session": "engine/lane/" + lane, "binding_generation": 1}
+    return {"host": "next-host", "session": "next-session", "binding_generation": 2}
+
+
+def r3_dispatch(world, lane):
+    identifier = "legacy-" + lane
+    brief = world.root.parent / (identifier + ".md")
+    brief.write_text("prior owner assignment\n")
+    invoke(world.root, "publish", {"message_id": identifier, "from": "engine/orchestrator", "to": "engine/lane/" + lane,
+        "host": "host-one", "session": "engine/orchestrator", "binding_generation": 1,
+        "type": "dispatch", "body": "previous independent assignment",
+        "brief": {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}})
+    return next(r["message"] for r in world.messages("dispatch") if r["message"]["message_id"] == identifier)
+
+
+def r3_reply(world, lane, parent, stage, generation):
+    message = {"message_id": parent + "-" + stage, "from": "engine/lane/" + lane, "to": "engine/orchestrator",
+               "in_reply_to": parent, **r3_identity(lane, generation)}
+    if stage == "accepted":
+        message.update(type="ack", acknowledgment="accepted", body="accepted prior assignment")
+        if lane != "review0":
+            message["readiness"] = {"worktree": str(world.checkout), "branch": "candidate",
+                "base_revision": world.revision, "lease_ref": "refs/aegis/lanes/modelled-legacy", "lease_oid": "a" * 40,
+                "lease_expires_at": "2099-01-01T00:00:00Z", "owned_paths": ["app.txt"],
+                "scan_workspace": str(world.checkout), "scan_evidence": "modelled scan",
+                "enforcement_tier": "advisory", "hook_evidence": "modelled hooks"}
+    else:
+        message.update(type="review" if lane == "review0" else "result",
+            body="prior assignment completed; grants no current lifecycle/check evidence",
+            result={"source_revision": world.revision, "source_tree": world.tree,
+                    "lane_check": "modelled legacy completion", "checks": [
+                        {"check": "legacy", "outcome": "fail", "reference": "prior failure retained"}]})
+    invoke(world.root, "publish", message)
+    return next(r for r in world.messages() if r["message"]["message_id"] == message["message_id"])
+
+
+@pytest.mark.parametrize("lane", ["fix", "review0"])
+@pytest.mark.parametrize("identity", ["superseded", "current"])
+def test_r3_superseded_generation_cannot_close_a_later_legacy_assignment(tmp_path, lane, identity):
+    (tmp_path / ".keep").write_text("R3 superseded binding generation evidence\n")
+    world = DispatchWorld(tmp_path)
+    r3_rebind(world, lane)
+    parent = r3_dispatch(world, lane)["message_id"]
+    replies = [r3_reply(world, lane, parent, stage, 2) for stage in ("accepted", "completed")]
+    if identity == "superseded":
+        # Generation 1 is a valid historical identity, but it was retired before this dispatch existed.
+        for record in replies:
+            rewrite_message(record, lambda m: m.update(r3_identity(lane, 1)))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    dispatches = [r["message"]["message_id"] for r in world.messages("dispatch")]
+    if identity == "superseded":
+        assert (row["state"], row.get("reason")) == ("held", "small_change_mixed_queue"), row
+        assert row["detail"] == "foreign lane dispatch: " + parent, row
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+        assert dispatches == [parent]
+    else:
+        assert row["state"] == "writer_sent", row
+        assert dispatches == [parent, "scw-" + raw_request(world.change.plan)["sha256"]]
+
+
+@pytest.mark.parametrize("identity", ["superseded", "current"])
+def test_r3_superseded_generation_cannot_close_a_sibling_small_change_writer_dispatch(tmp_path, identity):
+    (tmp_path / ".keep").write_text("R3 sibling writer dispatch closure evidence\n")
+    world = DispatchWorld(tmp_path)
+    r3_rebind(world, "fix")
+    second = SmallChange(world.ledger, request("engine-second"))
+    second.plan["plan"]["checks"] = ["check-0"]
+    second.register()
+    second.decide()
+    admission = second.admission()
+    admission["checks"] = [{"check": "check-0", "recipe": "focused", "recipes_sha256": world.recipe_hash,
+                            "evidence": world.ledger.evidence}]
+    second.admit(admission)
+    first, later = world.change.value["id"], second.value["id"]
+    sibling = "scw-" + raw_request(world.change.plan)["sha256"]
+    occupied = ("held", "small_change_configuration", "writer lane already has an open dispatch")
+    rows = {r["request_id"]: r for r in world.dispatch()["small_changes"]}
+    assert (rows[later]["state"], rows[later].get("reason"), rows[later].get("detail")) == occupied, rows
+    assert [r["message"]["message_id"] for r in world.messages("dispatch")] == [sibling]
+    replies = [r3_reply(world, "fix", sibling, stage, 2) for stage in ("accepted", "completed")]
+    if identity == "superseded":
+        # The sibling is the dispatcher's own scw, so only the open-dispatch guard sees this forged closure.
+        for record in replies:
+            rewrite_message(record, lambda m: m.update(r3_identity("fix", 1)))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    rows = {r["request_id"]: r for r in world.dispatch()["small_changes"]}
+    dispatches = [r["message"]["message_id"] for r in world.messages("dispatch")]
+    if identity == "superseded":
+        assert (rows[first]["state"], rows[first].get("reason")) == ("held", "small_change_binding_changed"), rows
+        assert (rows[later]["state"], rows[later].get("reason"), rows[later].get("detail")) == occupied, rows
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+        assert dispatches == [sibling]
+    else:
+        assert (rows[first]["state"], rows[first].get("reason")) == ("held", "small_change_check_failed"), rows
+        assert rows[later]["state"] == "writer_sent", rows
+        assert dispatches == [sibling, "scw-" + raw_request(second.plan)["sha256"]]
+
+
+@pytest.mark.parametrize("lane", ["fix", "review0"])
+def test_r3_successor_completion_after_acknowledged_handoff_permits_later_small_change(tmp_path, lane):
+    (tmp_path / ".keep").write_text("R3 acknowledged successor completion evidence\n")
+    world = DispatchWorld(tmp_path)
+    dispatch = r3_dispatch(world, lane)
+    parent = dispatch["message_id"]
+    accepted = r3_reply(world, lane, parent, "accepted", 1)["message"]
+    r3_rebind(world, lane, pending=dispatch, readiness=accepted.get("readiness"))
+    r3_reply(world, lane, parent, "completed", 2)
+    old = request("legacy-canonical")
+    world.ledger.ready(old)
+    world.ledger.intent(old)
+    world.ledger.event("start", actor=world.ledger.operator, intent_id="attempt-1", **world.ledger.target(old))
+    world.ledger.terminal(old)
+    world.ledger.accepted_delivery(old)
+    world.ledger.event("disposition", status="FINAL", resolution={"kind": "complete", "evidence": world.ledger.evidence},
+                       **world.ledger.target(old))
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "writer_sent", row
+    assert world.change.row()["terminal"] is None and world.change.row()["review"] is None
+    assert world.messages("job_request") == []
+    assert [r["message"]["message_id"] for r in world.messages("dispatch")] == [
+        parent, "scw-" + raw_request(world.change.plan)["sha256"]]
+
+
+@pytest.mark.parametrize("outcome,reason", [("failed", "small_change_check_failed"),
+                                            ("refused", "small_change_check_failed"),
+                                            ("completed", "small_change_receipt_invalid")])
+def test_r3_nonterminal_receipt_after_terminal_never_resumes_partial_batch(tmp_path, outcome, reason):
+    (tmp_path / ".keep").write_text("R3 inconsistent receipt history evidence\n")
+    changes = {"steps": [["$python", "-c", "raise SystemExit(7)"]]} if outcome == "failed" else None
+    world = DispatchWorld(tmp_path, checks=2, recipe_changes=changes)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    requests = world.messages("job_request")
+    assert len(requests) == 1
+    first = requests[0]["message"]["message_id"]
+    app = world.checkout / "app.txt"
+    original = app.read_bytes()
+    if outcome == "refused":
+        app.write_text("modelled dirty checkout during runner admission")
+    assert world.run_jobs()["rows"][0]["state"] == outcome
+    app.write_bytes(original)
+    terminal = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == outcome)
+    later = Path(terminal["path"]).with_name("r3-later-started.md")
+    later.write_bytes(Path(terminal["path"]).read_bytes())
+    stamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    rewrite_message({"path": str(later)}, lambda m: m.update(message_id="r3-later-started", created_at=stamp,
+                                                             receipt={"state": "started"}))
+    (world.workspace.store / "jobs/engine" / first / "result.json").unlink()
+    for command in ("status", "dispatch", "status", "dispatch"):
+        row = world.dispatch(command=command)["small_changes"][0]
+        assert (row["state"], row.get("reason")) == ("held", reason), row
+        assert world.messages("job_request") == requests
+        assert len(world.messages("dispatch")) == 1
+
+
+R3_LOOP_PASS = r"""
+import argparse, importlib.util, os, pwd, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_loop', sys.argv[1])
+loop = importlib.util.module_from_spec(spec); spec.loader.exec_module(loop)
+loop.TOOLS['sweep'] = Path(sys.argv[2])
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], sys.argv[3], user.pw_shell))
+journal, store, recipes, state_dir = map(Path, sys.argv[4:8])
+args = argparse.Namespace(lifecycle=journal, store=store, recipes=recipes, state_dir=state_dir, max_jobs=None)
+sys.exit(loop.one_pass(args, None)[0])
+"""
+
+
+@pytest.mark.parametrize("attachment", ["[]", "null", "{"], ids=["list", "null", "invalid-json"])
+def test_r3_malformed_foreign_job_packet_is_a_row_hold_and_run_open_continues(tmp_path, attachment):
+    from tests.integration.test_hierarchy_loop import EMPTY_SWEEP
+    (tmp_path / ".keep").write_text("R3 malformed foreign job packet evidence\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    packet = world.root.parent / "r3-foreign-packet.md"
+    packet.write_text(attachment)
+    invoke(world.root, "publish", {"message_id": "r3-foreign-job", "from": "engine/orchestrator", "to": "engine/root",
+        "host": "host-one", "session": "engine/orchestrator", "binding_generation": 1, "type": "job_request",
+        "body": "foreign job whose packet is not an object",
+        "brief": {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}})
+    docs = world.team("docs")
+    world.workspace.run("update", {"initiative": "docs", "source": "owner", "checkouts": [str(world.checkout)]})
+    canonical = tmp_path / "docs/canonical.md"
+    canonical.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+        "checkout": str(world.checkout), "commit": world.revision, "tree": world.tree}))
+    invoke(docs, "publish", {"message_id": "canonical-check", "from": "docs/orchestrator", "to": "docs/root",
+        "host": "host-one", "session": "docs-orchestrator", "binding_generation": 1,
+        "type": "job_request", "body": "owner canonical check", "brief": {
+            "path": str(canonical), "sha256": hashlib.sha256(canonical.read_bytes()).hexdigest()}})
+    # Only the wake step is modelled, so no host can start; router, dispatcher projection and runner are real.
+    sweep = tmp_path / "r3-sweep.py"
+    sweep.write_text("import json\nprint(json.dumps(%r))\n" % (EMPTY_SWEEP,))
+    state = tmp_path / "r3-loop-state"
+    state.mkdir()
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", R3_LOOP_PASS, str(ROOT / "tools/hierarchy_loop.py"),
+        str(sweep), str(tmp_path / "home"), str(world.ledger.path), str(world.workspace.store),
+        str(world.recipes_path), str(state)], env=os.environ.copy(), capture_output=True, text=True, timeout=60)
+    assert process.returncode == 3 and process.stderr == "", process.stdout + process.stderr
+    report = json.loads(process.stdout.splitlines()[-1])
+    detail = "malformed foreign job packet: r3-foreign-job"
+    steps = {r["step"]: r for r in report["steps"]}
+    assert (steps["sweep"]["state"], steps["run_open"]["state"]) == ("ok", "ok"), report
+    assert {"job": "docs/canonical-check", "state": "completed"} in steps["run_open"]["rows"], report
+    assert any((h["step"], h["kind"], h.get("request_id"), h["detail"]) ==
+               ("dispatch", "small_change_mixed_queue", world.change.value["id"], detail) for h in report["holds"]), report
+    row = world.projection()
+    assert (row["state"], row["reason"], row["detail"]) == ("held", "small_change_mixed_queue", detail), row
+    assert [r["message"]["message_id"] for r in world.messages("job_request")] == ["r3-foreign-job"]

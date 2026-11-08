@@ -19,8 +19,9 @@ import hierarchy_fresh_brief as fresh
 import hierarchy_jobs as jobs
 import hierarchy_lifecycle as life
 import hierarchy_router as router
-from hierarchy_mailbox import (Mailbox, MAX_BYTES, MAX_RECORDS, SLUG, digest, encoded, fields, matching, parse_time,
-                               read_bytes, read_json, require, safe_path, strict_json, timestamp, writer_lock)
+from hierarchy_mailbox import (Mailbox, MAX_BYTES, MAX_RECORDS, SLUG, TERMINAL_JOB_STATES, digest, encoded, fields,
+                               matching, parse_time, read_bytes, read_json, require, safe_path, strict_json, timestamp,
+                               writer_lock)
 
 
 SCHEMA = "aegis.small-change-dispatch/v1"
@@ -132,6 +133,16 @@ def historical(mailbox, message):
                 ("binding_generation", "generation"))), "message sender does not match historical binding")
 
 
+def in_force(mailbox, message):
+    """Historical form of Mailbox.fence(), which every publish applies: the sender generation was the endpoint's
+    current, acknowledged binding when the record was created. A retired generation cannot speak after its successor."""
+    historical(mailbox, message)
+    bindings = mailbox.bindings(message["from"])
+    generation, created = message["binding_generation"], parse_time(message["created_at"])
+    require(parse_time(bindings[generation - 1]["created_at"]) <= created, "foreign assignment predates its binding")
+    require(generation == len(bindings) or created < parse_time(bindings[generation]["created_at"]),
+            "foreign assignment record follows its superseding binding")
+    require(mailbox.ready(bindings[generation - 1]), "foreign assignment sender handoff is unacknowledged")
 
 
 def _artifact_mark(info):
@@ -581,8 +592,10 @@ class Row:
         envelope["id"] = msg_id
         router.journal_accepts(self.policy, self.state, envelope)
         if prior is None:
+            # Sibling scw dispatches skip foreign_publications, so this guard must apply the same validated closure.
+            history = self.mailbox.dispatch_history(self.records)
             check(not any(r["message"]["type"] == "dispatch" and r["message"]["to"] == self.writer
-                          and r["message"]["message_id"] not in self.mailbox.dispatch_history(self.records)[0]
+                          and not self.validated_closure(r["message"], history)
                           for r in self.records.values()), "small_change_configuration", "writer lane already has an open dispatch")
             raw, ref = self.compose(self.writer, "writer")
             remaining = (parse_time(self.row["request"]["continuation"]["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
@@ -698,7 +711,14 @@ class Row:
                     require(sum(r["message"]["receipt"]["state"] == terminal_state for r in receipts) <= 1,
                             "duplicate terminal job receipt")
                 state, witness = fresh.job_state(receipts)
-                item["state"] = state
+                # job_state lets a later receipt replace an earlier state. Failure is final regardless, and
+                # Mailbox.publish() refuses any receipt after a terminal one, so such history is invalid.
+                history = [r["message"]["receipt"]["state"] for r in sorted(receipts, key=fresh.receipt_order)]
+                item["state"] = next((s for s in history if s in {"failed", "refused"}), state)
+                check(item["state"] not in {"failed", "refused"}, "small_change_check_failed", "job did not pass: " + msg_id)
+                settled = next((n for n, s in enumerate(history) if s in TERMINAL_JOB_STATES), len(history))
+                check(all(s in TERMINAL_JOB_STATES for s in history[settled:]), "small_change_receipt_invalid",
+                      "nonterminal job receipt follows a terminal receipt: " + msg_id)
                 check(state != "unknown", "small_change_unknown_effect", "job receipt has unresolved uncertainty: " + msg_id)
                 job = _RetainedJob(self.store.path, self.initiative, record["message"])
                 self._retained_jobs.append(job)
@@ -846,6 +866,33 @@ class Row:
                                          "path": r["path"], "unread": r["message"]["message_id"] not in read_ids}
                                         for r in self.records.values() if r["message"].get("in_reply_to") in parents]
 
+    def validated_closure(self, message, history):
+        """Mailbox.dispatch_history() counts any correlated reply as closure, whatever its sender generation. A
+        dispatch is closed here only by unique acceptance and completion, each fenced by in_force, in order."""
+        closed_assignments, accepted_assignments = history
+        msg_id = message["message_id"]
+        accepted = [m for m in accepted_assignments if m["in_reply_to"] == msg_id]
+        completed = [r["message"] for r in self.records.values()
+                     if r["message"].get("in_reply_to") == msg_id and
+                     (r["message"]["type"] in {"result", "review"} or r["message"].get("acknowledgment") == "completed")]
+        if msg_id not in closed_assignments or len(accepted) != 1 or len(completed) != 1:
+            return False
+        try:
+            for m in [message, accepted[0], completed[0]]:
+                in_force(self.mailbox, m)
+            require(all(m["from"] == message["to"] and m["to"] == message["from"] for m in accepted + completed),
+                    "foreign assignment reply endpoints differ")
+            # Mailbox.publish() lets an acknowledged successor complete its predecessor's accepted
+            # dispatch; in_force applies that same fence to the completion's own generation.
+            require(accepted[0]["binding_generation"] <= completed[0]["binding_generation"],
+                    "foreign completion predates its accepted historical binding")
+            require(parse_time(message["created_at"]) <= parse_time(accepted[0]["created_at"])
+                    <= parse_time(completed[0]["created_at"]), "foreign assignment chronology differs")
+            self.mailbox.completion(completed[0].get("result"), self.mailbox.endpoint(message["to"])["kind"])
+        except (ValueError, KeyError, TypeError):
+            return False
+        return True
+
     def foreign_publications(self):
         known = set()
         for row in self.state["requests"].values():
@@ -854,40 +901,22 @@ class Row:
             known.update((identifier("scw", row), identifier("scr", row)))
             if row["small_change"]["admission"]:
                 known.update(identifier("scj", row, c["check"]) for c in row["small_change"]["admission"]["checks"])
-        closed_assignments, accepted_assignments = self.mailbox.dispatch_history(self.records)
+        history = self.mailbox.dispatch_history(self.records)
         for record in self.records.values():
             message = record["message"]
             if message["from"] != self.team + "/orchestrator" or message["message_id"] in known:
                 continue
             if message["type"] == "dispatch" and message["to"] in {self.writer, self.reviewer}:
-                msg_id = message["message_id"]
-                accepted = [m for m in accepted_assignments if m["in_reply_to"] == msg_id]
-                completed = [r["message"] for r in self.records.values()
-                             if r["message"].get("in_reply_to") == msg_id and
-                             (r["message"]["type"] in {"result", "review"}
-                              or r["message"].get("acknowledgment") == "completed")]
-                valid = msg_id in closed_assignments and len(accepted) == len(completed) == 1
-                if valid:
-                    try:
-                        for m in [message, accepted[0], completed[0]]:
-                            historical(self.mailbox, m)
-                            binding = self.mailbox.bindings(m["from"])[m["binding_generation"] - 1]
-                            require(parse_time(binding["created_at"]) <= parse_time(m["created_at"]),
-                                    "foreign assignment predates its binding")
-                        require(all(m["from"] == message["to"] and m["to"] == message["from"] for m in accepted + completed),
-                                "foreign assignment reply endpoints differ")
-                        require(accepted[0]["binding_generation"] == completed[0]["binding_generation"],
-                                "foreign completion does not match its accepted historical binding")
-                        require(parse_time(message["created_at"]) <= parse_time(accepted[0]["created_at"])
-                                <= parse_time(completed[0]["created_at"]), "foreign assignment chronology differs")
-                        self.mailbox.completion(completed[0].get("result"), self.mailbox.endpoint(message["to"])["kind"])
-                    except (ValueError, KeyError, TypeError):
-                        valid = False
-                check(valid, "small_change_mixed_queue", "foreign lane dispatch: " + msg_id)
+                check(self.validated_closure(message, history), "small_change_mixed_queue",
+                      "foreign lane dispatch: " + message["message_id"])
             if message["type"] == "job_request" and self.row["terminal"] is not None:
                 # A job packet is inert data. This reports overlap; it never gates the existing runner.
-                raw = self.mailbox.brief(message["brief"])
-                packet = strict_json(jobs.packet_text(raw))
+                malformed = "malformed foreign job packet: " + message["message_id"]
+                try:
+                    packet = strict_json(jobs.packet_text(self.mailbox.brief(message["brief"])))
+                except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
+                    raise Hold("small_change_mixed_queue", malformed) from exc
+                check(isinstance(packet, dict), "small_change_mixed_queue", malformed)
                 if hasattr(self, "result_record"):
                     source = self.result_record["message"]["result"]
                     if packet.get("commit") == source["source_revision"] or packet.get("tree") == source["source_tree"]:

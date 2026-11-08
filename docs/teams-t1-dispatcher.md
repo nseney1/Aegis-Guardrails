@@ -165,6 +165,8 @@ have no mailbox-size cap; preserve the runner's 4 MiB result limit, 2000-byte nu
 filtering. This snapshot is ephemeral, not a persistent store.
 A valid retained failed/refused result with matching admitted recipe provenance holds small_change_check_failed even if terminal receipt
 publication failed. Publish no missing batch IDs or Reviewer work; only the unchanged runner settles the original job and reservation.
+Receipt history is checked before PR2 job_state: any valid failed/refused receipt holds small_change_check_failed whatever follows it, and a
+nonterminal receipt ordered by receipt_order after a terminal one is small_change_receipt_invalid (Mailbox.publish refuses that history).
 
 ## 5. Loop-only skips, reporting and holds
 
@@ -194,6 +196,14 @@ bounded race after the final journal check remains explicit; no lock is held acr
 A foreign writer/Reviewer assignment is closed only by unique correlated acceptance and completion over validated mailbox records, correct
 historical bindings/endpoints and chronology. Valid closed history permits later work across binding succession without proving any new
 lifecycle/check success. Missing, duplicate, malformed or ambiguous completion holds; live canonical conflicts remain independently enforced.
+Each of the dispatch, acceptance and completion must come from the sender generation in force at its created_at (that binding's creation
+at or before it, the next binding's creation strictly after it) and acknowledged: the historical form of Mailbox.fence. A superseded
+generation's record holds small_change_mixed_queue. Completion may come from a later generation than acceptance, as Mailbox.publish permits
+an acknowledged successor; never an earlier one. The dispatcher's own scw/scr target-generation checks are unchanged. Before a new scw, the
+writer-lane open-dispatch guard applies this same validated closure to every dispatch to that lane, sibling small-change scw included: one
+not validly closed is open and holds small_change_configuration ("writer lane already has an open dispatch"). After the writer
+terminal, a foreign job_request whose packet cannot be read or decoded, or is not a JSON object, holds small_change_mixed_queue
+("malformed foreign job packet") as a row hold; the loop pass and run-open continue.
 
 For skip purposes an owned HOLD is a recorded coordinator disposition/resolve with blocked resolution and bounded
 owner/next_decision/condition/evidence; lifecycle obligations and UNKNOWN are still retained. Planning skips lift when EVERY small-change row in
