@@ -2006,3 +2006,626 @@ def test_compat_empty_durable_projection_preserves_canonical_output_omission(tmp
     assert {r["step"]: r["state"] for r in result["steps"]}["sweep"] == "ok"
     assert "small_changes" not in result
 
+
+# Formal-review repairs: public controls append to the frozen 624-case prefix.
+def formal_dispatch(world, *, command="dispatch", watch=None, action="", expect=0):
+    script = r"""
+import builtins, importlib.util, io, json, os, pwd, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+home, watched, action = sys.argv[2:5]
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], home, user.pw_shell))
+original = builtins.open
+original_io = io.open
+def opened(path, *args, **kwargs):
+    if watched and isinstance(path, (str, bytes, os.PathLike)) and Path(path) == Path(watched):
+        Path(watched + '.opened').write_text('unsafe downstream open attempted')
+        if action == 'deny':
+            raise OSError('modelled unsafe artifact open refused by test boundary')
+    return original(path, *args, **kwargs)
+builtins.open = opened
+def io_opened(path, *args, **kwargs):
+    if watched and isinstance(path, (str, bytes, os.PathLike)) and Path(path) == Path(watched):
+        Path(watched + '.opened').write_text('unsafe downstream io.open attempted')
+        if action == 'deny':
+            raise OSError('modelled unsafe artifact reopen refused by test boundary')
+    return original_io(path, *args, **kwargs)
+io.open = io_opened
+listed = os.listdir
+injected = False
+def listdir(path):
+    global injected
+    names = listed(path)
+    actual = Path(os.readlink('/proc/self/fd/%d' % path)) if type(path) is int else Path(path)
+    if action == 'late-entry' and not injected and actual == Path(watched):
+        injected = True
+        os.mkfifo(actual / 'step-late')
+    return names
+os.listdir = listdir
+opened_fd = os.open
+def fd_opened(path, flags, *args, **kwargs):
+    global injected
+    if action in {'replace-fifo', 'replace-symlink', 'change-content'} and not injected and str(path) == Path(watched).name:
+        directory = kwargs.get('dir_fd')
+        if directory is not None and Path(os.readlink('/proc/self/fd/%d' % directory)) == Path(watched).parent:
+            injected = True
+            target = Path(watched)
+            if action == 'change-content':
+                with original(target, 'ab') as stream: stream.write(b'changed')
+            else:
+                target.rename(target.with_name('retained-original-log'))
+                if action == 'replace-fifo': os.mkfifo(target)
+                else: target.symlink_to(target.with_name('retained-original-log'))
+    return opened_fd(path, flags, *args, **kwargs)
+os.open = fd_opened
+sys.exit(router.main(sys.argv[5:]))
+"""
+    args = ["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), command,
+            "--recipes", str(world.recipes_path), "--wait", "0.1"]
+    if command == "dispatch":
+        args.append("--evidence-only")
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER),
+        str(world.tmp / "home"), str(watch or ""), action, *args], capture_output=True, text=True,
+        env=os.environ.copy(), timeout=30)
+    assert process.returncode == expect and process.stderr == "", process.stdout + process.stderr
+    return json.loads(process.stdout)
+
+
+def formal_completed_job(world):
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    message = world.messages("job_request")[0]["message"]
+    return world.workspace.store / "jobs/engine" / message["message_id"]
+
+
+def test_formal_unlisted_fifo_refuses_before_downstream_open(tmp_path):
+    (tmp_path / ".keep").write_text("formal retained-artifact refusal evidence\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    fifo = folder / "step-extra"
+    os.mkfifo(fifo)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = formal_dispatch(world, watch=fifo, action="deny")["small_changes"][0]
+    assert row["reason"] == "small_change_receipt_invalid"
+    assert not Path(str(fifo) + ".opened").exists(), "retained FIFO reached an unchecked downstream reader"
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("role", [[], {}], ids=["list", "object"])
+def test_formal_policy_role_type_holds_only_projection_boundary(tmp_path, role):
+    world = compat_world(tmp_path)
+    policy = world.ledger.path / "policy.json"
+    value = json.loads(policy.read_text())
+    value["actors"]["operator-1"]["role"] = role
+    policy.write_text(json.dumps(value))
+    world.send("pilot/root", "pilot/orchestrator", "retained-role-error")
+    result, telemetry = compat_raw_pass(world, world.ledger.path, world.workspace.store)
+    assert any(r["kind"] == "planning_exclusions_unavailable" and r["act"] == "owner" for r in result["holds"])
+    assert {r["step"]: r["state"] for r in result["steps"]}["sweep"] == "skipped"
+    assert {r["step"]: r["state"] for r in result["steps"]}["run_open"] == "ok"
+    assert world.woken() == []
+    assert [r["message"]["message_id"] for r in world.inbox("pilot/orchestrator")] == ["retained-role-error"]
+
+
+def formal_foreign_assignment(world, lane="review0", complete=True):
+    endpoint = "engine/lane/" + lane
+    identifier = "legacy-" + lane
+    brief = world.root.parent / (identifier + ".md")
+    brief.write_text("prior owner assignment\n")
+    invoke(world.root, "publish", {"message_id": identifier, "from": "engine/orchestrator", "to": endpoint,
+        "host": "host-one", "session": "engine/orchestrator", "binding_generation": 1,
+        "type": "dispatch", "body": "previous independent assignment",
+        "brief": {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}})
+    readiness = {"worktree": str(world.checkout), "branch": "candidate", "base_revision": world.revision,
+        "lease_ref": "refs/aegis/lanes/modelled-legacy", "lease_oid": "a" * 40,
+        "lease_expires_at": "2099-01-01T00:00:00Z", "owned_paths": ["app.txt"],
+        "scan_workspace": str(world.checkout), "scan_evidence": "modelled scan",
+        "enforcement_tier": "advisory", "hook_evidence": "modelled hooks"}
+    extra = {} if lane == "review0" else {"readiness": readiness}
+    invoke(world.root, "publish", {"message_id": identifier + "-accepted", "from": endpoint,
+        "to": "engine/orchestrator", "host": "host-one", "session": endpoint, "binding_generation": 1,
+        "type": "ack", "in_reply_to": identifier, "body": "accepted prior assignment",
+        "acknowledgment": "accepted", **extra})
+    if complete:
+        invoke(world.root, "publish", {"message_id": identifier + "-completed", "from": endpoint,
+            "to": "engine/orchestrator", "host": "host-one", "session": endpoint, "binding_generation": 1,
+            "type": "review" if lane == "review0" else "result", "in_reply_to": identifier,
+            "body": "prior assignment completed; grants no current lifecycle/check evidence",
+            "result": {"source_revision": world.revision, "source_tree": world.tree,
+                "lane_check": "modelled legacy completion", "checks": [
+                    {"check": "legacy", "outcome": "fail", "reference": "prior failure retained"}]}})
+    return identifier
+
+
+def test_formal_completed_legacy_reviewer_does_not_block_later_small_change(tmp_path):
+    (tmp_path / ".keep").write_text("formal closed-history evidence\n")
+    world = DispatchWorld(tmp_path)
+    parent = formal_foreign_assignment(world)
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "writer_sent", row
+    assert [r["message"]["message_id"] for r in world.messages("dispatch")] == [
+        parent, "scw-" + raw_request(world.change.plan)["sha256"]]
+    assert world.change.row()["review"] is None and world.messages("job_request") == []
+
+
+@pytest.mark.parametrize("damage", ["directory", "symlink", "late-entry", "replace-fifo", "replace-symlink", "change-content"])
+def test_formal_artifact_types_and_races_hold_without_republication(tmp_path, damage):
+    (tmp_path / ".keep").write_text("retained artifact race evidence\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    watch, action = folder / "step-1.log", damage
+    if damage == "directory":
+        watch = folder / "step-extra"
+        watch.mkdir()
+        action = "deny"
+    elif damage == "symlink":
+        private = tmp_path / "home/.codex/modelled-private"
+        private.parent.mkdir()
+        private.write_text("modelled private target: never an actual owner file")
+        watch = folder / "step-extra"
+        watch.symlink_to(private)
+        action = "deny"
+    elif damage == "late-entry":
+        watch = folder
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = formal_dispatch(world, watch=watch, action=action)["small_changes"][0]
+    assert row["reason"] == "small_change_receipt_invalid", row
+    if damage in {"directory", "symlink"}:
+        assert not Path(str(watch) + ".opened").exists()
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("name", ["step-1.log", "result.json", "claim.json", "process.json", "packet.md"])
+def test_formal_captured_data_is_consumed_without_downstream_reopen(tmp_path, name):
+    (tmp_path / ".keep").write_text("snapshot-consumption evidence\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    row = formal_dispatch(world, watch=folder / name, action="deny")["small_changes"][0]
+    assert row["state"] == "reviewing", row
+    assert not Path(str(folder / name) + ".opened").exists(), "captured artifact reopened by an unchecked reader"
+
+
+def formal_jobs(world, mode, expect=3):
+    script = r"""
+import importlib.util, json, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_jobs', sys.argv[1])
+jobs = importlib.util.module_from_spec(spec); spec.loader.exec_module(jobs)
+original = os.link
+mode = sys.argv[2]
+def link(src, dst, *args, **kwargs):
+    target = Path(dst)
+    if mode == 'max-result' and target.name == 'result.json':
+        value = json.loads(Path(src).read_text())
+        value['padding'] = ''
+        value['padding'] = 'p' * (jobs.MAX_RESULT_BYTES - len(jobs.encoded(value)) - 1)
+        Path(src).write_bytes(jobs.encoded(value) + b'\n')
+    if mode == 'receipt-loss' and target.suffix == '.md':
+        text = Path(src).read_text()
+        if text.startswith('---\n'):
+            message = json.loads(text[4:].split('\n---\n', 1)[0])
+            if message.get('type') == 'job_receipt' and message['receipt']['state'] in {'failed', 'refused'}:
+                raise OSError('modelled original terminal receipt publication failure')
+    value = original(src, dst, *args, **kwargs)
+    if mode == 'numeric-logs' and target.name == 'result.json':
+        for path in target.parent.glob('step-*.log'):
+            path.rename(path.with_name('step-%d.log' % int(path.stem[5:])))
+    return value
+os.link = link
+sys.exit(jobs.main(sys.argv[3:]))
+"""
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(JOBS), mode,
+        "--store", str(world.workspace.store), "--recipes", str(world.recipes_path), "run-open"],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=60)
+    assert p.returncode == expect and p.stderr == "", p.stdout + p.stderr
+    return json.loads(p.stdout)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "refused"])
+def test_formal_retained_failure_blocks_partial_batch_until_original_settlement(tmp_path, outcome):
+    (tmp_path / ".keep").write_text("partial batch terminal receipt loss\n")
+    changes = {"steps": [["$python", "-c", "raise SystemExit(7)"]]} if outcome == "failed" else None
+    world = DispatchWorld(tmp_path, checks=2, recipe_changes=changes)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    requests = world.messages("job_request")
+    assert len(requests) == 1
+    first = requests[0]["message"]["message_id"]
+    app = world.checkout / "app.txt"
+    original = app.read_bytes()
+    if outcome == "refused":
+        app.write_text("modelled dirty checkout during runner admission")
+    formal_jobs(world, "receipt-loss")
+    if outcome == "refused":
+        app.write_bytes(original)
+    folder = world.workspace.store / "jobs/engine" / first
+    result = json.loads((folder / "result.json").read_text())
+    assert result["state"] == outcome
+    original_claim = (folder / "claim.json").read_bytes()
+    original_result = (folder / "result.json").read_bytes()
+    assert not any(r["message"]["receipt"]["state"] in {"failed", "refused"} for r in world.messages("job_receipt"))
+    for command in ("status", "dispatch", "status", "dispatch"):
+        row = world.dispatch(command=command)["small_changes"][0]
+        assert row["reason"] == "small_change_check_failed", row
+        assert world.messages("job_request") == requests
+        assert len(world.messages("dispatch")) == 1
+    settled = world.run_jobs()
+    assert settled["rows"][0]["state"] == outcome
+    assert any(r["message"]["receipt"]["state"] == outcome for r in world.messages("job_receipt"))
+    assert (folder / "claim.json").read_bytes() == original_claim
+    assert (folder / "result.json").read_bytes() == original_result
+    assert world.messages("job_request") == requests
+
+
+def test_formal_public_runner_receipt_parity_for_large_numeric_and_empty_logs(tmp_path):
+    (tmp_path / ".keep").write_text("public runner byte parity\n")
+    big = r"import sys; sys.stdout.buffer.write(b'x'*300000+b'\xff\x00\t\r\n')"
+    steps = [["$python", "-c", big]] + [["$python", "-c", "print('step-%d')" % n] for n in range(2, 10)]
+    steps += [["$python", "-c", r"import sys; sys.stdout.buffer.write(b'z'*3000+b'\xff\x00\t\r\n')"],
+              ["$python", "-c", "pass"]]
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": steps})
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    formal_jobs(world, "numeric-logs", expect=0)
+    receipts = world.messages("job_receipt")
+    terminal = next(r for r in receipts if r["message"]["receipt"]["state"] == "completed")
+    assert "z" * 100 in terminal["message"]["body"] and "\ufffd" in terminal["message"]["body"]
+    assert "\x00" not in terminal["message"]["body"] and "\r" not in terminal["message"]["body"]
+    job = world.messages("job_request")[0]["message"]["message_id"]
+    folder = world.workspace.store / "jobs/engine" / job
+    assert (folder / "step-1.log").stat().st_size > 262144 and (folder / "step-11.log").stat().st_size == 0
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    assert world.dispatch()["small_changes"][0]["state"] == "reviewing"
+    assert world.messages("job_receipt") == receipts
+    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.parametrize("lane", ["fix", "review0"])
+@pytest.mark.parametrize("succession", [False, True])
+def test_formal_closed_assignment_history_is_not_current_success_evidence(tmp_path, lane, succession):
+    (tmp_path / ".keep").write_text("closed historical binding evidence\n")
+    world = DispatchWorld(tmp_path)
+    parent = formal_foreign_assignment(world, lane=lane)
+    old = request("legacy-canonical")
+    world.ledger.ready(old)
+    world.ledger.intent(old)
+    world.ledger.event("start", actor=world.ledger.operator, intent_id="attempt-1", **world.ledger.target(old))
+    world.ledger.terminal(old)
+    world.ledger.accepted_delivery(old)
+    world.ledger.event("disposition", status="FINAL", resolution={"kind": "complete", "evidence": world.ledger.evidence},
+                       **world.ledger.target(old))
+    if succession:
+        path = world.root.parent / "handoff-history.md"
+        path.write_text("modelled owner stopped completed historical lane")
+        binding = invoke(world.root, "bind", {"endpoint": "engine/lane/" + lane, "host": "next-host",
+            "session": "next-session", "expected_generation": 1, "checkpoint": {
+                "outgoing_stopped": True, "briefs": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}],
+                "sources": [], "lease_refs": [], "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}})
+        invoke(world.root, "ack-handoff", {"endpoint": "engine/lane/" + lane, "session": "next-session",
+            "generation": 2, "checkpoint_sha256": binding["checkpoint_sha256"]})
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "writer_sent", row
+    assert world.change.row()["terminal"] is None and world.change.row()["review"] is None
+    assert world.messages("job_request") == []
+    assert [r["message"]["message_id"] for r in world.messages("dispatch")] == [
+        parent, "scw-" + raw_request(world.change.plan)["sha256"]]
+
+
+@pytest.mark.parametrize("damage", ["missing-completion", "missing-acceptance", "duplicate-completion", "malformed-completion", "wrong-binding", "live-canonical"])
+def test_formal_ambiguous_legacy_assignments_remain_held(tmp_path, damage):
+    (tmp_path / ".keep").write_text("ambiguous historical assignment evidence\n")
+    world = DispatchWorld(tmp_path)
+    parent = formal_foreign_assignment(world, complete=damage != "missing-completion")
+    if damage == "missing-acceptance":
+        record = next(r for r in world.messages() if r["message"]["message_id"] == parent + "-accepted")
+        Path(record["path"]).rename(tmp_path / "retained-missing-acceptance.md")
+    elif damage == "duplicate-completion":
+        record = next(r for r in world.messages() if r["message"]["message_id"] == parent + "-completed")
+        path = Path(record["path"]).with_name("duplicate-legacy.md")
+        path.write_bytes(Path(record["path"]).read_bytes())
+        rewrite_message({"path": str(path)}, lambda m: m.update(message_id="duplicate-legacy-completion"))
+    elif damage in {"malformed-completion", "wrong-binding"}:
+        record = next(r for r in world.messages() if r["message"]["message_id"] == parent + "-completed")
+        if damage == "malformed-completion":
+            rewrite_message(record, lambda m: m["result"].pop("checks"))
+        else:
+            rewrite_message(record, lambda m: m.update(session="not-the-historical-session"))
+    elif damage == "live-canonical":
+        world.ledger.publish(request("still-open-canonical"))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "held"
+    assert row["reason"] == ("small_change_result_invalid" if damage == "malformed-completion" else "small_change_mixed_queue")
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("prior", [False, True])
+def test_formal_fresh_mixed_queue_fence_preserves_prior_delivery_recovery(tmp_path, prior):
+    (tmp_path / ".keep").write_text("fresh mixed-queue fence and recovery\n")
+    world = Loop(tmp_path)
+    world.team("engine")
+    canonical = request("canonical-before-selection")
+    world.ledger.publish(canonical)
+    world.ledger.approve(canonical)
+    original_id = deliver_without_recording(world, canonical) if prior else None
+    original = world.inbox("engine") if prior else None
+    if prior:
+        assert [r["message"]["message_id"] for r in original] == [original_id]
+    change = SmallChange(world.ledger, request("small-registered-during-routing"))
+    envelope = {"id": "register-during-mailbox-lock", "actor": "coordinator-1", "generation": 1,
+        "custody": {"cid": "root-1", "generation": 1},
+        "event": {"type": "small_change_plan", "proposal": raw_request(change.plan),
+                  "participants": change.participants, **world.ledger.target(change.value)}}
+    path = tmp_path / "late-registration.json"
+    path.write_text(json.dumps(envelope))
+    script = r"""
+import importlib.util, os, subprocess, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+root, journal, envelope, lifecycle_cli = sys.argv[2:6]
+original = os.open
+registered = False
+def opened(path, flags, *args, **kwargs):
+    global registered
+    if not registered and Path(path) == Path(root) / '.write.lock':
+        registered = True
+        p = subprocess.run([sys.executable, '-I', '-B', lifecycle_cli, '--root', journal, 'record',
+                            '--event', envelope, '--evidence-only'], env=os.environ.copy(), capture_output=True, text=True)
+        assert p.returncode == 0, p.stdout + p.stderr
+    return original(path, flags, *args, **kwargs)
+os.open = opened
+sys.exit(router.main(sys.argv[6:]))
+"""
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(world.mailboxes["engine"]),
+        str(world.ledger.path), str(path), str(ROOT / "tools/hierarchy_lifecycle.py"),
+        "--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store),
+        "route", "--actor", "router-1", "--evidence-only", "--wait", "0.1"],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    result = json.loads(p.stdout)
+    if prior:
+        assert len(result["routed"]) == 1 and result["routed"][0]["delivered"] is False
+        assert world.inbox("engine") == original
+        before = world.ledger.files()
+        assert world.route()["routed"] == [] and world.ledger.files() == before
+    else:
+        assert result["routed"] == [] and world.inbox("engine") == []
+        assert next(r for r in result["requests"] if r["request_id"] == canonical["id"])["reason"] == "small_change_mixed_queue"
+
+
+def test_formal_result_uses_runner_four_mib_limit_and_captured_bytes(tmp_path):
+    (tmp_path / ".keep").write_text("exact public retained-result limit\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    formal_jobs(world, "max-result", expect=0)
+    first = world.messages("job_request")[0]["message"]["message_id"]
+    result = world.workspace.store / "jobs/engine" / first / "result.json"
+    assert result.stat().st_size == 4194304
+    receipts = world.messages("job_receipt")
+    assert formal_dispatch(world, watch=result, action="deny")["small_changes"][0]["state"] == "reviewing"
+    assert world.messages("job_receipt") == receipts
+    assert not Path(str(result) + ".opened").exists()
+    with result.open("ab") as stream:
+        stream.write(b" ")
+    row = formal_dispatch(world, watch=result, action="deny")["small_changes"][0]
+    assert row["reason"] == "small_change_receipt_invalid"
+    assert not Path(str(result) + ".opened").exists()
+
+
+def test_formal_mixed_queue_allows_recovery_already_mixed_and_preserves_conflict(tmp_path):
+    (tmp_path / ".keep").write_text("outer mixed selection recovery precedence\n")
+    world = Loop(tmp_path)
+    root = world.team("engine")
+    value = request("prior-canonical-delivery")
+    world.ledger.publish(value)
+    world.ledger.approve(value)
+    original_id = deliver_without_recording(world, value)
+    original = world.inbox("engine")
+    assert [r["message"]["message_id"] for r in original] == [original_id]
+    change = SmallChange(world.ledger, request("later-small-change"))
+    change.register()
+    route = world.route()
+    assert len(route["routed"]) == 1 and route["routed"][0]["delivered"] is False
+    assert world.inbox("engine") == original
+    conflict = request("conflicting-prior-delivery")
+    world.ledger.publish(conflict)
+    world.ledger.approve(conflict)
+    sha = raw_request(conflict)["sha256"]
+    invoke(root, "publish", {"message_id": "route-" + sha, "from": "engine/router", "to": "engine/orchestrator",
+        "host": "host-one", "session": "engine-router", "binding_generation": 1, "type": "info", "body": "conflicting prior bytes"})
+    result = world.route()
+    assert result["routed"] == []
+    row = next(r for r in result["requests"] if r["request_id"] == conflict["id"])
+    assert row["reason"] == "route_message_conflict"
+
+
+@pytest.mark.parametrize("name", ["result.json", "claim.json", "process.json"])
+def test_formal_present_null_metadata_is_not_absence(tmp_path, name):
+    (tmp_path / ".keep").write_text("unexpected retained metadata refuses\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    (folder / name).write_text("null")
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    assert row["reason"] == "small_change_receipt_invalid", row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+
+# Snapshot/v1 repair R2. All R1 tests above remain an exact byte prefix.
+def snapshot_v1_probe(world, *, command="dispatch", reserved=None, log=None, grow=False):
+    """Only OS I/O and the modelled password-database/home boundary are replaced."""
+    script = r"""
+import builtins, importlib.util, io, json, os, pwd, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+home, telemetry_path, reserved, watched, grow = sys.argv[2:7]
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], home, user.pw_shell))
+telemetry = {'reserved_opens': [], 'reads': [], 'appends': 0}
+raw_open, io_open, fd_open, read = builtins.open, io.open, os.open, os.read
+def target(path, kwargs=None):
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return None
+    value = Path(os.fsdecode(path))
+    descriptor = (kwargs or {}).get('dir_fd')
+    if not value.is_absolute() and descriptor is not None:
+        value = Path(os.readlink('/proc/self/fd/%d' % descriptor)) / value
+    return value
+def refuse_reserved(path, kwargs=None):
+    actual = target(path, kwargs)
+    if reserved and actual == Path(reserved):
+        telemetry['reserved_opens'].append(str(actual))
+        raise OSError('modelled reserved metadata content open attempted')
+def opened(path, *args, **kwargs):
+    refuse_reserved(path)
+    return raw_open(path, *args, **kwargs)
+def io_opened(path, *args, **kwargs):
+    refuse_reserved(path)
+    return io_open(path, *args, **kwargs)
+def fd_opened(path, flags, *args, **kwargs):
+    refuse_reserved(path, kwargs)
+    return fd_open(path, flags, *args, **kwargs)
+builtins.open, io.open, os.open = opened, io_opened, fd_opened
+def captured_read(descriptor, count):
+    actual = Path(os.readlink('/proc/self/fd/%d' % descriptor))
+    chunk = read(descriptor, count)
+    if watched and actual == Path(watched):
+        telemetry['reads'].append({'requested': count, 'returned': len(chunk)})
+        if grow == 'yes' and chunk and telemetry['appends'] < 3:
+            with raw_open(watched, 'ab') as stream:
+                stream.write(b'a' * 65536)
+            telemetry['appends'] += 1
+    return chunk
+os.read = captured_read
+try:
+    code = router.main(sys.argv[7:])
+finally:
+    Path(telemetry_path).write_text(json.dumps(telemetry))
+sys.exit(code)
+"""
+    home = world.tmp / "snapshot-home"
+    home.mkdir(exist_ok=True)
+    telemetry = world.tmp / ("snapshot-" + command + "-telemetry.json")
+    args = ["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), command,
+            "--recipes", str(world.recipes_path), "--wait", "0.1"]
+    if command == "dispatch":
+        args.append("--evidence-only")
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    env["HOME"] = str(home)
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(home),
+        str(telemetry), str(reserved or ""), str(log or ""), "yes" if grow else "no", *args],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    return json.loads(p.stdout), json.loads(telemetry.read_text())
+
+
+def snapshot_v1_unchanged(world):
+    events = world.workspace.store / "events"
+    return (world.ledger.files(), mailbox_snapshot(world.root),
+            {p.name: p.read_bytes() for p in events.iterdir()})
+
+
+def test_snapshot_v1_completed_runner_prerequisite_and_pristine_large_log_parity(tmp_path):
+    (tmp_path / ".keep").write_text("R2 pristine public v1 prerequisite\n")
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": [
+        ["$python", "-c", "import sys; sys.stdout.buffer.write(b'x' * 3000017)"]]})
+    folder = formal_completed_job(world)
+    packet = json.loads((folder / "packet.md").read_bytes())
+    assert packet["schema"] == "aegis.hierarchy-job-packet/v1"
+    assert not any((folder / name).exists() for name in ("execution.json", "derivation.json", "admitted.json"))
+    receipts = world.messages("job_receipt")
+    initial = (folder / "step-1.log").stat().st_size
+    assert initial == 3000017 and initial > 262144
+    result, telemetry = snapshot_v1_probe(world, log=folder / "step-1.log")
+    assert result["small_changes"][0]["state"] == "reviewing", result
+    assert sum(r["returned"] for r in telemetry["reads"]) == initial
+    assert telemetry["appends"] == 0 and telemetry["reserved_opens"] == []
+    assert world.messages("job_receipt") == receipts
+
+
+SNAPSHOT_RESERVED_CASES = [
+    ("execution.json", state, form)
+    for state in ("live", "unknown", "dead") for form in ("regular", "fifo", "symlink", "directory")
+] + [
+    (name, "unsupported", form)
+    for name in ("derivation.json", "admitted.json") for form in ("regular", "fifo", "symlink", "directory")
+]
+
+
+@pytest.mark.parametrize("name,state,form", SNAPSHOT_RESERVED_CASES,
+                         ids=["%s-%s-%s" % case for case in SNAPSHOT_RESERVED_CASES])
+def test_snapshot_v1_reserved_metadata_holds_before_content_reads(tmp_path, name, state, form):
+    (tmp_path / ".keep").write_text("R2 modelled unsupported retained metadata\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    target = folder / name
+    value = json.loads((folder / "claim.json").read_bytes())
+    if state in {"live", "unknown"}:
+        value["pid"] = os.getpid()
+        value["start"] = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+        if state == "unknown":
+            value["process_scope"] = {"modelled": "unobservable scope"}
+    if form == "regular":
+        target.write_text(json.dumps(value))
+    elif form == "fifo":
+        os.mkfifo(target)
+    elif form == "directory":
+        target.mkdir()
+    else:
+        private = tmp_path / "snapshot-home/.codex/modelled-reserved-target"
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("modelled private target; no read is permitted")
+        target.symlink_to(private)
+    retained_inbox = world.inbox("engine")
+    assert retained_inbox, "public writer/job progression must leave its original replies"
+    before = snapshot_v1_unchanged(world)
+    for command in ("status", "dispatch", "status", "dispatch"):
+        result, telemetry = snapshot_v1_probe(world, command=command, reserved=target)
+        row = result["small_changes"][0]
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert row["detail"] == "unsupported retained v1 metadata: " + name, row
+        assert telemetry["reserved_opens"] == [], "reserved metadata reached a content reader"
+        assert snapshot_v1_unchanged(world) == before
+        assert world.inbox("engine") == retained_inbox
+
+
+@pytest.mark.parametrize("size", [17, 3145747], ids=["small", "large"])
+def test_snapshot_v1_growing_log_has_initial_size_io_budget_and_holds(tmp_path, size):
+    (tmp_path / ".keep").write_text("R2 finite append stream and public I/O budget\n")
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": [
+        ["$python", "-c", "import sys; sys.stdout.buffer.write(b'x' * %d)" % size]]})
+    folder = formal_completed_job(world)
+    log = folder / "step-1.log"
+    initial = log.stat().st_size
+    assert initial == size
+    retained_inbox = world.inbox("engine")
+    assert retained_inbox, "public writer/job progression must leave its original replies"
+    before = snapshot_v1_unchanged(world)
+    for command in ("status", "dispatch"):
+        current = log.stat().st_size
+        result, telemetry = snapshot_v1_probe(world, command=command, log=log, grow=True)
+        row = result["small_changes"][0]
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert row["detail"] == "retained artifact changed while reading: step-1.log", row
+        assert telemetry["appends"] >= 1
+        consumed = sum(r["returned"] for r in telemetry["reads"])
+        assert consumed <= current, "snapshot read exceeded initially observed file size"
+        remaining = current
+        for read in telemetry["reads"]:
+            assert 0 < read["requested"] <= min(1048576, remaining)
+            remaining -= read["returned"]
+        assert remaining == 0
+        assert snapshot_v1_unchanged(world) == before
+        assert world.inbox("engine") == retained_inbox

@@ -779,6 +779,19 @@ still hold. Existing global run-open keeps its recipes, budgets and scheduling; 
 jobs continue even when a small-change row holds on recipe drift. A successful receipt also needs
 retained packet/source/evidence hashes, stopped processes and settled reservations before review.
 
+Receipt validation captures retained artifacts through validated directory/file descriptors and consumes that snapshot
+through evidence hashing, result/body validation and process checks. Every step entry is checked, including unlisted
+entries; symlinks, nonregular files, changed identity/content metadata or directory membership hold before review.
+This fixed-v1 path refuses exact execution.json, derivation.json and admitted.json names at anchored discovery,
+before content opens for any file type or apparent execution liveness. These are unsupported version metadata,
+reported as small_change_receipt_invalid; no dependent-job or newer runner semantics are inferred. D5 adoption
+remains separately held, and source comparison supplies no current-base runtime qualification.
+Each regular-file capture reads at most its initial N bytes using bounded requests, then validates unchanged
+identity/content metadata/membership. Short reads, growth and rewrites hold without following appends to EOF.
+Large valid logs have no mailbox-size cap; result metadata keeps the runner's 4 MiB bound and exact numeric-log
+2000-byte tail rendering. A retained failed/refused result holds a partial batch even when its terminal receipt was
+not published. Only the original runner settles it; the dispatcher publishes no replacement or remaining batch work.
+
 Missing or conflicting messages, duplicate results/terminal receipts, unknown or failed effects,
 expiry, denial, stale participants and recipe drift hold without a replacement attempt. A legacy
 canonical router-to-Orchestrator delivery takes precedence over new-work configuration checks:
@@ -794,7 +807,12 @@ separate dispatcher projection decoder. Malformed child holds remain visible whi
 work proceeds. Actual durable read/validation failure holds sweep without an empty-set fallback;
 canonical run-open still runs. Query locks are released before wakes, and an empty canonical projection
 omits `small_changes`. This read records no publication or lifecycle event and grants no authority.
-Mixed canonical/small-change initiative queues hold. Planning exclusions are separate
+Malformed durable policy role types also hold this reconstruction boundary without suppressing canonical run-open.
+Mixed canonical/small-change initiative queues hold. Canonical delivery checks fresh journal state inside the mailbox
+lock after classifying original delivery: an identical lost receipt recovers once even if newly mixed, while a new
+publication refuses. Valid completed foreign writer/Reviewer history requires unique correlated acceptance/completion
+and historical bindings; it permits later work without granting current lifecycle or check evidence. Ambiguous history
+holds, and live canonical conflicts still apply. Planning exclusions are separate
 from `start_failing`; deleting status.json cannot release them. Retained scw/scj/scr replies list IDs,
 paths and actual recorded read state, never fabricated reads. The team's planning skip lifts only
 after every small-change row is complete or has an owned blocked disposition. A `next` disposition,

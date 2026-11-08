@@ -343,6 +343,9 @@ def deliver(lifecycle, ledger, actor, key, wait):
                 if prior == "conflict":
                     return None, {"reason": "route_message_conflict"}
                 if prior is None:
+                    from hierarchy_small_change_dispatch import mixed_teams
+                    if team in mixed_teams(state):
+                        return None, {"reason": "small_change_mixed_queue"}
                     stage, why = decision_state(state, row, timestamp())
                     if stage is not None:
                         return None, {"reason": why or stage}
@@ -377,11 +380,14 @@ def route(lifecycle, store, actor, wait, only=None):
     from hierarchy_small_change_dispatch import mixed_teams
     mixed = mixed_teams(state)
     for key, row in authority_rows(state):
-        if "small_change" in row or row["request"]["team"] in mixed:
+        if "small_change" in row:
             continue
         if only is not None and key != only:
             continue
-        if row_view(state, key, row, ledger, at)["state"] not in {"ready", "delivered_unrecorded"}:
+        view = row_view(state, key, row, ledger, at)
+        if row["request"]["team"] in mixed and view["state"] != "delivered_unrecorded":
+            continue
+        if view["state"] not in {"ready", "delivered_unrecorded"}:
             continue
         result, failure = deliver(lifecycle, ledger, actor, key, wait)
         if result is not None:

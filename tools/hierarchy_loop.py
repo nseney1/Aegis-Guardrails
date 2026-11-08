@@ -501,7 +501,7 @@ class Pass:
             result = project(Lifecycle(self.args.lifecycle), Store(self.args.store),
                              recipes=self.args.recipes, mutate=False)
             _decode_dispatch(_object(result, "planning projection"), status=True)
-        except ERRORS + (RecursionError,) as exc:
+        except ERRORS + (RecursionError, TypeError, KeyError) as exc:
             self.hold("dispatch", "planning_exclusions_unavailable", str(exc), "owner")
             return False
         self.planning_exclusions = set(result["planning_exclusions"])

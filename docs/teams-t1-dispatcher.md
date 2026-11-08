@@ -150,6 +150,22 @@ hash == result hash at settlement; any mismatch is a per-row small_change_recipe
 `:1806`, `:867-870`). Other canonical jobs continue. Failed/refused/unknown jobs never receive replacement IDs; exclusive Job.claim and
 retained-result settlement already prevent runner replay (`tools/hierarchy_jobs.py:1177-1190`, `:1955-1982`).
 
+Retained-artifact successor to the denied whole-candidate review: receipt validation consumes one private, descriptor-anchored snapshot of
+all step-* and derivation candidates plus result/claim/process/packet metadata. Preflight original paths before discovery; retain validated
+ancestor and file descriptors, refuse symlinks/nonregular entries before reading, and detect identity, content metadata or membership change
+before publication. Evidence hashes, original-path references, result validation, process-stop checks and exact receipt body use captured data;
+never return the folder to unchecked Job readers. This fixed-v1 path refuses the exact reserved names execution.json, derivation.json and
+admitted.json at anchored directory discovery, before any content open, regardless of file type or apparent execution liveness. Surface
+small_change_receipt_invalid with the unsupported retained v1 metadata filename. The current qualification-base runner may prefer execution
+claims or include derivation evidence; this refusal is a version boundary, not a copy of dependent-job support or proof of current-base runtime
+parity. D5 dependent-job adoption remains a separate held successor.
+Read each regular file at most its initially observed N bytes through bounded chunk requests and a remaining counter; do not follow appends
+to EOF. Short reads, growth or rewrites hold, followed by the existing identity/content-metadata/membership validation. Large valid regular logs
+have no mailbox-size cap; preserve the runner's 4 MiB result limit, 2000-byte numeric-log tail, empty-log fallback, UTF-8 replacement and control
+filtering. This snapshot is ephemeral, not a persistent store.
+A valid retained failed/refused result with matching admitted recipe provenance holds small_change_check_failed even if terminal receipt
+publication failed. Publish no missing batch IDs or Reviewer work; only the unchanged runner settles the original job and reservation.
+
 ## 5. Loop-only skips, reporting and holds
 
 Canonical-compatibility successor to prior R4 b087f711ae76460591095c81760f10454d1806d56379772e07f0f065110ff17b:
@@ -169,6 +185,15 @@ planning skips retain unread counts and a small_change_planning_skipped report, 
 handling stays separate (`:512-518`, `:643-644`). Losing status.json cannot release a planning skip. Actual busy, corrupt, unreadable, private
 or symlinked durable input, or invalid projection, means owner planning_exclusions_unavailable and skipped sweep, with the cross-team wake
 delay explicit; run-open still runs. This projection records no event/publication and changes no capacity, claim or accounting authority.
+
+Malformed durable policy roles that raise TypeError/KeyError at this reconstruction boundary also produce planning_exclusions_unavailable;
+the finite exception boundary does not hide failures elsewhere. Under the mailbox lock, canonical delivery reloads the journal and classifies
+original delivery first: conflict remains conflict, identical publication recovers its receipt even after a queue becomes mixed. With no prior
+delivery, a fresh mixed queue refuses before publication. The outer filter admits delivered_unrecorded rows for that recovery. The existing
+bounded race after the final journal check remains explicit; no lock is held across a wake.
+A foreign writer/Reviewer assignment is closed only by unique correlated acceptance and completion over validated mailbox records, correct
+historical bindings/endpoints and chronology. Valid closed history permits later work across binding succession without proving any new
+lifecycle/check success. Missing, duplicate, malformed or ambiguous completion holds; live canonical conflicts remain independently enforced.
 
 For skip purposes an owned HOLD is a recorded coordinator disposition/resolve with blocked resolution and bounded
 owner/next_decision/condition/evidence; lifecycle obligations and UNKNOWN are still retained. Planning skips lift when EVERY small-change row in
