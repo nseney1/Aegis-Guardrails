@@ -57,6 +57,14 @@ image system directory also refuses: `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, 
 such as `/opt/aegis-python` remain usable. The interpreter named by a venv's `pyvenv.cfg` `home` must exist at the
 same path in the image; checking that is recorded for C2/C4 and is not solved by C1.
 
+Exact `/dev/shm` binds also refuse: that destination is reserved for the mandatory scratch tmpfs. A bind there
+would request two conflicting mount types and produce a plan that no inspect result could satisfy. Ordinary
+descendants such as `/dev/shm/aegis-project` remain allowed under the existing mount rules.
+Double-leading-slash mount paths, such as `//usr`, refuse in both planning and the pure structural builders.
+They are rejected rather than corrected: Python preserves that spelling while Linux resolves it as `/usr`, so
+lexical system-directory checks must not let the alias replace image userland. Existing system/ancestor,
+private-home, ownership, ACL and symlink checks still apply.
+
 ## Building the image — coming in C2
 
 The shipped Containerfile and executable `build-image` CLI are coming in C2. C1 provides only

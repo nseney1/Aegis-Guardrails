@@ -172,6 +172,8 @@ def _owner_roots(home):
 
 
 def _system_mount(path, homes=()):
+    require(not str(path).startswith("//"), "mount path has double leading slash: " + str(path))
+    require(path != Path("/dev/shm"), "mount conflicts with mandatory scratch tmpfs: " + str(path))
     require(path != Path("/usr/local") and not any(_inside(system, path) for system in IMAGE_SYSTEM_DIRS)
             and all(path != home / ".local" for home in homes),
             "mount replaces image system directory: " + str(path))

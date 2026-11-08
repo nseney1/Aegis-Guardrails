@@ -2492,3 +2492,113 @@ def test_other_requests_cannot_supply_missing_actual_facts(adapter, layout, surf
     else:
         host["SecurityOpt"] = None
     assert_request_witness(adapter, layout, expected, value, surface, [label])
+
+
+def model_system_mount_metadata(monkeypatch):
+    # Model only OS metadata for these system paths. Never create/write them or inspect owner homes.
+    paths = {"/", "//", "/dev", "/dev/shm", "/usr", "//usr"}
+    original_lstat, original_xattr = os.lstat, os.getxattr
+
+    def lstat(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if str(path) in paths:
+            parts = list(info)
+            parts[0], parts[4], parts[5] = stat.S_IFDIR | 0o755, 0, 0
+            return os.stat_result(parts)
+        return info
+
+    def getxattr(path, *args, **kwargs):
+        if str(path) in paths:
+            raise OSError(errno.ENODATA, "modelled absent access ACL")
+        return original_xattr(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "getxattr", getxattr)
+    return ("import errno,stat; _system_paths=%r; _system_lstat=os.lstat; _system_xattr=os.getxattr; "
+            "os.lstat=lambda p,*a,**kw: (lambda st: os.stat_result([stat.S_IFDIR|0o755]+list(st)[1:4]+[0,0]"
+            "+list(st)[6:]) if str(p) in _system_paths else st)(_system_lstat(p,*a,**kw)); "
+            "os.getxattr=lambda p,*a,**kw: (_ for _ in ()).throw(OSError(errno.ENODATA,"
+            "'modelled absent access ACL')) if str(p) in _system_paths else _system_xattr(p,*a,**kw); " % sorted(paths))
+
+
+def bind_policy_case(layout, case):
+    path = {"scratch": "/dev/shm", "system-alias": "//usr",
+            "ordinary-alias": "/" + str(layout.project)}[case]
+    message = ("mount conflicts with mandatory scratch tmpfs: " if case == "scratch" else
+               "mount path has double leading slash: ") + path
+    return path, message
+
+
+@pytest.mark.parametrize("surface", ["library", "cli"])
+@pytest.mark.parametrize("case", ["scratch", "system-alias", "ordinary-alias"])
+def test_bind_policy_planner_refuses_reserved_and_double_slash(adapter, layout, monkeypatch, surface, case):
+    path, message = bind_policy_case(layout, case)
+    bootstrap = model_system_mount_metadata(monkeypatch)
+    if surface == "library":
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            mounts(adapter, layout, project=path)
+    else:
+        result = cli(layout, {**config_for(layout), "project": path}, "plan", bootstrap=bootstrap)
+        assert result.returncode == 2
+        assert json.loads(result.stdout) == {"error": message}
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("case", ["scratch", "system-alias", "ordinary-alias"])
+def test_bind_policy_public_builders_refuse(adapter, layout, builder, engine, rw, case):
+    path, message = bind_policy_case(layout, case)
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        getattr(adapter, builder)(isolation, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": rw}], **kwargs)
+
+
+@pytest.mark.parametrize("case", ["scratch", "system-alias", "ordinary-alias"])
+def test_bind_policy_malicious_expected_and_actual_refuse(adapter, layout, case):
+    path, _ = bind_policy_case(layout, case)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("carrier", ["actual", "request"])
+@pytest.mark.parametrize("case", ["scratch", "system-alias", "ordinary-alias"])
+def test_bind_policy_actual_and_request_refuse(adapter, layout, surface, carrier, case):
+    path, _ = bind_policy_case(layout, case)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    if carrier == "actual":
+        value[0]["Mounts"][0].update(Source=path, Destination=path)
+    else:
+        add_recorded(value, "--mount", ["type=bind,src=" + path + ",dst=" + path])
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("surface", ["library", "cli"])
+def test_bind_policy_planner_keeps_scratch_descendant(adapter, layout, monkeypatch, surface):
+    bootstrap = model_system_mount_metadata(monkeypatch)
+    path = "/dev/shm/aegis-project"
+    if surface == "library":
+        plan = mounts(adapter, layout, project=path)
+    else:
+        result = cli(layout, {**config_for(layout), "project": path}, "plan", bootstrap=bootstrap)
+        assert result.returncode == 0, result.stdout
+        plan = json.loads(result.stdout)["mounts"]
+    assert {"source": path, "destination": path, "rw": True} in plan
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("path", ["/dev/shm/aegis-project", "/opt/aegis-project"])
+def test_bind_policy_builders_keep_ordinary_descendants(adapter, layout, engine, path):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = [{"source": path, "destination": path, "rw": True}]
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    assert "type=bind,src=" + path + ",dst=" + path in argv
+    assert adapter.verify(inspect_for(expected), expected) == []
