@@ -704,17 +704,22 @@ python3 -I -B tools/hierarchy_loop.py ... status [--text]
 For a team run, [`hierarchy_team.py up`](hierarchy-team.md) starts the loop detached with the run's `CODEX_HOME`
 and checks its environment, `status` reads it, and `down` stops it.
 
-Each pass runs these tools as child processes, in order, and acts on nothing else:
+Each pass runs these tools as child processes, in order, with a read-only durable planning projection immediately before sweep:
 
 1. `hierarchy_router.py status`, to read the journal under its lock and learn the current router.
 2. `hierarchy_router.py route --actor <current router> --evidence-only`, only when a request is
    `ready` or `delivered_unrecorded`.
-3. `hierarchy_sweep.py --rounds 1 --durable`, to wake sessions with unread mail.
-4. `hierarchy_jobs.py run-open`, last, so a long job does not hold up the pass's wakes. Its answers
+3. `hierarchy_router.py dispatch --recipes <configured recipes> --evidence-only`, for registered
+   small-change rows. With none, this stage is inert and the canonical report stays unchanged.
+4. `hierarchy_sweep.py --rounds 1 --durable`, to wake sessions with unread mail, excluding planning
+   endpoints whose team still has open small-change rows.
+5. `hierarchy_jobs.py run-open`, last, so a long job does not hold up the pass's wakes. Its answers
    are mail, which the next pass wakes the requester for.
 
-The loop writes no mail, journal event or approval itself, and it never wakes root. Children run in
-their own session with no timeout: killing one could leave a mailbox or journal `.write.lock` behind.
+The loop writes no mail, journal event or approval itself, and it never wakes root. Children get an
+explicit environment with inherited `CLAUDECODE`, `CLAUDE_PID` and `CLAUDE_CODE_*` removed; a host can
+set its own indicators afterward. They run in their own session with no timeout: killing one could
+leave a mailbox or journal `.write.lock` behind.
 A hung child therefore stalls the loop, and `status` shows which step and for how long. A SIGTERM or
 SIGINT stops the loop between steps. Only one loop runs per journal and per store: it holds a lock on
 `<lifecycle>.loop.lock` and `<store>.loop.lock`, and a second one is refused with "loop already active
@@ -730,6 +735,10 @@ Among them:
 - `journal_unavailable` for root; after 3 such passes in a row, `journal_lock` for the owner, naming
   `<lifecycle>/.write.lock`. The loop never removes a lock. `store_unavailable` and
   `router_status_error` are for root and do not count toward `journal_lock`.
+  When the independent durable planning projection cannot be read or validated, dispatch has an owner
+  `planning_exclusions_unavailable` hold and sweep is skipped. This delays wakes across teams
+  until durable inputs are readable; canonical run-open still runs and unread mail is retained.
+  A malformed canonical or dispatch child report holds its own step; it does not prevent that independent read.
 - Requests the router holds, `delivered_unrecorded`, `revoked_after_route` and unanswered
   escalations, for the Router session or root.
 - Sweep rows such as `ignored_mail`, `wake_marker_held`, `start_failed`, `start_backoff`, root's queue
@@ -742,6 +751,71 @@ Among them:
 - `start_failing` for the owner, once an endpoint failed to start in 3 passes in a row. The loop then
   skips that endpoint (`sweep --skip`) until the owner deletes `status.json`, which also clears the
   other counts. A malformed `status.json` restarts the counts with a one-pass `status_reset` hold.
+
+## Small-change dispatcher foundation
+
+The [R4 design and narrow canonical-compatibility successor](teams-t1-dispatcher.md) define this model-free progression. The public router
+`status --recipes <configured recipes>` and `dispatch --recipes <configured recipes> --evidence-only`
+commands expose `small_changes` separately from canonical `requests`; even already-routed small changes
+never become Orchestrator route candidates. `team_pending` keeps canonical rows and `root_decide`
+arguments unchanged and adds the optional sibling `small_change_pending` for plan decisions. That
+sibling grants ROOT no new tool or recording authority.
+
+An admitted row addresses exactly its first writing lane, of kind implementer or integrator, and the
+team's unique independent Reviewer lane. Both lifecycle participants and mailbox bindings are checked.
+Publication borrows only the ready Orchestrator mailbox binding; the router records only its own
+route event. Stable writer/check/Reviewer IDs (`scw-`, `scj-`, `scr-`) derive from the admitted plan
+hash and check identity. Published briefs and receipts are reused with their historical bindings.
+The writer's result must name the raw passed terminal hash as `lifecycle-terminal:<sha256>`; terminal
+and review remain on the request base, while results and check packets identify the new commit/tree.
+Before first writer publication, remaining expiry must exceed `2 * wait + 30` seconds. The 30-second
+scan/publish reserve is modelled, not an observed host latency bound.
+
+Before any check publication, all admitted checks must pass preflight. This foundation supports fixed
+v1 packets for command recipes with `require_clean=true` and no `$paths`; it infers no path selection.
+Each publish rechecks denial, expiry and the configured recipe file hash. Admission, claim and result
+hashes must agree at settlement. Partial batches resume only missing original IDs while those checks
+still hold. Existing global run-open keeps its recipes, budgets and scheduling; unrelated canonical
+jobs continue even when a small-change row holds on recipe drift. A successful receipt also needs
+retained packet/source/evidence hashes, stopped processes and settled reservations before review.
+
+Missing or conflicting messages, duplicate results/terminal receipts, unknown or failed effects,
+expiry, denial, stale participants and recipe drift hold without a replacement attempt. A legacy
+canonical router-to-Orchestrator delivery takes precedence over new-work configuration checks:
+`small_change_legacy_delivery` shows its original message ID and hashed file evidence; a conflicting
+route ID shows `route_message_conflict`. Neither can be converted into a small-change lane route.
+A published writer message with no route receipt stays `delivered_unrecorded`; the loop excludes that
+writer until recovery verifies the original route receipt. It never removes an abandoned lock.
+
+The loop reconstructs team-scoped Orchestrator/Decider exclusions immediately before sweep through
+public `hierarchy_small_change_dispatch.project(..., mutate=False)`, independently of canonical child
+output. It preflights raw lifecycle/store paths before constructing readers, then validates with the
+separate dispatcher projection decoder. Malformed child holds remain visible while healthy independent
+work proceeds. Actual durable read/validation failure holds sweep without an empty-set fallback;
+canonical run-open still runs. Query locks are released before wakes, and an empty canonical projection
+omits `small_changes`. This read records no publication or lifecycle event and grants no authority.
+Mixed canonical/small-change initiative queues hold. Planning exclusions are separate
+from `start_failing`; deleting status.json cannot release them. Retained scw/scj/scr replies list IDs,
+paths and actual recorded read state, never fabricated reads. The team's planning skip lifts only
+after every small-change row is complete or has an owned blocked disposition. A `next` disposition,
+denial or derived status edit cannot stand in for independent early release. Existing sweep
+`stalled_dispatch` holds remain available for accepted lanes that stopped without answering.
+
+After validated checks and review, `small_change_close_due` exposes exact delivery/disposition or
+blocker-resolve envelopes. The owner records those through `hierarchy_lifecycle.py record --event
+<draft file> --evidence-only`. The dispatcher never records coordinator events, grants/releases
+capacity or leases, meters actors, resets starts, or marks unknown/failed/revoked work complete.
+Closed rows are audited too: lost evidence becomes `small_change_closed_unverified` without undoing
+an owner's recorded disposition.
+
+All host behavior here is **modelled** by public subprocess tests, with participant events injected
+through the public lifecycle CLI. This is a foundation, not real end-to-end activation. D4 requires
+the separately qualified dispatcher registry companion, serialized after T2(a). D5's producer,
+connection, atomic staging, consumer and Reviewer tool seams, including Claude writers, require
+separately designed and qualified successors. D7's independent skip-only early-release record seam
+is still absent; automatic exclusions remain until it qualifies. No free-form message, HOLD or denial
+substitutes for it. Continuity and native/real-host qualification also remain open. Manual wakes,
+launcher resume and `team turn` remain owner actions outside the loop-only wake guarantee.
 
 ## Delegated Decider approvals
 

@@ -1,0 +1,2008 @@
+"""R4 dispatcher through public CLIs. Hosts are modelled; no activation credit."""
+import copy
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+if os.name == "posix":
+    import pwd
+
+pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
+                                reason="dispatcher job settlement observes Linux process evidence")
+
+from tests.integration.test_hierarchy_lifecycle import Ledger, raw_request, request
+from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, mailbox_snapshot
+from tests.integration.test_hierarchy_router import Loop, deliver_without_recording
+from tests.integration.test_hierarchy_small_change_admission import SmallChange
+
+
+ROUTER = ROOT / "tools/hierarchy_router.py"
+JOBS = ROOT / "tools/hierarchy_jobs.py"
+
+
+class DispatchWorld(Loop):
+    def __init__(self, tmp_path, *, writer_kind="implementer", reviewers=1, checks=1, expires=None,
+                 recipe_changes=None, mismatched_check=False, private_evidence=False):
+        seed = Ledger(tmp_path, initialize=False)
+        actors = {**seed.policy["actors"], "router-2": {**seed.policy["actors"]["router-1"], "generation": 2}}
+        super().__init__(tmp_path, policy_changes={"actors": actors,
+                         "successors": {**seed.policy["successors"], "router-1": "router-2"}})
+        self.root = tmp_path / "engine/mailbox"
+        self.root.parent.mkdir(parents=True)
+        endpoints = {"engine/" + e: {} for e in ("front-door", "orchestrator", "root", "router", "decider")}
+        endpoints["engine/lane/fix"] = {"kind": writer_kind}
+        endpoints.update({"engine/lane/review" + str(n): {"kind": "reviewer"} for n in range(reviewers)})
+        invoke(self.root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
+                                   "counterparts": [], "writer_limit": 3})
+        for endpoint in endpoints:
+            invoke(self.root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
+                                       "expected_generation": 0})
+        self.mailboxes["engine"] = self.root
+        self.checkout = tmp_path / "checkout"
+        self.checkout.mkdir()
+        git(self.checkout, "init", "-q", "-b", "candidate")
+        (self.checkout / "app.txt").write_text("candidate\n")
+        git(self.checkout, "add", "app.txt")
+        git(self.checkout, "commit", "-qm", "candidate")
+        self.revision = git(self.checkout, "rev-parse", "HEAD")
+        self.tree = git(self.checkout, "rev-parse", "HEAD^{tree}")
+        self.workspace.register("engine", mailbox_root=str(self.root), checkouts=[str(self.checkout)])
+        self.recipes = {"schema": "aegis.hierarchy-job-recipes/v1", "python": sys.executable,
+                        "path": ["/usr/bin", "/bin"], "recipes": {
+                            "focused": {"kind": "command", "heavy": False, "require_clean": True,
+                                        "sandbox": "none", "timeout_seconds": 10,
+                                        "steps": [["$python", "-c", "print('checked')"]]}}}
+        self.recipes_path = tmp_path / "recipes.json"
+        self.recipes["recipes"]["focused"].update(recipe_changes or {})
+        self.save_recipes()
+        value = request()
+        if expires:
+            value["continuation"]["expires_at"] = expires
+        self.change = SmallChange(self.ledger, value)
+        self.change.plan["plan"]["checks"] = ["check-" + str(n) for n in range(checks)]
+        self.change.register()
+        self.change.decide()
+        admission = self.change.admission()
+        admission["checks"] = [{"check": c, "recipe": "focused", "recipes_sha256": self.recipe_hash,
+                                "evidence": self.ledger.evidence} for c in self.change.plan["plan"]["checks"]]
+        if mismatched_check:
+            admission["checks"][-1]["recipes_sha256"] = "e" * 64
+        if private_evidence:
+            private = tmp_path / "home/.codex/evidence"
+            private.parent.mkdir(parents=True)
+            private.write_text("modelled private file; dispatcher must not open it")
+            admission["gates"]["capability"] = [{"path": str(private), "sha256": hashlib.sha256(private.read_bytes()).hexdigest()}]
+        self.change.admit(admission)
+
+    def save_recipes(self):
+        self.recipes_path.write_text(json.dumps(self.recipes))
+        self.recipe_hash = hashlib.sha256(self.recipes_path.read_bytes()).hexdigest()
+
+    def dispatch(self, *, fault=None, expect=0, command="dispatch"):
+        args = ["--lifecycle", str(self.ledger.path), "--store", str(self.workspace.store), command,
+                "--recipes", str(self.recipes_path), "--wait", "0.1"]
+        if command == "dispatch":
+            args.append("--evidence-only")
+        if fault == "batch-deny":
+            actor = self.ledger.root_actor
+            generation = self.ledger.policy["actors"][actor]["generation"]
+            envelope = {"id": "owner-mid-batch-deny", "actor": actor, "generation": generation,
+                "custody": {"cid": actor, "generation": generation}, "event": {"type": "decision",
+                  **self.ledger.target(self.change.value), "decision": "deny", "reason": "owner denial during publication"}}
+            (self.tmp / "mid-batch-deny.json").write_text(json.dumps(envelope))
+        argv = [sys.executable, "-I", "-B", str(ROUTER)]
+        if fault:
+            # Fault only at the OS publication boundary, keeping the public command unchanged.
+            script = """
+import importlib.util, json, os, sys
+import datetime
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+original = os.link
+count = 0
+class Future(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return super().now(tz) + datetime.timedelta(days=36500)
+if sys.argv[2] == 'future':
+    # The host wall clock is an OS boundary; business validation stays real.
+    import hierarchy_mailbox
+    hierarchy_mailbox.datetime = Future
+if sys.argv[2] == 'private':
+    import pwd
+    home = Path(sys.argv[sys.argv.index('--lifecycle')+1]).parent / 'home'
+    original_user = pwd.getpwuid(os.getuid())
+    pwd.getpwuid = lambda uid: pwd.struct_passwd((*original_user[:5], str(home), original_user.pw_shell))
+def link(src, dst, *args, **kwargs):
+    global count
+    path = Path(dst)
+    if sys.argv[2] == 'route' and path.parent.name == 'events':
+        event = json.loads(Path(src).read_text())['envelope']['event']
+        if event['type'] == 'route': raise OSError('injected route append failure')
+    if sys.argv[2] == 'route-committed' and path.parent.name == 'events':
+        event = json.loads(Path(src).read_text())['envelope']['event']
+        if event['type'] == 'route':
+            original(src, dst, *args, **kwargs)
+            raise OSError('injected lost committed route reply')
+    if sys.argv[2] == 'batch' and path.suffix == '.md' and path.parent.name == 'root':
+        count += 1
+        if count == 2: raise OSError('injected second job publication failure')
+    if sys.argv[2] in {'batch-drift', 'batch-deny', 'batch-expiry'} and path.suffix == '.md' and path.parent.name == 'root':
+        count += 1
+        answer = original(src, dst, *args, **kwargs)
+        if count == 1:
+            if sys.argv[2] == 'batch-drift':
+                recipes = Path(sys.argv[sys.argv.index('--recipes')+1])
+                recipes.write_bytes(recipes.read_bytes()+bytes([10]))
+            elif sys.argv[2] == 'batch-expiry':
+                import hierarchy_mailbox
+                hierarchy_mailbox.datetime = Future
+            else:
+                import subprocess
+                lifecycle = Path(sys.argv[sys.argv.index('--lifecycle')+1])
+                result = subprocess.run([sys.executable, '-I', '-B', str(Path(sys.argv[1]).with_name('hierarchy_lifecycle.py')),
+                    '--root', str(lifecycle), 'record', '--event', str(lifecycle.parent/'mid-batch-deny.json'), '--evidence-only'],
+                    capture_output=True, text=True, env=os.environ.copy())
+                if result.returncode: raise RuntimeError(result.stdout+result.stderr)
+        return answer
+    if sys.argv[2] == 'late-route' and path.suffix == '.md' and path.parent.name == 'lane':
+        answer = original(src, dst, *args, **kwargs)
+        import hierarchy_mailbox
+        hierarchy_mailbox.datetime = Future
+        return answer
+    return original(src, dst, *args, **kwargs)
+os.link = link
+sys.exit(module.main(sys.argv[3:]))
+"""
+            argv = [sys.executable, "-I", "-B", "-c", script, str(ROUTER), fault]
+        proc = subprocess.run(argv + args, env=os.environ.copy(), capture_output=True, text=True, timeout=40)
+        assert proc.returncode == expect, proc.stdout + proc.stderr
+        assert not proc.stderr, proc.stderr
+        return json.loads(proc.stdout)
+
+    def projection(self):
+        return self.run("status", "--recipes", str(self.recipes_path), "--wait", "0.1")["small_changes"][0]
+
+    def messages(self, kind=None):
+        from tools.hierarchy_mailbox import Mailbox
+        return [r for r in Mailbox(self.root).messages().values()
+                if kind is None or r["message"]["type"] == kind]
+
+    def publish_lane(self, endpoint, parent, kind, **extra):
+        return invoke(self.root, "publish", {"message_id": kind + "-" + endpoint.rsplit("/", 1)[1],
+            "from": endpoint, "to": "engine/orchestrator", "host": "host-one", "session": endpoint,
+            "binding_generation": 1, "type": kind, "in_reply_to": parent, "body": "fixture evidence", **extra})
+
+    def finish_writer(self, *, order="terminal-first", reference=None, outcome="passed", evidence=None):
+        message = self.messages("dispatch")[0]["message"]
+        readiness = {"worktree": str(self.checkout), "branch": "candidate", "base_revision": self.revision,
+                     "lease_ref": "refs/aegis/lanes/fixture", "lease_oid": "a" * 40,
+                     "lease_expires_at": "2099-01-01T00:00:00Z", "owned_paths": ["app.txt"],
+                     "scan_workspace": str(self.checkout), "scan_evidence": "fixture scan",
+                     "enforcement_tier": "advisory", "hook_evidence": "fixture hooks"}
+        self.publish_lane("engine/lane/fix", message["message_id"], "ack", acknowledgment="accepted", readiness=readiness)
+        self.ledger.intent(self.change.value)
+        self.ledger.event("start", actor=self.ledger.operator, intent_id="attempt-1", **self.ledger.target(self.change.value))
+        result = {"request_sha256": self.ledger.target(self.change.value)["request_sha256"], "intent_id": "attempt-1",
+                  "outcome": outcome, "exit_code": None if outcome == "unknown" else 0 if outcome == "passed" else 7,
+                  "source": self.change.value["source"], "evidence": self.ledger.evidence if evidence is None else evidence}
+        raw = raw_request(result)
+        completion = {"source_revision": self.revision, "source_tree": self.tree,
+                      "lane_check": reference or "lifecycle-terminal:" + raw["sha256"],
+                      "checks": [{"check": "writer", "outcome": "pass", "reference": "fixture check"}]}
+        def terminal():
+            self.ledger.event("terminal", actor=self.ledger.operator, result=raw, **self.ledger.target(self.change.value))
+        if order == "terminal-first":
+            terminal()
+        self.publish_lane("engine/lane/fix", message["message_id"], "result", result=completion)
+        if order == "result-first":
+            terminal()
+
+    def run_jobs(self, expect=0):
+        proc = subprocess.run([sys.executable, "-I", "-B", str(JOBS), "--store", str(self.workspace.store),
+                               "--recipes", str(self.recipes_path), "run-open"], env=os.environ.copy(),
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == expect, proc.stdout + proc.stderr
+        assert not proc.stderr, proc.stderr
+        return json.loads(proc.stdout)
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    original = pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: pwd.struct_passwd((*original[:5], str(home), original.pw_shell)))
+    for key in tuple(os.environ):
+        if key in {"CLAUDECODE", "CLAUDE_PID"} or key.startswith("CLAUDE_CODE_"):
+            monkeypatch.delenv(key)
+
+
+def held(world, kind):
+    row = world.projection()
+    assert row["state"] == "held", row
+    assert row["reason"] == kind, row
+    return row
+
+
+def test_ready_projection_is_separate_from_canonical_routes_and_plan_decisions(tmp_path):
+    world = DispatchWorld(tmp_path)
+    before = world.ledger.files()
+    status = world.run("status")
+    assert status["requests"] == []
+    assert status["small_changes"][0]["state"] == "writer_ready"
+    assert world.route()["routed"] == []
+    assert world.inbox("engine") == []
+    assert world.ledger.files() == before
+
+
+@pytest.mark.parametrize("order", ["terminal-first", "result-first"])
+def test_complete_public_progression_drafts_owner_closure_without_recording_it(tmp_path, order):
+    world = DispatchWorld(tmp_path)
+    initial = world.ledger.status()
+    world.dispatch()
+    writer = world.messages("dispatch")[0]
+    assert writer["message"]["from"] == "engine/orchestrator"
+    assert writer["message"]["to"] == "engine/lane/fix"
+    assert writer["message"]["message_id"] == "scw-" + raw_request(world.change.plan)["sha256"]
+    brief = Path(writer["message"]["brief"]["path"]).read_text()
+    assert all("## " + name in brief for name in ("Role contract", "Approved scope", "Source identity",
+               "Open obligations", "Dependencies", "Unread work", "Evidence references"))
+    snapshot = mailbox_snapshot(world.root)
+    world.dispatch()
+    assert mailbox_snapshot(world.root) == snapshot
+    world.finish_writer(order=order)
+    world.dispatch()
+    assert len(world.messages("job_request")) == 1
+    world.run_jobs()
+    world.dispatch()
+    review = [r["message"] for r in world.messages("dispatch") if r["message"]["to"].endswith("review0")][0]
+    world.publish_lane("engine/lane/review0", review["message_id"], "ack", acknowledgment="accepted")
+    world.ledger.event("review", actor="reviewer-1", result_sha256=world.change.row()["terminal"]["sha256"],
+        source=world.change.value["source"], verdict="accept", evidence=world.ledger.evidence,
+        **world.ledger.target(world.change.value))
+    world.publish_lane("engine/lane/review0", review["message_id"], "review", result={
+        "source_revision": world.revision, "source_tree": world.tree,
+        "checks": [{"check": "review", "outcome": "pass", "reference": "fixture acceptance"}]})
+    before = world.ledger.files()
+    world.dispatch()
+    row = held(world, "small_change_close_due")
+    assert world.ledger.files() == before
+    assert world.change.row()["delivery"] is None
+    for envelope in row["drafts"]:
+        path = tmp_path / "owner-event.json"
+        path.write_text(json.dumps(envelope))
+        world.ledger.cli("record", "--event", str(path), "--evidence-only")
+    assert world.ledger.status()["work_complete"] is True
+    assert world.projection()["state"] == "complete"
+    assert world.run("status")["planning_exclusions"] == []
+    assert world.ledger.status()["meters"]["root-1"] == initial["meters"]["root-1"]
+    assert world.ledger.status()["consumed"] == {world.change.value["id"]: 1}
+
+
+@pytest.mark.parametrize("writer_kind,reviewers", [("reviewer", 1), ("reviewer", 0), ("implementer", 0), ("implementer", 2)])
+def test_invalid_lane_selection_holds_without_messages_or_journal(tmp_path, writer_kind, reviewers):
+    world = DispatchWorld(tmp_path, writer_kind=writer_kind, reviewers=reviewers)
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_configuration")
+    assert world.messages() == [] and world.ledger.files() == before
+
+
+@pytest.mark.parametrize("fault", ["route"])
+@pytest.mark.parametrize("succession", ["router", "root", None])
+def test_publish_append_crash_recovers_under_current_custody_without_duplicate(tmp_path, fault, succession):
+    world = DispatchWorld(tmp_path)
+    world.dispatch(fault=fault)
+    held(world, "delivered_unrecorded")
+    original = world.messages("dispatch")[0]
+    if succession:
+        checkpoint = world.ledger.cli("checkpoint")
+        world.ledger.event("succeed", actor=succession + "-2", predecessor=succession + "-1",
+                           checkpoint_sha256=checkpoint["sha256"])
+        if succession == "root":
+            world.ledger.root_actor = "root-2"
+    world.dispatch()
+    assert world.messages("dispatch") == [original]
+    receipt = world.ledger.status()["receipts"][original["message"]["message_id"]]
+    before = world.ledger.files()
+    world.dispatch()
+    assert world.ledger.files() == before
+    assert world.ledger.status()["receipts"][receipt["event_id"]] == receipt
+
+
+@pytest.mark.parametrize("outcome,reference,reason", [("unknown", None, "small_change_unknown_effect"),
+    ("failed", None, "small_change_check_failed"), ("passed", "lifecycle-terminal:" + "0" * 64, "small_change_result_invalid")])
+def test_unknown_failed_or_unbound_writer_never_creates_jobs(tmp_path, outcome, reference, reason):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer(outcome=outcome, reference=reference)
+    for _ in range(2):
+        world.dispatch()
+        held(world, reason)
+    assert world.messages("job_request") == []
+    assert world.ledger.status()["consumed"] == {world.change.value["id"]: 1}
+
+
+def test_partial_check_batch_resumes_only_original_missing_ids(tmp_path):
+    world = DispatchWorld(tmp_path, checks=3)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    original = world.messages("job_request")
+    assert len(original) == 1
+    world.dispatch()
+    assert len(world.messages("job_request")) == 3
+    assert original[0] in world.messages("job_request")
+    world.dispatch()
+    assert len(world.messages("job_request")) == 3
+
+
+def test_live_deny_after_writer_blocks_checks_and_reviewer(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.ledger.event("decision", actor=world.ledger.root_actor, decision="deny", reason="revoked",
+                       **world.ledger.target(world.change.value))
+    world.dispatch()
+    held(world, "small_change_revoked")
+    assert world.messages("job_request") == [] and len(world.messages("dispatch")) == 1
+
+
+def test_expiry_margin_refuses_writer_before_any_publish(tmp_path):
+    expiry = (datetime.now(timezone.utc) + timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    world = DispatchWorld(tmp_path, expires=expiry)
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_expired")
+    assert world.messages() == [] and world.ledger.files() == before
+
+
+def test_recipe_drift_is_a_row_hold_and_never_replaces_job_identity(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('changed')"
+    world.save_recipes()
+    world.dispatch()
+    held(world, "small_change_recipe_mismatch")
+    assert world.messages("job_request") == []
+
+
+def test_recipe_drift_after_publication_never_accepts_current_recipes_as_admitted(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('changed after publish')"
+    world.save_recipes()
+    world.run_jobs()
+    original = world.messages("job_request")
+    world.dispatch()
+    held(world, "small_change_recipe_mismatch")
+    assert world.messages("job_request") == original
+    assert len(world.messages("dispatch")) == 1
+
+
+@pytest.mark.parametrize("unsupported", ["paths", "unclean"])
+def test_all_check_preflight_refuses_unsupported_recipe_without_partial_publication(tmp_path, unsupported):
+    changes = {"require_clean": False} if unsupported == "unclean" else {
+        "steps": [["$python", "-c", "print('paths')", "$paths"]]}
+    world = DispatchWorld(tmp_path, checks=2, recipe_changes=changes)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    held(world, "small_change_configuration")
+    assert world.messages("job_request") == []
+
+
+def test_missing_published_writer_message_is_never_recreated_from_route_receipt(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    Path(record["path"]).unlink()
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_message_lost")
+    assert world.messages() == [] and world.ledger.files() == before
+
+
+def test_corrupt_stored_brief_is_not_recomposed_or_republished(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    Path(record["message"]["brief"]["path"]).write_text("corrupt")
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_conflict")
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_failed_check_is_terminal_evidence_not_permission_to_reissue(tmp_path):
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": [["$python", "-c", "import sys; sys.exit(7)"]]})
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    original = world.messages("job_request")
+    world.run_jobs()
+    world.dispatch()
+    held(world, "small_change_check_failed")
+    world.dispatch()
+    assert world.messages("job_request") == original and len(world.messages("dispatch")) == 1
+
+
+def test_plan_pending_is_separate_and_canonical_arguments_are_byte_compatible(tmp_path):
+    world = Loop(tmp_path)
+    change = SmallChange(world.ledger)
+    script = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from hierarchy_lifecycle import Lifecycle
+from hierarchy_team_view import pending
+print(json.dumps(pending(Lifecycle(sys.argv[2]))))
+"""
+    def pending():
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"), str(world.ledger.path)],
+                                capture_output=True, text=True, env=os.environ.copy(), timeout=15)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    before = pending()
+    change.register()
+    after = pending()
+    assert after["pending"] == before["pending"]
+    assert after["small_change_pending"][0]["plan_sha256"] == raw_request(change.plan)["sha256"]
+    assert "root_decide" not in after["small_change_pending"][0]
+
+
+def test_loop_exclusions_are_durable_separate_from_start_failing_and_lift_on_owned_hold(tmp_path):
+    from tests.integration.test_hierarchy_loop import World
+    world = World(tmp_path)
+    world.add_role("pilot/lane/f2", cwd=str(tmp_path))
+    world.add_role("pilot/lane/review", cwd=str(tmp_path))
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.plan["plan"]["writing_lanes"][0]["lane"] = "f2"
+    change.register()
+    change.decide()
+    change.admit()
+    first = world.once(expect=3)
+    assert [r["step"] for r in first["steps"]] == ["router_status", "route", "dispatch", "sweep", "run_open"]
+    assert "pilot/orchestrator" not in world.woken() and "pilot/decider" not in world.woken()
+    writer = first["small_changes"][0]
+    world.send("pilot/lane/f2", "pilot/orchestrator", "retained-dispatcher-info",
+               in_reply_to="scw-" + writer["plan_sha256"])
+    world.status_path.unlink()
+    second = world.once(expect=3)
+    assert "pilot/orchestrator" not in world.woken()
+    skipped = [r for r in second["holds"] if r["kind"] == "small_change_planning_skipped"]
+    assert any(r.get("endpoint") == "pilot/orchestrator" for r in skipped)
+    assert not any(r["kind"] == "start_failing" for r in second["holds"])
+    assert second["small_changes"][0]["retained_replies"][0]["unread"] is True
+    world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "owner",
+        "next_decision": "review", "condition": "explicit owner custody", "evidence": world.ledger.evidence},
+        **world.ledger.target(change.value))
+    final = world.once()
+    assert final["holds"] == []
+    assert "pilot/orchestrator" in world.woken()
+    assert final["small_changes"][0]["state"] == "owned_hold"
+
+
+def rewrite_message(record, change):
+    path = Path(record["path"])
+    header, body = path.read_text()[4:].split("\n---\n\n", 1)
+    value = json.loads(header)
+    change(value)
+    path.write_text("---\n" + json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n---\n\n" + body)
+
+
+@pytest.mark.parametrize("damage", ["duplicate-check", "bad-tree"])
+def test_malformed_stored_writer_evidence_holds_without_any_check_replay(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    result = world.messages("result")[0]
+    if damage == "duplicate-check":
+        rewrite_message(result, lambda m: m["result"]["checks"].append(copy.deepcopy(m["result"]["checks"][0])))
+    else:
+        rewrite_message(result, lambda m: m["result"].update(source_tree="malformed"))
+    before = world.ledger.files()
+    for _ in range(2):
+        world.dispatch()
+        held(world, "small_change_result_invalid")
+    assert world.ledger.files() == before
+    assert len(list((world.root / "engine/root").glob("*.md"))) == 0
+
+
+@pytest.mark.parametrize("damage", ["bad-receipt", "bad-source", "bad-claim", "bad-result-hash", "bad-recipe"])
+def test_bad_check_receipt_or_retained_provenance_never_dispatches_reviewer(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    message = world.messages("job_request")[0]["message"]
+    world.run_jobs()
+    folder = world.workspace.store / "jobs/engine" / message["message_id"]
+    if damage == "bad-receipt":
+        receipt = [r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed"][0]
+        rewrite_message(receipt, lambda m: m["receipt"].update(exit_code=7))
+    elif damage in {"bad-source", "bad-result-hash", "bad-recipe"}:
+        path = folder / "result.json"
+        result = json.loads(path.read_text())
+        if damage == "bad-source":
+            result["after"]["source_tree"] = "e" * 40
+        elif damage == "bad-result-hash":
+            result["recipes_sha256"] = "e" * 64
+        else:
+            result["recipe"] = "other-recipe"
+        path.write_text(json.dumps(result))
+        receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+        rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                        for ref in m["receipt"]["evidence"] if ref["path"] == str(path)])
+    else:
+        path = folder / "claim.json"
+        claim = json.loads(path.read_text())
+        claim["recipes_sha256"] = "e" * 64
+        path.write_text(json.dumps(claim))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    row = world.projection()
+    assert row["reason"] == ("small_change_recipe_mismatch" if damage in {"bad-claim", "bad-result-hash"}
+                             else "small_change_receipt_invalid"), row
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_lost_job_receipt_is_recovered_by_existing_runner_without_reexecuting(tmp_path):
+    counter = tmp_path / "executions"
+    program = "from pathlib import Path; p=Path(%r); p.write_text(p.read_text()+'run\\n' if p.exists() else 'run\\n')" % str(counter)
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": [["$python", "-c", program]]})
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    terminal = [r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed"][0]
+    Path(terminal["path"]).unlink()
+    world.dispatch()
+    assert len(world.messages("dispatch")) == 1
+    world.run_jobs()
+    world.dispatch()
+    assert counter.read_text().splitlines() == ["run"]
+    assert len(world.messages("dispatch")) == 2
+    assert len([r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed"]) == 1
+
+
+def test_mixed_team_is_held_but_other_canonical_routing_keeps_progressing(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.ledger.publish(request("canonical"))
+    world.team("docs")
+    world.approved(request("other", team="docs"))
+    result = world.route()
+    assert [r["request_id"] for r in result["routed"]] == ["other"]
+    world.dispatch()
+    held(world, "small_change_mixed_queue")
+    assert world.messages() == []
+    assert len(world.inbox("docs")) == 1
+
+
+def test_changed_small_change_recipe_does_not_gate_unrelated_canonical_jobs(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('owner current recipe')"
+    world.save_recipes()
+    root = world.team("docs")
+    world.workspace.run("update", {"initiative": "docs", "source": "owner", "checkouts": [str(world.checkout)]})
+    packet = tmp_path / "docs/canonical.md"
+    packet.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+        "checkout": str(world.checkout), "commit": world.revision, "tree": world.tree}))
+    invoke(root, "publish", {"message_id": "canonical-check", "from": "docs/orchestrator", "to": "docs/root",
+        "host": "host-one", "session": "docs-orchestrator", "binding_generation": 1,
+        "type": "job_request", "body": "owner canonical check", "brief": {
+            "path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}})
+    results = world.run_jobs()
+    assert any(r["job"] == "docs/canonical-check" and r["state"] == "completed" for r in results["rows"])
+    world.dispatch()
+    held(world, "small_change_recipe_mismatch")
+
+
+def test_foreign_reviewer_dispatch_holds_instead_of_starting_another_assignment(tmp_path):
+    world = DispatchWorld(tmp_path)
+    brief = tmp_path / "engine/manual.md"
+    brief.write_text("Owner-created foreign review assignment\n")
+    invoke(world.root, "publish", {"message_id": "manual-review", "from": "engine/orchestrator", "to": "engine/lane/review0",
+        "host": "host-one", "session": "engine/orchestrator", "binding_generation": 1,
+        "type": "dispatch", "body": "owner-created assignment", "brief": {
+            "path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}})
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_mixed_queue")
+    assert world.ledger.files() == before
+    assert [r["message"]["message_id"] for r in world.messages("dispatch")] == ["manual-review"]
+
+
+@pytest.mark.parametrize("condition", ["unadmitted", "admitted", "denied", "expired", "binding-changed",
+                                        "orchestrator-changed", "conflict"])
+def test_legacy_delivery_precedes_configuration_and_never_replays(tmp_path, condition):
+    world = Loop(tmp_path)
+    root = world.team("engine")
+    change = SmallChange(world.ledger)
+    published = deliver_without_recording(world, change.value)
+    change.register()
+    if condition == "admitted":
+        change.decide()
+        change.admit()
+    if condition == "denied":
+        world.ledger.event("decision", actor=world.ledger.root_actor, decision="deny", reason="owner deny",
+                           **world.ledger.target(change.value))
+    records = invoke(root, "inbox", endpoint="engine/orchestrator")["messages"]
+    record = records[0]
+    if condition in {"binding-changed", "orchestrator-changed"}:
+        checkpoint = root.parent / "checkpoint.md"
+        checkpoint.write_text("owner checkpoint")
+        endpoint = "engine/router" if condition == "binding-changed" else "engine/orchestrator"
+        invoke(root, "bind", {"endpoint": endpoint, "host": "new-host", "session": "new-router",
+               "expected_generation": 1, "checkpoint": {"outgoing_stopped": True,
+                 "briefs": [{"path": str(checkpoint), "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest()}],
+                 "sources": [], "lease_refs": [], "completed_checks": [], "pending_message_ids": [published],
+                 "last_acknowledgment_ids": []}})
+    if condition == "conflict":
+        path = Path(record["path"])
+        header, _body = path.read_text()[4:].split("\n---\n\n", 1)
+        path.write_text("---\n" + header + "\n---\n\nconflicting legacy body")
+    journal, mailbox = world.ledger.files(), mailbox_snapshot(root)
+    reason = "route_message_conflict" if condition == "conflict" else "small_change_legacy_delivery"
+    world.recipes_path = tmp_path / "absent-recipes.json"
+    for _ in range(2):
+        status = (DispatchWorld.dispatch(world, fault="future", command="status") if condition == "expired"
+                  else world.run("status"))
+        assert status["requests"] == []
+        row = status["small_changes"][0]
+        assert (row["state"], row["reason"]) == ("held", reason), row
+        assert row["legacy_delivery"]["message_id"] == published
+        assert row["legacy_delivery"]["evidence"]["path"] == record["path"]
+        result = (DispatchWorld.dispatch(world, fault="future") if condition == "expired" else
+                  world.run("dispatch", "--recipes", str(world.recipes_path), "--evidence-only"))
+        assert result["small_changes"][0]["reason"] == reason
+        assert result["planning_exclusions"] == ["engine/decider", "engine/orchestrator"]
+        assert world.ledger.files() == journal and mailbox_snapshot(root) == mailbox
+    assert [m["message"]["message_id"] for m in world.inbox("engine")] == [published]
+
+
+@pytest.mark.parametrize("condition", ["denied", "drift", "expired"])
+def test_partial_batch_retains_original_and_holds_missing_after_precondition_loss(tmp_path, condition):
+    world = DispatchWorld(tmp_path, checks=3)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    original = world.messages("job_request")
+    if condition == "denied":
+        world.ledger.event("decision", actor=world.ledger.root_actor, decision="deny", reason="owner deny",
+                           **world.ledger.target(world.change.value))
+    elif condition == "drift":
+        world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('changed')"
+        world.save_recipes()
+    for _ in range(2):
+        result = world.dispatch(fault="future" if condition == "expired" else None)
+        row = result["small_changes"][0]
+        assert row["state"] == "held", row
+        assert row["reason"] == {"denied": "small_change_revoked", "drift": "small_change_recipe_mismatch",
+                                  "expired": "small_change_expired"}[condition], row
+        assert world.messages("job_request") == original and len(original) == 1
+        assert len(world.messages("dispatch")) == 1
+
+
+def test_current_planning_wake_holds_before_any_writer_publication(tmp_path):
+    world = DispatchWorld(tmp_path)
+    marker = world.root / ".wake-engine%2Forchestrator.lock"
+    marker.write_text("owner must reconcile an active or abandoned wake")
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_configuration")
+    assert world.messages() == [] and world.ledger.files() == before
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("stage", ["before-writer", "after-review"])
+def test_next_disposition_cannot_substitute_for_d7_skip_release(tmp_path, stage):
+    world = DispatchWorld(tmp_path)
+    if stage == "after-review":
+        reviewer = ready_reviewer(world)
+        review_result(world, reviewer)
+    world.ledger.event("disposition", status="FINAL", resolution={"kind": "next",
+        "request": raw_request(request("owner-next", team="other")), "evidence": world.ledger.evidence},
+        **world.ledger.target(world.change.value))
+    status = world.run("status")
+    assert status["small_changes"][0]["state"] == "held"
+    expected = ["engine/decider", "engine/orchestrator"]
+    if stage == "after-review":
+        # The next-disposition refusal precedes route verification, so its writer remains excluded too.
+        expected.insert(1, "engine/lane/fix")
+    assert status["planning_exclusions"] == expected
+
+
+def test_lost_check_message_with_claim_is_held_without_republication(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    original = world.messages("job_request")[0]
+    world.run_jobs()
+    for receipt in world.messages("job_receipt"):
+        Path(receipt["path"]).unlink()
+    Path(original["path"]).unlink()
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_lost")
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_malformed_retained_result_has_receipt_hold_without_new_work(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    message = world.messages("job_request")[0]["message"]
+    result = world.workspace.store / "jobs/engine" / message["message_id"] / "result.json"
+    result.write_text("{}")
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_receipt_invalid")
+    assert mailbox_snapshot(world.root) == before
+
+
+def ready_reviewer(world):
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    world.dispatch()
+    return next(r["message"] for r in world.messages("dispatch") if r["message"]["to"].endswith("review0"))
+
+
+def review_result(world, reviewer, verdict="accept"):
+    world.publish_lane("engine/lane/review0", reviewer["message_id"], "ack", acknowledgment="accepted")
+    world.ledger.event("review", actor="reviewer-1", result_sha256=world.change.row()["terminal"]["sha256"],
+        source=world.change.value["source"], verdict=verdict, evidence=world.ledger.evidence,
+        **world.ledger.target(world.change.value))
+    world.publish_lane("engine/lane/review0", reviewer["message_id"], "review", result={
+        "source_revision": world.revision, "source_tree": world.tree,
+        "checks": [{"check": "review", "outcome": "pass", "reference": "fixture review"}]})
+
+
+def record_drafts(world, row):
+    assert row["drafts"], row
+    for envelope in row["drafts"]:
+        path = world.tmp / "owner-envelope.json"
+        path.write_text(json.dumps(envelope))
+        world.ledger.cli("record", "--event", str(path), "--evidence-only")
+
+
+@pytest.mark.parametrize("endpoint", ["engine/lane/fix", "engine/lane/review0", "engine/orchestrator"])
+def test_unacknowledged_binding_never_starts_writer(tmp_path, endpoint):
+    world = DispatchWorld(tmp_path)
+    brief = world.root.parent / "handoff.md"
+    brief.write_text("Owner stopped outgoing session")
+    checkpoint = {"outgoing_stopped": True, "briefs": [{"path": str(brief),
+        "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}], "sources": [], "lease_refs": [],
+        "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}
+    invoke(world.root, "bind", {"endpoint": endpoint, "host": "next-host", "session": "next-session",
+                               "expected_generation": 1, "checkpoint": checkpoint})
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_binding_changed")
+    assert world.messages() == [] and world.ledger.files() == before
+
+
+def test_all_check_hashes_are_checked_before_any_publication(tmp_path):
+    world = DispatchWorld(tmp_path, checks=2, mismatched_check=True)
+    world.dispatch()
+    world.finish_writer()
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_recipe_mismatch")
+    assert world.messages("job_request") == [] and world.ledger.files() == before
+
+
+def test_wrong_historical_result_actor_is_not_accepted(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    rewrite_message(world.messages("result")[0], lambda m: m.update(session="forged-session"))
+    world.dispatch()
+    held(world, "small_change_binding_changed")
+    assert world.messages("job_request") == []
+
+
+@pytest.mark.parametrize("damage", ["duplicate-result", "missing-reference", "failed-lane-check"])
+def test_duplicate_or_nonpassing_writer_completion_never_publishes_jobs(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    record = world.messages("result")[0]
+    if damage == "duplicate-result":
+        path = Path(record["path"]).with_name("duplicate.md")
+        path.write_bytes(Path(record["path"]).read_bytes())
+        rewrite_message({"path": str(path)}, lambda m: m.update(message_id="duplicate-result"))
+    elif damage == "missing-reference":
+        rewrite_message(record, lambda m: m["result"].pop("lane_check"))
+    else:
+        rewrite_message(record, lambda m: m["result"]["checks"][0].update(outcome="fail"))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_check_failed" if damage == "failed-lane-check" else "small_change_result_invalid")
+    assert mailbox_snapshot(world.root) == before
+    assert list((world.root / "engine/root").glob("*.md")) == []
+
+
+def test_duplicate_terminal_receipt_is_corruption_not_another_success(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    record = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    path = Path(record["path"]).with_name("duplicate.md")
+    path.write_bytes(Path(record["path"]).read_bytes())
+    rewrite_message({"path": str(path)}, lambda m: m.update(message_id="duplicate-receipt"))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_receipt_invalid")
+    assert mailbox_snapshot(world.root) == before
+
+
+@pytest.mark.parametrize("state", ["unknown", "refused"])
+def test_unknown_or_refused_check_never_reissues_or_dispatches_reviewer(tmp_path, state):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    job = world.messages("job_request")[0]["message"]
+    invoke(world.root, "publish", {"message_id": "owner-check-" + state, "from": "engine/root",
+        "to": "engine/orchestrator", "host": "host-one", "session": "engine/root", "binding_generation": 1,
+        "type": "job_receipt", "in_reply_to": job["message_id"], "body": "original check unresolved",
+        "receipt": {"state": state, "reason": "owner retains original uncertain or refused check"}})
+    original = world.messages("job_request")
+    for _ in range(2):
+        world.dispatch()
+        held(world, "small_change_unknown_effect" if state == "unknown" else "small_change_check_failed")
+        assert world.messages("job_request") == original and len(world.messages("dispatch")) == 1
+
+
+def test_denial_after_checks_prevents_reviewer_publication(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    world.ledger.event("decision", actor=world.ledger.root_actor, decision="deny", reason="owner denied review",
+                       **world.ledger.target(world.change.value))
+    world.dispatch()
+    held(world, "small_change_revoked")
+    assert len(world.messages("dispatch")) == 1
+
+
+def test_rejected_review_only_drafts_owned_hold_and_never_replays(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    review_result(world, reviewer, "reject")
+    original = world.messages("dispatch")
+    world.dispatch()
+    row = held(world, "small_change_review_rejected")
+    assert all(e["event"]["type"] == "disposition" and e["event"]["status"] == "HOLD" for e in row["drafts"])
+    record_drafts(world, row)
+    assert world.projection()["state"] == "owned_hold"
+    assert world.run("status")["planning_exclusions"] == []
+    world.dispatch()
+    assert world.messages("dispatch") == original and not world.ledger.status()["work_complete"]
+
+
+def test_owner_can_resolve_owned_blocker_with_exact_drafted_evidence(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "owner",
+        "next_decision": "review", "condition": "owner waiting for independent review", "evidence": world.ledger.evidence},
+        **world.ledger.target(world.change.value))
+    review_result(world, reviewer)
+    world.dispatch()
+    row = world.projection()
+    assert row["state"] == "owned_hold" and row["reason"] == "small_change_close_due", row
+    assert [e["event"]["type"] for e in row["drafts"]] == ["delivery", "resolve"]
+    record_drafts(world, row)
+    assert world.ledger.status()["work_complete"] is True
+    # Losing evidence after owner completion is visible; no replacement assignment is sent.
+    before = mailbox_snapshot(world.root)
+    result = world.messages("review")[0]
+    Path(result["path"]).unlink()
+    world.dispatch()
+    held(world, "small_change_closed_unverified")
+    assert len(world.messages("dispatch")) == 2
+    assert world.ledger.status()["work_complete"] is True
+
+
+def test_dispatcher_only_passes_preserve_slots_leases_meters_and_cumulative_starts(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reservation = world.workspace.ask("engine", holder="owner:retained-reservation")
+    assert world.workspace.grant()["request_id"] == reservation
+    def store_bytes():
+        return {str(p.relative_to(world.workspace.store)): p.read_bytes()
+                for p in world.workspace.store.rglob("*") if p.is_file()}
+    before = store_bytes()
+    accounting = world.ledger.status()
+    refs = git(world.checkout, "for-each-ref", "refs/aegis/lanes")
+    world.dispatch()
+    world.dispatch()
+    assert store_bytes() == before
+    assert world.ledger.status()["meters"] == accounting["meters"]
+    assert world.ledger.status()["consumed"] == accounting["consumed"] == {}
+    world.finish_writer(outcome="unknown")
+    accounting = world.ledger.status()
+    for _ in range(2):
+        world.dispatch()
+    assert store_bytes() == before
+    assert world.ledger.status()["meters"] == accounting["meters"]
+    assert world.ledger.status()["consumed"] == {world.change.value["id"]: 1}
+    assert git(world.checkout, "for-each-ref", "refs/aegis/lanes") == refs
+
+
+@pytest.mark.parametrize("successor", ["router", "root"])
+def test_committed_route_reply_loss_returns_original_receipt_after_succession(tmp_path, successor):
+    world = DispatchWorld(tmp_path)
+    result = world.dispatch(fault="route-committed")
+    assert result["small_changes"][0]["reason"] == "delivered_unrecorded"
+    original = world.ledger.status()["receipts"][world.messages("dispatch")[0]["message"]["message_id"]]
+    checkpoint = world.ledger.cli("checkpoint")
+    world.ledger.event("succeed", actor=successor + "-2", predecessor=successor + "-1", checkpoint_sha256=checkpoint["sha256"])
+    if successor == "root":
+        world.ledger.root_actor = "root-2"
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    world.dispatch()
+    assert world.ledger.status()["receipts"][original["event_id"]] == original
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("damage", ["packet", "evidence", "stop-proof", "live-runner", "reservation"])
+def test_retained_job_requires_unchanged_evidence_stopped_process_and_settled_slot(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    message = world.messages("job_request")[0]["message"]
+    folder = world.workspace.store / "jobs/engine" / message["message_id"]
+    if damage == "packet":
+        (folder / "packet.md").write_text("changed retained packet")
+    elif damage == "evidence":
+        next(folder.glob("step-*.log")).write_text("changed retained evidence")
+    elif damage == "stop-proof":
+        path = folder / "result.json"
+        result = json.loads(path.read_text())
+        result["process_stopped_confirmed"] = False
+        path.write_text(json.dumps(result))
+        (folder / "process.json").unlink(missing_ok=True)
+        receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+        rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                        for ref in m["receipt"]["evidence"] if ref["path"] == str(path)])
+    elif damage == "live-runner":
+        from tools.hierarchy_jobs import process_start
+        path = folder / "claim.json"
+        claim = json.loads(path.read_text())
+        claim.update(pid=os.getpid(), start=process_start(os.getpid()))
+        path.write_text(json.dumps(claim))
+    else:
+        holder = "job:engine/" + message["message_id"]
+        reservation = world.workspace.ask("engine", holder=holder)
+        assert world.workspace.grant()["request_id"] == reservation
+    before = mailbox_snapshot(world.root)
+    store = {str(p): p.read_bytes() for p in world.workspace.store.rglob("*") if p.is_file()}
+    world.dispatch()
+    held(world, "small_change_unknown_effect" if damage == "live-runner" else "small_change_receipt_invalid")
+    assert mailbox_snapshot(world.root) == before
+    assert {str(p): p.read_bytes() for p in world.workspace.store.rglob("*") if p.is_file()} == store
+
+
+def test_scoped_loop_skip_keeps_other_team_running_and_reuses_stalled_lane_hold(tmp_path):
+    from tests.integration.test_hierarchy_loop import World
+    from tests.integration.test_hierarchy_provision import INITIATIVE, provision
+    from tests.integration.test_hierarchy_sweep import started
+    world = World(tmp_path)
+    world.add_role("pilot/lane/f2", cwd=str(tmp_path))
+    world.add_role("pilot/lane/review", cwd=str(tmp_path))
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.plan["plan"]["writing_lanes"][0]["lane"] = "f2"
+    change.register()
+    change.decide()
+    change.admit()
+    parent = "scw-" + raw_request(change.plan)["sha256"]
+    readiness = {"worktree": str(world.checkout), "branch": "feature/x", "base_revision": world.head()["commit"],
+        "lease_ref": "refs/aegis/lanes/fixture", "lease_oid": "a" * 40, "lease_expires_at": "2099-01-01T00:00:00Z",
+        "owned_paths": ["src/app.py"], "scan_workspace": str(world.checkout), "scan_evidence": "fixture scan",
+        "enforcement_tier": "advisory", "hook_evidence": "fixture hooks"}
+    world.plan({"pilot/lane/f2": {"send": [{"message_id": "accepted-fix", "to": "pilot/orchestrator",
+        "type": "ack", "acknowledgment": "accepted", "in_reply_to": parent, "body": "accepted", "readiness": readiness}]}})
+    base = tmp_path / "initiatives/docs"
+    initialization = world.init_request()
+    initialization.update(base=str(base), initiative={**INITIATIVE, "id": "docs"})
+    provision("init", initialization)
+    for role in ("orchestrator", "root"):
+        host = "codex-cli" if role == "root" else "claude-code"
+        options = {"session": "docs-root"} if role == "root" else {}
+        record = provision("add-role", world.request(base=str(base), endpoint="docs/" + role,
+                                                     host=host, cwd=str(tmp_path), **options))
+        started(world, host, record["session"])
+    world.send("docs/root", "docs/orchestrator", "other-team-work", root=base / "mailbox")
+    first = world.once(expect=3)
+    second = world.once(expect=3)
+    assert "docs/orchestrator" in world.woken()
+    assert "pilot/orchestrator" not in world.woken() and "pilot/decider" not in world.woken()
+    stalled = [r for r in second["holds"] if r["kind"] == "stalled_dispatch"]
+    assert len(stalled) == 1 and stalled[0]["endpoint"] == "pilot/lane/f2", second
+    assert stalled[0]["act"] == "root"
+    assert second["small_changes"][0]["retained_replies"][0]["unread"] is True
+
+
+def test_declared_private_evidence_refuses_before_composer_reads_it(tmp_path):
+    world = DispatchWorld(tmp_path, private_evidence=True)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    for command in ("status", "dispatch"):
+        row = world.dispatch(fault="private", command=command)["small_changes"][0]
+        assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
+        assert "owner-private" in row["detail"], row
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_brief_output_cannot_overlap_the_actual_store(tmp_path):
+    world = DispatchWorld(tmp_path)
+    destination = world.root.parent / "briefs"
+    world.workspace.store.rename(destination)
+    world.workspace.store = destination
+    before = {str(p): p.read_bytes() for p in destination.rglob("*") if p.is_file()}
+    row = world.dispatch()["small_changes"][0]
+    assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
+    assert "overlaps coordination store" in row["detail"]
+    assert {str(p): p.read_bytes() for p in destination.rglob("*") if p.is_file()} == before
+    assert world.messages() == []
+
+
+@pytest.mark.parametrize("fault,reason", [("batch-deny", "small_change_revoked"),
+    ("batch-expiry", "small_change_expired"), ("batch-drift", "small_change_recipe_mismatch")])
+def test_live_preconditions_are_rechecked_between_each_batch_publication(tmp_path, fault, reason):
+    world = DispatchWorld(tmp_path, checks=3)
+    world.dispatch()
+    world.finish_writer()
+    row = world.dispatch(fault=fault)["small_changes"][0]
+    assert (row["state"], row["reason"]) == ("held", reason), row
+    assert len(world.messages("job_request")) == 1
+    assert len(world.messages("dispatch")) == 1
+
+
+def test_expiry_after_writer_publication_retains_unrecorded_delivery_and_writer_skip(tmp_path):
+    world = DispatchWorld(tmp_path)
+    row = world.dispatch(fault="late-route")["small_changes"][0]
+    assert row["reason"] == "delivered_unrecorded", row
+    original = world.messages("dispatch")
+    before = world.ledger.files()
+    status = world.dispatch(command="status", fault="future")
+    assert status["small_changes"][0]["reason"] == "delivered_unrecorded"
+    assert "engine/lane/fix" in status["planning_exclusions"]
+    assert world.ledger.files() == before and world.messages("dispatch") == original
+
+
+@pytest.mark.parametrize("stage", ["before-publish", "awaiting-intent", "intent"])
+def test_stale_lifecycle_writer_never_restarts_an_assignment(tmp_path, stage):
+    world = DispatchWorld(tmp_path)
+    if stage != "before-publish":
+        world.dispatch()
+    if stage == "intent":
+        world.ledger.intent(world.change.value)
+    checkpoint = world.ledger.cli("checkpoint")
+    world.ledger.event("succeed", actor="operator-2", predecessor="operator-1", checkpoint_sha256=checkpoint["sha256"])
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_unknown_effect" if stage == "intent" else "small_change_binding_changed")
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_intent_without_route_receipt_is_a_protocol_hold_not_retroactive_route(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.ledger.intent(world.change.value)
+    before = world.ledger.files()
+    world.dispatch()
+    held(world, "small_change_result_invalid")
+    assert world.messages() == [] and world.ledger.files() == before
+
+
+def test_read_only_reviewer_dispatch_can_finish_valid_checks_after_expiry(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    result = world.dispatch(fault="future")
+    assert result["small_changes"][0]["state"] == "reviewing", result
+    assert len(world.messages("dispatch")) == 2
+
+
+@pytest.mark.parametrize("damage", ["identity", "type", "destination", "deep-body", "extra", "target-bool",
+                                    "target-zero", "target-unknown", "target-future"])
+def test_conflicting_writer_identity_is_not_hidden_by_a_valid_brief(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    path = Path(record["path"])
+    if damage in {"identity", "extra", "target-bool", "target-zero", "target-unknown", "target-future"}:
+        header, body = path.read_text()[4:].split("\n---\n\n", 1)
+        metadata = json.loads(body)
+        if damage == "identity":
+            metadata["plan_sha256"] = "e" * 64
+        elif damage == "extra":
+            metadata["owner_release"] = True
+        else:
+            generation = True if damage == "target-bool" else 0 if damage == "target-zero" else 2
+            if damage == "target-future":
+                invoke(world.root, "bind", {"endpoint": "engine/lane/fix", "host": "next-host", "session": "next-session",
+                    "expected_generation": 1, "checkpoint": {"outgoing_stopped": True, "briefs": [record["message"]["brief"]],
+                      "sources": [], "lease_refs": [], "completed_checks": [],
+                      "pending_message_ids": [record["message"]["message_id"]], "last_acknowledgment_ids": []}})
+            metadata["target_generation"] = generation
+            brief = Path(record["message"]["brief"]["path"])
+            raw = brief.read_bytes().replace(b"Target generation: 1", ("Target generation: " + str(generation)).encode())
+            sha = hashlib.sha256(raw).hexdigest()
+            replacement = brief.with_name("fresh-" + sha + ".md")
+            replacement.write_bytes(raw)
+            parsed_header = json.loads(header)
+            parsed_header["brief"] = {"path": str(replacement), "sha256": sha}
+            header = json.dumps(parsed_header)
+        path.write_text("---\n" + header + "\n---\n\n" + json.dumps(metadata))
+    elif damage == "type":
+        rewrite_message(record, lambda m: m.update(type="info"))
+    elif damage == "destination":
+        rewrite_message(record, lambda m: m.update(to="engine/lane/review0"))
+    else:
+        header, _body = path.read_text()[4:].split("\n---\n\n", 1)
+        path.write_text("---\n" + header + "\n---\n\n" + "[" * 2000 + "]" * 2000)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_conflict")
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_terminal_evidence_hash_must_match_before_any_check_publication(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    terminal_evidence = tmp_path / "terminal-evidence.txt"
+    terminal_evidence.write_text("original terminal evidence")
+    world.finish_writer(evidence=[{"path": str(terminal_evidence),
+                                  "sha256": hashlib.sha256(terminal_evidence.read_bytes()).hexdigest()}])
+    terminal_evidence.write_text("changed terminal evidence")
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    world.dispatch()
+    row = held(world, "small_change_configuration")
+    assert row["detail"] == "evidence reference hash mismatch"
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("condition", ["registry", "source"])
+def test_fixed_source_and_registered_checkout_are_required_before_check_publish(tmp_path, condition):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    if condition == "registry":
+        world.workspace.run("update", {"initiative": "engine", "source": "owner", "checkouts": []})
+    else:
+        rewrite_message(world.messages("result")[0], lambda m: m["result"].update(source_tree="e" * 40))
+    world.dispatch()
+    held(world, "small_change_configuration")
+    assert world.messages("job_request") == []
+
+
+def test_reviewer_source_cannot_differ_from_writer_checked_source(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    review_result(world, reviewer)
+    rewrite_message(world.messages("review")[0], lambda m: m["result"].update(source_tree="e" * 40))
+    world.dispatch()
+    row = held(world, "small_change_result_invalid")
+    assert not any(e["event"].get("resolution", {}).get("kind") == "complete" for e in row["drafts"])
+
+
+@pytest.mark.parametrize("damage", ["missing-result", "body", "nonoriginal-id"])
+def test_completed_receipt_requires_original_identity_body_and_retained_result(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    record = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    if damage == "missing-result":
+        job = world.messages("job_request")[0]["message"]["message_id"]
+        (world.workspace.store / "jobs/engine" / job / "result.json").unlink()
+    elif damage == "body":
+        path = Path(record["path"])
+        header, _body = path.read_text()[4:].split("\n---\n\n", 1)
+        path.write_text("---\n" + header + "\n---\n\nchanged receipt body")
+    else:
+        rewrite_message(record, lambda m: m.update(message_id="nonoriginal-completed-receipt"))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    row = held(world, "small_change_receipt_invalid")
+    if damage == "missing-result":
+        assert "missing successful retained job result" in row["detail"]
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_hashed_stored_brief_still_requires_complete_fresh_format(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    path = Path(record["message"]["brief"]["path"])
+    raw = ("Endpoint: engine/lane/fix\nTarget generation: 1\n" + raw_request(world.change.value)["sha256"]
+           + "\n" + raw_request(world.change.plan)["sha256"]).encode()
+    sha = hashlib.sha256(raw).hexdigest()
+    replacement = path.with_name("fresh-" + sha + ".md")
+    replacement.write_bytes(raw)
+    rewrite_message(record, lambda m: m.update(brief={"path": str(replacement), "sha256": sha}))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_conflict")
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_lost_reviewer_message_with_review_event_is_not_republished(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    review_result(world, reviewer)
+    for record in world.messages():
+        if record["message"]["message_id"] == reviewer["message_id"] or record["message"].get("in_reply_to") == reviewer["message_id"]:
+            Path(record["path"]).unlink()
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_lost")
+    assert mailbox_snapshot(world.root) == before
+
+
+@pytest.mark.parametrize("endpoint", ["engine/orchestrator", "engine/root"])
+def test_publication_rechecks_handoff_after_writer_route(tmp_path, endpoint):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    brief = world.root.parent / "handoff.md"
+    brief.write_text("Owner stopped outgoing binding")
+    invoke(world.root, "bind", {"endpoint": endpoint, "host": "next-host", "session": "next-session",
+        "expected_generation": 1, "checkpoint": {"outgoing_stopped": True, "briefs": [{"path": str(brief),
+          "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}], "sources": [], "lease_refs": [],
+          "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}})
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_binding_changed")
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_later_binding_cannot_claim_an_earlier_dispatch_result(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    brief = world.root.parent / "handoff.md"
+    brief.write_text("Owner stopped completed writer")
+    invoke(world.root, "bind", {"endpoint": "engine/lane/fix", "host": "next-host", "session": "next-session",
+        "expected_generation": 1, "checkpoint": {"outgoing_stopped": True, "briefs": [{"path": str(brief),
+          "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}], "sources": [], "lease_refs": [],
+          "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}})
+    for record in world.messages():
+        if record["message"]["from"] == "engine/lane/fix":
+            rewrite_message(record, lambda m: m.update(host="next-host", session="next-session", binding_generation=2))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_binding_changed")
+    assert mailbox_snapshot(world.root) == before
+
+
+@pytest.mark.parametrize("subject", ["router-1", "coordinator-1"])
+def test_journal_dry_run_checks_current_cap_without_publication_or_closure_drafts(tmp_path, subject):
+    world = DispatchWorld(tmp_path)
+    if subject == "coordinator-1":
+        reviewer = ready_reviewer(world)
+        review_result(world, reviewer)
+    cap = world.ledger.policy["actors"][subject]["cap_seconds"]
+    world.ledger.event("meter", actor="operator-1", subject=subject, active_seconds=cap, open_since=None)
+    before = world.ledger.files(), mailbox_snapshot(world.root), world.ledger.status()["meters"]
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "held" and "cap reached" in row["detail"], row
+    if subject == "coordinator-1":
+        assert row["drafts"] == []
+    else:
+        assert all(e["event"].get("status") == "HOLD" for e in row["drafts"])
+    assert (world.ledger.files(), mailbox_snapshot(world.root), world.ledger.status()["meters"]) == before
+
+
+def test_busy_mailbox_is_not_unlocked_or_written_by_dispatcher(tmp_path):
+    world = DispatchWorld(tmp_path)
+    lock = world.root / ".write.lock"
+    lock.write_text("owner lock")
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    assert row["state"] == "held" and "busy" in row["detail"], row
+    assert lock.read_text() == "owner lock"
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+@pytest.mark.parametrize("stage", ["writer", "checks"])
+def test_record_limit_preflight_leaves_no_partial_dispatch_or_artifact(tmp_path, stage):
+    from tools.hierarchy_mailbox import MAX_RECORDS
+    world = DispatchWorld(tmp_path, checks=2)
+    if stage == "checks":
+        world.dispatch()
+        world.finish_writer()
+    invoke(world.root, "publish", {"message_id": "capacity-seed", "from": "engine/root", "to": "engine/orchestrator",
+        "host": "host-one", "session": "engine/root", "binding_generation": 1, "type": "info", "body": "inert fixture history"})
+    records = world.messages()
+    seed = next(r for r in records if r["message"]["message_id"] == "capacity-seed")
+    header, body = Path(seed["path"]).read_text()[4:].split("\n---\n\n", 1)
+    target = MAX_RECORDS if stage == "writer" else MAX_RECORDS - 1
+    # Model the OS history boundary with copies of a public inert info record, never receipts or authority.
+    for index in range(target - len(records)):
+        message = json.loads(header)
+        message["message_id"] = "capacity-" + str(index)
+        Path(seed["path"]).with_name("capacity-%05d.md" % index).write_text(
+            "---\n" + json.dumps(message) + "\n---\n\n" + body)
+    def bytes_at(path):
+        return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
+    before = bytes_at(world.root.parent), world.ledger.files()
+    row = world.dispatch()["small_changes"][0]
+    assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
+    assert (bytes_at(world.root.parent), world.ledger.files()) == before
+
+
+def test_missing_planning_exclusions_is_a_protocol_refusal_never_an_empty_skip_set(tmp_path):
+    from tests.integration.test_hierarchy_loop import World, answering
+    world = World(tmp_path)
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.register()
+    world.send("pilot/root", "pilot/orchestrator", "retained-root-message")
+    malformed = answering(world, "incomplete-router.py", {
+        "status": (0, {"router": "router-1", "requests": [], "small_changes": []}), "dispatch": (0, {})})
+    result = world.once(expect=3, swap=("router", malformed))
+    assert any(row["step"] == "router_status" and row["kind"] == "child_failed" for row in result["holds"])
+    assert any(row["step"] == "dispatch" and row["kind"] == "dispatch_error" for row in result["holds"])
+    assert not any(row["kind"] == "planning_exclusions_unavailable" for row in result["holds"])
+    assert result["small_changes"][0]["request_id"] == change.value["id"]
+    assert any(row["kind"] == "small_change_planning_skipped" and row.get("endpoint") == "pilot/orchestrator"
+               for row in result["holds"])
+    assert world.woken() == []
+    assert [r["message"]["message_id"] for r in world.inbox("pilot/orchestrator")] == ["retained-root-message"]
+
+
+@pytest.mark.parametrize("damage", ["schema", "enabled", "authenticated", "missing-rows", "nonstring-skip",
+                                    "unknown-state", "missing-row-id", "bad-retained", "bad-reason"])
+def test_loop_refuses_invalid_dispatch_protocol_without_waking_planners(tmp_path, damage):
+    from tests.integration.test_hierarchy_loop import World, answering
+    world = World(tmp_path)
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.register()
+    status = subprocess.run([sys.executable, "-I", "-B", str(ROUTER), "--lifecycle", str(world.ledger.path),
+        "--store", str(world.workspace.store), "status"], capture_output=True, text=True, env=os.environ.copy(), timeout=20)
+    assert status.returncode == 0, status.stdout + status.stderr
+    value = {"schema": "aegis.small-change-dispatch-run/v1", "execution_enabled": False, "authenticated": False,
+             "small_changes": [], "planning_exclusions": ["pilot/orchestrator", "pilot/decider"]}
+    if damage == "schema":
+        value["schema"] = "unsupported"
+    elif damage == "enabled":
+        value["execution_enabled"] = True
+    elif damage == "authenticated":
+        value["authenticated"] = True
+    elif damage == "missing-rows":
+        value.pop("small_changes")
+    elif damage == "nonstring-skip":
+        value["planning_exclusions"] = [None]
+    else:
+        row = json.loads(status.stdout)["small_changes"][0]
+        row["state"] = "unexpected" if damage == "unknown-state" else "writer_sent"
+        if damage == "missing-row-id":
+            row.pop("request_id")
+        elif damage == "bad-retained":
+            row["retained_replies"] = None
+        elif damage == "bad-reason":
+            row["reason"] = 7
+        value["small_changes"] = [row]
+    malformed = answering(world, "bad-dispatch.py", {"status": (0, json.loads(status.stdout)), "dispatch": (0, value)})
+    result = world.once(expect=3, swap=("router", malformed))
+    assert any(row["kind"] == "dispatch_error" and row["act"] == "owner" for row in result["holds"])
+    assert world.woken() == []
+
+
+def test_loop_children_strip_parent_nested_claude_environment(tmp_path, monkeypatch):
+    from tests.integration.test_hierarchy_loop import World
+    world = World(tmp_path)
+    for key in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_FIXTURE"):
+        monkeypatch.setenv(key, "parent-only")
+    script = world.script("probe-child-environment.py", """
+import json, os, sys
+if any(k in {'CLAUDECODE', 'CLAUDE_PID'} or k.startswith('CLAUDE_CODE_') for k in os.environ):
+    sys.exit(7)
+print(json.dumps({'rows': [], 'still_unread': [], 'root_queue': [], 'root_time': []}))
+""")
+    result = world.once(swap=("sweep", script))
+    assert result["holds"] == []
+
+
+def test_unknown_check_metadata_is_a_closed_schema_refusal(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    record = world.messages("job_request")[0]
+    path = Path(record["path"])
+    header, body = path.read_text()[4:].split("\n---\n\n", 1)
+    value = json.loads(body)
+    value["owner_release"] = True
+    path.write_text("---\n" + header + "\n---\n\n" + json.dumps(value))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_conflict")
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_owned_blocker_resolution_due_is_an_owner_loop_hold(tmp_path):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "owner",
+        "next_decision": "review", "condition": "owner waiting for review", "evidence": world.ledger.evidence},
+        **world.ledger.target(world.change.value))
+    review_result(world, reviewer)
+    process = subprocess.run([sys.executable, "-I", "-B", str(ROOT / "tools/hierarchy_loop.py"),
+        "--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), "--recipes", str(world.recipes_path),
+        "--state-dir", str(tmp_path / "loop-state"), "once"], capture_output=True, text=True,
+        env=os.environ.copy(), timeout=40)
+    assert not process.stderr, process.stderr
+    assert process.returncode == 3, process.stdout
+    value = json.loads(process.stdout)
+    assert any(row["kind"] == "small_change_close_due" and row["act"] == "owner" for row in value["holds"])
+    assert value["small_changes"][0]["state"] == "owned_hold"
+    assert [e["event"]["type"] for e in value["small_changes"][0]["drafts"]] == ["delivery", "resolve"]
+
+
+def test_stored_attachment_is_a_content_addressed_dispatcher_artifact(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    path = Path(record["message"]["brief"]["path"])
+    alias = path.with_name("unaddressed.md")
+    alias.write_bytes(path.read_bytes())
+    rewrite_message(record, lambda m: m["brief"].update(path=str(alias)))
+    before = mailbox_snapshot(world.root)
+    world.dispatch()
+    held(world, "small_change_message_conflict")
+    assert mailbox_snapshot(world.root) == before
+
+
+def test_original_job_receipts_survive_a_later_root_mailbox_binding(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    world.run_jobs()
+    receipts = world.messages("job_receipt")
+    brief = world.root.parent / "root-checkpoint.md"
+    brief.write_text("Owner stopped the completed ROOT runner")
+    invoke(world.root, "bind", {"endpoint": "engine/root", "host": "next-root-host", "session": "next-root-session",
+        "expected_generation": 1, "checkpoint": {"outgoing_stopped": True, "briefs": [{"path": str(brief),
+          "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}], "sources": [], "lease_refs": [],
+          "completed_checks": [], "pending_message_ids": [], "last_acknowledgment_ids": []}})
+    world.dispatch()
+    assert world.projection()["state"] == "reviewing"
+    assert world.messages("job_receipt") == receipts
+    assert len(world.messages("job_request")) == 1 and len(world.messages("dispatch")) == 2
+
+
+def test_different_admitted_recipe_hashes_hold_only_the_mismatched_small_change(tmp_path):
+    from tools.hierarchy_mailbox import Mailbox
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch()
+    original = world.messages("job_request")
+    old_hash = world.recipe_hash
+    world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('new admitted recipe')"
+    world.save_recipes()
+    assert world.recipe_hash != old_hash
+    root = tmp_path / "docs/mailbox"
+    root.parent.mkdir()
+    endpoints = {"docs/" + name: {} for name in ("front-door", "orchestrator", "root", "router")}
+    endpoints.update({"docs/lane/fix": {"kind": "implementer"}, "docs/lane/review0": {"kind": "reviewer"}})
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [], "writer_limit": 3})
+    for endpoint in endpoints:
+        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint, "expected_generation": 0})
+    world.workspace.register("docs", mailbox_root=str(root), checkouts=[str(world.checkout)])
+    second = SmallChange(world.ledger, request("docs-small", team="docs"))
+    second.register()
+    second.decide()
+    admission = second.admission()
+    admission["checks"][0]["recipes_sha256"] = world.recipe_hash
+    second.admit(admission)
+    world.dispatch()
+    dispatch = next(r["message"] for r in Mailbox(root).messages().values() if r["message"]["type"] == "dispatch")
+    readiness = world.messages("ack")[0]["message"]["readiness"]
+    def reply(kind, **extra):
+        return invoke(root, "publish", {"message_id": "docs-" + kind, "from": "docs/lane/fix", "to": "docs/orchestrator",
+            "host": "host-one", "session": "docs/lane/fix", "binding_generation": 1, "type": kind,
+            "in_reply_to": dispatch["message_id"], "body": "modelled participant evidence", **extra})
+    reply("ack", acknowledgment="accepted", readiness=readiness)
+    world.ledger.intent(second.value, intent_id="docs-attempt")
+    world.ledger.event("start", actor=world.ledger.operator, intent_id="docs-attempt", **world.ledger.target(second.value))
+    terminal = raw_request({"request_sha256": world.ledger.target(second.value)["request_sha256"], "intent_id": "docs-attempt",
+        "outcome": "passed", "exit_code": 0, "source": second.value["source"], "evidence": world.ledger.evidence})
+    world.ledger.event("terminal", actor=world.ledger.operator, result=terminal, **world.ledger.target(second.value))
+    reply("result", result={"source_revision": world.revision, "source_tree": world.tree,
+        "lane_check": "lifecycle-terminal:" + terminal["sha256"],
+        "checks": [{"check": "writer", "outcome": "pass", "reference": "modelled participant check"}]})
+    world.dispatch()
+    world.run_jobs()
+    world.dispatch()
+    rows = {r["request_id"]: r for r in world.run("status")["small_changes"]}
+    assert rows[world.change.value["id"]]["reason"] == "small_change_recipe_mismatch"
+    assert rows[second.value["id"]]["state"] == "reviewing"
+    assert world.messages("job_request") == original
+    assert len([r for r in Mailbox(root).messages().values() if r["message"]["type"] == "job_request"]) == 1
+    assert world.ledger.status()["consumed"] == {world.change.value["id"]: 1, second.value["id"]: 1}
+
+
+PRIVATE_INPUT_ERROR = "owner-private host directory is not an input"
+PRIVATE_INPUT_ENTRIES = ("status", "dispatch", "status-api", "projection", "projection-mutate")
+PRIVATE_INPUT_PROBE = r"""
+import json, os, pwd, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], sys.argv[3], user.pw_shell))
+import hierarchy_router as router
+import hierarchy_small_change_dispatch as dispatcher
+from hierarchy_lifecycle import Lifecycle
+from hierarchy_workspace import Store
+entry = sys.argv[2]
+journal, store_path, recipes = map(Path, sys.argv[4:7])
+# API callers supply real objects. Their constructors do not load policy or events.
+if entry not in {'status', 'dispatch'}:
+    lifecycle, store = Lifecycle(journal), Store(store_path)
+accesses = []
+def observe(operation, value):
+    if not isinstance(value, (str, bytes, os.PathLike)):
+        return
+    path = Path(os.fsdecode(value))
+    if any(path == root or root in path.parents for root in (journal, store_path)):
+        accesses.append({'operation': operation, 'path': str(path)})
+# Metadata lookup is discovery too: reject CLI private paths before safe_path's lstat.
+original_stat, original_lstat = os.stat, os.lstat
+def stat(path, *args, **kwargs):
+    observe('stat', path)
+    return original_stat(path, *args, **kwargs)
+def lstat(path, *args, **kwargs):
+    observe('lstat', path)
+    return original_lstat(path, *args, **kwargs)
+os.stat, os.lstat = stat, lstat
+def audit(event, args):
+    if event in {'open', 'os.listdir', 'os.scandir', 'os.mkdir', 'os.remove', 'os.rename'} and args:
+        observe(event, args[0])
+sys.addaudithook(audit)
+if entry in {'status', 'dispatch'}:
+    args = ['--lifecycle', str(journal), '--store', str(store_path), entry,
+            '--recipes', str(recipes), '--wait', '0.1']
+    if entry == 'dispatch':
+        args.append('--evidence-only')
+    code = router.main(args)
+else:
+    try:
+        if entry == 'status-api':
+            result = router.status(lifecycle, store, 0.1, recipes)
+        else:
+            result = dispatcher.project(lifecycle, store, 0.1, recipes, mutate=entry == 'projection-mutate')
+    except ValueError as error:
+        print(json.dumps({'exception': type(error).__name__, 'error': str(error)}))
+        code = 2
+    else:
+        print(json.dumps(result))
+        code = 0
+print(json.dumps({'accesses': accesses}))
+sys.exit(code)
+"""
+
+
+def coordination_input_fixture(tmp_path, directory, component, populated, private_root=False):
+    # Preserve the modelled password-database home and all runner-owned case evidence.
+    (tmp_path / ".keep").write_text("retain private-input refusal evidence\n")
+    world = Loop(tmp_path)
+    if populated:
+        SmallChange(world.ledger).register()
+    destination = tmp_path / "home" / directory
+    if not private_root:
+        destination /= component
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if component == "journal":
+        world.ledger.path.rename(destination)
+        world.ledger.path = destination
+    else:
+        world.workspace.store.rename(destination)
+        world.workspace.store = destination
+    recipes = tmp_path / "recipes.json"
+    recipes.write_text(json.dumps({"schema": "aegis.hierarchy-job-recipes/v1", "python": sys.executable,
+        "path": ["/usr/bin", "/bin"], "recipes": {"focused": {"kind": "command", "heavy": False,
+        "require_clean": True, "sandbox": "none", "timeout_seconds": 10,
+        "steps": [["$python", "-c", "print('modelled check')"]]}}}))
+    return world, recipes
+
+
+def coordination_input_snapshot(root, metadata=False):
+    snapshot = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        info = path.lstat()
+        value = (info.st_mode, path.read_bytes() if path.is_file() else None)
+        if metadata:
+            value += (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        snapshot[str(path.relative_to(root))] = value
+    return snapshot
+
+
+def coordination_input_probe(world, recipes, entry):
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVATE_INPUT_PROBE, str(ROOT / "tools"), entry,
+        str(world.tmp / "home"), str(world.ledger.path), str(world.workspace.store), str(recipes)],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=20)
+    assert process.stderr == "", process.stderr
+    lines = process.stdout.splitlines()
+    assert len(lines) == 2, process.stdout
+    return process.returncode, json.loads(lines[0]), json.loads(lines[1])["accesses"]
+
+
+@pytest.mark.parametrize("directory", [".codex", ".claude"])
+@pytest.mark.parametrize("component", ["journal", "store"])
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+@pytest.mark.parametrize("populated", [False, True], ids=["empty", "registered-plan"])
+def test_private_coordination_inputs_refuse_before_discovery(tmp_path, directory, component, entry, populated):
+    world, recipes = coordination_input_fixture(tmp_path, directory, component, populated)
+    before = coordination_input_snapshot(tmp_path, metadata=True)
+    code, result, accesses = coordination_input_probe(world, recipes, entry)
+    assert code == 2, {"result": result, "access_count": len(accesses),
+        "lock_accessed": any(Path(a["path"]).name == ".write.lock" for a in accesses),
+        "policy_opened": any(a["operation"] == "open" and Path(a["path"]).name == "policy.json" for a in accesses),
+        "events_enumerated": any(a["operation"] in {"os.listdir", "os.scandir"}
+                                 and Path(a["path"]).name == "events" for a in accesses)}
+    if entry in {"status", "dispatch"}:
+        expected = {"state": "hold", "execution_enabled": False, "error": PRIVATE_INPUT_ERROR}
+        if entry == "status":
+            expected["source"] = "arguments"
+    else:
+        expected = {"exception": "ValueError", "error": PRIVATE_INPUT_ERROR}
+    assert result == expected, {"result": result, "accesses": accesses}
+    assert accesses == [], "private input must refuse before any coordination-root discovery or lock creation"
+    assert coordination_input_snapshot(tmp_path, metadata=True) == before
+
+
+@pytest.mark.parametrize("directory", [".codex.public", ".claude.public"])
+@pytest.mark.parametrize("component", ["journal", "store"])
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+def test_public_coordination_inputs_remain_readable_with_empty_rows(tmp_path, directory, component, entry):
+    world, recipes = coordination_input_fixture(tmp_path, directory, component, False)
+    before = coordination_input_snapshot(tmp_path)
+    code, result, accesses = coordination_input_probe(world, recipes, entry)
+    assert code == 0, result
+    assert accesses, "positive control must exercise actual journal/store discovery"
+    if entry in {"status", "status-api"}:
+        assert result["requests"] == []
+    else:
+        assert result["small_changes"] == []
+    assert coordination_input_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("directory", [".codex", ".claude"])
+@pytest.mark.parametrize("component", ["journal", "store"])
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+@pytest.mark.parametrize("path_form", ["root", "double-leading-slash"])
+def test_private_coordination_root_spelling_refuses_before_discovery(tmp_path, directory, component, entry, path_form):
+    # Model the exact private root and POSIX's alternative leading-slash spelling.
+    world, recipes = coordination_input_fixture(tmp_path, directory, component, False, private_root=path_form == "root")
+    if path_form == "double-leading-slash":
+        if component == "journal":
+            world.ledger.path = Path("/" + str(world.ledger.path))
+        else:
+            world.workspace.store = Path("/" + str(world.workspace.store))
+    before = coordination_input_snapshot(tmp_path, metadata=True)
+    code, result, accesses = coordination_input_probe(world, recipes, entry)
+    assert code == 2, {"result": result, "access_count": len(accesses)}
+    if entry in {"status", "dispatch"}:
+        expected = {"state": "hold", "execution_enabled": False, "error": PRIVATE_INPUT_ERROR}
+        if entry == "status":
+            expected["source"] = "arguments"
+    else:
+        expected = {"exception": "ValueError", "error": PRIVATE_INPUT_ERROR}
+    assert result == expected
+    assert accesses == [], "private root spelling must refuse before coordination-root discovery"
+    assert coordination_input_snapshot(tmp_path, metadata=True) == before
+
+
+def coordination_input_probe_at_home(world, recipes, entry, pwd_home):
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVATE_INPUT_PROBE, str(ROOT / "tools"), entry,
+        str(pwd_home), str(world.ledger.path), str(world.workspace.store), str(recipes)],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=20)
+    assert process.stderr == "", process.stderr
+    lines = process.stdout.splitlines()
+    assert len(lines) == 2, process.stdout
+    return process.returncode, json.loads(lines[0]), json.loads(lines[1])["accesses"]
+
+
+def coordination_input_spelling(world, component, spelling):
+    if spelling == "double":
+        if component == "journal":
+            world.ledger.path = Path("/" + str(world.ledger.path))
+        else:
+            world.workspace.store = Path("/" + str(world.workspace.store))
+
+
+@pytest.mark.parametrize("directory", [".codex", ".claude"])
+@pytest.mark.parametrize("component", ["journal", "store"])
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+@pytest.mark.parametrize("root_form", ["root", "descendant"])
+@pytest.mark.parametrize("input_form", ["normal", "double"])
+def test_double_pwd_home_refuses_private_inputs_before_discovery(
+        tmp_path, directory, component, entry, root_form, input_form):
+    # Both pwd and candidate spellings describe real temporary fixtures, never owner-private data.
+    world, recipes = coordination_input_fixture(tmp_path, directory, component, False, private_root=root_form == "root")
+    coordination_input_spelling(world, component, input_form)
+    before = coordination_input_snapshot(tmp_path, metadata=True)
+    code, result, accesses = coordination_input_probe_at_home(world, recipes, entry, "/" + str(world.tmp / "home"))
+    assert code == 2, {"result": result, "access_count": len(accesses)}
+    if entry in {"status", "dispatch"}:
+        expected = {"state": "hold", "execution_enabled": False, "error": PRIVATE_INPUT_ERROR}
+        if entry == "status":
+            expected["source"] = "arguments"
+    else:
+        expected = {"exception": "ValueError", "error": PRIVATE_INPUT_ERROR}
+    assert result == expected
+    assert accesses == [], "pwd home and every candidate must be compared before discovery or lock creation"
+    assert coordination_input_snapshot(tmp_path, metadata=True) == before
+
+
+@pytest.mark.parametrize("directory", [".codex.public", ".claude.public"])
+@pytest.mark.parametrize("component", ["journal", "store"])
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+@pytest.mark.parametrize("input_form", ["normal", "double"])
+@pytest.mark.parametrize("home_form", ["normal", "double"])
+def test_public_inputs_accept_normal_and_double_pwd_home_spellings(
+        tmp_path, directory, component, entry, input_form, home_form):
+    world, recipes = coordination_input_fixture(tmp_path, directory, component, False)
+    coordination_input_spelling(world, component, input_form)
+    pwd_home = str(world.tmp / "home")
+    if home_form == "double":
+        pwd_home = "/" + pwd_home
+    before = coordination_input_snapshot(tmp_path)
+    code, result, accesses = coordination_input_probe_at_home(world, recipes, entry, pwd_home)
+    assert code == 0, result
+    assert accesses, "positive control must exercise real journal/store discovery"
+    if entry in {"status", "status-api"}:
+        assert result["requests"] == []
+    else:
+        assert result["small_changes"] == []
+    assert coordination_input_snapshot(tmp_path) == before
+
+
+# Canonical child transport and durable planning evidence are independent public boundaries.
+def compat_world(tmp_path):
+    from tests.integration.test_hierarchy_loop import World
+    (tmp_path / ".keep").write_text("retain canonical compatibility evidence\n")
+    return World(tmp_path)
+
+
+def compat_router(world, dispatch_action=""):
+    return world.script("compat-router.py", (
+        "import json, os, subprocess, sys\nfrom pathlib import Path\n"
+        "if 'dispatch' in sys.argv:\n" +
+        "".join("    " + line + "\n" for line in (dispatch_action or "pass").splitlines()) +
+        "print(json.dumps({'router': False, 'requests': []} if 'status' in sys.argv else {}))\n"))
+
+
+def compat_add_other_team(world):
+    from tests.integration.test_hierarchy_provision import INITIATIVE, provision
+    from tests.integration.test_hierarchy_sweep import started
+    base = world.tmp / "initiatives/docs"
+    initialization = world.init_request()
+    initialization.update(base=str(base), initiative={**INITIATIVE, "id": "docs"})
+    provision("init", initialization)
+    for role in ("orchestrator", "root"):
+        host = "codex-cli" if role == "root" else "claude-code"
+        options = {"session": "docs-root"} if role == "root" else {}
+        record = provision("add-role", world.request(base=str(base), endpoint="docs/" + role,
+                                                     host=host, cwd=str(world.tmp), **options))
+        started(world, host, record["session"])
+    world.send("docs/root", "docs/orchestrator", "independent-canonical-work", root=base / "mailbox")
+
+
+def test_compat_durable_skips_survive_bad_status_while_other_team_progresses(tmp_path):
+    world = compat_world(tmp_path)
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.register()
+    world.send("pilot/root", "pilot/orchestrator", "retained-planning-mail")
+    compat_add_other_team(world)
+    journal = world.ledger.files()
+    result = world.once(expect=3, swap=("router", compat_router(world)))
+    assert any(r["step"] == "router_status" and r["kind"] == "child_failed" for r in result["holds"])
+    assert any(r["step"] == "dispatch" and r["kind"] == "dispatch_error" for r in result["holds"])
+    assert not any(r["kind"] == "planning_exclusions_unavailable" for r in result["holds"])
+    assert "docs/orchestrator" in world.woken()
+    assert "pilot/orchestrator" not in world.woken() and "pilot/decider" not in world.woken()
+    assert any(r["kind"] == "small_change_planning_skipped" and r.get("endpoint") == "pilot/orchestrator"
+               for r in result["holds"])
+    assert result["small_changes"][0]["request_id"] == change.value["id"]
+    assert [r["message"]["message_id"] for r in world.inbox("pilot/orchestrator")] == ["retained-planning-mail"]
+    assert world.ledger.files() == journal
+
+
+def test_compat_registration_after_status_and_status_loss_reconstruct_fresh_skips(tmp_path):
+    world = compat_world(tmp_path)
+    change = SmallChange(world.ledger, request(team="pilot"))
+    event = {"id": "registration-between-loop-steps", "actor": "coordinator-1", "generation": 1,
+        "custody": {"cid": "root-1", "generation": 1},
+        "event": {"type": "small_change_plan", "proposal": raw_request(change.plan),
+                  "participants": change.participants, **world.ledger.target(change.value)}}
+    envelope = tmp_path / "registration.json"
+    envelope.write_text(json.dumps(event))
+    action = ("p = subprocess.run([sys.executable, '-I', '-B', %r, '--root', %r, 'record', '--event', %r, "
+              "'--evidence-only'], env=os.environ.copy(), capture_output=True, text=True)\n"
+              "assert p.returncode == 0, p.stdout + p.stderr") % (
+                  str(ROOT / "tools/hierarchy_lifecycle.py"), str(world.ledger.path), str(envelope))
+    child = compat_router(world, action)
+    # A valid but stale first status must not become skip authority after the registration.
+    child.write_text(child.read_text().replace("{'router': False, 'requests': []}",
+        "{'router': 'router-1', 'requests': [], 'small_changes': [], 'planning_exclusions': []}"))
+    world.send("pilot/root", "pilot/orchestrator", "new-plan-retained")
+    for tick in range(2):
+        if tick:
+            world.status_path.unlink()
+        result = world.once(expect=3, swap=("router", child))
+        assert result["small_changes"][0]["request_id"] == change.value["id"]
+        assert any(r["kind"] == "small_change_planning_skipped" and r.get("endpoint") == "pilot/orchestrator"
+                   for r in result["holds"])
+        assert world.woken() == []
+        assert [r["message"]["message_id"] for r in world.inbox("pilot/orchestrator")] == ["new-plan-retained"]
+
+
+COMPAT_RAW_PASS = r"""
+import argparse, importlib.util, json, os, pwd, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_loop', sys.argv[1])
+loop = importlib.util.module_from_spec(spec); spec.loader.exec_module(loop)
+loop.TOOLS['router'], loop.TOOLS['jobs'] = Path(sys.argv[2]), Path(sys.argv[3])
+user = pwd.getpwuid(os.getuid())
+pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], sys.argv[4], user.pw_shell))
+journal, store, recipes, state_dir = map(Path, sys.argv[5:9])
+accesses = []
+def observe(kind, value):
+    if isinstance(value, (str, bytes, os.PathLike)):
+        p = Path(os.fsdecode(value))
+        if any(p == root or root in p.parents for root in (journal, store)):
+            accesses.append({'operation': kind, 'path': str(p)})
+stat, lstat = os.stat, os.lstat
+def traced_stat(path, *args, **kwargs):
+    observe('stat', path)
+    return stat(path, *args, **kwargs)
+def traced_lstat(path, *args, **kwargs):
+    observe('lstat', path)
+    return lstat(path, *args, **kwargs)
+os.stat, os.lstat = traced_stat, traced_lstat
+def audit(event, args):
+    if event in {'open', 'os.listdir', 'os.scandir', 'os.mkdir', 'os.remove', 'os.rename'} and args:
+        observe(event, args[0])
+sys.addaudithook(audit)
+args = argparse.Namespace(lifecycle=journal, store=store, recipes=recipes, state_dir=state_dir, max_jobs=None)
+code, stopped, report, wrote = loop.one_pass(args, None)
+print(json.dumps({'accesses': accesses, 'stopped': stopped, 'wrote': wrote}))
+sys.exit(code)
+"""
+
+
+def compat_raw_pass(world, journal, store):
+    from tests.integration.test_hierarchy_loop import answering
+    world.state_dir.mkdir(exist_ok=True)
+    child = compat_router(world)
+    jobs = answering(world, "compat-jobs.py", {"run-open": (0, {"rows": []})})
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", COMPAT_RAW_PASS,
+        str(ROOT / "tools/hierarchy_loop.py"), str(child), str(jobs), str(world.tmp / "modelled-home"),
+        str(journal), str(store), str(world.recipes_path), str(world.state_dir)],
+        env=world.env(), capture_output=True, text=True, timeout=40)
+    assert process.returncode == 3 and process.stderr == "", process.stdout + process.stderr
+    lines = process.stdout.splitlines()
+    assert len(lines) == 2, process.stdout
+    return json.loads(lines[0]), json.loads(lines[1])
+
+
+@pytest.mark.parametrize("component,damage", [
+    ("journal", "busy"), ("journal", "corrupt"), ("store", "corrupt"),
+    ("journal", "nested-json"),
+    ("journal", "unreadable"), ("store", "unreadable"),
+    ("journal", "symlink"), ("store", "symlink"),
+    ("journal", ".codex"), ("store", ".codex"), ("journal", ".claude"), ("store", ".claude"),
+])
+def test_compat_bad_durable_input_blocks_wakes_but_run_open_continues(tmp_path, component, damage):
+    world = compat_world(tmp_path)
+    world.ledger.publish(request("durable-input-probe", team="pilot"))
+    world.send("pilot/root", "pilot/orchestrator", "must-stay-unread")
+    journal, store = world.ledger.path, world.workspace.store
+    target = journal if component == "journal" else store
+    if damage == "busy":
+        (target / ".write.lock").write_text("retained fixture lock")
+    elif damage in {"corrupt", "nested-json"}:
+        first = next((target / "events").iterdir())
+        first.write_text("{}" if damage == "corrupt" else "[" * 2000 + "0" + "]" * 2000)
+    elif damage == "unreadable":
+        assert os.geteuid() != 0, "permission-refusal control requires an unprivileged test runner"
+        first = next((target / "events").iterdir())
+        first.chmod(0)
+    elif damage == "symlink":
+        alias = tmp_path / ("linked-" + component)
+        alias.symlink_to(target, target_is_directory=True)
+        target = alias
+    else:
+        private = tmp_path / "modelled-home" / damage / component
+        private.parent.mkdir(parents=True)
+        target.rename(private)
+        target = private
+    journal, store = (target, store) if component == "journal" else (journal, target)
+    if damage in {".codex", ".claude"}:
+        before = coordination_input_snapshot(target.parent, metadata=True)
+    result, telemetry = compat_raw_pass(world, journal, store)
+    owner = [r for r in result["holds"] if r["kind"] == "planning_exclusions_unavailable"]
+    assert len(owner) == 1 and owner[0]["act"] == "owner"
+    assert {r["step"]: r["state"] for r in result["steps"]}["sweep"] == "skipped"
+    assert {r["step"]: r["state"] for r in result["steps"]}["run_open"] == "ok"
+    assert world.woken() == []
+    assert [r["message"]["message_id"] for r in world.inbox("pilot/orchestrator")] == ["must-stay-unread"]
+    assert "router must be str" not in owner[0]["detail"], "transport rejection is not a durable read failure"
+    if damage in {".codex", ".claude"}:
+        assert owner[0]["detail"] == PRIVATE_INPUT_ERROR
+        assert telemetry["accesses"] == [], "raw private paths must refuse before constructors discover them"
+        assert coordination_input_snapshot(target.parent, metadata=True) == before
+    elif damage == "busy":
+        assert "busy" in owner[0]["detail"]
+        assert (target / ".write.lock").read_text() == "retained fixture lock"
+    elif damage == "unreadable":
+        assert "Permission denied" in owner[0]["detail"]
+    elif damage == "symlink":
+        assert "symlink" in owner[0]["detail"]
+    else:
+        assert owner[0]["detail"]
+
+
+def test_compat_unrecorded_writer_is_still_skipped_after_dispatch_child_failure(tmp_path):
+    world = compat_world(tmp_path)
+    world.add_role("pilot/lane/f2", cwd=str(tmp_path))
+    world.add_role("pilot/lane/review", cwd=str(tmp_path))
+    change = SmallChange(world.ledger, request(team="pilot"))
+    change.plan["plan"]["writing_lanes"][0]["lane"] = "f2"
+    change.register()
+    change.decide()
+    change.admit()
+    row = DispatchWorld.dispatch(world, fault="route")["small_changes"][0]
+    assert row["reason"] == "delivered_unrecorded"
+    writer = world.inbox("pilot/lane/f2")
+    assert len(writer) == 1 and writer[0]["message"]["type"] == "dispatch"
+    journal, mail = world.ledger.files(), mailbox_snapshot(world.root)
+    result = world.once(expect=3, swap=("router", compat_router(world)))
+    assert result["small_changes"][0]["reason"] == "delivered_unrecorded"
+    assert any(r["kind"] == "small_change_planning_skipped" and r.get("endpoint") == "pilot/lane/f2"
+               for r in result["holds"])
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == (journal, mail)
+    assert world.inbox("pilot/lane/f2") == writer
+    assert world.woken() == []
+
+
+def test_compat_empty_durable_projection_preserves_canonical_output_omission(tmp_path):
+    world = compat_world(tmp_path)
+    result = world.once(expect=3, swap=("router", compat_router(world)))
+    assert any(r["step"] == "router_status" and r["kind"] == "child_failed" for r in result["holds"])
+    assert any(r["step"] == "dispatch" and r["kind"] == "dispatch_error" for r in result["holds"])
+    assert not any(r["kind"] == "planning_exclusions_unavailable" for r in result["holds"])
+    assert {r["step"]: r["state"] for r in result["steps"]}["sweep"] == "ok"
+    assert "small_changes" not in result
+

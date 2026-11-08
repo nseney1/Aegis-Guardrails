@@ -198,12 +198,34 @@ def _request_rows(result):
 def _decode_router_status(result):
     _field(result, "router", str)
     _request_rows(result)
+    if "small_changes" in result or "planning_exclusions" in result:
+        _decode_dispatch(result, status=True)
     for row, path in _rows(result, "escalations", optional=True):
         for key in ("request_id", "reason", "team"):
             _field(row, key, str, path)
         decision = _field(row, "root_decision", str, path, optional=True, nullable=True)
         if decision not in (None, "approve", "deny"):
             refuse(path + ".root_decision is unknown")
+
+
+def _decode_dispatch(result, status=False):
+    if not status:
+        if _field(result, "schema", str) != "aegis.small-change-dispatch-run/v1":
+            refuse("unknown small-change dispatch schema")
+        if _field(result, "execution_enabled", bool) is not False or _field(result, "authenticated", bool) is not False:
+            refuse("dispatch must remain configured evidence-only")
+    for row, path in _rows(result, "small_changes"):
+        for name in ("request_id", "request_sha256", "team", "plan_sha256", "writer", "state"):
+            _field(row, name, str, path)
+        from hierarchy_small_change_dispatch import STATES
+        if row["state"] not in STATES:
+            refuse(path + ".state is unknown")
+        for name in ("reason", "detail"):
+            _field(row, name, str, path, optional=True)
+        _field(row, "retained_replies", list, path)
+    values = _field(result, "planning_exclusions", list)
+    if not all(type(value) is str for value in values):
+        refuse("planning_exclusions must list endpoints")
 
 
 def _decode_route(result):
@@ -312,8 +334,10 @@ def _child_diagnostics(tool, result):
 
 def run_child(tool, args, decoder):
     """Exit, validated result, stderr tail and a contract failure (if any)."""
+    child_env = {key: value for key, value in os.environ.items()
+                 if key not in {"CLAUDECODE", "CLAUDE_PID"} and not key.startswith("CLAUDE_CODE_")}
     proc = subprocess.run([sys.executable, "-I", "-B", str(TOOLS[tool]), *args], stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, start_new_session=True)
+                          capture_output=True, text=True, start_new_session=True, env=child_env)
     lines = proc.stdout.strip().splitlines()
     try:
         parsed = json.loads(lines[-1]) if lines else None
@@ -372,6 +396,8 @@ class Pass:
         self.args = args
         self.steps, self.holds = [], []
         self.journal_unavailable = self.status_read = False
+        self.planning_exclusions = set()
+        self.small_changes = None
         # Holds of the previous pass by hold_key, endpoints under a start_failing hold, and the heartbeat writer.
         self.earlier, self.skipped = earlier or {}, skipped or {}
         self.beat = beat or (lambda step: None)
@@ -388,7 +414,7 @@ class Pass:
         return ["--store", str(self.args.store), "--recipes", str(self.args.recipes)]
 
     def router_status(self):
-        code, result, stderr, problem = run_child("router", self.common("router") + ["status"], _decode_router_status)
+        code, result, stderr, problem = run_child("router", self.common("router") + ["status", "--recipes", str(self.args.recipes)], _decode_router_status)
         if code == 0 and result is not None:
             self.status_read = True
             self.steps.append({"step": "router_status", "state": "ok", "exit": 0, "router": result.get("router")})
@@ -451,9 +477,49 @@ class Pass:
                 self.hold("router_status", "escalation", {"reason": row["reason"], "team": row["team"]}, "root",
                           request_id=row["request_id"])
 
+    def dispatch(self, status):
+        # Canonical-only reports remain byte-compatible; the stage is an inert no-op there.
+        if status is not None and "small_changes" not in status:
+            return
+        code, result, stderr, problem = run_child("router", self.common("router") + ["dispatch", "--recipes",
+                    str(self.args.recipes), "--evidence-only"], _decode_dispatch)
+        if code == 0 and result is not None:
+            self.steps.append({"step": "dispatch", "state": "ok", "exit": 0})
+            self.small_changes = result.get("small_changes", [])
+        else:
+            self.steps.append({"step": "dispatch", "state": "hold", "exit": code})
+            self.hold("dispatch", "dispatch_error", (result or {}).get("error", stderr or problem), "owner")
+
+    def refresh_planning(self):
+        # Child reports can fail independently of durable evidence, including after publication.
+        try:
+            from hierarchy_router import preflight_paths
+            from hierarchy_lifecycle import Lifecycle
+            from hierarchy_workspace import Store
+            from hierarchy_small_change_dispatch import project
+            preflight_paths(self.args.lifecycle, self.args.store)
+            result = project(Lifecycle(self.args.lifecycle), Store(self.args.store),
+                             recipes=self.args.recipes, mutate=False)
+            _decode_dispatch(_object(result, "planning projection"), status=True)
+        except ERRORS + (RecursionError,) as exc:
+            self.hold("dispatch", "planning_exclusions_unavailable", str(exc), "owner")
+            return False
+        self.planning_exclusions = set(result["planning_exclusions"])
+        self.small_changes = result["small_changes"] or None
+        for row in self.small_changes or []:
+            if row["state"] == "held" or row.get("reason") == "small_change_close_due":
+                kind = row.get("reason", "small_change_configuration")
+                self.hold("dispatch", kind, row.get("detail", kind), "owner", request_id=row["request_id"], initiative=row["team"])
+        return True
+
     def sweep(self):
+        if not self.refresh_planning():
+            self.steps.append({"step": "sweep", "state": "skipped"})
+            return
         args = self.common("sweep") + ["--rounds", "1", "--durable"]
         for _initiative, endpoint in sorted(self.skipped):
+            args += ["--skip", endpoint]
+        for endpoint in sorted(self.planning_exclusions):
             args += ["--skip", endpoint]
         code, result, stderr, problem = run_child("sweep", args, _decode_sweep)
         if code not in (0, 2, 3) or result is None:
@@ -472,6 +538,9 @@ class Pass:
             where = {"initiative": row.get("initiative"), "endpoint": row.get("endpoint")}
             held.add((where["initiative"], where["endpoint"]))
             if row["state"] == "skipped":
+                if row["endpoint"] in self.planning_exclusions:
+                    self.hold("sweep", "small_change_planning_skipped", {"unread_count": row.get("unread_count", 0)},
+                              "root", **where)
                 # The start_failing hold that asked for the skip already says why.
                 continue
             rest = {k: v for k, v in row.items() if k not in {"initiative", "endpoint", "state"}}
@@ -541,7 +610,7 @@ class Pass:
     def run(self):
         """Steps in order; a stop request is honoured only between them."""
         status = rows = None
-        for step in ("router_status", "route", "sweep", "run_open"):
+        for step in ("router_status", "route", "dispatch", "sweep", "run_open"):
             if Stop.requested:
                 return True
             self.beat(step)
@@ -550,6 +619,8 @@ class Pass:
             elif step == "route":
                 rows = self.route(status)
                 self.request_holds(rows, status)
+            elif step == "dispatch":
+                self.dispatch(status)
             elif step == "sweep":
                 self.sweep()
             else:
@@ -677,6 +748,8 @@ def one_pass(args, interval, memory=None):
     value = {"schema": SCHEMA, "pass_id": previous.get("pass_id", 0) + 1, "started_at": started, "finished_at": finished,
              "interval": interval, "steps": work.steps, "holds": holds, "stopped": stopped,
              "consecutive_journal_unavailable": unavailable, "current_step": None, "step_started_at": None}
+    if work.small_changes is not None:
+        value["small_changes"] = work.small_changes
     shown, wrote = value, True
     try:
         write_status(args.state_dir, value)

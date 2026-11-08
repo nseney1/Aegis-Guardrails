@@ -220,10 +220,14 @@ def test_a_held_journal_lock_is_a_hold_and_after_three_passes_an_owner_hold_and_
 
     first = world.once(expect=3)
 
-    assert step_states(first) == {"router_status": "hold", "route": "skipped", "sweep": "ok", "run_open": "ok"}
+    assert step_states(first) == {"router_status": "hold", "route": "skipped", "dispatch": "hold",
+                                  "sweep": "skipped", "run_open": "ok"}
     held = holds(first)[("router_status", "journal_unavailable", None)]
     assert held["act"] == "root" and "busy" in held["detail"]
-    assert world.woken() == ["pilot/orchestrator"], "the wake does not wait on the journal"
+    planning = holds(first)[("dispatch", "planning_exclusions_unavailable", None)]
+    assert planning["act"] == "owner" and "busy" in planning["detail"]
+    assert world.woken() == [], "unknown planning exclusions delay wakes until the journal is readable"
+    assert len(world.inbox("pilot/orchestrator")) == 1
     assert first["consecutive_journal_unavailable"] == 1
     second = world.once(expect=3)
     assert ("router_status", "journal_lock", None) not in holds(second)
@@ -234,9 +238,11 @@ def test_a_held_journal_lock_is_a_hold_and_after_three_passes_an_owner_hold_and_
     owner = holds(third)[("router_status", "journal_lock", None)]
     assert owner["act"] == "owner" and str(world.ledger.path) in owner["detail"]
     assert lock.read_text() == "fixture writer"
+    assert world.woken() == [] and len(world.inbox("pilot/orchestrator")) == 1
     lock.unlink()
     recovered = world.once()
     assert recovered["consecutive_journal_unavailable"] == 0 and recovered["holds"] == []
+    assert world.woken() == ["pilot/orchestrator"]
 
 
 def test_after_router_rotation_the_new_current_router_routes(tmp_path):
@@ -325,10 +331,13 @@ def test_status_text_groups_holds_by_who_must_act(world):
 
     lines = text.splitlines()
     assert lines[0].startswith("loop: not_running")
-    assert "root:" in lines and "owner:" not in lines
-    root_block = lines[lines.index("root:") + 1:]
-    assert any("sweep root_queue pilot/root" in line for line in root_block)
+    assert "root:" in lines and "owner:" in lines
+    root_start, owner_start = lines.index("root:"), lines.index("owner:")
+    root_block = lines[root_start + 1:owner_start]
+    owner_block = lines[owner_start + 1:]
     assert any("router_status journal_unavailable" in line for line in root_block)
+    assert any("dispatch planning_exclusions_unavailable" in line for line in owner_block)
+    assert not any("sweep root_queue pilot/root" in line for line in lines)
 
 
 def test_sigterm_during_a_step_lets_it_finish_and_stops_before_the_next(world):

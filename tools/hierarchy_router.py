@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,26 @@ RUN = "aegis.router-run/v1"
 ROUTED = "aegis.routed-request/v1"
 MAX_BODY = 65536
 EVIDENCE_ONLY = "routing requires --evidence-only; the router is configuration-bound and unauthenticated"
+
+
+def preflight_paths(*paths):
+    """Refuse owner-private roots lexically, before even filesystem path discovery."""
+    if os.name == "posix":
+        import pwd
+
+        def lexical_path(value):
+            path = Path(value)
+            if path.anchor == "//":
+                return Path("/", *path.parts[1:])
+            return path
+
+        home = lexical_path(pwd.getpwuid(os.getuid()).pw_dir)
+        for value in paths:
+            path = lexical_path(value)
+            for name in (".claude", ".codex"):
+                private = home / name
+                require(path != private and private not in path.parents,
+                        "owner-private host directory is not an input")
 
 
 def route_id(sha256):
@@ -206,8 +227,14 @@ def report(lifecycle, store, wait, held=None):
 def request_rows(state, ledger, held=None):
     at = timestamp()
     rows = []
+    from hierarchy_small_change_dispatch import mixed_teams
+    mixed = mixed_teams(state)
     for key, row in authority_rows(state):
+        if "small_change" in row:
+            continue
         view = row_view(state, key, row, ledger, at)
+        if row["request"]["team"] in mixed and view["state"] == "ready":
+            view.update(state="held", reason="small_change_mixed_queue")
         if held and key in held:
             # A delivery attempt this run failed after the checks passed; say why instead of "ready".
             if view["state"] == "ready":
@@ -247,14 +274,19 @@ def blamed(source, action):
         raise
 
 
-def status(lifecycle, store, wait):
+def status(lifecycle, store, wait, recipes=None):
+    preflight_paths(lifecycle.root, store.path)
     _policy, state = blamed("journal", lambda: locked_load(lifecycle, wait))
     ledger = blamed("store", store.load)
     # The current router comes from journal custody, so a caller that routes as it follows a succession without
     # its own record of who the router is.
-    return {"schema": STATUS, "execution_enabled": False, "identity": "configured", "authenticated": False,
+    result = {"schema": STATUS, "execution_enabled": False, "identity": "configured", "authenticated": False,
             "router": state["current"]["router"], "requests": request_rows(state, ledger),
             "escalations": escalations(state)}
+    if any("small_change" in row for row in state["requests"].values()):
+        from hierarchy_small_change_dispatch import project
+        result.update(project(lifecycle, store, wait, recipes))
+    return result
 
 
 def router_actor(policy, state, actor):
@@ -342,7 +374,11 @@ def route(lifecycle, store, actor, wait, only=None):
     ledger = store.load()
     at = timestamp()
     routed, held = [], {}
+    from hierarchy_small_change_dispatch import mixed_teams
+    mixed = mixed_teams(state)
     for key, row in authority_rows(state):
+        if "small_change" in row or row["request"]["team"] in mixed:
+            continue
         if only is not None and key != only:
             continue
         if row_view(state, key, row, ledger, at)["state"] not in {"ready", "delivered_unrecorded"}:
@@ -367,19 +403,34 @@ def main(argv=None):
     parser.add_argument("--lifecycle", required=True, help="Absolute path to the lifecycle journal")
     parser.add_argument("--store", required=True, help="Absolute path to the workspace store (the team registry)")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status", help="Where each authority request stands; changes nothing")
+    reader = commands.add_parser("status", help="Where each authority request stands; changes nothing")
+    reader.add_argument("--recipes", help="Configured recipes for read-only small-change preflight")
+    reader.add_argument("--wait", type=float, default=5.0)
     runner = commands.add_parser("route", help="Deliver every approved, unrouted request and record the route")
     runner.add_argument("--actor", required=True, help="The configured router actor CID; not authenticated")
     runner.add_argument("--evidence-only", action="store_true")
     runner.add_argument("--request", default=None, help="Route only this request ID")
     runner.add_argument("--wait", type=float, default=5.0, help="Seconds to wait out a busy writer lock")
+    dispatch = commands.add_parser("dispatch", help="Progress admitted small changes without planning model turns")
+    dispatch.add_argument("--recipes", required=True)
+    dispatch.add_argument("--evidence-only", action="store_true")
+    dispatch.add_argument("--wait", type=float, default=5.0)
     args = parser.parse_args(argv)
     try:
+        preflight_paths(args.lifecycle, args.store)
         lifecycle_path, store_path = cli_path(args.lifecycle, "--lifecycle"), cli_path(args.store, "--store")
         lifecycle = blamed("journal", lambda: Lifecycle(lifecycle_path))
         store = blamed("store", lambda: Store(store_path))
         if args.command == "status":
-            result = status(lifecycle, store, 5.0)
+            require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
+            result = status(lifecycle, store, args.wait, cli_path(args.recipes, "--recipes") if args.recipes else None)
+        elif args.command == "dispatch":
+            require(args.evidence_only, EVIDENCE_ONLY)
+            require(0 <= args.wait <= 60, "wait must be between 0 and 60 seconds")
+            from hierarchy_small_change_dispatch import project
+            result = {"schema": "aegis.small-change-dispatch-run/v1", "execution_enabled": False,
+                      "identity": "configured", "authenticated": False,
+                      **project(lifecycle, store, args.wait, cli_path(args.recipes, "--recipes"), mutate=True)}
         else:
             require(args.evidence_only, EVIDENCE_ONLY)
             require(0 <= args.wait <= 60, "--wait must be between 0 and 60 seconds")
