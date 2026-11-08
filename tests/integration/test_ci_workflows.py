@@ -53,12 +53,97 @@ def _step_using(job, prefix):
 
 FULL_VALIDATION = "github.event_name != 'pull_request' || github.base_ref != 'develop'"
 WAVE_PR = "github.event_name == 'pull_request' && github.base_ref == 'develop'"
+INTEGRATION_BRANCH = "feature/manager-workspace-prototype"
+
+
+def _condition_allows(condition, context):
+    """Evaluate this workflow's small condition subset, with prerequisites successful."""
+    if condition is None or condition == "always()":
+        return True
+    if " || " in condition:
+        return any([_condition_allows(part, context) for part in condition.split(" || ")])
+    if " && " in condition:
+        return all([_condition_allows(part, context) for part in condition.split(" && ")])
+    match = re.fullmatch(r"([a-z_.]+) (==|!=) '([^']*)'", condition)
+    assert match is not None, f"Unsupported workflow condition: {condition}"
+    key, operator, value = match.groups()
+    assert key in context, f"Unsupported workflow context: {key}"
+    equal = context[key] == value
+    return equal if operator == "==" else not equal
+
+
+def test_integration_lane_pull_requests_do_not_trigger_validate():
+    triggers = _triggers(_load("validate.yml"))
+    assert triggers["pull_request"] == {"branches": ["main", "develop", "release/**"]}
+    assert INTEGRATION_BRANCH not in triggers["pull_request"]["branches"]
+
+
+def test_integration_push_change_preserves_other_triggers():
+    triggers = _triggers(_load("validate.yml"))
+    assert {key: value for key, value in triggers.items() if key not in ("push", "pull_request")} == {
+        "workflow_call": None,
+        "workflow_dispatch": None,
+        "schedule": [{"cron": "17 4 * * *"}],
+    }
+
+
+def test_integration_push_runs_every_develop_job_and_step_condition():
+    """Eligibility only: upstream jobs and preceding steps are assumed successful."""
+    workflow = _load("validate.yml")
+    assert INTEGRATION_BRANCH in _triggers(workflow)["push"]["branches"]
+    jobs = workflow["jobs"]
+    assert set(jobs) == {
+        "dependency-audit", "build-wheel", "test-fast", "aegis-check", "validate", "test-windows", "verdict",
+    }
+    matrix = jobs["validate"]["strategy"]["matrix"]
+    validate_legs = [
+        (os_name, version) for os_name in matrix["os"] for version in matrix["python-version"]
+        if {"os": os_name, "python-version": version} not in matrix["exclude"]
+    ]
+    validate_legs += [(leg["os"], leg["python-version"]) for leg in matrix["include"]]
+    assert sorted(validate_legs) == [
+        ("macos-latest", "3.11"), ("macos-latest", "3.9"),
+        ("ubuntu-24.04", "3.9"), ("ubuntu-latest", "3.11"),
+    ]
+    assert jobs["validate"]["runs-on"] == "${{ matrix.os }}"
+    windows_matrix = jobs["test-windows"]["strategy"]["matrix"]
+    assert windows_matrix == {"python-version": ["3.9", "3.12"]}
+    assert jobs["test-windows"]["runs-on"] == "windows-latest"
+    legs = [(name, job["runs-on"], None) for name, job in jobs.items()
+            if name not in ("validate", "test-windows")]
+    legs += [("validate", os_name, version) for os_name, version in validate_legs]
+    legs += [("test-windows", "windows-latest", version) for version in windows_matrix["python-version"]]
+    assert len(legs) == 11
+    runner_os = {"ubuntu-latest": "Linux", "ubuntu-24.04": "Linux",
+                 "macos-latest": "macOS", "windows-latest": "Windows"}
+    for name, runner, version in legs:
+        job = jobs[name]
+        contexts = [{"github.event_name": "push", "github.base_ref": "",
+                     "github.ref": "refs/heads/" + branch, "github.ref_name": branch,
+                     "runner.os": runner_os[runner]}
+                    for branch in ("develop", INTEGRATION_BRANCH)]
+        eligible = [_condition_allows(job.get("if"), context) for context in contexts]
+        assert eligible == [True, True], (name, runner, version)
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        for dependency in needs:
+            assert all(_condition_allows(jobs[dependency].get("if"), context) for context in contexts)
+        outcomes = [[_condition_allows(step.get("if"), context) for step in job["steps"]]
+                    for context in contexts]
+        assert outcomes[0] == outcomes[1], (name, runner, version)
+        skipped = set()
+        if name == "aegis-check":
+            skipped.add("Fetch wave pull request head as data")
+        if name == "validate" and runner_os[runner] != "Linux":
+            skipped.update(("Install bubblewrap", "Prove bubblewrap runs"))
+        assert outcomes[1] == [step.get("name") not in skipped for step in job["steps"]], (name, runner, version)
 
 
 def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_downstream():
     workflow = _load("validate.yml")
     triggers = _triggers(workflow)
-    assert triggers["push"]["branches"] == ["main", "develop", "release/**"]
+    assert triggers["push"]["branches"] == ["main", "develop", "release/**", INTEGRATION_BRANCH]
     assert triggers["pull_request"]["branches"] == ["main", "develop", "release/**"]
     assert {"workflow_call", "workflow_dispatch"} <= set(triggers)
     jobs = workflow["jobs"]
@@ -371,8 +456,8 @@ def test_build_and_audit_tools_are_version_pinned():
     """Tools that touch release bytes or gate them are installed at exact versions."""
     text = _read("validate.yml")
     for tool in ("build", "pip-audit"):
-        lines = [l for l in text.splitlines()
-                 if re.search(rf"pip install\b.*\b{re.escape(tool)}\b", l)]
+        lines = [line for line in text.splitlines()
+                 if re.search(rf"pip install\b.*\b{re.escape(tool)}\b", line)]
         assert lines, f"no pip install line for {tool}"
         for line in lines:
             assert re.search(rf"\b{re.escape(tool)}==\d+(\.\d+)+\b", line), line
