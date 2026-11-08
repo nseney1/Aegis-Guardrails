@@ -176,6 +176,21 @@ publication failed. Publish no missing batch IDs or Reviewer work; only the unch
 Receipt history is checked before PR2 job_state: any valid failed/refused receipt holds small_change_check_failed whatever follows it, and a
 nonterminal receipt ordered by receipt_order after a terminal one is small_change_receipt_invalid (Mailbox.publish refuses that history).
 
+R5 recovery validates the original owned publication's sender interval and handoff acknowledgment before any route append. A retired or
+unacknowledged sender cannot acquire a route receipt or release the writer exclusion. Valid publications predating succession still recover
+their original receipt. Every check receipt must likewise come from its sender binding in force and be dated at or after its own request;
+violations hold small_change_receipt_invalid without publishing missing work.
+The shared fresh-brief file_ref reader covers dispatcher verification and composition's prepare/lifecycle/evidence traversal. It anchors
+ancestor directories with no-follow descriptors, opens evidence nonblocking, requires the opened regular-file identity to match discovery,
+hashes at most the initially observed size, then rechecks identity/content metadata and ancestry. FIFO/symlink/replacement/growth refuses;
+large unchanged regular evidence has no mailbox-size cap. Platforms without secure directory-descriptor support refuse rather than use an
+unsafe fallback; native qualification remains separate. No descriptor is held across a wake.
+Before accepting retained scr or surfacing successful closure drafts, require exactly the immutable assignment's verified writer-result,
+terminal and completed-check receipt references, including their hashes. Those references bind the writer's commit/tree transitively through
+the validated result; changing a source/proof reference cannot reuse a valid brief header. Assignment and lifecycle review timestamps must
+follow the writer terminal/result and every completed check receipt; the existing acceptance/completion chronology still applies. Scope or
+chronology mismatch holds small_change_message_conflict. This validation grants no Reviewer or coordinator recording authority.
+
 ## 5. Loop-only skips, reporting and holds
 
 Canonical-compatibility successor to prior R4 b087f711ae76460591095c81760f10454d1806d56379772e07f0f065110ff17b:

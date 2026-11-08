@@ -3048,3 +3048,319 @@ def test_r4_nonobject_provision_is_a_row_hold_and_canonical_job_runs(tmp_path, p
     assert any(h["kind"] == "small_change_configuration" and h.get("request_id") == world.change.value["id"]
                and h["detail"] == "provision record must be an object" for h in report["holds"]), report
     assert world.messages("dispatch") == []
+
+
+# R5: validate recovery and receipt authority before effect, and bind review to completed checks.
+def r5_rotate(world, endpoint, *, acknowledge=True):
+    draft = invoke(world.root, "draft-handoff", {"endpoint": endpoint, "host": "r5-host",
+        "session": "r5-session", "outgoing_stopped": True})
+    binding = invoke(world.root, "bind", draft)
+    if acknowledge:
+        invoke(world.root, "ack-handoff", {"endpoint": endpoint, "generation": binding["generation"],
+            "session": binding["session"], "checkpoint_sha256": binding["checkpoint_sha256"]})
+    return binding
+
+
+@pytest.mark.parametrize("stale", [False, True], ids=["valid-before-rotation", "retired-after-rotation"])
+def test_r5_recovery_fences_original_dispatch_before_recording_route(tmp_path, stale):
+    (tmp_path / ".keep").write_text("R5 recovered dispatch authority and durable writer exclusion\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch(fault="route")
+    original = world.messages("dispatch")[0]
+    r5_rotate(world, "engine/orchestrator")
+    if stale:
+        after = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        rewrite_message(original, lambda m: m.update(created_at=after))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    result = world.dispatch()
+    row = result["small_changes"][0]
+    if stale:
+        assert world.ledger.files() == before[0], "invalid recovered dispatch must not acquire a lifecycle route"
+        assert "route_receipt" not in row
+        assert "engine/lane/fix" in result["planning_exclusions"]
+        assert row["state"] == "held"
+        assert mailbox_snapshot(world.root) == before[1]
+        again = world.dispatch()
+        assert "engine/lane/fix" in again["planning_exclusions"] and world.ledger.files() == before[0]
+    else:
+        assert row["state"] == "writer_sent" and row["route_receipt"]
+        assert "engine/lane/fix" not in result["planning_exclusions"]
+    assert len(world.messages("dispatch")) == 1
+
+
+@pytest.mark.parametrize("case", ["retired", "unacknowledged", "before-request", "valid-before-rotation"])
+def test_r5_check_receipts_require_in_force_sender_and_request_chronology(tmp_path, case):
+    (tmp_path / ".keep").write_text("R5 check receipt binding and request chronology\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    assert (folder / "result.json").is_file()
+    receipts = world.messages("job_receipt")
+    completed = next(r for r in receipts if r["message"]["receipt"]["state"] == "completed")
+    request_message = world.messages("job_request")[0]["message"]
+    if case in {"retired", "unacknowledged", "valid-before-rotation"}:
+        binding = r5_rotate(world, "engine/root", acknowledge=case != "unacknowledged")
+        stamp = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        if case == "retired":
+            rewrite_message(completed, lambda m: m.update(created_at=stamp))
+        elif case == "unacknowledged":
+            rewrite_message(completed, lambda m: m.update(created_at=stamp, host=binding["host"],
+                session=binding["session"], binding_generation=binding["generation"]))
+    else:
+        origin = datetime.fromisoformat(request_message["created_at"].replace("Z", "+00:00"))
+        for index, record in enumerate(sorted(receipts, key=lambda r: r["message"]["created_at"])):
+            stamp = (origin - timedelta(microseconds=len(receipts) - index)).isoformat(
+                timespec="microseconds").replace("+00:00", "Z")
+            rewrite_message(record, lambda m, stamp=stamp: m.update(created_at=stamp))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    if case == "valid-before-rotation":
+        assert row["state"] == "reviewing", row
+    else:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert world.ledger.files() == before[0]
+        assert mailbox_snapshot(world.root) == before[1]
+        assert len(world.messages("dispatch")) == 1
+
+
+@pytest.mark.parametrize("damage", ["early", "missing-proofs", "wrong-source-proof"])
+def test_r5_reviewer_assignment_is_bound_to_completed_check_proofs(tmp_path, damage):
+    (tmp_path / ".keep").write_text("R5 immutable Reviewer assignment evidence and chronology\n")
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    review_result(world, reviewer)
+    record = next(r for r in world.messages("dispatch") if r["message"]["message_id"] == reviewer["message_id"])
+    if damage == "early":
+        writer = next(r["message"] for r in world.messages("result"))
+        start = datetime.fromisoformat(writer["created_at"].replace("Z", "+00:00"))
+        replies = [r for r in world.messages() if r["message"].get("in_reply_to") == reviewer["message_id"]]
+        acceptance = next(r for r in replies if r["message"].get("acknowledgment") == "accepted")
+        completion = next(r for r in replies if r["message"]["type"] == "review")
+        for index, current in enumerate([record, acceptance, completion]):
+            stamp = (start + timedelta(microseconds=index + 1)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            rewrite_message(current, lambda m, stamp=stamp: m.update(created_at=stamp))
+    else:
+        raw = Path(reviewer["brief"]["path"]).read_text()
+        lines = raw.splitlines()
+        matches = 0
+        for index, line in enumerate(lines):
+            if not line.startswith("- "):
+                continue
+            item = json.loads(line[2:])
+            if item.get("kind") == "small_change_assignment":
+                matches += 1
+                if damage == "missing-proofs":
+                    item["evidence"] = []
+                else:
+                    wrong = tmp_path / "wrong-writer-source.json"
+                    wrong.write_text(json.dumps({"source_revision": "e" * 40, "source_tree": "f" * 40}))
+                    item["evidence"][0] = {"path": str(wrong), "sha256": hashlib.sha256(wrong.read_bytes()).hexdigest()}
+                lines[index] = "- " + json.dumps(item, sort_keys=True)
+        assert matches == 1
+        raw = ("\n".join(lines) + "\n").encode()
+        sha = hashlib.sha256(raw).hexdigest()
+        path = world.root.parent / "briefs" / ("fresh-" + sha + ".md")
+        path.write_bytes(raw)
+        rewrite_message(record, lambda m: m.update(brief={"path": str(path), "sha256": sha}))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    for command in ("status", "dispatch"):
+        row = world.dispatch(command=command)["small_changes"][0]
+        assert (row["state"], row.get("reason")) == ("held", "small_change_message_conflict"), row
+        assert not any(d["event"].get("status") == "FINAL" for d in row["drafts"]), row
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_r5_terminal_evidence_open_race_never_blocks_independent_run_open(tmp_path):
+    from tests.integration.test_hierarchy_loop import EMPTY_SWEEP
+    (tmp_path / ".keep").write_text("R5 terminal evidence regular-to-FIFO race, modelled OS boundary\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    target = tmp_path / "terminal-evidence"
+    target.write_bytes(b"valid terminal evidence")
+    world.finish_writer(evidence=[{"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}])
+    docs = world.team("docs")
+    world.workspace.run("update", {"initiative": "docs", "source": "owner", "checkouts": [str(world.checkout)]})
+    packet = tmp_path / "docs/r5-canonical.md"
+    packet.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+        "checkout": str(world.checkout), "commit": world.revision, "tree": world.tree}))
+    invoke(docs, "publish", {"message_id": "r5-canonical-check", "from": "docs/orchestrator", "to": "docs/root",
+        "host": "host-one", "session": "docs-orchestrator", "binding_generation": 1,
+        "type": "job_request", "body": "independent canonical check", "brief": {
+            "path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}})
+    sweep = tmp_path / "r5-sweep.py"
+    sweep.write_text("import json\nprint(json.dumps(%r))\n" % (EMPTY_SWEEP,))
+    telemetry = tmp_path / "r5-evidence-io.json"
+    injection = r"""
+import io, stat
+target, telemetry = Path(sys.argv[8]), Path(sys.argv[9])
+observed = {'injected': False, 'unsafe_open': False}
+old_stat, old_io_open, old_fd_open = os.stat, io.open, os.open
+def actual(path, kwargs):
+    if not isinstance(path, (str, bytes, os.PathLike)): return None
+    value = Path(os.fsdecode(path))
+    if not value.is_absolute() and kwargs.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / value
+    return value
+def inspected(path, *args, **kwargs):
+    info = old_stat(path, *args, **kwargs)
+    if (not observed['injected'] and actual(path, kwargs) == target and stat.S_ISREG(info.st_mode)
+            and (kwargs.get('follow_symlinks', True) or kwargs.get('dir_fd') is not None)):
+        observed['injected'] = True
+        target.rename(target.with_name(target.name + '.original'))
+        os.mkfifo(target)
+    return info
+def opened(path, *args, **kwargs):
+    if actual(path, kwargs) == target and observed['injected']:
+        observed['unsafe_open'] = True
+        raise OSError('modelled blocking evidence open intercepted before a real hang')
+    return old_io_open(path, *args, **kwargs)
+def descriptor(path, flags, *args, **kwargs):
+    if actual(path, kwargs) == target and observed['injected'] and not flags & os.O_NONBLOCK:
+        observed['unsafe_open'] = True
+        raise OSError('modelled descriptor open lacks nonblocking flag')
+    return old_fd_open(path, flags, *args, **kwargs)
+os.stat, io.open, os.open = inspected, opened, descriptor
+"""
+    script = R3_LOOP_PASS.replace("journal, store, recipes, state_dir", injection + "\njournal, store, recipes, state_dir")
+    script = script.replace("sys.exit(loop.one_pass(args, None)[0])", """
+try:
+    code = loop.one_pass(args, None)[0]
+finally:
+    telemetry.write_text(json.dumps(observed))
+sys.exit(code)
+""").replace("import argparse, importlib.util, os, pwd, sys", "import argparse, importlib.util, json, os, pwd, sys")
+    state = tmp_path / "r5-loop-state"
+    state.mkdir()
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools/hierarchy_loop.py"),
+        str(sweep), str(tmp_path / "home"), str(world.ledger.path), str(world.workspace.store),
+        str(world.recipes_path), str(state), str(target), str(telemetry)],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=60)
+    assert p.returncode == 3 and p.stderr == "", p.stdout + p.stderr
+    observed = json.loads(telemetry.read_text())
+    assert observed["injected"]
+    assert not observed["unsafe_open"], "terminal evidence reached a blocking open after its regular-file check"
+    report = json.loads(p.stdout.splitlines()[-1])
+    steps = {r["step"]: r for r in report["steps"]}
+    assert steps["run_open"]["state"] == "ok"
+    assert {"job": "docs/r5-canonical-check", "state": "completed"} in steps["run_open"]["rows"], report
+
+
+def r5b_reader_probe(world, target, *, entry="file_ref", action="steady"):
+    script = r"""
+import importlib.util, io, json, os, stat, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('hierarchy_fresh_brief', sys.argv[1])
+fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+target, entry, action, root, lifecycle = Path(sys.argv[2]), *sys.argv[3:7]
+seen = {'unsafe_open': False, 'injected': False, 'bytes': 0, 'appends': 0}
+original_stat, original_open, original_fd, original_read = os.stat, io.open, os.open, os.read
+def actual(path, kwargs):
+    if not isinstance(path, (str, bytes, os.PathLike)): return None
+    path = Path(os.fsdecode(path))
+    if not path.is_absolute() and kwargs.get('dir_fd') is not None:
+        path = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / path
+    return path
+def changed(path, *args, **kwargs):
+    info = original_stat(path, *args, **kwargs)
+    if (action in {'fifo', 'swap-regular'} and not seen['injected'] and actual(path, kwargs) == target
+            and stat.S_ISREG(info.st_mode)
+            and (kwargs.get('follow_symlinks', True) or kwargs.get('dir_fd') is not None)):
+        seen['injected'] = True
+        target.rename(target.with_name(target.name + '.original'))
+        if action == 'fifo': os.mkfifo(target)
+        else:
+            with original_open(target, 'wb') as out: out.write(b'stable reference')
+    return info
+def observe(chunk):
+    seen['bytes'] += len(chunk)
+    if action == 'grow' and chunk and seen['appends'] < 3:
+        with original_open(target, 'ab') as out: out.write(b'a' * 65536)
+        seen['appends'] += 1
+    return chunk
+class Reader:
+    def __init__(self, stream): self.stream = stream
+    def __enter__(self): self.stream.__enter__(); return self
+    def __exit__(self, *args): return self.stream.__exit__(*args)
+    def read(self, *args): return observe(self.stream.read(*args))
+    def __getattr__(self, name): return getattr(self.stream, name)
+def opened(path, *args, **kwargs):
+    if actual(path, kwargs) == target:
+        if action == 'fifo' and seen['injected']:
+            seen['unsafe_open'] = True
+            raise OSError('modelled blocking reference open intercepted')
+        return Reader(original_open(path, *args, **kwargs))
+    return original_open(path, *args, **kwargs)
+def descriptor(path, flags, *args, **kwargs):
+    if actual(path, kwargs) == target and not flags & os.O_NONBLOCK:
+        seen['unsafe_open'] = True
+        raise OSError('reference descriptor is not nonblocking')
+    return original_fd(path, flags, *args, **kwargs)
+def read(fd, size):
+    chunk = original_read(fd, size)
+    return observe(chunk) if Path(os.readlink('/proc/self/fd/%d' % fd)) == target else chunk
+os.stat, io.open, os.open, os.read = changed, opened, descriptor, read
+try:
+    if entry == 'file_ref':
+        result = fresh.file_ref(target)
+    else:
+        raw, result = fresh.prepare(SimpleNamespace(root=root, initiative='engine', endpoint='engine/lane/review0',
+            lifecycle=lifecycle, delivery_dir=None, as_of=None, target_generation=1))
+    answer = {'state': 'ok', 'result': result}
+except (ValueError, OSError) as exc:
+    answer = {'state': 'refused', 'error': str(exc)}
+print(json.dumps({**answer, 'observed': seen}))
+"""
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+        str(ROOT / "tools/hierarchy_fresh_brief.py"), str(target), entry, action, str(world.root),
+        str(world.ledger.path)], env=os.environ.copy(), capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    return json.loads(p.stdout)
+
+
+@pytest.mark.parametrize("entry", ["file_ref", "prepare"])
+def test_r5b_shared_reader_race_is_nonblocking_for_direct_and_composition_paths(tmp_path, entry):
+    (tmp_path / ".keep").write_text("R5b shared reader FIFO substitution without a real blocking open\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    target = tmp_path / "shared-terminal-evidence"
+    target.write_bytes(b"stable reference")
+    world.finish_writer(evidence=[{"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}])
+    answer = r5b_reader_probe(world, target, entry=entry, action="fifo")
+    assert answer["observed"]["injected"]
+    assert not answer["observed"]["unsafe_open"], answer
+    if entry == "file_ref":
+        assert answer["state"] == "refused", answer
+
+
+def test_r5b_shared_reader_stops_at_initial_size_and_refuses_growth(tmp_path):
+    (tmp_path / ".keep").write_text("R5b finite initial-size reference budget\n")
+    world = DispatchWorld(tmp_path)
+    target = tmp_path / "growing-reference"
+    target.write_bytes(b"x" * 65553)
+    initial = target.stat().st_size
+    answer = r5b_reader_probe(world, target, action="grow")
+    assert answer["observed"]["appends"] > 0
+    assert answer["observed"]["bytes"] <= initial, answer
+    assert answer["state"] == "refused", answer
+
+
+def test_r5b_shared_reader_rejects_replacement_inode_even_with_identical_bytes(tmp_path):
+    (tmp_path / ".keep").write_text("R5b reference identity changes at open\n")
+    world = DispatchWorld(tmp_path)
+    target = tmp_path / "replaced-reference"
+    target.write_bytes(b"stable reference")
+    answer = r5b_reader_probe(world, target, action="swap-regular")
+    assert answer["observed"]["injected"]
+    assert answer["state"] == "refused", answer
+
+
+def test_r5b_shared_reader_preserves_large_regular_evidence(tmp_path):
+    (tmp_path / ".keep").write_text("R5b large evidence remains supported\n")
+    world = DispatchWorld(tmp_path)
+    target = tmp_path / "large-reference"
+    data = b"x" * 3000017
+    target.write_bytes(data)
+    answer = r5b_reader_probe(world, target)
+    assert answer["state"] == "ok", answer
+    assert answer["result"] == {"path": str(target), "sha256": hashlib.sha256(data).hexdigest()}
+    assert answer["observed"]["bytes"] == len(data)

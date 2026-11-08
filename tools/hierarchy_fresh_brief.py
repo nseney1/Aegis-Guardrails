@@ -35,15 +35,71 @@ class JSONArgumentParser(argparse.ArgumentParser):
         raise ValueError(message)
 
 
+def _reference_mark(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _reference_parent(path):
+    """Walk without following links, with bounded handles and recorded ancestor identities."""
+    names = {function.__name__ for function in os.supports_dir_fd}
+    require(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_NONBLOCK")
+            and {"open", "stat"} <= names, "secure reference hashing requires directory descriptor support")
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = None
+    marks = []
+    try:
+        descriptor = os.open(path.anchor, flags)
+        info = os.fstat(descriptor)
+        marks.append((path.anchor, info.st_dev, info.st_ino, info.st_mode))
+        for component in path.parts[1:]:
+            previous = descriptor
+            descriptor = os.open(component, flags, dir_fd=previous)
+            os.close(previous)
+            info = os.fstat(descriptor)
+            require(stat.S_ISDIR(info.st_mode), "reference parent must be a directory")
+            marks.append((component, info.st_dev, info.st_ino, info.st_mode))
+        return descriptor, marks
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
 def file_ref(path):
-    """Hash bytes, including evidence larger than a mailbox message, without copying their contents."""
+    """Hash exactly the initially observed regular-file bytes through anchored nonblocking descriptors."""
     path = safe_path(path)
-    require(stat.S_ISREG(path.stat().st_mode), "reference must be a regular file: " + str(path))
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(65536), b""):
-            sha.update(chunk)
-    return {"path": str(path), "sha256": sha.hexdigest()}
+    directory, ancestors = _reference_parent(path.parent)
+    try:
+        before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        require(stat.S_ISREG(before.st_mode), "reference must be a regular file: " + str(path))
+        mark = _reference_mark(before)
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            require(stat.S_ISREG(os.fstat(descriptor).st_mode) and _reference_mark(os.fstat(descriptor)) == mark,
+                    "reference changed while opening: " + str(path))
+            sha, remaining = hashlib.sha256(), before.st_size
+            while remaining:
+                requested = min(65536, remaining)
+                chunk = os.read(descriptor, requested)
+                require(len(chunk) == requested, "reference changed while hashing: " + str(path))
+                remaining -= len(chunk)
+                sha.update(chunk)
+            require(_reference_mark(os.fstat(descriptor)) == mark
+                    == _reference_mark(os.stat(path.name, dir_fd=directory, follow_symlinks=False)),
+                    "reference changed while hashing: " + str(path))
+        finally:
+            os.close(descriptor)
+        returned, current_ancestors = _reference_parent(path.parent)
+        try:
+            require(current_ancestors == ancestors
+                    and _reference_mark(os.stat(path.name, dir_fd=returned, follow_symlinks=False)) == mark,
+                    "reference path changed while hashing: " + str(path))
+        finally:
+            os.close(returned)
+        return {"path": str(path), "sha256": sha.hexdigest()}
+    finally:
+        os.close(directory)
 
 
 def check_ref(ref):
@@ -657,6 +713,7 @@ def prepare(args):
     delivery = cli_path(args.delivery_dir, "--delivery-dir") if args.delivery_dir else safe_path(
         setup["delivery_dir"] if setup else base / "delivery")
     protect_stores(base / "briefs", mailbox, base, run, lifecycle, delivery, setup)
+    require_secure_publication()
     brief = Brief()
     role_contract(brief, mailbox, base, setup, args.endpoint)
     brief.add("Source identity", "mailbox_identity", file_ref(mailbox.root / "manifest.json"))
@@ -678,7 +735,6 @@ def prepare(args):
     sha = hashlib.sha256(raw).hexdigest()
     reference = {"path": str(base / "briefs" / ("fresh-" + sha + ".md")), "sha256": sha}
     mailbox.brief(reference, verify=False)
-    require_secure_publication()
     return raw, {"ok": True, "brief": reference, "entries": len(brief.seen),
                  "coverage": {"lifecycle": lifecycle_coverage}, "as_of": as_of, "target_generation": generation}
 

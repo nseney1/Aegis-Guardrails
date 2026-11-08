@@ -537,9 +537,13 @@ class Row:
                 require(("Target generation: %s" % body["target_generation"]) in raw.decode(), "brief target generation mismatch")
                 require(self.row["raw"]["sha256"] in raw.decode() and self.view["plan_sha256"] in raw.decode(),
                         "brief lacks request/plan witnesses")
-            return record
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
             raise Hold("small_change_message_conflict", str(exc)) from exc
+        try:
+            in_force(self.mailbox, message)
+        except ValueError as exc:
+            raise Hold("small_change_binding_changed", str(exc)) from exc
+        return record
 
     def compose(self, target, stage):
         args = SimpleNamespace(root=str(self.mailbox.root), initiative=self.team, endpoint=target,
@@ -705,6 +709,7 @@ class Row:
             verify(ref)
         self.proofs += [reference(record["path"]), self.event_ref("terminal", terminal)]
         self.result_record, self.accepted = record, accepted
+        self.review_not_before = max(parse_time(record["message"]["created_at"]), parse_time(terminal["at"]))
         return record
 
     def packet(self, admission):
@@ -745,7 +750,9 @@ class Row:
                         and r["message"].get("in_reply_to") == msg_id]
             try:
                 for receipt in receipts:
-                    historical(self.mailbox, receipt["message"])
+                    in_force(self.mailbox, receipt["message"])
+                    require(parse_time(record["message"]["created_at"]) <= parse_time(receipt["message"]["created_at"]),
+                            "job receipt precedes its request: " + msg_id)
                     self.mailbox.job_receipt(receipt["message"]["receipt"])
                 for terminal_state in ("completed", "failed", "refused"):
                     require(sum(r["message"]["receipt"]["state"] == terminal_state for r in receipts) <= 1,
@@ -801,6 +808,7 @@ class Row:
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 raise Hold("small_change_receipt_invalid", str(exc)) from exc
             self.proofs.append(reference(witness["path"]))
+            self.review_not_before = max(self.review_not_before, parse_time(witness["message"]["created_at"]))
         return complete
 
     def publish_checks(self, entries, mutate=True):
@@ -845,6 +853,7 @@ class Row:
         msg_id = identifier("scr", self.row)
         prior = self.prior(msg_id, "reviewer", self.reviewer)
         if prior:
+            self.reviewer_evidence(prior)
             return prior
         check(self.row["review"] is None, "small_change_message_lost", "Reviewer message missing with retained review evidence")
         self.live()
@@ -855,8 +864,32 @@ class Row:
             life.sync_directory(Path(ref["path"]).parent)
             self.reload()
             self.live()
-            return self.publish(self.publication(msg_id, self.reviewer, "dispatch", self.metadata("reviewer", self.reviewer), ref))
+            check(parse_time(timestamp()) >= self.review_not_before, "small_change_message_conflict",
+                  "Reviewer assignment would precede verified check evidence")
+            published = self.publish(self.publication(msg_id, self.reviewer, "dispatch", self.metadata("reviewer", self.reviewer), ref))
+            self.reviewer_evidence(published)
+            return published
         return None
+
+    def reviewer_evidence(self, record):
+        """Bind the immutable review scope to the exact writer/terminal/settled-receipt witnesses."""
+        try:
+            message = record["message"]
+            body = strict_json(message["body"])
+            raw = self.mailbox.brief(message["brief"])
+            assignments = [strict_json(line[2:]) for line in raw.decode("utf-8").splitlines() if line.startswith("- ")]
+            assignments = [item for item in assignments if item.get("kind") == "small_change_assignment"]
+            expected = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **body,
+                        "instructions": "Read-only review of the exact writer commit/tree and all check receipts.",
+                        "evidence": self.proofs}
+            require(assignments == [expected], "Reviewer assignment source/proof references differ")
+            require(parse_time(message["created_at"]) >= self.review_not_before,
+                    "Reviewer assignment precedes verified check evidence")
+            if self.row["review"] is not None:
+                require(parse_time(self.row["review"]["at"]) >= self.review_not_before,
+                        "lifecycle review precedes verified check evidence")
+        except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
+            raise Hold("small_change_message_conflict", str(exc)) from exc
 
     def drafts(self, reason=None):
         blocked = self.row["resolution"] is not None and self.row["resolution"]["kind"] == "blocked"
