@@ -1130,3 +1130,89 @@ def test_worker_r5_failed_final_events_and_selection_leave_no_stale_ordinal(tmp_
     assert after[2]["error_type"] == "RuntimeError" and "Windows error 6" in after[2]["error"]
     assert diagnostic["capture_status"] == "UNKNOWN"
     assert diagnostic["reported_error"] is None and diagnostic["reported_error_state"] == "UNAVAILABLE"
+
+
+def _p6_r6_fallback_fault(repeated=False, cancellation=False, after_prior=False):
+    needle = "self._pending = (error, None, 'UNAVAILABLE')"
+    kind = "KeyboardInterrupt" if cancellation else "MemoryError"
+    replacement = ("global _modelled_fallback_count\n"
+                   "            _modelled_fallback_count += 1\n"
+                   "            if not getattr(self, '_modelled_fallback_failed', False) or " + str(repeated) + ":\n"
+                   "                self._modelled_fallback_failed = True\n"
+                   "                raise " + kind + "('modelled fallback tuple allocation failure')\n"
+                   "            " + needle)
+    faults = _p6_r5_faults("append_always" if repeated or after_prior else "append_once")
+    if after_prior:
+        faults += [("if not self.failed or True:", "if row['phase'] == 'recovery':")]
+    return faults + [(needle, replacement), ("\n\ndef worker(config):\n", "\n\n_modelled_fallback_count = 0\n\ndef worker(config):\n")]
+
+
+@pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize("recovery_failure", [False, True])
+def test_worker_r6_failed_capture_fallback_preserves_primary(tmp_path, monkeypatch, repeated, recovery_failure):
+    after, diagnostic = _p6_pair(tmp_path, monkeypatch, fault="fixture_mkdir", second_revert=recovery_failure,
+                                 mutation=_p6_r6_fallback_fault(repeated))
+    assert after[1].impersonations == 2 and after[3]["code"] == (3 if recovery_failure else 1)
+    assert diagnostic["capture_status"] == "UNKNOWN"
+    assert diagnostic["reported_error"] is None and diagnostic["reported_error_state"] == "UNAVAILABLE"
+    assert diagnostic["omitted_errors"] == 0 and diagnostic["errors"] == []
+    assert after[0]._modelled_fallback_count == 1, "failed capture was retried after the sticky fault"
+    _p6_r5_ordinals(diagnostic)
+
+
+def test_worker_r6_failed_capture_fallback_cancellation_propagates(tmp_path, monkeypatch):
+    after = _p6_diagnostic_case(tmp_path / "candidate", monkeypatch, fault="fixture_mkdir",
+                                mutation=_p6_r6_fallback_fault(cancellation=True))
+    assert after[1].impersonations == after[1].reverts == 2 and not after[1].active
+    assert 101 in after[1].closed and 102 in after[1].closed
+    assert after[3]["escape"] is None and after[3]["code"] == 1
+    assert after[2]["error_type"] == "KeyboardInterrupt"
+    assert after[2]["error"] == "modelled fallback tuple allocation failure"
+
+
+def test_worker_r6_fallback_failure_clears_previous_pending_ordinal(tmp_path, monkeypatch):
+    after, diagnostic = _p6_pair(tmp_path, monkeypatch, fault="fixture_mkdir", second_revert=True,
+                                 mutation=_p6_r6_fallback_fault(after_prior=True))
+    assert after[3]["code"] == 3 and after[2]["error_type"] == "RevertFailed"
+    assert len(diagnostic["errors"]) == 1 and diagnostic["errors"][0]["operation"] == "fixture_mkdir"
+    assert diagnostic["reported_error"] is None and diagnostic["reported_error_state"] == "UNAVAILABLE"
+    assert diagnostic["capture_status"] == "UNKNOWN" and after[0]._modelled_fallback_count == 1
+    _p6_r5_ordinals(diagnostic)
+
+
+@pytest.mark.parametrize("guard", ["containment", "sticky", "cancellation"])
+def test_worker_r6_sealed_sticky_capture_guards(tmp_path, monkeypatch, guard):
+    import hashlib
+
+    changes = {
+        "containment": [("self._capture_failed = True", "raise")],
+        "sticky": [("if self._capture_failed:", "if False:")],
+        "cancellation": [("except Exception:\n            # This last-resort path", "except BaseException:\n            # This last-resort path")],
+    }[guard]
+
+    def contract(root, mutation=()):
+        root.mkdir()
+        fault = _p6_r6_fallback_fault(repeated=guard == "sticky", cancellation=guard == "cancellation")
+        if guard == "cancellation":
+            after = _p6_diagnostic_case(root / "candidate", monkeypatch, fault="fixture_mkdir", mutation=fault + list(mutation))
+            assert not after[1].active and 101 in after[1].closed and 102 in after[1].closed
+            assert after[2]["error_type"] == "KeyboardInterrupt", "diagnostic suppressed cancellation"
+            return
+        after, diagnostic = _p6_pair(root, monkeypatch, fault="fixture_mkdir",
+                                     mutation=fault + list(mutation))
+        assert after[0]._modelled_fallback_count == 1, "failed diagnostic capture was retried"
+        assert diagnostic["reported_error"] is None and diagnostic["reported_error_state"] == "UNAVAILABLE"
+        assert diagnostic["capture_status"] == "UNKNOWN"
+        _p6_r5_ordinals(diagnostic)
+
+    contract(tmp_path / "pristine")
+    with pytest.raises(AssertionError) as rejected:
+        contract(tmp_path / "mutant", changes)
+    path = tmp_path / "mutant/candidate/probe.py"
+    assert path.is_file() and path.stat().st_mode & 0o777 == 0o400
+    (tmp_path / ".keep").touch()
+    (tmp_path / "guard-result.json").write_text(json.dumps({
+        "classification": _P6_MODELLED, "guard": guard, "result": "PUBLIC_ORACLE_REJECTED_MUTANT",
+        "oracle": str(rejected.value).splitlines()[0], "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "mode": path.stat().st_mode & 0o777,
+    }, indent=2) + "\n")

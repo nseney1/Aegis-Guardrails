@@ -324,6 +324,7 @@ class _P6Diagnostic:
             'omitted_events': 0, 'omitted_errors': 0}
         self._refs = [None] * self.ERROR_LIMIT
         self._pending = None
+        self._capture_failed = False
         self._roles = []
         root, source = config.get('evidence'), config.get('source')
         if type(root) is str and type(source) is str:
@@ -375,7 +376,21 @@ class _P6Diagnostic:
         self.unknown()
         return None, 'UNSUPPORTED'
 
-    def error(self, error, operation='UNATTRIBUTED_WORKER_STATEMENT', phase='outer'):
+    def error(self, error, operation=None, phase=None):
+        try:
+            if self._capture_failed:
+                return None
+            if operation is None and phase is None:
+                return self._capture_error(error)
+            return self._capture_error(error, operation, 'outer' if phase is None else phase)
+        except Exception:
+            # This last-resort path only writes existing slots: no ticket allocation or helper call.
+            self._capture_failed = True
+            self.data['capture_status'] = 'UNKNOWN'
+            self._pending = None
+            return None
+
+    def _capture_error(self, error, operation='UNATTRIBUTED_WORKER_STATEMENT', phase='outer'):
         try:
             if self._pending is not None and self._pending[0] is error:
                 return self._pending[1]
