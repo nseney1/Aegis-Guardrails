@@ -1,0 +1,1820 @@
+"""C1 public adapter contract. No real owner homes or engines are used by default."""
+import copy
+import errno
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "tools" / "hierarchy_container.py"
+FAKE = Path(__file__).with_name("hierarchy_fake_engine.py")
+IMAGE = "localhost/aegis-teams@sha256:" + "a" * 64
+ENGINE_HOME = str(Path.home())  # Podman alone needs its original local image store in the opt-in test.
+REAL_PODMAN = shutil.which("podman")  # Resolve before layout places the test fake on PATH.
+ISOLATION = {"mode": "container", "engine": "podman", "image": IMAGE,
+             "cpus": 1, "memory": "1g", "pids": 64}
+SECRET_PATHS = (".claude", ".codex", ".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker",
+                ".netrc", ".git-credentials")
+pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="container isolation requires Linux")
+
+
+@pytest.fixture
+def layout(tmp_path, monkeypatch):
+    import pwd
+
+    host_getpwuid = pwd.getpwuid
+    previous_umask = os.umask(0o077)
+    # The managed sandbox maps / to nobody and exposes group-writable workspace parents. Model trusted
+    # outer ancestors at the OS boundary; permissions of paths within tmp_path remain real and testable.
+    outer = {str(path) for path in tmp_path.parents}
+    original_lstat = os.lstat
+
+    def trusted_outer(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        if str(path) in outer:
+            parts = list(info)
+            parts[0], parts[4] = info.st_mode & ~0o022, 0
+            return os.stat_result(parts)
+        return info
+
+    monkeypatch.setattr(os, "lstat", trusted_outer)
+    home = tmp_path / "owner"
+    passwd_home = tmp_path / "password-home"
+    paths = {key: tmp_path / key for key in ("run", "project", "source", "prefix", "live")}
+    for folder in (home, passwd_home, *paths.values()):
+        folder.mkdir()
+    for owner in (home, passwd_home):
+        for name in SECRET_PATHS:
+            if name in (".netrc", ".git-credentials"):
+                (owner / name).touch()
+            else:
+                (owner / name).mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    def isolated_passwd(uid):
+        entry = host_getpwuid(uid)
+        return SimpleNamespace(pw_uid=entry.pw_uid, pw_gid=entry.pw_gid, pw_name=entry.pw_name,
+                               pw_dir=str(passwd_home))
+
+    monkeypatch.setattr(pwd, "getpwuid", isolated_passwd)
+    (paths["prefix"] / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    for engine in ("podman", "docker"):
+        shutil.copyfile(FAKE, binaries / engine)
+        (binaries / engine).chmod(0o755)
+    monkeypatch.setenv("PATH", str(binaries) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_STATE", str(tmp_path / "engine-state.json"))
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_LOG", str(tmp_path / "engine-argv.jsonl"))
+    try:
+        yield SimpleNamespace(home=home, passwd_home=passwd_home, outer=sorted(outer), host_lstat=original_lstat, **paths)
+    finally:
+        os.umask(previous_umask)
+
+
+@pytest.fixture
+def adapter():
+    # Lazy import leaves CLI RED observable even before the module exists.
+    return importlib.import_module("tools.hierarchy_container")
+
+
+def config_for(layout):
+    return {"schema": "aegis.team-run/v2", "run": str(layout.run), "project": str(layout.project),
+            "source": str(layout.source), "recipes": {"python": str(layout.prefix / "bin" / "python")},
+            "live_checkouts": [str(layout.live)], "isolation": dict(ISOLATION)}
+
+
+def cli(layout, config, *args, bootstrap=""):
+    path = layout.run.parent / "team-run.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    # Password database is an OS boundary. Patch it in the child too: changing HOME alone must never hide
+    # the real password-database home from production checks, or aim a test at ~/.claude or ~/.codex.
+    code = ("import os, pwd, runpy, sys; from types import SimpleNamespace; "
+            "pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=%r); " % str(layout.passwd_home)
+            + "_lstat = os.lstat; _outer = %r; " % layout.outer
+            + "os.lstat = lambda p,*a,**kw: (lambda st: os.stat_result([st.st_mode & ~0o022] + list(st)[1:4] "
+              "+ [0] + list(st)[5:]) if str(p) in _outer else st)(_lstat(p,*a,**kw)); "
+            + bootstrap + "sys.argv = [%r] + sys.argv[1:]; runpy.run_path(%r, run_name='__main__')"
+            % (str(SCRIPT), str(SCRIPT)))
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run([sys.executable, "-I", "-B", "-c", code, *args, "--config", str(path)],
+                          env=env, capture_output=True, text=True, timeout=15)
+
+
+def mounts(adapter, layout, **changes):
+    args = {"run": layout.run, "project": layout.project, "source": layout.source,
+            "python_prefix": layout.prefix, "live_checkouts": [layout.live], "home": layout.home}
+    args.update(changes)
+    return adapter.mount_plan(**args)
+
+
+def image_info(image=IMAGE):
+    # Modelled default image fixture; its config hash agrees with the fake's image-inspect response.
+    config_id = hashlib.sha256(("config:" + image).encode("utf-8")).hexdigest()
+    return [{"Id": "sha256:" + config_id, "Digest": image.rsplit("@", 1)[-1], "RepoDigests": [image],
+             "Config": {"Env": ["PATH=/venv/bin:/usr/bin", "PYTHONDONTWRITEBYTECODE=1"]}}]
+
+
+def expected_for(adapter, isolation, **kwargs):
+    kwargs.setdefault("image_inspect", image_info(isolation["image"]))
+    return adapter.expected_plan(isolation, **kwargs)
+
+
+@pytest.mark.parametrize("raw", [None, {"mode": "host"}])
+def test_host_library(adapter, layout, raw):
+    assert adapter.read_isolation(raw, run=layout.run, home=layout.home) is None
+
+
+@pytest.mark.parametrize("raw", [None, {"mode": "host"}])
+def test_host_cli(layout, raw):
+    config = {} if raw is None else {"schema": "aegis.team-run/v2", "isolation": raw}
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
+
+
+INVALID = [
+    ({**ISOLATION, "cpus": 0.001}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ([], "isolation must be a JSON object"),
+    ({}, "isolation.mode must be host or container"),
+    ({"mode": "other"}, "isolation.mode must be host or container"),
+    ({"mode": "host", "engine": "podman"}, "isolation host mode accepts only mode"),
+    ({**ISOLATION, "extra": True}, "isolation has unknown fields: extra"),
+    ({**ISOLATION, "engine": "other"}, "isolation.engine must be podman or docker"),
+    ({k: v for k, v in ISOLATION.items() if k != "engine"}, "isolation.engine must be podman or docker"),
+    ({**ISOLATION, "image": "ubuntu:24.04"}, "isolation.image must carry @sha256:<64 hex>"),
+    ({**ISOLATION, "image": "x@sha256:" + "a" * 63}, "isolation.image must carry @sha256:<64 hex>"),
+    ({**ISOLATION, "image": "x@sha256:" + "z" * 64}, "isolation.image must carry @sha256:<64 hex>"),
+    ({**ISOLATION, "image": "-x@sha256:" + "a" * 64}, "isolation.image must carry @sha256:<64 hex>"),
+    ({**ISOLATION, "image": "x\n@sha256:" + "a" * 64}, "isolation.image must carry @sha256:<64 hex>"),
+    ({**ISOLATION, "cpus": 0}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "cpus": -1}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "cpus": True}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "cpus": "1"}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "cpus": 10 ** 9}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "cpus": 10 ** 400}, "isolation.cpus must be >= 0.01 and <= os.cpu_count()"),
+    ({**ISOLATION, "memory": "1G"}, "isolation.memory must be <positive int>[kmg]"),
+    ({**ISOLATION, "memory": "0g"}, "isolation.memory must be <positive int>[kmg]"),
+    ({**ISOLATION, "memory": "1.5g"}, "isolation.memory must be <positive int>[kmg]"),
+    ({**ISOLATION, "memory": 1024}, "isolation.memory must be <positive int>[kmg]"),
+    ({**ISOLATION, "pids": 63}, "isolation.pids must be an integer >= 64"),
+    ({**ISOLATION, "pids": True}, "isolation.pids must be an integer >= 64"),
+    ({**ISOLATION, "pids": 64.0}, "isolation.pids must be an integer >= 64"),
+    ({**ISOLATION, "allow_unqualified": 1}, "isolation.allow_unqualified must be a bool"),
+    ({**ISOLATION, "engine": "docker"}, "docker is unqualified; set isolation.allow_unqualified to true"),
+]
+
+
+@pytest.mark.parametrize("raw,message", INVALID)
+def test_validation_cli(layout, raw, message):
+    config = config_for(layout)
+    config["isolation"] = raw
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 2, proc.stderr
+    assert json.loads(proc.stdout) == {"error": message}
+    assert list(layout.run.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ["image", "cpus", "memory", "pids"])
+def test_missing_required(adapter, layout, field):
+    raw = dict(ISOLATION)
+    del raw[field]
+    message = {"image": "isolation.image must carry @sha256:<64 hex>",
+               "cpus": "isolation.cpus must be >= 0.01 and <= os.cpu_count()",
+               "memory": "isolation.memory must be <positive int>[kmg]",
+               "pids": "isolation.pids must be an integer >= 64"}[field]
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        adapter.read_isolation(raw, run=layout.run, home=layout.home)
+
+
+def test_platform_and_unknown_cpu(adapter, layout, monkeypatch):
+    monkeypatch.setattr(adapter.sys, "platform", "darwin")
+    with pytest.raises(ValueError, match="^container isolation requires Linux$"):
+        adapter.read_isolation(ISOLATION, run=layout.run, home=layout.home)
+    monkeypatch.setattr(adapter.sys, "platform", "linux")
+    monkeypatch.setattr(adapter.os, "cpu_count", lambda: None)
+    with pytest.raises(ValueError, match=r"^isolation.cpus must be >= 0.01 and <= os.cpu_count\(\)$"):
+        adapter.read_isolation(ISOLATION, run=layout.run, home=layout.home)
+
+
+def test_valid_limits(adapter, layout, monkeypatch):
+    monkeypatch.setattr(adapter.os, "cpu_count", lambda: 2)
+    for cpus in (0.01, 0.5, 2):
+        for memory in ("1k", "128m", "16g"):
+            value = {**ISOLATION, "cpus": cpus, "memory": memory}
+            assert adapter.read_isolation(value, run=layout.run, home=layout.home) == {
+                **value, "allow_unqualified": False}
+    for cpus in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match=r"^isolation.cpus must be >= 0.01 and <= os.cpu_count\(\)$"):
+            adapter.read_isolation({**ISOLATION, "cpus": cpus}, run=layout.run, home=layout.home)
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("child", ["", *SECRET_PATHS, ".codex/sessions", ".claude/projects", ".config/gh"])
+def test_protected_home(adapter, layout, owner, child):
+    path = getattr(layout, owner) / child
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(path)) + "$"):
+        mounts(adapter, layout, project=path)
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_documents_project_and_venv_allowed_cli(layout, owner):
+    documents = getattr(layout, owner) / "Documents"
+    project, prefix = documents / "project", documents / "venv"
+    project.mkdir(parents=True)
+    prefix.mkdir()
+    (prefix / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    config = config_for(layout)
+    config["project"] = str(project)
+    config["recipes"]["python"] = str(prefix / "bin" / "python")
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    planned = json.loads(proc.stdout)["mounts"]
+    assert {"source": str(project), "destination": str(project), "rw": True} in planned
+    assert {"source": str(prefix), "destination": str(prefix), "rw": False} in planned
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_documents_containing_relocated_secret_refused_cli(layout, owner):
+    home = getattr(layout, owner)
+    documents = home / "Documents"
+    credentials = documents / "credentials"
+    credentials.mkdir(parents=True)
+    config = config_for(layout)
+    config["project"] = str(documents)
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (home / ".codex").rmdir()
+    (home / ".codex").symlink_to(credentials, target_is_directory=True)
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 2, proc.stderr
+    assert json.loads(proc.stdout) == {"error": "mount overlaps protected home: " + str(documents)}
+
+
+def test_mount_inode_alias_contains_relocated_secret(adapter, layout, monkeypatch):
+    parent = layout.run.parent / "relocated-parent"
+    credentials = parent / "credentials"
+    credentials.mkdir(parents=True)
+    (layout.home / ".codex").rmdir()
+    (layout.home / ".codex").symlink_to(credentials, target_is_directory=True)
+    original_stat, identity = os.stat, parent.stat()
+
+    def bind_stat(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if Path(path) == layout.project:
+            return SimpleNamespace(st_dev=identity.st_dev, st_ino=identity.st_ino, st_mode=info.st_mode)
+        return info
+
+    monkeypatch.setattr(adapter.os, "stat", bind_stat)
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(layout.project)) + "$"):
+        mounts(adapter, layout)
+
+
+def test_all_three_owner_homes_remain_protected(adapter, layout):
+    explicit_home = layout.run.parent / "explicit-owner"
+    project, prefix = explicit_home / "Documents" / "project", explicit_home / "Documents" / "venv"
+    project.mkdir(parents=True)
+    prefix.mkdir()
+    plan = mounts(adapter, layout, home=explicit_home, project=project, python_prefix=prefix)
+    assert {"source": str(project), "destination": str(project), "rw": True} in plan
+    for owner in (explicit_home, layout.home, layout.passwd_home):
+        with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(owner)) + "$"):
+            mounts(adapter, layout, home=explicit_home, project=owner)
+        secret = owner / ".ssh"
+        secret.mkdir(exist_ok=True)
+        with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(secret)) + "$"):
+            mounts(adapter, layout, home=explicit_home, project=secret)
+
+
+def test_missing_secrets_are_not_created_or_enumerated(adapter, layout, monkeypatch):
+    missing = layout.home / ".ssh"
+    missing.rmdir()
+
+    def no_enumeration(*args, **kwargs):
+        raise AssertionError("mount planning must not enumerate directories")
+
+    monkeypatch.setattr(os, "scandir", no_enumeration)
+    mounts(adapter, layout)
+    assert not missing.exists()
+
+
+def test_mount_contains_home(adapter, layout):
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(layout.home.parent)) + "$"):
+        mounts(adapter, layout, project=layout.home.parent)
+
+
+@pytest.mark.parametrize("name", [".claude", ".codex"])
+def test_protected_config_relocated_outside_home(adapter, layout, name):
+    relocated = layout.run.parent / "relocated"
+    relocated.mkdir()
+    (layout.home / name).rmdir()
+    (layout.home / name).symlink_to(relocated, target_is_directory=True)
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(relocated)) + "$"):
+        mounts(adapter, layout, project=relocated)
+
+
+def test_password_home_unavailable(adapter, layout, monkeypatch):
+    import pwd
+
+    def unavailable(uid):
+        raise KeyError(uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", unavailable)
+    with pytest.raises(ValueError, match="^cannot find the owner's password-database home$"):
+        mounts(adapter, layout)
+
+
+@pytest.mark.parametrize("suffix", ["", ".claude", ".codex"])
+def test_symlink_alias(adapter, layout, suffix):
+    alias = layout.run.parent / "alias"
+    alias.symlink_to(layout.home / suffix, target_is_directory=True)
+    with pytest.raises(ValueError, match="^mount source contains a symlink: " + re.escape(str(alias)) + "$"):
+        mounts(adapter, layout, project=alias)
+
+
+def test_symlink_ancestor_and_relative(adapter, layout):
+    alias = layout.run.parent / "alias"
+    alias.symlink_to(layout.project, target_is_directory=True)
+    with pytest.raises(ValueError, match="^mount source contains a symlink: " + re.escape(str(alias)) + "$"):
+        mounts(adapter, layout, project=alias / "child")
+    for path in ("relative", str(layout.project / ".." / "project")):
+        with pytest.raises(ValueError, match="^project must be an absolute path without "):
+            mounts(adapter, layout, project=path)
+
+
+@pytest.mark.parametrize("suffix", [",readonly", ":bad"])
+def test_mount_argument_injection_refused(adapter, layout, suffix):
+    path = layout.project / ("source" + suffix)
+    with pytest.raises(ValueError, match="^mount source contains an unsupported character: " + re.escape(str(path)) + "$"):
+        mounts(adapter, layout, project=path)
+
+
+@pytest.mark.parametrize("target", ["home", ".claude", ".codex", "ancestor", "secret-ancestor"])
+def test_inode_alias_checks_every_ancestor(adapter, layout, monkeypatch, target):
+    # Model bind mounts at the stat boundary; no mount privileges or secret reads required.
+    alias = layout.run.parent / "bind-alias"
+    alias.mkdir()
+    protected = (layout.home if target in ("home", "ancestor") else
+                 layout.home / (".codex" if target == "secret-ancestor" else target))
+    identity = protected.stat()
+    original_stat = os.stat
+
+    def bind_stat(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if Path(path) == alias:
+            return SimpleNamespace(st_dev=identity.st_dev, st_ino=identity.st_ino, st_mode=info.st_mode)
+        return info
+
+    monkeypatch.setattr(adapter.os, "stat", bind_stat)
+    candidate = alias / "missing" / "child" if target in ("ancestor", "secret-ancestor") else alias
+    if target == "ancestor":
+        plan = mounts(adapter, layout, project=candidate)
+        assert {"source": str(candidate), "destination": str(candidate), "rw": True} in plan
+        return
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(candidate)) + "$"):
+        mounts(adapter, layout, project=candidate)
+
+
+@pytest.mark.parametrize("kind", ["equal", "rw-parent", "ro-parent", "inode"])
+def test_rw_ro_overlap(adapter, layout, monkeypatch, kind):
+    source, project = layout.source, layout.project
+    if kind == "equal":
+        source = project
+    elif kind == "rw-parent":
+        source = project / "runtime"
+    elif kind == "ro-parent":
+        project = source / "project"
+    else:
+        original_stat, identity = os.stat, project.stat()
+
+        def bind_stat(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if Path(path) == source:
+                return SimpleNamespace(st_dev=identity.st_dev, st_ino=identity.st_ino, st_mode=info.st_mode)
+            return info
+
+        monkeypatch.setattr(adapter.os, "stat", bind_stat)
+    with pytest.raises(ValueError, match="^read-write and read-only mounts overlap: "):
+        mounts(adapter, layout, project=project, source=source)
+
+
+def test_inode_alias_with_missing_tails_on_both_sides(adapter, layout, monkeypatch):
+    alias = layout.run.parent / "parent-alias"
+    alias.mkdir()
+    original_stat, identity = os.stat, layout.project.stat()
+
+    def bind_stat(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if Path(path) == alias:
+            return SimpleNamespace(st_dev=identity.st_dev, st_ino=identity.st_ino, st_mode=info.st_mode)
+        return info
+
+    monkeypatch.setattr(adapter.os, "stat", bind_stat)
+    with pytest.raises(ValueError, match="^read-write and read-only mounts overlap: "):
+        mounts(adapter, layout, project=layout.project / "missing", source=alias / "missing" / "runtime")
+
+
+def test_mount_plan_is_sorted_same_path_and_deduplicated(adapter, layout):
+    plan = mounts(adapter, layout, live_checkouts=[layout.live, layout.source, layout.live])
+    assert plan == sorted([
+        {"source": str(folder), "destination": str(folder), "rw": rw}
+        for folder, rw in ((layout.run, True), (layout.project, True), (layout.source, False),
+                           (layout.prefix, False), (layout.live, False))], key=lambda row: row["source"])
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_create_golden(adapter, layout, engine):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    plan = mounts(adapter, layout)
+    name = "aegis-team-" + hashlib.sha256(str(layout.run).encode()).hexdigest()[:12]
+    expected = [engine, "run", "-d", "--name", name, "--label", "aegis.team.run=" + str(layout.run),
+                "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev", "--tmpfs", "/dev/shm:rw,nosuid,nodev", "--init", "--cpus", "1", "--memory", "1g",
+                "--pids-limit", "64", "--ipc=private", "--network=bridge"]
+    expected += (["--pid=private", "--userns=keep-id", "--security-opt=unmask=/proc/*", "--env-host=false",
+                  "--http-proxy=false", "--read-only-tmpfs=false"] if engine == "podman" else
+                 ["--user", "1234:5678", "--security-opt", "systempaths=unconfined"])
+    environment = {"HOME": str(layout.run / "home"), "CODEX_HOME": str(layout.run / "codex-home"),
+                   "CLAUDE_CONFIG_DIR": str(layout.run / "claude-home"), "LANG": "C.UTF-8",
+                   "PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
+    for key, value in sorted(environment.items()):
+        expected += ["--env", key + "=" + value]
+    for row in plan:
+        expected += ["--mount", "type=bind,src={source},dst={destination}".format(**row)
+                     + ("" if row["rw"] else ",readonly")]
+    expected += [IMAGE, "/bin/sleep", "infinity"]
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=plan, uid=1234, gid=5678,
+                               env={"LANG": "C.UTF-8"})
+    assert argv == expected
+    assert "--env-host" not in argv
+    assert not any(word.startswith("--cap-add") for word in argv)
+
+
+def test_environment_refuses_secrets_and_home_override(adapter, layout):
+    for env, message in (({"SSH_AUTH_SOCK": "/secret"}, "environment variables not allowlisted: SSH_AUTH_SOCK"),
+                         ({"HOME": "/owner"}, "container HOME is fixed inside the run"),
+                         ({"LANG": "C\x00bad"}, "invalid environment value: LANG")):
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            adapter.create_argv(ISOLATION, run=layout.run, mounts=mounts(adapter, layout), env=env)
+
+
+def test_other_argv_builders(adapter, layout):
+    run = layout.run
+    name = "aegis-team-" + hashlib.sha256(str(run).encode()).hexdigest()[:12]
+    assert adapter.inspect_argv("podman", run) == ["podman", "container", "inspect", name]
+    assert adapter.stop_argv("docker", run, timeout=7) == ["docker", "stop", "--time", "7", name]
+    assert adapter.rm_argv("podman", run) == ["podman", "rm", name]
+    assert adapter.image_inspect_argv("docker", IMAGE) == ["docker", "image", "inspect", IMAGE]
+    assert adapter.build_image_argv("podman", context=layout.source, containerfile=layout.source / "Containerfile",
+                                    tag="localhost/aegis-teams:c2") == [
+        "podman", "build", "--file", str(layout.source / "Containerfile"), "--tag", "localhost/aegis-teams:c2",
+        str(layout.source)]
+    argv = adapter.exec_argv("docker", run, ["id", "-u"], workdir=layout.project, env={"LANG": "C"})
+    assert argv[:4] == ["docker", "exec", "--workdir", str(layout.project)]
+    assert argv[-3:] == [name, "id", "-u"]
+    assert "LANG=C" in argv and "HOME=" + str(run / "home") in argv
+    assert "--env-host" not in argv
+    with pytest.raises(ValueError, match="^stop timeout must be a positive integer$"):
+        adapter.stop_argv("podman", run, timeout=0)
+
+
+def test_exec_preserves_empty_arguments(adapter, layout):
+    argv = adapter.exec_argv("podman", layout.run, ["printf", "%s", ""], workdir=layout.project)
+    assert argv[-3:] == ["printf", "%s", ""]
+
+
+def inspect_id_map(identity):
+    before = min(identity, 65536)
+    rows = (["0:1:%d" % before] if before else []) + ["%d:0:1" % identity]
+    if before < 65536:
+        rows.append("%d:%d:%d" % (identity + 1, before + 1, 65536 - before))
+    return rows
+
+
+def inspect_for(expected, env=None):
+    uid, gid = map(int, expected["user"].split(":"))
+    podman = expected["engine"] == "podman"
+    # Positive model records carry the environment actually requested by the golden create argv.
+    environment = {"HOME": expected["run"] + "/home", "CODEX_HOME": expected["run"] + "/codex-home",
+                   "CLAUDE_CONFIG_DIR": expected["run"] + "/claude-home",
+                   "PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
+    environment.update(env or {})
+    env_argv = [word for key, value in sorted(environment.items()) for word in ("--env", key + "=" + value)]
+    return [{"Config": {"Labels": {"aegis.team.run": expected["run"]}, "User": expected["user"],
+                        "Image": expected["image"], "Env": [key + "=" + value for key, value in sorted(environment.items())],
+                        "CreateCommand": ["podman", "run", "--security-opt=unmask=/proc/*", "--env-host=false",
+                                          "--http-proxy=false", "--read-only-tmpfs=false", *env_argv, expected["image"]]},
+             "Image": expected["image_info"]["id"],
+             "ImageDigest": expected["image"].split("@")[1],
+             "Mounts": [{"Type": "bind", "Source": m["source"], "Destination": m["destination"], "RW": m["rw"]}
+                        for m in expected["mounts"]], "HostConfig": {
+                            "ReadonlyRootfs": True, "Privileged": False, "CapAdd": [], "Devices": [],
+                            "PidMode": "private", "IpcMode": "private", "NetworkMode": "bridge",
+                            "UsernsMode": "private" if podman else "",
+                            "SecurityOpt": [] if podman else ["systempaths=unconfined"],
+                            "IDMappings": {"UidMap": inspect_id_map(uid), "GidMap": inspect_id_map(gid)},
+                            "NanoCpus": 1000000000, "Memory": 1073741824, "PidsLimit": 64,
+                            "Tmpfs": {"/tmp": "rw,nosuid,nodev,rprivate,tmpcopyup",
+                                      "/dev/shm": "rw,nosuid,nodev,rprivate,tmpcopyup"}}}]
+
+
+@pytest.mark.parametrize("field", [None, "label", "image", "mounts", "read_only", "user"])
+def test_verify_tampering(adapter, layout, field):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    obj = value[0]
+    if field == "label":
+        obj["Config"]["Labels"]["aegis.team.run"] = "/other"
+    elif field == "image":
+        obj["ImageDigest"] = "sha256:" + "b" * 64
+    elif field == "mounts":
+        obj["Mounts"][0]["RW"] = not obj["Mounts"][0]["RW"]
+    elif field == "read_only":
+        obj["HostConfig"]["ReadonlyRootfs"] = False
+    elif field == "user":
+        obj["Config"]["User"] = "0:0"
+    obj["FutureEngineField"] = {"anything": [1, 2, 3]}
+    assert adapter.verify(value, expected) == ([] if field is None else [field])
+    assert adapter.verify(json.dumps(value), expected) == ([] if field is None else [field])
+
+
+@pytest.mark.parametrize("tamper", ["source", "destination", "missing", "extra", "duplicate", "tmpfs", "wrong-type"])
+def test_verify_exact_mounts(adapter, layout, tamper):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    rows = value[0]["Mounts"]
+    if tamper in ("source", "destination"):
+        rows[0][tamper.title()] = "/changed"
+    elif tamper == "missing":
+        rows.pop()
+    elif tamper == "duplicate":
+        rows.append(copy.deepcopy(rows[0]))
+    elif tamper == "wrong-type":
+        rows[0]["Type"] = "volume"
+    else:
+        rows.append({"Type": "tmpfs" if tamper == "tmpfs" else "bind", "Source": "x",
+                     "Destination": "/extra", "RW": True})
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("value", [None, [], [1], [{}, {}], "bad json", {"Config": None, "Mounts": None}])
+def test_verify_malformed_never_raises(adapter, layout, value):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    assert adapter.verify(value, expected)
+
+
+def test_docker_inspect_and_declared_tmpfs(adapter, layout):
+    expected = expected_for(adapter, {**ISOLATION, "engine": "docker", "allow_unqualified": True},
+                                     run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    del value[0]["ImageDigest"]  # Docker records the manifest reference in Config.Image, Image is a config ID.
+    value[0]["Image"] = expected["image_info"]["id"]
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True})
+    assert adapter.verify(value, expected) == []
+    value[0]["Image"] = "sha256:" + "c" * 64
+    assert adapter.verify(value, expected) == ["image"]
+
+
+def test_plan_and_verify_cli(adapter, layout):
+    config = config_for(layout)
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 0, proc.stderr
+    plan = json.loads(proc.stdout)
+    assert plan["mode"] == "container" and plan["isolation"] == {**ISOLATION, "allow_unqualified": False}
+    assert plan["create_argv"][:3] == ["podman", "run", "-d"]
+    assert len(plan["mounts"]) == 5
+    path = layout.run.parent / "inspect.json"
+    value = inspect_for(expected_for(adapter, plan["isolation"], run=config["run"], mounts=plan["mounts"]))
+    path.write_text(json.dumps(value), encoding="utf-8")
+    proc = cli(layout, config, "verify", "--inspect", str(path))
+    assert proc.returncode == 0 and json.loads(proc.stdout) == {"mismatches": []}
+    value[0]["Config"]["User"] = "wrong"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    proc = cli(layout, config, "verify", "--inspect", str(path))
+    assert proc.returncode == 2 and json.loads(proc.stdout) == {"mismatches": ["user"]}
+    assert list(layout.run.iterdir()) == []  # A plan never starts an engine or creates homes.
+
+
+def test_cli_missing_inspect_and_internal_error(layout):
+    proc = cli(layout, config_for(layout), "verify", "--inspect", str(layout.run / "missing.json"))
+    assert proc.returncode == 2
+    assert json.loads(proc.stdout)["error"] == "file unavailable: " + str(layout.run / "missing.json")
+    proc = cli(layout, config_for(layout), "plan", bootstrap=(
+        "import os; os.cpu_count = lambda: (_ for _ in ()).throw(RuntimeError('fixture internal')); "))
+    assert proc.returncode == 3
+    assert json.loads(proc.stdout) == {"error": "internal error: fixture internal"}
+
+
+def test_isolation_requires_v2_and_host_cannot_verify(layout):
+    config = config_for(layout)
+    config["schema"] = "aegis.team-run/v1"
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 2 and json.loads(proc.stdout) == {
+        "error": "isolation requires schema aegis.team-run/v2"}
+    proc = cli(layout, {}, "verify", "--inspect", str(layout.run / "not-read.json"))
+    assert proc.returncode == 2 and json.loads(proc.stdout) == {"error": "verify requires container isolation"}
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_fake_engine_round_trip(adapter, layout, monkeypatch, engine):
+    executable = layout.run.parent / engine
+    shutil.copyfile(FAKE, executable)
+    executable.chmod(0o755)
+    state, log = layout.run.parent / "fake-state.json", layout.run.parent / "fake-argv.jsonl"
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_STATE", str(state))
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_LOG", str(log))
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/fixture/host-socket-must-not-leak")
+    monkeypatch.setenv("HTTPS_PROXY", "fixture-ambient-proxy")
+    monkeypatch.setenv("PATH", str(executable.parent) + os.pathsep + os.environ["PATH"])
+
+    def call(argv):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=15)
+
+    plan = mounts(adapter, layout)
+    isolation = {**ISOLATION, "engine": engine, "cpus": 0.29, "allow_unqualified": engine == "docker"}
+    inspected_image = call(adapter.image_inspect_argv(engine, IMAGE))
+    assert inspected_image.returncode == 0
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=plan, image_inspect=inspected_image.stdout)
+    create = adapter.create_argv(isolation, run=layout.run, mounts=plan)
+    proc = call(create)
+    assert proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{64}\n", proc.stdout), proc.stderr
+    inspected = json.loads(call(adapter.inspect_argv(engine, layout.run)).stdout)
+    host = inspected[0]["HostConfig"]
+    if engine == "podman":
+        assert host["UsernsMode"] == "private" and host["SecurityOpt"] == []
+        assert host["CpuPeriod"] == 100000 and host["CpuQuota"] == 28999 and host["NanoCpus"] == 289990000
+        assert "IDMappings" in host
+        assert all(bind.endswith(",rprivate,rbind") for bind in host["Binds"])
+    else:
+        assert host["PidMode"] == "" and host["UsernsMode"] == "" and "IDMappings" not in host
+        assert "ImageDigest" not in inspected[0] and "--pid=private" not in create
+    assert not any(item.startswith("HTTPS_PROXY=") for item in inspected[0]["Config"]["Env"])
+    assert adapter.verify(inspected, expected) == []
+    command = [sys.executable, "-c", "import json, os; print(json.dumps([os.getcwd(), os.environ['LANG'], "
+               "os.environ['HOME'], 'SSH_AUTH_SOCK' in os.environ]))"]
+    proc = call(adapter.exec_argv(engine, layout.run, command, workdir=layout.project, env={"LANG": "C"}))
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [str(layout.project), "C", str(layout.run / "home"), False]
+    failing = call(adapter.exec_argv(engine, layout.run, [sys.executable, "-c", "raise SystemExit(7)"],
+                                     workdir=layout.project))
+    assert failing.returncode == 7
+    assert json.loads(log.read_text(encoding="utf-8").splitlines()[1]) == create[1:]
+    refused = call([engine, "system", "prune"])
+    assert refused.returncode == 2 and refused.stderr == "fake engine: unsupported command: system\n"
+    refused = call([engine, "run", "--privileged"])
+    assert refused.returncode == 2 and refused.stderr == "fake engine: unsupported option: --privileged\n"
+    assert call(create).stderr == "fake engine: container already exists: " + adapter.container_name(layout.run) + "\n"
+    assert call(adapter.rm_argv(engine, layout.run)).returncode == 2
+    assert call(adapter.stop_argv(engine, layout.run)).returncode == 0
+    assert call(adapter.exec_argv(engine, layout.run, ["id"], workdir=layout.project)).returncode == 2
+    assert call(adapter.rm_argv(engine, layout.run)).returncode == 0
+    assert call(adapter.inspect_argv(engine, layout.run)).stderr == (
+        "fake engine: no such container: " + adapter.container_name(layout.run) + "\n")
+
+
+@pytest.mark.parametrize("case", ["foreign", "sticky", "group-writable"])
+def test_mount_ancestor_trust(adapter, layout, monkeypatch, case):
+    original = os.lstat
+    original_getxattr = os.getxattr
+    uid = os.geteuid()
+    shared_uid = uid + 1 if case == "foreign" else uid
+    shared_mode = 0o770 if case == "group-writable" else 0o700
+    virtual = {Path("/tmp"): (0, 0o1777), Path("/tmp/shared"): (shared_uid, shared_mode),
+               Path("/tmp/shared/project"): (uid, 0o700)}
+
+    def lstat(path, *args, **kwargs):
+        if Path(path) in virtual:
+            owner, mode = virtual[Path(path)]
+            return SimpleNamespace(st_uid=owner, st_gid=os.getegid() + 1, st_mode=stat.S_IFDIR | mode)
+        return original(path, *args, **kwargs)
+
+    def getxattr(path, name, **kwargs):
+        # The virtual directories also model authoritative ACL absence, not a real nonexistent path.
+        if Path(path) in virtual:
+            assert name == "system.posix_acl_access" and kwargs == {"follow_symlinks": False}
+            raise OSError(errno.ENODATA, "modelled ACL absence")
+        return original_getxattr(path, name, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "getxattr", getxattr)
+    if case == "sticky":
+        plan = mounts(adapter, layout, project="/tmp/shared/project")
+        assert {"source": "/tmp/shared/project", "destination": "/tmp/shared/project", "rw": True} in plan
+    else:
+        reason = "owned by another user" if case == "foreign" else "writable by other users"
+        message = "mount component %s: /tmp/shared (uid %d)" % (reason, shared_uid)
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            mounts(adapter, layout, project="/tmp/shared/project")
+
+
+@pytest.mark.parametrize("path", ["/", "/usr", "/usr/local", "/opt", "/run", "/etc", "/tmp"])
+def test_image_system_mount_refused(adapter, layout, path):
+    with pytest.raises(ValueError, match="^mount replaces image system directory: " + re.escape(path) + "$"):
+        mounts(adapter, layout, project=path)
+
+
+def test_local_prefix_and_inferred_non_venv_refuse(adapter, layout):
+    local = layout.home / ".local"
+    with pytest.raises(ValueError, match="^mount replaces image system directory: " + re.escape(str(local)) + "$"):
+        mounts(adapter, layout, python_prefix=local)
+    (layout.prefix / "pyvenv.cfg").unlink()
+    config = config_for(layout)
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 2 and json.loads(proc.stdout) == {
+        "error": "python_prefix requires pyvenv.cfg or an explicit config key"}
+    config["python_prefix"] = str(layout.prefix)
+    proc = cli(layout, config, "plan")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_dangling_secret_protects_target(adapter, layout):
+    (layout.home / ".codex").rmdir()
+    target = layout.run.parent / "unmounted-vault" / "codex"
+    (layout.home / ".codex").symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(str(target.parent)) + "$"):
+        mounts(adapter, layout, project=target.parent)
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("tamper", ["relative", "destination", "comma", "newline", "colon", "rw", "extra", "image"])
+def test_builders_revalidate_stored_plan(adapter, layout, builder, tamper):
+    plan = mounts(adapter, layout)
+    isolation = dict(ISOLATION)
+    message = ""
+    if tamper == "relative":
+        plan[0]["source"] = "relative"
+        message = "mount source must be an absolute path without ..: relative"
+    elif tamper == "destination":
+        plan[0]["destination"] = "/other"
+        message = "mount source and destination must be equal"
+    elif tamper in ("comma", "newline", "colon"):
+        value = str(layout.project) + {"comma": ",readonly", "newline": "\nbad", "colon": ":bad"}[tamper]
+        plan[0]["source"] = plan[0]["destination"] = value
+        message = "mount source contains an unsupported character: " + value
+    elif tamper == "rw":
+        plan[0]["rw"] = "false"
+        message = "mount row rw must be a bool"
+    elif tamper == "extra":
+        plan[0]["extra"] = True
+        message = "mount row must contain only source, destination and rw"
+    else:
+        isolation["image"] = "ubuntu:24.04"
+        message = "isolation.image must carry @sha256:<64 hex>"
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        getattr(adapter, builder)(isolation, run=layout.run, mounts=plan, **(
+            {"image_inspect": image_info(isolation["image"])} if builder == "expected_plan" else {}))
+
+
+@pytest.mark.parametrize("tamper", ["tmpfs", "binds", "conflict", "duplicate-tmpfs"])
+def test_docker_writable_mount_declarations(adapter, layout, tamper):
+    isolation = {**ISOLATION, "engine": "docker", "allow_unqualified": True}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    if tamper == "tmpfs":
+        host["Tmpfs"] = {"/tmp": "rw", "/var/lib/extra": "rw"}
+    elif tamper == "binds":
+        host["Binds"] = ["/other:/other:rw"]
+    elif tamper == "duplicate-tmpfs":
+        value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True})
+        host["Tmpfs"] = {"/tmp": "ro"}
+    else:
+        row = expected["mounts"][0]
+        host["Binds"] = ["%s:%s:%s" % (row["source"], row["destination"], "ro" if row["rw"] else "rw")]
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_docker_mount_representations_agree(adapter, layout):
+    expected = expected_for(adapter, {**ISOLATION, "engine": "docker", "allow_unqualified": True},
+                                     run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    # Modelled Moby v27.5.1: MountPoint has Mode/RW, not Options; --tmpfs lives in HostConfig.Tmpfs.
+    # https://github.com/moby/moby/blob/v27.5.1/api/types/container/hostconfig.go
+    value[0]["HostConfig"]["Tmpfs"] = {"/tmp": "rw,nosuid,nodev", "/dev/shm": "rw,nosuid,nodev"}
+    value[0]["HostConfig"]["Binds"] = ["%s:%s:%s" % (m["source"], m["destination"], "rw" if m["rw"] else "ro")
+                                        for m in expected["mounts"]]
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.mark.parametrize("field,bad,name", [
+    ("Privileged", True, "privileged"), ("CapAdd", ["SYS_ADMIN"], "cap_add"),
+    ("PidMode", "host", "pid_mode"), ("IpcMode", "host", "ipc_mode"),
+    ("UsernsMode", "host", "userns_mode"), ("NetworkMode", "host", "network_mode"),
+    ("Devices", [{"PathOnHost": "/dev/sda"}], "devices"),
+    ("SecurityOpt", ["seccomp=unconfined"], "security_opt"),
+    ("NanoCpus", 0, "cpus"), ("Memory", 0, "memory"), ("PidsLimit", -1, "pids")])
+def test_verify_confinement_and_limits(adapter, layout, field, bad, name):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"][field] = bad
+    assert adapter.verify(value, expected) == [name]
+
+
+@pytest.mark.parametrize("membership", ["private", "root-owned", "explicit-other", "primary-other"])
+def test_private_group_writable_ancestors(adapter, layout, monkeypatch, membership):
+    import grp
+    import pwd
+
+    owner = SimpleNamespace(pw_uid=os.geteuid(), pw_gid=os.getegid(), pw_name="owner", pw_dir=str(layout.home))
+    root_owner = SimpleNamespace(pw_uid=0, pw_gid=0, pw_name="root", pw_dir=str(layout.home))
+    other = SimpleNamespace(pw_uid=owner.pw_uid + 1, pw_gid=owner.pw_gid, pw_name="other")
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: owner if uid == owner.pw_uid else root_owner)
+    monkeypatch.setattr(pwd, "getpwall", lambda: [owner, other] if membership == "primary-other" else [owner])
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(
+        gr_gid=gid, gr_name="owner", gr_mem=["other"] if membership == "explicit-other" else []))
+    layout.home.chmod(0o755)
+    documents = layout.home / "Documents"
+    documents.mkdir(mode=0o775)
+    documents.chmod(0o775)
+    project = documents / "project"
+    project.mkdir(mode=0o775)
+    project.chmod(0o775)
+    if membership == "root-owned":
+        original = os.lstat
+
+        def root_owned_parent(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            if Path(path) == documents:
+                parts = list(info)
+                parts[4] = 0
+                return os.stat_result(parts)
+            return info
+
+        monkeypatch.setattr(os, "lstat", root_owned_parent)
+    if membership in ("private", "root-owned"):
+        assert {"source": str(project), "destination": str(project), "rw": True} in mounts(
+            adapter, layout, project=project)
+    else:
+        message = "mount component writable by other users: %s (uid %d)" % (documents, owner.pw_uid)
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            mounts(adapter, layout, project=project)
+
+
+def test_leaf_write_permission_cannot_replace_leaf(adapter, layout):
+    layout.project.chmod(0o777)
+    assert {"source": str(layout.project), "destination": str(layout.project), "rw": True} in mounts(adapter, layout)
+
+
+@pytest.mark.parametrize("representation", ["quota", "nano", "both"])
+def test_captured_podman_cpu_conversion(adapter, layout, representation):
+    expected = expected_for(adapter, {**ISOLATION, "cpus": 0.29}, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    host.update(NanoCpus=289990000, CpuPeriod=100000, CpuQuota=28999)
+    if representation == "quota":
+        del host["NanoCpus"]
+    elif representation == "nano":
+        del host["CpuPeriod"], host["CpuQuota"]
+    assert adapter.verify(value, expected) == []
+    if representation == "nano":
+        host["NanoCpus"] = 290000000
+    else:
+        host["CpuQuota"] = 29000
+    assert adapter.verify(value, expected) == ["cpus"]
+
+
+@pytest.mark.parametrize("tamper", ["missing", "root-mapping", "gid-mapping", "overlap", "malformed"])
+def test_keep_id_requires_observed_mappings(adapter, layout, tamper):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    maps = value[0]["HostConfig"]["IDMappings"]
+    if tamper == "missing":
+        del value[0]["HostConfig"]["IDMappings"]
+    elif tamper == "root-mapping":
+        maps["UidMap"] = ["0:0:65536"]
+    elif tamper == "gid-mapping":
+        maps["GidMap"] = ["0:0:65536"]
+    elif tamper == "overlap":
+        maps["UidMap"].append("0:0:65536")
+    else:
+        maps["UidMap"] = ["not:a:mapping"]
+    assert adapter.verify(value, expected) == ["userns_mode"]
+
+
+@pytest.mark.parametrize("case,mode", [
+    ("private", "private"), ("false", False), ("null", None), ("integer", 1), ("list", ["private"]),
+    ("missing", None), ("shared", "container:unrelated"), ("shared-path", "container:/unrelated"),
+    ("host", "host"), ("intent-alias", "keep-id"), ("empty", ""), ("object", {"mode": "private"}),
+])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+def test_keep_id_requires_observed_private_mode(adapter, layout, case, mode, surface):
+    # Observed Podman 4.9.3 (including real-podman-fix7-native): private, not the create-argv spelling keep-id.
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    mappings = copy.deepcopy(host["IDMappings"])
+    assert adapter.verify(value, expected) == []
+    if case == "missing":
+        del host["UsernsMode"]
+    else:
+        host["UsernsMode"] = mode
+    assert verify_surface(adapter, layout, expected, value, surface) == ([] if case == "private" else ["userns_mode"])
+    assert host["IDMappings"] == mappings
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("builder", ["expected_plan", "create_argv"])
+@pytest.mark.parametrize("axis", ["uid", "gid"])
+@pytest.mark.parametrize("identity", [4294967295, 4294967296, 18446744073709551616])
+def test_user_upper_bounds_refuse_before_effect(adapter, layout, monkeypatch, engine, builder, axis, identity):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    plan = mounts(adapter, layout)
+
+    def no_engine(*args, **kwargs):
+        raise AssertionError("pure builders must not invoke an engine")
+
+    monkeypatch.setattr(subprocess, "run", no_engine)
+    ids = {"uid": 1000, "gid": 1000, axis: identity}
+    kwargs = {"image_inspect": image_info()} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^user uid and gid must be < 4294967295$"):
+        getattr(adapter, builder)(isolation, run=layout.run, mounts=plan, **ids, **kwargs)
+    assert list(layout.run.iterdir()) == []
+    assert not Path(os.environ["AEGIS_FAKE_ENGINE_LOG"]).exists()
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("builder", ["expected_plan", "create_argv"])
+@pytest.mark.parametrize("axis", ["uid", "gid"])
+@pytest.mark.parametrize("identity", [True, False, -1, 1.5, "1000"])
+def test_user_numeric_type_diagnostic_stays_stable(adapter, layout, engine, builder, axis, identity):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    ids = {"uid": 1000, "gid": 1000, axis: identity}
+    kwargs = {"image_inspect": image_info()} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^user must be a numeric uid:gid$"):
+        getattr(adapter, builder)(isolation, run=layout.run, mounts=mounts(adapter, layout), **ids, **kwargs)
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("axis", ["uid", "gid"])
+@pytest.mark.parametrize("identity", [0, 1000, 4294967294])
+def test_user_valid_linux_boundaries(adapter, layout, engine, axis, identity):
+    # Modelled numeric records only; this neither executes an engine nor qualifies a high-ID host account.
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    ids = {"uid": 1000, "gid": 1000, axis: identity}
+    plan = mounts(adapter, layout)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=plan, **ids)
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=plan, **ids)
+    assert expected["user"] == "%d:%d" % (ids["uid"], ids["gid"])
+    if engine == "docker":
+        assert argv[argv.index("--user") + 1] == expected["user"]
+    else:
+        assert "--user" not in argv
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("axis", ["uid", "gid"])
+@pytest.mark.parametrize("identity", [4294967295, 4294967296, 18446744073709551616])
+def test_matching_invalid_user_records_still_refuse(adapter, layout, engine, axis, identity):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout), uid=1000, gid=1000)
+    value = inspect_for(expected)
+    ids = {"uid": 1000, "gid": 1000, axis: identity}
+    expected["user"] = value[0]["Config"]["User"] = "%d:%d" % (ids["uid"], ids["gid"])
+    assert adapter.verify(value, expected) == (["user", "userns_mode"] if engine == "podman" else ["user"])
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("record", [False, "name:1000", "-1:1000", "1000"])
+def test_matching_malformed_numeric_user_records_refuse(adapter, layout, engine, record):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["user"] = value[0]["Config"]["User"] = record
+    assert adapter.verify(value, expected) == (["user", "userns_mode"] if engine == "podman" else ["user"])
+
+
+def test_recorded_unmask_request_is_distinct_from_effective_mask(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    assert value[0]["HostConfig"]["SecurityOpt"] == []
+    assert adapter.verify(value, expected) == []
+    value[0]["Config"]["CreateCommand"] = ["podman", "run", expected["image"]]
+    assert adapter.verify(value, expected) == ["security_opt"]
+
+
+def test_explicit_shared_memory_is_required(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["Tmpfs"]["/dev/shm"] = "ro,nosuid,nodev"
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_expected_plan_requires_image_inspection(adapter, layout):
+    with pytest.raises(TypeError, match="image_inspect"):
+        adapter.expected_plan(ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    with pytest.raises(ValueError, match="^image inspect must describe exactly one image$"):
+        adapter.expected_plan(ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=None)
+
+
+def test_observed_pwd_is_an_engine_environment_key(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Config"]["Env"] += ["PWD=/", "container=podman"]
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.fixture
+def acl_ancestor(layout, monkeypatch):
+    """Modelled NSS membership, real directory metadata; ACL reads are real unless a test replaces them."""
+    import grp
+    import pwd
+
+    owner = SimpleNamespace(pw_uid=os.geteuid(), pw_gid=os.getegid(), pw_name="owner", pw_dir=str(layout.home))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: owner)
+    monkeypatch.setattr(pwd, "getpwall", lambda: [owner])
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid, gr_name="owner", gr_mem=[]))
+    parent = layout.home / "Documents"
+    parent.mkdir()
+    parent.chmod(0o775)
+    project = parent / "project"
+    project.mkdir()
+    return parent, project
+
+
+ACL_UNDEFINED = 0xffffffff
+# Observed Linux bytes/modes: real-acl-host-fix5/capture.json, 2026-11-08, named UID 65534.
+# That capture used adapter SHA256 f4368160b7ebed0a4b9018b84cd4eb787820cf5178de147ac5d778709a83c45c.
+ACL_CAPTURE = {
+    "foreign-write": (0o775, "0200000001000700ffffffff02000700feff000004000700ffffffff10000700ffffffff20000500ffffffff"),
+    "foreign-read": (0o775, "0200000001000700ffffffff02000500feff000004000700ffffffff10000700ffffffff20000500ffffffff"),
+    "masked-write": (0o755, "0200000001000700ffffffff02000700feff000004000700ffffffff10000500ffffffff20000500ffffffff"),
+}
+
+
+def foreign_id(identity):
+    return 65534 if identity != 65534 else 65533
+
+
+def acl_bytes(entries, version=2):
+    return struct.pack("<I", version) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+
+
+def model_access_acl(monkeypatch, parent, raw):
+    """Only the ACL query is modelled; lstat and the public mount plan remain real."""
+    getter = os.getxattr
+
+    def getxattr(path, name, **kwargs):
+        if Path(path) == parent:
+            assert name == "system.posix_acl_access" and kwargs == {"follow_symlinks": False}
+            if isinstance(raw, OSError):
+                raise raw
+            return raw
+        return getter(path, name, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", getxattr)
+
+
+@pytest.mark.parametrize("case", list(ACL_CAPTURE))
+@pytest.mark.parametrize("surface", ["mount-plan", "cli"])
+def test_observed_linux_access_acl_permissions(adapter, layout, acl_ancestor, monkeypatch, case, surface):
+    parent, project = acl_ancestor
+    mode, raw = ACL_CAPTURE[case]
+    parent.chmod(mode)
+    # UID 65534 denotes a trusted grant if the tests themselves run as that user; other tests always model
+    # a distinct foreign ID. Keep these observed bytes unchanged on every host.
+    unsafe = case == "foreign-write" and os.geteuid() != 65534
+    message = "mount component writable by other users: %s (uid %d)" % (parent, os.geteuid())
+    if surface == "mount-plan":
+        model_access_acl(monkeypatch, parent, bytes.fromhex(raw))
+        if unsafe:
+            with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+                mounts(adapter, layout, project=project)
+        else:
+            assert {"source": str(project), "destination": str(project), "rw": True} in mounts(
+                adapter, layout, project=project)
+    else:
+        bootstrap = ("import grp; _acl_get = os.getxattr; "
+                     "os.getxattr = lambda p,n,**kw: bytes.fromhex(%r) if str(p)==%r else _acl_get(p,n,**kw); "
+                     "_owner = SimpleNamespace(pw_uid=%r,pw_gid=%r,pw_name='owner',pw_dir=%r); "
+                     "pwd.getpwuid = lambda uid: _owner; pwd.getpwall = lambda: [_owner]; "
+                     "grp.getgrgid = lambda gid: SimpleNamespace(gr_name='owner',gr_mem=[]); "
+                     % (raw, str(parent), os.geteuid(), os.getegid(), str(layout.passwd_home)))
+        config = {**config_for(layout), "project": str(project)}
+        result = cli(layout, config, "plan", bootstrap=bootstrap)
+        assert result.returncode == (2 if unsafe else 0), result.stdout + result.stderr
+        if unsafe:
+            assert json.loads(result.stdout) == {"error": message}
+        else:
+            assert {"source": str(project), "destination": str(project), "rw": True} in json.loads(result.stdout)["mounts"]
+
+
+@pytest.mark.parametrize("case", ["foreign-user-write", "trusted-root", "trusted-user", "named-private-write",
+                                 "named-foreign-read", "named-foreign-write", "named-foreign-masked",
+                                 "owning-shared-write", "mask-is-not-grant", "minimal", "optional-mask",
+                                 "other-is-not-masked"])
+def test_modelled_acl_effective_grants(adapter, layout, acl_ancestor, monkeypatch, case):
+    import grp
+
+    parent, project = acl_ancestor
+    uid, gid = foreign_id(os.geteuid()), foreign_id(os.getegid())
+    users = [(2, 5, uid)]
+    groups = []
+    group_perm, mask, other = 7, 7, 5
+    if case == "foreign-user-write":
+        users = [(2, 7, uid)]
+    elif case in ("trusted-root", "trusted-user"):
+        users = [(2, 7, 0 if case == "trusted-root" else os.geteuid())]
+    elif case.startswith("named-"):
+        groups = [(8, 5 if case == "named-foreign-read" else 7,
+                   os.getegid() if case == "named-private-write" else gid)]
+        if case == "named-foreign-masked":
+            mask = 5
+    elif case in ("owning-shared-write", "mask-is-not-grant"):
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(gr_name="users", gr_mem=[]))
+        if case == "mask-is-not-grant":
+            group_perm = 5  # A writable mask alone grants nobody write permission.
+    elif case in ("minimal", "optional-mask"):
+        users = []
+        if case == "minimal":
+            mask = None
+    else:
+        mask, other = 5, 7  # OTHER is deliberately outside the mask.
+    parent.chmod(0o700 | ((group_perm if mask is None else mask) << 3) | other)
+    entries = ([(1, 7, ACL_UNDEFINED)] + users + [(4, group_perm, ACL_UNDEFINED)] + groups
+               + ([] if mask is None else [(16, mask, ACL_UNDEFINED)]) + [(32, other, ACL_UNDEFINED)])
+    model_access_acl(monkeypatch, parent, acl_bytes(entries))
+    unsafe = case in ("foreign-user-write", "named-foreign-write", "owning-shared-write", "other-is-not-masked")
+    if unsafe:
+        message = "mount component writable by other users: %s (uid %d)" % (parent, os.geteuid())
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            mounts(adapter, layout, project=project)
+    else:
+        assert {"source": str(project), "destination": str(project), "rw": True} in mounts(adapter, layout, project=project)
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("string", "expected bytes"), ("boolean", "expected bytes"), ("bytearray", "expected bytes"),
+    ("short-header", "invalid length"), ("header-only", "invalid length"), ("trailing-byte", "invalid length"),
+    ("version", "unsupported version"), ("big-endian", "unsupported version"), ("tag", "invalid tag"),
+    ("permission", "invalid permissions"), ("user-id", "invalid entry ID"), ("group-id", "invalid entry ID"),
+    ("owner-qualifier", "invalid entry ID"), ("group-qualifier", "invalid entry ID"),
+    ("mask-qualifier", "invalid entry ID"), ("other-qualifier", "invalid entry ID"),
+    ("duplicate-user", "duplicate named ID"), ("duplicate-group", "duplicate named ID"),
+    ("duplicate-owner", "duplicate singleton"), ("duplicate-owning-group", "duplicate singleton"),
+    ("duplicate-mask", "duplicate singleton"), ("duplicate-other", "duplicate singleton"),
+    ("missing-owner", "missing required entries"), ("missing-owning-group", "missing required entries"),
+    ("missing-other", "missing required entries"), ("missing-user-mask", "missing mask"),
+    ("missing-group-mask", "missing mask"), ("tag-order", "entries out of order"),
+])
+def test_modelled_acl_malformed_abi_refuses(adapter, layout, acl_ancestor, monkeypatch, case, reason):
+    parent, project = acl_ancestor
+    uid, gid = foreign_id(os.geteuid()), foreign_id(os.getegid())
+    entries = [(1, 7, ACL_UNDEFINED), (2, 5, uid), (4, 7, ACL_UNDEFINED),
+               (16, 7, ACL_UNDEFINED), (32, 5, ACL_UNDEFINED)]
+    if case in ("tag", "permission", "user-id"):
+        entries[1] = {"tag": (3, 5, uid), "permission": (2, 8, uid), "user-id": (2, 5, ACL_UNDEFINED)}[case]
+    elif case == "group-id":
+        entries.insert(3, (8, 5, ACL_UNDEFINED))
+    elif case.endswith("qualifier"):
+        index = {"owner-qualifier": 0, "group-qualifier": 2, "mask-qualifier": 3, "other-qualifier": 4}[case]
+        tag, perm, _ = entries[index]
+        entries[index] = (tag, perm, 0)
+    elif case.startswith("duplicate-"):
+        if case == "duplicate-group":
+            entries[3:3] = [(8, 5, gid), (8, 5, gid)]
+        else:
+            index = {"duplicate-user": 1, "duplicate-owner": 0, "duplicate-owning-group": 2,
+                     "duplicate-mask": 3, "duplicate-other": 4}[case]
+            entries.insert(index, entries[index])
+    elif case.startswith("missing-"):
+        tag = {"missing-owner": 1, "missing-owning-group": 4, "missing-other": 32,
+               "missing-user-mask": 16, "missing-group-mask": 16}[case]
+        entries = [entry for entry in entries if entry[0] != tag]
+        if case == "missing-group-mask":
+            entries[1] = (8, 5, gid)
+            entries.sort()
+    elif case == "tag-order":
+        entries[1], entries[2] = entries[2], entries[1]
+    raw = acl_bytes(entries, version=1 if case == "version" else 2)
+    raw = {"string": "not bytes", "boolean": True, "bytearray": bytearray(raw), "short-header": raw[:3],
+           "header-only": raw[:4], "trailing-byte": raw + b"x", "big-endian": b"\0\0\0\2" + raw[4:]}.get(case, raw)
+    model_access_acl(monkeypatch, parent, raw)
+    message = "mount access ACL malformed: %s: %s; require Linux POSIX access ACL v2 metadata" % (parent, reason)
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        mounts(adapter, layout, project=project)
+
+
+@pytest.mark.parametrize("case", ["owner", "mask", "other", "minimal-group", "masked-mode"])
+def test_modelled_acl_mode_correspondence_refuses(adapter, layout, acl_ancestor, monkeypatch, case):
+    parent, project = acl_ancestor
+    entries = [(1, 5 if case == "owner" else 7, ACL_UNDEFINED), (2, 5, foreign_id(os.geteuid())),
+               (4, 7, ACL_UNDEFINED), (16, 5 if case == "mask" else 7, ACL_UNDEFINED),
+               (32, 7 if case == "other" else 5, ACL_UNDEFINED)]
+    if case == "minimal-group":
+        entries = [(1, 7, ACL_UNDEFINED), (4, 5, ACL_UNDEFINED), (32, 5, ACL_UNDEFINED)]
+    if case == "masked-mode":
+        parent.chmod(0o755)
+    model_access_acl(monkeypatch, parent, acl_bytes(entries))
+    message = "mount access ACL mode mismatch: %s; revalidate unchanged ACL and lstat metadata" % parent
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        mounts(adapter, layout, project=project)
+
+
+@pytest.mark.parametrize("case", ["malformed", "unreadable"])
+def test_modelled_sticky_does_not_hide_invalid_acl_metadata(adapter, layout, acl_ancestor, monkeypatch, case):
+    parent, project = acl_ancestor
+    parent.chmod(0o1777)
+    raw = b"invalid" if case == "malformed" else OSError(errno.EACCES, "modelled denied ACL")
+    model_access_acl(monkeypatch, parent, raw)
+    if case == "malformed":
+        message = "mount access ACL malformed: %s: invalid length; require Linux POSIX access ACL v2 metadata" % parent
+    else:
+        message = ("mount access ACL cannot be qualified: %s: access ACL query failed (EACCES); require readable "
+                   "Linux POSIX access ACL metadata" % parent)
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        mounts(adapter, layout, project=project)
+
+
+def test_native_acl_absence_preserves_private_775(adapter, layout, acl_ancestor):
+    parent, project = acl_ancestor
+    # Observed Linux OS boundary: this tests an actual ACL query, not a model of an absent ACL.
+    with pytest.raises(OSError) as caught:
+        os.getxattr(parent, "system.posix_acl_access", follow_symlinks=False)
+    assert caught.value.errno == errno.ENODATA
+    assert {"source": str(project), "destination": str(project), "rw": True} in mounts(adapter, layout, project=project)
+
+
+@pytest.mark.parametrize("case", ["unsupported", "denied", "no-api"])
+def test_modelled_acl_query_failures_refuse(adapter, layout, acl_ancestor, monkeypatch, case):
+    parent, project = acl_ancestor
+    getter = os.getxattr
+
+    def getxattr(path, name, **kwargs):
+        if Path(path) == parent:
+            assert name == "system.posix_acl_access" and kwargs == {"follow_symlinks": False}
+            raise OSError(errno.EOPNOTSUPP if case == "unsupported" else errno.EACCES, case)
+        return getter(path, name, **kwargs)
+
+    if case == "no-api":
+        monkeypatch.delattr(os, "getxattr")
+    else:
+        monkeypatch.setattr(os, "getxattr", getxattr)
+    reason = {"unsupported": "access ACL query failed (EOPNOTSUPP)", "denied": "access ACL query failed (EACCES)",
+              "no-api": "Linux access ACL API is unavailable"}[case]
+    component = Path("/") if case == "no-api" else parent
+    message = ("mount access ACL cannot be qualified: %s: %s; require readable Linux POSIX access ACL metadata" %
+               (component, reason))
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        mounts(adapter, layout, project=project)
+
+
+def test_modelled_acl_does_not_defeat_sticky_child_protection(adapter, layout, acl_ancestor, monkeypatch):
+    parent, project = acl_ancestor
+    parent.chmod(0o1777)
+    entries = [(1, 7, ACL_UNDEFINED), (2, 7, foreign_id(os.geteuid())), (4, 7, ACL_UNDEFINED),
+               (16, 7, ACL_UNDEFINED), (32, 7, ACL_UNDEFINED)]
+    model_access_acl(monkeypatch, parent, acl_bytes(entries))
+    assert {"source": str(project), "destination": str(project), "rw": True} in mounts(adapter, layout, project=project)
+
+
+def test_modelled_shared_group_name_cannot_claim_private_nss(adapter, layout, acl_ancestor, monkeypatch):
+    import grp
+
+    parent, project = acl_ancestor
+    monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid, gr_name="users", gr_mem=[]))
+    message = "mount component writable by other users: %s (uid %d)" % (parent, os.geteuid())
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        mounts(adapter, layout, project=project)
+
+
+@pytest.mark.parametrize("field", ["config", "digest", "empty-digest", "config-ref", "repo", "empty-config",
+                                   "expected-id", "expected-digest"])
+def test_captured_image_witnesses_are_conjunctive(adapter, layout, field):
+    # Config/digest association copied from the owner Podman 4.9.3 capture; paths remain fixture-owned.
+    digest = "sha256:6b10bb037f470542125fe00896d5235cf253fc603d2266c052fba6e94e86ec9c"
+    config_id = "1df87640e83ef43b4fc4b891f58f28e16cf800327fe85ea90f9601c2d9d34a78"
+    image = "localhost/aegis-test@" + digest
+    inspected_image = [{"Id": config_id, "Digest": digest, "RepoDigests": [image], "Config": {"Env": []}}]
+    expected = expected_for(adapter, {**ISOLATION, "image": image}, run=layout.run, mounts=mounts(adapter, layout),
+                            image_inspect=inspected_image)
+    value = inspect_for(expected)
+    if field == "config":
+        value[0]["Image"] = "f" * 64
+    elif field in ("digest", "empty-digest"):
+        value[0]["ImageDigest"] = "sha256:" + "f" * 64 if field == "digest" else ""
+    elif field == "config-ref":
+        value[0]["Config"]["Image"] = "localhost/other@sha256:" + "f" * 64
+    elif field == "repo":
+        value[0]["RepoDigests"] = ["localhost/other@sha256:" + "f" * 64]
+    elif field == "empty-config":
+        value[0]["Image"] = ""
+    elif field == "expected-id":
+        expected["image_info"]["id"] = ""
+    else:
+        expected["image_info"]["digest"] = ""
+    assert adapter.verify(value, expected) == ["image"]
+
+
+def test_canonical_image_config_ids_agree(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Image"] = expected["image_info"]["id"].removeprefix("sha256:").upper()
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.mark.parametrize("case", ["empty-id", "id-conflict", "digest-conflict", "empty-digest", "boolean-id"])
+def test_pinned_image_inspect_has_no_contradictory_identity(adapter, layout, case):
+    info = image_info()
+    if case == "empty-id":
+        info[0]["Id"] = ""
+    elif case == "id-conflict":
+        info[0]["ID"] = "f" * 64
+    elif case == "digest-conflict":
+        info[0]["ImageDigest"] = "sha256:" + "f" * 64
+    elif case == "empty-digest":
+        info[0]["Digest"] = ""
+    else:
+        info[0]["Id"] = True
+    with pytest.raises(ValueError, match="^image inspect has conflicting or invalid identity$"):
+        adapter.expected_plan(ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+
+
+def test_modelled_docker_does_not_match_empty_digest(adapter, layout):
+    info = image_info()
+    del info[0]["Digest"]  # Docker supplies its association via RepoDigests and config Id.
+    expected = expected_for(adapter, {**ISOLATION, "engine": "docker", "allow_unqualified": True},
+                            run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+    value = inspect_for(expected)
+    del value[0]["ImageDigest"]
+    assert adapter.verify(value, expected) == []
+    value[0]["ImageDigest"] = ""
+    assert adapter.verify(value, expected) == ["image"]
+
+
+@pytest.mark.parametrize("axis", ["UidMap", "GidMap"])
+@pytest.mark.parametrize("entry", ["4294967295:4294967295:1", "4294967294:4294967294:2",
+                                  "4294967294:70000:2", "70000:4294967294:2",
+                                  "4294967296:70000:1", "70000:4294967296:1", "70000:70000:0",
+                                  "70000:70000:-1", True, {"inside": 70000, "outside": 70000, "count": True}])
+def test_mapping_numeric_domain_refuses_malformed_inspect(adapter, layout, axis, entry):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["IDMappings"][axis].append(entry)
+    assert adapter.verify(value, expected) == ["userns_mode"]
+
+
+def test_mapping_last_usable_linux_id_is_valid(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    for axis in ("UidMap", "GidMap"):
+        value[0]["HostConfig"]["IDMappings"][axis].append("4294967294:4294967294:1")
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.mark.parametrize("flag", ["--read-only-tmpfs=false", "--env-host=false", "--http-proxy=false"])
+@pytest.mark.parametrize("case", ["missing", "contradictory"])
+def test_unverifiable_effects_require_recorded_requests(adapter, layout, flag, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    argv = value[0]["Config"]["CreateCommand"]
+    if case == "missing":
+        argv.remove(flag)
+    else:
+        argv.insert(-1, flag.replace("=false", "=true"))
+    assert adapter.verify(value, expected) == ["security_opt"]
+
+
+def test_recorded_option_value_cannot_hide_later_relaxation(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    argv = value[0]["Config"]["CreateCommand"]
+    argv[-1:-1] = ["--label", expected["image"], "--security-opt=unmask=ALL"]
+    assert adapter.verify(value, expected) == ["security_opt"]
+
+
+@pytest.mark.parametrize("dest", ["/tmp", "/dev/shm"])
+@pytest.mark.parametrize("options", ["rw", "rw,nosuid", "rw,nodev", "rw,nosuid,nodev,suid", "rw,nosuid,nodev,dev",
+                                    "rw,ro,nosuid,nodev", "rw,nosuid,nodev,exec,noexec"])
+def test_writable_tmpfs_requires_safe_option_witnesses(adapter, layout, dest, options):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["Tmpfs"][dest] = options
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("options", [["rw", "suid", "dev"], "rw,nosuid,nodev", True, [True]])
+def test_tmpfs_metadata_cannot_override_conflicting_options(adapter, layout, options):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/dev/shm", "RW": True,
+                               "Options": options})
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_unattested_engine_shm_options_refuse(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    del value[0]["HostConfig"]["Tmpfs"]["/dev/shm"]
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "shm", "Destination": "/dev/shm", "RW": True})
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_owner_capture_replay(adapter, layout):
+    # External owner evidence stays outside the repository and tests/fixtures. The fake embeds its shape for CI.
+    variable = "AEGIS_TEST_C1_HISTORICAL_CAPTURE_DIR"
+    location = os.environ.get(variable)
+    if location is None:
+        pytest.skip("set " + variable + " to replay optional historical Podman 4.9.3 evidence")
+    if not location.strip():
+        pytest.fail(variable + " must name the historical capture directory; the supplied value is empty", pytrace=False)
+    root = Path(location)
+
+    def capture_json(name):
+        try:
+            if not root.is_dir():
+                raise ValueError("capture directory does not exist or is not a directory")
+            data = adapter.strict_json((root / name).read_text(encoding="utf-8"))
+            if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+                raise ValueError("expected a one-element JSON array containing an inspect object")
+        except (OSError, UnicodeError, ValueError) as exc:
+            pytest.fail("%s=%s: invalid %s: %s; supply the historical real-podman-4.9.3 capture directory" %
+                        (variable, root, name, exc), pytrace=False)
+        return data
+
+    value = capture_json("container-inspect.json")
+    image = capture_json("image-inspect.json")
+    try:
+        if not isinstance(value[0]["HostConfig"]["Tmpfs"], dict):
+            raise ValueError("container-inspect.json HostConfig.Tmpfs must be an object")
+        if not isinstance(image[0]["Config"]["Env"], list):
+            raise ValueError("image-inspect.json Config.Env must be an array")
+        run = value[0]["Config"]["Labels"]["aegis.team.run"]
+        rows = [{"source": row["Source"], "destination": row["Destination"], "rw": row["RW"]}
+                for row in value[0]["Mounts"]]
+        expected = adapter.expected_plan({**ISOLATION, "cpus": 0.29, "pids": 4096,
+                                          "image": image[0]["RepoDigests"][0]},
+                                         run=run, mounts=rows, uid=1000, gid=1000, image_inspect=image)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        pytest.fail("%s=%s: malformed historical inspect fields: %s; both inspect files must come from the "
+                    "historical real-podman-4.9.3 capture" % (variable, root, exc), pytrace=False)
+    # The supplied capture predates the explicit shm mount: it should now fail only that changed plan field.
+    assert adapter.verify(value, expected) == ["mounts"], (
+        variable + " must reference the historical capture before the writable shm fix")
+    value[0]["HostConfig"]["Tmpfs"]["/dev/shm"] = "rw,nosuid,nodev,rprivate,tmpcopyup"
+    assert adapter.verify(value, expected) == [], variable + ": historical capture must verify after the in-memory shm update"
+
+
+def test_verify_quota_cpu_form(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    host.update(NanoCpus=0, CpuPeriod=100000, CpuQuota=100000)
+    assert adapter.verify(value, expected) == []
+    host["CpuQuota"] = 200000
+    assert adapter.verify(value, expected) == ["cpus"]
+
+
+def test_verify_unexpected_environment(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Config"]["Env"] += ["HTTPS_PROXY=fixture-proxy"]
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+def fake_created_inspect(adapter, layout, isolation, *, env=None, uid=None, gid=None):
+    """Public engine CLI with explicit process env; high account IDs are modelled at the child OS boundary."""
+    plan = mounts(adapter, layout)
+
+    def call(argv):
+        p = subprocess.run(argv, env=dict(os.environ), capture_output=True, text=True, timeout=15)
+        assert p.returncode == 0, p.stderr
+        return p.stdout
+
+    image = call(adapter.image_inspect_argv(isolation["engine"], isolation["image"]))
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=plan, env=env, uid=uid, gid=gid)
+    if uid is not None or gid is not None:
+        # Model the invoking account, not a fictional Podman option or actual high-ID native execution.
+        bootstrap = ("import os,runpy,sys; os.getuid=lambda:%r; os.getgid=lambda:%r; "
+                     "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')" % (uid, gid))
+        call([sys.executable, "-B", "-c", bootstrap, str(layout.run.parent / "bin" / isolation["engine"]), *argv[1:]])
+    else:
+        call(argv)
+    value = json.loads(call(adapter.inspect_argv(isolation["engine"], layout.run)))
+    kwargs = {"env": env} if env is not None else {}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=plan, image_inspect=image,
+                            uid=uid, gid=gid, **kwargs)
+    return expected, value
+
+
+def verify_surface(adapter, layout, expected, value, surface):
+    if surface == "pure":
+        return adapter.verify(value, expected)
+    path = layout.run.parent / "tampered-inspect.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    result = cli(layout, {**config_for(layout), "isolation": {
+        **ISOLATION, "engine": expected["engine"], "allow_unqualified": expected["engine"] == "docker"}},
+                 "verify", "--inspect", str(path))
+    assert result.returncode in (0, 2), result.stdout + result.stderr
+    answer = json.loads(result.stdout)
+    assert set(answer) == {"mismatches"}, answer
+    return answer["mismatches"]
+
+
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+@pytest.mark.parametrize("key", ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PATH", "PYTHONDONTWRITEBYTECODE"])
+@pytest.mark.parametrize("change", ["missing", "changed", "outside"])
+def test_required_create_environment_values(adapter, layout, surface, key, change):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    items = dict(item.split("=", 1) for item in value[0]["Config"]["Env"])
+    if change == "missing":
+        del items[key]
+    else:
+        items[key] = ("/outside" if change == "outside" else str(layout.project)) if key in (
+            "HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR") else "unrequested-value"
+    value[0]["Config"]["Env"] = [k + "=" + v for k, v in items.items()]
+    assert verify_surface(adapter, layout, expected, value, surface) == ["environment"]
+
+
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+@pytest.mark.parametrize("change", ["runtime", "recorded", "both"])
+@pytest.mark.parametrize("key", ["ANTHROPIC_API_KEY", "TERM"])
+def test_pinned_image_credential_cannot_be_overridden(adapter, layout, monkeypatch, surface, change, key):
+    info = image_info()
+    info[0]["Config"]["Env"].append(key + "=placeholder")  # Synthetic, never an owner credential.
+    image_path = layout.run.parent / "pinned-image.json"
+    image_path.write_text(json.dumps(info), encoding="utf-8")
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_IMAGE", str(image_path))
+    credential = "synthetic-ambient-credential-not-an-owner-secret"
+    monkeypatch.setenv(key, credential)
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    assert adapter.verify(value, expected) == []
+    assert "placeholder" not in json.dumps(expected)
+    assert credential not in json.dumps(expected)
+    if change in ("runtime", "both"):
+        value[0]["Config"]["Env"] = [key + "=" + credential if item.startswith(key + "=")
+                                      else item for item in value[0]["Config"]["Env"]]
+    if change in ("recorded", "both"):
+        argv = value[0]["Config"]["CreateCommand"]
+        index = argv.index(IMAGE)
+        argv[index:index] = ["--env", key + "=" + credential]
+    assert verify_surface(adapter, layout, expected, value, surface) == ["environment"]
+    assert credential not in Path(os.environ["AEGIS_FAKE_ENGINE_LOG"]).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_explicit_environment_overrides_have_value_witnesses(adapter, layout, engine):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    env = {"LANG": "C.UTF-8", "PATH": "/controlled/bin:/usr/bin"}
+    expected, value = fake_created_inspect(adapter, layout, isolation, env=env)
+    assert adapter.verify(value, expected) == []
+    value[0]["Config"]["Env"] += ["PWD=/", "TERM=xterm"]
+    assert adapter.verify(value, expected) == []
+    default = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    assert adapter.verify(value, default) == ["environment"]
+    value[0]["Config"]["Env"] = ["LANG=unapproved" if item.startswith("LANG=") else item
+                                  for item in value[0]["Config"]["Env"]]
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("key", ["LANG", "LC_ALL", "TZ"])
+def test_allowlist_name_without_override_witness_refuses(adapter, layout, key):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Config"]["Env"].append(key + "=ambient-value")
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("change", ["missing", "wrong-value", "duplicate", "inherit-host"])
+def test_recorded_create_environment_must_agree(adapter, layout, change):
+    expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+    argv = value[0]["Config"]["CreateCommand"]
+    index = next(i for i, word in enumerate(argv) if word.startswith("HOME="))
+    if change == "missing":
+        del argv[index - 1:index + 1]
+    elif change == "wrong-value":
+        argv[index] = "HOME=" + str(layout.project)
+    elif change == "inherit-host":
+        argv[index] = "HOME"
+    else:
+        argv[index:index] = [argv[index], "--env"]
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("change", ["missing-map", "missing-home", "fixed-home", "unapproved-key"])
+def test_expected_environment_cannot_waive_value_contract(adapter, layout, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    assert adapter.verify(value, expected) == []
+
+    def fingerprint(key, content):
+        # The normalized witness format hashes canonical JSON [name,value], not raw credential values.
+        return hashlib.sha256(json.dumps([key, content], ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
+
+    values = dict(item.split("=", 1) for item in value[0]["Config"]["Env"])
+    expected.setdefault("environment", {key: fingerprint(key, content) for key, content in values.items()})
+    if change == "missing-map":
+        del expected["environment"]
+    elif change == "missing-home":
+        del expected["environment"]["HOME"]
+    else:
+        key = "HOME" if change == "fixed-home" else "UNAPPROVED_KEY"
+        content = str(layout.project) if change == "fixed-home" else "synthetic-value"
+        expected["environment"][key] = fingerprint(key, content)
+        values[key] = content
+        value[0]["Config"]["Env"] = [k + "=" + v for k, v in values.items()]
+        argv = value[0]["Config"]["CreateCommand"]
+        if change == "fixed-home":
+            argv[next(i for i, word in enumerate(argv) if word.startswith("HOME="))] = "HOME=" + content
+        else:
+            argv[-1:-1] = ["--env", key + "=" + content]
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("bad", [False, {}, ["A=one", "A=two"], ["not-an-assignment"], ["BAD-NAME=value"]])
+def test_image_environment_malformed_refuses(adapter, layout, bad):
+    info = image_info()
+    info[0]["Config"]["Env"] = bad
+    with pytest.raises(ValueError, match="^image inspect has invalid Config.Env$"):
+        expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+@pytest.mark.parametrize("change", ["opposite", "both", "duplicate", "wrong-type", "bad-member", "binds",
+                                    "binds-duplicate", "binds-both", "binds-last-match"])
+def test_every_bind_access_witness_must_agree(adapter, layout, engine, rw, surface, change):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    if surface == "fake-cli":
+        expected, value = fake_created_inspect(adapter, layout, isolation)
+    else:
+        expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+        value = inspect_for(expected)
+    row = next(row for row in value[0]["Mounts"] if row["RW"] is rw)
+    opposite = "ro" if rw else "rw"
+    access = "rw" if rw else "ro"
+    if change.startswith("binds"):
+        flags = {"binds": opposite, "binds-duplicate": access + "," + access,
+                 "binds-both": "ro,rw", "binds-last-match": access}[change]
+        value[0]["HostConfig"]["Binds"] = ["%s:%s:%s" % (row["Source"], row["Destination"], flags)]
+        if change == "binds-last-match":
+            row["RW"] = not rw
+            row["Options" if engine == "podman" else "Mode"] = [opposite] if engine == "podman" else opposite
+    elif engine == "podman":
+        row["Options"] = {"opposite": [opposite], "both": ["ro", "rw"], "duplicate": [access, access],
+                          "wrong-type": opposite, "bad-member": [False]}[change]
+    else:
+        row["Mode"] = {"opposite": opposite, "both": "ro,rw", "duplicate": access + "," + access,
+                       "wrong-type": [opposite], "bad-member": False}[change]
+    assert verify_surface(adapter, layout, expected, value, surface) == ["mounts"]
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("rw", [False, True])
+def test_optional_bind_access_fields_may_be_absent_or_agree(adapter, layout, engine, rw):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected, value = fake_created_inspect(adapter, layout, isolation)
+    row = next(row for row in value[0]["Mounts"] if row["RW"] is rw)
+    field = "Options" if engine == "podman" else "Mode"
+    row.pop(field, None)
+    assert adapter.verify(value, expected) == []
+    row[field] = ["rw" if rw else "ro", "rbind"] if engine == "podman" else ("rw" if rw else "ro")
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.mark.parametrize("axis", ["uid", "gid"])
+@pytest.mark.parametrize("identity", [0, 1000, 65536, 70000, 4294967294])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+def test_modelled_mapping_supports_independent_linux_ids(adapter, layout, axis, identity, surface):
+    uid, gid = (identity, 1000) if axis == "uid" else (1000, identity)
+    if surface == "fake-cli":
+        expected, value = fake_created_inspect(adapter, layout, ISOLATION, uid=uid, gid=gid)
+    else:
+        expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout), uid=uid, gid=gid)
+        value = inspect_for(expected)
+    wanted = (["0:0:1", "1:1:65536"] if identity == 0 else
+              ["0:1:1000", "1000:0:1", "1001:1001:64536"] if identity == 1000 else
+              ["0:1:65536", "%d:0:1" % identity])
+    assert adapter.verify(value, expected) == []
+    assert value[0]["HostConfig"]["IDMappings"]["UidMap" if axis == "uid" else "GidMap"] == wanted
+
+
+def test_fake_image_environment_and_manifest_list(adapter, layout, monkeypatch):
+    image_path = layout.run.parent / "image.json"
+    image_path.write_text(json.dumps([{"Id": "sha256:" + "b" * 64, "Digest": "sha256:" + "c" * 64,
+                                      "RepoDigests": [IMAGE], "Config": {"Env": ["IMAGE_SETTING=fixture"]}}]),
+                          encoding="utf-8")
+    monkeypatch.setenv("AEGIS_FAKE_ENGINE_IMAGE", str(image_path))
+    monkeypatch.setenv("HTTPS_PROXY", "fixture-host-proxy")
+    plan = mounts(adapter, layout)
+
+    def call(argv):
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    image_info = call(adapter.image_inspect_argv("podman", IMAGE))
+    call(adapter.create_argv(ISOLATION, run=layout.run, mounts=plan))
+    value = json.loads(call(adapter.inspect_argv("podman", layout.run)))
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=plan, image_inspect=image_info)
+    assert "IMAGE_SETTING=fixture" in value[0]["Config"]["Env"]
+    assert not any(item.startswith("HTTPS_PROXY=") for item in value[0]["Config"]["Env"])
+    assert adapter.verify(value, expected) == []
+    value[0]["ImageDigest"] = "sha256:" + "d" * 64
+    assert adapter.verify(value, expected) == ["image"]
+
+
+def test_verify_cli_inspects_pinned_image_once(adapter, layout):
+    config = config_for(layout)
+    planned = cli(layout, config, "plan")
+    assert planned.returncode == 0, planned.stdout
+    plan = json.loads(planned.stdout)
+    path = layout.run.parent / "inspect.json"
+    path.write_text(json.dumps(inspect_for(expected_for(adapter, plan["isolation"], run=config["run"], mounts=plan["mounts"]))), encoding="utf-8")
+    verified = cli(layout, config, "verify", "--inspect", str(path))
+    assert verified.returncode == 0, verified.stdout
+    log = Path(os.environ["AEGIS_FAKE_ENGINE_LOG"])
+    assert log.exists(), "verify must inspect the pinned image"
+    assert [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] == [["image", "inspect", IMAGE]]
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+def test_builders_refuse_unequal_path_spellings(adapter, layout, builder):
+    plan = mounts(adapter, layout)
+    plan[0]["source"] += "/."
+    with pytest.raises(ValueError, match="^mount source and destination must be equal$"):
+        getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=plan, **(
+            {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}))
+
+
+@pytest.mark.parametrize("field,bad", [("Tmpfs", []), ("Binds", {})])
+def test_verify_malformed_mount_declarations(adapter, layout, field, bad):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    # Retain the valid declaration in Mounts so a malformed, empty second representation cannot be ignored.
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True})
+    value[0]["HostConfig"][field] = bad
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_verify_cpu_quota_rounding(adapter, layout):
+    isolation = {**ISOLATION, "cpus": 0.33333333}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"].update(NanoCpus=0, CpuPeriod=100000, CpuQuota=33333)
+    assert adapter.verify(value, expected) == []
+    value[0]["HostConfig"]["CpuQuota"] = 33334
+    assert adapter.verify(value, expected) == ["cpus"]
+
+
+def test_verify_cli_image_timeout(adapter, layout):
+    config = config_for(layout)
+    plan = json.loads(cli(layout, config, "plan").stdout)
+    path = layout.run.parent / "inspect.json"
+    path.write_text(json.dumps(inspect_for(expected_for(adapter, plan["isolation"], run=config["run"], mounts=plan["mounts"]))), encoding="utf-8")
+    result = cli(layout, config, "verify", "--inspect", str(path), bootstrap=(
+        "import subprocess; subprocess.run = lambda *a,**kw: "
+        "(_ for _ in ()).throw(subprocess.TimeoutExpired(a[0], kw['timeout'])); "))
+    assert result.returncode == 2 and json.loads(result.stdout) == {"error": "image inspect timed out after 30 seconds"}
+
+
+@pytest.mark.skipif(os.environ.get("AEGIS_TEST_CONTAINER") != "podman",
+                    reason="set AEGIS_TEST_CONTAINER=podman to opt into a real local container")
+def test_real_podman_opt_in(adapter, layout, monkeypatch):
+    if REAL_PODMAN is None:
+        pytest.skip("podman is not on PATH")
+
+    def call(argv):
+        # Keep the engine's existing local image store; container HOME is independently passed with --env.
+        return subprocess.run([REAL_PODMAN, *argv[1:]], env=dict(os.environ, HOME=ENGINE_HOME),
+                              capture_output=True, text=True, timeout=60)
+
+    image = call(adapter.image_inspect_argv("podman", "ubuntu:24.04"))
+    if image.returncode:
+        pytest.skip("local ubuntu:24.04 is unavailable: " + image.stderr.strip())
+    info = json.loads(image.stdout)[0]
+    refs = info.get("RepoDigests", [])
+    if not refs:
+        pytest.skip("local ubuntu:24.04 has no repository digest")
+    isolation = adapter.read_isolation({**ISOLATION, "image": refs[0]}, run=layout.run, home=layout.home)
+    monkeypatch.setattr(os, "lstat", layout.host_lstat)  # Native admission must use real ownership and modes.
+    plan = mounts(adapter, layout)
+    for name in ("home", "codex-home", "claude-home"):
+        (layout.run / name).mkdir()
+    proc = call(adapter.create_argv(isolation, run=layout.run, mounts=plan))
+    assert proc.returncode == 0, proc.stderr
+    try:
+        pinned_image = call(adapter.image_inspect_argv("podman", isolation["image"]))
+        assert pinned_image.returncode == 0, pinned_image.stderr
+        expected = expected_for(adapter, isolation, run=layout.run, mounts=plan, image_inspect=pinned_image.stdout)
+        inspected = call(adapter.inspect_argv("podman", layout.run))
+        assert inspected.returncode == 0, inspected.stderr
+        assert adapter.verify(inspected.stdout, expected) == []
+        identity = call(adapter.exec_argv("podman", layout.run, ["id", "-u"], workdir=layout.project))
+        assert identity.returncode == 0 and identity.stdout.strip() == str(os.getuid()), identity.stderr
+    finally:
+        stopped = call(adapter.stop_argv("podman", layout.run, timeout=5))
+        removed = call(adapter.rm_argv("podman", layout.run))
+        assert stopped.returncode == removed.returncode == 0, stopped.stderr + removed.stderr
