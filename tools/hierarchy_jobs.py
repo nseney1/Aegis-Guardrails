@@ -56,6 +56,7 @@ Linux only, because the census and the liveness checks read /proc.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -75,6 +76,7 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
+import hierarchy_hosts  # noqa: E402
 from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
                                publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                status_entries, writer_lock)
@@ -823,6 +825,55 @@ def source_digest(checkout):
                "dirty_content_sha256": digest, "dirty_entries": count}
 
 
+def derive_host_plan(initiative):
+    """Only the canonical mailbox of a provisioned Claude base can use its fully validated plan."""
+    root = safe_path(Path(initiative["mailbox_root"]))
+    base = root.parent
+    path = base / hierarchy_hosts.PLAN_FILE
+    reason = "derive is for shell-less teams"
+    try:
+        require(root == base / "mailbox", "registered mailbox is not <base>/mailbox")
+        setup = read_json(base / "provision.json")
+        require(setup["mailbox_root"] == str(root) and setup["initiative"] == initiative["id"],
+                "registered mailbox does not match provision.json")
+        plan = hierarchy_hosts.base_plan(base, initiative["id"])
+        require(plan is not None and plan["team"] == hierarchy_hosts.CLAUDE, reason)
+        raw = read_bytes(path)
+        require(strict_json(raw.decode("utf-8")) == plan, "host plan changed while reading")
+    except ERRORS as exc:
+        raise ValueError(reason + ": " + str(exc)) from exc
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "team": plan["team"]}
+
+
+class AdmissionHeld(Exception):
+    """Another runner already has custody; observing it never grants a second admission writer."""
+
+
+def admitted_derivation(job, raw, recipes_sha256):
+    """The first successful admission is immutable and bound to both the original packet and recipe bytes."""
+    reference = read_json(job.folder / "admitted.json")
+    fields(reference, {"packet_sha256", "recipes_sha256", "derivation_sha256"})
+    saved = read_bytes(job.folder / "packet.md")
+    require(saved == raw and reference["packet_sha256"] == hashlib.sha256(raw).hexdigest(),
+            "admitted packet does not match the original request")
+    require(reference["recipes_sha256"] == recipes_sha256, "recipes changed after admission")
+    require(reference["derivation_sha256"] == file_sha256(job.folder / "derivation.json"),
+            "admitted derivation evidence changed")
+    derived = read_json(job.folder / "derivation.json")
+    matching(derived["dirty_content_sha256"], SHA256, "admitted dirty_content_sha256")
+    matching(derived["expected_tree"], GIT_ID, "admitted expected_tree")
+    require(derived["derived_by"] == "runner", "invalid admitted derivation")
+    return derived
+
+
+def derivation_provenance(job):
+    path = job.folder / "derivation.json"
+    if not path.exists():
+        return {}
+    derived = read_json(path)
+    return {key: derived[key] for key in ("derived_by", "dirty_content_sha256", "expected_tree", "host_plan", "changed_paths")}
+
+
 class DependencyPending(ValueError):
     """No dependent effect was admitted; keep the original request available for reconciliation."""
 
@@ -907,7 +958,7 @@ def pending_dependency(store, job, exc, wait, recipes_sha256):
         return blocked_row(job, failure)
 
 
-def admit(ledger, initiative, message, mailbox, recipes, store=None):
+def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
     """Everything a job must satisfy before it runs. A ValueError here becomes the refusal's reason."""
     raw = mailbox.brief(message["brief"])
     try:
@@ -919,11 +970,23 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     dependent = isinstance(packet, dict) and packet.get("schema") == DEPENDENT_PACKET_SCHEMA
     fields(packet, {"schema", "recipe", "checkout", "commit", "tree"} |
            ({"after", "recipes_sha256"} if dependent else set()),
-           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge"})
+           {"dirty_content_sha256", "paths", "expected_tree", "message", "merge", "derive"})
     require(packet["schema"] in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA), "unsupported packet schema")
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
     recipe = recipes["recipes"][name]
+    kind = recipe["kind"]
+    derive = "derive" in packet
+    if derive:
+        require(packet["derive"] == "runner", "derive must be runner")
+        require(kind == "commit", "only a commit recipe takes derive")
+        host_plan = derive_host_plan(initiative)
+        require(store is not None, "derivation requires the workspace store")
+        job = job or Job(store.path, initiative, message)
+        saved = (admitted_derivation(job, raw, recipes["recipes_sha256"])
+                 if (job.folder / "admitted.json").exists() else None)
+        if saved is not None:
+            require(saved["host_plan"] == host_plan, "host plan changed after admission")
     checkout = absolute(packet["checkout"], "checkout")
     require(checkout in initiative["checkouts"], "checkout is not registered for this initiative: " + checkout)
     matching(packet["commit"], GIT_ID, "commit")
@@ -933,7 +996,6 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     # A test run over uncommitted bytes says nothing about any commit a Reviewer can read.
     require(not recipe.get("require_clean", False) or dirty == EMPTY_STATUS, clean_refusal(name))
     paths = checked_paths(packet, recipe, checkout)
-    kind = recipe["kind"]
     if dependent:
         require(kind == "command" and dirty == EMPTY_STATUS, "dependent jobs require command checks on clean source")
         fields(packet["after"], {"message_id", "sha256"})
@@ -944,15 +1006,18 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
         require(store is not None, "dependent jobs require the workspace store")
         check_dependency(store, initiative, message, packet, recipes)
     if kind in ("commit", "merge"):
-        require("expected_tree" in packet and "message" in packet, "a %s recipe needs expected_tree and message" % kind)
-        matching(packet["expected_tree"], GIT_ID, "expected_tree")
+        require(("expected_tree" in packet or derive) and "message" in packet,
+                "a %s recipe needs expected_tree and message" % kind)
+        if "expected_tree" in packet:
+            matching(packet["expected_tree"], GIT_ID, "expected_tree")
         text(packet["message"], "commit message", 65536)
     else:
         require("expected_tree" not in packet and "message" not in packet,
                 "only a commit recipe or a merge recipe takes expected_tree or message")
     require(kind == "merge" or "merge" not in packet, "only a merge recipe takes merge")
     if kind == "commit":
-        require(packet["expected_tree"] != packet["tree"], "this commit would make no change")
+        if "expected_tree" in packet:
+            require(packet["expected_tree"] != packet["tree"], "this commit would make no change")
         code, overlap = check_paths(ledger, initiative["id"], paths)
         require(code == 0, "paths overlap another lease or a checkout could not be read: " + json.dumps(
             overlap["conflicts"] + overlap["unreadable_checkouts"], sort_keys=True)[:1024])
@@ -969,6 +1034,8 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     require(recipe["sandbox"] == "none" or shutil.which("bwrap") is not None,
             "this recipe needs bubblewrap, which is not available")
     witness = source_state(mailbox, checkout, MERGE_VIEW_ENV if kind == "merge" else None)
+    if derive and "dirty_content_sha256" not in packet:
+        dirty = saved["dirty_content_sha256"] if saved is not None else witness["dirty_content_sha256"]
     # Named before the plain mismatch, so a packet that claimed a clean checkout learns why it cannot run.
     require(not recipe.get("require_clean", False) or witness["dirty_content_sha256"] == EMPTY_STATUS, clean_refusal(name))
     require((witness["source_revision"], witness["source_tree"], witness["dirty_content_sha256"]) ==
@@ -976,6 +1043,25 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None):
     if recipe.get("require_clean", False):
         refuse_paths_outside_commit(checkout, packet["commit"], paths)
     admitted = {**packet, "dirty_content_sha256": dirty, "paths": paths}
+    if derive:
+        if saved is not None:
+            admitted.update({key: saved[key] for key in ("expected_tree", "derived_by", "host_plan", "changed_paths")})
+            return admitted, raw
+        if not job.claim(raw, recipes["recipes_sha256"]):
+            raise AdmissionHeld()
+        job.admission_owned = True
+        derived = derive_commit_tree(admitted, recipes, job, host_plan)
+        tree = derived["expected_tree"]
+        require(source_state(mailbox, checkout) == witness, "source changed during derivation")
+        require(tree != packet["tree"], "this commit would make no change")
+        require("expected_tree" not in packet or packet["expected_tree"] == tree,
+                "the derived tree %s is not the expected tree %s" % (tree, packet.get("expected_tree")))
+        outside = [name for name in derived["changed_paths"] if name not in paths]
+        require(not outside, "derive staged files outside paths: " + ", ".join(outside))
+        admitted.update({key: derived[key] for key in ("expected_tree", "derived_by", "host_plan", "changed_paths")})
+        publish_file(job.folder / "admitted.json", encoded({"packet_sha256": hashlib.sha256(raw).hexdigest(),
+                     "recipes_sha256": recipes["recipes_sha256"],
+                     "derivation_sha256": file_sha256(job.folder / "derivation.json")}) + b"\n")
     if kind == "merge":
         merge_refusals(checkout, packet["commit"], packet["merge"])
         # The witness binds the revision and tree, not the branch, so the branch is held here and checked again at run time.
@@ -1125,6 +1211,8 @@ class Job:
         self.claim_path = self.folder / "claim.json"
         self.result_path = self.folder / "result.json"
         self.process_path = self.folder / "process.json"
+        self.execution_path = self.folder / "execution.json"
+        self.admission_owned = False
 
     def result(self):
         """Read with the same limit it was written with, or a valid large result could never be settled."""
@@ -1192,7 +1280,7 @@ class Job:
     def runner_alive(self):
         """True/False only with a valid original claim and observable process; otherwise unknown."""
         try:
-            claim = read_json(self.claim_path)
+            claim = read_json(self.execution_path if self.execution_path.exists() else self.claim_path)
         except (ValueError, OSError):
             return None
         require(isinstance(claim, dict) and claim.get("job") == self.id, "claim does not belong to job: " + self.id)
@@ -1201,6 +1289,43 @@ class Job:
         if claim.get("process_scope") != process_scope():
             return None
         return process_start(claim["pid"]) == claim["start"]
+
+    @contextmanager
+    def disposition(self):
+        """Serialize execution claims and root resolution; a crashed holder cannot leave a stale file lock."""
+        import fcntl  # Linux-only runner; keep recipe inspection importable on other platforms.
+
+        with open(safe_path(self.folder / "disposition.lock"), "a+b") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("job disposition is busy: " + self.id) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def take_execution(self, packet_raw, recipes_sha256):
+        """A successful derived admission may wait across polls; its execution claim is still one-use."""
+        if not (self.folder / "admitted.json").exists():
+            return self.claim(packet_raw, recipes_sha256)
+        with self.disposition():
+            raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
+            admitted_derivation(self, raw, recipes_sha256)
+            check_settlement_processes(self, {"steps": []})
+            claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
+                     "process_scope": process_scope(), "recipes_sha256": recipes_sha256}
+            try:
+                publish_file(self.execution_path, encoded(claim) + b"\n")
+            except FileExistsError:
+                return False
+            # A scheduler may have re-admitted this job before root resolved it. Claim publication alone is not
+            # permission to run: check the terminal record and our ownership under the same exclusion as resolve.
+            if self.result_path.exists():
+                return False
+            require(read_json(self.execution_path) == claim and self.runner_alive() is True,
+                    "execution claim ownership changed: " + self.id)
+            return True
 
     def process_record(self):
         try:
@@ -1231,7 +1356,8 @@ class Job:
         return None
 
     def evidence(self):
-        names = sorted(path for path in self.folder.iterdir() if path.name.startswith("step-") or path.name == "result.json")
+        names = sorted(path for path in self.folder.iterdir()
+                       if path.name.startswith("step-") or path.name in ("result.json", "derivation.json"))
         return [{"path": str(path), "sha256": file_sha256(path)} for path in names]
 
 
@@ -1331,7 +1457,7 @@ def settle(store, job, wait):
     result = job.result()
     check_settlement_processes(job, result)
     state = result["state"]
-    evidence = job.evidence() if state != "refused" else None
+    evidence = job.evidence() if state != "refused" or (job.folder / "derivation.json").exists() else None
     publish_receipt(job, state, result_body(job, result), wait, exit_code=result["exit_code"], evidence=evidence,
                     reason=result.get("reason"))
     reference = {"path": str(job.result_path), "sha256": file_sha256(job.result_path)}
@@ -1435,9 +1561,11 @@ def keep_evidence(job, keep):
 
 
 def refuse(store, job, reason, wait, recipes_sha256=None):
-    if not job.claim(None, recipes_sha256):
+    if not job.admission_owned and not job.take_execution(None, recipes_sha256):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
-    write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256)
+    if job.admission_owned:
+        check_settlement_processes(job, {"steps": []})
+    write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256, **derivation_provenance(job))
     return settle(store, job, wait)
 
 
@@ -1523,11 +1651,12 @@ def job_environment(recipes, job, checkout, export=None):
 
 
 class Step:
-    def __init__(self, argv, env=None, capture=False, verdict=False):
+    def __init__(self, argv, env=None, capture=False, verdict=False, raw=False):
         # A verdict step's exit is the plan's to judge: it receives (exit code, output), so a non-zero exit can halt the
         # job with a reason of its own, such as the conflicted paths, instead of a bare exit code. Its output is the
         # captured stdout, or else its log, so that reason can quote git's own error.
         self.argv, self.env, self.capture, self.verdict = argv, env or {}, capture, verdict
+        self.raw = raw
 
 
 class Halt(Exception):
@@ -1589,19 +1718,61 @@ def put_back(git, env, job, old, new, failed, code, output):
     raise Halt("%s failed after HEAD moved to %s (exit %d): %s. %s." % (failed, new, code, git_error(output), outcome))
 
 
+def commit_git(recipes):
+    identity = recipes["identity"]
+    return ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
+            "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
+
+
+def stage_commit_tree(packet, recipes, job):
+    """Admission and execution stage the same paths, with the same Git config and a private index."""
+    git = commit_git(recipes)
+    temporary = {"GIT_LITERAL_PATHSPECS": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_INDEX_FILE": str(job.folder / "scratch" / "index")}
+    yield Step(git + ["read-tree", packet["commit"]], temporary)
+    yield Step(git + ["add", "--", *packet["paths"]], temporary)
+    return (yield Step(git + ["write-tree"], temporary, capture=True))
+
+
+def derive_commit_tree(packet, recipes, job, host_plan):
+    """Stage under the job's durable claim: uncertain processes never become terminal admission refusals."""
+    def plan():
+        tree = yield from stage_commit_tree(packet, recipes, job)
+        names = yield Step(commit_git(recipes) + ["diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z",
+                                                packet["commit"], tree], capture=True, raw=True)
+        return {"expected_tree": tree, "changed_paths": sorted(names.split("\0")[:-1])}
+
+    def stopped():
+        try:
+            check_settlement_processes(job, {"steps": []})
+        except ERRORS as exc:
+            raise StillRunning(job.process_group() or 0, "staging stop is unconfirmed: " + str(exc)) from exc
+
+    derived = {"derived_by": "runner", "dirty_content_sha256": packet["dirty_content_sha256"],
+               "host_plan": host_plan, "expected_tree": None, "changed_paths": None}
+    try:
+        result = execute(job, recipes["recipes"][packet["recipe"]], packet, recipes, lambda: None, {}, plan=plan())
+    except ERRORS:
+        stopped()
+        publish_file(job.folder / "derivation.json", encoded(derived) + b"\n")
+        raise
+    stopped()
+    if result.reason is None:
+        matching(result.created["expected_tree"], GIT_ID, "derived expected_tree")
+        derived.update(result.created)
+    publish_file(job.folder / "derivation.json", encoded(derived) + b"\n")
+    require(result.reason is None, "could not derive expected_tree: " + str(result.reason))
+    return derived
+
+
 def commit_steps(packet, recipes, job, details):
     """Built on a throwaway index, so a wrong tree leaves the checkout's index, HEAD and files as they were."""
-    identity = recipes["identity"]
-    git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-           "-c", "user.name=" + identity["name"], "-c", "user.email=" + identity["email"]]
+    git = commit_git(recipes)
     plain = {"GIT_LITERAL_PATHSPECS": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    temporary = {**plain, "GIT_INDEX_FILE": str(job.folder / "scratch" / "index")}
     message_file = job.folder / "scratch" / "commit-message"
     message_file.parent.mkdir(mode=0o700, exist_ok=True)
     message_file.write_text(packet["message"], encoding="utf-8")
-    yield Step(git + ["read-tree", packet["commit"]], temporary)
-    yield Step(git + ["add", "--", *packet["paths"]], temporary)
-    tree = yield Step(git + ["write-tree"], temporary, capture=True)
+    tree = yield from stage_commit_tree(packet, recipes, job)
     if tree != packet["expected_tree"]:
         raise Halt("the staged tree %s is not the expected tree %s" % (tree, packet["expected_tree"]))
     commit = details["new_commit"] = yield Step(git + ["commit-tree", tree, "-p", packet["commit"], "-F", str(message_file)],
@@ -1714,22 +1885,24 @@ def run_step(job, number, step, sandbox, env, checkout, deadline, on_start, pref
     row["exit_code"] = process.returncode
     row["seconds"] = round(time.monotonic() - began, 3)
     source = out_path if step.capture else log_path if step.verdict else None
-    return row, source.read_text(encoding="utf-8", errors="replace").strip() if source else None
+    output = source.read_text(encoding="utf-8", errors="replace") if source else None
+    return row, output if step.raw or output is None else output.strip()
 
 
-def execute(job, recipe, packet, recipes, on_start, details, export=None):
+def execute(job, recipe, packet, recipes, on_start, details, export=None, *, plan=None, step_offset=0):
     """export, for a require_clean job, replaces the checkout as the steps' folder and $checkout."""
     env = job_environment(recipes, job, packet["checkout"], export)
     sandbox = sandbox_prefix(recipes, recipe, job, packet["checkout"], export)
     checkout = export or packet["checkout"]
     prefix = list(recipes.get("prefix", []))
     deadline = time.monotonic() + recipe["timeout_seconds"]
-    if recipe["kind"] == "commit":
-        plan = commit_steps(packet, recipes, job, details)
-    elif recipe["kind"] == "merge":
-        plan = merge_steps(packet, recipes, job, details)
-    else:
-        plan = command_steps(recipe, packet, recipes, job, checkout)
+    if plan is None:
+        if recipe["kind"] == "commit":
+            plan = commit_steps(packet, recipes, job, details)
+        elif recipe["kind"] == "merge":
+            plan = merge_steps(packet, recipes, job, details)
+        else:
+            plan = command_steps(recipe, packet, recipes, job, checkout)
     rows, reason, exit_code, created, output = [], None, 0, None, None
     failed_launch = None
     started = False
@@ -1743,7 +1916,7 @@ def execute(job, recipe, packet, recipes, on_start, details, export=None):
     try:
         step = plan.send(None)
         while True:
-            row, output = run_step(job, len(rows) + 1, step, sandbox, env, checkout, deadline, started_once, prefix)
+            row, output = run_step(job, step_offset + len(rows) + 1, step, sandbox, env, checkout, deadline, started_once, prefix)
             rows.append(row)
             if row["timed_out"]:
                 reason = "timed out after %d seconds" % recipe["timeout_seconds"]
@@ -1793,17 +1966,26 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
         try:
             with writer_lock(Path(job.initiative["mailbox_root"])):
                 check_dependency(store, job.initiative, job.message, packet, recipes)
-                claimed = job.claim(packet_raw, recipes["recipes_sha256"])
+                claimed = job.take_execution(packet_raw, recipes["recipes_sha256"])
         except DependencyPending as exc:
             return pending_dependency(store, job, exc, wait, recipes["recipes_sha256"])
     else:
-        claimed = job.claim(packet_raw, recipes["recipes_sha256"])
+        claimed = job.take_execution(packet_raw, recipes["recipes_sha256"])
     if not claimed:
+        if packet.get("derived_by") == "runner" and job.result_path.exists():
+            return settle(store, job, wait)
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
     view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
     provenance = {"recipes_sha256": recipes["recipes_sha256"]}
+    if packet.get("derived_by") == "runner":
+        provenance.update(derivation_provenance(job))
+        try:
+            require(derive_host_plan(job.initiative) == packet["host_plan"], "host plan changed after admission")
+        except ERRORS as exc:
+            write_result(job, "refused", None, reason=str(exc)[:2048], **provenance)
+            return settle(store, job, wait)
     try:
         before = source_state(mailbox, checkout, view)
         branch = head_ref(checkout) if recipe["kind"] == "merge" else None
@@ -1864,7 +2046,10 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
             return settle(store, job, wait)
     details = {}
     try:
-        execution = execute(job, recipe, packet, recipes, announce, details, export)
+        # Derivation's logs/process records stay in this same folder; execution must append, never overwrite them.
+        offset = max((int(path.name[5:-4]) for path in job.folder.glob("step-*.log")
+                      if path.name[5:-4].isdigit()), default=0) if packet.get("derived_by") == "runner" else 0
+        execution = execute(job, recipe, packet, recipes, announce, details, export, step_offset=offset)
     except StillRunning as exc:
         # Without a confirmed stop there is no honest result, so the job keeps its slot until root resolves it.
         row = {"job": job.id, "state": "abandoned", "process_group": exc.group, "process_alive": True, "error": str(exc)}
@@ -1961,6 +2146,13 @@ def visit_existing(store, job, wait):
             return blocked_row(job, exc)
     if not job.folder.exists():
         return None
+    if (job.folder / "admitted.json").exists() and not job.execution_path.exists():
+        # Only a successful, stopped derivation can publish this marker. It is ready, not a crashed execution.
+        try:
+            check_settlement_processes(job, {"steps": []})
+        except ERRORS as exc:
+            return blocked_row(job, exc)
+        return None
     group = job.process_group()
     runner = job.runner_alive()
     if runner is None:
@@ -2015,7 +2207,14 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
                 rows.append(existing)
                 continue
             try:
-                packet, raw = admit(ledger, initiative, message, mailbox, recipes, store)
+                packet, raw = admit(ledger, initiative, message, mailbox, recipes, store, job)
+            except AdmissionHeld:
+                rows.append(visit_existing(store, job, wait) or {"job": job.id, "state": "waiting", "reason": "admission_busy"})
+                continue
+            except StillRunning as exc:
+                rows.append({"job": job.id, "state": "abandoned", "process_group": job.process_group(),
+                             "process_alive": None, "reason": str(exc)})
+                continue
             except DependencyPending as exc:
                 rows.append(pending_dependency(store, job, exc, wait, recipes["recipes_sha256"]))
                 continue
@@ -2191,22 +2390,23 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     folder = safe_path(store.path / "jobs" / initiative_id / message_id)
     require(record is not None and folder.exists(), "no running job here: " + identifier)
     job = Job(store.path, initiative, record["message"])
-    require(not job.result_path.exists(), "job is already finished: " + identifier)
-    runner = job.runner_alive()
-    require(runner is not None, "runner visibility is unknown: " + identifier)
-    require(not runner, "its runner is still running: " + identifier)
-    group = job.process_group()
-    require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
-    unrecorded = job.unrecorded_step()
-    if unrecorded:
-        require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
-                "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
-    # runner_alive above has read and checked this claim. A claim written before the hash was stored records null.
-    recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
-    require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
-            "invalid recipes_sha256 in the claim of job: " + identifier)
-    write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
-                 process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256)
+    with job.disposition():
+        require(not job.result_path.exists(), "job is already finished: " + identifier)
+        runner = job.runner_alive()
+        require(runner is not None, "runner visibility is unknown: " + identifier)
+        require(not runner, "its runner is still running: " + identifier)
+        group = job.process_group()
+        require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
+        unrecorded = job.unrecorded_step()
+        if unrecorded:
+            require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
+                    "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
+        # runner_alive above has read and checked this claim. A claim written before the hash was stored records null.
+        recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
+        require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
+                "invalid recipes_sha256 in the claim of job: " + identifier)
+        write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
+                     process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256, **derivation_provenance(job))
     return 0, settle(store, job, wait)
 
 
@@ -2261,7 +2461,8 @@ def recovery_source(job, mailbox, result):
     """Observe the original packet and current source without admitting or running it."""
     if mailbox is None or "brief" not in job.message:
         return {"state": "unavailable", "reason": "original mailbox request is unavailable"}
-    packet = strict_json(packet_text(mailbox.brief(job.message["brief"])))
+    raw = mailbox.brief(job.message["brief"])
+    packet = strict_json(packet_text(raw))
     require(isinstance(packet, dict) and packet.get("schema") in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA),
             "invalid recovery packet")
     checkout = absolute(packet["checkout"], "checkout")
@@ -2270,6 +2471,16 @@ def recovery_source(job, mailbox, result):
     observed = source_state(mailbox, checkout, view)
     expected = {"source_revision": packet["commit"], "source_tree": packet["tree"],
                 "dirty_content_sha256": packet.get("dirty_content_sha256", EMPTY_STATUS)}
+    if (job.folder / "admitted.json").exists():
+        reference = read_json(job.folder / "admitted.json")
+        derived = admitted_derivation(job, raw, reference["recipes_sha256"])
+        expected["dirty_content_sha256"] = derived["dirty_content_sha256"]
+    elif packet.get("derive") == "runner" and (job.folder / "derivation.json").exists():
+        # A known staging failure or a crash before the successful-admission marker still has an observed digest.
+        require(read_bytes(job.folder / "packet.md") == raw, "derivation packet does not match the original request")
+        derived = read_json(job.folder / "derivation.json")
+        matching(derived["dirty_content_sha256"], SHA256, "derived dirty_content_sha256")
+        expected["dirty_content_sha256"] = derived["dirty_content_sha256"]
     # A completed commit/merge changes source intentionally. Its after-witness, not the old packet,
     # is the reference for later incoming-work revalidation; the original packet remains untouched.
     if result is not None and isinstance(result.get("after"), dict):
@@ -2296,8 +2507,13 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 group = job.process_group()
                 row["process_group"] = group
                 row["process_alive"] = bool(group_members(group)) if group else None
-                row["state"] = "running" if row["runner_alive"] is True else "unknown_effect"
-                row["next_action"] = "Retain the original reservation; a qualified operator must reconcile process effects."
+                if (job.folder / "admitted.json").exists() and not job.execution_path.exists():
+                    check_settlement_processes(job, {"steps": []})
+                    row["state"] = "admitted"
+                    row["next_action"] = "Recheck the persisted admission with run-open; do not derive again."
+                else:
+                    row["state"] = "running" if row["runner_alive"] is True else "unknown_effect"
+                    row["next_action"] = "Retain the original reservation; a qualified operator must reconcile process effects."
             else:
                 # Historical evidence remains useful when the original process scope
                 # cannot be observed. Record it before the independent stop check;
@@ -2308,7 +2524,7 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 receipt = {"state": result["state"]}
                 if result["exit_code"] is not None:
                     receipt["exit_code"] = result["exit_code"]
-                if result["state"] != "refused":
+                if result["state"] != "refused" or (job.folder / "derivation.json").exists():
                     receipt["evidence"] = job.evidence()
                 if result.get("reason") is not None:
                     receipt["reason"] = result["reason"][:4096]
