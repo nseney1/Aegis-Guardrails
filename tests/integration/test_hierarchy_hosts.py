@@ -207,7 +207,7 @@ def test_session_uuid_shape_distinguishes_ids_from_prompt_words(value, expected)
 
 def test_unproven_selector_still_accepts_its_bound_legacy_session_id():
     session = "modelled-legacy-session"
-    assert hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
+    assert not hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
 
 
 @pytest.mark.parametrize("evidence", ["proven", "unproven"])
@@ -773,3 +773,123 @@ def test_session_recorded_compares_an_existing_record_and_refuses_a_different_on
     path.write_text(json.dumps({**record, "start_mode": "background"}), encoding="utf-8")
     assert refusal(hierarchy_hosts.session_recorded, path, record) == (
         "session record for m1/lane/f2 generation 3 differs from this binding")
+
+
+# R2's finite, source-bound catalog, copied as test data rather than read from the matcher under test.
+# Public Codex rust-v0.167.0, commit 086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a:
+# G: cli/src/main.rs:127-141 + tui/src/cli.rs:66-67,128-135; E: exec/src/cli.rs:15-25;
+# R_exec globals: config_override.rs:29-36, main.rs:958-965 and exec/src/cli.rs:36-79,163-170.
+R2_CODEX_OPTIONS = [
+    (("-c", "--config"), ("G", "E", "R_exec"), 'model="modelled"'),
+    (("--enable",), ("G", "E", "R_exec"), "apps"),
+    (("--disable",), ("G", "E", "R_exec"), "apps"),
+    (("--model", "-m"), ("G", "E", "R_exec"), "modelled"),
+    (("--sandbox", "-s"), ("G", "E"), "workspace-write"),
+    (("--cd", "-C"), ("G", "E"), "/modelled path/resume data"),
+    (("--add-dir",), ("G", "E"), "/modelled path/additional"),
+    (("--profile", "-p"), ("G", "E"), "modelled-profile"),
+    (("--output-last-message", "-o"), ("E", "R_exec"), "/modelled output/message"),
+    (("--output-schema",), ("E", "R_exec"), "/modelled output/schema.json"),
+    (("--json", "--experimental-json"), ("E", "R_exec"), None),
+    (("--ignore-user-config",), ("E", "R_exec"), None),
+    (("--skip-git-repo-check",), ("E", "R_exec"), None),
+]
+
+
+@pytest.mark.parametrize("names,stages,value", R2_CODEX_OPTIONS)
+@pytest.mark.parametrize("stage", ["G", "E", "R_exec", "R_direct"])
+def test_r2_codex_option_stages_and_aliases_are_finite(names, stages, value, stage):
+    for name in names:
+        option = [name] + ([] if value is None else [value])
+        argv = {"G": ["codex", *option, "exec", "resume", SESSION],
+                "E": ["codex", "exec", *option, "resume", SESSION],
+                "R_exec": ["codex", "exec", "resume", *option, SESSION],
+                "R_direct": ["codex", "resume", *option, SESSION]}[stage]
+        assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION) is (stage in stages), argv
+
+
+@pytest.mark.parametrize("names,stages,value", R2_CODEX_OPTIONS)
+def test_r2_codex_unadmitted_equals_attached_and_post_sid_forms_hold(names, stages, value):
+    stage = "G" if "G" in stages else "E"
+    for name in names:
+        forms = [name + "=" + (value if value is not None else "true")]
+        if name.startswith("-") and not name.startswith("--") and value is not None:
+            forms.append(name + value)
+        for form in forms:
+            argv = (["codex", form, "exec", "resume", SESSION] if stage == "G" else
+                    ["codex", "exec", form, "resume", SESSION])
+            assert not hierarchy_hosts.matches_session("codex-cli", argv, SESSION), argv
+        after = ["codex", "exec", "resume", SESSION, name, *([] if value is None else [value])]
+        assert not hierarchy_hosts.matches_session("codex-cli", after, SESSION), after
+
+
+def test_r2_all_codex_builder_optional_combinations_preserve_opaque_atoms():
+    from itertools import product
+
+    other = "00000000-0000-0000-0000-000000000001"
+    disabled_lists = [[], ["apps"], ["apps", "plugins"], hierarchy_provision.CODEX_DISABLED,
+                      hierarchy_provision.CODEX_DISABLED + hierarchy_provision.CODEX_SHELL]
+    dirs = [[], ["/modelled path/one"], ["/modelled path/one", "/modelled path/resume " + other]]
+    profiles = vectors = 0
+    for sandbox, ignore, model, effort, tier, tmpdir, skip in product(
+            ("read-only", "workspace-write"), (False, True), (None, "model with spaces"), (None, "high"),
+            (None, "priority"), (None, "/modelled temp/quotes' resume " + other), (False, True)):
+        for disabled, add_dirs in product(disabled_lists, dirs):
+            profile = {"disabled_features": disabled, "ignore_user_config": ignore, "sandbox": sandbox,
+                       "approval_policy": "never", "writable_roots": ["/modelled roots/resume " + other],
+                       "network_access": False, "mcp_servers": {"mailbox": {"command": "python", "args": [
+                           "/modelled mcp.py", "--root", "resume " + other]}}, "cwd": "/modelled cwd/resume " + other,
+                       "model": model, "effort": effort, "service_tier": tier, "tmpdir": tmpdir,
+                       "add_dirs": add_dirs, "skip_git_repo_check": skip}
+            profiles += 1
+            for tail, expected in ((["resume " + SESSION], False), (["resume", SESSION], True),
+                                   (["resume", SESSION, "resume"], True),
+                                   (["resume", SESSION, "please resume " + other + " --resume " + other], True)):
+                argv = hierarchy_provision.codex_argv(profile, tail)
+                assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION) is expected, argv
+                vectors += 1
+    assert profiles == 1920 and vectors == 7680
+
+
+def test_r2_descendant_negative_guard_keeps_the_complete_resume_prompt_opaque():
+    # MODELLED complete atoms, using the admitted builder tail; the final resume is owner prompt data.
+    argv = ["codex", "exec", "resume", SESSION, "resume"]
+    assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION)
+    assert not hierarchy_hosts.selects_other_session(argv, SESSION)
+
+
+def test_r2_all_claude_builder_optional_combinations_preserve_opaque_atoms():
+    from itertools import product
+
+    # Producer/modelled grammar only: no claim that an installed Claude accepted these option combinations.
+    other = "00000000-0000-0000-0000-000000000001"
+    catalog = json.dumps({"worker": {"prompt": "Explain --resume " + other}})
+    cases = 0
+    for bg, assistants, model, effort, ultra, allowed, dirs, selector, tools in product(
+            (False, True), (None, catalog), (None, "modelled"), (None, "high"), (False, True),
+            ([], ["Read", "Edit"]), ([], ["/modelled path/one"], ["/modelled path/one", "/modelled path/two"]),
+            ("--resume", "--session-id"), ([], ["Read", "Edit"])):
+        request = {"add_dirs": dirs}
+        if model is not None:
+            request["model"] = model
+        if effort is not None:
+            request["effort"] = effort
+        if ultra:
+            request["ultracode"] = True
+        argv = hierarchy_provision.claude_argv([selector, SESSION], "/modelled connection.json", tools, allowed,
+                                             request, assistants, "modelled background" if bg else None)
+        if bg:
+            argv += ["resume"]  # The builder's genuine -- protects its one opaque background prompt.
+        assert hierarchy_hosts.matches_session("claude-code", argv, SESSION), argv
+        cases += 1
+    assert cases == 768
+
+
+@pytest.mark.parametrize("kind,argv", [
+    ("codex-cli", ["codex", "--unknown=value", "exec", "resume", SESSION]),
+    ("codex-cli", ["node", "--unknown=value", "/bin/codex", "exec", "resume", SESSION]),
+    ("claude-code", ["claude", "--unknown=value", "--resume", SESSION]),
+    ("claude-code", ["node", "--unknown=value", "/bin/claude", "--resume", SESSION]),
+])
+def test_r2_unknown_host_or_node_options_cannot_establish_ownership(kind, argv):
+    assert not hierarchy_hosts.matches_session(kind, argv, SESSION)

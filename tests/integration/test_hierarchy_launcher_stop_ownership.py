@@ -3,15 +3,19 @@ import os
 import json
 from pathlib import Path
 import signal
+import shlex
 import subprocess
 import sys
 import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_launcher import Launch, REVIEW, launcher_module, wait_until
+from tests.integration.test_hierarchy_launcher import (Launch, REVIEW, R2Processes, R2Custody, R2CleanupError,
+                                                       r2_map_present, R2Facade,
+                                                       R2CleanupUnknown, R2_ACTOR_BOOTSTRAP, launcher_module,
+                                                       r2_kernel_process, native_wait_fields, wait_until)
 from tests.integration.test_hierarchy_launcher_hosts import Hosts
-from tests.integration.test_hierarchy_mailbox import git
+from tests.integration.test_hierarchy_mailbox import ROOT, git
 
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="these process argv tests need Linux")
@@ -67,13 +71,13 @@ def launch(tmp_path):
 
 
 @pytest.fixture
-def children(tmp_path):
-    """Real Python children with the argv of a host or wrapper; no installed host or Node is run."""
+def children(tmp_path, r2_case):
+    """Physical Python children; callers supply MODELLED complete host arrays, never a native inference."""
     running = []
     for name in ("sleeper.py", "claude", "codex", "K=V"):
         (tmp_path / name).write_text(CHILD, encoding="utf-8")
 
-    def spawn(*argv):
+    def spawn(*argv, logical_argv, body=CHILD):
         argv = list(argv)
         if argv[0] != sys.executable:
             binary = Path(argv[0]).parent / "interpreters" / Path(argv[0]).name
@@ -81,10 +85,8 @@ def children(tmp_path):
             binary.symlink_to(sys.executable)
             argv[0] = str(binary)
         ready = tmp_path / ("ready-%d" % len(running))
-        process = subprocess.Popen(argv, cwd=str(tmp_path),
-                                   env={**os.environ, "STOP_OWNERSHIP_READY": str(ready)},
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   start_new_session=True)
+        process = r2_case.spawn_legacy(argv, logical_argv, body, {"STOP_OWNERSHIP_READY": str(ready)})
+        argv = list(process.args)
         running.append(process)
         wait_until(lambda: ready.exists() or process.poll() is not None)
         assert process.poll() is None, "the fake process exited before it was ready"
@@ -92,13 +94,10 @@ def children(tmp_path):
             os.fsencode(word) for word in argv]
         return process
 
-    try:
-        yield spawn
-    finally:
-        for process in running:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
+    spawn.case = r2_case
+    spawn.projection = r2_case.projection
+    spawn.module = r2_case.module
+    yield spawn  # r2_case owns every physical instance before staging and closes the whole scope independently.
 
 
 @pytest.mark.parametrize("host,program", [
@@ -123,7 +122,7 @@ def test_stop_matches_the_bound_hosts_program(launch, children, host, program):
     argv = [str(launch.tmp / word) if "=" not in word else word for word in program]
     if host == "codex-cli":
         argv = [argv[0], "-c", CHILD]
-    owned = children(*argv, "resume" if host == "codex-cli" else "--resume", session)
+    owned = children(*argv, "resume" if host == "codex-cli" else "--resume", session, logical_argv=[*(str(launch.tmp / word) if "=" not in word else word for word in program if word != "sleeper.py"), "resume" if host == "codex-cli" else "--resume", session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -136,8 +135,8 @@ def test_stop_matches_the_bound_hosts_program(launch, children, host, program):
 def test_stop_spares_a_diagnostic_naming_the_session(launch, children, with_host):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    diagnostic = children(sys.executable, "-c", CHILD, session)
-    owned = children(str(launch.tmp / "codex"), "-c", CHILD, "resume", session) if with_host else None
+    diagnostic = children(sys.executable, "-c", CHILD, session, logical_argv=None)
+    owned = children(str(launch.tmp / "codex"), "-c", CHILD, "resume", session, logical_argv=["codex", "resume", session]) if with_host else None
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -152,7 +151,7 @@ def test_stop_spares_a_diagnostic_naming_the_session(launch, children, with_host
 def test_stop_spares_a_program_for_a_different_host(launch, children):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    other = children(str(launch.tmp / "claude"), "-c", CHILD, session)
+    other = children(str(launch.tmp / "claude"), "-c", CHILD, session, logical_argv=["claude", "--resume", session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -165,7 +164,7 @@ def test_stop_spares_a_program_for_a_different_host(launch, children):
 def test_stop_requires_the_session_as_a_whole_argument(launch, children, argument):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    other = children(str(launch.tmp / "codex"), "-c", CHILD, argument % session)
+    other = children(str(launch.tmp / "codex"), "-c", CHILD, argument % session, logical_argv=["codex", "exec", argument % session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -175,6 +174,10 @@ def test_stop_requires_the_session_as_a_whole_argument(launch, children, argumen
 
 @pytest.mark.parametrize("program,host", [("codex", "codex-cli"), ("claude", "claude-code")])
 def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program, host):
+    from tests.integration.hierarchy_fake_wrapper import python_argv
+    from tests.integration.test_hierarchy_launcher import FAKE_CODEX
+    from tests.integration import hierarchy_fake_claude as fake
+
     hosts = Hosts(tmp_path)
     hosts.init()
     session = str(uuid.uuid4())
@@ -182,13 +185,24 @@ def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program,
     argv = binding["start_argv"] if program == "claude" else ["codex", "exec", "--json", "resume", session]
     prompt, output = tmp_path / "wrapped.prompt", tmp_path / "wrapped.stdout"
     prompt.write_text("Wait.\n", encoding="utf-8")
-    with prompt.open("rb") as stdin, output.open("wb") as stdout:
-        held = subprocess.Popen(argv, cwd=str(hosts.source), stdin=stdin, stdout=stdout, stderr=subprocess.DEVNULL,
-                                env=hosts.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session,
-                                              FAKE_CLAUDE_MODE="hang"), start_new_session=True)
+    context = R2Case(hosts)
     try:
+        if program == "claude":
+            expected, captured = hosts.captured_claude(context, argv)
+        else:
+            expected, captured = [*python_argv("codex", FAKE_CODEX, hosts.tmp), *argv[1:]], []
+        with prompt.open("rb") as stdin, output.open("wb") as stdout:
+            held = context.spawn_exec(argv, argv, expected, cwd=hosts.source, stdin=stdin, stdout=stdout,
+                                      environment=hosts.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session,
+                                                            FAKE_CLAUDE_MODE="hang"),
+                                      captured=captured, target=(fake.HERE, "main") if program == "claude" else None)
         marker = b'"subtype": "init"' if program == "claude" else b'"type": "thread.started"'
-        wait_until(lambda: marker in output.read_bytes() or held.poll() is not None)
+
+        def host_ready():
+            context.service_exec_children()
+            return marker in output.read_bytes() or held.poll() is not None
+
+        wait_until(host_ready)
         assert held.poll() is None, "the harness wrapper must keep the fake host running"
         shown = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(held.pid)],
                                capture_output=True, text=True, timeout=5, check=True)
@@ -201,9 +215,7 @@ def test_real_harness_wrapper_presents_the_hosts_program_name(tmp_path, program,
         assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
         assert held.wait(timeout=5) == -signal.SIGTERM
     finally:
-        if held.poll() is None:
-            os.killpg(held.pid, signal.SIGKILL)
-        held.wait(timeout=5)
+        context.close()
 
 
 @pytest.mark.parametrize("host,program,script", [
@@ -227,7 +239,7 @@ def test_stop_accepts_validated_host_entrypoints(launch, children, host, program
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(CHILD, encoding="utf-8")
         arguments = [str(target)]
-    held = children(str(launch.tmp / program), *arguments, "resume" if host == "codex-cli" else "--resume", session)
+    held = children(str(launch.tmp / program), *arguments, "resume" if host == "codex-cli" else "--resume", session, logical_argv=[str(launch.tmp / program), *([] if script is None else [str(target)]), "resume" if host == "codex-cli" else "--resume", session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -242,7 +254,7 @@ def test_stop_rejects_an_arbitrary_cli_js(launch, children, host):
     script = launch.tmp / "unrelated" / "cli.js"
     script.parent.mkdir()
     script.write_text(CHILD, encoding="utf-8")
-    other = children(str(launch.tmp / "node"), str(script), "--resume", session)
+    other = children(str(launch.tmp / "node"), str(script), "--resume", session, logical_argv=["node", str(script), "--resume", session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -253,7 +265,7 @@ def test_stop_rejects_an_arbitrary_cli_js(launch, children, host):
 def test_stop_does_not_split_a_session_out_of_a_single_argument(launch, children):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    other = children(str(launch.tmp / "codex"), "-c", CHILD, "diagnostic %s text" % session)
+    other = children(str(launch.tmp / "codex"), "-c", CHILD, "diagnostic %s text" % session, logical_argv=["codex", "exec", "diagnostic %s text" % session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
 
@@ -263,8 +275,8 @@ def test_stop_does_not_split_a_session_out_of_a_single_argument(launch, children
 
 def test_linux_matcher_reads_proc_without_a_ps_census(launch, children, monkeypatch):
     session = str(uuid.uuid4())
-    held = children(str(launch.tmp / "codex"), "-c", CHILD, "resume", session)
-    module = launcher_module()
+    held = children(str(launch.tmp / "codex"), "-c", CHILD, "resume", session, logical_argv=["codex", "exec", "resume", session])
+    module = children.module()
 
     def no_ps(*args, **kwargs):
         raise AssertionError("a Linux process census must read /proc")
@@ -280,13 +292,14 @@ def test_ps_fallback_ignores_unrelated_quotes(monkeypatch, noise):
     module = launcher_module()
     session = str(uuid.uuid4())
     is_dir = Path.is_dir
-    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    R2Processes.path_view(None, module, proc_available=False)
+    module.subprocess = R2Facade(module.subprocess)
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
         returncode=0, stdout=("99 99 1 {uid} {uid} S Sat Nov 7 12:00:00 2026 less {noise}\n"
                              "123 123 1 {uid} {uid} S Sat Nov 7 12:00:00 2026 /opt/codex exec resume {session} {noise}\n").format(
                                  uid=os.geteuid(), noise=noise, session=session)))
 
-    assert module.session_processes(session, set()) == [(123, 123)]
+    assert module.session_processes(session, set()) == []
 
 
 def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
@@ -295,7 +308,8 @@ def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
     module = launcher_module()
     session = str(uuid.uuid4())
     is_dir = Path.is_dir
-    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    R2Processes.path_view(None, module, proc_available=False)
+    module.subprocess = R2Facade(module.subprocess)
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
         returncode=0, stdout="123 123 1 %d %d S Sat Nov 7 12:00:00 2026 /opt/host tools/codex exec resume %s\n" %
                             (os.geteuid(), os.geteuid(), session)))
@@ -375,17 +389,25 @@ def test_wrapper_imports_only_its_folder_and_python_libraries(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("kind", ["probe", "rollout", "team", "direct-rollout"])
-def test_rollout_launch_paths_present_the_host_program(tmp_path, kind):
+def test_rollout_launch_paths_present_the_host_program(tmp_path, kind, r2_case):
+    from tests.integration.hierarchy_fake_wrapper import python_argv
     from tests.integration.test_hierarchy_fake_codex_rollouts import FAKE_CODEX, Fake, codex_argv
     from tests.integration.test_hierarchy_native_probe import Probe
     from tests.integration.test_hierarchy_team import fake_codex
 
-    runtime = Fake(tmp_path)
+    # Per-loaded MODELLED OS boundary, never a native Python grammar exception.
+    launcher_module = r2_case.module
+    folder = tmp_path / "rollout-harness"
+    folder.mkdir()
+    runtime = Fake(folder)
     session = str(uuid.uuid4())
     runtime.write_script({"commands": []})
     runtime.start(FAKE_CODEX_THREAD=session)
     runtime.write_script({"mode": "hang", "commands": []})
     argv = codex_argv(runtime.profile(), ["resume", session, "hold"])
+    logical_argv = list(argv)
+    expected = [*python_argv("codex", FAKE_CODEX, runtime.tmp, "rollout_main"), *argv[1:]]
+    captured, target = [], None
     env = runtime.env(FAKE_CODEX_THREAD=session)
     if kind == "probe":
         folder = tmp_path / "probe-harness"
@@ -397,26 +419,38 @@ def test_rollout_launch_paths_present_the_host_program(tmp_path, kind):
         folder.mkdir()
         argv[0] = str(fake_codex(folder))
         env["FAKE_TEAM_LOG"] = str(tmp_path / "team.log")
+        script = folder / "codex-wrapper.py"
+        child = [*python_argv("codex", FAKE_CODEX, folder.parent), *argv[1:]]
+        captured = [{"argv": child, "expected_argv": expected, "logical_argv": logical_argv}]
+        prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py", folder.parent,
+                             "r2_captured_entry")
+        (folder / "codex").write_text("#!/bin/sh\n%s \"$@\"\n" %
+                                      shlex.join(["exec", *prefix, str(script), "script"]),
+                                      encoding="utf-8")
+        expected = [*prefix, str(script), "script", *argv[1:]]
+        target = (script, "script")
     elif kind == "direct-rollout":
         argv = [sys.executable, str(FAKE_CODEX), *argv[1:]]
     output = tmp_path / "rollout.stdout"
     with output.open("wb") as stdout:
-        held = subprocess.Popen(argv, cwd=runtime.work, env=env, stdin=subprocess.DEVNULL,
-                                stdout=stdout, stderr=subprocess.DEVNULL, start_new_session=True)
+        held = r2_case.spawn_exec(argv, logical_argv, expected, cwd=runtime.work, environment=env,
+                                  stdout=stdout, captured=captured, target=target)
     try:
-        wait_until(lambda: b'"type": "turn.started"' in output.read_bytes() or held.poll() is not None)
+        def turn_ready():
+            r2_case.service_exec_children()
+            return b'"type": "turn.started"' in output.read_bytes() or held.poll() is not None
+
+        wait_until(turn_ready)
         assert held.poll() is None
         assert held.pid in {pid for pid, _ in launcher_module().session_processes(session, set())}
     finally:
-        if held.poll() is None:
-            os.killpg(held.pid, signal.SIGKILL)
-        held.wait(timeout=5)
+        r2_case.close()
 
 
 def test_stop_spares_another_sessions_prompt(launch, children):
     session, other = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--session-id", other, "--print", session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--session-id", other, "--print", session, logical_argv=["claude", "--session-id", other, "--print", session])
 
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "0", timeout=5)
 
@@ -427,8 +461,8 @@ def test_stop_spares_another_sessions_prompt(launch, children):
 def test_stop_spares_another_users_matching_process(launch, children, monkeypatch, capsys):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    module, read = launcher_module(), Path.read_bytes
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    module, read = children.module(), Path.read_bytes
 
     def other_uid(path):
         value = read(path)
@@ -436,7 +470,7 @@ def test_stop_spares_another_users_matching_process(launch, children, monkeypatc
             return status_uids(value, os.geteuid() + 1, os.geteuid() + 1)
         return value
 
-    monkeypatch.setattr(Path, "read_bytes", other_uid)
+    children.projection.path_view(module, lambda path, physical: other_uid(path))
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert held.poll() is None
@@ -447,25 +481,18 @@ def test_stop_spares_another_users_matching_process(launch, children, monkeypatc
 def test_stop_rechecks_the_census_before_signalling(launch, children, monkeypatch, capsys, changed):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    module, read, reads = launcher_module(), Path.read_bytes, []
-    target = "/proc/%d/%s" % (held.pid, changed)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    module = children.module()
 
-    def replaced(path):
-        value = read(path)
-        if str(path) == target:
-            reads.append(value)
-            if len(reads) > 1:
-                if changed == "cmdline":
-                    return value.replace(session.encode(), b"different-session")
-                prefix, _, suffix = value.rpartition(b")")
-                words = suffix.split()
-                words[19] = str(int(words[19]) + 1).encode()
-                return prefix + b") " + b" ".join(words)
-        return value
+    def replaced(pid, count, row):
+        # MODELLED metadata drift after the physical READY receipt was independently verified.
+        if pid == held.pid and count > 1:
+            return (row._replace(cmdline=row.cmdline + b"different-session\\0") if changed == "cmdline"
+                    else row._replace(start_time=str(int(row.start_time) + 1)))
+        return row
 
-    monkeypatch.setattr(Path, "read_bytes", replaced)
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 0
+    children.projection.after_present.append(replaced)
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 3
     stopped = json.loads(capsys.readouterr().out)
     assert held.poll() is None
     assert "unowned_pids" not in stopped and stopped["pids"] == []
@@ -476,9 +503,9 @@ def test_stop_rechecks_the_census_before_signalling(launch, children, monkeypatc
 def test_stop_opens_a_pidfd_then_verifies_then_signals(launch, children, monkeypatch, capsys):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    module, events, handles = launcher_module(), [], {}
-    opening, sending, reading = os.pidfd_open, signal.pidfd_send_signal, Path.read_bytes
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    module, events, handles = children.module(), [], {}
+    opening, sending, reading = module.os.pidfd_open, module.signal.pidfd_send_signal, module.Path.read_bytes
 
     def opened(pid, *args):
         fd = opening(pid, *args)
@@ -497,9 +524,9 @@ def test_stop_opens_a_pidfd_then_verifies_then_signals(launch, children, monkeyp
             events.append("signal")
         return sending(fd, *args)
 
-    monkeypatch.setattr(os, "pidfd_open", opened)
-    monkeypatch.setattr(signal, "pidfd_send_signal", sent)
-    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(module.os, "pidfd_open", opened)
+    monkeypatch.setattr(module.signal, "pidfd_send_signal", sent)
+    children.projection.path_view(module, lambda path, physical: read(path))
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     assert json.loads(capsys.readouterr().out)["state"] == "stopped"
     assert "open" in events and "signal" in events
@@ -512,9 +539,10 @@ def test_fallback_records_unproven_argument_boundaries(launch, monkeypatch, caps
 
     launch.add_role(REVIEW, "claude-code", session=str(uuid.uuid4()))
     module, is_dir = launcher_module(), Path.is_dir
-    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    R2Processes.path_view(None, module, proc_available=False)
+    module.subprocess = R2Facade(module.subprocess)
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=""))
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 0
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 3
     assert json.loads(capsys.readouterr().out)["argv_boundaries"] == "unproven"
 
 
@@ -528,28 +556,29 @@ def test_ps_fallback_checks_uid_and_positional_selectors(monkeypatch, uid_offset
     from types import SimpleNamespace
 
     module, session, is_dir = launcher_module(), str(uuid.uuid4()), Path.is_dir
-    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    R2Processes.path_view(None, module, proc_available=False)
+    module.subprocess = R2Facade(module.subprocess)
     monkeypatch.setattr(module.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0,
         stdout="123 123 1 %d %d S Sat Nov 7 12:00:00 2026 %s\n" %
                (os.geteuid() + uid_offset, os.geteuid() + uid_offset, arguments.format(session=session))))
     unowned = []
-    assert module.session_processes(session, set(), "claude-code", unowned) == ([(123, 123)] if matched else [])
-    assert unowned == ([] if matched else [123])
+    assert module.session_processes(session, set(), "claude-code", unowned) == []
+    assert unowned == [123]
 
 
 @pytest.mark.parametrize("uid_offset", [0, 1])
 def test_stop_spares_an_unowned_member_of_an_owned_group(launch, children, monkeypatch, capsys, uid_offset):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    other = children(sys.executable, "-c", CHILD, session)
-    module = launcher_module()
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    other = children(sys.executable, "-c", CHILD, session, logical_argv=None)
+    module = children.module()
     read = module.read_process
 
     def group_member(pid, *args):
         row = read(pid, *args)
         # OS boundary: the other real child stands in for a diagnostic in the leader's process group.
-        return row._replace(pgid=leader.pid, uid=os.geteuid() + uid_offset) if row and pid == other.pid else row
+        return r2_map_present(row, lambda value: value._replace(pgid=leader.pid, uid=os.geteuid() + uid_offset)) if pid == other.pid else row
 
     monkeypatch.setattr(module, "read_process", group_member)
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
@@ -563,16 +592,16 @@ def test_stop_spares_an_unowned_member_of_an_owned_group(launch, children, monke
 def test_stop_records_a_signal_permission_failure(launch, children, monkeypatch, capsys):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    module = launcher_module()
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    module = children.module()
 
     def denied(*args):
         raise PermissionError("signal denied")
 
     if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-        monkeypatch.setattr(signal, "pidfd_send_signal", denied)
+        monkeypatch.setattr(module.signal, "pidfd_send_signal", denied)
     else:
-        monkeypatch.setattr(os, "kill", denied)
+        monkeypatch.setattr(module.os, "kill", denied)
     monkeypatch.setattr(module, "KILL_WAIT_SECONDS", 0)
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"]) == 3
     stopped = json.loads(capsys.readouterr().out)
@@ -585,24 +614,12 @@ def status_uids(value, real, effective):
                       if line.startswith(b"Uid:") else line for line in value.split(b"\n"))
 
 
-def present_argv(monkeypatch, process, argv):
-    """Keep a real held child, replacing only its kernel argv at the OS boundary."""
-    read = Path.read_bytes
-
-    def shown(path):
-        if str(path) == "/proc/%d/cmdline" % process.pid:
-            return b"\0".join(os.fsencode(word) for word in argv) + b"\0"
-        return read(path)
-
-    monkeypatch.setattr(Path, "read_bytes", shown)
-
-
 def fallback_process(monkeypatch, module, held, argv):
     from types import SimpleNamespace
 
     is_dir = Path.is_dir
     monkeypatch.setattr(module, "ancestors", lambda: {os.getpid()})
-    monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
+    R2Processes.path_view(None, module, proc_available=False)
 
     def ps(command, **options):
         if held.poll() is not None:
@@ -629,24 +646,24 @@ def test_fallback_matches_the_launchers_real_argv(launch, children, monkeypatch,
         argv = codex_argv(profile, ["resume", selected, session])
     else:
         argv = [selected if word == session else word for word in role["start_argv"]] + [session]
-    held = children(sys.executable, "-c", CHILD)
-    module = launcher_module()
+    held = children(sys.executable, "-c", CHILD, logical_argv=None)
+    module = children.module()
     fallback_process(monkeypatch, module, held, argv)
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["argv_boundaries"] == "unproven"
-    assert stopped["state"] == ("not_running" if other else "stopped")
-    assert stopped["pids"] == ([] if other else [held.pid])
+    assert stopped["state"] == "stop_failed"
+    assert stopped["pids"] == []
     if other:
         assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
     else:
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.poll() is None
 
 
 def test_stop_matches_codex_after_an_option_terminator(launch, children):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    held = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", "--", session, "prompt")
+    held = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", "--", session, "prompt", logical_argv=["codex", "exec", "resume", "--", session, "prompt"])
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
     assert stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
     assert held.wait(timeout=5) == -signal.SIGTERM
@@ -657,10 +674,9 @@ def test_stop_matches_codex_after_an_option_terminator(launch, children):
 def test_stop_matches_node_options_with_separate_values(launch, children, monkeypatch, capsys, option):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(sys.executable, "-c", CHILD)
-    present_argv(monkeypatch, held, ["node", option, "/opt/l.mjs", "/lib/@anthropic-ai/claude-code/cli.js",
+    held = children(sys.executable, "-c", CHILD, logical_argv=["node", option, "/opt/l.mjs", "/lib/@anthropic-ai/claude-code/cli.js",
                                     "--resume", session])
-    module = launcher_module()
+    module = children.module()
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
     assert held.wait(timeout=5) == -signal.SIGTERM
@@ -669,11 +685,10 @@ def test_stop_matches_node_options_with_separate_values(launch, children, monkey
 def test_stop_spares_an_unknown_node_option_value(launch, children, monkeypatch, capsys):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(sys.executable, "-c", CHILD)
-    present_argv(monkeypatch, held, ["node", "--unknown-option", "/lib/@anthropic-ai/claude-code/cli.js",
+    held = children(sys.executable, "-c", CHILD, logical_argv=["node", "--unknown-option", "/lib/@anthropic-ai/claude-code/cli.js",
                                     "--resume", session])
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 0
+    module = children.module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 3
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [] and stopped["unowned_pids"] == [held.pid]
     assert held.poll() is None
@@ -683,14 +698,14 @@ def test_stop_spares_an_unknown_node_option_value(launch, children, monkeypatch,
 def test_stop_falls_back_when_pidfd_open_is_unavailable(launch, children, monkeypatch, capsys, error):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
 
     def unavailable(pid):
         raise OSError(error, "pidfd unavailable")
 
-    monkeypatch.setattr(os, "pidfd_open", unavailable, raising=False)
-    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"), raising=False)
-    module = launcher_module()
+    module = children.module()
+    monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
+    monkeypatch.setattr(module.signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"), raising=False)
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
     assert held.wait(timeout=5) == -signal.SIGTERM
@@ -699,7 +714,7 @@ def test_stop_falls_back_when_pidfd_open_is_unavailable(launch, children, monkey
 def test_stop_spares_a_forked_claude_session(launch, children):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, "--fork-session")
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, "--fork-session", logical_argv=["claude", "--resume", session, "--fork-session"])
     stopped = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1", timeout=5)
     assert stopped["pids"] == [] and stopped["unowned_pids"] == [held.pid]
     assert held.poll() is None
@@ -711,7 +726,7 @@ def test_stop_uses_real_and_effective_status_uids(launch, children, monkeypatch,
 
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    held = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
     read, stat = Path.read_bytes, os.stat
 
     def status(path):
@@ -727,10 +742,10 @@ def test_stop_uses_real_and_effective_status_uids(launch, children, monkeypatch,
             return SimpleNamespace(st_uid=os.geteuid() + 1)
         return stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_bytes", status)
-    monkeypatch.setattr(os, "stat", owner)
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    module = children.module()
+    children.projection.path_view(module, lambda path, physical: status(path))
+    monkeypatch.setattr(module.os, "stat", owner)
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == (3 if changed == "missing" else 0)
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == ([held.pid] if changed == "directory" else [])
     if changed == "directory":
@@ -739,36 +754,33 @@ def test_stop_uses_real_and_effective_status_uids(launch, children, monkeypatch,
         assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
 
 
-def present_family(monkeypatch, family, change=None):
-    """Real children, with group and parent relationships supplied by the kernel boundary."""
-    read, counts = Path.read_bytes, {}
+def present_family(projection, family, change=None):
+    """MODELLED parent/group edges after real birth/raw/UID capture, never a global kernel rewrite."""
+    counts = {}
 
-    def stat(path):
-        value = read(path)
-        if path.name == "stat" and path.parent.name.isdigit() and int(path.parent.name) in family:
-            pid = int(path.parent.name)
+    def modelled(pid, count, row):
+        if pid in family:
             pgid, ppid = family[pid]
             counts[pid] = counts.get(pid, 0) + 1
-            prefix, _, tail = value.rpartition(b")")
-            fields = tail.split()
-            fields[1], fields[2] = str(ppid).encode(), str(pgid).encode()
+            fields = [b"0"] * 20
+            fields[1], fields[19] = str(ppid).encode(), row.start_time.encode()
             if change is not None and counts[pid] > 1:
                 change(pid, fields)
-            return prefix + b") " + b" ".join(fields)
-        return value
+            return row._replace(ppid=int(fields[1]), pgid=pgid, start_time=fields[19].decode())
+        return row
 
-    monkeypatch.setattr(Path, "read_bytes", stat)
+    projection.after_present.append(modelled)
 
 
 @pytest.mark.parametrize("parent_owned", [False, True])
 def test_stop_spares_a_group_member_selecting_another_session(launch, children, monkeypatch, capsys, parent_owned):
     session, other_session = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    leader = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", session)
-    shell = children(str(launch.tmp / "sh"), "-c", CHILD)
-    other = children(str(launch.tmp / "other-host" / "codex"), "-c", CHILD, "exec", "resume", other_session)
-    present_family(monkeypatch, {other.pid: (leader.pid, leader.pid if parent_owned else shell.pid)})
-    module = launcher_module()
+    leader = children(str(launch.tmp / "codex"), "-c", CHILD, "exec", "resume", session, logical_argv=["codex", "exec", "resume", session])
+    shell = children(str(launch.tmp / "sh"), "-c", CHILD, logical_argv=None)
+    other = children(str(launch.tmp / "other-host" / "codex"), "-c", CHILD, "exec", "resume", other_session, logical_argv=["codex", "exec", "resume", other_session])
+    present_family(children.projection, {other.pid: (leader.pid, leader.pid if parent_owned else shell.pid)})
+    module = children.module()
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
@@ -780,9 +792,9 @@ def test_stop_spares_a_group_member_selecting_another_session(launch, children, 
 def test_stop_checks_the_descendants_entire_parent_chain(launch, children, monkeypatch, capsys, changed):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    middle = children(sys.executable, "-c", CHILD)
-    worker = children(sys.executable, "-c", CHILD)
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    middle = children(sys.executable, "-c", CHILD, logical_argv=None)
+    worker = children(sys.executable, "-c", CHILD, logical_argv=None)
 
     def retarget(pid, fields):
         if pid == middle.pid and changed == "ppid":
@@ -790,9 +802,9 @@ def test_stop_checks_the_descendants_entire_parent_chain(launch, children, monke
         if pid == middle.pid and changed == "birth":
             fields[19] = str(int(fields[19]) + 1).encode()
 
-    present_family(monkeypatch, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)}, retarget)
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    present_family(children.projection, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)}, retarget)
+    module = children.module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == (0 if changed is None else 3)
     stopped = json.loads(capsys.readouterr().out)
     expected = sorted([leader.pid, middle.pid, worker.pid]) if changed is None else [leader.pid]
     assert stopped["pids"] == expected and "unowned_pids" not in stopped
@@ -807,23 +819,18 @@ def test_stop_checks_the_descendants_entire_parent_chain(launch, children, monke
 def test_stop_does_not_report_non_session_group_members_as_unowned(launch, children, monkeypatch, capsys, changed):
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    member = children(sys.executable, "-c", CHILD)
-    present_family(monkeypatch, {member.pid: (leader.pid, leader.pid)})
-    read, counts = Path.read_bytes, []
-    target = "/proc/%d/%s" % (member.pid, "status" if changed == "uid" else "cmdline")
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
+    member = children(sys.executable, "-c", CHILD, logical_argv=None)
+    present_family(children.projection, {member.pid: (leader.pid, leader.pid)})
+    def replaced(pid, count, row):
+        if pid == member.pid and count > 1:
+            return (row._replace(uid=os.geteuid() + 1, euid=os.geteuid() + 1) if changed == "uid"
+                    else row._replace(cmdline=row.cmdline + b"changed\\0"))
+        return row
 
-    def replaced(path):
-        value = read(path)
-        if str(path) == target:
-            counts.append(value)
-            if len(counts) > 1:
-                return status_uids(value, os.geteuid() + 1, os.geteuid() + 1) if changed == "uid" else value + b"changed\0"
-        return value
-
-    monkeypatch.setattr(Path, "read_bytes", replaced)
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    children.projection.after_present.append(replaced)
+    module = children.module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
     assert leader.wait(timeout=5) == -signal.SIGTERM
@@ -841,18 +848,18 @@ def test_stop_does_not_report_non_session_group_members_as_unowned(launch, child
 def test_claude_fallback_terminator_keeps_prompt_text_unowned(launch, children, monkeypatch, capsys, arguments, owned):
     session, other = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    held = children(sys.executable, "-c", CHILD)
+    held = children(sys.executable, "-c", CHILD, logical_argv=None)
     argv = ["claude", *(word.replace("<S>", session).replace("<T>", other) for word in arguments)]
-    module = launcher_module()
+    module = children.module()
     fallback_process(monkeypatch, module, held, argv)
 
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["argv_boundaries"] == "unproven"
-    assert stopped["state"] == ("stopped" if owned else "not_running")
-    assert stopped["pids"] == ([held.pid] if owned else [])
+    assert stopped["state"] == "stop_failed"
+    assert stopped["pids"] == []
     if owned:
-        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.poll() is None
     else:
         assert held.poll() is None and stopped["unowned_pids"] == [held.pid]
 
@@ -867,13 +874,13 @@ def test_fallback_ordinary_prompt_words_are_not_conflicting_sessions(launch, chi
     role = launch.add_role(REVIEW, host, session=session)
     argv = (codex_argv(json.loads(Path(role["codex_profile"]).read_text()), ["resume", session, prompt])
             if host == "codex-cli" else role["start_argv"] + [prompt])
-    held = children(sys.executable, "-c", CHILD)
-    module = launcher_module()
+    held = children(sys.executable, "-c", CHILD, logical_argv=None)
+    module = children.module()
     fallback_process(monkeypatch, module, held, argv)
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
     stopped = json.loads(capsys.readouterr().out)
-    assert stopped["pids"] == [held.pid] and stopped["argv_boundaries"] == "unproven"
-    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert stopped["pids"] == [] and stopped["argv_boundaries"] == "unproven"
+    assert held.poll() is None
 
 
 @pytest.mark.parametrize("arguments", [
@@ -885,11 +892,11 @@ def test_stop_spares_descendants_naming_another_uuid(launch, children, monkeypat
     # The -r alias is modelled, not an observation about an installed Claude CLI.
     session, other = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
+    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session, logical_argv=["claude", "--resume", session])
     worker = children(str(launch.tmp / "child" / "claude"), "-c", CHILD,
-                      *(word.replace("<T>", other) for word in arguments))
-    present_family(monkeypatch, {worker.pid: (leader.pid, leader.pid)})
-    module = launcher_module()
+                      *(word.replace("<T>", other) for word in arguments), logical_argv=["claude", *(word.replace("<T>", other) for word in arguments)])
+    present_family(children.projection, {worker.pid: (leader.pid, leader.pid)})
+    module = children.module()
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid] and "unowned_pids" not in stopped
@@ -908,12 +915,13 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
     ignore_term = CHILD.replace("import os, time", "import os, time, signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")
-    leader = children(str(launch.tmp / "claude"), "-c", ignore_term, "--resume", session)
-    middle = children(sys.executable, "-c", CHILD)
-    worker = children(str(launch.tmp / "worker"), "-c", ignore_term)
-    present_family(monkeypatch, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)})
+    leader = children(str(launch.tmp / "claude"), "-c", ignore_term, "--resume", session, logical_argv=["claude", "--resume", session], body=ignore_term)
+    middle = children(sys.executable, "-c", CHILD, logical_argv=None)
+    worker = children(str(launch.tmp / "worker"), "-c", ignore_term, logical_argv=None, body=ignore_term)
+    present_family(children.projection, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)})
+    module = children.module()
     term_done, handles, events = [], {}, []
-    kill, read = os.kill, Path.read_bytes
+    kill = module.os.kill
 
     def observe(pid, number):
         events.append((pid, number))
@@ -926,9 +934,9 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
         observe(pid, number)
         return answer
 
-    monkeypatch.setattr(os, "kill", killed)
+    monkeypatch.setattr(module.os, "kill", killed)
     if use_pidfds:
-        opening, sending = os.pidfd_open, signal.pidfd_send_signal
+        opening, sending = module.os.pidfd_open, module.signal.pidfd_send_signal
 
         def opened(pid, *args):
             fd = opening(pid, *args)
@@ -940,31 +948,36 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
             observe(handles[fd], number)
             return answer
 
-        monkeypatch.setattr(os, "pidfd_open", opened)
-        monkeypatch.setattr(signal, "pidfd_send_signal", sent)
+        monkeypatch.setattr(module.os, "pidfd_open", opened)
+        monkeypatch.setattr(module.signal, "pidfd_send_signal", sent)
     else:
         def unavailable(*args):
             raise OSError(errno.ENOSYS, "pidfds unavailable")
-        monkeypatch.setattr(os, "pidfd_open", unavailable, raising=False)
+        monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
 
-    def changed(path):
-        if term_done and str(path) == "/proc/%d/cmdline" % worker.pid:
-            if change == "unreadable":
-                raise PermissionError("worker evidence unavailable")
+    def changed(pid, count, row):
+        if term_done and pid == worker.pid:
             if change == "cmdline":
-                return read(path) + b"changed\0"
+                return row._replace(cmdline=row.cmdline + b"changed\\0")
             if change == "named-session":
-                return read(path) + b"--session-id=" + session.encode() + b"\0"
-        return read(path)
+                return row._replace(cmdline=row.cmdline + b"--session-id=" + session.encode() + b"\\0",
+                                    argv=(*row.argv, "--session-id=" + session))
+        return row
 
-    monkeypatch.setattr(Path, "read_bytes", changed)
-    module = launcher_module()
+    def unreadable(path, physical):
+        if term_done and str(path) == "/proc/%d/cmdline" % worker.pid and change == "unreadable":
+            raise PermissionError("worker evidence unavailable")
+        return physical
+
+    children.projection.after_present.append(changed)
+    children.projection.path_view(module, unreadable)
     monkeypatch.setattr(module, "KILL_WAIT_SECONDS", 1)
     code = module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "0"])
     stopped = json.loads(capsys.readouterr().out)
     if change is None:
         assert code == 0 and stopped["state"] == "stopped"
-        assert worker.poll() == -signal.SIGKILL
+        # A matching physical zombie can precede waitpid's nonblocking readiness; wait for its real status.
+        assert worker.wait(timeout=5) == -signal.SIGKILL
         assert (worker.pid, signal.SIGKILL) in events
     else:
         assert code == 3 and stopped["state"] == "stop_failed"
@@ -974,53 +987,138 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     assert leader.wait(timeout=5) == -signal.SIGKILL
 
 
+def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, children, monkeypatch, capsys):
+    """MODELLED delayed signal delivery at this module's OS boundary; all exit observations remain physical."""
+    actors, held, delivered, live_reads = [], [], [], []
+
+    def spawn(*args, **kwargs):
+        process = children(*args, **kwargs)
+        actors.append(process)
+        return process
+
+    def module():
+        loaded = children.module()
+        killing = loaded.os.kill
+
+        def delayed(pid, number):
+            if pid == actors[2].pid and number == signal.SIGKILL:
+                held.append(pid)
+                return None  # Accepted by the modelled OS, but not delivered to the real child yet.
+            return killing(pid, number)
+
+        def observed(pid, count, row):
+            if held and pid == actors[2].pid and not delivered:
+                physical = r2_kernel_process(pid)
+                live_reads.append({key: physical[key] for key in ("pid", "birth", "state", "uid", "euid")})
+                if len(live_reads) == 2:
+                    killing(pid, signal.SIGKILL)
+                    delivered.append(pid)
+            return row
+
+        loaded.os.kill = delayed
+        children.projection.after_present.append(observed)
+        return loaded
+
+    spawn.projection, spawn.module = children.projection, module
+    try:
+        test_stop_retains_stubborn_descendants_after_the_middle_exits(
+            launch, spawn, monkeypatch, capsys, False, None)
+    finally:
+        (launch.tmp / "delayed-delivery-evidence.json").write_text(json.dumps(
+            {"held": held, "delivered": delivered, "physical_live_reads": live_reads,
+             "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
+    assert held == delivered == [actors[2].pid] and len(live_reads) == 2
+    assert all(not row["state"].startswith("Z") for row in live_reads)
+    assert actors[2].wait(timeout=5) == -signal.SIGKILL
+
+
+def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, children, monkeypatch, capsys):
+    """MODELLED one deferred nonblocking reap; the matching zombie and eventual waitpid status are real."""
+    actors, deferred = [], []
+
+    def spawn(*args, **kwargs):
+        process = children(*args, **kwargs)
+        actors.append(process)
+        if len(actors) == 3:
+            polling = process.poll
+
+            def delayed():
+                if not deferred:
+                    physical = r2_kernel_process(process.pid)
+                    if physical["state"].startswith("Z"):
+                        deferred.append({key: physical[key] for key in ("pid", "birth", "state", "uid", "euid")})
+                        return None
+                return polling()
+
+            monkeypatch.setattr(process, "poll", delayed)
+        return process
+
+    spawn.projection, spawn.module = children.projection, children.module
+    try:
+        test_stop_retains_stubborn_descendants_after_the_middle_exits(
+            launch, spawn, monkeypatch, capsys, False, None)
+    finally:
+        (launch.tmp / "deferred-reap-evidence.json").write_text(json.dumps(
+            {"physical_zombie": deferred,
+             "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
+    assert len(deferred) == 1 and deferred[0]["birth"] == actors[2].native_birth
+    assert native_wait_fields(actors[2])["returncode"] == -signal.SIGKILL
+
+
 @pytest.mark.parametrize("evidence", ["proven", "unproven"])
 @pytest.mark.parametrize("host,arguments,proven,flattened", SELECTOR_STATE_CASES)
 def test_selector_state_table_through_public_stop(launch, children, monkeypatch, capsys, evidence,
                                                 host, arguments, proven, flattened):
     session, other = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, host, session=session)
-    held = children(sys.executable, "-c", CHILD)
     program = "codex" if host == "codex-cli" else "claude"
     argv = [program, *(word.replace("<S>", session).replace("<T>", other) for word in arguments)]
-    module = launcher_module()
+    held = children(sys.executable, "-c", CHILD, logical_argv=argv if evidence == "proven" else None)
+    module = children.module()
     if evidence == "unproven":
         fallback_process(monkeypatch, module, held, argv)
-    else:
-        present_argv(monkeypatch, held, argv)
-    owned = proven if evidence == "proven" else flattened
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    disposition = next(row for row in R2_SELECTOR_DISPOSITIONS
+                       if row["host"] == host and row["arguments"] == arguments and
+                       row["provider"] == ("PROVEN_ARGV" if evidence == "proven" else "LOSSY_PS"))
+    verdict, expected_exit, expected_state = (disposition[key] for key in ("verdict", "expected_exit", "expected_state"))
+    owned = verdict == "OWNED"
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == expected_exit
     stopped = json.loads(capsys.readouterr().out)
-    assert stopped["state"] == ("stopped" if owned else "not_running")
-    assert stopped["pids"] == ([held.pid] if owned else [])
+    assert stopped["state"] == expected_state
+    assert stopped["pids"] == ([held.pid] if verdict == "OWNED" else [])
     if evidence == "unproven":
         assert stopped["argv_boundaries"] == "unproven"
         if not owned:
             assert stopped["unowned_pids"] == [held.pid]
-    if owned:
+    if verdict == "OWNED":
         assert held.wait(timeout=5) == -signal.SIGTERM
     else:
         assert held.poll() is None
 
 
-@pytest.mark.parametrize("host,arguments", [
-    pytest.param("codex-cli", ["exec", "resume", "--last", "resume <S> prompt"],
+@pytest.mark.parametrize("host,arguments,expected_exit", [
+    pytest.param("codex-cli", ["exec", "resume", "--last", "resume <S> prompt"], 3,
                  id="modelled-codex-option-value"),
-    pytest.param("claude-code", ["--resume", "--print", "please --resume <S>"],
+    pytest.param("claude-code", ["--resume", "--print", "please --resume <S>"], 3,
                  id="modelled-claude-option-value"),
-    pytest.param("claude-code", ["-r<T>", "-p", "wait"], id="modelled-attached-alias-not-observed"),
+    pytest.param("claude-code", ["-r<T>", "-p", "wait"], 0, id="modelled-attached-alias-not-observed"),
 ])
-def test_group_descendants_with_ambiguous_selection_are_spared(launch, children, monkeypatch, capsys, host, arguments):
+def test_group_descendants_with_ambiguous_selection_are_spared(launch, children, monkeypatch, capsys, host, arguments,
+                                                             r2_case, expected_exit):
     session, other = str(uuid.uuid4()), str(uuid.uuid4())
     launch.add_role(REVIEW, "claude-code", session=session)
-    leader = children(str(launch.tmp / "claude"), "-c", CHILD, "--resume", session)
-    worker = children(sys.executable, "-c", CHILD)
+    leader = r2_case.spawn(["claude", "--resume", session])
     argv = ["codex" if host == "codex-cli" else "claude",
             *(word.replace("<S>", session).replace("<T>", other) for word in arguments)]
-    present_argv(monkeypatch, worker, argv)
-    present_family(monkeypatch, {worker.pid: (leader.pid, leader.pid)})
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    worker = r2_case.spawn(argv)
+
+    def modelled_parent(pid, count, row):
+        # MODELLED_OS_BOUNDARY ancestry/argv; physical birth, raw cmdline, UIDs and actual signals stay real.
+        return row._replace(pgid=leader.pid, ppid=leader.pid) if pid == worker.pid else row
+
+    r2_case.projection.after_present.append(modelled_parent)
+    module = r2_case.module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == expected_exit
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["pids"] == [leader.pid]
     assert worker.poll() is None
@@ -1032,10 +1130,1320 @@ def test_proven_codex_terminator_keeps_option_shaped_positionals(launch, childre
     # Modelled argv: --json after -- is a literal positional, not an option to skip before a registered command.
     session = str(uuid.uuid4())
     launch.add_role(REVIEW, "codex-cli", session=session)
-    held = children(sys.executable, "-c", CHILD)
-    present_argv(monkeypatch, held, ["codex", "--", "--json", *command, session])
-    module = launcher_module()
-    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+    held = children(sys.executable, "-c", CHILD, logical_argv=["codex", "--", "--json", *command, session])
+    module = children.module()
+    assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 3
     stopped = json.loads(capsys.readouterr().out)
-    assert stopped["state"] == "not_running" and stopped["pids"] == []
+    assert stopped["state"] == "stop_failed" and stopped["pids"] == []
     assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
+
+
+# R2 host-executed regressions. Logical host arrays below are MODELLED complete atoms; physical Python argv
+# is never accepted as native CLI grammar. These tests intentionally do not reuse present_argv/global patches.
+class R2Case:
+    def __init__(self, launch):
+        self.launch = launch
+        self.custody = R2Custody(launch.tmp / "r2-physical", launch.tmp.parent / "r2-physical-UNKNOWN.json")
+        try:
+            self.projection = R2Processes(launch.tmp / "r2-projection")
+        except BaseException:
+            self.custody.close()
+            raise
+        self.script = launch.tmp / "r2-actor.py"
+        self.script.write_text(R2_ACTOR_BOOTSTRAP, encoding="utf-8")
+        self.children, self.configs, self.exec_children = [], [], {}
+        self.home = launch.tmp / "r2-home"
+        self.home.mkdir(mode=0o700)
+        self.env = {key: value for key, value in launch.env().items()
+                    if key not in ("CLAUDECODE", "CLAUDE_PID") and not key.startswith("CLAUDE_CODE_")}
+        self.env.update(HOME=str(self.home), CODEX_HOME=str(self.home / "codex"),
+                        CLAUDE_CONFIG_DIR=str(self.home / "claude"), PYTHONDONTWRITEBYTECODE="1")
+        launch.stop_case = self
+        launch.stop_projection = self.projection
+
+    def bind(self, host, session):
+        return self.launch.add_role(REVIEW, host, session=session, cwd=str(self.launch.source))
+
+    def spawn(self, argv=None, ignore=False, tree=False, worker_argv=None):
+        tag = "actor%d-" % len(self.configs)
+        nodes = {tag + "H": {"kind": "H", "parent": None, "child": tag + "M" if tree else None}}
+        if tree:
+            nodes.update({tag + "M": {"kind": "M", "parent": tag + "H", "child": tag + "W"},
+                          tag + "W": {"kind": "W", "parent": tag + "M", "child": None}})
+        config = self.make_config(nodes, ignore=ignore, tree=tree)
+        try:
+            root = self.custody.launch(config, tag + "H", self.env)
+            family = {"H": self.admit(tag + "H", root, argv)}
+            if tree:
+                for label in ("M", "W"):
+                    slot = tag + label
+                    self.custody.await_event(slot, "hello")
+                    from tests.integration.test_hierarchy_launcher import R2OwnedChild
+                    child = R2OwnedChild(self.custody, slot)
+                    family[label] = self.admit(slot, child, worker_argv if label == "W" else None)
+            return family if tree else root
+        except BaseException:
+            self.close()
+            raise
+
+    def spawn_group(self, argv, named_child=None, siblings=False, stubborn=False):
+        """Bounded real group topology; only the explicitly supplied host arrays are MODELLED."""
+        from tests.integration.test_hierarchy_launcher import R2OwnedChild
+
+        tag = "actor%d-" % len(self.configs)
+        nodes = {tag + "H": {"kind": "H", "parent": None, "child": tag + "M"},
+                 tag + "M": {"kind": "M", "parent": tag + "H", "child": None}}
+        if siblings:
+            nodes[tag + "W"] = {"kind": "W", "parent": tag + "H", "child": None}
+        sidecars = {tag + "H": [tag + "W"]} if siblings else {}
+        config = self.make_config(nodes, ignore=stubborn, sidecars=sidecars)
+        try:
+            root = self.custody.launch(config, tag + "H", self.env)
+            family = {"H": self.admit(tag + "H", root, argv, sidecars.get(tag + "H", ()))}
+            for label in (("M", "W") if siblings else ("M",)):
+                slot = tag + label
+                self.custody.await_event(slot, "hello")
+                child = R2OwnedChild(self.custody, slot)
+                family[label] = self.admit(slot, child, named_child if label == "M" else None)
+            return family
+        except BaseException:
+            self.close()
+            raise
+
+    def make_config(self, nodes, **extra):
+        self.custody.plan(nodes)
+        path = self.launch.tmp / ("actor-%d.json" % len(self.configs))
+        self.configs.append(path)
+        return self.custody.config(nodes, self.script, path, exit_file=str(path.with_suffix(".exit")), **extra)
+
+    def spawn_legacy(self, argv, logical_argv, body, environment):
+        """Known launch request plus private gate; modelled argv is supplied explicitly by the caller."""
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+
+        tag = "actor%d-legacy" % len(self.configs)
+        nodes = {tag: {"kind": "H", "parent": None, "child": None}}
+        config = self.make_config(nodes)
+        script = self.launch.tmp / (tag + ".py")
+        prelude = (
+            "import os, json, sys, runpy\nfrom pathlib import Path\n"
+            "control = Path(os.environ['R2_LEGACY_CONFIG'])\n"
+            "if any(p.is_symlink() for p in (control, *control.parents)):\n"
+            "    raise RuntimeError('R2 fixture: linked legacy control input')\n"
+            "configuration = json.loads(control.read_text())\n"
+            "sys.path.insert(0, configuration['trusted_root'])\n"
+            "runpy.run_path(configuration['helper'])['r2_legacy_child_gate'](configuration, os.environ['R2_LEGACY_SLOT'])\n"
+        )
+        script.write_text(prelude + body, encoding="utf-8")
+        requested = Path(argv[0])
+        directory = requested.parent if self.launch.tmp in requested.parents else self.launch.tmp
+        command = [*python_argv(requested.name, script, directory), *argv[1:]]
+        env = {**self.env, **environment, "R2_LEGACY_CONFIG": config["config"], "R2_LEGACY_SLOT": tag}
+        try:
+            process = self.custody.launch(config, tag, env, argv=command, cwd=self.launch.tmp)
+            self.admit(tag, process, logical_argv)
+            return process
+        except BaseException:
+            self.close()
+            raise
+
+    def spawn_exec(self, argv, logical_argv, expected_argv, environment=None, cwd=None,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   captured=(), target=None):
+        """Actual harness exec, explicit MODELLED logical atoms; exact constructor bytes witness readiness.
+
+        Neither program names nor the production matcher discover this receipt. Physical custody precedes
+        exec, and keeps its original handle through every pending/READY failure and natural exit.
+        """
+        import time
+
+        if (not isinstance(expected_argv, (list, tuple)) or not expected_argv or
+                not all(isinstance(word, str) and "\0" not in word for word in expected_argv)):
+            raise RuntimeError("R2 fixture: an exact actual-exec array is required")
+        tag = "actor%d-exec" % len(self.configs)
+        nodes = {tag: {"kind": "H", "parent": None, "child": None}}
+        specs = {}
+        for index, spec in enumerate(captured):
+            if set(spec) != {"argv", "expected_argv", "logical_argv"}:
+                raise RuntimeError("R2 fixture: invalid declared captured child")
+            slot = tag + "-child%d" % index
+            nodes[slot] = {"kind": "M", "parent": tag, "child": None}
+            specs[slot] = spec
+        extra = {"exec_argv": list(argv), "exec_slot": tag, "capture_specs": specs,
+                 "exec_children": {slot: spec["argv"] for slot, spec in specs.items()}}
+        if target is not None:
+            import hashlib
+            path, entry = target
+            extra["capture_target"] = {"path": str(path), "entry": entry,
+                                       "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+        config = self.make_config(nodes, **extra)
+        for slot, spec in specs.items():
+            self.exec_children[slot] = {"spec": spec, "state": "RESERVED"}
+        env = {key: value for key, value in {**self.env, **(environment or {})}.items()
+               if key not in ("CLAUDECODE", "CLAUDE_PID") and not key.startswith("CLAUDE_CODE_")}
+        if target is not None:
+            env["R2_CAPTURE_CONFIG"] = config["config"]
+        expected = b"\0".join(os.fsencode(word) for word in expected_argv) + b"\0"
+        try:
+            process = self.custody.launch(config, tag, env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr)
+            self.children.append(process)
+            self.custody.await_event(tag, "hello")
+            self.projection.pending(process)
+            self.custody.release(tag)
+            self.custody.await_event(tag, "running")
+            deadline = time.monotonic() + 3
+            while True:
+                self.service_exec_children()
+                if self.custody.observe(tag) is not None:
+                    self.retire_pending_exit(process, tag)
+                    return process
+                try:
+                    physical = r2_kernel_process(process.pid)
+                    if physical["raw"] == expected:
+                        self.projection.ready(process, logical_argv)
+                        return process
+                except (FileNotFoundError, RuntimeError):
+                    receipt = self.projection.receipts.get(str(process.pid))
+                    if (receipt is None or receipt["state"] != "PENDING" or
+                            self.custody.observe(tag) is None):
+                        raise
+                    self.retire_pending_exit(process, tag)
+                    return process
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("R2 fixture: actual exec handshake failed\n" + self.custody.stderr_tail())
+                time.sleep(0.01)
+        except BaseException:
+            self.close()
+            raise
+
+    def service_exec_children(self):
+        from tests.integration.test_hierarchy_launcher import R2OwnedChild
+
+        self.custody.pump()
+        ready = False
+        for slot, item in self.exec_children.items():
+            if not self.custody.slots[slot]["hello"]:
+                continue
+            child = R2OwnedChild(self.custody, slot)
+            if item["state"] == "RESERVED":
+                self.projection.pending(child)
+                item["state"] = "PENDING"
+                self.custody.release(slot)
+            if item["state"] != "PENDING":
+                ready = True
+                continue
+            if self.custody.observe(slot) is not None:
+                self.retire_pending_exit(child, slot)
+                item["state"] = "EXITED"
+                ready = True
+                continue
+            physical = r2_kernel_process(child.pid)
+            expected = b"\0".join(os.fsencode(word) for word in item["spec"]["expected_argv"]) + b"\0"
+            if physical["raw"] == expected:
+                self.projection.ready(child, item["spec"]["logical_argv"])
+                item["state"] = "READY"
+                ready = True
+        return ready
+
+    def retire_pending_exit(self, process, slot):
+        receipt = self.projection.receipts.get(str(process.pid))
+        if (receipt is None or receipt["state"] != "PENDING" or
+                self.custody.observe(slot) is None):
+            raise RuntimeError("R2 fixture: pending exit needs original-instance exit evidence")
+        # No positive reader has seen this pending input. Its physical exit stays in custody; a missing
+        # metadata read alone can never retire it or turn it into a READY/native projection.
+        del self.projection.receipts[str(process.pid)]
+        self.projection.save()
+
+    def admit(self, slot, process, argv, sidecars=()):
+        self.children.append(process)
+        self.custody.await_event(slot, "hello")
+        self.projection.pending(process)
+        self.projection.ready(process, argv)
+        for child in sidecars:
+            if (len(sidecars) != 1 or child not in self.custody.slots or
+                    self.custody.slots[child]["parent"] != slot or
+                    self.custody.slots[slot]["kind"] != "H" or self.custody.slots[child]["child"] is not None):
+                raise RuntimeError("R2 fixture: invalid reserved sibling")
+            self.custody.slots[child]["permitted"] = True
+        self.custody.release(slot)
+        self.custody.await_event(slot, "running")
+        return process
+
+    def runner(self, session=None, action="stop", timeout=3, stop_words=None, echo_exit=False):
+        from tests.integration.test_hierarchy_launcher import R2OwnedChild
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+        tag = "actor%d-" % len(self.configs)
+        words = stop_words if stop_words is not None else ("stop", "--endpoint", REVIEW, "--grace-seconds", "1")
+        request = self.projection.command("--base", str(self.launch.base), *words)
+        nodes = {tag + "R": {"kind": "R", "parent": tag + "C" if session else None, "child": None}}
+        if session:
+            nodes[tag + "C"] = {"kind": "C", "parent": None, "child": tag + "R"}
+        config = self.make_config(nodes, runner_request=request, runner_action=action, runner_timeout=timeout,
+                                  echo_exit=echo_exit)
+        root_slot = tag + ("C" if session else "R")
+        command = ([*python_argv("codex", self.script, self.launch.tmp), config["config"], root_slot, session]
+                   if session else None)
+        try:
+            root = self.custody.launch(config, root_slot, self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       argv=command)
+            self.admit(root_slot, root, ["codex", "exec", "resume", session] if session else None)
+            if session:
+                self.custody.await_event(tag + "R", "hello")
+                child = R2OwnedChild(self.custody, tag + "R")
+                self.admit(tag + "R", child, None)
+            else:
+                child = root
+            return root, child
+        except BaseException:
+            self.close()
+            raise
+
+    def module(self, pidfds=True):
+        import errno
+
+        module = launcher_module(self.projection)
+        if pidfds:
+            if not (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")):
+                raise RuntimeError("R2 fixture prerequisite: Linux pidfd APIs required for this selected case")
+            # Qualify the host capability on our own instance, independently of the product path being tested.
+            target = self.children[0].pid if self.children else os.getpid()
+            try:
+                fd = os.pidfd_open(target)
+                try:
+                    signal.pidfd_send_signal(fd, 0)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise RuntimeError("R2 fixture prerequisite: actual pidfd capability failed: " + str(exc)) from exc
+        else:
+            def unavailable(*args):
+                raise OSError(errno.ENOSYS, "modelled pidfd unavailability")
+            module.os.pidfd_open = unavailable
+        module.KILL_WAIT_SECONDS = 1
+        return module
+
+    def stop(self, module, capsys, grace=1):
+        code = module.main(["--base", str(self.launch.base), "stop", "--endpoint", REVIEW,
+                            "--grace-seconds", str(grace)])
+        return code, json.loads(capsys.readouterr().out)
+
+    def ps(self, module, process, argv):
+        """MODELLED flattened ps at a module-local subprocess boundary; real PID/UID/PPID/group stay actual."""
+        from types import SimpleNamespace
+
+        run = module.subprocess.run
+        self.projection.path_view(module, proc_available=False)
+
+        def shown(command, **options):
+            if "-o" not in command or "args=" not in command[command.index("-o") + 1]:
+                return run(command, **options)
+            if process is None or process.poll() is not None:
+                return SimpleNamespace(returncode=1 if "-p" in command else 0, stdout="")
+            physical = r2_kernel_process(process.pid)
+            text = "%d %d %d %d %d %s Sat Nov 7 12:00:00 2026 %s\n" % (
+                process.pid, physical["pgid"], physical["ppid"], physical["uid"], physical["euid"],
+                physical["state"], " ".join(argv))
+            return SimpleNamespace(returncode=0, stdout=text)
+        module.subprocess.run = shown
+
+    def close(self):
+        return self.custody.close()
+
+
+@pytest.fixture
+def r2_case(launch):
+    try:
+        made = R2Case(launch)
+    except R2CleanupUnknown as exc:
+        pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
+    try:
+        yield made
+    finally:
+        try:
+            made.close()
+        except R2CleanupUnknown as exc:
+            pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+@pytest.mark.parametrize("field", ["stat", "status", "cmdline"])
+def test_r2_unavailable_before_first_signal_keeps_live_candidate(r2_case, capsys, pidfds, field):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(pidfds)
+    stage, faults = [], []
+
+    def before(pid, count):
+        if pid == held.pid and count >= 2:
+            stage.append("recheck")
+
+    def unavailable(path, physical):
+        if stage and str(path) == "/proc/%d/%s" % (held.pid, field):
+            faults.append(field)
+            raise PermissionError("modelled unavailable evidence before first signal")
+        return physical
+
+    r2_case.projection.before_read.append(before)
+    r2_case.projection.path_view(module, unavailable)
+    code, stopped = r2_case.stop(module, capsys)
+    assert stage and faults, "fixture prerequisite: the census and targeted recheck must both execute"
+    assert any(pid == held.pid for pid, _ in r2_case.projection.opens) is pidfds, "fixture prerequisite: requested pidfd/fallback mode was actually used"
+    assert held.poll() is None and r2_case.projection.events == []
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == []
+    assert stopped.get("unresolved_pids") == [held.pid]
+    assert "unavailable" in json.dumps(stopped)
+
+
+@pytest.mark.parametrize("provider", ["proven", "unproven"])
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("collision", ["claude-prompt", "claude-system", "codex-cd", "codex-builder"])
+def test_r2_flatten_identical_arrays_do_not_share_ownership(r2_case, capsys, provider, side, collision):
+    from hierarchy_provision import codex_argv
+
+    session, other = str(uuid.uuid4()), str(uuid.uuid4())
+    host = "claude-code" if collision.startswith("claude") else "codex-cli"
+    role = r2_case.bind(host, session)
+    if collision == "claude-prompt":
+        pair = (["claude", "--print", "Please --resume " + session],
+                ["claude", "--print", "Please", "--resume", session])
+    elif collision == "claude-system":
+        pair = (["claude", "--print", "--system-prompt", "Explain --resume " + session + " carefully"],
+                ["claude", "--print", "--system-prompt", "Explain", "--resume", session, "carefully"])
+    elif collision == "codex-cd":
+        pair = (["codex", "--cd", "resume " + other, "exec", "resume " + session],
+                ["codex", "--cd", "resume " + other + " exec", "resume", session])
+    else:
+        prefix = codex_argv(json.loads(Path(role["codex_profile"]).read_text()))
+        pair = (prefix + ["resume " + session], prefix + ["resume", session])
+    assert pair[0] != pair[1] and " ".join(pair[0]) == " ".join(pair[1])
+    argv = pair[side == "right"]
+    held = r2_case.spawn(argv)
+    module = r2_case.module()
+    if provider == "unproven":
+        r2_case.ps(module, held, argv)
+    code, stopped = r2_case.stop(module, capsys)
+    if provider == "unproven":
+        assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == []
+        assert stopped["argv_boundaries"] == "unproven" and stopped["unowned_pids"] == [held.pid]
+        assert held.poll() is None and r2_case.projection.events == []
+    elif side == "left":
+        assert code == 0 and stopped["state"] == "not_running" and stopped["pids"] == []
+        assert held.poll() is None and r2_case.projection.events == []
+    else:
+        assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
+        assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r2_exact_round7_prompt_is_only_lossy_diagnostic_evidence(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    argv = ["claude", "--print", "Please --resume " + session + " now"]
+    held = r2_case.spawn(argv)
+    module = r2_case.module()
+    r2_case.ps(module, held, argv)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == []
+    assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
+    assert r2_case.projection.events == []
+
+
+def test_r2_actual_codex_builder_keeps_single_word_resume_prompt(r2_case, capsys):
+    from hierarchy_provision import codex_argv
+
+    session = str(uuid.uuid4())
+    role = r2_case.bind("codex-cli", session)
+    argv = codex_argv(json.loads(Path(role["codex_profile"]).read_text()), ["resume", session, "resume"])
+    held = r2_case.spawn(argv)
+    code, stopped = r2_case.stop(r2_case.module(), capsys)
+    assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("which", ["start", "wake"])
+def test_r2_actual_claude_builder_arrays_remain_stoppable(r2_case, capsys, which):
+    session = str(uuid.uuid4())
+    role = r2_case.bind("claude-code", session)
+    argv = role["start_argv"] if which == "start" else json.loads(Path(role["wake_profile"]).read_text())["argv"]
+    held = r2_case.spawn(argv)
+    code, stopped = r2_case.stop(r2_case.module(), capsys)
+    assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r2_empty_lossy_provider_cannot_prove_no_targets(r2_case, capsys):
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module()
+    r2_case.ps(module, None, [])
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == []
+    assert stopped["argv_boundaries"] == "unproven" and r2_case.projection.events == []
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+@pytest.mark.parametrize("drift", [None, "cmdline", "birth", "uid", "unavailable", "named-session"])
+def test_r2_real_descendant_chain_retains_attempts_after_middle_exit(r2_case, capsys, pidfds, drift):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    host, middle, worker = (family[label] for label in ("H", "M", "W"))
+    module = r2_case.module(pidfds)
+    term_done = []
+
+    def signalled(pid, number):
+        if pid == middle.pid and number == signal.SIGTERM:
+            wait_until(lambda: middle.poll() is not None)
+        if pid == host.pid and number == signal.SIGTERM:
+            assert middle.poll() is not None
+            term_done.append(True)
+
+    def modelled_drift(pid, count, row):
+        if term_done and pid == worker.pid:
+            if drift == "cmdline":
+                return row._replace(cmdline=row.cmdline + b"modelled-change\0")
+            if drift == "named-session":
+                word = "--session-id=" + session
+                return row._replace(cmdline=row.cmdline + word.encode() + b"\0", argv=(*row.argv, word))
+            if drift == "birth":
+                return row._replace(start_time=str(int(row.start_time) + 1))
+            if drift == "uid":
+                return row._replace(uid=os.geteuid() + 1, euid=os.geteuid() + 1)
+        return row
+
+    def unavailable(path, physical):
+        if term_done and drift == "unavailable" and str(path) == "/proc/%d/cmdline" % worker.pid:
+            raise PermissionError("modelled attempted worker evidence unavailable")
+        return physical
+
+    r2_case.projection.after_signal.append(signalled)
+    r2_case.projection.after_present.append(modelled_drift)
+    r2_case.projection.path_view(module, unavailable)
+    code, stopped = r2_case.stop(module, capsys)
+    assert term_done, "fixture prerequisite: H was attempted after the real M exit"
+    assert any(pid == worker.pid for pid, _ in r2_case.projection.opens) is pidfds, "fixture prerequisite: requested worker instance-handle mode was actually used"
+    assert stopped["pids"] == sorted(child.pid for child in family.values())
+    assert not set(stopped["pids"]) & set(stopped.get("unowned_pids", []))
+    if drift is None:
+        assert code == 0 and stopped["state"] == "stopped" and worker.poll() is not None
+        assert (worker.pid, signal.SIGKILL) in r2_case.projection.events
+    else:
+        assert code == 3 and stopped["state"] == "stop_failed" and worker.poll() is None
+        assert worker.pid in stopped.get("unresolved_pids", [])
+        assert (worker.pid, signal.SIGKILL) not in r2_case.projection.events
+    assert host.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_r2_projection_contract_preserves_real_evidence(r2_case):
+    session = str(uuid.uuid4())
+    logical = ["claude", "--resume", session]
+    held = r2_case.spawn(logical)
+    physical = r2_kernel_process(held.pid)
+    read_bytes, kill, send = Path.read_bytes, os.kill, getattr(signal, "pidfd_send_signal", None)
+    module = r2_case.module()
+    observation = module.read_process(held.pid)
+    row = getattr(observation, "snapshot", observation)
+    assert row.argv == tuple(logical)
+    assert row.pid == held.pid and row.cmdline == physical["raw"] and row.start_time == physical["birth"]
+    assert (row.uid, row.euid, row.ppid, row.pgid, row.state) == (
+        physical["uid"], physical["euid"], physical["ppid"], physical["pgid"], physical["state"])
+    assert Path.read_bytes is read_bytes and os.kill is kill and getattr(signal, "pidfd_send_signal", None) is send
+    assert module.os is not os and module.signal is not signal and module.subprocess is not subprocess
+    assert "--resume" not in [os.fsdecode(word) for word in physical["raw"].split(b"\0")]
+
+
+def test_r2_legacy_child_keeps_physical_argv_and_independent_custody(r2_case):
+    session = str(uuid.uuid4())
+    logical = ["codex", "exec", "resume", session]
+    ready = r2_case.launch.tmp / "legacy-ready"
+    held = r2_case.spawn_legacy([str(r2_case.launch.tmp / "codex"), "-c", CHILD, "resume", session], logical,
+                                CHILD, {"STOP_OWNERSHIP_READY": str(ready)})
+    wait_until(ready.exists)
+    physical = r2_kernel_process(held.pid)
+    assert Path(os.fsdecode(physical["raw"].split(b"\0")[0])).name == "codex"
+    assert physical["raw"].split(b"\0")[:-1] == [os.fsencode(word) for word in held.args]
+    module = r2_case.module()
+    observation = module.read_process(held.pid)
+    row = getattr(observation, "snapshot", observation)
+    assert row.argv == tuple(logical) and row.cmdline == physical["raw"]
+    assert (row.start_time, row.uid, row.euid) == (physical["birth"], physical["uid"], physical["euid"])
+    report = r2_case.close()
+    assert report["state"] == "CLOSED" and all(entry["exit"] for entry in report["entries"].values())
+    assert held.wait(timeout=5) == 0 and r2_case.projection.events == []
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+def test_r2_post_signal_empty_cmdline_retains_the_live_attempt(r2_case, capsys, pidfds):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+    module = r2_case.module(pidfds)
+    terms, negatives = [], []
+
+    def signalled(pid, number):
+        if pid == held.pid and number == signal.SIGTERM:
+            terms.append(pid)  # The facade calls this only after the real public signal returns.
+
+    def empty_after_term(path, physical):
+        if terms and str(path) == "/proc/%d/cmdline" % held.pid:
+            negatives.append(physical)
+            return b""  # MODELLED OS observation; the TERM-ignoring physical child remains alive.
+        return physical
+
+    r2_case.projection.after_signal.append(signalled)
+    r2_case.projection.path_view(module, empty_after_term)
+    code, stopped = r2_case.stop(module, capsys)
+    assert terms == [held.pid] and negatives and all(negatives)
+    assert any(pid == held.pid for pid, _ in r2_case.projection.opens) is pidfds
+    assert held.poll() is None and r2_kernel_process(held.pid)["raw"]
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
+    assert held.pid not in stopped.get("unowned_pids", [])
+    assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
+    observation = module.read_process(held.pid)
+    row = getattr(observation, "snapshot", observation)
+    physical = r2_kernel_process(held.pid)
+    assert row.cmdline == b"" and row.argv == () and not row.state.startswith("Z")
+    assert (row.pid, row.start_time, row.uid, row.euid, row.ppid, row.pgid) == (
+        held.pid, physical["birth"], physical["uid"], physical["euid"], physical["ppid"], physical["pgid"])
+    report = r2_case.close()  # Independent physical custody, never another production attempt.
+    assert report["state"] == "CLOSED" and all(entry["exit"] for entry in report["entries"].values())
+    assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("tamper", ["never-verified", "other-module", "pending", "birth", "digest",
+                                     "argv", "structure", "missing"])
+def test_r2_empty_cmdline_requires_the_same_module_verified_receipt(r2_case, tamper):
+    session = str(uuid.uuid4())
+    logical = ["claude", "--resume", session]
+    held = r2_case.spawn(logical, ignore=True)
+    module = r2_case.module()
+    if tamper != "never-verified":
+        observation = module.read_process(held.pid)
+        row = getattr(observation, "snapshot", observation)
+        assert row.argv == tuple(logical) and row.cmdline == r2_kernel_process(held.pid)["raw"]
+    if tamper == "other-module":
+        module = r2_case.module()  # A different loaded module has no verified receipt fingerprint.
+    receipt = r2_case.projection.receipts[str(held.pid)]
+    if tamper == "pending":
+        receipt["state"] = "PENDING"
+    elif tamper == "birth":
+        receipt["birth"] = str(int(receipt["birth"]) + 1)
+    elif tamper == "digest":
+        receipt["digest"] = "0" * 64
+    elif tamper == "argv":
+        receipt["argv"] = ["claude", "--resume", str(uuid.uuid4())]
+    elif tamper == "structure":
+        receipt["unexpected"] = "modelled receipt tamper"
+    elif tamper == "missing":
+        del r2_case.projection.receipts[str(held.pid)]
+
+    def empty(path, physical):
+        return b"" if str(path) == "/proc/%d/cmdline" % held.pid else physical
+
+    r2_case.projection.path_view(module, empty)
+    with pytest.raises(RuntimeError, match="^R2 fixture: stale/unknown projection receipt; no native fallback$"):
+        module.read_process(held.pid)
+    assert held.poll() is None and r2_kernel_process(held.pid)["raw"]
+    assert r2_case.projection.events == []
+
+
+def test_r2_modelled_other_uid_is_spared_without_any_attempt(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module()
+
+    def modelled_other_uid(pid, count, row):
+        return row._replace(uid=os.geteuid() + 1, euid=os.geteuid() + 1) if pid == held.pid else row
+
+    r2_case.projection.after_present.append(modelled_other_uid)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 0 and stopped["state"] == "not_running" and stopped["pids"] == []
+    assert stopped["unowned_pids"] == [held.pid] and held.poll() is None
+    assert r2_case.projection.events == []
+
+
+def test_r2_projection_contract_refuses_unknown_pending_and_stale_receipts(r2_case):
+    held = r2_case.spawn(["claude", "--resume", str(uuid.uuid4())])
+    module = r2_case.module()
+    receipt = r2_case.projection.receipts[str(held.pid)]
+    try:
+        del r2_case.projection.receipts[str(held.pid)]
+        with pytest.raises(RuntimeError, match="^R2 fixture: attempted signal outside the owned receipt set$"):
+            module.os.kill(held.pid, signal.SIGTERM)
+        assert held.poll() is None
+    finally:
+        r2_case.projection.receipts[str(held.pid)] = receipt
+    for field, invalid in (("state", "PENDING"), ("birth", "unrecognized"), ("digest", "0" * 64)):
+        original = receipt[field]
+        try:
+            receipt[field] = invalid
+            with pytest.raises(RuntimeError, match="^R2 fixture: stale/unknown projection receipt; no native fallback$"):
+                module.read_process(held.pid)
+            assert held.poll() is None and r2_case.projection.events == []
+        finally:
+            receipt[field] = original
+
+
+def test_r2_projection_contract_does_not_upgrade_ps_text(r2_case):
+    session = str(uuid.uuid4())
+    argv = ["claude", "--print", "Please --resume " + session + " now"]
+    held = r2_case.spawn(argv)
+    physical = r2_kernel_process(held.pid)
+    module = r2_case.module()
+    r2_case.ps(module, held, argv)
+    census = module.process_census(session)
+    assert census.argv_boundaries == "unproven" and len(census) == 1
+    row = census[0]
+    assert row.pid == held.pid and row.cmdline == os.fsencode(" ".join(argv))
+    assert row.cmdline != physical["raw"]
+    assert (row.uid, row.euid, row.ppid, row.pgid) == (
+        physical["uid"], physical["euid"], physical["ppid"], physical["pgid"])
+    assert held.poll() is None and r2_case.projection.events == []
+
+
+def test_r2_projection_contract_confines_unavailable_read_to_the_loaded_module(r2_case):
+    held = r2_case.spawn(["claude", "--resume", str(uuid.uuid4())])
+    module = r2_case.module()
+    original = Path.read_bytes
+
+    def unreadable(path, physical):
+        if str(path) == "/proc/%d/cmdline" % held.pid:
+            raise PermissionError("modelled fixture reader fault")
+        return physical
+
+    r2_case.projection.path_view(module, unreadable)
+    observation = module.read_process(held.pid)
+    assert observation is None or getattr(observation, "kind", None) == "UNAVAILABLE"
+    assert Path.read_bytes is original and r2_kernel_process(held.pid)["raw"]
+    assert held.poll() is None and r2_case.projection.events == []
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+def test_r2_confirmed_exit_before_first_signal_resolves_candidate(r2_case, capsys, pidfds):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(pidfds)
+    confirmed = []
+
+    def before(pid, count):
+        if pid == held.pid and count == 2:
+            r2_case.configs[0].with_suffix(".exit").touch()
+            assert held.wait(timeout=5) == 0  # Real child wait proves the original instance exited.
+            confirmed.append(True)
+
+    r2_case.projection.before_read.append(before)
+    code, stopped = r2_case.stop(module, capsys)
+    assert confirmed and r2_case.projection.events == []
+    assert code == 0 and stopped["state"] == "not_running" and stopped["pids"] == []
+    assert not stopped.get("unresolved_pids")
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+@pytest.mark.parametrize("field", ["cmdline", "birth", "uid"])
+def test_r2_metadata_drift_before_first_signal_spares_live_candidate(r2_case, capsys, pidfds, field):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(pidfds)
+    changed = []
+
+    def modelled(pid, count, row):
+        if pid == held.pid and count >= 2:
+            changed.append(field)
+            if field == "cmdline":
+                return row._replace(cmdline=row.cmdline + b"modelled-exec-change\0")
+            if field == "birth":
+                return row._replace(start_time=str(int(row.start_time) + 1))
+            return row._replace(uid=os.geteuid() + 1, euid=os.geteuid() + 1)
+        return row
+
+    r2_case.projection.after_present.append(modelled)
+    code, stopped = r2_case.stop(module, capsys)
+    assert changed and held.poll() is None and r2_case.projection.events == []
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == []
+    assert stopped.get("unresolved_pids") == [held.pid]
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
+@pytest.mark.parametrize("field", ["birth", "ppid"])
+def test_r2_parent_chain_drift_blocks_first_descendant_signal(r2_case, capsys, pidfds, field):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    host, middle, worker = (family[label] for label in ("H", "M", "W"))
+    module = r2_case.module(pidfds)
+    changed = []
+
+    def modelled(pid, count, row):
+        if pid == middle.pid and count >= 2:
+            changed.append(field)
+            return (row._replace(start_time=str(int(row.start_time) + 1)) if field == "birth"
+                    else row._replace(ppid=os.getpid()))
+        return row
+
+    r2_case.projection.after_present.append(modelled)
+    code, stopped = r2_case.stop(module, capsys)
+    assert changed and middle.poll() is None and worker.poll() is None
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [host.pid]
+    assert set(stopped.get("unresolved_pids", [])) == {middle.pid, worker.pid}
+    assert all(pid == host.pid for pid, _ in r2_case.projection.events)
+    assert host.wait(timeout=5) == -signal.SIGKILL
+
+
+@pytest.mark.parametrize("argument", ["<T>", "--unlisted=<T>", "-r<T>", "-r", "ambiguous"])
+def test_r2_real_descendant_with_other_or_ambiguous_selection_is_spared(r2_case, capsys, argument):
+    # -r is modelled, not observed. This negative guard never establishes root ownership.
+    session, other = str(uuid.uuid4()), str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    argv = (["claude", "--resume", "--print", "wait"] if argument == "ambiguous" else
+            ["claude", "-r", other] if argument == "-r" else
+            ["claude", argument.replace("<T>", other)])
+    family = r2_case.spawn(["claude", "--resume", session], tree=True, worker_argv=argv)
+    host, worker = family["H"], family["W"]
+    code, stopped = r2_case.stop(r2_case.module(), capsys)
+    assert code == 0 and stopped["state"] == "stopped" and worker.poll() is None
+    assert worker.pid not in stopped["pids"] and worker.pid not in stopped.get("unowned_pids", [])
+    assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
+    assert host.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_r2_initial_unavailable_descendant_cannot_disappear_from_accounting(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    host, middle, worker = (family[label] for label in ("H", "M", "W"))
+    module, missing = r2_case.module(), []
+
+    def missing_uid(path, physical):
+        if str(path) == "/proc/%d/status" % worker.pid:
+            missing.append(True)
+            # MODELLED incomplete metadata, while real PPID/birth/raw argv and independent custody remain.
+            return b"\n".join(line for line in physical.splitlines() if not line.startswith(b"Uid:"))
+        return physical
+
+    r2_case.projection.path_view(module, missing_uid)
+    code, stopped = r2_case.stop(module, capsys)
+    assert missing and worker.poll() is None
+    assert code == 3 and stopped["state"] == "stop_failed"
+    assert stopped["pids"] == sorted([host.pid, middle.pid])
+    assert stopped.get("unresolved_pids") == [worker.pid]
+    assert worker.pid not in stopped.get("unowned_pids", [])
+    assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
+    assert host.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_r2_complete_descendant_prompt_resume_remains_opaque(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    # MODELLED complete Codex argv; the final atom is its owner's prompt, not a missing selector.
+    family = r2_case.spawn(["claude", "--resume", session], tree=True,
+                           worker_argv=["codex", "exec", "resume", session, "resume"])
+    host, middle, worker = (family[label] for label in ("H", "M", "W"))
+    code, stopped = r2_case.stop(r2_case.module(), capsys)
+    assert code == 0 and stopped["state"] == "stopped"
+    assert stopped["pids"] == sorted([host.pid, middle.pid, worker.pid])
+    assert "unresolved_pids" not in stopped and "unowned_pids" not in stopped
+    assert (worker.pid, signal.SIGKILL) in r2_case.projection.events and worker.poll() is not None
+    assert host.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_r2_initial_incomplete_candidate_resolves_on_its_actual_zombie(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    host = r2_case.spawn(["claude", "--resume", session])
+    worker = r2_case.spawn()
+    module, exited = r2_case.module(), []
+
+    def missing_uid(path, physical):
+        if str(path) == "/proc/%d/status" % worker.pid:
+            return b"\n".join(line for line in physical.splitlines() if not line.startswith(b"Uid:"))
+        return physical
+
+    def exit_original(pid, count):
+        if pid == worker.pid and count == 2:
+            r2_case.configs[1].with_suffix(".exit").touch()
+            # Observe a real unreaped zombie, without manufacturing absence or polling Popen's cached status.
+            wait_until(lambda: r2_kernel_process(worker.pid)["state"].startswith("Z"))
+            exited.append(True)
+
+    r2_case.projection.path_view(module, missing_uid)
+    r2_case.projection.before_read.append(exit_original)
+    code, stopped = r2_case.stop(module, capsys)
+    assert exited and worker.wait(timeout=5) == 0
+    assert host.wait(timeout=5) == -signal.SIGTERM
+    assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [host.pid]
+    assert "unresolved_pids" not in stopped and "unowned_pids" not in stopped
+    assert r2_case.projection.events == [(host.pid, signal.SIGTERM)]
+
+
+def test_r2_numeric_esrch_cannot_resolve_a_previously_lost_attempt(r2_case, capsys):
+    import errno
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+    module = r2_case.module(pidfds=False)
+    terms, drifted, missing = [], [], []
+
+    def signalled(pid, number):
+        if pid == held.pid and number == signal.SIGTERM:
+            terms.append(True)
+
+    def replacement(pid, count, row):
+        if pid == held.pid and terms:
+            # MODELLED reused-PID observation, not a claim that the physical test actor changed identity.
+            drifted.append(True)
+            return row._replace(start_time=str(int(row.start_time) + 1))
+        return row
+
+    def opening(pid, *args):
+        if pid == held.pid and drifted:
+            missing.append(pid)
+            # MODELLED later numeric absence: it cannot recover the already-lost original-instance proof.
+            raise ProcessLookupError(errno.ESRCH, "modelled numeric PID disappeared after identity loss")
+        raise OSError(errno.ENOSYS, "modelled initial pidfd unavailability")
+
+    module.os.pidfd_open = opening
+    r2_case.projection.after_signal.append(signalled)
+    r2_case.projection.after_present.append(replacement)
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    assert terms and drifted and missing, "fixture prerequisite: attempted, lost identity, then numeric ESRCH"
+    assert held.poll() is None and r2_case.projection.events == [(held.pid, signal.SIGTERM)]
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
+    assert stopped.get("unresolved_pids") == [held.pid] and held.pid not in stopped.get("unowned_pids", [])
+    assert all(row["pid"] != held.pid for row in stopped.get("absence_evidence", []))
+
+
+@pytest.mark.parametrize("stage", ["before_signal", "after_signal"])
+@pytest.mark.parametrize("missing_field", ["status", "cmdline"])
+def test_r2_partial_replacement_birth_cannot_be_resolved_by_numeric_absence(r2_case, capsys, stage, missing_field):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+    module = r2_case.module(pidfds=False)
+    terms, drift, absent = [], [], []
+    killing = module.os.kill
+
+    def before_read(pid, count):
+        if pid == held.pid and ((stage == "before_signal" and count >= 2) or terms):
+            drift.append(True)
+
+    def incomplete(path, raw):
+        if path.parent == Path("/proc/%d" % held.pid) and drift:
+            # MODELLED coherent replacement birth plus unavailable status/cmdline at the OS boundary.
+            if path.name == "stat":
+                head, separator, tail = raw.rpartition(b")")
+                fields = tail.split()
+                fields[19] = str(int(fields[19]) + 1).encode()
+                return head + separator + b" " + b" ".join(fields)
+            if path.name == missing_field:
+                raise PermissionError("modelled replacement metadata unavailable")
+        return raw
+
+    def numeric_absence(pid, number):
+        if pid == held.pid and number == 0 and drift:
+            absent.append(pid)
+            if len(absent) >= 2:
+                raise ProcessLookupError("modelled later numeric absence")
+        return killing(pid, number)
+
+    r2_case.projection.before_read.append(before_read)
+    r2_case.projection.after_signal.append(lambda pid, number: terms.append(pid)
+                                          if pid == held.pid and number == signal.SIGTERM else None)
+    r2_case.projection.path_view(module, incomplete)
+    module.os.kill = numeric_absence
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    expected = [held.pid] if stage == "after_signal" else []
+    assert drift and len(absent) >= 2, "fixture prerequisite: coherent partial birth, then numeric absence"
+    assert held.poll() is None and r2_case.projection.events == ([(held.pid, signal.SIGTERM)] if expected else [])
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == expected
+    assert stopped.get("unresolved_pids") == [held.pid]
+    assert all(row["pid"] != held.pid for row in stopped.get("absence_evidence", []))
+
+
+def test_custody_cached_returncode_is_not_native_wait_evidence():
+    from types import SimpleNamespace
+
+    physical = r2_kernel_process(os.getpid())
+    entry = {"pid": os.getpid(), "birth": physical["birth"], "process": SimpleNamespace(returncode=0),
+             "fd": None, "verified_fd": False, "lost": False, "exit": None}
+    observer = SimpleNamespace(entries={"actor": entry})
+    assert R2Custody.observe(observer, "actor") is None
+    assert entry["exit"] is None and entry.get("wait_status") == "unavailable"
+
+
+def test_witnessed_child_keeps_echild_distinct_from_a_real_zero_status(r2_case):
+    held = r2_case.spawn()
+    r2_case.configs[0].with_suffix(".exit").touch()
+    wait_until(lambda: r2_kernel_process(held.pid)["state"].startswith("Z"))
+    reaped, status = os.waitpid(held.pid, os.WNOHANG)
+    assert reaped == held.pid and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    assert held.poll() is None and held.native_wait_evidence is None
+    with pytest.raises(ChildProcessError, match="^R2 fixture: native wait status unavailable$"):
+        held.wait(timeout=.1)
+    slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == held.pid)
+    evidence = r2_case.custody.observe(slot)
+    assert evidence["proof"] == "original_pidfd_exit" and "returncode" not in evidence
+    assert r2_case.custody.entries[slot]["wait_status"] == "unavailable"
+
+
+def test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit(r2_case):
+    """MODELLED read failure after an independently witnessed real child exit; no PID absence inference."""
+    import importlib.util
+    from types import SimpleNamespace
+    from tests.integration import test_hierarchy_launcher as helper
+
+    held = r2_case.spawn()
+    slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == held.pid)
+    entry = r2_case.custody.entries[slot]
+    assert entry["fd"] is not None and entry["verified_fd"]
+    spec = importlib.util.spec_from_file_location("exit_observer_" + uuid.uuid4().hex, helper.__file__)
+    isolated = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = isolated
+    spec.loader.exec_module(isolated)
+    observations = []
+
+    def exiting(pid):
+        assert pid == held.pid
+        r2_case.configs[0].with_suffix(".exit").touch()
+        assert held.wait(timeout=2) == 0
+        observations.append(pid)
+        raise ProcessLookupError("modelled /proc read racing confirmed original exit")
+
+    isolated.r2_kernel_process = exiting
+    observer = SimpleNamespace(entries={slot: entry})
+    evidence = isolated.R2Custody.observe(observer, slot)
+    assert observations == [held.pid] and evidence == {"proof": "original_pidfd_exit"}
+    assert not entry["lost"]
+
+
+def test_modelled_custody_lost_birth_cannot_be_resolved_by_numeric_absence(tmp_path):
+    """Actorless modelled OS observations: no real PID is ever signalled or put in physical custody."""
+    import importlib.util
+    from tests.integration import test_hierarchy_launcher as helper
+
+    spec = importlib.util.spec_from_file_location("actorless_custody_" + uuid.uuid4().hex, helper.__file__)
+    isolated = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = isolated
+    spec.loader.exec_module(isolated)
+    original = r2_kernel_process(os.getpid())
+    control = isolated.R2Custody(tmp_path / "observer", tmp_path / "modelled-quarantine.json")
+    control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+    control.slots["actor"].update(permitted=True, hello=True, released=True)
+    control.entries["actor"] = {"pid": os.getpid(), "birth": original["birth"], "process": None,
+                                 "fd": None, "verified_fd": False, "lost": False, "exit": None}
+    reads = []
+
+    def changed_then_missing(pid):
+        reads.append(pid)
+        if len(reads) == 1:
+            return {**original, "birth": str(int(original["birth"]) + 1)}
+        raise FileNotFoundError("modelled missing original metadata")
+
+    def numeric_only(pid, number):
+        assert number == 0, "the actorless control must never send a signal"
+        raise ProcessLookupError("modelled numeric absence")
+
+    isolated.r2_kernel_process = changed_then_missing
+    isolated.os = R2Facade(os, kill=numeric_only)
+    try:
+        assert control.observe("actor") is None and control.entries["actor"]["lost"]
+        assert control.observe("actor") is None and control.entries["actor"]["exit"] is None
+        with pytest.raises(isolated.R2CleanupUnknown):
+            control.close()
+        assert control.report["state"] == "UNKNOWN" and control.report["unresolved_slots"] == ["actor"]
+        with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
+            control.admit_check()
+    finally:
+        # This is an actorless negative observer, not an unknown real process scope. Preserve its quarantine
+        # report under that explicit label and close only the pipe descriptors this control itself created.
+        report = control.folder / "closure.json"
+        if report.exists():
+            report.rename(control.folder / "actorless-observer-report.json")
+        for fd in (control.safety_read, control.safety_write, control.report_read, control.report_write,
+                   *(fd for pair in control.gates.values() for fd in pair)):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_r2_projection_runner_uses_the_public_stop_entrypoint(r2_case):
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    held = r2_case.spawn(["codex", "exec", "resume", session])
+    runner, _ = r2_case.runner()
+    out, err = runner.communicate(timeout=5)
+    assert err == "" and runner.returncode == 0, out + err
+    answer = json.loads(out)
+    assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r2_ancestor_exclusion_spares_a_ready_host_named_caller(r2_case):
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    held = r2_case.spawn(["codex", "exec", "resume", session])
+    caller, runner = r2_case.runner(session=session)
+    assert r2_kernel_process(runner.pid)["ppid"] == caller.pid
+    assert session.encode() in r2_kernel_process(caller.pid)["raw"].split(b"\0")
+    assert Path(os.fsdecode(r2_kernel_process(caller.pid)["raw"].split(b"\0")[0])).name == "codex"
+    out, err = caller.communicate(timeout=5)
+    assert caller.returncode == 0 and err == "", out + err
+    answer = json.loads(out)
+    assert answer["state"] == "stopped" and answer["pids"] == [held.pid] and caller.pid not in answer["pids"]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+# Exact finite 28-row matrix from the Root-admitted R2 evidence, not matcher-derived expectations.
+def test_r2_fixture_closure_failed_ready_keeps_physical_custody(r2_case, monkeypatch):
+    def failed_ready(*args, **kwargs):
+        raise OSError("modelled READY staging failure")
+
+    monkeypatch.setattr(r2_case.projection, "ready", failed_ready)
+    with pytest.raises(OSError, match="^modelled READY staging failure$"):
+        r2_case.spawn(["claude", "--resume", str(uuid.uuid4())], tree=True)
+    report = r2_case.custody.report
+    assert report["state"] == "CLOSED" and not report["unresolved_slots"]
+    assert len(report["entries"]) == 1 and all(row["exit"] for row in report["entries"].values())
+    assert len(report["uncreated_slots"]) == 2
+    assert all(row["state"] == "PENDING" for row in r2_case.projection.receipts.values())
+    with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
+        r2_case.spawn()
+
+
+def test_r2_sibling_fixture_retains_real_parents_and_group(r2_case):
+    session = str(uuid.uuid4())
+    family = r2_case.spawn_group(None, named_child=["codex", "exec", "resume", session], siblings=True)
+    host, first, second = (family[label] for label in ("H", "M", "W"))
+    assert r2_kernel_process(first.pid)["ppid"] == r2_kernel_process(second.pid)["ppid"] == host.pid
+    assert {r2_kernel_process(child.pid)["pgid"] for child in family.values()} == {host.pid}
+    report = r2_case.close()
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert len(report["entries"]) == 3 and all(row["exit"] for row in report["entries"].values())
+
+
+def test_r2_sibling_fixture_closes_both_children_when_ready_staging_fails(r2_case, monkeypatch):
+    ready = r2_case.projection.ready
+    calls = []
+
+    def failed_child(process, argv):
+        calls.append(process.pid)
+        if len(calls) == 2:
+            raise OSError("modelled sibling READY staging failure")
+        return ready(process, argv)
+
+    monkeypatch.setattr(r2_case.projection, "ready", failed_child)
+    with pytest.raises(OSError, match="^modelled sibling READY staging failure$"):
+        r2_case.spawn_group(None, named_child=["codex", "exec", "resume", str(uuid.uuid4())], siblings=True)
+    report = r2_case.custody.report
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert len(report["entries"]) == 3 and all(row["exit"] for row in report["entries"].values())
+
+
+def test_r2_exec_fixture_uses_actual_exec_bytes_and_owned_cleanup(r2_case):
+    ready = r2_case.launch.tmp / "exec-ready"
+    session = str(uuid.uuid4())
+    command = [sys.executable, "-c", CHILD]
+    held = r2_case.spawn_exec(command, ["codex", "exec", "resume", session], command,
+                             environment={"STOP_OWNERSHIP_READY": str(ready)})
+    wait_until(ready.exists)
+    physical = r2_kernel_process(held.pid)
+    row = r2_case.module().read_process(held.pid).snapshot
+    assert physical["raw"].split(b"\0")[:-1] == [os.fsencode(word) for word in command]
+    assert row.cmdline == physical["raw"] and row.start_time == physical["birth"]
+    assert row.argv == ("codex", "exec", "resume", session)
+    report = r2_case.close()
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert r2_case.projection.events == [] and held.wait(timeout=5) < 0
+
+
+def test_r2_exec_fixture_closes_an_actual_exec_on_ready_failure(r2_case, monkeypatch):
+    def fail(*args):
+        raise OSError("modelled actual-exec READY failure")
+
+    monkeypatch.setattr(r2_case.projection, "ready", fail)
+    command = [sys.executable, "-c", "import time; time.sleep(5)"]
+    with pytest.raises(OSError, match="^modelled actual-exec READY failure$"):
+        r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command)
+    report = r2_case.custody.report
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert len(report["entries"]) == 1 and all(row["exit"] for row in report["entries"].values())
+    assert r2_case.projection.events == []
+
+
+def test_r2_exec_fixture_keeps_a_fast_original_exit_as_negative_evidence(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    module = r2_case.module()
+    command = [sys.executable, "-c", "pass"]
+    held = r2_case.spawn_exec(command, ["codex", "resume", session], command)
+    assert held.wait(timeout=5) == 0
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 0 and stopped["state"] == "not_running" and stopped["pids"] == []
+    assert r2_case.projection.events == []
+
+
+def test_r2_captured_exec_registers_a_real_child_before_releasing_it(r2_case, capsys):
+    from tests.integration.hierarchy_fake_wrapper import python_argv
+    from tests.integration.test_hierarchy_mailbox import ROOT
+
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    ready = r2_case.launch.tmp / "captured-child-ready"
+    child = [sys.executable, "-c", CHILD]
+    target = r2_case.launch.tmp / "captured-parent.py"
+    target.write_text("import subprocess, time\nsubprocess.run(%r)\ntime.sleep(5)\n" % child, encoding="utf-8")
+    prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py", r2_case.launch.tmp,
+                         "r2_captured_entry")
+    command = [*prefix, str(target), "script"]
+    held = r2_case.spawn_exec(command, ["codex", "exec", "resume", session], command,
+                             environment={"STOP_OWNERSHIP_READY": str(ready)},
+                             captured=[{"argv": child, "expected_argv": child, "logical_argv": None}],
+                             target=(target, "script"))
+    try:
+        wait_until(lambda: r2_case.service_exec_children() or ready.exists())
+    except AssertionError as error:
+        raise AssertionError("captured child did not become ready\n" + r2_case.custody.stderr_tail()) from error
+    r2_case.service_exec_children()
+    descendants = [e for e in r2_case.custody.entries.values() if e["pid"] != held.pid]
+    assert len(descendants) == 1
+    worker = descendants[0]["pid"]
+    assert r2_kernel_process(worker)["ppid"] == held.pid
+    code, stopped = r2_case.stop(r2_case.module(), capsys)
+    assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == sorted([held.pid, worker])
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r2_captured_exec_closes_a_child_still_behind_its_gate(r2_case, monkeypatch):
+    from tests.integration.hierarchy_fake_wrapper import python_argv
+    from tests.integration.test_hierarchy_mailbox import ROOT
+
+    child = [sys.executable, "-c", "import time; time.sleep(5)"]
+    target = r2_case.launch.tmp / "captured-pending-parent.py"
+    target.write_text("import subprocess\nsubprocess.run(%r)\n" % child, encoding="utf-8")
+    prefix = python_argv("codex", ROOT / "tests/integration/test_hierarchy_launcher.py", r2_case.launch.tmp,
+                         "r2_captured_entry")
+    command = [*prefix, str(target), "script"]
+    releasing = r2_case.custody.release
+
+    def failed_child(slot):
+        if slot.endswith("-child0"):
+            raise OSError("modelled captured-child gate failure")
+        return releasing(slot)
+
+    monkeypatch.setattr(r2_case.custody, "release", failed_child)
+    with pytest.raises(OSError, match="^modelled captured-child gate failure$"):
+        r2_case.spawn_exec(command, ["codex", "resume", str(uuid.uuid4())], command,
+                           captured=[{"argv": child, "expected_argv": child, "logical_argv": None}],
+                           target=(target, "script"))
+        wait_until(lambda: r2_case.service_exec_children())
+    report = r2_case.close()
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
+
+
+def test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure(r2_case, monkeypatch):
+    original = r2_case.projection.pending
+
+    def failed_middle(process):
+        if len(r2_case.custody.entries) >= 2:
+            raise OSError("modelled middle receipt failure")
+        return original(process)
+
+    monkeypatch.setattr(r2_case.projection, "pending", failed_middle)
+    with pytest.raises(OSError, match="^modelled middle receipt failure$"):
+        r2_case.spawn(["claude", "--resume", str(uuid.uuid4())], tree=True)
+    report = r2_case.custody.report
+    assert report["state"] == "CLOSED" and not report["unresolved_slots"]
+    assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
+    assert len(report["uncreated_slots"]) == 1
+    assert len(r2_case.projection.receipts) == 1  # The unreceipted M still had independent physical custody.
+
+
+@pytest.mark.parametrize("ending", ["timeout", "caller-killed"])
+def test_r2_fixture_closure_visits_all_and_closes_orphan_runner(r2_case, ending):
+    caller, runner = r2_case.runner(session=str(uuid.uuid4()), action="hang",
+                                   timeout=3 if ending == "caller-killed" else 0.3)
+    caller_slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == caller.pid)
+    if ending == "caller-killed":
+        r2_case.custody.kill_owned(caller_slot)
+        # An actual native wait can precede Popen cleanup; never manufacture success from ECHILD.
+        assert r2_case.custody.wait_native(caller_slot) == -signal.SIGKILL
+    else:
+        caller.communicate(timeout=2)
+        assert caller.returncode == 124  # Cached real Popen status is independent of the runner's liveness.
+    assert runner.poll() is None  # Caller exit alone did not close the still-owned runner.
+    seen = []
+
+    def failed_once(slot):
+        seen.append(slot)
+        if len(seen) == 1:
+            raise OSError("modelled first cleanup failure")
+
+    r2_case.custody.cleanup_hook = failed_once
+    with pytest.raises(R2CleanupError) as caught:
+        r2_case.close()
+    report = caught.value.report
+    assert report["state"] == "CLOSED_WITH_ERRORS" and not report["unresolved_slots"]
+    assert set(seen) == set(report["entries"]) == set(report["visited"])
+    assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
+    assert any("modelled first cleanup failure" in error for error in report["errors"])
+    assert runner.poll() is not None and not r2_case.custody.quarantine.exists()
+    with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
+        r2_case.custody.admit_check()
+
+
+R2_SELECTOR_DISPOSITIONS = [
+    {'host': 'claude-code', 'id': 'modelled-system-prompt-consumed-terminator', 'provider': 'PROVEN_ARGV', 'arguments': ['--print', '--system-prompt', 'Explain --resume', '--', '--resume <S>'], 'verdict': 'NOT_OWNED', 'expected_exit': 0, 'expected_state': 'not_running'},
+    {'host': 'claude-code', 'id': 'modelled-system-prompt-consumed-terminator', 'provider': 'LOSSY_PS', 'arguments': ['--print', '--system-prompt', 'Explain --resume', '--', '--resume <S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-selector-consumed-terminator', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '--', '--resume <S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-selector-consumed-terminator', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '--', '--resume <S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-claude-option-valued-selection', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '--print', 'please --resume <S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-claude-option-valued-selection', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '--print', 'please --resume <S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'codex-cli', 'id': 'modelled-codex-option-valued-selection', 'provider': 'PROVEN_ARGV', 'arguments': ['exec', 'resume', '--last', 'resume <S> prompt'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'codex-cli', 'id': 'modelled-codex-option-valued-selection', 'provider': 'LOSSY_PS', 'arguments': ['exec', 'resume', '--last', 'resume <S> prompt'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-unknown-value-cannot-recover', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', 'unknown', '--resume', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-unknown-value-cannot-recover', 'provider': 'LOSSY_PS', 'arguments': ['--resume', 'unknown', '--resume', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-missing-value-after-bound-selection', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '<S>', '--session-id'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-missing-value-after-bound-selection', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '<S>', '--session-id'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-option-value-after-bound-selection', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '<S>', '--resume', '--print', 'wait'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-option-value-after-bound-selection', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '<S>', '--resume', '--print', 'wait'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-unknown-selection-after-bound-selection', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '<S>', '--resume', 'unknown'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-unknown-selection-after-bound-selection', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '<S>', '--resume', 'unknown'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'codex-cli', 'id': 'established-codex-positional-terminator', 'provider': 'PROVEN_ARGV', 'arguments': ['exec', 'resume', '--', '<S>', 'prompt'], 'verdict': 'OWNED', 'expected_exit': 0, 'expected_state': 'stopped'},
+    {'host': 'codex-cli', 'id': 'established-codex-positional-terminator', 'provider': 'LOSSY_PS', 'arguments': ['exec', 'resume', '--', '<S>', 'prompt'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'codex-cli', 'id': 'builder-codex-ordinary-prompt', 'provider': 'PROVEN_ARGV', 'arguments': ['exec', 'resume', '<S>', 'please resume the review'], 'verdict': 'OWNED', 'expected_exit': 0, 'expected_state': 'stopped'},
+    {'host': 'codex-cli', 'id': 'builder-codex-ordinary-prompt', 'provider': 'LOSSY_PS', 'arguments': ['exec', 'resume', '<S>', 'please resume the review'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-claude-ordinary-prompt', 'provider': 'PROVEN_ARGV', 'arguments': ['--session-id', '<S>', '--print', 'please --resume the review'], 'verdict': 'OWNED', 'expected_exit': 0, 'expected_state': 'stopped'},
+    {'host': 'claude-code', 'id': 'modelled-claude-ordinary-prompt', 'provider': 'LOSSY_PS', 'arguments': ['--session-id', '<S>', '--print', 'please --resume the review'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-proven-prompt-versus-flat-conflict', 'provider': 'PROVEN_ARGV', 'arguments': ['--resume', '<S>', '--', '--resume <T>'], 'verdict': 'OWNED', 'expected_exit': 0, 'expected_state': 'stopped'},
+    {'host': 'claude-code', 'id': 'modelled-proven-prompt-versus-flat-conflict', 'provider': 'LOSSY_PS', 'arguments': ['--resume', '<S>', '--', '--resume <T>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-opaque-configuration-value', 'provider': 'PROVEN_ARGV', 'arguments': ['--system-prompt', '--resume', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-opaque-configuration-value', 'provider': 'LOSSY_PS', 'arguments': ['--system-prompt', '--resume', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-proven-configuration-versus-flat-ambiguity', 'provider': 'PROVEN_ARGV', 'arguments': ['--system-prompt', '--resume', '--session-id', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+    {'host': 'claude-code', 'id': 'modelled-proven-configuration-versus-flat-ambiguity', 'provider': 'LOSSY_PS', 'arguments': ['--system-prompt', '--resume', '--session-id', '<S>'], 'verdict': 'HOLD', 'expected_exit': 3, 'expected_state': 'stop_failed'},
+]
+
+
+@pytest.mark.parametrize("case", R2_SELECTOR_DISPOSITIONS,
+                         ids=[case["id"] + "-" + case["provider"].lower() for case in R2_SELECTOR_DISPOSITIONS])
+def test_r2_finite_selector_disposition_through_public_stop(r2_case, capsys, case):
+    session, other = str(uuid.uuid4()), str(uuid.uuid4())
+    r2_case.bind(case["host"], session)
+    program = "claude" if case["host"] == "claude-code" else "codex"
+    argv = [program, *(word.replace("<S>", session).replace("<T>", other) for word in case["arguments"])]
+    held = r2_case.spawn(argv)
+    module = r2_case.module()
+    if case["provider"] == "LOSSY_PS":
+        r2_case.ps(module, held, argv)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == case["expected_exit"] and stopped["state"] == case["expected_state"]
+    assert stopped["pids"] == ([held.pid] if case["verdict"] == "OWNED" else [])
+    if case["verdict"] == "OWNED":
+        assert held.wait(timeout=5) == -signal.SIGTERM
+    else:
+        assert held.poll() is None and r2_case.projection.events == []
+    if case["provider"] == "LOSSY_PS":
+        assert stopped["argv_boundaries"] == "unproven" and stopped["unowned_pids"] == [held.pid]

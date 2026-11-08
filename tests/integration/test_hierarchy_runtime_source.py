@@ -165,20 +165,20 @@ def test_trusted_control_checkout_can_stop_owned_session_after_pinned_source_dri
     built = Launch(tmp_path)
     built.init()
     session = built.start()["session"]
-    process = subprocess.Popen(["sh", "-c", 'exec codex exec --json resume "$0"', session],
-                               env=built.env(FAKE_CODEX_MODE="hang", FAKE_CODEX_THREAD=session),
-                               stdout=subprocess.DEVNULL, start_new_session=True)
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
+
+    context = R2Case(built)
+    # MODELLED complete host atoms, independently captured real Python instance. Recovery imports trusted ROOT.
+    process = context.spawn(["codex", "exec", "--json", "resume", session])
     try:
-        wait_until(lambda: owned_pids(session) == [process.pid])
+        wait_until(lambda: owned_pids(session, projection=context.projection) == [process.pid])
         drift(built, kind, tmp_path / "executed")
         stopped = built.run("stop", "--endpoint", REVIEW, "--grace-seconds", "1")
         assert stopped["state"] == "stopped" and stopped["pids"] == [process.pid]
         assert process.wait(timeout=5) < 0
         assert not (tmp_path / "executed").exists()
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
+        context.close()
 
 
 def test_source_drift_refusal_leaves_existing_profile_bytes_and_binding_unchanged(tmp_path):

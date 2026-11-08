@@ -73,6 +73,32 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 NODE_ARITIES = {"--loader": 1, "--experimental-loader": 1, "--import": 1, "-r": 1, "--require": 1,
                 "--env-file": 1, "--conditions": 1, "-C": 1, "--title": 1, "--input-type": 1,
                 "--no-warnings": 0, "--trace-warnings": 0}
+# Closed stop grammar, bounded by Codex rust-v0.167.0 (086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a):
+# G: cli/src/main.rs:127-141, tui/src/cli.rs:66-67,128-135; E: exec/src/cli.rs:15-25;
+# R: exec/src/cli.rs:172-175,205-234. No claim of complete installed-host CLI support.
+# names, admitted stages, arity, repeatable, value validator. Aliases share one occurrence counter.
+CODEX_STOP_OPTIONS = (
+    (("-c", "--config"), ("G", "E", "R"), 1, True, "config"),  # utils/cli/src/config_override.rs:29-71
+    (("--enable",), ("G", "E", "R"), 1, True, "atom"),  # cli/src/main.rs:958-965
+    (("--disable",), ("G", "E", "R"), 1, True, "atom"),
+    (("--model", "-m"), ("G", "E", "R"), 1, False, "atom"),  # shared_options.rs:21-23
+    (("--sandbox", "-s"), ("G", "E"), 1, False, "sandbox"),  # shared_options.rs:38-41
+    (("--cd", "-C"), ("G", "E"), 1, False, "atom"),  # shared_options.rs:66-68
+    (("--add-dir",), ("G", "E"), 1, True, "atom"),  # shared_options.rs:74-76
+    (("--profile", "-p"), ("G", "E"), 1, False, "atom"),  # shared_options.rs:34-36
+    (("--output-last-message", "-o"), ("E", "R"), 1, False, "atom"),  # exec/src/cli.rs:72-79
+    (("--output-schema",), ("E", "R"), 1, False, "atom"),  # exec/src/cli.rs:52-54
+    (("--json", "--experimental-json"), ("E", "R"), 0, False, None),  # exec/src/cli.rs:63-70
+    (("--ignore-user-config",), ("E", "R"), 0, False, None),  # exec/src/cli.rs:44-46
+    (("--skip-git-repo-check",), ("E", "R"), 0, False, None),  # exec/src/cli.rs:36-38
+)
+# Claude's emitted forms: hierarchy_provision.claude_argv; additional retained vocabulary is modelled.
+CLAUDE_STOP_FLAGS = (("--restricted",), ("--strict-mcp-config",), ("--print", "-p"), ("--verbose",),
+                     ("--disable-slash-commands",), ("--bg",))
+CLAUDE_STOP_VALUES = ("--mcp-config", "--permission-mode", "--permission-prompts", "--output-format", "--name",
+                      "--model", "--effort", "--settings", "--add-dir", "--agents", "--disallowedTools",
+                      "--allowedTools", "--input-format", "--system-prompt", "--append-system-prompt", "--agent",
+                      "--plugin-dir")
 
 _HOSTS = {
     CLAUDE: {
@@ -82,6 +108,10 @@ _HOSTS = {
                         "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",),
                         "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": ("--resume", "--session-id"), "commands": (),
+                              "grammar": {"stage": "C", "flags": CLAUDE_STOP_FLAGS,
+                                          "split_one": CLAUDE_STOP_VALUES, "equals_one": ("--tools",),
+                                          "repeatable": ("--add-dir", "--plugin-dir"),
+                                          "exclusive_modes": ("--print", "--bg")},
                               "conflicting_flags": ("--fork-session",),
                               "value_options": ("--model", "--settings", "--permission-mode", "--output-format",
                                                 "--input-format", "--system-prompt", "--append-system-prompt",
@@ -105,6 +135,7 @@ _HOSTS = {
         "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex", "codex.js"),
                         "node_script_suffixes": (), "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": (), "commands": (("resume",), ("exec", "resume")),
+                              "grammar": {"options": CODEX_STOP_OPTIONS, "exec": "exec", "resume": "resume"},
                               "conflicting_flags": (),
                               "value_options": ("-c", "--config", "--disable", "--enable", "--sandbox", "-s",
                                                 "-C", "--cd", "--add-dir", "--model", "-m", "--profile", "-p",
@@ -167,13 +198,15 @@ def entrypoints(kind):
     return found
 
 
-def _host_arguments(kind, argv):
+def _host_arguments(kind, argv, strict=False):
     """Host arguments after env and an optional Node interpreter, or None for another program."""
     found = entrypoints(kind)
     if argv and Path(argv[0]).name == "env":
         argv = argv[1:]
         while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
             argv = argv[1:]
+        if strict and (not argv or argv[0].startswith("-")):
+            return False
     if not argv:
         return None
     program = Path(argv[0]).name
@@ -193,8 +226,13 @@ def _host_arguments(kind, argv):
         if not equal:
             arity = found["node_option_arities"].get(option)
             if arity is None:
-                return None  # Without a declared arity, the next word might be an option value, not a script.
+                return False if strict else None
+            if strict and arity and (index >= len(argv) or not argv[index] or argv[index].startswith("-")):
+                return False
             index += arity
+        elif strict and (option not in found["node_option_arities"] or found["node_option_arities"][option] != 1 or
+                         not word.partition("=")[2]):
+            return False  # An entrypoint name alone does not admit an unknown interpreter option.
     if index >= len(argv):
         return None
     script = Path(argv[index])
@@ -226,108 +264,178 @@ def _selector_value(value, session):
     return "other" if SESSION_UUID.fullmatch(value) else "unknown"
 
 
-def _session_values(selectors, arguments, argv_boundaries, session):
-    """One selector-state scan; proven argv skips complete values, ps retains its weaker evidence.
+def _stop_option(catalog, arguments, index, stage, seen):
+    """Consume one declared option and one opaque value atom; an invalid transition stays HOLD."""
+    word = arguments[index]
+    row = next((row for row in catalog if word in row[0]), None)
+    if row is None:
+        return None
+    names, stages, arity, repeatable, validator = row
+    if stage not in stages or (not repeatable and names[0] in seen):
+        return None
+    seen.add(names[0])
+    if arity:
+        if index + 1 >= len(arguments):
+            return None
+        value = arguments[index + 1]
+        if not value or value.startswith("-"):
+            return None
+        if validator == "config" and (not value.partition("=")[0] or not value.partition("=")[1] or
+                                      not value.partition("=")[2]):
+            return None
+        if validator == "sandbox" and value not in ("read-only", "workspace-write", "danger-full-access"):
+            return None
+    return index + 1 + arity
 
-    scan -> value leaves i at the prospective value. Ambiguity blocks permanently and an option-shaped value
-    stays at i so -- always reaches the terminator transition. prompt only relaxes ordinary non-UUID ps words
-    after a bound selection; it cannot repair an earlier invalid selection. terminated never establishes one.
-    """
-    flat = argv_boundaries == "unproven"
-    selected, conflicting, index, options = [], False, 0, True
-    state, after_value, command_value, positional = "scan", "scan", False, []
-    commands = {command[-1] for command in selectors["commands"]}
 
-    def record(value, incidental=False):
-        nonlocal conflicting
-        shape = _selector_value(value, session)
-        if shape in ("bound", "other"):
-            selected.append(value)
-        if shape in ("ambiguous", "other") or (shape == "unknown" and not incidental):
-            conflicting = True
-        return shape
+def _codex_selection(selectors, arguments, session):
+    grammar, stage, index, seen = selectors["grammar"], "G", 0, set()
+    while stage in ("G", "E"):
+        if index == len(arguments):
+            return "NOT_OWNED" if stage == "E" else "HOLD"
+        word = arguments[index]
+        if word.startswith("-"):
+            after = _stop_option(grammar["options"], arguments, index, stage, seen)
+            if after is None:
+                return "HOLD"
+            index = after
+        elif stage == "G" and word == grammar["exec"]:
+            stage, index = "E", index + 1
+        elif word == grammar["resume"]:
+            stage, index = ("R" if stage == "E" else "DIRECT"), index + 1
+        else:
+            # Fresh exec has zero/one opaque prompt. A single "resume S" atom is never a command.
+            return ("NOT_OWNED" if stage == "E" and index + 1 == len(arguments) else "HOLD")
+    if stage == "R":
+        while index < len(arguments) and arguments[index].startswith("-") and arguments[index] != "--":
+            after = _stop_option(grammar["options"], arguments, index, "R", seen)
+            if after is None:
+                return "HOLD"
+            index = after
+    options = True
+    if index < len(arguments) and arguments[index] == "--":
+        options, index = False, index + 1
+    value = arguments[index] if index < len(arguments) else None
+    shape = _selector_value(value, session)
+    if shape not in ("bound", "other"):
+        return "HOLD"
+    index += 1
+    # The only remaining position is ONE owner prompt. Never scan its contents as another command/selector.
+    if len(arguments) - index > 1:
+        return "HOLD"
+    if index < len(arguments) and options and arguments[index].startswith("-") and arguments[index] != "-":
+        return "HOLD"
+    return "OWNED" if shape == "bound" else "NOT_OWNED"
 
-    while index < len(arguments) or state == "value":
-        if state == "value":
-            value = arguments[index] if index < len(arguments) else None
-            if value == "--" and command_value and options:
-                # The established Codex resume -- S form disables options before its positional value.
-                options = False
-                index += 1
-                continue
-            shape = record(value, flat and after_value == "prompt")
-            state = after_value
-            if value is None:
-                break
-            if shape != "ambiguous":
-                index += 1
-                continue
-            # Do not consume an option-shaped value. In particular, Claude's -- must still terminate scanning.
+
+def _claude_selection(selectors, arguments, session):
+    grammar, index, options, prompts = selectors["grammar"], 0, True, 0
+    seen, selected = set(), []
+    flags = {name: row[0] for row in grammar["flags"] for name in row}
+    while index < len(arguments):
         word = arguments[index]
         if options and word == "--":
-            options = False
-            if selectors["options"]:
-                state = "terminated"
-            index += 1
+            options, index = False, index + 1
             continue
-        if state == "terminated":
-            if flat:
-                # ps cannot prove the prompt boundary; only another UUID counts as conflicting evidence here.
-                conflicting = conflicting or any(value != session for value in _uuid_values([word]))
+        if not options or not word.startswith("-"):
+            prompts += 1
+            if prompts > 1:
+                return "HOLD"
             index += 1
             continue
         option, equal, value = word.partition("=")
-        if options and option in selectors["conflicting_flags"]:
-            conflicting = True
-        elif options and option in selectors["options"]:
-            if equal:
-                record(value, flat and state == "prompt")
-            else:
-                after_value, state, command_value = state, "value", False
-        elif options and option in selectors["value_options"]:
+        if option in selectors["conflicting_flags"]:
+            return "NOT_OWNED"
+        if option in selectors["options"]:
             if not equal:
-                # Proven argv keeps a declared value opaque, even if it looks like a selector. ps cannot prove
-                # that boundary and must block on an option-shaped value. Neither mode may swallow --.
-                next_word = arguments[index + 1] if index + 1 < len(arguments) else None
-                if next_word is not None and next_word != "--" and (not flat or not next_word.startswith("-")):
-                    index += 1
-                elif flat:
-                    conflicting = True
-        elif options and option in selectors["prompt_options"]:
-            if not equal and index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
-                index += 1
-                if flat and selected:
-                    state = "prompt"
-        elif word in commands:
-            positional.append(word)
-            if flat or selected or tuple(positional) in selectors["commands"]:
-                after_value, state, command_value = state, "value", True
-        elif not word.startswith("-") or not options:
-            positional.append(word)
-            if flat and selected:
-                state = "prompt"
-        index += 1
-    return selected, conflicting
+                value = arguments[index + 1] if index + 1 < len(arguments) else None
+            shape = _selector_value(value, session)
+            if shape not in ("bound", "other"):
+                return "HOLD"  # In particular, a pending selector cannot consume a terminator.
+            selected.append(shape)
+            index += 1 if equal else 2
+        elif word in flags:
+            canonical = flags[word]
+            if canonical in seen:
+                return "HOLD"
+            seen.add(canonical)
+            if all(mode in seen for mode in grammar["exclusive_modes"]):
+                return "HOLD"
+            index += 1
+        elif option in grammar["equals_one"] and equal:
+            if option in seen:
+                return "HOLD"
+            seen.add(option)  # --tools= is an actual builder shape, including its empty RHS.
+            index += 1
+        elif word in grammar["split_one"]:
+            if word in seen and word not in grammar["repeatable"]:
+                return "HOLD"
+            seen.add(word)
+            value = arguments[index + 1] if index + 1 < len(arguments) else None
+            if not value or value.startswith("-"):
+                return "HOLD"
+            index += 2  # One complete opaque atom: prompts, quotes and UUIDs inside it are data.
+        else:
+            return "HOLD"
+    return "OWNED" if selected and all(shape == "bound" for shape in selected) else "NOT_OWNED"
+
+
+def session_verdict(kind, argv, session, argv_boundaries="proven"):
+    """Closed complete-atom grammar; flattened ps text never establishes first ownership."""
+    selectors = _host(kind)["session_selectors"]
+    if argv_boundaries != "proven":
+        return "HOLD"
+    if not isinstance(argv, (list, tuple)) or not all(isinstance(word, str) and "\0" not in word for word in argv):
+        return "HOLD"
+    arguments = _host_arguments(kind, argv, strict=True)
+    if arguments is False:
+        return "HOLD"
+    if arguments is None:
+        return "NOT_OWNED"
+    return (_claude_selection(selectors, arguments, session) if selectors["options"]
+            else _codex_selection(selectors, arguments, session))
 
 
 def matches_session(kind, argv, session, argv_boundaries="proven"):
-    """A host's own selector must name this session, without a conflict or a new-session flag."""
-    arguments = _host_arguments(kind, argv)
-    if arguments is None:
-        return False
-    selected, conflicting = _session_values(_host(kind)["session_selectors"], arguments, argv_boundaries, session)
-    return bool(selected) and not conflicting and all(value == session for value in selected)
+    """Compatibility boolean: only an OWNED verdict permits signalling."""
+    return session_verdict(kind, argv, session, argv_boundaries) == "OWNED"
+
+
+def descendant_verdict(argv, session):
+    """Negative-only CLEAR/OTHER/HOLD: definite exclusion differs from unresolved selection."""
+    if any(found.group() != session for word in argv for found in SESSION_UUID_OCCURRENCE.finditer(word)):
+        return "OTHER"
+    for kind in TEAM_HOSTS:
+        selectors = _host(kind)["session_selectors"]
+        arguments = _host_arguments(kind, argv, strict=True)
+        if arguments is False:
+            return "HOLD"
+        if arguments is not None:
+            if any(word.partition("=")[0] in selectors["conflicting_flags"] for word in arguments):
+                return "OTHER"
+            if session_verdict(kind, argv, session) == "HOLD":
+                return "HOLD"
+            # Complete admitted host syntax already identifies command/value/prompt positions. Its opaque
+            # prompt must not be rescanned for selector-looking words. UUID sparing above remains separate.
+            return "CLEAR"
+    for kind in TEAM_HOSTS:
+        selectors = _host(kind)["session_selectors"]
+        # Unknown descendants may still carry a known ambiguous selector. This never establishes ownership.
+        for index, word in enumerate(argv[1:], 1):
+            option, equal, value = word.partition("=")
+            if option in selectors["options"] or any(word == command[-1] for command in selectors["commands"]):
+                if not equal:
+                    value = argv[index + 1] if index + 1 < len(argv) else None
+                    if value == "--" and selectors["commands"]:
+                        value = argv[index + 2] if index + 2 < len(argv) else None
+                if _selector_value(value, session) != "bound":
+                    return "HOLD"
+    return "CLEAR"
 
 
 def selects_other_session(argv, session):
-    """A descendant naming another UUID is spared even when its selector is unknown to the registry."""
-    if any(found.group() != session for word in argv for found in SESSION_UUID_OCCURRENCE.finditer(word)):
-        return True
-    for kind in TEAM_HOSTS:
-        selected, conflicting = _session_values(_host(kind)["session_selectors"], argv[1:], "unproven", session)
-        if conflicting or any(value != session for value in selected):
-            return True
-    return False
+    """Compatibility refusal predicate; neither OTHER nor HOLD grants borrowed ancestry authority."""
+    return descendant_verdict(argv, session) != "CLEAR"
 
 
 def qualify(kind, writer):

@@ -27,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -642,10 +643,20 @@ class ProcessSnapshot(NamedTuple):
     euid: int
 
 
+class ProcessObservation(NamedTuple):
+    kind: str
+    pid: int
+    snapshot: object = None
+    partial: object = None
+    reason: str = ""
+    proof: str = ""
+
+
 class ProcessCensus(list):
-    def __init__(self, rows, argv_boundaries):
+    def __init__(self, rows, argv_boundaries, unavailable=None):
         super().__init__(rows)
         self.argv_boundaries = argv_boundaries
+        self.unavailable = unavailable or {}
 
 
 def ps_census(pid=None):
@@ -658,49 +669,98 @@ def ps_census(pid=None):
         words = line.split(None, 11)
         if len(words) < 12 or not all(word.isdigit() for word in words[:5]):
             continue
-        # ps is not shell-escaped: quotes are literal, and paths with spaces cannot be recovered here.
-        # Linux uses the NUL-separated /proc argv instead; lstart is the fallback's coarser birth timestamp.
+        # ps erases argv boundaries. Quotes are literal; neither paths with spaces nor freeform values can
+        # be recovered. These rows are diagnostic only, including apparently canonical selector strings.
         rows.append(ProcessSnapshot(int(words[0]), int(words[1]), words[5], int(words[3]),
                                     " ".join(words[6:11]), os.fsencode(words[11]), tuple(words[11].split()),
                                     int(words[2]), int(words[4])))
     return rows
 
 
-def read_process(pid, argv_boundaries="proven"):
-    """Read a process snapshot, also used immediately before signalling it."""
-    if argv_boundaries == "unproven":
-        return next(iter(ps_census(pid)), None)
-    folder = Path("/proc") / str(pid)
+def process_existence(pid, reason, partial=None):
+    """Missing metadata alone proves nothing; qualified numeric ESRCH is a distinct observation."""
     try:
-        fields = (folder / "stat").read_bytes().rpartition(b")")[2].split()
-        status = (folder / "status").read_bytes()
-        cmdline = (folder / "cmdline").read_bytes()
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
-        # A process can end during the census; inaccessible argv cannot establish ownership.
-        return None
-    if len(fields) < 20 or not all(fields[index].isdigit() for index in (1, 2, 19)):
-        return None
-    uids = next((line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")), [])
-    uid, euid = (int(uids[0]), int(uids[1])) if len(uids) >= 2 and all(v.isdigit() for v in uids[:2]) else (-1, -1)
-    arguments = cmdline.split(b"\0")
-    if arguments[-1] == b"":
-        arguments.pop()
-    return ProcessSnapshot(pid, int(fields[2]), fields[0].decode("ascii"), uid, fields[19].decode("ascii"),
-                           cmdline, tuple(os.fsdecode(a) for a in arguments), int(fields[1]), euid)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return ProcessObservation("CONFIRMED_ABSENT", pid, partial=partial, proof="qualified_namespace_ESRCH")
+    except PermissionError:
+        return ProcessObservation("UNAVAILABLE", pid, partial=partial, reason=reason + "; existence_unknown")
+    return ProcessObservation("UNAVAILABLE", pid, partial=partial, reason=reason + "; existence_live")
+
+
+def read_process(pid, argv_boundaries="proven"):
+    """One coherent multipart read, never retrying unreadable or torn evidence into apparent absence."""
+    if argv_boundaries == "unproven":
+        rows = ps_census(pid)
+        return (ProcessObservation("PRESENT", pid, rows[0]) if rows else
+                ProcessObservation("UNAVAILABLE", pid, reason="argv_boundaries_unavailable"))
+    folder, data, errors = Path("/proc") / str(pid), {}, []
+    for name, filename in (("before", "stat"), ("status", "status"), ("cmdline", "cmdline"), ("after", "stat")):
+        try:
+            data[name] = (folder / filename).read_bytes()
+        except OSError as exc:
+            errors.append("%s: %s" % (filename, exc))
+    partial = {}
+    fields = data.get("before", b"").rpartition(b")")[2].split()
+    after = data.get("after", b"").rpartition(b")")[2].split()
+    if len(fields) >= 20 and all(fields[index].isdigit() for index in (1, 2, 19)):
+        partial.update(start_time=fields[19].decode("ascii"), ppid=int(fields[1]), pgid=int(fields[2]),
+                       state=os.fsdecode(fields[0]))
+    else:
+        errors.append("malformed stat")
+    coherent_birth = ("start_time" in partial and len(after) >= 20 and after[19].isdigit() and
+                      after[19:20] == fields[19:20])
+    partial["coherent_birth"] = coherent_birth
+    partial["exit_observed"] = coherent_birth and (fields[0] == b"Z" or after[0] == b"Z")
+    if not coherent_birth:
+        errors.append("unstable birth evidence")
+    elif after[1:3] != fields[1:3]:
+        errors.append("unstable parent/group evidence")
+    uids = next((line.split()[1:] for line in data.get("status", b"").splitlines() if line.startswith(b"Uid:")), [])
+    if len(uids) >= 2 and all(value.isdigit() for value in uids[:2]):
+        partial.update(uid=int(uids[0]), euid=int(uids[1]))
+    else:
+        errors.append("missing real/effective status UIDs")
+    if "cmdline" in data:
+        raw = data["cmdline"]
+        arguments = raw.split(b"\0")
+        if arguments[-1] == b"":
+            arguments.pop()
+        partial.update(cmdline=raw, argv=tuple(os.fsdecode(a) for a in arguments))
+        if raw and not raw.endswith(b"\0"):
+            errors.append("truncated cmdline")
+    if errors:
+        return process_existence(pid, "evidence_unavailable: " + "; ".join(errors), partial)
+    row = ProcessSnapshot(pid, partial["pgid"], partial["state"], partial["uid"], partial["start_time"],
+                          partial["cmdline"], partial["argv"], partial["ppid"], partial["euid"])
+    return ProcessObservation("PRESENT", pid, row)
 
 
 def process_census(session):
-    """Retain birth time and exact Linux argv; ps is an explicitly unproven fallback without /proc."""
+    """Complete atoms on Linux; lost boundaries or relevant unreadable coverage cannot prove no targets."""
     proc = Path("/proc")
     if not proc.is_dir():
         return ProcessCensus(ps_census(), "unproven")
-    rows = (read_process(int(folder.name)) for folder in proc.iterdir() if folder.name.isdigit())
-    return ProcessCensus((row for row in rows if row is not None), "proven")
+    rows, unavailable = [], {}
+    for folder in proc.iterdir():
+        if not folder.name.isdigit():
+            continue
+        observation = read_process(int(folder.name))
+        if observation.kind == "PRESENT":
+            rows.append(observation.snapshot)
+        elif observation.kind == "UNAVAILABLE":
+            unavailable[observation.pid] = observation
+    return ProcessCensus(rows, "proven", unavailable)
 
 
 def names_session(row, session):
-    # Equals selectors still carry a whole session value, never an arbitrary substring of a prompt.
-    return any(word == session or word.partition("=")[2] == session for word in row.argv)
+    # Discovery is negative-only: prompt/config atoms may name S without selecting it.
+    return argv_names_session(row.argv, session)
+
+
+def argv_names_session(argv, session):
+    return any(word == session or word.partition("=")[2] == session
+               for atom in argv for word in atom.split())
 
 
 def our_uid(row):
@@ -711,38 +771,85 @@ def owns_process(row, session, host, boundaries):
     return our_uid(row) and hierarchy_hosts.matches_session(host, row.argv, session, boundaries)
 
 
+def unresolved(observed, pid, stage, reason):
+    observed["unresolved"][pid] = {"pid": pid, "stage": stage, "reason": reason}
+
+
 def session_processes(session, excluded, host=CODEX, unowned=None, observed=None):
-    """(pid, pgid) of live processes with our UID and the bound host's session selector."""
+    """Owned roots only; retain unresolved candidates independently from attempted signals."""
     hierarchy_hosts.entrypoints(host)
-    found = []
+    state = observed if observed is not None else {}
     census = process_census(session)
-    if observed is not None:
-        observed.update(census={row.pid: row for row in census}, argv_boundaries=census.argv_boundaries)
+    state.update(census={row.pid: row for row in census}, argv_boundaries=census.argv_boundaries,
+                 candidates={}, unresolved={}, resolved={}, handles={}, blocked=set(), identity_lost=set(),
+                 initial_unavailable={}, numeric=False)
+    found = []
+    if census.argv_boundaries != "proven":
+        state["coverage"] = "argv_boundaries_unavailable"
     for row in census:
-        # A zombie has already ended; it only waits for its parent to collect it.
         if row.pid in excluded or row.state.startswith("Z") or not names_session(row, session):
             continue
         # A diagnostic command naming the session must never be signalled.
-        if owns_process(row, session, host, census.argv_boundaries):
+        verdict = hierarchy_hosts.session_verdict(host, row.argv, session, census.argv_boundaries)
+        if our_uid(row) and verdict == "OWNED":
             found.append((row.pid, row.pgid))
-        elif unowned is not None:
-            unowned.append(row.pid)
+            state["candidates"][row.pid] = row
+        else:
+            if unowned is not None:
+                unowned.append(row.pid)
+            if census.argv_boundaries == "proven" and our_uid(row) and verdict == "HOLD":
+                state["candidates"][row.pid] = row
+                unresolved(state, row.pid, "census", "host_grammar_unavailable")
+    for pid, observation in getattr(census, "unavailable", {}).items():
+        facts = observation.partial or {}
+        if pid in excluded or any(facts.get(key) is not None and facts[key] != os.geteuid()
+                                  for key in ("uid", "euid")):
+            continue
+        # Incomplete same-user coverage can hide a descendant with no session argument. A readable command
+        # line alone cannot prove that its unknown UID/birth/parent data is outside this session's scope.
+        state["candidates"][pid] = None
+        state["initial_unavailable"][pid] = facts
+        unresolved(state, pid, "census", observation.reason)
+        raw = facts.get("cmdline")
+        if unowned is not None and isinstance(raw, bytes) and raw.endswith(b"\0") and argv_names_session(
+                facts.get("argv", ()), session):
+            # A current, complete cmdline can prove the name was observed without proving signal ownership.
+            unowned.append(pid)
     return found
+
+
+def original_exit(expected, observed):
+    handle = observed["handles"].get(expected.pid)
+    if handle is None or not handle["verified"]:
+        return False
+    poller = select.poll()
+    poller.register(handle["fd"], select.POLLIN)
+    if any(event & select.POLLIN for _, event in poller.poll(0)):
+        observed["resolved"][expected.pid] = "original_pidfd_exit"
+        observed["unresolved"].pop(expected.pid, None)
+        return True
+    return False
 
 
 def process_state(expected, current, boundaries, session, host, unowned, require_host=True, parent=None,
                   retained=False):
-    if current is None or current.state.startswith("Z"):
+    if current is None:
+        current = process_existence(expected.pid, "evidence_unavailable: reader returned None")
+    if isinstance(current, ProcessSnapshot):
+        current = ProcessObservation("PRESENT", expected.pid, current)
+    if current.kind == "CONFIRMED_ABSENT":
         return "gone"
-    if (current.start_time != expected.start_time or current.cmdline != expected.cmdline or
-            (not retained and current.pgid != expected.pgid) or not our_uid(current) or
-            (current.uid, current.euid) != (expected.uid, expected.euid) or
-            (parent is not None and current.ppid != parent) or
-            (require_host and not owns_process(current, session, host, boundaries))):
-        # Retained targets were already attempted and cannot be recorded as spared.
-        # A replacement PID, or an unrelated changed group member, is not a process naming this session.
-        if not retained and current.start_time == expected.start_time and names_session(current, session):
-            unowned.append(current.pid)
+    if current.kind != "PRESENT":
+        return "unavailable"
+    row = current.snapshot
+    if row.start_time == expected.start_time and row.state.startswith("Z"):
+        return "gone"
+    if (row.start_time != expected.start_time or row.cmdline != expected.cmdline or
+            (not retained and row.pgid != expected.pgid) or not our_uid(row) or
+            (row.uid, row.euid) != (expected.uid, expected.euid) or
+            (parent is not None and row.ppid != parent) or
+            (require_host and not owns_process(row, session, host, boundaries))):
+        # A changed census candidate stays unresolved; stale positive argv cannot reclassify it as spared.
         return "changed"
     return "authorized"
 
@@ -752,69 +859,141 @@ def unchanged_process(expected, boundaries, session, host, unowned, require_host
                          require_host, parent, retained) == "authorized"
 
 
-def retained_state(expected, boundaries, session, host, unowned):
+def note_identity_loss(expected, observation, observed):
+    if observed is None:
+        return
+    if observation.kind == "PRESENT":
+        birth = observation.snapshot.start_time
+    else:
+        facts = observation.partial or {}
+        birth = facts.get("start_time") if facts.get("coherent_birth") else None
+    if birth is not None and birth != expected.start_time:
+        observed["identity_lost"].add(expected.pid)
+
+
+def retained_state(expected, boundaries, session, host, unowned, observed=None):
+    if observed is not None and original_exit(expected, observed):
+        return "gone"
     current = read_process(expected.pid, boundaries)
-    if current is None:
-        # Missing permission/evidence is not proof of exit. Zombies are returned by read_process and skipped below.
-        try:
-            os.kill(expected.pid, 0)
-        except ProcessLookupError:
-            return "gone"
-        except PermissionError:
-            return "changed"
-        return "changed"
-    return process_state(expected, current, boundaries, session, host, unowned, require_host=False, retained=True)
+    note_identity_loss(expected, current, observed)
+    if observed is not None:
+        if current.kind == "CONFIRMED_ABSENT" and expected.pid in observed["identity_lost"]:
+            return "unavailable"  # A later numeric absence does not recover a lost original-instance proof.
+    result = process_state(expected, current, boundaries, session, host, unowned,
+                           require_host=False, retained=True)
+    if observed is not None and result == "gone":
+        observed["resolved"][expected.pid] = current.proof or "matching_birth_zombie"
+        observed["unresolved"].pop(expected.pid, None)
+    return result
 
 
-def signal_process(chain, number, boundaries, session, host, unowned, retained=False):
-    handles = {}
+def signal_process(chain, number, boundaries, session, host, unowned, retained=False, observed=None, attempted=None):
+    state = observed
+    target, opened = chain[0], {}
     try:
         for expected in chain:
-            if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+            kept = state["handles"].get(expected.pid) if state is not None else None
+            if kept is not None:
+                opened[expected.pid] = kept
+            elif hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
                 try:
-                    # Pin every process in the parent chain before rechecking it.
-                    handles[expected.pid] = os.pidfd_open(expected.pid)
+                    opened[expected.pid] = {"fd": os.pidfd_open(expected.pid), "verified": False}
                 except OSError as exc:
                     if exc.errno == errno.ESRCH:
+                        if state is not None:
+                            if expected.pid == target.pid:
+                                if target.pid in state["identity_lost"]:
+                                    unresolved(state, target.pid, "before_signal",
+                                               "original_instance_unresolved_after_numeric_ESRCH")
+                                else:
+                                    state["resolved"][target.pid] = "qualified_namespace_ESRCH"
+                                    state["unresolved"].pop(target.pid, None)
+                            else:
+                                unresolved(state, target.pid, "before_signal", "parent_instance_absent")
                         return False
-                    # Older kernels and seccomp may reject pidfds while ordinary signalling still works.
+                    # Non-ESRCH pidfd failures retain the admitted numeric fallback, after identical rechecks.
         for index in reversed(range(len(chain))):
             expected = chain[index]
             parent = chain[index + 1].pid if index + 1 < len(chain) else None
-            if not unchanged_process(expected, boundaries, session, host, unowned, parent is None and not retained,
-                                     parent, retained):
+            observation = read_process(expected.pid, boundaries)
+            note_identity_loss(expected, observation, state)
+            result = process_state(expected, observation, boundaries, session, host, unowned,
+                                   parent is None and not retained, parent, retained)
+            if (state is not None and expected.pid in state["identity_lost"] and
+                    observation.kind == "CONFIRMED_ABSENT"):
+                result = "unavailable"
+            if result != "authorized" or (state is not None and target.pid in state["blocked"]):
+                if state is not None:
+                    if result == "gone" and expected.pid == target.pid:
+                        state["resolved"][target.pid] = observation.proof or "matching_birth_zombie"
+                        state["unresolved"].pop(target.pid, None)
+                    else:
+                        reason = "evidence_unavailable" if result == "unavailable" else "instance_or_parent_changed"
+                        unresolved(state, target.pid, "before_signal", reason)
+                        if result == "changed":
+                            state["blocked"].add(target.pid)
                 return False
+            if expected.pid in opened:
+                opened[expected.pid]["verified"] = True
             if parent is not None and hierarchy_hosts.selects_other_session(expected.argv, session):
+                if state is not None:
+                    unresolved(state, target.pid, "before_signal", "descendant_selection_ambiguous")
                 return False
-        expected, handle = chain[0], handles.get(chain[0].pid)
+        handle = opened.get(target.pid)
+        if state is not None and handle is not None:
+            state["handles"][target.pid] = handle
+        if attempted is not None:
+            # Enter A before the syscall: an error or lost reply must never erase a possible effect.
+            attempted.add(target.pid)
+        if state is not None:
+            state["unresolved"].pop(target.pid, None)
         if handle is None:
-            os.kill(expected.pid, number)
+            if state is not None:
+                state["numeric"] = True
+            # The birth/cmdline/UID check and numeric kill are not atomic; ADR7 admits this residual race.
+            os.kill(target.pid, number)
         else:
-            signal.pidfd_send_signal(handle, number)
+            signal.pidfd_send_signal(handle["fd"], number)
         return "sent"
     except ProcessLookupError:
+        if state is not None:
+            state["resolved"][target.pid] = "signal_ESRCH"
+            state["unresolved"].pop(target.pid, None)
         return False
-    except PermissionError:
-        # Retain the attempted host PID so a live process denied by the OS still produces stop_failed.
+    except PermissionError as exc:
+        if state is not None:
+            unresolved(state, target.pid, "signal", "signal_denied: " + str(exc))
         return "denied"
     finally:
-        for handle in handles.values():
-            os.close(handle)
+        for pid, handle in opened.items():
+            if state is None or state["handles"].get(pid) is not handle:
+                os.close(handle["fd"])
 
 
-def descendant_chain(member, census, owners, session):
-    chain, seen = [], set()
+def descendant_lineage(member, census, owners, session):
+    """A candidate chain can be unresolved without becoming signal authority."""
+    chain, seen, verdict = [], set(), "CLEAR"
     while member.pid not in seen:
         seen.add(member.pid)
         chain.append(member)
         if member.pid in owners:
-            return chain
-        if not our_uid(member) or hierarchy_hosts.selects_other_session(member.argv, session):
-            return []
+            return chain, verdict
+        if not our_uid(member):
+            return [], "OTHER"
+        selection = hierarchy_hosts.descendant_verdict(member.argv, session)
+        if selection == "OTHER":
+            return [], "OTHER"
+        if selection == "HOLD":
+            verdict = "HOLD"
         member = census.get(member.ppid)
         if member is None:
-            return []
-    return []
+            return [], "HOLD"
+    return [], "HOLD"
+
+
+def descendant_chain(member, census, owners, session):
+    chain, verdict = descendant_lineage(member, census, owners, session)
+    return chain if verdict == "CLEAR" else []
 
 
 def process_depth(member, census):
@@ -830,37 +1009,78 @@ def process_depth(member, census):
 def signal_all(found, number, observed, session, host, unowned, attempted=None):
     census, boundaries = observed["census"], observed["argv_boundaries"]
     attempted = set() if attempted is None else attempted
-    pids = {pid for pid, _ in found}
+    owners = {pid for pid, _ in found}
     groups = {pgid for _, pgid in found if pgid != os.getpgrp()}
-    targets = [[census[pid]] for pid in pids]
+    targets = [[census[pid]] for pid in owners]
     for member in census.values():
-        if member.pid not in pids and member.pid not in unowned and member.pgid in groups:
-            chain = descendant_chain(member, census, pids, session)
+        if member.pid not in owners and member.pgid in groups:
+            chain, verdict = descendant_lineage(member, census, owners, session)
             if chain:
-                targets.append(chain)
-    # Children go first so their owned ancestors can still be rechecked at each signal.
+                if verdict == "HOLD":
+                    if names_session(member, session):
+                        # An ambiguous S-naming host cannot vanish from scope merely because its program is
+                        # another host kind. No-S negative exclusions still confer no borrowed authority.
+                        observed["candidates"][member.pid] = member
+                        unresolved(observed, member.pid, "census", "descendant_selection_ambiguous")
+                else:
+                    targets.append(chain)
+    for chain in targets:
+        observed["candidates"][chain[0].pid] = chain[0]
+    # Children first: every parent edge still exists and is freshly checked BEFORE the child's first signal.
     for chain in sorted(targets, key=lambda rows: process_depth(rows[0], census), reverse=True):
-        result = signal_process(chain, number, boundaries, session, host, unowned)
-        if result:
-            attempted.add(chain[0].pid)
+        signal_process(chain, number, boundaries, session, host, unowned, observed=observed, attempted=attempted)
     return attempted
 
 
 def signal_retained(pids, number, observed, session, host, unowned):
-    # The first pass proved ancestry. Reparenting after SIGTERM must not erase that authorization; every target
-    # still needs its own unchanged birth time, cmdline and real/effective uid before an individual signal.
     for pid in sorted(pids):
-        signal_process([observed["census"][pid]], number, observed["argv_boundaries"], session, host, unowned,
-                       retained=True)
+        expected = observed["candidates"][pid]
+        if pid not in observed["resolved"] and not original_exit(expected, observed):
+            # W's first pass proved ancestry; dead M must not erase W's retained original-instance evidence.
+            signal_process([expected], number, observed["argv_boundaries"], session, host, unowned,
+                           retained=True, observed=observed, attempted=pids)
 
 
 def gone_within(session, excluded, pids, seconds, host, observed, unowned):
     deadline = time.monotonic() + seconds
     while True:
-        left = {pid for pid in pids if pid not in excluded and retained_state(
-            observed["census"][pid], observed["argv_boundaries"], session, host, unowned) != "gone"}
-        if not left or time.monotonic() >= deadline:
-            return not left
+        for pid, expected in observed["candidates"].items():
+            if pid in excluded or pid in observed["resolved"]:
+                continue
+            if expected is None:
+                observation = read_process(pid, observed["argv_boundaries"])
+                initial = observed["initial_unavailable"].get(pid, {})
+                birth = initial.get("start_time") if initial.get("coherent_birth") else None
+                if observation.kind == "PRESENT":
+                    current = {"start_time": observation.snapshot.start_time, "coherent_birth": True,
+                               "exit_observed": observation.snapshot.state.startswith("Z")}
+                else:
+                    current = observation.partial or {}
+                current_birth = current.get("start_time") if current.get("coherent_birth") else None
+                if birth and current_birth and current_birth != birth:
+                    observed["identity_lost"].add(pid)
+                if birth and current_birth == birth and current.get("exit_observed"):
+                    observed["resolved"][pid] = "matching_partial_birth_zombie"
+                    result = "gone"
+                elif observation.kind == "CONFIRMED_ABSENT" and pid not in observed["identity_lost"]:
+                    observed["resolved"][pid] = observation.proof
+                    result = "gone"
+                else:
+                    result = "unavailable"
+            else:
+                result = retained_state(expected, observed["argv_boundaries"], session, host, unowned, observed)
+            if result == "gone":
+                observed["resolved"].setdefault(pid, "confirmed_instance_exit")
+                observed["unresolved"].pop(pid, None)
+            else:
+                unresolved(observed, pid, "after_signal" if pid in pids else "before_signal",
+                           "evidence_unavailable" if result == "unavailable" else "original_instance_live_or_changed")
+                if result == "changed":
+                    observed["blocked"].add(pid)
+        if len(observed["resolved"]) == len(observed["candidates"]):
+            return not observed.get("coverage")
+        if not pids or time.monotonic() >= deadline:
+            return False
         time.sleep(POLL_SECONDS)
 
 
@@ -873,7 +1093,6 @@ def stop(launches, endpoint, grace):
     if endpoint_parts(endpoint)[1] == "root":
         launches.refuse(endpoint, identifier, "stop", ROOT_STOP, **known)
     if known["host"] == NATIVE:
-        # Its thread lives inside the shared app-server, so no process names it; signalling would only cut its mail.
         launches.refuse(endpoint, identifier, "stop", "a native thread is stopped by its own app, not the launcher", **known)
     try:
         background = profile.is_file() and read_json(profile).get("mode") == "background"
@@ -882,37 +1101,49 @@ def stop(launches, endpoint, grace):
     if background:
         launches.refuse(endpoint, identifier, "stop",
                         "a background claude session stops through claude stop; use the wake tool's control", **known)
-    signalled = False
+    pids, unowned, observed = set(), [], {}
+    marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
+    error = None
     try:
         excluded = ancestors()
-        unowned, observed = [], {}
         found = session_processes(known["session"], excluded, known["host"], unowned, observed)
-        marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
-        if observed["argv_boundaries"] == "unproven":
+        if observed["argv_boundaries"] != "proven":
             marker["argv_boundaries"] = "unproven"
-        pids, stopped = set(), True
         if found:
-            signalled = True
             signal_all(found, signal.SIGTERM, observed, known["session"], known["host"], unowned, pids)
-            stopped = gone_within(known["session"], excluded, pids, grace, known["host"], observed, unowned)
-            if not stopped:
-                signal_retained(pids, signal.SIGKILL, observed, known["session"], known["host"], unowned)
-                stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"], observed, unowned)
-            # The marker belongs to the wake that made it; whoever inspects it decides whether that turn has ended.
-            marker["wake_marker_present"] = launches.mailbox.wake_marker(endpoint).exists()
+        stopped = gone_within(known["session"], excluded, pids, grace, known["host"], observed, unowned)
+        if not stopped and pids:
+            signal_retained(pids, signal.SIGKILL, observed, known["session"], known["host"], unowned)
+            stopped = gone_within(known["session"], excluded, pids, KILL_WAIT_SECONDS, known["host"], observed, unowned)
+        marker["wake_marker_present"] = launches.mailbox.wake_marker(endpoint).exists()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        if not signalled:
+        if not pids:
             launches.refuse(endpoint, identifier, "stop", str(exc), **known)
-        # Signals were already sent, so "refused" would claim nothing was done.
-        if unowned:
-            marker["unowned_pids"] = sorted(set(unowned))
-        return 3, launches.record(endpoint, identifier, "stop", "stop_failed", **known, pids=sorted(pids),
-                                  error=str(exc), **marker)
-    if unowned:
-        marker["unowned_pids"] = sorted(set(unowned))
-    if not pids:
-        return 0, launches.record(endpoint, identifier, "stop", "not_running", **known, pids=[], **marker)
-    state = "stopped" if stopped else "stop_failed"
+        error, stopped = str(exc), False
+        for pid in observed.get("candidates", {}):
+            if pid not in observed["resolved"]:
+                unresolved(observed, pid, "operation_error", "evidence_unavailable: " + str(exc))
+    finally:
+        for handle in observed.get("handles", {}).values():
+            os.close(handle["fd"])
+    spared = sorted(set(unowned) - pids)
+    if spared:
+        marker["unowned_pids"] = spared
+    if observed.get("unresolved"):
+        marker["unresolved_pids"] = sorted(observed["unresolved"])
+        marker["unresolved"] = [observed["unresolved"][pid] for pid in sorted(observed["unresolved"])]
+    if observed.get("coverage"):
+        marker["reason"] = observed["coverage"]
+    if observed.get("resolved"):
+        marker["absence_evidence"] = [{"pid": pid, "proof": observed["resolved"][pid]}
+                                      for pid in sorted(observed["resolved"])]
+    if pids:
+        marker["identity_check_mode"] = "start_time_recheck" if observed["numeric"] else "pidfd"
+    if error is not None:
+        marker["error"] = error
+    state = "stopped" if pids else "not_running"
+    if not stopped:
+        state = "stop_failed"
     return (0 if stopped else 3), launches.record(endpoint, identifier, "stop", state, **known, pids=sorted(pids), **marker)
 
 

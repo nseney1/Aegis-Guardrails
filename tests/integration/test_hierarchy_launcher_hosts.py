@@ -112,6 +112,26 @@ class Hosts(Launch):
         path.chmod(0o700)
         fake.require_fake(str(self.bin))
 
+    def captured_claude(self, context, argv):
+        """MODELLED OS argv only; declare every real MCP child before starting the held fake."""
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+
+        helper = ROOT / "tests/integration/test_hierarchy_launcher.py"
+        prefix = python_argv("claude", helper, self.tmp, "r2_captured_entry")
+        wrapper = self.bin / "claude"
+        wrapper.write_text("#!/bin/sh\n%s \"$@\"\n" %
+                           shlex.join(["exec", *prefix, str(fake.HERE), "main"]), encoding="utf-8")
+        wrapper.chmod(0o700)
+        fake.require_fake(str(self.bin))
+        captured = []
+        for index, word in enumerate(argv[:-1]):
+            if word == "--mcp-config":
+                definitions = json.loads(Path(argv[index + 1]).read_text())["mcpServers"]
+                for definition in definitions.values():
+                    child = [definition["command"], *definition.get("args", [])]
+                    captured.append({"argv": child, "expected_argv": child, "logical_argv": None})
+        return [*prefix, str(fake.HERE), "main", *argv[1:]], captured
+
 
 def write_plan(hosts, team):
     """The plan a team run's init writes for the base's own initiative: the front door is a claude-code stand-in, as
@@ -485,17 +505,28 @@ def test_a_held_start_lock_refuses_a_claude_start_under_its_host(claude_team):
 # -- stop and resume of a Claude-started role -------------------------------------------------------------------------
 
 def test_stop_ends_a_hung_turn_of_a_claude_started_role(claude_team, tmp_path):
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
+
     answer = claude_team.start(endpoint=IMPLEMENTER)
     session = answer["session"]
     wake = json.loads(Path(answer["wake_profile"]).read_text())
     out = tmp_path / "hung.stdout"
+    context = R2Case(claude_team)
+    launcher_module = context.module
+    expected, captured = claude_team.captured_claude(context, wake["argv"])
     # The role's own wake argv, as a wake would run it, left hanging after its init event.
-    with open(answer["prompt_file"], "rb") as prompt, open(out, "wb") as stdout:
-        hung = subprocess.Popen(wake["argv"], cwd=wake["cwd"], stdin=prompt, stdout=stdout, stderr=subprocess.DEVNULL,
-                                env=claude_team.env(FAKE_CLAUDE_MODE="hang"), start_new_session=True)
     try:
+        with open(answer["prompt_file"], "rb") as prompt, open(out, "wb") as stdout:
+            hung = context.spawn_exec(wake["argv"], wake["argv"], expected, cwd=wake["cwd"], stdin=prompt,
+                                      stdout=stdout, environment=claude_team.env(FAKE_CLAUDE_MODE="hang"),
+                                      captured=captured, target=(fake.HERE, "main"))
+
+        def initialized():
+            context.service_exec_children()
+            return '"subtype": "init"' in out.read_text()
+
         # After init, the fake's MCP probes (which also name the session) have ended; only the turn is left.
-        wait_until(lambda: '"subtype": "init"' in out.read_text(), 30)
+        wait_until(initialized, 30)
         wait_until(lambda: launcher_module().session_processes(session, set(), CLAUDE) == [(hung.pid, hung.pid)])
         stopped = claude_team.run("stop", "--endpoint", IMPLEMENTER, "--grace-seconds", "2")
         assert stopped["state"] == "stopped" and stopped["pids"] == [hung.pid]
@@ -503,9 +534,7 @@ def test_stop_ends_a_hung_turn_of_a_claude_started_role(claude_team, tmp_path):
         assert hung.wait(timeout=5) < 0
         assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["bound", "stopped"]
     finally:
-        if hung.poll() is None:
-            os.killpg(hung.pid, 9)
-            hung.wait(timeout=5)
+        context.close()
 
 
 def test_resume_dry_run_of_a_claude_started_role_runs_the_claude_wake_argv(claude_team):
