@@ -353,15 +353,16 @@ def _mount_rows(mounts):
                 "mount source contains an unsupported character: " + str(source))
         require(type(row["rw"]) is bool, "mount row rw must be a bool")
         _system_mount(source, (Path.home(),))
-        # mount_plan refuses symlinked sources, but a stored row may name one and the engine binds its target.
-        require(not _image_tree(Path(os.path.realpath(source))),
-                "mount replaces image system directory: " + str(source))
         try:
+            # Stored rows may name symlinks. Canonicalization and exclusion metadata are one refusal boundary;
+            # neither filesystem errors nor Python's recursive realpath limit may escape row validation.
+            require(not _image_tree(Path(os.path.realpath(source))),
+                    "mount replaces image system directory: " + str(source))
             protected = _owner_roots(Path.home()) if protected is None else protected
             _owner_exclusions(source, protected)
-        except OSError:
-            # Unreadable metadata (ENOTDIR, ELOOP, EACCES, ENAMETOOLONG) cannot prove the exclusions. Refuse as
-            # a row error so verify names "mounts" on engine-supplied rows instead of raising.
+        except (OSError, RecursionError):
+            # Unreadable or unresolvable metadata cannot prove the exclusions. A row error keeps verify's
+            # named "mounts" result for expected rows and recorded requests, as well as builder refusals.
             raise ValueError("mount overlaps protected home: " + str(source)) from None
         # The early check knows only HOME; repeat it with mount_plan's resolved homes so the password-database
         # home's .local refuses here too when HOME differs from it.
@@ -378,6 +379,16 @@ def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home):
     All source ancestors must be free of symlinks and protected against replacement by other users.
     A mount cannot straddle a read-write/read-only boundary, including through directory identity aliases.
     """
+    try:
+        return _planned_mounts(run=run, project=project, source=source, python_prefix=python_prefix,
+                               live_checkouts=live_checkouts, home=home)
+    except RecursionError:
+        # Cover owner/secret resolution, source metadata and ACL queries together. Existing OSError refusals
+        # keep their path/errno diagnostics; recursive traversal is a bounded validation failure too.
+        raise ValueError("mount metadata exceeds recursion limit") from None
+
+
+def _planned_mounts(*, run, project, source, python_prefix, live_checkouts, home):
     require(isinstance(live_checkouts, (list, tuple)), "live_checkouts must be a list")
     requested = [(run, "run", True), (project, "project", True), (source, "source", False),
                  (python_prefix, "python_prefix", False)]

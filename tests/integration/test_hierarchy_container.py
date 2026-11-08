@@ -2996,3 +2996,130 @@ def test_confirmed_non_directory_owner_has_no_secret_children(adapter, layout):
     owner_file.write_text("not a directory\n", encoding="utf-8")
     plan = mounts(adapter, layout, home=owner_file)
     assert {"source": str(layout.project), "destination": str(layout.project), "rw": True} in plan
+
+
+@pytest.fixture
+def recursive_mount_chain(layout):
+    # Real temporary symlinks: an acyclic chain exercises Python realpath recursion, not kernel ELOOP alone.
+    folder = layout.run.parent / "recursive-links"
+    folder.mkdir()
+    links = [folder / ("link-%d" % index) for index in range(sys.getrecursionlimit() + 32)]
+    for index, link in enumerate(links):
+        link.symlink_to(links[index + 1].name if index + 1 < len(links) else layout.project)
+    return str(links[0])
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+def test_recorded_recursive_mount_refuses(adapter, layout, recursive_mount_chain, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (recursive_mount_chain, recursive_mount_chain)])
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_expected_recursive_mount_refuses(adapter, layout, recursive_mount_chain, engine):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=recursive_mount_chain, destination=recursive_mount_chain)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+def test_builder_recursive_mount_refuses(adapter, layout, recursive_mount_chain, engine, builder):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = [{"source": recursive_mount_chain, "destination": recursive_mount_chain, "rw": True}]
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + recursive_mount_chain) + "$"):
+        getattr(adapter, builder)(isolation, run=layout.run, mounts=rows, **kwargs)
+
+
+def test_planner_recursive_source_refuses_symlink(adapter, layout, recursive_mount_chain):
+    with pytest.raises(ValueError, match="^" + re.escape("mount source contains a symlink: " + recursive_mount_chain) + "$"):
+        mounts(adapter, layout, project=recursive_mount_chain)
+
+
+def test_planner_recursive_secret_refuses(adapter, layout, recursive_mount_chain):
+    secret = layout.home / ".codex"
+    secret.rmdir()
+    secret.symlink_to(recursive_mount_chain)
+    with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+        mounts(adapter, layout)
+
+
+MOUNT_RECURSION_PROBES = [("realpath", "source"), ("stat", "source"), ("lstat", "source"),
+                          ("realpath", "owner"), ("stat", "owner"), ("lstat", "secret")]
+
+
+@pytest.mark.parametrize("operation,target", MOUNT_RECURSION_PROBES)
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "expected", "recorded"])
+def test_mount_metadata_recursion_is_refused(adapter, layout, monkeypatch, operation, target, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    # Only project rows keep the builder's existing path-specific refusal diagnostic deterministic.
+    rows = [{"source": str(layout.project), "destination": str(layout.project), "rw": True}]
+    denied = {"source": layout.project, "owner": layout.home, "secret": layout.home / ".codex"}[target]
+    module = os.path if operation == "realpath" else os
+    original, probes = getattr(module, operation), []
+
+    def fail(path, *args, **kwargs):
+        if os.fspath(path) == str(denied):
+            probes.append(str(denied))
+            raise RecursionError("modelled mount metadata recursion")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, operation, fail)
+    if surface == "planner":
+        with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+            mounts(adapter, layout)
+    elif surface in ("create_argv", "expected_plan"):
+        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + str(layout.project)) + "$"):
+            getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+    else:
+        if surface == "recorded":
+            add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
+        assert adapter.verify(value, expected) == ["mounts"]
+    assert probes
+
+
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "expected", "recorded"])
+def test_mount_canonicalization_oserror_refuses(adapter, layout, monkeypatch, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    original, denied = os.path.realpath, str(layout.project)
+
+    def fail(path, *args, **kwargs):
+        if os.fspath(path) == denied:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), denied)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", fail)
+    if surface == "planner":
+        with pytest.raises(OSError) as error:
+            mounts(adapter, layout)
+        assert error.value.errno == errno.EIO and error.value.filename == denied
+    elif surface in ("create_argv", "expected_plan"):
+        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + denied) + "$"):
+            getattr(adapter, surface)(ISOLATION, run=layout.run,
+                                      mounts=[{"source": denied, "destination": denied, "rw": True}], **kwargs)
+    else:
+        if surface == "recorded":
+            add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
+        assert adapter.verify(value, expected) == ["mounts"]
+
+
+def test_planner_acl_metadata_recursion_refuses(adapter, layout, monkeypatch):
+    original = os.getxattr
+
+    def fail(path, *args, **kwargs):
+        if os.fspath(path) == str(layout.project.parent):
+            raise RecursionError("modelled mount ACL query recursion")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", fail)
+    with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+        mounts(adapter, layout)

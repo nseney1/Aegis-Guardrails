@@ -18,7 +18,9 @@ lifecycle integration in C4. Missing isolation keeps host mode.
   resolved targets too. Named entries are probed with `lstat`; only confirmed absence is treated as missing.
   Unreadable or failed secret metadata refuses, including when an owner home cannot be searched. Planning never
   creates or enumerates secret paths. Source-symlink and inferred-venv marker checks also refuse metadata errors
-  rather than treating them as missing paths.
+  rather than treating them as missing paths. Path-resolution recursion limits refuse too: shorten or revalidate
+  the symlink chain. Builders return a mount-row validation error, and verification reports `mounts`, including
+  for forged expected rows and recorded requests; these failures never establish a safe bind.
   Every existing source component, from `/` down, must be owned by root or the effective user. Write-bit checks
   apply to ancestors, since a leaf's write permission cannot replace its own directory entry. Effective group
   write is allowed for the owner's primary user-private group only when its name equals the user's name, `grp`
