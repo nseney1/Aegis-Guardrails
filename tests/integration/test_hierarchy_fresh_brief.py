@@ -753,7 +753,12 @@ def test_template_rendering_exactly_matches_launcher_in_a_separate_process(tmp_p
 def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     ledger = Ledger(tmp_path)
-    paths = [str(tmp_path / "declared" / str(index)) + "/" + "/".join(["p" * 100] * 22) for index in range(128)]
+    # Nested JSON escaping grows the wire record, not the POSIX filename bytes.
+    component = '"\\' * 64
+    paths = [str(tmp_path / "declared" / str(index) / component / component) for index in range(256)]
+    assert len(paths) <= 256
+    assert max(len(os.fsencode(path)) for path in paths) < 1024
+    assert max(len(os.fsencode(part)) for path in paths for part in Path(path).parts) < 255
     value = request("large-history", paths=paths)
     receipt = ledger.publish(value)
     record = ledger.path / "events" / ("%06d.json" % receipt["sequence"])
@@ -763,6 +768,7 @@ def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pi
     before = files(tmp_path)
     answer = compose(root)
     assert answer["entries"] < 20
+    assert all(row.get("request_id") != value["id"] for rows in sections(answer["brief"]).values() for row in rows)
     after = files(tmp_path)
     after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
     assert after == before
@@ -856,7 +862,8 @@ def test_search_only_parent_directories_allow_publication(pilot):  # noqa: F811
 @secure_publication
 def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
     root, _ = pilot
-    driver = ("import errno,os,runpy,sys\n"
+    # Python 3.9's pathlib accessor must capture the builtin before os.open is patched.
+    driver = ("import errno,os,runpy,sys\nfrom pathlib import Path\n"
               "tool,root=sys.argv[1:]\nreal_open=os.open\n"
               "def opening(path,flags,*args,**kwargs):\n"
               "    if str(path)=='briefs': raise PermissionError(errno.EACCES,'fixture directory denied')\n"
@@ -864,9 +871,11 @@ def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
               "os.open=opening\n"
               "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
               "runpy.run_path(tool,run_name='__main__')\n")
+    before = files(root.parent)
     code, answer = faulted_cli(root, driver)
     assert code == 2 and "publication directory permission denied" in answer["error"]
     assert "changed" not in answer["error"]
+    assert files(root.parent) == before
 
 
 def structured_job(tmp_path, changes=None, missing=None):
