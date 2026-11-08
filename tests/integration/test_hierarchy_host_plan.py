@@ -611,13 +611,41 @@ def test_a_host_plan_outside_the_v2_schema_is_refused(team, capsys, change, erro
 
 @linux
 @pytest.mark.parametrize("hosts", [{"root": CODEX, "team": CLAUDE}, {"root": CLAUDE, "team": CODEX}])
-def test_init_refuses_a_claude_plan_until_claude_support_lands_and_writes_nothing(team, hosts):
-    team.config.update(schema="aegis.team-run/v2", hosts=hosts)
+def test_claude_plans_init_but_root_and_up_refuse_until_pr6_and_write_nothing(team, hosts):
+    # PR 5 lifted this test's interim init refusal; starting or binding a Claude role waits for T2(a) PR 6.
+    from tests.integration.hierarchy_fake_claude import BILLING, install, require_fake
+    install(team.bin)
+    require_fake(str(team.bin))
+    for name in BILLING:
+        team.monkeypatch.delenv(name, raising=False)
+    # The harness exports CLAUDE_CONFIG_DIR=<tmp>/claude-home to every command, so the run uses that folder.
+    team.config.update(schema="aegis.team-run/v2", hosts=hosts, claude_home=str(team.tmp / "claude-home"))
+    if hosts["team"] == CLAUDE:
+        team.save()
+        refused = team.team("init", expect=2)
+        assert refused == {"error": "lane f2: tmpdir is only for a Codex writer, and this run's team host is "
+                                    "claude-code"}
+        assert not team.run.exists() and not team.codex_home.exists()
+        del team.config["lanes"][0]["tmpdir"]
     team.save()
-    answer = team.team("init", expect=2)
-    assert answer == {"error": "this team command runs codex-cli roles and ROOT until T2(a) PR 6; hosts is %s"
-                               % json.dumps(hosts, sort_keys=True)}
-    assert not team.run.exists() and not team.codex_home.exists()
+
+    answer = team.team("init")
+
+    assert answer["init"] == "complete" and "until T2(a) PR 6" not in json.dumps(answer)
+
+    def files():
+        return {str(p.relative_to(team.run)): sha(p) for p in sorted(team.run.rglob("*"))
+                if p.is_file() and not p.is_symlink() and p.name != "team-commands.jsonl"}
+
+    before = files()
+    if hosts["root"] == CLAUDE:
+        assert team.team("root", "--session", ROOT_SESSION, expect=2) == {
+            "error": "this team command binds a claude-code ROOT from T2(a) PR 6"}
+        assert team.mailbox().status()["bindings"]["pilot/root"] is None
+    if hosts["team"] == CLAUDE:
+        assert team.team("up", expect=2) == {"error": "this team command starts claude-code team roles from T2(a) PR 6"}
+        assert not (team.base_dir / "team.json").exists()
+    assert files() == before, "a refusal writes nothing"
 
 
 @linux
