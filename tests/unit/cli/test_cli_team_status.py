@@ -145,7 +145,8 @@ def test_status_unknown_or_expired_evidence_is_not_a_passing_check(ws, capsys):
 
 
 @pytest.mark.parametrize("raw,reason", [(b'{"v":2}', "its keys are not the v1 lease keys"),
-                                       (b"x" * (team.MAX_LEASE_BYTES + 1), "cap")])
+                                       (b"x" * (team.MAX_LEASE_BYTES + 1), "cap")],
+                         ids=["wrong-keys", "over-cap"])
 def test_malformed_and_oversized_leases_remain_visible(ws, capsys, raw, reason):
     oid = gitsafe.write_blob(ws, raw)
     gitsafe.update_ref(ws, "refs/aegis/lanes/bad", oid, None)
