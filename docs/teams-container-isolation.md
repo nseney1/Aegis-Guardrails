@@ -15,7 +15,10 @@ lifecycle integration in C4. Missing isolation keeps host mode.
   Changing HOME does not hide the password-database home. Mounts overlapping an existing secret path under any
   owner home refuse in either direction (equal to, inside or containing): `.claude`, `.codex`, `.ssh`, `.gnupg`,
   `.config`, `.aws`, `.kube`, `.docker`, `.netrc` and `.git-credentials`. Dangling secret symlinks protect their
-  resolved targets too. Other missing secret paths are absent; planning never creates or enumerates them.
+  resolved targets too. Named entries are probed with `lstat`; only confirmed absence is treated as missing.
+  Unreadable or failed secret metadata refuses, including when an owner home cannot be searched. Planning never
+  creates or enumerates secret paths. Source-symlink and inferred-venv marker checks also refuse metadata errors
+  rather than treating them as missing paths.
   Every existing source component, from `/` down, must be owned by root or the effective user. Write-bit checks
   apply to ancestors, since a leaf's write permission cannot replace its own directory entry. Effective group
   write is allowed for the owner's primary user-private group only when its name equals the user's name, `grp`

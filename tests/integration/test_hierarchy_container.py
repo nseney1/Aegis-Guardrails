@@ -2901,3 +2901,98 @@ def test_docker_confinement_witness_must_be_present(adapter, layout, field, labe
     assert adapter.verify(value, expected) == []
     del value[0]["HostConfig"][field]
     assert adapter.verify(value, expected) == [label]
+
+
+def deny_secret_discovery(layout, monkeypatch, owner, code, scope):
+    home = layout.home if owner == "home" else layout.passwd_home
+    secret = home / ".codex"
+    secret.rmdir()
+    secret.symlink_to(layout.project, target_is_directory=True)
+    names = [".codex"] if scope == "name" else list(SECRET_PATHS)
+    denied = {str(home / name) for name in names}
+    original = os.lstat
+    probes = []
+
+    def lstat_(path, *args, **kwargs):
+        if os.fspath(path) in denied:
+            probes.append(os.fspath(path))
+            raise OSError(code, os.strerror(code), os.fspath(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat_)
+    bootstrap = ("_discovery_lstat=os.lstat; _denied_secrets=%r; "
+                 "os.lstat=lambda p,*a,**kw: (_ for _ in ()).throw(OSError(%d,%r,os.fspath(p))) "
+                 "if os.fspath(p) in _denied_secrets else _discovery_lstat(p,*a,**kw); "
+                 % (sorted(denied), code, os.strerror(code)))
+    return home / names[0], probes, bootstrap
+
+
+@pytest.mark.parametrize("owner", ["home", "password"])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.ENOTDIR])
+@pytest.mark.parametrize("scope", ["name", "directory"])
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "verify"])
+def test_secret_discovery_errors_cannot_be_absence(adapter, layout, monkeypatch, owner, code, scope, surface):
+    # Build safe comparison inputs before relocating the fake secret, then model discovery (lstat) failure.
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    denied, probes, _ = deny_secret_discovery(layout, monkeypatch, owner, code, scope)
+    if surface == "planner":
+        with pytest.raises(OSError) as error:
+            mounts(adapter, layout)
+        assert error.value.errno == code and error.value.filename == str(denied)
+    elif surface == "verify":
+        assert adapter.verify(value, expected) == ["mounts"]
+    else:
+        rows = [{"source": str(layout.project), "destination": str(layout.project), "rw": True}]
+        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + str(layout.project)) + "$"):
+            getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+    assert probes, "the refusal must exercise secret-name discovery itself"
+
+
+@pytest.mark.parametrize("command", ["plan", "verify"])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.ENOTDIR])
+def test_cli_secret_discovery_error_refuses(adapter, layout, monkeypatch, command, code):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    path = layout.run.parent / "discovery-inspect.json"
+    path.write_text(json.dumps(inspect_for(expected)), encoding="utf-8")
+    denied, _, bootstrap = deny_secret_discovery(layout, monkeypatch, "password", code, "directory")
+    args = ("--inspect", str(path)) if command == "verify" else ()
+    result = cli(layout, config_for(layout), command, *args, bootstrap=bootstrap)
+    assert result.returncode == 2, result.stdout
+    assert json.loads(result.stdout) == {"error": str(OSError(code, os.strerror(code), str(denied)))}
+
+
+@pytest.mark.parametrize("code", [errno.ELOOP, errno.ENOTDIR, errno.EBADF])
+def test_source_symlink_probe_errors_are_not_absence(adapter, layout, monkeypatch, code):
+    original, probes = os.lstat, []
+
+    def lstat_(path, *args, **kwargs):
+        # Fail only the first symlink probe. Later stat/lstat reads cannot retroactively justify ignoring it.
+        if os.fspath(path) == str(layout.project) and not probes:
+            probes.append(os.fspath(path))
+            raise OSError(code, os.strerror(code), os.fspath(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat_)
+    with pytest.raises(OSError) as error:
+        mounts(adapter, layout)
+    assert error.value.errno == code and probes == [str(layout.project)]
+
+
+@pytest.mark.parametrize("code", [errno.ELOOP, errno.ENOTDIR])
+def test_inferred_venv_marker_errors_are_not_missing(layout, code):
+    marker = str(layout.prefix / "pyvenv.cfg")
+    bootstrap = ("_marker_stat=os.stat; os.stat=lambda p,*a,**kw: (_ for _ in ()).throw("
+                 "OSError(%d,%r,os.fspath(p))) if os.fspath(p)==%r else _marker_stat(p,*a,**kw); "
+                 % (code, os.strerror(code), marker))
+    result = cli(layout, config_for(layout), "plan", bootstrap=bootstrap)
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {"error": str(OSError(code, os.strerror(code), marker))}
+
+
+def test_confirmed_non_directory_owner_has_no_secret_children(adapter, layout):
+    owner_file = layout.run.parent / "non-directory-home"
+    owner_file.write_text("not a directory\n", encoding="utf-8")
+    plan = mounts(adapter, layout, home=owner_file)
+    assert {"source": str(layout.project), "destination": str(layout.project), "rw": True} in plan

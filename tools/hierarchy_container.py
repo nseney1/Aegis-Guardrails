@@ -172,9 +172,23 @@ def _owner_roots(home):
         raise ValueError("cannot find the owner's password-database home") from None
     owners = (_absolute(home, "home"), _absolute(Path.home(), "HOME"), _absolute(passwd, "password home"))
     homes = {Path(os.path.realpath(owner)) for owner in owners}
-    # Only stat named paths: missing secrets are absent, and no owner folder is created or enumerated.
-    secrets = {Path(os.path.realpath(owner / name)) for owner in owners for name in SECRET_PATHS
-               if os.path.lexists(owner / name)}
+    # Probe named entries without following the final link: dangling secrets still protect their targets.
+    # Only confirmed absence is missing; unreadable metadata must never remove an exclusion.
+    secrets = set()
+    for owner in owners:
+        for name in SECRET_PATHS:
+            secret = owner / name
+            try:
+                os.lstat(secret)
+            except FileNotFoundError:
+                continue
+            except NotADirectoryError:
+                # A named child cannot exist under a confirmed non-directory home. An ENOTDIR report
+                # under a directory, or an unreadable parent, is not proof of absence.
+                if not stat.S_ISDIR(os.stat(owner).st_mode):
+                    continue
+                raise
+            secrets.add(Path(os.path.realpath(secret)))
     return ([(path, _ancestors(path), True) for path in sorted(homes)]
             + [(path, _ancestors(path), False) for path in sorted(secrets)])
 
@@ -375,7 +389,11 @@ def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home):
         path = _absolute(value, label)
         _system_mount(path, [owner for owner, _, is_home in protected if is_home])
         for ancestor in (path, *path.parents):
-            require(not ancestor.is_symlink(), "mount source contains a symlink: " + str(ancestor))
+            try:
+                info = os.lstat(ancestor)
+            except FileNotFoundError:
+                continue
+            require(not stat.S_ISLNK(info.st_mode), "mount source contains a symlink: " + str(ancestor))
         # --mount uses comma-separated fields; these characters would change its meaning or make bad argv.
         require(not any(char in str(path) for char in (",", ":", "\n", "\r")),
                 "mount source contains an unsupported character: " + str(path))
@@ -1121,8 +1139,13 @@ def _plan(config):
     require(python.parent.name == "bin", "recipes.python must be in a Python or venv bin directory")
     prefix = _absolute(config.get("python_prefix", str(python.parent.parent)), "python_prefix")
     _system_mount(prefix, (Path.home(),))
-    require("python_prefix" in config or (prefix / "pyvenv.cfg").is_file(),
-            "python_prefix requires pyvenv.cfg or an explicit config key")
+    if "python_prefix" not in config:
+        try:
+            marker = os.stat(prefix / "pyvenv.cfg")
+        except FileNotFoundError:
+            marker = None
+        require(marker is not None and stat.S_ISREG(marker.st_mode),
+                "python_prefix requires pyvenv.cfg or an explicit config key")
     plan = mount_plan(run=config.get("run"), project=config.get("project"),
                       source=config.get("source", str(HERE.parent)), python_prefix=prefix,
                       live_checkouts=config.get("live_checkouts", []), home=Path.home())
