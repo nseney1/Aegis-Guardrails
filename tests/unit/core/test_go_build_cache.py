@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import threading
 import time
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -784,6 +785,61 @@ def test_inspection_refuses_a_cache_with_no_existing_ancestor(compiler, monkeypa
 
 
 @pytest.mark.parametrize("cancel", [False, True])
+def test_cleanup_diagnostic_adds_no_process_observations_or_control(compiler, monkeypatch, cancel):
+    from aegis_core.ast import gobuild
+
+    popen, prepare = subprocess.Popen, gobuild.prepare_go_driver
+    completed, calls, roots = False, [], []
+
+    def observed_popen(argv, **options):
+        proc = popen(argv, **options)
+        if argv[1] == "build":
+            original = {name: getattr(proc, name)
+                        for name in ("poll", "wait", "send_signal", "terminate", "kill")}
+            roots.append((proc, original))
+
+            def boundary(name):
+                def observed(*args, **kwargs):
+                    if completed:
+                        calls.append(name)
+                        assert name == "poll", f"diagnostic must not call Popen.{name}"
+                    return original[name](*args, **kwargs)
+                return observed
+
+            for name in original:
+                monkeypatch.setattr(proc, name, boundary(name))
+        return proc
+
+    def observed_prepare(*args, **kwargs):
+        nonlocal completed
+        try:
+            return prepare(*args, **kwargs)
+        finally:
+            # Product cleanup has finished before the public call returns or raises.
+            # Only the existing assertion may poll after this point; formatting is passive.
+            completed = True
+
+    monkeypatch.setattr(subprocess, "Popen", observed_popen)
+    monkeypatch.setattr(gobuild, "prepare_go_driver", observed_prepare)
+    try:
+        test_compiler_communication_error_or_cancellation_reaps_root_before_removing_directory(
+            compiler, monkeypatch, cancel)
+        assert len(roots) == 1
+        assert calls == ["poll"], "only the original root-reaped assertion may poll"
+    finally:
+        # A failed probe still owns these real fixture roots. Use the saved OS methods
+        # only if public cleanup left a root unresolved; never remove retained cache state.
+        for proc, original in roots:
+            for name, method in original.items():
+                monkeypatch.setattr(proc, name, method)
+            if proc.returncode is None:
+                original["kill"]()
+                original["wait"](timeout=3)
+            for stream in (proc.stdout, proc.stderr):
+                stream.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
 def test_compiler_communication_error_or_cancellation_reaps_root_before_removing_directory(compiler, monkeypatch, cancel):
     from aegis_core.ast.gobuild import GoDriverUnavailableError, prepare_go_driver
 
@@ -802,11 +858,17 @@ def test_compiler_communication_error_or_cancellation_reaps_root_before_removing
 
     monkeypatch.setattr(subprocess, "Popen", interrupted)
     error_type = KeyboardInterrupt if cancel else GoDriverUnavailableError
-    with pytest.raises(error_type, match="fixture cancellation" if cancel else "fixture pipe error"):
+    with pytest.raises(error_type, match="fixture cancellation" if cancel else "fixture pipe error") as error:
         prepare_go_driver(compiler.workspace)
-    assert processes and all(proc.poll() is not None for proc in processes)
-    assert all(proc.stdout.closed and proc.stderr.closed for proc in processes)
-    assert not list(compiler.cache.glob(".go-build-*"))
+    diagnostic = (
+        f"go build: reason={getattr(error.value, 'reason', None)!r}, "
+        f"detail={getattr(error.value, 'detail', None)!r}; "
+        f"processes (pid, returncode)={[(proc.pid, proc.returncode) for proc in processes]!r}\n"
+        + "".join(traceback.format_exception(type(error.value), error.value, error.value.__traceback__))
+    )
+    assert processes and all(proc.poll() is not None for proc in processes), diagnostic
+    assert all(proc.stdout.closed and proc.stderr.closed for proc in processes), diagnostic
+    assert not list(compiler.cache.glob(".go-build-*")), diagnostic
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group failure boundary")

@@ -62,7 +62,7 @@ def test_wave_prs_keep_governance_while_full_validation_runs_on_develop_and_down
     assert triggers["pull_request"]["branches"] == ["main", "develop", "release/**"]
     assert {"workflow_call", "workflow_dispatch"} <= set(triggers)
     jobs = workflow["jobs"]
-    for name in ("dependency-audit", "build-wheel", "validate", "test-windows"):
+    for name in ("dependency-audit", "build-wheel", "native-compat", "validate", "test-windows"):
         assert jobs[name].get("if") == FULL_VALIDATION, name
     check = jobs["aegis-check"]
     assert check.get("if") == "always()"
@@ -114,7 +114,8 @@ def test_wave_tests_run_pull_requests_into_develop_without_secrets():
     ("success", "failure", False), ("skipped", "cancelled", False),
 ])
 def test_required_check_rejects_unexpected_upstream_results(expected, actual, passed):
-    proc = _run_upstream_gate(expected, {"build-wheel": {"result": actual}, FAST_JOB: {"result": "success"}})
+    proc = _run_upstream_gate(expected, {"build-wheel": {"result": actual}, FAST_JOB: {"result": "success"},
+                                         "native-compat": {"result": expected}})
     assert (proc.returncode == 0) is passed, proc.stderr
     if not passed:
         assert "build-wheel" in proc.stderr and "Unexpected upstream job results" in proc.stderr
@@ -138,7 +139,7 @@ def _run_upstream_gate(expected, needs):
     ("success", "failure", False), ("skipped", None, False),
 ])
 def test_required_check_needs_the_fast_leg_to_succeed_on_every_run(expected, fast, passed):
-    needs = {"build-wheel": {"result": expected}}
+    needs = {"build-wheel": {"result": expected}, "native-compat": {"result": expected}}
     if fast is not None:
         needs[FAST_JOB] = {"result": fast}
     proc = _run_upstream_gate(expected, needs)
@@ -409,7 +410,7 @@ def test_windows_test_job_runs_the_whole_suite_and_fails_on_failure():
 
 # The jobs that run the suite: the matrix, Windows, and aegis-check, whose `check --ci` reruns the
 # head commit's trailer snapshot and must be able to collect what the others collect (R-trust-a3).
-TEST_JOBS = ("validate", "test-windows", "aegis-check")
+TEST_JOBS = ("validate", "test-windows", "aegis-check", "native-compat")
 INSTALL_STEP = "Install test dependencies"
 
 
@@ -664,3 +665,511 @@ def test_the_check_ci_step_has_no_condition_and_stays_the_required_check(text):
     assert any("if" not in step for step in steps)
     assert all("continue-on-error" not in step for step in steps)
     assert human_gate.aegis_check_jobs(body) == ["aegis-check"]
+
+
+COMPAT_JOB = "native-compat"
+COMPAT_STEP = "Run exactly two native compatibility cases"
+COMPAT_CASES = {
+    "macos-latest": (
+        "tests.integration.test_hierarchy_fresh_brief",
+        ("test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit",
+         "test_directory_eacces_is_a_permission_refusal")),
+    "ubuntu-24.04": (
+        "tests.integration.test_hierarchy_team_homes",
+        ("test_round4_root_competing_after_logins_final_reload_keeps_both_bindings[False]",
+         "test_round4_root_competing_after_logins_final_reload_keeps_both_bindings[True]")),
+}
+
+
+def _compat_job():
+    jobs = _load("validate.yml")["jobs"]
+    assert COMPAT_JOB in jobs, "full native jobs need the early compatibility gate"
+    return jobs[COMPAT_JOB]
+
+
+def _compat_step():
+    return next(s for s in _compat_job()["steps"] if s.get("name") == COMPAT_STEP)
+
+
+def _assert_compat_edges(jobs):
+    assert jobs[COMPAT_JOB]["needs"] == "build-wheel"
+    assert jobs["validate"]["needs"] == ["build-wheel", "dependency-audit", COMPAT_JOB]
+    assert jobs["test-windows"]["needs"] == ["build-wheel", COMPAT_JOB]
+    for name in ("aegis-check", "verdict"):
+        assert COMPAT_JOB in jobs[name]["needs"], name
+    for name in ("validate", "test-windows", COMPAT_JOB):
+        assert jobs[name]["if"] == FULL_VALIDATION, name
+
+
+def test_native_compatibility_precedes_both_full_families_and_the_verdict():
+    jobs = _load("validate.yml")["jobs"]
+    _assert_compat_edges(jobs)
+    job = _compat_job()
+    assert job["runs-on"] == "${{ matrix.os }}"
+    assert job["strategy"] == {"fail-fast": False,
+                                "matrix": {"os": ["macos-latest", "ubuntu-24.04"]}}
+    assert job["timeout-minutes"] == 15  # Operational ceiling, not a performance assertion.
+    assert [s["with"]["python-version"] for s in _step_using(job, "actions/setup-python")] == ["3.9"]
+    assert jobs["validate"]["timeout-minutes"] == 300
+    assert jobs["validate"]["strategy"]["matrix"] == {
+        "os": ["ubuntu-latest", "macos-latest"], "python-version": ["3.9", "3.11"],
+        "exclude": [{"os": "ubuntu-latest", "python-version": "3.9"}],
+        "include": [{"os": "ubuntu-24.04", "python-version": "3.9"}]}
+    assert jobs["test-windows"]["timeout-minutes"] == 90
+    assert jobs["test-windows"]["strategy"]["matrix"] == {"python-version": ["3.9", "3.12"]}
+
+
+@pytest.mark.parametrize("name", ["validate", "test-windows", "aegis-check", "verdict"])
+def test_removing_a_compat_dependency_edge_is_rejected(name):
+    jobs = _load("validate.yml")["jobs"]
+    jobs[name]["needs"] = [n for n in jobs[name]["needs"] if n != COMPAT_JOB]
+    with pytest.raises(AssertionError):
+        _assert_compat_edges(jobs)
+
+
+def test_native_compat_reuses_verified_artifacts_and_read_only_source_identity():
+    job = _compat_job()
+    assert job.get("permissions", _load("validate.yml")["permissions"]) == {"contents": "read"}
+    assert job.get("defaults", {}).get("run", {}).get("shell") == "bash"
+    checkout, = _step_using(job, "actions/checkout")
+    assert checkout["with"] == {"ref": "${{ github.sha }}", "fetch-depth": 0, "persist-credentials": False}
+    download, = _step_using(job, "actions/download-artifact")
+    assert download["with"] == {"name": "aegis-wheel", "path": "dist/"}
+    for prefix in ("actions/checkout", "actions/setup-python", "actions/download-artifact"):
+        assert _step_using(job, prefix)[0]["uses"] == _step_using(
+            _load("validate.yml")["jobs"]["validate"], prefix)[0]["uses"]
+    assert len([s for s in job["steps"] if "uses" in s]) == 3
+    assert job["steps"].index(download) < _index(job, "verify_dist.py verify dist") < _index(job, "pip install dist/*.whl")
+    identity = _runs(job)[_index(job, "git rev-parse HEAD", "HEAD^{tree}")]
+    assert '"$GITHUB_SHA"' in identity and "exit 1" in identity
+    text = yaml.safe_dump(job)
+    assert not re.search(r"\bsecrets\b|github\s*(\.|\[)\s*'?token|GH_TOKEN|actions/cache|upload-artifact", text)
+    for step in job["steps"]:
+        assert not step.get("continue-on-error") and "|| true" not in step.get("run", "")
+        assert step.get("if") in (None, "runner.os == 'Linux'")
+    env = _compat_step()["env"]
+    assert env["HOME"] == env["USERPROFILE"] and "runner.temp" in env["HOME"]
+    assert "runner.temp" in env["XDG_CONFIG_HOME"] and str(env["PYTHONDONTWRITEBYTECODE"]) == "1"
+    assert 'mkdir "$HOME"\nmkdir "$XDG_CONFIG_HOME"' in _compat_step()["run"]
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_actual_compat_identity_command_refuses_a_different_checkout(tmp_path, bash, matching):
+    env = _diagnostic_env(tmp_path)
+    observed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, env=env,
+                              capture_output=True, text=True, check=True, timeout=10).stdout.strip()
+    env["GITHUB_SHA"] = observed if matching else "0" * 40
+    command = _runs(_compat_job())[_index(_compat_job(), "git rev-parse HEAD", "HEAD^{tree}")]
+    proc = subprocess.run([bash, "-c", command], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == (0 if matching else 1), proc.stdout + proc.stderr
+    if matching:
+        assert re.fullmatch(rf"native-compat commit={observed} tree=[0-9a-f]{{40}}\n", proc.stdout)
+    else:
+        assert proc.stderr.strip() == "Unexpected checkout commit" and proc.stdout == ""
+
+
+def test_native_compat_linux_proves_bubblewrap_before_targeted_pytest():
+    job = _compat_job()
+    install = _index(job, "apt-get", "install -y --no-install-recommends bubblewrap")
+    probe = _index(job, _bubblewrap_probe())
+    assert install < probe < job["steps"].index(_compat_step())
+    assert _runs(job)[install] == "sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap"
+    for index in (install, probe):
+        assert job["steps"][index]["if"] == "runner.os == 'Linux'"
+    assert "kernel.apparmor_restrict_unprivileged_userns=0" in _runs(job)[probe]
+
+
+def test_dropping_a_dependency_from_the_compat_copy_is_rejected():
+    jobs = _load("validate.yml")["jobs"]
+    step = _install_step(jobs[COMPAT_JOB])
+    assert step is not None and " hypothesis==" in step["run"]
+    step["run"] = step["run"].replace(" hypothesis==6.126.0", "")
+    assert _divergent_installs(jobs) == [COMPAT_JOB]
+
+
+@pytest.mark.parametrize("expected,result,passed", [
+    ("success", "success", True), ("skipped", "skipped", True),
+    ("success", "failure", False), ("success", "cancelled", False),
+    ("success", "skipped", False), ("skipped", "success", False),
+    ("skipped", "failure", False), ("skipped", "cancelled", False),
+    ("success", None, False), ("skipped", None, False),
+    ("success", "missing-result", False), ("skipped", "missing-result", False),
+])
+def test_required_check_requires_a_compat_result_even_when_skips_are_expected(expected, result, passed):
+    needs = {"build-wheel": {"result": expected}, FAST_JOB: {"result": "success"}}
+    if result is not None:
+        needs[COMPAT_JOB] = {} if result == "missing-result" else {"result": result}
+    proc = _run_upstream_gate(expected, needs)
+    assert (proc.returncode == 0) is passed, proc.stderr
+    if not passed:
+        assert COMPAT_JOB in proc.stderr and "Unexpected upstream job results" in proc.stderr
+
+
+def _embedded_python(run):
+    match = re.search(r"<<'PY'\n(.*?)\nPY(?:\n|$)", run, re.DOTALL)
+    assert match, "the workflow must contain the public inline Python validator"
+    return match[1]
+
+
+def _diagnostic_env(root):
+    home = root / "private-home"
+    home.mkdir(exist_ok=True)
+    assert not home.is_symlink()
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "USERPROFILE": str(home),
+           "XDG_CONFIG_HOME": str(home / "config"), "PYTHONDONTWRITEBYTECODE": "1"}
+    # Preserve this interpreter's installed test dependencies when HOME changes,
+    # without putting the checkout or its conftest on the model subprocess path.
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path
+                                      if p.endswith(("site-packages", "dist-packages")))
+    if "SYSTEMROOT" in os.environ:
+        env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+    return env
+
+
+@pytest.mark.parametrize("result,passed", [("success", True), (None, False), ("missing-result", False),
+                                         ("skipped", False), ("failure", False), ("cancelled", False)])
+def test_actual_verdict_predicate_requires_successful_compat(tmp_path, result, passed):
+    job = _load("validate.yml")["jobs"]["verdict"]
+    step = next(s for s in job["steps"] if "predicate.json" in s.get("run", ""))
+    needs = {"aegis-check": {"result": "success"}, FAST_JOB: {"result": "success"}}
+    if result is not None:
+        needs[COMPAT_JOB] = {} if result == "missing-result" else {"result": result}
+    env = dict(_diagnostic_env(tmp_path), NEEDS=json.dumps(needs), GITHUB_SHA="a" * 40,
+               GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1")
+    proc = subprocess.run([sys.executable, "-c", _embedded_python(step["run"]), "b" * 40],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10)
+    assert (proc.returncode == 0) is passed, proc.stderr
+    if passed:
+        assert json.loads(proc.stdout)["jobs"][COMPAT_JOB] == "success"
+    else:
+        assert "Traceback" in proc.stderr
+
+
+@pytest.mark.parametrize("gate", ["upstream", "verdict"])
+def test_missing_compat_negative_control_detects_a_deleted_presence_guard(tmp_path, gate):
+    needs = {"build-wheel": {"result": "success"}, FAST_JOB: {"result": "success"}}
+    env = dict(_diagnostic_env(tmp_path), GITHUB_SHA="a" * 40, GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="1")
+    if gate == "upstream":
+        step = _load("validate.yml")["jobs"]["aegis-check"]["steps"][0]
+        body = shlex.split(step["run"])[2]
+        mutant = body.replace("always + required", "always")
+        env.update(NEEDS_JSON=json.dumps(needs), EXPECTED_RESULT="success", ALWAYS_SUCCESS=FAST_JOB,
+                   REQUIRED_JOBS=COMPAT_JOB)
+    else:
+        job = _load("validate.yml")["jobs"]["verdict"]
+        step = next(s for s in job["steps"] if "predicate.json" in s.get("run", ""))
+        body = _embedded_python(step["run"])
+        mutant = body.replace('"native-compat" in needs and ', "")
+        env["NEEDS"] = json.dumps(needs)
+    assert mutant != body
+    for command, code in ((body, 1), (mutant, 0)):
+        proc = subprocess.run([sys.executable, "-c", command, "b" * 40], cwd=tmp_path, env=env,
+                              capture_output=True, text=True, timeout=10)
+        assert proc.returncode == code, proc.stdout + proc.stderr
+
+
+@pytest.fixture(scope="module")
+def compat_reports(tmp_path_factory):
+    """Public pytest reports from model cases; these do not qualify the native fixtures."""
+    reports = {}
+    for os_name in COMPAT_CASES:
+        root = tmp_path_factory.mktemp("compat-report")
+        module, config = _compat_model(root, os_name)
+        report = root / "results.xml"
+        proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-c", str(config),
+                               "--confcutdir", str(root), "--rootdir", str(root),
+                               "--junitxml", str(report), str(module)], cwd=root, env=_diagnostic_env(root),
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        reports[os_name] = report.read_bytes()
+    return reports
+
+
+def _compat_model(root, os_name):
+    classname, names = COMPAT_CASES[os_name]
+    module = root / (classname.replace(".", "/") + ".py")
+    module.parent.mkdir(parents=True)
+    if os_name == "ubuntu-24.04":
+        source = ("import pytest\n@pytest.mark.parametrize('fail_login_save', [False, True])\n"
+                  f"def {names[0].split('[')[0]}(fail_login_save):\n    assert isinstance(fail_login_save, bool)\n")
+    else:
+        source = "\n".join(f"def {name}():\n    assert True\n" for name in names)
+    module.write_text(source, encoding="utf-8")
+    config = root / "pytest.ini"
+    config.write_text("[pytest]\njunit_family=xunit2\n", encoding="utf-8")
+    return module, config
+
+
+def _run_compat_report(root, report, os_name):
+    return subprocess.run([sys.executable, "-c", _embedded_python(_compat_step()["run"]),
+                           str(report), os_name], cwd=root, env=_diagnostic_env(root),
+                          capture_output=True, text=True, timeout=10)
+
+
+@pytest.mark.parametrize("os_name", COMPAT_CASES)
+def test_actual_compat_validator_accepts_two_public_pytest_cases(tmp_path, compat_reports, os_name):
+    report = tmp_path / "report.xml"
+    report.write_bytes(compat_reports[os_name])
+    proc = _run_compat_report(tmp_path, report, os_name)
+    assert proc.returncode == 0, proc.stderr
+    summary = json.loads(proc.stdout)
+    classname, names = COMPAT_CASES[os_name]
+    assert summary == {"tests": 2, "failures": 0, "errors": 0, "skipped": 0,
+                       "cases": [[classname, name] for name in sorted(names)]}
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    ("wrong-name", "case identities"), ("wrong-class", "case identities"),
+    ("missing-case", "case identities"), ("extra-case", "case identities"),
+    ("duplicate-case", "case identities"), ("skipped", "testcase outcome"),
+    ("failure", "testcase outcome"), ("error", "testcase outcome"),
+    ("xfail", "testcase outcome"), ("forged-tests", "suite counters"),
+    ("missing-counter", "suite counters"), ("negative-counter", "suite counters"),
+    ("forged-failures", "suite counters"), ("forged-root", "suite counters"),
+    ("malformed", "malformed XML"), ("dtd", "DTD/entity"), ("entity", "DTD/entity"),
+    ("oversized", "size limit"), ("missing", "report unavailable"),
+    ("directory", "regular file"), ("unknown-os", "unknown compatibility leg"),
+])
+def test_actual_compat_validator_refuses_unqualified_reports(tmp_path, compat_reports, mutation, reason):
+    import copy
+    import xml.etree.ElementTree as ET
+
+    report = tmp_path / "report.xml"
+    root = ET.fromstring(compat_reports["macos-latest"])
+    suite = root.find("testsuite")
+    cases = suite.findall("testcase")
+    if mutation == "wrong-name":
+        cases[0].set("name", "unexpected")
+    elif mutation == "wrong-class":
+        cases[0].set("classname", "unexpected")
+    elif mutation == "missing-case":
+        suite.remove(cases[0])
+    elif mutation == "extra-case":
+        suite.append(copy.deepcopy(cases[0]))
+    elif mutation == "duplicate-case":
+        cases[1].set("name", cases[0].get("name"))
+    elif mutation in ("skipped", "failure", "error", "xfail"):
+        ET.SubElement(cases[0], "skipped" if mutation == "xfail" else mutation,
+                      {"type": "pytest.xfail"} if mutation == "xfail" else {})
+    elif mutation == "forged-tests":
+        suite.set("tests", "0")
+    elif mutation == "missing-counter":
+        del suite.attrib["skipped"]
+    elif mutation == "negative-counter":
+        suite.set("errors", "-1")
+    elif mutation == "forged-failures":
+        suite.set("failures", "1")
+    elif mutation == "forged-root":
+        root.attrib.update(tests="0", failures="0", errors="0", skipped="0")
+    data = ET.tostring(root)
+    if mutation == "malformed":
+        data = b"<testsuites>"
+    elif mutation in ("dtd", "entity"):
+        data = (b'<!DOCTYPE testsuites []>' if mutation == "dtd" else b'<!ENTITY x "value">') + data
+    elif mutation == "oversized":
+        data = b" " * (1024 * 1024 + 1)
+    if mutation == "directory":
+        report.mkdir()
+    elif mutation != "missing":
+        report.write_bytes(data)
+    proc = _run_compat_report(tmp_path, report, "other" if mutation == "unknown-os" else "macos-latest")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "native-compat:" in proc.stderr and reason in proc.stderr
+
+
+def test_native_compat_invokes_only_the_exact_platform_selectors():
+    run = _compat_step()["run"]
+    assert run.startswith("set -euo pipefail\n")
+    assert 'case "$COMPAT_OS" in' in run and "exit 1" in run
+    invocation = 'python - "$REPORT" "${cases[@]}" <<\'PYTEST\''
+    assert run.count(invocation) == 1
+    runner = run.split("<<'PYTEST'\n", 1)[1].split("\nPYTEST", 1)[0]
+    assert 'args = ["-q", "-o", "junit_family=xunit2", "-o", "xfail_strict=true",' in runner
+    assert '"--junitxml=" + sys.argv[1], *sys.argv[2:]]' in runner
+    assert 'guard = RequireUnmarkedCompatibilityCases()' in runner
+    assert 'pytest.main(args, plugins=[guard])' in runner
+    assert "tryfirst" not in runner and "trylast" not in runner
+    assert run.index(invocation) < run.index("<<'PY'")
+    mac = run.split("macos-latest)", 1)[1].split(";;", 1)[0]
+    linux = run.split("ubuntu-24.04)", 1)[1].split(";;", 1)[0]
+    for os_name, block in (("macos-latest", mac), ("ubuntu-24.04", linux)):
+        classname, names = COMPAT_CASES[os_name]
+        module = classname.replace(".", "/") + ".py"
+        selectors = [f"{module}::{name.split('[')[0]}" for name in names]
+        actual = re.findall(r"tests/integration/[^\s)]+", block)
+        assert actual == list(dict.fromkeys(selectors))
+    for forbidden in ("--deselect", "--ignore", " -k ", " -m ", "--reruns", "|| true"):
+        assert forbidden not in runner
+
+
+@pytest.mark.parametrize("os_name,outcome,code", [
+    ("macos-latest", "pass", 0), ("ubuntu-24.04", "pass", 0),
+    ("macos-latest", "fail", 1), ("macos-latest", "skip", 1),
+    ("macos-latest", "xfail", 4), ("macos-latest", "xpass", 4),
+    ("macos-latest", "missing", 4), ("other", "unknown", 1),
+])
+def test_actual_compat_shell_runs_pytest_before_validating_outcomes(tmp_path, bash, os_name, outcome, code):
+    module, _ = _compat_model(tmp_path, "macos-latest" if os_name == "other" else os_name)
+    if outcome == "fail":
+        module.write_text(module.read_text().replace("assert True", "assert False"), encoding="utf-8")
+    elif outcome == "skip":
+        module.write_text("import pytest\n" + module.read_text().replace("assert True", "pytest.skip('model')"),
+                          encoding="utf-8")
+    elif outcome in ("xfail", "xpass"):
+        source = module.read_text().replace("def ", "@pytest.mark.xfail(reason='model')\ndef ")
+        if outcome == "xfail":
+            source = source.replace("assert True", "assert False")
+        module.write_text("import pytest\n" + source, encoding="utf-8")
+    elif outcome == "missing":
+        module.write_text("", encoding="utf-8")
+    home = tmp_path / "compat-home"
+    env = dict(_diagnostic_env(tmp_path), RUNNER_TEMP=str(tmp_path), COMPAT_OS=os_name,
+               HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(home / "config"))
+    proc = subprocess.run([bash, "-c", _compat_step()["run"]], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == code, proc.stdout + proc.stderr
+    summary = '"cases":'
+    if outcome == "pass":
+        assert summary in proc.stdout and '"skipped": 0' in proc.stdout
+    else:
+        assert summary not in proc.stdout
+        if outcome == "skip":
+            assert "native-compat: testcase outcome" in proc.stderr
+        elif outcome in ("xfail", "xpass"):
+            assert "native-compat: selected cases must not carry xfail marks" in proc.stderr
+        elif outcome == "unknown":
+            assert "Unknown native compatibility leg" in proc.stderr
+
+
+def test_actual_compat_shell_refuses_an_existing_home_before_pytest(tmp_path, bash):
+    _compat_model(tmp_path, "macos-latest")
+    env = dict(_diagnostic_env(tmp_path), RUNNER_TEMP=str(tmp_path), COMPAT_OS="macos-latest")
+    proc = subprocess.run([bash, "-c", _compat_step()["run"]], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "native-compat: private home must be new" in proc.stderr
+    assert not (tmp_path / "native-compat.xml").exists()
+
+
+@pytest.mark.parametrize("origin", ["strict-false", "run-false", "condition-false", "module",
+                                    "parameter", "generated-parameter", "collection-wrapper",
+                                    "equal-priority-wrapper"])
+def test_actual_compat_shell_rejects_collected_xfail_before_execution(tmp_path, bash, origin):
+    os_name = "ubuntu-24.04" if "parameter" in origin else "macos-latest"
+    module, _ = _compat_model(tmp_path, os_name)
+    source = module.read_text()
+    # The marker proves that even an unmarked selected sibling did not run.
+    executed = "from pathlib import Path; Path('executed').write_text('ran', encoding='utf-8')"
+    source = source.replace("assert True", executed).replace("assert isinstance(fail_login_save, bool)", executed)
+    mark = "pytest.mark.xfail(strict=False, reason='model')"
+    if origin in ("strict-false", "run-false", "condition-false"):
+        if origin == "run-false":
+            mark = "pytest.mark.xfail(run=False, strict=False, reason='model')"
+        elif origin == "condition-false":
+            mark = "pytest.mark.xfail(False, strict=False, reason='model')"
+        source = "import pytest\n" + source.replace("def ", f"@{mark}\ndef ")
+    elif origin == "module":
+        source = f"import pytest\npytestmark = {mark}\n" + source
+    elif origin == "parameter":
+        source = source.replace("[False, True]", f"[pytest.param(False, marks={mark}), True]")
+    elif origin == "generated-parameter":
+        source = source.replace("@pytest.mark.parametrize('fail_login_save', [False, True])\n", "")
+        source += ("\ndef pytest_generate_tests(metafunc):\n"
+                   f"    metafunc.parametrize('fail_login_save', [pytest.param(False, marks={mark}), True])\n")
+    else:
+        priority = ", tryfirst=True" if origin == "equal-priority-wrapper" else ""
+        (tmp_path / "conftest.py").write_text(
+            f"import pytest\n@pytest.hookimpl(wrapper=True{priority})\n"
+            "def pytest_collection_modifyitems(items):\n    yield\n"
+            f"    items[0].add_marker({mark})\n", encoding="utf-8")
+    module.write_text(source, encoding="utf-8")
+    home = tmp_path / "compat-home"
+    env = dict(_diagnostic_env(tmp_path), RUNNER_TEMP=str(tmp_path), COMPAT_OS=os_name,
+               HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(home / "config"))
+    proc = subprocess.run([bash, "-c", _compat_step()["run"]], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert "native-compat: selected cases must not carry xfail marks" in proc.stderr
+    assert not (tmp_path / "executed").exists(), "collection refusal must precede every selected test body"
+    assert '"cases":' not in proc.stdout
+
+
+@pytest.mark.parametrize("origin,code,body_ran", [
+    ("setup-xpass", 1, True), ("call-xpass", 1, True), ("empty-reason-xpass", 1, True),
+    ("call-xfail", 1, True), ("setup-xfail", 1, False), ("teardown-xfail", 1, True),
+    ("xpass-then-interrupt", 2, True),
+])
+def test_actual_compat_shell_rejects_runtime_xfail_reports(tmp_path, bash, origin, code, body_ran):
+    module, _ = _compat_model(tmp_path, "macos-latest")
+    names = COMPAT_CASES["macos-latest"][1]
+    source = "import pytest\nfrom pathlib import Path\n"
+    for index, name in enumerate(names):
+        request = "request" if origin in ("call-xpass", "empty-reason-xpass", "xpass-then-interrupt") else ""
+        body = "    Path('executed').write_text('ran', encoding='utf-8')\n"
+        if request:
+            reason = "" if origin == "empty-reason-xpass" else "runtime"
+            body += f"    request.node.add_marker(pytest.mark.xfail(strict=False, reason={reason!r}))\n"
+        elif origin == "call-xfail":
+            body += "    pytest.xfail('runtime')\n"
+        if origin == "xpass-then-interrupt" and index == 1:
+            body = "    raise KeyboardInterrupt('model interrupt')\n"
+        source += f"def {name}({request}):\n{body}\n"
+    module.write_text(source, encoding="utf-8")
+    if origin in ("setup-xpass", "setup-xfail", "teardown-xfail"):
+        if origin == "setup-xpass":
+            body = "    request.node.add_marker(pytest.mark.xfail(strict=False, reason='runtime'))\n"
+        elif origin == "setup-xfail":
+            body = "    pytest.xfail('runtime')\n"
+        else:
+            body = "    yield\n    pytest.xfail('runtime')\n"
+        (tmp_path / "conftest.py").write_text(
+            "import pytest\n@pytest.fixture(autouse=True)\ndef late(request):\n" + body, encoding="utf-8")
+    home = tmp_path / "compat-home"
+    env = dict(_diagnostic_env(tmp_path), RUNNER_TEMP=str(tmp_path), COMPAT_OS="macos-latest",
+               HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(home / "config"))
+    proc = subprocess.run([bash, "-c", _compat_step()["run"]], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == code, proc.stdout + proc.stderr
+    if code == 1:
+        assert "native-compat: xfail/XPASS reports cannot qualify selected cases" in proc.stderr
+    else:
+        assert "KeyboardInterrupt: model interrupt" in proc.stdout + proc.stderr
+    assert (tmp_path / "executed").exists() is body_ran
+    assert '"cases":' not in proc.stdout
+
+
+@pytest.mark.parametrize("guard,mutation", [
+    ("case identities", "identity"), ("testcase outcome", "outcome"),
+    ("suite counters", "counters"), ("DTD/entity", "dtd"), ("size limit", "size"),
+])
+def test_report_negative_controls_detect_deleted_guards(tmp_path, compat_reports, guard, mutation):
+    """Delete each guard from an owned command copy and exercise the real file boundary."""
+    import xml.etree.ElementTree as ET
+
+    body = _embedded_python(_compat_step()["run"])
+    root = ET.fromstring(compat_reports["macos-latest"])
+    if mutation == "identity":
+        root[0][0].set("name", "unexpected")
+        body = body.replace('refuse("case identities must match exactly two selected cases")', "pass")
+    elif mutation == "outcome":
+        ET.SubElement(root[0][0], "skipped")
+        body = body.replace('refuse("testcase outcome must have no skipped, failure, error or other children")', "pass")
+    elif mutation == "counters":
+        root[0].set("tests", "0")
+        body = body.replace('refuse("suite counters disagree with actual testcase outcomes")', "pass")
+    data = ET.tostring(root)
+    if mutation == "dtd":
+        data = b"<!DOCTYPE testsuites []>" + data
+        body = body.replace('refuse("DTD/entity or non-UTF-8 XML is forbidden")', "pass")
+    elif mutation == "size":
+        data += b" " * (1024 * 1024)
+        body = body.replace('refuse("report exceeds size limit")', "pass")
+    assert body != _embedded_python(_compat_step()["run"])
+    report = tmp_path / "report.xml"
+    report.write_bytes(data)
+    refused = _run_compat_report(tmp_path, report, "macos-latest")
+    assert refused.returncode == 1 and guard in refused.stderr
+    mutant = subprocess.run([sys.executable, "-c", body, str(report), "macos-latest"],
+                            cwd=tmp_path, env=_diagnostic_env(tmp_path), capture_output=True, text=True, timeout=10)
+    assert mutant.returncode == 0, mutant.stderr

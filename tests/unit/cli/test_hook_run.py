@@ -674,6 +674,231 @@ def test_overhead_subtracts_the_interpreter_start(baseline, ok):
     assert (overhead([0.9] * 12, baseline) < 0.25) is ok
 
 
+def _hook_profile_enabled(system, version, covered):
+    return system == "win32" and tuple(version) == (3, 12) and covered is True
+
+
+_HOOK_PROFILE_SOURCES = (
+    "tests/unit/cli/test_hook_run.py", "aegis_cli/__main__.py", "aegis_cli/cli.py",
+    "aegis_cli/hooks/pretool.py", "aegis_core/scan_compliance.py", "aegis_core/gitsafe.py",
+    "aegis_core/storage.py", "aegis_core/workspace/layout.py",
+)
+
+
+def _profile_environment(home):
+    # Keep the default _cli environment contract, without changing its measured path.
+    env = dict(os.environ)
+    env.update({"HOME": str(home), "USERPROFILE": str(home)})
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p)
+    for key in ("AEGIS_WORKSPACE", "CLAUDE_PROJECT_DIR"):
+        env.pop(key, None)
+    return env
+
+
+def _profile_location(value, roots):
+    import re
+
+    value = str(value).replace("\\", "/")
+    if ".." in value.split("/"):
+        return "<EXTERNAL>"
+    for root, label in sorted(roots, key=lambda item: len(str(item[0])), reverse=True):
+        prefix = str(root).replace("\\", "/").rstrip("/")
+        if value.lower().startswith(prefix.lower() + "/"):
+            relative = value[len(prefix) + 1:]
+            if len(relative) <= 160 and re.fullmatch(r"[A-Za-z0-9_./ -]+", relative):
+                return label + "/" + relative
+            return label + "/<NAME>"
+    if re.fullmatch(r"<frozen [A-Za-z0-9_.]+>", value):
+        return value
+    return "<BUILTIN>" if value == "~" else "<EXTERNAL>"
+
+
+def _profile_symbol(value):
+    import re
+
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_ .<>'{}-]{1,100}", value) else "<SYMBOL>"
+
+
+def _profile_file(path, limit=8 * 1024 * 1024):
+    import hashlib
+    import stat
+
+    if path.is_symlink():
+        raise ValueError("diagnostic file is a symlink")
+    digest, count = hashlib.sha256(), 0
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("diagnostic input is not a regular file")
+    size = info.st_size
+    with path.open("rb") as stream:
+        while count < min(size, limit):
+            chunk = stream.read(min(65536, limit - count))
+            if not chunk:
+                break
+            digest.update(chunk)
+            count += len(chunk)
+    complete = count == size
+    return {"size": size, "sha256": digest.hexdigest() if complete else None,
+            "prefix_sha256": None if complete else digest.hexdigest(),
+            "hashed_bytes": count, "truncated": not complete}
+
+
+def _profile_tables(profile, import_log, roots):
+    import io
+    import math
+    import pstats
+    import re
+    import stat
+
+    if (profile.stat().st_size > 4 * 1024 * 1024 or profile.is_symlink()
+            or not stat.S_ISREG(profile.stat().st_mode) or import_log.is_symlink()
+            or not stat.S_ISREG(import_log.stat().st_mode)):
+        raise ValueError("profile input exceeds its bound or is a symlink")
+    stats = pstats.Stats(str(profile), stream=io.StringIO()).stats
+    if len(stats) > 10000:
+        raise ValueError("profile function count exceeds its bound")
+    functions = []
+    for (filename, line, name), (primitive, calls, own, cumulative, _) in stats.items():
+        if (not all(type(n) is int and n >= 0 for n in (line, primitive, calls))
+                or not all(type(n) in (int, float) and math.isfinite(n) and n >= 0 for n in (own, cumulative))):
+            raise ValueError("invalid profile counters")
+        functions.append({"location": _profile_location(filename, roots), "line": line,
+                          "function": _profile_symbol(name), "calls": calls,
+                          "self_seconds": own, "cumulative_seconds": cumulative})
+    imports, unparsed = [], 0
+    with import_log.open("rb") as stream:
+        raw = stream.read(512 * 1024 + 1)
+    for line in raw[:512 * 1024].decode("utf-8", "replace").splitlines():
+        match = re.fullmatch(r"import time:\s*(\d{1,12})\s*\|\s*(\d{1,12})\s*\|\s*([A-Za-z0-9_.]{1,100})\s*", line)
+        if match:
+            imports.append({"module": match[3], "self_us": int(match[1]), "cumulative_us": int(match[2])})
+        elif not line.startswith("import time: self [us]"):
+            unparsed += 1
+    return {"top_cumulative": sorted(functions, key=lambda row: row["cumulative_seconds"], reverse=True)[:8],
+            "top_self": sorted(functions, key=lambda row: row["self_seconds"], reverse=True)[:8],
+            "top_imports": sorted(imports, key=lambda row: row["cumulative_us"], reverse=True)[:8],
+            "functions_truncated": len(stats) > 8, "import_log_truncated": len(raw) > 512 * 1024,
+            "imports_truncated": len(imports) > 8, "unparsed_stderr_lines": unparsed,
+            "import_rows": len(imports)}
+
+
+def _capture_hook_profile(ws, home, data, samples, primary, event_check_passed):
+    # All profiling imports, hashes and I/O belong after the original measurement.
+    import hashlib
+    import platform
+    import re
+    import tempfile
+
+    report = {"schema": "HOOK_PROFILE_V1", "status": "failed", "profile_is_performance_evidence": False,
+              "raw_artifacts_uploaded": False, "invocations": 0, "samples": samples,
+              "partial_samples": len(samples["hook_seconds"]) != 12 or len(samples["python_seconds"]) != 12,
+              "overhead_seconds": overhead(samples["hook_seconds"], samples["python_seconds"])
+              if len(samples["hook_seconds"]) == len(samples["python_seconds"]) == 12 else None,
+              "primary_error_type": type(primary).__name__ if primary is not None else None,
+              "original_event_assertion_passed": event_check_passed, "summary_truncated": False}
+    try:
+        report["run"] = {}
+        for name, pattern in (("GITHUB_RUN_ID", r"[0-9]{1,24}"), ("GITHUB_RUN_ATTEMPT", r"[0-9]{1,8}"),
+                              ("GITHUB_SHA", r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")):
+            value = os.environ.get(name)
+            report["run"][name] = value if value is None or re.fullmatch(pattern, value) else "<INVALID>"
+        report["runtime"] = {name: _profile_symbol(value) for name, value in (
+            ("python", platform.python_version()), ("system", platform.system()),
+            ("release", platform.release()), ("version", platform.version()), ("machine", platform.machine()))}
+        report["fixture"] = _profile_file(scan_compliance.activity_path(ws))
+        report["payload"] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        report["sources"] = []
+        for relative in _HOOK_PROFILE_SOURCES:
+            source = REPO / relative
+            if source.is_symlink() or REPO.resolve() not in source.resolve().parents:
+                raise ValueError("source digest escaped checkout")
+            report["sources"].append({"location": "<CHECKOUT>/" + relative, **_profile_file(source)})
+        parent = home.parent.resolve()
+        checkout = REPO.resolve()
+        if parent == checkout or checkout in parent.parents or home.is_symlink() or ws.is_symlink():
+            raise ValueError("profile directory must be external to checkout")
+        before = len(events.read(ws, "scan_gate").rows)
+        report["scan_gate_events_before_profile"] = before
+        with tempfile.TemporaryDirectory(prefix="aegis-hook-profile-", dir=str(parent)) as temporary:
+            if Path(temporary).is_symlink():
+                raise ValueError("profile directory is a symlink")
+            directory = Path(temporary).resolve()
+            if directory == checkout or checkout in directory.parents:
+                raise ValueError("profile directory must be external to checkout")
+            profile, out, err = [directory / name for name in ("profile.pstats", "stdout.bin", "importtime.bin")]
+            roots = [(checkout, "<CHECKOUT>"), (directory, "<PROFILE>"), (parent, "<TEMP>"),
+                     (Path(sys.prefix).resolve(), "<PYTHON>"), (Path(sys.base_prefix).resolve(), "<PYTHON>")]
+            try:
+                with out.open("wb") as stdout, err.open("wb") as stderr:
+                    report["invocations"] = 1
+                    proc = subprocess.run(
+                        [sys.executable, "-X", "importtime", "-m", "cProfile", "-o", str(profile),
+                         "-m", "aegis_cli", "hook", "run", "pre-tool", "--host", "claude-code"],
+                        input=data, cwd=str(ws), env=_profile_environment(home),
+                        stdout=stdout, stderr=stderr, timeout=60, check=False,
+                    )
+                    report["exit_code"] = proc.returncode
+            except Exception as error:
+                report["capture_error_type"] = type(error).__name__
+            finally:
+                report["scan_gate_events_added_by_profile"] = len(events.read(ws, "scan_gate").rows) - before
+                report["raw"] = {}
+                for label, path in (("profile", profile), ("stdout", out), ("importtime", err)):
+                    report["raw"][label] = _profile_file(path) if path.exists() else {"missing": True}
+            if profile.exists() and err.exists():
+                report.update(_profile_tables(profile, err, roots))
+            if (report.get("exit_code") == 0 and report["raw"]["stdout"].get("size") == 0
+                    and report.get("import_rows", 0) and report.get("unparsed_stderr_lines") == 0
+                    and report.get("scan_gate_events_added_by_profile") == 1):
+                report["status"] = "captured"
+            else:
+                report.setdefault("capture_error_type", "IncompleteCapture")
+    except Exception as error:
+        report["status"] = "failed"
+        report.setdefault("capture_error_type", type(error).__name__)
+        report["diagnosis_error_type"] = type(error).__name__
+    return report
+
+
+def _hook_profile_warning(report):
+    import warnings
+
+    prefix = "HOOK_PROFILE_V1 "
+    report = dict(report)
+    keys = ("top_cumulative", "top_self", "top_imports")
+    try:
+        for key in keys:
+            if key in report:
+                report[key] = list(report[key])
+        encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        while len((prefix + encoded).encode("utf-8")) > 12 * 1024:
+            largest = max(keys, key=lambda key: len(report.get(key, [])))
+            if not report.get(largest):
+                raise ValueError("profile summary exceeds 12 KiB")
+            report[largest].pop()
+            report["summary_truncated"] = True
+            encoded = json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    except Exception as error:
+        encoded = json.dumps({"schema": "HOOK_PROFILE_V1", "status": "failed", "stage": "summary",
+                              "capture_error_type": type(error).__name__, "summary_truncated": True})
+    warnings.warn(prefix + encoded, pytest.PytestWarning, stacklevel=2)
+
+
+def _emit_hook_profile(ws, home, data, samples, primary, event_check_passed):
+    try:
+        report = _capture_hook_profile(ws, home, data, samples, primary, event_check_passed)
+    except Exception as error:
+        report = {"schema": "HOOK_PROFILE_V1", "status": "failed", "capture_error_type": type(error).__name__,
+                  "profile_is_performance_evidence": False, "samples": samples}
+    try:
+        _hook_profile_warning(report)
+    except Exception as error:
+        if primary is None:
+            raise
+        if hasattr(primary, "add_note"):
+            primary.add_note("HOOK_PROFILE_V1 warning delivery failed: " + type(error).__name__)
+
+
 @pytest.mark.timing
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])
 def test_hook_run_overhead_is_under_250_ms(ws, home, covered):
@@ -683,31 +908,62 @@ def test_hook_run_overhead_is_under_250_ms(ws, home, covered):
     tail (the covering scan row deep in it, or none), and an event to append. The only
     wall-clock assertion on this path; the spawn counters in test_scan_spawn_budget pin the
     regression class."""
-    _busy_log(ws, "src/a.py" if covered else None)
-    assert scan_compliance.activity_path(ws).stat().st_size > 3.5 * 1024 * 1024
-    data = json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
-    expected = (0, b"", b"") if covered else (2, b"", b"aegis: call aegis_scan with src/a.py before editing "
-                                                      b"(or run: aegis scan src/a.py)\n")
+    samples = {"hook_seconds": [], "python_seconds": [], "warmup_complete": False, "phase": "fixture"}
+    data, primary, event_check_passed = None, None, False
+    try:
+        _busy_log(ws, "src/a.py" if covered else None)
+        assert scan_compliance.activity_path(ws).stat().st_size > 3.5 * 1024 * 1024
+        data = json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
+        expected = (0, b"", b"") if covered else (2, b"", b"aegis: call aegis_scan with src/a.py before editing "
+                                                          b"(or run: aegis scan src/a.py)\n")
 
-    def once() -> float:
-        started = time.perf_counter()
-        proc = _cli(["pre-tool", "--host", "claude-code"], data, ws, home)
-        elapsed = time.perf_counter() - started
-        assert (proc.returncode, proc.stdout, proc.stderr.replace(b"\r\n", b"\n")) == expected  # Windows text stderr
-        return elapsed
+        def once() -> float:
+            started = time.perf_counter()
+            proc = _cli(["pre-tool", "--host", "claude-code"], data, ws, home)
+            elapsed = time.perf_counter() - started
+            # Retain completed samples in order, outside the measured interval.
+            if samples["warmup_complete"]:
+                samples["hook_seconds"].append(elapsed)
+            else:
+                samples["warmup_seconds"] = elapsed
+            samples["last_hook_exit"] = proc.returncode
+            assert (proc.returncode, proc.stdout, proc.stderr.replace(b"\r\n", b"\n")) == expected  # Windows text stderr
+            return elapsed
 
-    def noop() -> float:
-        started = time.perf_counter()
-        subprocess.run([sys.executable, "-c", "import sys"], cwd=str(ws), capture_output=True, timeout=60, check=True)
-        return time.perf_counter() - started
+        def noop() -> float:
+            started = time.perf_counter()
+            subprocess.run([sys.executable, "-c", "import sys"], cwd=str(ws), capture_output=True, timeout=60, check=True)
+            elapsed = time.perf_counter() - started
+            samples["python_seconds"].append(elapsed)
+            return elapsed
 
-    once()  # warm the OS file cache
-    timings = [once() for _ in range(12)]
-    baseline = [noop() for _ in range(12)]
-    extra = overhead(timings, baseline)
-    assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start: "
-                          f"{[round(t * 1000) for t in sorted(timings)]} vs {[round(t * 1000) for t in sorted(baseline)]}")
-    assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"] * 13
+        samples["phase"] = "warmup"
+        once()  # warm the OS file cache
+        samples["warmup_complete"] = True
+        samples["phase"] = "hook_samples"
+        timings = [once() for _ in range(12)]
+        samples["phase"] = "python_samples"
+        baseline = [noop() for _ in range(12)]
+        samples["phase"] = "assertions"
+        extra = overhead(timings, baseline)
+        assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start: "
+                              f"{[round(t * 1000) for t in sorted(timings)]} vs {[round(t * 1000) for t in sorted(baseline)]}")
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"] * 13
+            event_check_passed = True
+        except Exception as error:
+            if primary is None:
+                primary = error
+                raise
+            if hasattr(primary, "add_note"):
+                primary.add_note("The original 13-event scan_gate assertion also failed.")
+        finally:
+            if _hook_profile_enabled(sys.platform, sys.version_info[:2], covered):
+                _emit_hook_profile(ws, home, data, samples, primary, event_check_passed)
 
 
 # ── what the busy-log path costs, in counts (X-hook-windows-cost) ────────────
@@ -851,3 +1107,226 @@ def test_the_hooks_cost_does_not_grow_with_the_log(ws, capsys):
     eight = best_of_3()
     capsys.readouterr()
     assert eight / max(one, 1e-9) < 24, f"eight times the log multiplied the cost by {eight / max(one, 1e-9):.1f}"
+
+
+@pytest.mark.parametrize("system,version,covered,enabled", [
+    ("win32", (3, 12), True, True), ("win32", (3, 12), False, False),
+    ("win32", (3, 9), True, False), ("linux", (3, 12), True, False),
+    ("darwin", (3, 12), True, False), ("win32", (3, 11), True, False),
+])
+def test_hook_profile_selects_only_the_admitted_native_case(system, version, covered, enabled):
+    assert _hook_profile_enabled(system, version, covered) is enabled
+
+
+@pytest.fixture
+def profile_layout(ws, home, tmp_path, monkeypatch):
+    """Modelled checkout layout and subprocess boundary, never native qualification."""
+    checkout = tmp_path / "model-checkout"
+    for relative in _HOOK_PROFILE_SOURCES:
+        path = checkout / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"modelled source bytes\n")
+    monkeypatch.setitem(globals(), "REPO", checkout)
+    _busy_log(ws, "src/a.py")
+    data = json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
+    return ws, home, checkout, data
+
+
+def _model_profile_files(argv, options):
+    import cProfile
+
+    profile = cProfile.Profile()
+    profile.runcall(lambda: None)
+    profile.dump_stats(argv[argv.index("-o") + 1])
+    options["stderr"].write(b"import time: self [us] | cumulative | imported package\n"
+                            b"import time: 123 | 456 | aegis_cli.cli\n")
+
+
+@pytest.mark.parametrize("failure", [None, "timeout", "exit"])
+def test_hook_profile_has_one_invocation_same_environment_and_separate_event_count(
+        profile_layout, monkeypatch, failure):
+    ws, home, checkout, data = profile_layout
+    calls, environment_matches = [], []
+    original = subprocess.run
+    measured_environment = None
+
+    def run(argv, **options):
+        nonlocal measured_environment
+        if argv[0] != sys.executable:
+            return original(argv, **options)
+        if "-X" not in argv:
+            calls.append("measured")
+            measured_environment = options["env"]
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        calls.append("profile")
+        environment_matches.append(options["env"] == measured_environment)
+        if (argv[1:6] != ["-X", "importtime", "-m", "cProfile", "-o"]
+                or argv[7:] != ["-m", "aegis_cli", "hook", "run", "pre-tool", "--host", "claude-code"]):
+            pytest.fail("profile command differs from the admitted public invocation")
+        assert checkout not in Path(argv[6]).resolve().parents
+        if options["input"] != data or options["cwd"] != str(ws) or options["timeout"] != 60:
+            pytest.fail("capture payload/cwd/deadline contract mismatch (contents omitted)")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, 60)
+        _model_profile_files(argv, options)
+        events.append(ws, "scan_gate", "pass", {"paths": 1}, host="claude-code")
+        return subprocess.CompletedProcess(argv, 7 if failure == "exit" else 0)
+
+    monkeypatch.setenv("AEGIS_WORKSPACE", "removed pin")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "removed project")
+    monkeypatch.setenv("GITHUB_RUN_ID", "invalid/PRIVATE_VALUE")
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+    monkeypatch.setenv("UNRELATED_SECRET", "PRIVATE_VALUE")
+    monkeypatch.setattr(subprocess, "run", run)
+    _cli(["pre-tool", "--host", "claude-code"], data, ws, home)
+    assert calls == ["measured"]
+    calls.clear()
+    for _ in range(13):
+        events.append(ws, "scan_gate", "pass", {"paths": 1}, host="claude-code")
+    samples = {"hook_seconds": [0.2, 0.1] * 6, "python_seconds": [0.02, 0.01] * 6}
+    report = _capture_hook_profile(ws, home, data, samples, None, True)
+    assert calls == ["profile"] and report["invocations"] == 1
+    assert environment_matches == [True]
+    assert report["scan_gate_events_before_profile"] == 13
+    assert report["scan_gate_events_added_by_profile"] == (0 if failure == "timeout" else 1)
+    assert report["status"] == ("failed" if failure else "captured")
+    assert report["samples"] == samples and report["partial_samples"] is False
+    assert report["overhead_seconds"] == overhead(samples["hook_seconds"], samples["python_seconds"])
+    assert report["run"]["GITHUB_RUN_ID"] == "<INVALID>"
+    assert report["run"]["GITHUB_SHA"] == "a" * 40
+    assert len(report["sources"]) == len(_HOOK_PROFILE_SOURCES)
+    if failure == "timeout":
+        assert report["capture_error_type"] == "TimeoutExpired" and report["raw"]["profile"]["missing"]
+    else:
+        assert report["raw"]["profile"]["sha256"] and report["top_imports"][0]["module"] == "aegis_cli.cli"
+        assert report["exit_code"] == (7 if failure else 0)
+    with pytest.warns(pytest.PytestWarning, match="^HOOK_PROFILE_V1 ") as rows:
+        _hook_profile_warning(report)
+    assert len(rows) == 1 and len(str(rows[0].message).encode("utf-8")) <= 12 * 1024
+    assert "PRIVATE_VALUE" not in str(rows[0].message) and str(ws) not in str(rows[0].message)
+
+
+def test_hook_profile_refuses_artifacts_inside_the_checkout(profile_layout, monkeypatch):
+    ws, _, checkout, data = profile_layout
+    home = checkout / "private-home"
+    home.mkdir()
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    report = _capture_hook_profile(ws, home, data, {"hook_seconds": [], "python_seconds": []}, None, False)
+    assert report["status"] == "failed" and report["capture_error_type"] == "ValueError"
+    assert report["invocations"] == 0 and calls == []
+    assert not list(checkout.glob("aegis-hook-profile-*"))
+
+
+def test_hook_profile_paths_and_untrusted_output_are_sanitized(tmp_path):
+    import cProfile
+
+    roots = [("C:/agent/checkout", "<CHECKOUT>"), ("C:/Python312", "<PYTHON>")]
+    assert _profile_location(r"C:\agent\checkout\aegis_cli\cli.py", roots) == "<CHECKOUT>/aegis_cli/cli.py"
+    assert _profile_location(r"C:\Python312\Lib\pstats.py", roots) == "<PYTHON>/Lib/pstats.py"
+    assert _profile_location("/PRIVATE_VALUE/owner.py", roots) == "<EXTERNAL>"
+    assert _profile_symbol("/PRIVATE_VALUE/argv-or-payload") == "<SYMBOL>"
+    namespace = {}
+    exec(compile("def work(): return 1", "/PRIVATE_VALUE/owner.py", "exec"), namespace)
+    profile, imports = tmp_path / "model.pstats", tmp_path / "model-imports.txt"
+    profiler = cProfile.Profile()
+    profiler.runcall(namespace["work"])
+    profiler.dump_stats(str(profile))
+    imports.write_text("import time: 1 | 2 | safe.module\nPRIVATE_VALUE payload and argv\n", encoding="utf-8")
+    tables = _profile_tables(profile, imports, roots)
+    assert tables["unparsed_stderr_lines"] == 1
+    assert "PRIVATE_VALUE" not in json.dumps(tables)
+    assert any(row["location"] == "<EXTERNAL>" for row in tables["top_cumulative"])
+    with pytest.warns(pytest.PytestWarning) as rows:
+        _hook_profile_warning(dict(tables, samples={"hook_seconds": [0.2, 0.1] * 6,
+                                                   "python_seconds": [0.02, 0.01] * 6},
+                                   top_imports=[{"module": "x" * 100, "self_us": 1}] * 150))
+    summary = json.loads(str(rows[0].message).removeprefix("HOOK_PROFILE_V1 "))
+    assert summary["summary_truncated"] and len(str(rows[0].message).encode("utf-8")) <= 12 * 1024
+    assert summary["samples"]["hook_seconds"] == [0.2, 0.1] * 6
+
+
+def test_hook_profile_runs_after_the_original_measurement_and_13_event_check(profile_layout, monkeypatch):
+    ws, home, _, _ = profile_layout
+    original, phases = subprocess.run, []
+
+    def run(argv, **options):
+        if argv[0] == sys.executable and "-X" in argv:
+            assert phases == ["hook"] * 13 + ["python"] * 12
+            assert len(events.read(ws, "scan_gate").rows) == 13
+            phases.append("profile")
+            _model_profile_files(argv, options)
+            events.append(ws, "scan_gate", "pass", {"paths": 1}, host="claude-code")
+            return subprocess.CompletedProcess(argv, 0)
+        if argv[0] == sys.executable and argv[1:3] == ["-m", "aegis_cli"]:
+            phases.append("hook")
+            events.append(ws, "scan_gate", "pass", {"paths": 1}, host="claude-code")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        if argv[0] == sys.executable and argv[1:] == ["-c", "import sys"]:
+            phases.append("python")
+            return subprocess.CompletedProcess(argv, 0)
+        return original(argv, **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setitem(globals(), "_hook_profile_enabled", lambda system, version, covered: covered)
+    with pytest.warns(pytest.PytestWarning, match="^HOOK_PROFILE_V1 ") as rows:
+        test_hook_run_overhead_is_under_250_ms(ws, home, True)
+    assert phases == ["hook"] * 13 + ["python"] * 12 + ["profile"]
+    assert len(rows) == 1
+    report = json.loads(str(rows[0].message).removeprefix("HOOK_PROFILE_V1 "))
+    assert report["status"] == "captured" and report["original_event_assertion_passed"] is True
+    assert len(report["samples"]["hook_seconds"]) == len(report["samples"]["python_seconds"]) == 12
+    assert report["scan_gate_events_before_profile"] == 13 and report["scan_gate_events_added_by_profile"] == 1
+
+
+@pytest.mark.parametrize("fail_at", [1, 4], ids=["warmup", "third-hook-sample"])
+def test_hook_profile_preserves_measurement_failure_and_reports_partial_samples(profile_layout, monkeypatch, fail_at):
+    ws, home, _, _ = profile_layout
+    primary = OSError("modelled measurement failure")
+    original = subprocess.run
+    phases = []
+
+    def run(argv, **options):
+        if "-X" in argv:
+            phases.append("profile")
+            assert len(events.read(ws, "scan_gate").rows) == fail_at - 1
+            raise RuntimeError("modelled capture failure")
+        if argv[1:3] == ["-m", "aegis_cli"]:
+            phases.append("measurement")
+            if phases.count("measurement") == fail_at:
+                raise primary
+            events.append(ws, "scan_gate", "pass", {"paths": 1}, host="claude-code")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        return original(argv, **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    # Explicit test-only capture selection; never mutate sys.platform or import Windows modules.
+    monkeypatch.setitem(globals(), "_hook_profile_enabled", lambda system, version, covered: covered)
+    with pytest.warns(pytest.PytestWarning, match="^HOOK_PROFILE_V1 ") as rows:
+        with pytest.raises(OSError) as caught:
+            test_hook_run_overhead_is_under_250_ms(ws, home, True)
+    assert caught.value is primary and phases == ["measurement"] * fail_at + ["profile"]
+    assert len(rows) == 1
+    report = json.loads(str(rows[0].message).removeprefix("HOOK_PROFILE_V1 "))
+    assert report["status"] == "failed" and report["capture_error_type"] == "RuntimeError"
+    assert report["partial_samples"] and len(report["samples"]["hook_seconds"]) == max(0, fail_at - 2)
+    assert report["samples"]["python_seconds"] == []
+    assert report["overhead_seconds"] is None and report["original_event_assertion_passed"] is False
+
+
+def test_hook_profile_warning_delivery_failure_preserves_the_primary_exception(monkeypatch):
+    import warnings
+
+    primary = AssertionError("original performance failure")
+    monkeypatch.setitem(globals(), "_capture_hook_profile", lambda *args: {"status": "failed"})
+
+    def denied(*args, **kwargs):
+        raise RuntimeError("modelled warning delivery failure")
+
+    monkeypatch.setattr(warnings, "warn", denied)
+    with pytest.raises(AssertionError) as caught:
+        try:
+            raise primary
+        finally:
+            _emit_hook_profile(None, None, b"", {}, primary, False)
+    assert caught.value is primary

@@ -157,8 +157,181 @@ jobs:
           fi
           echo "No hardcoded paths found"
 
+  # Source-fixture compatibility on the oldest supported Python precedes the full native
+  # families. This is not installed-wheel qualification; those jobs retain their wheel smoke.
+  native-compat:
+    if: github.event_name != 'pull_request' || github.base_ref != 'develop'
+    needs: build-wheel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.9'
+      - name: Download wheel artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: aegis-wheel
+          path: dist/
+      - name: Verify artifact digests
+        run: python .github/scripts/verify_dist.py verify dist
+      - name: Install test dependencies
+        run: |
+          pip install pytest==8.3.4 pytest-xdist==3.6.1 ruff==0.9.10 hypothesis==6.126.0 coverage==7.6.12 pyyaml==6.0.2 anyio==4.12.1
+          pip install dist/*.whl
+      - name: Record checkout identity
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          [ "$commit" = "$GITHUB_SHA" ] || { echo "Unexpected checkout commit" >&2; exit 1; }
+          printf 'native-compat commit=%s tree=%s\n' "$commit" "$(git rev-parse 'HEAD^{tree}')"
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+      - name: Prove bubblewrap runs
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-net --unshare-pid --ro-bind / / --dev /dev --proc /proc true
+      - name: Run exactly two native compatibility cases
+        env:
+          COMPAT_OS: ${{ matrix.os }}
+          HOME: ${{ runner.temp }}/native-compat-home
+          USERPROFILE: ${{ runner.temp }}/native-compat-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/native-compat-home/config
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          set -euo pipefail
+          umask 077
+          # A new home cannot contain inherited state or symlinks. mkdir also refuses a
+          # collision after the check, before any test can run against another home.
+          if [ -e "$HOME" ] || [ -L "$HOME" ]; then
+            echo "native-compat: private home must be new" >&2
+            exit 1
+          fi
+          mkdir "$HOME"
+          mkdir "$XDG_CONFIG_HOME"
+          case "$COMPAT_OS" in
+            macos-latest)
+              cases=(
+                tests/integration/test_hierarchy_fresh_brief.py::test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit
+                tests/integration/test_hierarchy_fresh_brief.py::test_directory_eacces_is_a_permission_refusal
+              ) ;;
+            ubuntu-24.04)
+              cases=(tests/integration/test_hierarchy_team_homes.py::test_round4_root_competing_after_logins_final_reload_keeps_both_bindings) ;;
+            *) echo "Unknown native compatibility leg" >&2; exit 1 ;;
+          esac
+          REPORT="$RUNNER_TEMP/native-compat.xml"
+          python - "$REPORT" "${cases[@]}" <<'PYTEST'
+          import sys
+          import pytest
+
+          class RequireUnmarkedCompatibilityCases:
+              def __init__(self):
+                  self.xfail_reported = False
+
+              # This separate phase starts after collection and all its wrappers returned.
+              # It neither filters items nor depends on collection-hook priority.
+              @pytest.hookimpl(wrapper=True)
+              def pytest_runtestloop(self, session):
+                  if any(next(item.iter_markers(name="xfail"), None) is not None for item in session.items):
+                      raise pytest.UsageError("native-compat: selected cases must not carry xfail marks")
+                  return (yield)
+
+              def pytest_runtest_logreport(self, report):
+                  # Presence matters: a real XPASS can carry an empty reason.
+                  if hasattr(report, "wasxfail"):
+                      self.xfail_reported = True
+
+          args = ["-q", "-o", "junit_family=xunit2", "-o", "xfail_strict=true",
+                  "--junitxml=" + sys.argv[1], *sys.argv[2:]]
+          guard = RequireUnmarkedCompatibilityCases()
+          result = pytest.main(args, plugins=[guard])
+          # All reporting/session hooks have returned. Preserve pytest's real nonzero
+          # results and standard reports; an xfail witness can only turn success into failure.
+          if guard.xfail_reported and result == pytest.ExitCode.OK:
+              print("native-compat: xfail/XPASS reports cannot qualify selected cases", file=sys.stderr)
+              result = pytest.ExitCode.TESTS_FAILED
+          raise SystemExit(result)
+          PYTEST
+          # Pytest's successful exit alone accepts skips. Require the actual public report's
+          # exact identities and outcomes too; never trust summary counters without entries.
+          python - "$REPORT" "$COMPAT_OS" <<'PY'
+          import json, os, re, stat, sys
+          import xml.etree.ElementTree as ET
+
+          def refuse(reason):
+              sys.exit("native-compat: " + reason)
+
+          expected = {
+              "macos-latest": {
+                  ("tests.integration.test_hierarchy_fresh_brief", "test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit"),
+                  ("tests.integration.test_hierarchy_fresh_brief", "test_directory_eacces_is_a_permission_refusal")},
+              "ubuntu-24.04": {
+                  ("tests.integration.test_hierarchy_team_homes", "test_round4_root_competing_after_logins_final_reload_keeps_both_bindings[False]"),
+                  ("tests.integration.test_hierarchy_team_homes", "test_round4_root_competing_after_logins_final_reload_keeps_both_bindings[True]")}}
+          if sys.argv[2] not in expected:
+              refuse("unknown compatibility leg")
+          limit = 1024 * 1024
+          try:
+              before = os.lstat(sys.argv[1])
+              if not stat.S_ISREG(before.st_mode):
+                  refuse("report must be a regular file")
+              if before.st_size > limit:
+                  refuse("report exceeds size limit")
+              flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+              with os.fdopen(os.open(sys.argv[1], flags), "rb") as stream:
+                  opened = os.fstat(stream.fileno())
+                  if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                      refuse("report must remain the same regular file")
+                  data = stream.read(limit + 1)
+          except OSError:
+              refuse("report unavailable")
+          if len(data) > limit:
+              refuse("report exceeds size limit")
+          try:
+              text = data.decode("utf-8")
+              if "\x00" in text or re.search(r"<!\s*(?:DOCTYPE|ENTITY)\b", text, re.IGNORECASE):
+                  refuse("DTD/entity or non-UTF-8 XML is forbidden")
+              root = ET.fromstring(text)
+          except (UnicodeError, ET.ParseError):
+              refuse("malformed XML")
+          if root.tag != "testsuites" or len(root) != 1 or root[0].tag != "testsuite":
+              refuse("unexpected suite structure")
+          suite = root[0]
+          cases = list(suite)
+          identities = [(case.get("classname"), case.get("name")) for case in cases]
+          if (len(cases) != 2 or any(case.tag != "testcase" for case in cases)
+                  or len(set(identities)) != 2 or set(identities) != expected[sys.argv[2]]):
+              refuse("case identities must match exactly two selected cases")
+          if any(list(case) for case in cases):
+              refuse("testcase outcome must have no skipped, failure, error or other children")
+          counts = {"tests": 2, "failures": 0, "errors": 0, "skipped": 0}
+          for element in (suite, root):
+              if element is suite or any(key in element.attrib for key in counts):
+                  if any(element.get(key) != str(value) for key, value in counts.items()):
+                      refuse("suite counters disagree with actual testcase outcomes")
+          print(json.dumps(dict(counts, cases=sorted(identities)), sort_keys=True))
+          PY
+
   aegis-check:
-    needs: [dependency-audit, build-wheel, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, native-compat, validate, test-windows, test-fast]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -173,8 +346,10 @@ jobs:
           EXPECTED_RESULT: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && 'skipped' || 'success' }}
           # Jobs that run on every event, wave PRs included, so they must always succeed.
           ALWAYS_SUCCESS: test-fast
+          # Presence is required even when the full-native jobs are expected to skip.
+          REQUIRED_JOBS: native-compat
         run: |
-          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
+          python3 -c 'import json, os, sys; needs = json.loads(os.environ["NEEDS_JSON"]); expected = os.environ["EXPECTED_RESULT"]; always = os.environ["ALWAYS_SUCCESS"].split(); required = os.environ["REQUIRED_JOBS"].split(); bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != ("success" if k in always else expected)}; bad.update({k: "missing" for k in always + required if k not in needs}); sys.exit(f"Unexpected upstream job results (expected {expected}, and success for {always}): {bad}" if bad else 0)'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'pull_request' && github.base_ref == 'develop' && github.event.pull_request.base.sha || github.sha }}
@@ -225,7 +400,7 @@ jobs:
 
   validate:
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
-    needs: [build-wheel, dependency-audit]
+    needs: [build-wheel, dependency-audit, native-compat]
     timeout-minutes: 300
     strategy:
       # One red leg must not cancel the others and hide the per-OS results.
@@ -317,7 +492,7 @@ jobs:
   # tests that drive PowerShell spawn it themselves.
   test-windows:
     if: github.event_name != 'pull_request' || github.base_ref != 'develop'
-    needs: build-wheel
+    needs: [build-wheel, native-compat]
     runs-on: windows-latest
     timeout-minutes: 90
     strategy:
@@ -565,7 +740,7 @@ jobs:
   # The CI verdict (v4.3 T2): attests sha256 of "aegis-ci-verdict/v1\ncommit <sha>\ntree <tree>\n"
   # once every job passed, only on the events doctor --release consumes (not release, not PRs).
   verdict:
-    needs: [dependency-audit, build-wheel, aegis-check, validate, test-windows, test-fast]
+    needs: [dependency-audit, build-wheel, native-compat, aegis-check, validate, test-windows, test-fast]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -587,7 +762,7 @@ jobs:
           python3 - "$tree" > predicate.json <<'PY'
           import json, os, sys
           needs = json.loads(os.environ["NEEDS"])
-          assert needs and all(v["result"] == "success" for v in needs.values()), needs
+          assert needs and "native-compat" in needs and all(v["result"] == "success" for v in needs.values()), needs
           print(json.dumps({"commit": os.environ["GITHUB_SHA"], "tree": sys.argv[1],
                             "run": f'{os.environ["GITHUB_RUN_ID"]}/{os.environ["GITHUB_RUN_ATTEMPT"]}',
                             "jobs": {k: v["result"] for k, v in sorted(needs.items())}}))
