@@ -51,11 +51,22 @@ of a secret's descendant is not discovered without its original ancestors. Plann
 under trusted private ancestors; executing the plan requires preparing them first and recomputing the plan.
 
 An inferred Python prefix must contain `pyvenv.cfg`. Otherwise set the explicit top-level `python_prefix` key.
-Mounts of `/`, `/usr`, `/usr/local` and any owner home's `.local` refuse. Any mount equal to or containing an
-image system directory also refuses: `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, `/etc`, `/var`, `/opt`, `/run`,
-`/proc`, `/sys`, `/dev`, `/tmp`. Such binds would replace image userland and invalidate the digest pin. Subfolders
-such as `/opt/aegis-python` remain usable. The interpreter named by a venv's `pyvenv.cfg` `home` must exist at the
-same path in the image; checking that is recorded for C2/C4 and is not solved by C1.
+Mounts of `/` and any owner home's `.local` refuse. Any mount equal to or containing an image system directory
+also refuses: `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, `/etc`, `/var`, `/opt`, `/run`, `/proc`, `/sys`, `/dev`,
+`/tmp`. Any mount equal to or inside a protected image tree refuses as well: `/bin`, `/sbin`, `/lib`, `/lib32`,
+`/lib64`, `/libx32`, `/usr` (including all of `/usr/local`), `/etc`, `/boot`, `/proc`, `/sys`, `/run`, `/dev`
+and `/var`. For example, `/usr/bin`, `/usr/local/bin`, `/etc/aegis`, `/var/lib/aegis`, `/run/user/1000` and
+`/dev/sda` refuse. Such binds would replace image executables, libraries or configuration, invalidating the digest
+pin, or expose host runtime sockets and devices. The only carve-outs are strict descendants of `/dev/shm` and
+`/var/tmp`, such as `/var/tmp/aegis-project`; `/var/tmp` itself refuses. Subfolders of `/opt`, `/tmp`, `/srv` and
+other non-system roots, such as `/opt/aegis-python`, remain usable. Because all of `/var` is protected, an owner
+whose home resolves under `/var` (for example `/var/home/<user>` on ostree systems such as Fedora Silverblue)
+cannot use container isolation in C1. Planning, the expected record and both builders apply the same rule.
+Expected records and builders apply the `.local` refusal and the owner-home/secret exclusions to HOME and the
+password-database home; only planning also knows a configured `home`. Planning refuses symlinked sources; the expected record and both builders also apply
+the rule to the resolved source, so a symlink into a protected tree, such as one to `/run/user/1000` or `/usr/bin`,
+refuses with the same message naming the supplied path. The interpreter named by a venv's `pyvenv.cfg` `home` must
+exist at the same path in the image; checking that is recorded for C2/C4 and is not solved by C1.
 
 Exact `/dev/shm` binds also refuse: that destination is reserved for the mandatory scratch tmpfs. A bind there
 would request two conflicting mount types and produce a plan that no inspect result could satisfy. Ordinary
@@ -197,7 +208,7 @@ This is structural validation of supplied evidence, not authentication against a
 | Image association | Required config ID, digest-or-explicit-null, repository digest list and fingerprint map; pin belongs to the inspected association | `image`, `environment` |
 | Image Config | Raw image response requires an object; missing/null/empty-list Env are supported empty representations, other malformed Env refuses | CLI refusal |
 | Environment | Typed name-to-SHA256 maps; create defaults, fixed homes and the allowlist remain mandatory; pinned defaults may be known-empty | `environment` |
-| Mount rows | Exact existing row keys, absolute same paths and literal boolean access; existing character/system-directory/duplicate rules apply | `mounts` |
+| Mount rows | Exact existing row keys, absolute same paths and literal boolean access; existing character/system-directory/duplicate rules, also on the resolved source, and the owner-home/secret and `.local` exclusions for HOME and the password-database home apply; unreadable path metadata refuses | `mounts` |
 | Root and user | Literal read-only true; both numeric IDs in the existing Linux bounds | `read_only`, `user`, `userns_mode` |
 | Limits | Existing finite CPU range; positive integer memory bytes representable by `k`/`m`/`g`; integer PID limit at least 64; booleans refuse | `cpus`, `memory`, `pids` |
 
@@ -206,7 +217,7 @@ limit -1, cannot authorize unlimited resources. `image_info.digest=null` is a su
 only with the pinned RepoDigest association; a missing key or empty string is different and refuses.
 
 Verification compares the derived name, label, image identity, exact bind set (source/destination/access), read-only root,
-numeric user, environment values, CPU/memory/PID limits, Privileged=false, empty CapAdd/Devices, private PID/IPC,
+numeric user, environment values, CPU/memory/PID limits, Privileged=false, present empty CapAdd/Devices, private PID/IPC,
 keep-id mappings for Podman (the default userns record for Docker), and forced bridge networking.
 The observed Name must equal `container_name(run)`. Podman's captured name is plain. The modelled Docker
 branch allows one leading slash, following [Moby v27.5.1 reserveName](https://github.com/moby/moby/blob/v27.5.1/daemon/names.go),
@@ -310,7 +321,10 @@ and 3 internal failure.
 The library also returns argv for exec (absolute workdir and explicit env), inspect, timed stop, rm and image
 inspect. Later callers must verify immediately before exec, stop or removal and leave a mismatched container
 alone. Builders execute nothing. They revalidate the image pattern and every mount row's keys, absolute paths,
-same-path equality, characters and boolean access. These structural checks do not attest filesystem custody:
+same-path equality, characters and boolean access, plus the system-directory and owner-home/secret exclusions
+(missing paths stay legal). Metadata that cannot be read, such as a path through a regular file, a symlink loop,
+an overlong component or a denied directory, cannot prove the exclusions: builders raise `mount overlaps protected
+home: <path>` and `verify` reports `mounts`. These checks do not attest filesystem custody:
 C4 must recompute `mount_plan` from config immediately before `run`, rather than trust a stored plan.
 
 ## Protection and limits

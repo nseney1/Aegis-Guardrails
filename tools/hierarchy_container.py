@@ -38,6 +38,12 @@ SECRET_PATHS = (".claude", ".codex", ".ssh", ".gnupg", ".config", ".aws", ".kube
 IMAGE_SYSTEM_DIRS = tuple(Path(path) for path in
                           ("/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc", "/var", "/opt", "/run",
                            "/proc", "/sys", "/dev", "/tmp"))
+# A same-path bind anywhere inside these trees overlays image executables, libraries or configuration, or
+# exposes host runtime sockets and devices. Only strict descendants of the scratch trees are carved out.
+IMAGE_PROTECTED_TREES = tuple(Path(path) for path in
+                              ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/usr", "/etc", "/boot",
+                               "/proc", "/sys", "/run", "/dev", "/var"))
+IMAGE_SCRATCH_TREES = (Path("/dev/shm"), Path("/var/tmp"))
 # Bounded engine exceptions: podman-run(1), ENVIRONMENT; names are shown by the official Config.Env example:
 # https://docs.podman.io/en/v4.9.3/markdown/podman-container-inspect.1.html#example
 # https://docs.podman.io/en/latest/markdown/podman-run.1.html#environment
@@ -142,9 +148,11 @@ def _inside_alias(child, parent, child_ids, parent_ids):
         return True
     # An identity match alone would reject everything (all paths share /). Compare the remaining suffixes
     # at each matching ancestor. This also catches bind aliases above missing tails on *both* sides.
+    # A shared lexical ancestor reduces exactly to the _inside() result above, so only distinct paths with one
+    # identity are compared. Skipping them keeps the shared expected-record checks cheap on deep paths.
     for child_parent, child_id in child_ids.items():
         for parent_parent, parent_id in parent_ids.items():
-            if child_id == parent_id:
+            if child_id == parent_id and child_parent != parent_parent:
                 if _inside(child.relative_to(child_parent), parent.relative_to(parent_parent)):
                     return True
     return False
@@ -171,12 +179,28 @@ def _owner_roots(home):
             + [(path, _ancestors(path), False) for path in sorted(secrets)])
 
 
+def _image_tree(path):
+    scratch = any(tree in path.parents for tree in IMAGE_SCRATCH_TREES)
+    return (any(_inside(system, path) for system in IMAGE_SYSTEM_DIRS)
+            or not scratch and any(_inside(path, tree) for tree in IMAGE_PROTECTED_TREES))
+
+
 def _system_mount(path, homes=()):
     require(not str(path).startswith("//"), "mount path has double leading slash: " + str(path))
     require(path != Path("/dev/shm"), "mount conflicts with mandatory scratch tmpfs: " + str(path))
-    require(path != Path("/usr/local") and not any(_inside(system, path) for system in IMAGE_SYSTEM_DIRS)
-            and all(path != home / ".local" for home in homes),
+    require(not _image_tree(path) and all(path != home / ".local" for home in homes),
             "mount replaces image system directory: " + str(path))
+
+
+def _owner_exclusions(path, protected):
+    """Refuse a mount containing an owner home or overlapping a listed secret, including identity aliases."""
+    real = Path(os.path.realpath(path))
+    identities = _ancestors(real)
+    for owner, owner_ids, is_home in protected:
+        unsafe = (_inside_alias(owner, real, owner_ids, identities) if is_home else
+                  _overlap(real, owner, identities, owner_ids))
+        require(not unsafe, "mount overlaps protected home: " + str(path))
+    return real, identities
 
 
 def _private_group(uid, gid):
@@ -299,8 +323,10 @@ def _trusted_source(path, private_groups):
 
 
 def _mount_rows(mounts):
-    """Structural validation only; C4 recomputes mount_plan from config immediately before run."""
+    """Structure plus the shared system and home/secret exclusions. Missing paths stay legal; source trust and
+    ACL checks remain in mount_plan, which C4 recomputes from config immediately before run."""
     require(isinstance(mounts, list), "mounts must be a list")
+    protected = None
     checked = []
     for row in mounts:
         require(isinstance(row, dict) and row.keys() == {"source", "destination", "rw"},
@@ -313,6 +339,19 @@ def _mount_rows(mounts):
                 "mount source contains an unsupported character: " + str(source))
         require(type(row["rw"]) is bool, "mount row rw must be a bool")
         _system_mount(source, (Path.home(),))
+        # mount_plan refuses symlinked sources, but a stored row may name one and the engine binds its target.
+        require(not _image_tree(Path(os.path.realpath(source))),
+                "mount replaces image system directory: " + str(source))
+        try:
+            protected = _owner_roots(Path.home()) if protected is None else protected
+            _owner_exclusions(source, protected)
+        except OSError:
+            # Unreadable metadata (ENOTDIR, ELOOP, EACCES, ENAMETOOLONG) cannot prove the exclusions. Refuse as
+            # a row error so verify names "mounts" on engine-supplied rows instead of raising.
+            raise ValueError("mount overlaps protected home: " + str(source)) from None
+        # The early check knows only HOME; repeat it with mount_plan's resolved homes so the password-database
+        # home's .local refuses here too when HOME differs from it.
+        _system_mount(source, [Path.home()] + [owner for owner, _, is_home in protected if is_home])
         checked.append({"source": str(source), "destination": str(destination), "rw": row["rw"]})
     require(len({row["destination"] for row in checked}) == len(checked), "duplicate mount destination")
     return sorted(checked, key=lambda row: row["source"])
@@ -340,12 +379,7 @@ def mount_plan(*, run, project, source, python_prefix, live_checkouts=(), home):
         # --mount uses comma-separated fields; these characters would change its meaning or make bad argv.
         require(not any(char in str(path) for char in (",", ":", "\n", "\r")),
                 "mount source contains an unsupported character: " + str(path))
-        path = Path(os.path.realpath(path))
-        identities = _ancestors(path)
-        for owner, owner_ids, is_home in protected:
-            unsafe = (_inside_alias(owner, path, owner_ids, identities) if is_home else
-                      _overlap(path, owner, identities, owner_ids))
-            require(not unsafe, "mount overlaps protected home: " + str(path))
+        path, identities = _owner_exclusions(Path(os.path.realpath(path)), protected)
         _trusted_source(path, private_groups)
         checked.append((path, rw, identities))
     for index, (path, rw, identities) in enumerate(checked):
@@ -1054,10 +1088,11 @@ def verify(inspect_json, expected):
         mismatches.append("user")
     if host.get("Privileged") is not False:
         mismatches.append("privileged")
-    if host.get("CapAdd") not in (None, []):
+    # A deleted key is no observation; only a present null or [] witnesses that nothing was added.
+    if "CapAdd" not in host or host["CapAdd"] not in (None, []):
         mismatches.append("cap_add")
     mismatches.extend(_namespace_witnesses(host, expected, requested_bad))
-    if host.get("Devices") not in (None, []):
+    if "Devices" not in host or host["Devices"] not in (None, []):
         mismatches.append("devices")
     security_ok = ("security_opt" not in requested_bad if podman else
                    host.get("SecurityOpt") == ["systempaths=unconfined"])

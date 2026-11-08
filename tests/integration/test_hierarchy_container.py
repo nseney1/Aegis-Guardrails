@@ -2496,7 +2496,7 @@ def test_other_requests_cannot_supply_missing_actual_facts(adapter, layout, surf
 
 def model_system_mount_metadata(monkeypatch):
     # Model only OS metadata for these system paths. Never create/write them or inspect owner homes.
-    paths = {"/", "//", "/dev", "/dev/shm", "/usr", "//usr"}
+    paths = {"/", "//", "/dev", "/dev/shm", "/usr", "//usr", "/opt", "/var", "/var/tmp"}
     original_lstat, original_xattr = os.lstat, os.getxattr
 
     def lstat(path, *args, **kwargs):
@@ -2602,3 +2602,302 @@ def test_bind_policy_builders_keep_ordinary_descendants(adapter, layout, engine,
     expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
     assert "type=bind,src=" + path + ",dst=" + path in argv
     assert adapter.verify(inspect_for(expected), expected) == []
+
+
+# Same-path binds inside these trees would replace pinned image userland or expose host runtime/devices.
+IMAGE_USERLAND_PATHS = ["/usr/bin", "/usr/local/bin", "/usr/lib", "/etc/aegis", "/var/lib/aegis", "/run/user/1000",
+                        "/bin/aegis", "/lib64/aegis", "/dev/aegis", "/var/tmp"]
+
+
+@pytest.mark.parametrize("surface", ["library", "cli"])
+@pytest.mark.parametrize("field", ["project", "python_prefix", "live_checkouts"])
+@pytest.mark.parametrize("path", IMAGE_USERLAND_PATHS)
+def test_image_userland_descendant_planner_refuses(adapter, layout, surface, field, path):
+    message = "mount replaces image system directory: " + path
+    value = [path] if field == "live_checkouts" else path
+    if surface == "library":
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            mounts(adapter, layout, **{field: value})
+        return
+    config = {**config_for(layout), field: value}
+    for command in (["plan"], ["verify", "--inspect", str(layout.run.parent / "not-read-inspect.json")]):
+        result = cli(layout, config, *command)
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert json.loads(result.stdout) == {"error": message}
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("path", IMAGE_USERLAND_PATHS)
+def test_image_userland_descendant_builders_refuse(adapter, layout, builder, engine, rw, path):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+        getattr(adapter, builder)(isolation, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": rw}], **kwargs)
+
+
+@pytest.mark.parametrize("path", IMAGE_USERLAND_PATHS)
+def test_image_userland_expected_record_and_matching_actual_refuse(adapter, layout, path):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("surface", ["library", "cli"])
+@pytest.mark.parametrize("path", ["/opt/aegis-project", "/var/tmp/aegis-project", "/dev/shm/aegis-project"])
+def test_image_userland_planner_keeps_carve_outs(adapter, layout, monkeypatch, surface, path):
+    bootstrap = model_system_mount_metadata(monkeypatch)
+    if surface == "library":
+        plan = mounts(adapter, layout, project=path)
+    else:
+        result = cli(layout, {**config_for(layout), "project": path}, "plan", bootstrap=bootstrap)
+        assert result.returncode == 0, result.stdout
+        plan = json.loads(result.stdout)["mounts"]
+    assert {"source": path, "destination": path, "rw": True} in plan
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("path", ["/opt/aegis-project", "/var/tmp/aegis-project", "/dev/shm/aegis-project",
+                                  "/srv/aegis-project"])
+def test_image_userland_builders_keep_carve_outs(adapter, layout, engine, path):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = [{"source": path, "destination": path, "rw": True}] + mounts(adapter, layout)
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    assert "type=bind,src=" + path + ",dst=" + path in argv
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+def owner_secret_case(layout, case):
+    if case == "alias":
+        alias = layout.run.parent / "codex-alias"
+        alias.symlink_to(layout.home / ".codex", target_is_directory=True)
+        return alias
+    return {"home-secret": layout.home / ".codex", "passwd-secret": layout.passwd_home / ".codex",
+            "missing-tail": layout.home / ".codex" / "sessions", "file-secret": layout.passwd_home / ".netrc",
+            "home": layout.home, "contains-home": layout.home.parent}[case]
+
+
+OWNER_SECRET_CASES = ["home-secret", "passwd-secret", "missing-tail", "file-secret", "alias", "home", "contains-home"]
+
+
+@pytest.mark.parametrize("case", OWNER_SECRET_CASES)
+def test_expected_record_cannot_authorize_owner_secret(adapter, layout, case):
+    path = str(owner_secret_case(layout, case))
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("case", OWNER_SECRET_CASES)
+def test_builders_refuse_owner_homes_and_secrets(adapter, layout, builder, rw, case):
+    path = str(owner_secret_case(layout, case))
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^mount overlaps protected home: " + re.escape(path) + "$"):
+        getattr(adapter, builder)(ISOLATION, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": rw}], **kwargs)
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_builders_refuse_every_owner_home_local(adapter, layout, builder, owner):
+    # HOME and the password-database home differ in this layout; planning refuses both .local folders.
+    path = str(getattr(layout, owner) / ".local")
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^mount replaces image system directory: " + re.escape(path) + "$"):
+        getattr(adapter, builder)(ISOLATION, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_expected_record_cannot_bind_owner_home_local(adapter, layout, owner):
+    path = str(getattr(layout, owner) / ".local")
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_cli_verify_refuses_owner_secret_mount(layout, owner):
+    path = getattr(layout, owner) / ".codex"
+    result = cli(layout, {**config_for(layout), "project": str(path)}, "verify",
+                 "--inspect", str(layout.run.parent / "not-read-inspect.json"))
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"error": "mount overlaps protected home: " + str(path)}
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+def test_expected_record_keeps_missing_non_secret_home_path(adapter, layout, monkeypatch, owner):
+    path = str(getattr(layout, owner) / "Documents" / "missing-project")
+
+    def no_enumeration(*args, **kwargs):
+        raise AssertionError("expected-record validation must not enumerate directories")
+
+    monkeypatch.setattr(os, "scandir", no_enumeration)
+    monkeypatch.setattr(os, "listdir", no_enumeration)
+    rows = [{"source": path, "destination": path, "rw": True}] + mounts(adapter, layout)
+    assert "type=bind,src=" + path + ",dst=" + path in adapter.create_argv(ISOLATION, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+    assert not Path(path).exists()
+
+
+def test_cli_verify_keeps_non_secret_home_project(adapter, layout):
+    project = layout.home / "Documents" / "project"
+    project.mkdir(parents=True)
+    config = {**config_for(layout), "project": str(project)}
+    plan = json.loads(cli(layout, config, "plan").stdout)
+    assert {"source": str(project), "destination": str(project), "rw": True} in plan["mounts"]
+    path = layout.run.parent / "home-project-inspect.json"
+    path.write_text(json.dumps(inspect_for(expected_for(adapter, plan["isolation"], run=config["run"],
+                                                       mounts=plan["mounts"]))), encoding="utf-8")
+    result = cli(layout, config, "verify", "--inspect", str(path))
+    assert result.returncode == 0 and json.loads(result.stdout) == {"mismatches": []}, result.stdout
+
+
+def mount_alias(layout, target, child=""):
+    # Dangling targets are deliberate: the engine binds whatever the link names when it resolves the source.
+    alias = layout.run.parent / "alias"
+    alias.symlink_to(layout.project if target == "project" else target, target_is_directory=True)
+    return str(alias / child) if child else str(alias)
+
+
+PROTECTED_ALIASES = [("/usr/bin", ""), ("/usr/local/bin", ""), ("/usr", "bin"), ("/run/user/1000", ""),
+                     ("/dev", ""), ("/var/lib", ""), ("/tmp", ""), ("/", "")]
+
+
+@pytest.mark.parametrize("target,child", PROTECTED_ALIASES)
+def test_alias_into_protected_tree_expected_record_refuses(adapter, layout, target, child):
+    path = mount_alias(layout, target, child)
+    symlink = "mount source contains a symlink: " + str(layout.run.parent / "alias")
+    with pytest.raises(ValueError, match="^" + re.escape(symlink) + "$"):
+        mounts(adapter, layout, project=path)
+    result = cli(layout, {**config_for(layout), "project": path}, "plan")
+    assert result.returncode == 2 and json.loads(result.stdout) == {"error": symlink}, result.stdout
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("target,child", PROTECTED_ALIASES)
+def test_alias_into_protected_tree_builders_refuse(adapter, layout, builder, engine, target, child):
+    path = mount_alias(layout, target, child)
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+        getattr(adapter, builder)(isolation, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+
+
+@pytest.mark.parametrize("target", ["project", "/var/tmp/aegis-project", "/dev/shm/aegis-project"])
+def test_alias_outside_protected_trees_keeps_builders(adapter, layout, target):
+    path = mount_alias(layout, target)
+    rows = [{"source": path, "destination": path, "rw": True}] + mounts(adapter, layout)
+    assert "type=bind,src=" + path + ",dst=" + path in adapter.create_argv(ISOLATION, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+def unreadable_mount(layout, case):
+    # Real ENOTDIR, ENAMETOOLONG and ELOOP metadata; none of these is a missing path that may stay legal.
+    if case == "file":
+        return str(layout.run.parent / ".keep" / "child")
+    if case == "long":
+        return str(layout.run.parent / ("L" * 300))
+    loop = layout.run.parent / "loop"
+    loop.symlink_to(loop)
+    return str(loop / "child")
+
+
+UNREADABLE_MOUNTS = ["file", "long", "loop"]
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("case", UNREADABLE_MOUNTS)
+def test_recorded_unreadable_mount_is_named_mismatch(adapter, layout, surface, case):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    path = unreadable_mount(layout, case)
+    add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (path, path)])
+    assert_request_witness(adapter, layout, expected, value, surface, ["mounts"])
+
+
+@pytest.mark.parametrize("case", UNREADABLE_MOUNTS)
+def test_expected_record_unreadable_mount_is_named_mismatch(adapter, layout, case):
+    path = unreadable_mount(layout, case)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected["mounts"][0].update(source=path, destination=path)
+    value[0]["Mounts"][0].update(Source=path, Destination=path)
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+@pytest.mark.parametrize("case", UNREADABLE_MOUNTS)
+def test_builders_refuse_unreadable_mount(adapter, layout, builder, case):
+    path = unreadable_mount(layout, case)
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + path) + "$"):
+        getattr(adapter, builder)(ISOLATION, run=layout.run,
+                                  mounts=[{"source": path, "destination": path, "rw": False}], **kwargs)
+
+
+def test_unreadable_owner_identity_fails_closed(adapter, layout, monkeypatch):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    denied, original_stat = str(layout.home / ".codex"), os.stat
+
+    def stat_(path, *args, **kwargs):
+        # Model EACCES at the OS boundary; a root CI runner could otherwise read a chmod-000 folder.
+        if os.fspath(path) == denied:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), denied)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_)
+    assert adapter.verify(value, expected) == ["mounts"]
+    first = expected["mounts"][0]["source"]
+    for builder, kwargs in (("create_argv", {}), ("expected_plan", {"image_inspect": image_info(IMAGE)})):
+        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + first) + "$"):
+            getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=expected["mounts"], **kwargs)
+    # The planner keeps reporting the OS error: unreadable identities are never treated as absent there.
+    with pytest.raises(PermissionError):
+        mounts(adapter, layout)
+
+
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+@pytest.mark.parametrize("field,label", [("CapAdd", "cap_add"), ("Devices", "devices")])
+@pytest.mark.parametrize("change", ["missing", "null", "empty"])
+def test_confinement_witness_must_be_present(adapter, layout, surface, field, label, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    if change == "missing":
+        del host[field]
+    else:
+        host[field] = None if change == "null" else []
+    assert_request_witness(adapter, layout, expected, value, surface, [label] if change == "missing" else [])
+
+
+@pytest.mark.parametrize("field,label", [("CapAdd", "cap_add"), ("Devices", "devices")])
+def test_docker_confinement_witness_must_be_present(adapter, layout, field, label):
+    isolation = {**ISOLATION, "engine": "docker", "allow_unqualified": True}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"][field] = None
+    assert adapter.verify(value, expected) == []
+    del value[0]["HostConfig"][field]
+    assert adapter.verify(value, expected) == [label]
