@@ -2,7 +2,7 @@ name: Validate
 
 on:
   push:
-    branches: [main, develop, 'release/**']
+    branches: [main, develop, 'release/**', 'feature/manager-workspace-prototype']
   pull_request:
     branches: [main, develop, 'release/**']
   workflow_call:
