@@ -36,6 +36,7 @@ def layout(tmp_path, monkeypatch):
 
     host_getpwuid = pwd.getpwuid
     previous_umask = os.umask(0o077)
+    (tmp_path / ".keep").write_text("Retain C1 desktop-pytest evidence.\n", encoding="utf-8")
     # The managed sandbox maps / to nobody and exposes group-writable workspace parents. Model trusted
     # outer ancestors at the OS boundary; permissions of paths within tmp_path remain real and testable.
     outer = {str(path) for path in tmp_path.parents}
@@ -143,6 +144,16 @@ def test_host_cli(layout, raw):
     proc = cli(layout, config, "plan")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
+
+
+@pytest.mark.parametrize("raw", [None, False, [], "container", 1])
+def test_cli_present_isolation_is_not_absence(layout, raw):
+    absent = cli(layout, {}, "plan")
+    assert absent.returncode == 0
+    assert json.loads(absent.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
+    present = cli(layout, {"schema": "aegis.team-run/v2", "isolation": raw}, "plan")
+    assert present.returncode == 2
+    assert json.loads(present.stdout) == {"error": "isolation must be a JSON object"}
 
 
 INVALID = [
@@ -511,7 +522,10 @@ def inspect_for(expected, env=None):
                    "PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
     environment.update(env or {})
     env_argv = [word for key, value in sorted(environment.items()) for word in ("--env", key + "=" + value)]
-    return [{"Config": {"Labels": {"aegis.team.run": expected["run"]}, "User": expected["user"],
+    # Observed Podman plain name; Docker's single slash is modelled from Moby v27.5.1 daemon/names.go.
+    name = "aegis-team-" + hashlib.sha256(expected["run"].encode()).hexdigest()[:12]
+    value = [{"Name": name if podman else "/" + name,
+             "Config": {"Labels": {"aegis.team.run": expected["run"]}, "User": expected["user"],
                         "Image": expected["image"], "Env": [key + "=" + value for key, value in sorted(environment.items())],
                         "CreateCommand": ["podman", "run", "--security-opt=unmask=/proc/*", "--env-host=false",
                                           "--http-proxy=false", "--read-only-tmpfs=false", *env_argv, expected["image"]]},
@@ -527,6 +541,9 @@ def inspect_for(expected, env=None):
                             "NanoCpus": 1000000000, "Memory": 1073741824, "PidsLimit": 64,
                             "Tmpfs": {"/tmp": "rw,nosuid,nodev,rprivate,tmpcopyup",
                                       "/dev/shm": "rw,nosuid,nodev,rprivate,tmpcopyup"}}}]
+    if not podman:
+        del value[0]["Config"]["CreateCommand"]  # Not part of Moby's inspect schema.
+    return value
 
 
 @pytest.mark.parametrize("field", [None, "label", "image", "mounts", "read_only", "user"])
@@ -1520,6 +1537,257 @@ def verify_surface(adapter, layout, expected, value, surface):
     answer = json.loads(result.stdout)
     assert set(answer) == {"mismatches"}, answer
     return answer["mismatches"]
+
+
+@pytest.mark.parametrize("flag,label,admitted", [("--userns", "userns_mode", "keep-id"),
+                                               ("--pid", "pid_mode", "private"),
+                                               ("--ipc", "ipc_mode", "private"),
+                                               ("--network", "network_mode", "bridge")])
+@pytest.mark.parametrize("arity", ["equals", "separate"])
+@pytest.mark.parametrize("change", ["absent", "agree", "contradict", "bad-then-good", "good-then-bad"])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+def test_recorded_namespace_witnesses_conjoin(adapter, layout, flag, label, admitted, arity, change, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    requests = {"absent": [], "agree": [admitted], "contradict": ["host"],
+                "bad-then-good": ["host", admitted], "good-then-bad": [admitted, "host"]}[change]
+    argv = value[0]["Config"]["CreateCommand"]
+    words = [word for request in requests for word in (
+        [flag + "=" + request] if arity == "equals" else [flag, request])]
+    argv[-1:-1] = words
+    assert verify_surface(adapter, layout, expected, value, surface) == (
+        [] if change in ("absent", "agree") else [label])
+
+
+@pytest.mark.parametrize("change", ["missing", "null", "false", "list", "string", "integer"])
+@pytest.mark.parametrize("surface", ["constructor", "cli"])
+def test_image_config_requires_known_object(adapter, layout, monkeypatch, change, surface):
+    info = image_info()
+    if change == "missing":
+        del info[0]["Config"]
+    else:
+        info[0]["Config"] = {"null": None, "false": False, "list": [], "string": "", "integer": 0}[change]
+    if surface == "constructor":
+        with pytest.raises(ValueError, match="^image inspect has invalid Config$"):
+            expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+    else:
+        image_path = layout.run.parent / "unknown-image-config.json"
+        image_path.write_text(json.dumps(info), encoding="utf-8")
+        monkeypatch.setenv("AEGIS_FAKE_ENGINE_IMAGE", str(image_path))
+        expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+        path = layout.run.parent / "inspect.json"
+        path.write_text(json.dumps(inspect_for(expected)), encoding="utf-8")
+        p = cli(layout, config_for(layout), "verify", "--inspect", str(path))
+        assert p.returncode == 2
+        assert json.loads(p.stdout) == {"error": "image inspect has invalid Config"}
+
+
+@pytest.mark.parametrize("config", [{}, {"Env": None}, {"Env": []}])
+def test_known_empty_image_env_remains_valid(adapter, layout, config):
+    info = image_info()
+    info[0]["Config"] = config
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+    assert expected["image_info"]["env_fingerprints"] == {}
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("bad", [None, False, [], {"TERM": None}, {"TERM": "not-a-fingerprint"}, {"BAD-NAME": "a" * 64}])
+def test_expected_fingerprint_unknown_is_not_empty(adapter, layout, bad):
+    info = image_info()
+    info[0]["Config"] = {"Env": []}
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout), image_inspect=info)
+    value = inspect_for(expected)
+    expected["image_info"]["env_fingerprints"] = bad
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("destination", ["/tmp", "/dev/shm"])
+@pytest.mark.parametrize("mode", ["ro", "rw,suid", "rw,dev", "ro,suid,dev", None, False, [], ["rw"],
+                                  "rw,nosuid,nodev,ro", "rw,nosuid,nodev,suid", "rw,nosuid,nodev,dev",
+                                  "rw,nosuid,nodev,exec,noexec"])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+def test_tmpfs_mode_cannot_waive_other_witnesses(adapter, layout, destination, mode, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": destination,
+                               "RW": True, "Mode": mode})
+    assert verify_surface(adapter, layout, expected, value, surface) == ["mounts"]
+
+
+@pytest.mark.parametrize("mode", ["", "rw", "rw,nosuid,nodev", "rw,nosuid,nodev,exec", "rw,nosuid,nodev,noexec"])
+def test_tmpfs_partial_mode_does_not_require_noexec(adapter, layout, mode):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True, "Mode": mode})
+    assert adapter.verify(value, expected) == []
+
+
+@pytest.mark.parametrize("mode", ["", "rw", "rw,nosuid,nodev"])
+def test_tmpfs_mode_only_full_safe_witness_can_supply_safety(adapter, layout, mode):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    del value[0]["HostConfig"]["Tmpfs"]["/dev/shm"]
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "shm", "Destination": "/dev/shm", "RW": True, "Mode": mode})
+    assert adapter.verify(value, expected) == ([] if mode == "rw,nosuid,nodev" else ["mounts"])
+
+
+@pytest.mark.parametrize("mode,other", [("exec", "noexec"), ("noexec", "exec")])
+def test_tmpfs_explicit_optional_flags_cannot_contradict(adapter, layout, mode, other):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["Tmpfs"]["/tmp"] += "," + other
+    value[0]["Mounts"].append({"Type": "tmpfs", "Source": "tmpfs", "Destination": "/tmp", "RW": True,
+                               "Mode": "rw,nosuid,nodev," + mode})
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("change", ["same", "slash", "double-slash", "wrong", "null", "false", "list", "missing"])
+@pytest.mark.parametrize("surface", ["pure", "fake-cli"])
+def test_name_witness_is_derived_from_run(adapter, layout, engine, change, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    name = adapter.container_name(layout.run)
+    if change == "missing":
+        del value[0]["Name"]
+    else:
+        value[0]["Name"] = {"same": name, "slash": "/" + name, "double-slash": "//" + name,
+                             "wrong": "unrelated", "null": None, "false": False, "list": [name]}[change]
+    valid = change == "same" or (engine == "docker" and change == "slash")
+    assert verify_surface(adapter, layout, expected, value, surface) == ([] if valid else ["name"])
+
+
+@pytest.mark.parametrize("change", ["absent", "agree", "contradict", "bad-then-good", "good-then-bad"])
+def test_recorded_name_cannot_waive_derived_name(adapter, layout, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    name = adapter.container_name(layout.run)
+    names = {"absent": [], "agree": [name], "contradict": ["unrelated"],
+             "bad-then-good": ["unrelated", name], "good-then-bad": [name, "unrelated"]}[change]
+    value[0]["Config"]["CreateCommand"][-1:-1] = [word for item in names for word in ("--name", item)]
+    assert adapter.verify(value, expected) == ([] if change in ("absent", "agree") else ["name"])
+
+
+@pytest.mark.parametrize("field,bad,actual", [
+    ("memory", 0, 0), ("memory", -1, -1), ("memory", True, 1), ("memory", 1024.0, 1024),
+    ("memory", "1024", 1024), ("memory", None, 0), ("memory", [], 0), ("memory", 1, 1), ("memory", 1025, 1025),
+    ("pids", -1, -1), ("pids", 0, 0), ("pids", 63, 63), ("pids", True, 1), ("pids", 64.0, 64),
+    ("pids", "64", 64), ("pids", None, 0), ("pids", [], 0),
+    ("cpus", True, 1000000000), ("cpus", False, 0), ("cpus", 0, 0), ("cpus", 0.001, 1000000),
+    ("cpus", float("nan"), 1000000000), ("cpus", float("inf"), 1000000000), ("cpus", "1", 1000000000),
+    ("cpus", None, 1000000000), ("cpus", [], 1000000000),
+])
+def test_expected_resource_domains_precede_equality(adapter, layout, field, bad, actual):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected[field] = bad
+    value[0]["HostConfig"][{"memory": "Memory", "pids": "PidsLimit", "cpus": "NanoCpus"}[field]] = actual
+    assert adapter.verify(value, expected) == [field]
+
+
+def test_matching_unlimited_expected_limits_never_authorize(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected.update(memory=0, pids=-1)
+    value[0]["HostConfig"].update(Memory=0, PidsLimit=-1)
+    assert adapter.verify(value, expected) == ["memory", "pids"]
+
+
+@pytest.mark.parametrize("field,labels", [
+    ("run", ["label", "name", "environment"]), ("engine", ["engine"]), ("image", ["image"]),
+    ("user", ["user", "userns_mode"]), ("read_only", ["read_only"]), ("mounts", ["mounts"]),
+    ("cpus", ["cpus"]), ("memory", ["memory"]), ("pids", ["pids"]),
+    ("image_info", ["image", "environment"]), ("environment", ["environment"]),
+])
+def test_expected_record_requires_every_field(adapter, layout, field, labels):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    del expected[field]
+    assert adapter.verify(value, expected) == labels
+
+
+@pytest.mark.parametrize("field,bad,labels", [
+    ("read_only", False, ["read_only"]), ("read_only", 1, ["read_only"]),
+    ("read_only", None, ["read_only"]), ("mounts", None, ["mounts"]), ("mounts", {}, ["mounts"]),
+    ("engine", None, ["engine"]), ("engine", False, ["engine"]), ("engine", "unknown", ["engine"]),
+    ("run", False, ["label", "name", "environment"]), ("run", "relative", ["label", "name", "environment"]),
+    ("run", "/bad-\ud800", ["label", "name", "environment"]),
+    ("image", None, ["image"]), ("image", False, ["image"]),
+    ("image_info", None, ["image", "environment"]), ("image_info", False, ["image", "environment"]),
+    ("image_info", [], ["image", "environment"]), ("environment", None, ["environment"]),
+    ("environment", [], ["environment"]),
+])
+def test_expected_record_wrong_types_never_become_absence(adapter, layout, field, bad, labels):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    expected[field] = bad
+    assert adapter.verify(value, expected) == labels
+
+
+@pytest.mark.parametrize("change", ["null", "false", "list", "unknown-field"])
+def test_expected_record_root_is_explicit(adapter, layout, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    if change == "unknown-field":
+        expected["unreviewed"] = True
+    else:
+        expected = {"null": None, "false": False, "list": []}[change]
+    assert adapter.verify(value, expected) == ["expected"]
+
+
+@pytest.mark.parametrize("field", ["id", "digest", "repo_digests", "env_fingerprints"])
+@pytest.mark.parametrize("change", ["missing", "null", "false", "wrong-type"])
+def test_expected_image_record_witnesses_are_typed(adapter, layout, field, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    info = expected["image_info"]
+    if change == "missing":
+        del info[field]
+    else:
+        info[field] = {"null": None, "false": False,
+                       "wrong-type": {} if field == "repo_digests" else []}[change]
+    # An explicit absent platform Digest is supported when the RepoDigest still ties the image to the pin.
+    labels = [] if field == "digest" and change == "null" else [
+        "environment" if field == "env_fingerprints" else "image"]
+    assert adapter.verify(value, expected) == labels
+
+
+@pytest.mark.parametrize("change", ["unknown-key", "unassociated-pin", "non-digest-repo"])
+def test_expected_image_association_is_an_explicit_contract(adapter, layout, change):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    if change == "unknown-key":
+        expected["image_info"]["unreviewed"] = True
+    elif change == "unassociated-pin":
+        expected["image"] = "localhost/other@sha256:" + "f" * 64
+    else:
+        expected["image_info"]["repo_digests"] = [False]
+    assert adapter.verify(value, expected) == ["image"]
+
+
+def test_expected_mount_access_is_boolean_before_equality(adapter, layout):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    next(row for row in expected["mounts"] if row["rw"])["rw"] = 1
+    assert adapter.verify(value, expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("cpus,memory,pids,nano", [(0.01, "1k", 64, 10000000),
+                                                 (0.29, "128m", 4096, 290000000),
+                                                 (1, "16g", 64000, 1000000000)])
+def test_expected_contract_preserves_valid_resource_boundaries(adapter, layout, engine, cpus, memory, pids, nano):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker",
+                 "cpus": cpus, "memory": memory, "pids": pids}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    host = value[0]["HostConfig"]
+    host.update(Memory=expected["memory"], PidsLimit=pids, NanoCpus=nano)
+    if engine == "podman":
+        quota = int(float(cpus) * 100000)  # Observed Podman conversion, not a native high-ID/resource probe.
+        host.update(CpuPeriod=100000, CpuQuota=quota, NanoCpus=quota * 10000)
+    assert adapter.verify(value, expected) == []
 
 
 @pytest.mark.parametrize("surface", ["pure", "fake-cli"])

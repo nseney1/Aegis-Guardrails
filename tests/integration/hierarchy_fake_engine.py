@@ -299,7 +299,9 @@ def run_container(argv, state, path, engine):
     else:
         host["NanoCpus"] = int(Fraction(one(parsed, "--cpus")) * 1000000000)
         host["SecurityOpt"] = parsed.get("--security-opt", [])
-    container = {"Id": identity, "Name": name, "Image": info["Id"], "Config": config, "HostConfig": host,
+    # Model Moby v27.5.1 reserveName's leading slash; Podman's observed name has no slash.
+    container = {"Id": identity, "Name": name if engine == "podman" else "/" + name,
+                 "Image": info["Id"], "Config": config, "HostConfig": host,
                  "Mounts": mounts, "State": {"Running": True}, "Command": tail[1:]}
     if engine == "podman":
         container["ImageDigest"] = info["Digest"]

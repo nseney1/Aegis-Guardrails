@@ -94,7 +94,9 @@ An unknown CPU count refuses. `memory` is a positive
 integer followed by lowercase `k`, `m` or `g`; zero is refused because it would disable the cap. `pids` is an
 integer at least 64. Boolean numbers, unknown isolation fields and missing container fields refuse. Optional
 `allow_unqualified` defaults to false and must be a boolean. Host mode is an absent isolation object or exactly
-`{"mode":"host"}`. The standalone CLI refuses isolation on a v1 config.
+`{"mode":"host"}`. A present `isolation` key with null or any non-object value refuses; it never selects
+legacy host mode. The library's `read_isolation(None, ...)` retains its absent-input API meaning. The standalone
+CLI refuses isolation on a v1 config.
 
 ```sh
 python3 tools/hierarchy_container.py plan --config /absolute/path/team-run.json
@@ -176,9 +178,32 @@ inspected association. A matching digest never waives a contradictory config has
 Docker's absent Digest is allowed only with the pinned RepoDigest/config-ID association. The call also provides
 fingerprints of the pinned image's environment values.
 
-Verification compares the label, image identity, exact bind set (source/destination/access), read-only root,
+Before comparing container fields, `expected_plan` and `verify` apply one contract to the existing comparison
+record. Unknown expected fields refuse; missing or malformed values never become empty/absent witnesses.
+This is structural validation of supplied evidence, not authentication against a hostile owner or root.
+
+| Expected input | Required domain and absence rule | Mismatch label |
+| --- | --- | --- |
+| Record and engine | Object with only the existing fields; engine is `podman` or `docker` | `expected`, `engine` |
+| Run and name | Absolute run with a representable derived `container_name(run)` | `label`, `name`, `environment` |
+| Image association | Required config ID, digest-or-explicit-null, repository digest list and fingerprint map; pin belongs to the inspected association | `image`, `environment` |
+| Image Config | Raw image response requires an object; missing/null/empty-list Env are supported empty representations, other malformed Env refuses | CLI refusal |
+| Environment | Typed name-to-SHA256 maps; create defaults, fixed homes and the allowlist remain mandatory; pinned defaults may be known-empty | `environment` |
+| Mount rows | Exact existing row keys, absolute same paths and literal boolean access; existing character/system-directory/duplicate rules apply | `mounts` |
+| Root and user | Literal read-only true; both numeric IDs in the existing Linux bounds | `read_only`, `user`, `userns_mode` |
+| Limits | Existing finite CPU range; positive integer memory bytes representable by `k`/`m`/`g`; integer PID limit at least 64; booleans refuse | `cpus`, `memory`, `pids` |
+
+Known bad fields retain their individual labels. A matching invalid actual value, such as memory 0 or PID
+limit -1, cannot authorize unlimited resources. `image_info.digest=null` is a supported absent platform digest
+only with the pinned RepoDigest association; a missing key or empty string is different and refuses.
+
+Verification compares the derived name, label, image identity, exact bind set (source/destination/access), read-only root,
 numeric user, environment values, CPU/memory/PID limits, Privileged=false, empty CapAdd/Devices, private PID/IPC,
 keep-id mappings for Podman (the default userns record for Docker), and forced bridge networking.
+The observed Name must equal `container_name(run)`. Podman's captured name is plain. The modelled Docker
+branch allows one leading slash, following [Moby v27.5.1 reserveName](https://github.com/moby/moby/blob/v27.5.1/daemon/names.go),
+which prefixes names with `/`; additional slashes refuse. Every supplied Podman recorded `--name` must agree too.
+The label cannot waive a contradictory name, and neither field authenticates ownership against a hostile owner.
 Podman 4.9.3 reports `UsernsMode="private"` for keep-id, including the `real-podman-fix7-native` capture.
 Verification requires exactly that string **and** valid keep-id mappings. Missing, malformed, host, shared or
 unknown modes refuse; `keep-id` is a create request, not an admitted inspect alias. Docker's empty default
@@ -190,6 +215,12 @@ included ID must be in `0..4294967294`; Linux deliberately leaves `4294967295` u
 ([user_namespaces(7)](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)). Missing, malformed,
 zero-sized, reserved-ID, overflowing, root-wide or conflicting mappings refuse. No extra exec or engine call
 is needed for this proof.
+
+Every supplied Podman recorded namespace request must also agree with the plan: `--userns=keep-id`,
+`--pid=private`, `--ipc=private`, `--network=bridge`. Both existing parser forms (`--flag=value` and
+`--flag value`) are checked, including contradictory duplicates. Valid actual mappings/private/bridge fields
+cannot waive a recorded host/shared request. These optional recorded requests add no effective proof when
+absent; actual namespace witnesses and the existing mandatory recorded security/false flags still apply.
 
 Both numeric UID/GID arguments must be in `0..4294967294` before either engine's create argv or expected plan
 can be returned. Types, booleans and negatives retain `user must be a numeric uid:gid`; reserved/larger IDs
@@ -209,7 +240,7 @@ supported. Podman uses `quota=int(float(cpus)*100000)` and derives NanoCpus from
 `cpus=0.29` yields `CpuQuota=28999`, `CpuPeriod=100000`, `NanoCpus=289990000`. Either representation suffices;
 when both are present they must agree. `Mounts`, `HostConfig.Tmpfs` and `HostConfig.Binds` are normalized together.
 Captured Podman bind options include `rprivate,rbind`, and tmpfs options include `rprivate,tmpcopyup`.
-For binds, supplied `Mode` strings and Podman `Options` lists must be well typed. Any explicit `ro`/`rw` flag
+For binds and tmpfs, supplied `Mode` strings and Podman `Options` lists must be well typed. Any explicit `ro`/`rw` flag
 must agree with `RW`, the planned access and `HostConfig.Binds`. Conflicting or duplicate access flags refuse.
 Omitted fields, empty Mode and Options containing only `rbind` assert no additional access mode; they do not
 turn a read-only bind into a writable one. Serialized Binds without access flags retain their engine rw default.
@@ -217,7 +248,11 @@ Identical cross-references
 agree; conflicting declarations, duplicates within a representation or extra mounts refuse. Only the declared
 rw binds and the explicitly declared `/tmp` and `/dev/shm` tmpfs may be reported writable. Both scratch mounts
 must be present and writable with `nosuid,nodev` option evidence; supplied option declarations must agree and
-must not include `suid`, `dev`, `ro` or contradictory `exec,noexec`. Automatic mounts absent from inspect are not
+must not include `suid`, `dev`, `ro` or contradictory `exec,noexec`. A partial or empty tmpfs Mode supplies no
+positive safety proof; only a complete
+`rw,nosuid,nodev` Mode, Options list or HostConfig.Tmpfs declaration does. Every supplied witness is checked,
+including contradictions across representations. There is no mandatory `noexec` policy: either `exec` or
+`noexec` alone is admitted, while explicitly requesting both refuses. Automatic mounts absent from inspect are not
 attested by this comparison. The old capture with read-only shm therefore differs from the revised plan.
 Additional read-only binds also refuse. Unknown engine metadata is ignored; malformed required fields produce mismatches. A matching
 result is `{"mismatches":[]}`. Mismatches name the affected field, such as `image`, `mounts`, `environment`,

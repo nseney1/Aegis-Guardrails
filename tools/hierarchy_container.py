@@ -47,6 +47,15 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 NETWORK_MODE = "bridge"
 # user_namespaces(7): (uid_t)-1 is deliberately unmapped. Endpoints below are exclusive.
 LINUX_ID_LIMIT = 4294967295
+EXPECTED_FIELDS = frozenset(("run", "engine", "image", "user", "read_only", "mounts", "cpus", "memory", "pids",
+                             "image_info", "environment"))
+IMAGE_INFO_FIELDS = frozenset(("id", "digest", "repo_digests", "env_fingerprints"))
+EXPECTED_ERROR_ORDER = ("expected", "engine", "label", "name", "image", "mounts", "read_only", "user",
+                        "userns_mode", "cpus", "memory", "pids", "environment")
+NAMESPACE_REQUESTS = (("--pid", "PidMode", "pid_mode", "private"),
+                      ("--ipc", "IpcMode", "ipc_mode", "private"),
+                      ("--userns", "UsernsMode", "userns_mode", "keep-id"),
+                      ("--network", "NetworkMode", "network_mode", NETWORK_MODE))
 
 
 def _image(image):
@@ -60,6 +69,24 @@ def _absolute(value, label):
     from hierarchy_team import absolute
 
     return absolute(os.fspath(value) if isinstance(value, os.PathLike) else value, label)
+
+
+def _cpus_limit(cpus):
+    available = os.cpu_count()
+    require(type(cpus) in (int, float) and available is not None and 0.01 <= cpus <= available
+            and math.isfinite(cpus), "isolation.cpus must be >= 0.01 and <= os.cpu_count()")
+    return cpus
+
+
+def _memory_limit(memory):
+    require(isinstance(memory, str) and MEMORY.fullmatch(memory) is not None,
+            "isolation.memory must be <positive int>[kmg]")
+    return memory
+
+
+def _pids_limit(pids):
+    require(type(pids) is int and pids >= 64, "isolation.pids must be an integer >= 64")
+    return pids
 
 
 def read_isolation(raw, *, run, home):
@@ -79,14 +106,9 @@ def read_isolation(raw, *, run, home):
     _absolute(home, "home")
     engine = _engine(raw.get("engine"))
     image = _image(raw.get("image"))
-    cpus, available = raw.get("cpus"), os.cpu_count()
-    require(type(cpus) in (int, float) and available is not None and 0.01 <= cpus <= available
-            and math.isfinite(cpus), "isolation.cpus must be >= 0.01 and <= os.cpu_count()")
-    memory = raw.get("memory")
-    require(isinstance(memory, str) and MEMORY.fullmatch(memory) is not None,
-            "isolation.memory must be <positive int>[kmg]")
-    pids = raw.get("pids")
-    require(type(pids) is int and pids >= 64, "isolation.pids must be an integer >= 64")
+    cpus = _cpus_limit(raw.get("cpus"))
+    memory = _memory_limit(raw.get("memory"))
+    pids = _pids_limit(raw.get("pids"))
     unqualified = raw.get("allow_unqualified", False)
     require(type(unqualified) is bool, "isolation.allow_unqualified must be a bool")
     require(engine != "docker" or unqualified, "docker is unqualified; set isolation.allow_unqualified to true")
@@ -382,6 +404,7 @@ def _container_isolation(isolation, run):
 
 
 def _memory_bytes(memory):
+    _memory_limit(memory)
     return int(memory[:-1]) * {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[memory[-1]]
 
 
@@ -446,7 +469,9 @@ def _image_record(value, image):
         raise ValueError("image inspect has conflicting or invalid identity") from None
     require(image.rsplit("@", 1)[-1].lower() in repos | digests,
             "image inspect does not match configured digest")
-    raw_env = _object(info.get("Config")).get("Env", [])
+    config = info.get("Config")
+    require(isinstance(config, dict), "image inspect has invalid Config")
+    raw_env = config.get("Env", [])
     values = _env_values([] if raw_env is None else raw_env)
     require(values is not None, "image inspect has invalid Config.Env")
     return {"digest": next(iter(digests), None), "id": identities.pop(), "repo_digests": sorted(repos),
@@ -460,11 +485,102 @@ def expected_plan(isolation, *, run, mounts, image_inspect, uid=None, gid=None, 
     Pass the same optional env to create_argv and here. Only value fingerprints are retained; nothing executes.
     """
     isolation = _container_isolation(isolation, run)
-    return {"run": str(_absolute(run, "run")), "engine": isolation["engine"], "image": isolation["image"],
+    record = {"run": str(_absolute(run, "run")), "engine": isolation["engine"], "image": isolation["image"],
             "user": _user(uid, gid), "read_only": True, "mounts": _mount_rows(mounts),
             "cpus": isolation["cpus"], "memory": _memory_bytes(isolation["memory"]), "pids": isolation["pids"],
             "image_info": _image_record(image_inspect, isolation["image"]),
             "environment": _env_fingerprints(container_env(run, env))}
+    checked, errors = _validated_expected(record)
+    require(not errors, "invalid expected record: " + ", ".join(errors))
+    return checked
+
+
+def _fingerprint_record(value):
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and ENV_NAME.fullmatch(key) is not None
+        and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        for key, digest in value.items())
+
+
+def _validated_expected(expected):
+    """One side-effect-free contract for the existing comparison record; never repair unknown into absence.
+
+    Return a normalized copy or ordered field errors before observing/equating any actual container fields.
+    Scalar resource rules are shared with read_isolation; mount structure is shared with both argv builders.
+    """
+    if not isinstance(expected, dict):
+        return None, ["expected"]
+    bad, checked = set(), dict(expected)
+    if expected.keys() - EXPECTED_FIELDS:
+        bad.add("expected")
+    try:
+        require(isinstance(expected.get("run"), str), "run must be a string")
+        checked["run"] = str(_absolute(expected["run"], "run"))
+        container_name(checked["run"])  # The derived identity must be representable too.
+    except (ValueError, TypeError):
+        bad.update(("label", "name", "environment"))
+    try:
+        checked["engine"] = _engine(expected.get("engine"))
+    except ValueError:
+        bad.add("engine")
+    try:
+        checked["image"] = _image(expected.get("image"))
+    except ValueError:
+        bad.add("image")
+    if not _valid_user_record(expected.get("user")):
+        bad.add("user")
+        if expected.get("engine") == "podman":
+            bad.add("userns_mode")
+    if expected.get("read_only") is not True:
+        bad.add("read_only")
+    try:
+        checked["mounts"] = _mount_rows(expected.get("mounts"))
+    except (ValueError, TypeError):
+        bad.add("mounts")
+    try:
+        _cpus_limit(expected.get("cpus"))
+    except ValueError:
+        bad.add("cpus")
+    try:
+        memory = expected.get("memory")
+        require(type(memory) is int and memory > 0 and memory % 1024 == 0, "invalid memory bytes")
+        require(_memory_bytes(str(memory // 1024) + "k") == memory, "invalid memory bytes")
+    except ValueError:
+        bad.add("memory")
+    try:
+        _pids_limit(expected.get("pids"))
+    except ValueError:
+        bad.add("pids")
+    info = expected.get("image_info")
+    if not isinstance(info, dict):
+        bad.update(("image", "environment"))
+    else:
+        if info.keys() - IMAGE_INFO_FIELDS:
+            bad.add("image")
+        try:
+            identity = _config_id(info.get("id"))
+            require("digest" in info, "missing digest witness")
+            digest = None if info["digest"] is None else _digest(info["digest"])
+            require(isinstance(info.get("repo_digests"), list), "invalid repository digests")
+            repos = {_digest(item) for item in info["repo_digests"]}
+            wanted = _image(expected.get("image")).rsplit("@", 1)[-1].lower()
+            require(wanted in repos | ({digest} if digest is not None else set()), "unassociated image")
+            checked["image_info"] = {"id": identity, "digest": digest, "repo_digests": sorted(repos),
+                                     "env_fingerprints": info.get("env_fingerprints")}
+        except (ValueError, TypeError):
+            bad.add("image")
+        if not _fingerprint_record(info.get("env_fingerprints")):
+            bad.add("environment")
+    create = expected.get("environment")
+    if not _fingerprint_record(create):
+        bad.add("environment")
+    elif "label" not in bad:
+        baseline = _env_fingerprints(container_env(checked["run"]))
+        if (not baseline.keys() <= create.keys() or create.keys() - ENV_ALLOWLIST
+                or any(create[key] != baseline[key] for key in ("HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"))):
+            bad.add("environment")
+    errors = [field for field in EXPECTED_ERROR_ORDER if field in bad]
+    return (None, errors) if errors else (checked, [])
 
 
 def create_argv(isolation, *, run, mounts, env=None, uid=None, gid=None, command=None):
@@ -551,17 +667,36 @@ def _access(options):
     return _access_mode(options) is not False
 
 
-def _scratch_options(options):
+def _scratch_options(options, *, complete=True):
     require(isinstance(options, str), "invalid tmpfs options")
     flags = set(options.split(","))
-    require({"rw", "nosuid", "nodev"} <= flags and not flags & {"ro", "suid", "dev"}
+    safe = {"rw", "nosuid", "nodev"} <= flags
+    require((not complete or safe) and not flags & {"ro", "suid", "dev"}
             and not {"exec", "noexec"} <= flags, "unsafe scratch tmpfs options")
+    return safe
+
+
+def _mount_option_witness(kind, options, rw, *, complete):
+    """All provided option representations assert access; only full safe tmpfs flags establish safety."""
+    access = _access_mode(options)
+    require(access is None or access == rw, "conflicting mount access")
+    return _scratch_options(options, complete=complete) if kind == "tmpfs" else False
 
 
 def _inspected_mounts(value, host):
     """Merge the three engine representations; identical cross-references agree, conflicts refuse."""
     declarations = {}
     scratch_witnesses = set()
+    scratch_flags = {}
+
+    def observe(kind, destination, options, rw, *, complete):
+        safe = _mount_option_witness(kind, options, rw, complete=complete)
+        if kind == "tmpfs":
+            flags = scratch_flags.setdefault(destination, set())
+            flags.update(options.split(","))
+            _scratch_options(",".join(sorted(flags)), complete=False)
+            if safe:
+                scratch_witnesses.add(destination)
 
     def put(kind, source, destination, rw, options=None):
         require(isinstance(source, str) and isinstance(destination, str) and type(rw) is bool,
@@ -571,16 +706,12 @@ def _inspected_mounts(value, host):
         if kind == "tmpfs":
             require(destination in ("/tmp", "/dev/shm") and source in ("", "tmpfs", "shm"), "unexpected tmpfs")
             require(rw, "declared scratch tmpfs must be writable")
-            if options is not None:
-                _scratch_options(options)
-                scratch_witnesses.add(destination)
             source = "tmpfs"
         else:
             require(kind == "bind", "unexpected mount type")
             _absolute(source, "mount source")
-            if options is not None:
-                access = _access_mode(options)
-                require(access is None or access == rw, "conflicting mount access")
+        if options is not None:
+            observe(kind, destination, options, rw, complete=True)
         row = (kind, source, rw)
         require(destination not in declarations or declarations[destination] == row, "conflicting mounts")
         declarations[destination] = row
@@ -598,9 +729,8 @@ def _inspected_mounts(value, host):
                 require(isinstance(row["Options"], list) and all(isinstance(item, str) for item in row["Options"]),
                         "invalid mount Options")
                 options = ",".join(row["Options"])
-            if row.get("Type", "bind") == "bind" and "Mode" in row:
-                access = _access_mode(row["Mode"])
-                require(access is None or access == row.get("RW"), "conflicting mount access")
+            if "Mode" in row:
+                observe(row.get("Type", "bind"), dest, row["Mode"], row.get("RW"), complete=False)
             put(row.get("Type", "bind"), row.get("Source"), dest, row.get("RW"), options)
         tmpfs = {} if host.get("Tmpfs") is None else host["Tmpfs"]
         require(isinstance(tmpfs, dict), "invalid Tmpfs")
@@ -628,14 +758,12 @@ def _inspected_mounts(value, host):
 def _image_matches(actual, config, expected):
     """Every supplied identity must agree with the image explicitly inspected by the configured digest."""
     try:
-        wanted = _image(expected["image"]).rsplit("@", 1)[-1].lower()
         info = expected["image_info"]
-        identity = _config_id(info["id"])
-        associated = {_digest(item) for item in info["repo_digests"]}
+        identity = info["id"]
+        associated = set(info["repo_digests"])
         # Docker has no Digest field. Absence is distinct from an invalid, explicitly empty witness.
         if info["digest"] is not None:
-            associated.add(_digest(info["digest"]))
-        require(wanted in associated, "expected image association is missing")
+            associated.add(info["digest"])
         require(_config_id(actual.get("Image")) == identity, "container image config differs")
         for key in ("ImageDigest", "Digest"):
             if key in actual:
@@ -745,17 +873,40 @@ def _unmask_requested(config, host, image):
     return recorded is not None and all(recorded.get(key) == values for key, values in required.items())
 
 
+def _namespace_witnesses(host, expected, recorded):
+    """Actual domains and every supplied recorded request conjoin; missing optional intent is not proof."""
+    bad = []
+    podman = expected["engine"] == "podman"
+    for flag, key, label, request in NAMESPACE_REQUESTS:
+        if flag == "--userns":
+            actual_ok = _keep_id(host, expected["user"]) if podman else host.get(key) == ""
+        elif flag == "--network":
+            actual_ok = host.get(key) == NETWORK_MODE
+        else:
+            actual_ok = host.get(key) in ("", "private")
+        request_ok = recorded is None or all(value == request for value in recorded.get(flag, []))
+        if not actual_ok or not request_ok:
+            bad.append(label)
+    return bad
+
+
+def _name_witnesses(actual, expected, recorded):
+    wanted = container_name(expected["run"])
+    observed = actual.get("Name")
+    if not isinstance(observed, str):
+        return False
+    # Moby v27.5.1 daemon/names.go reserveName adds exactly one slash. Podman capture names are plain.
+    if expected["engine"] == "docker" and observed.startswith("/"):
+        observed = observed[1:]
+    return observed == wanted and (recorded is None or all(value == wanted for value in recorded.get("--name", [])))
+
+
 def _environment_matches(config, expected, recorded_env):
     values = _env_values(config.get("Env"))
-    create = expected.get("environment")
-    pinned = _object(expected.get("image_info")).get("env_fingerprints")
-    if values is None or not isinstance(create, dict) or not isinstance(pinned, dict):
+    if values is None:
         return False
-    baseline = _env_fingerprints(container_env(expected["run"]))
-    if not baseline.keys() <= create.keys() or create.keys() - ENV_ALLOWLIST:
-        return False
-    if any(create[key] != baseline[key] for key in ("HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR")):
-        return False
+    create = expected["environment"]
+    pinned = expected["image_info"]["env_fingerprints"]
     # Finite precedence: explicit allowlisted create > pinned defaults > optional engine-only names.
     required = {**pinned, **create}
     observed = _env_fingerprints(values)
@@ -775,14 +926,21 @@ def verify(inspect_json, expected):
     The expected image_info comes from an image inspect by digest: pinned environment value fingerprints and
     platform identity. No matching witness waives contradictory values or access declarations.
     """
+    expected, errors = _validated_expected(expected)
+    if errors:
+        return errors
     actual = _inspection(inspect_json)
     if actual is None:
         return ["inspect"]
     config = _object(actual.get("Config"))
     host = _object(actual.get("HostConfig"))
+    podman = expected["engine"] == "podman"
+    recorded = _recorded_options(config, expected["image"]) if podman else None
     mismatches = []
     if _object(config.get("Labels")).get("aegis.team.run") != expected["run"]:
         mismatches.append("label")
+    if not _name_witnesses(actual, expected, recorded):
+        mismatches.append("name")
     if not _image_matches(actual, config, expected):
         mismatches.append("image")
     planned = sorted((row["source"], row["destination"], row["rw"]) for row in expected["mounts"])
@@ -790,22 +948,13 @@ def verify(inspect_json, expected):
         mismatches.append("mounts")
     if host.get("ReadonlyRootfs") is not True:
         mismatches.append("read_only")
-    valid_user = _valid_user_record(expected["user"])
-    if not valid_user or config.get("User") != expected["user"]:
+    if config.get("User") != expected["user"]:
         mismatches.append("user")
     if host.get("Privileged") is not False:
         mismatches.append("privileged")
     if host.get("CapAdd") not in (None, []):
         mismatches.append("cap_add")
-    for key, name in (("PidMode", "pid_mode"), ("IpcMode", "ipc_mode")):
-        if host.get(key) not in ("", "private"):
-            mismatches.append(name)
-    podman = expected["engine"] == "podman"
-    userns_ok = (valid_user and _keep_id(host, expected["user"])) if podman else host.get("UsernsMode") == ""
-    if not userns_ok:
-        mismatches.append("userns_mode")
-    if host.get("NetworkMode") != NETWORK_MODE:
-        mismatches.append("network_mode")
+    mismatches.extend(_namespace_witnesses(host, expected, recorded))
     if host.get("Devices") not in (None, []):
         mismatches.append("devices")
     security_ok = (_unmask_requested(config, host, expected["image"]) if podman else
@@ -819,7 +968,7 @@ def verify(inspect_json, expected):
             mismatches.append(name)
     # An invalid/missing Podman command already refuses as security_opt. When structurally valid, its env
     # declarations must also agree. Docker's primary inspect schema supplies no CreateCommand witness.
-    recorded_env = _recorded_options(config, expected["image"]).get("--env", []) if podman and security_ok else None
+    recorded_env = recorded.get("--env", []) if podman and security_ok else None
     if not _environment_matches(config, expected, recorded_env):
         mismatches.append("environment")
     return mismatches
@@ -827,6 +976,7 @@ def verify(inspect_json, expected):
 def _plan(config):
     require(isinstance(config, dict), "team-run.json must be a JSON object")
     if "isolation" in config:
+        require(isinstance(config["isolation"], dict), "isolation must be a JSON object")
         require(config.get("schema") == "aegis.team-run/v2", "isolation requires schema aegis.team-run/v2")
     isolation = read_isolation(config.get("isolation"), run=config.get("run"), home=Path.home())
     if isolation is None:
