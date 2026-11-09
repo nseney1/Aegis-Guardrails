@@ -3047,8 +3047,9 @@ def test_planner_recursive_secret_refuses(adapter, layout, recursive_mount_chain
     secret = layout.home / ".codex"
     secret.rmdir()
     secret.symlink_to(recursive_mount_chain)
-    with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+    with pytest.raises(OSError) as error:
         mounts(adapter, layout)
+    assert error.value.errno == errno.ELOOP
 
 
 MOUNT_RECURSION_PROBES = [("realpath", "source"), ("stat", "source"), ("lstat", "source"),
@@ -3063,7 +3064,8 @@ def test_mount_metadata_recursion_is_refused(adapter, layout, monkeypatch, opera
     # Only project rows keep the builder's existing path-specific refusal diagnostic deterministic.
     rows = [{"source": str(layout.project), "destination": str(layout.project), "rw": True}]
     denied = {"source": layout.project, "owner": layout.home, "secret": layout.home / ".codex"}[target]
-    module = os.path if operation == "realpath" else os
+    # Keep the legacy canonicalization case IDs; inject at the strict resolver's actual OS probe now.
+    module, operation = os, "lstat" if operation == "realpath" else operation
     original, probes = getattr(module, operation), []
 
     def fail(path, *args, **kwargs):
@@ -3072,18 +3074,19 @@ def test_mount_metadata_recursion_is_refused(adapter, layout, monkeypatch, opera
             raise RecursionError("modelled mount metadata recursion")
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(module, operation, fail)
-    if surface == "planner":
-        with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
-            mounts(adapter, layout)
-    elif surface in ("create_argv", "expected_plan"):
-        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
-        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + str(layout.project)) + "$"):
-            getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
-    else:
-        if surface == "recorded":
-            add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
-        assert adapter.verify(value, expected) == ["mounts"]
+    with monkeypatch.context() as m:
+        m.setattr(module, operation, fail)
+        if surface == "planner":
+            with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+                mounts(adapter, layout)
+        elif surface in ("create_argv", "expected_plan"):
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + str(layout.project)) + "$"):
+                getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+        else:
+            if surface == "recorded":
+                add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
+            assert adapter.verify(value, expected) == ["mounts"]
     assert probes
 
 
@@ -3091,27 +3094,28 @@ def test_mount_metadata_recursion_is_refused(adapter, layout, monkeypatch, opera
 def test_mount_canonicalization_oserror_refuses(adapter, layout, monkeypatch, surface):
     expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
     value = inspect_for(expected)
-    original, denied = os.path.realpath, str(layout.project)
+    original, denied = os.lstat, str(layout.project)
 
     def fail(path, *args, **kwargs):
         if os.fspath(path) == denied:
             raise OSError(errno.EIO, os.strerror(errno.EIO), denied)
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(os.path, "realpath", fail)
-    if surface == "planner":
-        with pytest.raises(OSError) as error:
-            mounts(adapter, layout)
-        assert error.value.errno == errno.EIO and error.value.filename == denied
-    elif surface in ("create_argv", "expected_plan"):
-        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
-        with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + denied) + "$"):
-            getattr(adapter, surface)(ISOLATION, run=layout.run,
-                                      mounts=[{"source": denied, "destination": denied, "rw": True}], **kwargs)
-    else:
-        if surface == "recorded":
-            add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
-        assert adapter.verify(value, expected) == ["mounts"]
+    with monkeypatch.context() as m:
+        m.setattr(os, "lstat", fail)
+        if surface == "planner":
+            with pytest.raises(OSError) as error:
+                mounts(adapter, layout)
+            assert error.value.errno == errno.EIO and error.value.filename == denied
+        elif surface in ("create_argv", "expected_plan"):
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + denied) + "$"):
+                getattr(adapter, surface)(ISOLATION, run=layout.run,
+                                          mounts=[{"source": denied, "destination": denied, "rw": True}], **kwargs)
+        else:
+            if surface == "recorded":
+                add_recorded(value, "--mount", ["type=bind,src=%s,dst=%s" % (denied, denied)])
+            assert adapter.verify(value, expected) == ["mounts"]
 
 
 def test_planner_acl_metadata_recursion_refuses(adapter, layout, monkeypatch):
@@ -3125,3 +3129,785 @@ def test_planner_acl_metadata_recursion_refuses(adapter, layout, monkeypatch):
     monkeypatch.setattr(os, "getxattr", fail)
     with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
         mounts(adapter, layout)
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home", "symlinked_passwd_home"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_resolved_local_alias_refuses(adapter, layout, monkeypatch, owner, engine, surface):
+    import pwd
+
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    home = layout.home if owner == "home" else layout.passwd_home
+    (home / ".local").mkdir()
+    password_home = layout.passwd_home
+    if owner == "symlinked_passwd_home":
+        password_home = layout.run.parent / "password-home-link"
+        password_home.symlink_to(layout.passwd_home, target_is_directory=True)
+    alias = layout.run.parent / "local-alias"
+    alias.symlink_to((password_home if owner != "home" else home) / ".local", target_is_directory=True)
+    path = str(alias)
+    with monkeypatch.context() as m:
+        if owner == "symlinked_passwd_home":
+            # Model only the password-database path; all identity fields retain their fixture values.
+            entry = pwd.getpwuid(os.getuid())
+            m.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(
+                pw_uid=entry.pw_uid, pw_gid=entry.pw_gid, pw_name=entry.pw_name, pw_dir=str(password_home)))
+        if surface == "verify":
+            expected["mounts"][0].update(source=path, destination=path)
+            assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+                getattr(adapter, surface)(isolation, run=layout.run,
+                                          mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+
+
+def unavailable_home_lookup(m, shape):
+    import pwd
+
+    def unavailable(uid):
+        raise KeyError(uid)
+
+    m.delenv("HOME", raising=False)
+    m.setattr(pwd, "getpwuid", unavailable)
+    if shape == "python39":
+        # Model the reported older Path.home KeyError boundary; native Python 3.12 translates it to RuntimeError.
+        m.setattr(Path, "home", classmethod(lambda cls: cls(pwd.getpwuid(os.getuid()).pw_dir)))
+
+
+@pytest.mark.parametrize("shape", ["native", "python39"])
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "verify"])
+def test_unavailable_home_lookup_refuses(adapter, layout, monkeypatch, shape, surface):
+    rows = mounts(adapter, layout)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
+    value = inspect_for(expected)
+    with monkeypatch.context() as m:
+        unavailable_home_lookup(m, shape)
+        if surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        else:
+            with pytest.raises(ValueError, match="^cannot find the owner's password-database home$"):
+                if surface == "planner":
+                    mounts(adapter, layout)
+                else:
+                    kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+                    getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+
+
+@pytest.mark.parametrize("shape", ["native", "python39"])
+@pytest.mark.parametrize("command", ["plan", "verify"])
+def test_cli_unavailable_home_lookup_refuses(layout, shape, command):
+    bootstrap = ("os.environ.pop('HOME',None); "
+                 "pwd.getpwuid=lambda uid: (_ for _ in ()).throw(KeyError(uid)); ")
+    if shape == "python39":
+        bootstrap += ("import pathlib; pathlib.Path.home=classmethod("
+                      "lambda cls: cls(pwd.getpwuid(os.getuid()).pw_dir)); ")
+    args = ("--inspect", str(layout.run.parent / "not-read.json")) if command == "verify" else ()
+    result = cli(layout, config_for(layout), command, *args, bootstrap=bootstrap)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"error": "cannot find the owner's password-database home"}
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+def test_home_lookup_keeps_environment_and_password_fallback(adapter, layout, monkeypatch, builder):
+    import pwd
+
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    # Empty stored rows isolate the lookup: owner exclusions still require pwd on any real mount row.
+    before = getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=[], **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+        assert Path.home() == layout.home
+        assert getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=[], **kwargs) == before
+    rows = mounts(adapter, layout)
+    before = getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+    with monkeypatch.context() as m:
+        m.delenv("HOME", raising=False)
+        assert Path.home() == layout.passwd_home
+        assert getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=rows, **kwargs) == before
+
+
+STORED_OVERLAPS = ["ro-parent", "rw-parent", "symlink-child", "symlink-equal", "inode", "missing-inode"]
+
+
+def stored_overlap_rows(layout, kind):
+    left, right = layout.source, layout.source / "tools"
+    alias = layout.run.parent / "overlap-alias"
+    identity = None
+    if kind.startswith("symlink"):
+        alias.symlink_to(left, target_is_directory=True)
+        right = alias if kind == "symlink-equal" else alias / "tools"
+    elif kind in ("inode", "missing-inode"):
+        alias.mkdir()
+        identity = (alias, left.stat())
+        right = alias / "tools"
+        if kind == "missing-inode":
+            left = left / "missing" / "runtime"
+            right = alias / "missing" / "runtime" / "tools"
+    rows = [{"source": str(left), "destination": str(left), "rw": kind == "rw-parent"},
+            {"source": str(right), "destination": str(right), "rw": kind != "rw-parent"}]
+    return rows, identity
+
+
+def model_stored_inode_alias(m, identity):
+    if identity is None:
+        return
+    alias, target = identity
+    original = os.stat
+
+    def stat_(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if Path(path) == alias:
+            return SimpleNamespace(st_dev=target.st_dev, st_ino=target.st_ino, st_mode=info.st_mode)
+        return info
+
+    m.setattr(os, "stat", stat_)
+
+
+@pytest.mark.parametrize("kind", STORED_OVERLAPS)
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_stored_mixed_access_overlap_refuses(adapter, layout, monkeypatch, kind, reverse, engine, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    rows, identity = stored_overlap_rows(layout, kind)
+    if reverse:
+        rows.reverse()
+    canonical = [os.path.realpath(row["source"]) for row in rows]
+    message = "read-write and read-only mounts overlap: %s and %s" % tuple(canonical)
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        if surface == "verify":
+            expected["mounts"] = rows
+            assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+                getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
+
+
+@pytest.mark.parametrize("kind", STORED_OVERLAPS)
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_stored_same_access_overlap_stays_valid(adapter, layout, monkeypatch, kind, rw, engine):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows, identity = stored_overlap_rows(layout, kind)
+    for row in rows:
+        row["rw"] = rw
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        assert adapter.create_argv(isolation, run=layout.run, mounts=rows)
+        expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+        assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_stored_disjoint_access_and_surrogate_paths_stay_valid(adapter, layout, engine):
+    # Linux surrogate-escaped bytes are allowed; do not turn the unrelated allegation into a restriction.
+    path = str(layout.run.parent / ("bytes-" + chr(0xdcff)))
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = mounts(adapter, layout, project=path)
+    assert {"source": path, "destination": path, "rw": True} in rows
+    argv = adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    assert "type=bind,src=" + path + ",dst=" + path in argv
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+EMPTY_NAMESPACE_CASES = [("podman", "PidMode", "pid_mode", False),
+                         ("podman", "PidMode", "pid_mode", True),
+                         ("podman", "IpcMode", "ipc_mode", False),
+                         ("podman", "IpcMode", "ipc_mode", True),
+                         ("docker", "IpcMode", "ipc_mode", False)]
+
+
+@pytest.mark.parametrize("engine,field,label,recorded", EMPTY_NAMESPACE_CASES)
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+def test_empty_private_namespace_witness_refuses(adapter, layout, engine, field, label, recorded, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"][field] = ""
+    if recorded:
+        add_recorded(value, "--pid" if field == "PidMode" else "--ipc", ["private"])
+    if surface == "pure":
+        assert adapter.verify(value, expected) == [label]
+    else:
+        path = layout.run.parent / "empty-namespace-inspect.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        result = cli(layout, {**config_for(layout), "isolation": isolation}, "verify", "--inspect", str(path))
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert json.loads(result.stdout) == {"mismatches": [label]}
+
+
+@pytest.mark.parametrize("engine,pid", [("podman", "private"), ("docker", ""), ("docker", "private")])
+@pytest.mark.parametrize("surface", ["pure", "cli"])
+def test_private_namespace_domains_stay_valid(adapter, layout, engine, pid, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    value[0]["HostConfig"]["PidMode"] = pid
+    if surface == "pure":
+        assert adapter.verify(value, expected) == []
+    else:
+        path = layout.run.parent / "private-namespace-inspect.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        result = cli(layout, {**config_for(layout), "isolation": isolation}, "verify", "--inspect", str(path))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout) == {"mismatches": []}
+
+
+LOCAL_ROOT_CASES = ["relocated-direct", "relocated-alias", "identity", "relocated-identity", "dangling-direct",
+                    "ordinary-symlink"]
+
+
+def recorded_local_root(layout, owner, kind):
+    home = getattr(layout, owner) if owner != "configured" else layout.run.parent / "configured-home"
+    home.mkdir(exist_ok=True)
+    local = home / ".local"
+    target = local
+    if kind.startswith("relocated") or kind == "dangling-direct":
+        target = layout.run.parent / ("unmounted/local" if kind == "dangling-direct" else "relocated-local")
+        if kind != "dangling-direct":
+            target.mkdir()
+        local.symlink_to(target, target_is_directory=True)
+    else:
+        local.mkdir()
+    identity = None
+    path = target
+    if kind in ("identity", "relocated-identity"):
+        path = layout.run.parent / "local-identity-alias"
+        path.mkdir()
+        identity = (path, target.stat())
+    elif kind in ("relocated-alias", "ordinary-symlink"):
+        path = layout.run.parent / "local-root-link"
+        path.symlink_to(local, target_is_directory=True)
+    return home, path, identity
+
+
+@pytest.mark.parametrize("kind", LOCAL_ROOT_CASES)
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_recorded_local_root_refuses(adapter, layout, monkeypatch, kind, owner, engine, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    _, source, identity = recorded_local_root(layout, owner, kind)
+    path = str(source)
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        if surface == "verify":
+            expected["mounts"] = [{"source": path, "destination": path, "rw": True}]
+            assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+                getattr(adapter, surface)(isolation, run=layout.run,
+                                          mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+
+
+@pytest.mark.parametrize("kind", ["relocated-direct", "identity", "relocated-identity", "dangling-direct"])
+@pytest.mark.parametrize("owner", ["home", "passwd_home", "configured"])
+def test_planner_recorded_local_root_refuses(adapter, layout, monkeypatch, kind, owner):
+    home, source, identity = recorded_local_root(layout, owner, kind)
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + str(source)) + "$"):
+            mounts(adapter, layout, home=home if owner == "configured" else layout.home, project=source)
+
+
+@pytest.mark.parametrize("kind", ["relocated-direct", "identity", "relocated-identity", "dangling-direct"])
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_recorded_local_root_descendants_stay_valid(adapter, layout, monkeypatch, kind, owner, engine):
+    _, root, identity = recorded_local_root(layout, owner, kind)
+    path = str(root / "share" / "x")  # Missing descendants too: a missing leaf must not equal a missing root ID.
+    rows = [{"source": path, "destination": path, "rw": True}]
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        assert adapter.create_argv(isolation, run=layout.run, mounts=rows)
+        expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+        assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home", "configured"])
+def test_planner_recorded_local_descendant_stays_valid(adapter, layout, owner):
+    home, root, _ = recorded_local_root(layout, owner, "relocated-direct")
+    path = root / "share" / "x"
+    plan = mounts(adapter, layout, home=home if owner == "configured" else layout.home, project=path)
+    assert {"source": str(path), "destination": str(path), "rw": True} in plan
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("fault", [errno.EACCES, errno.EIO, errno.ENOTDIR, "recursion", "identity-io"])
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "verify"])
+def test_local_root_metadata_cannot_be_absence(adapter, layout, monkeypatch, owner, fault, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    local = getattr(layout, owner) / ".local"
+    target = layout.run.parent / "local-metadata-target"
+    target.mkdir()
+    local.symlink_to(target, target_is_directory=True)
+    denied = target if fault == "identity-io" else local
+    # Resolution now reads links explicitly instead of delegating to non-strict realpath.
+    module, operation = os, "readlink" if fault == "recursion" else ("stat" if fault == "identity-io" else "lstat")
+    original, probes = getattr(module, operation), []
+
+    def fail(path, *args, **kwargs):
+        if os.fspath(path) == str(denied):
+            probes.append(str(denied))
+            if fault == "recursion":
+                raise RecursionError("modelled local-root resolution recursion")
+            code = errno.EIO if fault == "identity-io" else fault
+            raise OSError(code, os.strerror(code), str(denied))
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(module, operation, fail)
+        if surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        elif surface == "planner":
+            if fault == "recursion":
+                with pytest.raises(ValueError, match="^mount metadata exceeds recursion limit$"):
+                    mounts(adapter, layout)
+            else:
+                with pytest.raises(OSError) as error:
+                    mounts(adapter, layout)
+                assert error.value.errno == (errno.EIO if fault == "identity-io" else fault)
+                assert error.value.filename == str(denied)
+        else:
+            rows = [{"source": str(layout.project), "destination": str(layout.project), "rw": True}]
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + str(layout.project)) + "$"):
+                getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+        assert probes
+
+
+@pytest.mark.parametrize("shape", ["native", "python39"])
+@pytest.mark.parametrize("explicit_host", [False, True])
+def test_host_plan_needs_no_owner_home(layout, shape, explicit_host):
+    bootstrap = ("os.environ.pop('HOME',None); "
+                 "pwd.getpwuid=lambda uid: (_ for _ in ()).throw(KeyError(uid)); ")
+    if shape == "python39":
+        bootstrap += ("import pathlib; pathlib.Path.home=classmethod("
+                      "lambda cls: cls(pwd.getpwuid(os.getuid()).pw_dir)); ")
+    config = {"schema": "aegis.team-run/v2", "isolation": {"mode": "host"}} if explicit_host else {}
+    result = cli(layout, config, "plan", bootstrap=bootstrap)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
+
+
+NESTED_DESTINATIONS = ["child-link", "ancestor-link", "missing-target"]
+
+
+def nested_destination_rows(layout, kind, parent_rw):
+    parent = layout.source
+    if kind == "ancestor-link":
+        parent = layout.run.parent / "destination-parent-link"
+        parent.symlink_to(layout.source, target_is_directory=True)
+    child = parent / "sub"
+    child.symlink_to(layout.project / "missing" if kind == "missing-target" else layout.project,
+                     target_is_directory=True)
+    # Host source resolution is deliberately disjoint, while the container's supplied destinations nest.
+    resolved_parent, resolved_child = Path(os.path.realpath(parent)), Path(os.path.realpath(child))
+    assert resolved_parent != resolved_child
+    assert resolved_parent not in resolved_child.parents and resolved_child not in resolved_parent.parents
+    return [{"source": str(parent), "destination": str(parent), "rw": parent_rw},
+            {"source": str(child), "destination": str(child), "rw": not parent_rw}]
+
+
+@pytest.mark.parametrize("kind", NESTED_DESTINATIONS)
+@pytest.mark.parametrize("parent_rw", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_mixed_access_nested_destinations_refuse(adapter, layout, kind, parent_rw, reverse, engine, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    rows = nested_destination_rows(layout, kind, parent_rw)
+    if reverse:
+        rows.reverse()
+    message = "read-write and read-only mounts overlap: %s and %s" % tuple(row["destination"] for row in rows)
+    if surface == "verify":
+        expected["mounts"] = rows
+        assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+    else:
+        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+        with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+            getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
+
+
+@pytest.mark.parametrize("kind", NESTED_DESTINATIONS)
+@pytest.mark.parametrize("rw", [False, True])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_equal_access_nested_destinations_stay_valid(adapter, layout, kind, rw, engine):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = nested_destination_rows(layout, kind, rw)
+    rows[1]["rw"] = rw
+    assert adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+def relocated_local_parent(layout, owner, placement, alias, missing):
+    home = getattr(layout, owner) if owner != "configured" else layout.run.parent / "configured-local-home"
+    home.mkdir(exist_ok=True)
+    parent = home / "dotfiles" if placement == "inside" else layout.run.parent / "external-local-store"
+    parent.mkdir()
+    target = parent / ".local"
+    if not missing:
+        target.mkdir()
+    (home / ".local").symlink_to(target, target_is_directory=True)
+    source, identity = parent, None
+    if alias:
+        source = layout.run.parent / "local-parent-alias"
+        source.mkdir()
+        identity = (source, parent.stat())
+    return home, source, identity
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("placement", ["inside", "outside"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_relocated_local_parent_refuses(adapter, layout, monkeypatch, owner, placement, alias, missing, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    _, source, identity = relocated_local_parent(layout, owner, placement, alias, missing)
+    path = str(source)
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        if surface == "verify":
+            expected["mounts"] = [{"source": path, "destination": path, "rw": True}]
+            assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+                getattr(adapter, surface)(ISOLATION, run=layout.run,
+                                          mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home", "configured"])
+@pytest.mark.parametrize("placement", ["inside", "outside"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_planner_relocated_local_parent_refuses(adapter, layout, monkeypatch, owner, placement, alias, missing):
+    home, source, identity = relocated_local_parent(layout, owner, placement, alias, missing)
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, identity)
+        with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + str(source)) + "$"):
+            mounts(adapter, layout, home=home if owner == "configured" else layout.home, project=source)
+
+
+def local_via_intermediate_link(layout, owner, relative=False, repeated=False):
+    data = layout.run.parent / "canonical-local-data"
+    data.mkdir()
+    hop = layout.run.parent / "canonical-local-hop"
+    hop.symlink_to(data, target_is_directory=True)
+    local = getattr(layout, owner) / ".local"
+    target = str(hop / "missing")
+    if repeated:
+        target = str(hop) + "/../" + hop.name + "/missing"
+    if relative:
+        target = os.path.relpath(target, local.parent)
+    local.symlink_to(target, target_is_directory=True)
+    return hop, data / "missing"
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("code", [errno.EIO, errno.EACCES, errno.ELOOP, errno.ENOTDIR])
+@pytest.mark.parametrize("candidate", ["root", "unrelated"])
+@pytest.mark.parametrize("surface", ["planner", "create_argv", "expected_plan", "verify"])
+def test_intermediate_local_metadata_refuses(adapter, layout, monkeypatch, owner, relative, code, candidate, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    hop, root = local_via_intermediate_link(layout, owner, relative)
+    path = str(root if candidate == "root" else layout.project)
+    rows = [{"source": path, "destination": path, "rw": True}]
+    expected["mounts"] = rows
+    value = inspect_for(expected)
+    original, probes = os.lstat, []
+
+    def fail(target, *args, **kwargs):
+        if os.fspath(target) == str(hop):
+            probes.append(str(hop))
+            raise OSError(code, os.strerror(code), str(hop))
+        return original(target, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "lstat", fail)
+        if surface == "planner":
+            with pytest.raises(OSError) as error:
+                mounts(adapter, layout, project=path)
+            assert error.value.errno == code and error.value.filename == str(hop)
+        elif surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + path) + "$"):
+                getattr(adapter, surface)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+        assert probes
+
+
+@pytest.mark.parametrize("owner", ["home", "passwd_home"])
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_intermediate_local_enoent_target_protected_descendants_allowed(adapter, layout, owner, relative, repeated):
+    _, root = local_via_intermediate_link(layout, owner, relative, repeated)
+    path = str(root)
+    for surface in ("create_argv", "expected_plan"):
+        kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+        with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+            getattr(adapter, surface)(ISOLATION, run=layout.run,
+                                      mounts=[{"source": path, "destination": path, "rw": True}], **kwargs)
+    with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+        mounts(adapter, layout, project=root)
+    child = str(root / "share" / "x")
+    rows = mounts(adapter, layout, project=child)
+    assert {"source": child, "destination": child, "rw": True} in rows
+    assert adapter.create_argv(ISOLATION, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("ending", ["/..", "/.", "/"])
+def test_exclusion_resolution_nondirectory_traversal_refuses(adapter, layout, ending):
+    file = layout.run.parent / "local-intermediate-file"
+    file.write_text("not a directory\n", encoding="utf-8")
+    (layout.home / ".local").symlink_to(str(file) + ending + "/missing", target_is_directory=True)
+    with pytest.raises(OSError) as error:
+        mounts(adapter, layout)
+    assert error.value.errno == errno.ENOTDIR
+
+
+def test_exclusion_resolution_cycle_refuses(adapter, layout):
+    loop = layout.run.parent / "local-cycle"
+    loop.symlink_to(loop)
+    (layout.home / ".local").symlink_to(loop)
+    with pytest.raises(OSError) as error:
+        mounts(adapter, layout)
+    assert error.value.errno == errno.ELOOP
+
+
+def test_existing_local_leaf_identity_alias_boundary(adapter, layout, monkeypatch):
+    # Existing-leaf identity protection is retained. This models no host bind of a missing root or ancestor;
+    # owner-created host bind aliases remain outside the documented threat model.
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    leaf = layout.home / ".local"
+    leaf.mkdir()
+    alias = layout.run.parent / "existing-local-leaf-alias"
+    alias.mkdir()
+    path = str(alias)
+    rows = [{"source": path, "destination": path, "rw": True}]
+    with monkeypatch.context() as m:
+        model_stored_inode_alias(m, (alias, leaf.stat()))
+        for builder in ("create_argv", "expected_plan"):
+            kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+                getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=rows, **kwargs)
+        expected["mounts"] = rows
+        assert adapter.verify(inspect_for(expected), expected) == ["mounts"]
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("code", [errno.EIO, errno.EACCES, errno.EAGAIN])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_home_nss_oserror_is_validation_refusal(adapter, layout, monkeypatch, engine, code, surface):
+    import pwd
+
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = mounts(adapter, layout)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    value = inspect_for(expected)
+    calls = []
+
+    def unavailable(uid):
+        calls.append(uid)
+        raise OSError(code, "modelled NSS failure")
+
+    with monkeypatch.context() as m:
+        m.delenv("HOME", raising=False)
+        m.setattr(pwd, "getpwuid", unavailable)
+        if surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^cannot find the owner's password-database home$"):
+                getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
+        assert calls
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.EACCES, errno.EAGAIN])
+@pytest.mark.parametrize("command", ["plan", "verify"])
+def test_cli_home_nss_oserror_has_normalized_message(layout, code, command):
+    bootstrap = ("os.environ.pop('HOME',None); "
+                 "pwd.getpwuid=lambda uid: (_ for _ in ()).throw(OSError(%d,'modelled NSS failure')); " % code)
+    args = ("--inspect", str(layout.run.parent / "not-read-nss.json")) if command == "verify" else ()
+    result = cli(layout, config_for(layout), command, *args, bootstrap=bootstrap)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"error": "cannot find the owner's password-database home"}
+
+
+@pytest.mark.parametrize("builder", ["create_argv", "expected_plan"])
+def test_home_set_does_not_require_nss_for_empty_builder(adapter, layout, monkeypatch, builder):
+    import pwd
+
+    kwargs = {"image_inspect": image_info(IMAGE)} if builder == "expected_plan" else {}
+    before = getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=[], **kwargs)
+    with monkeypatch.context() as m:
+        m.setattr(pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(OSError(errno.EIO, "modelled NSS failure")))
+        assert getattr(adapter, builder)(ISOLATION, run=layout.run, mounts=[], **kwargs) == before
+
+
+def expansion_links(layout, kind, size):
+    folder = layout.run.parent / "expansion-links"
+    folder.mkdir()
+    final = layout.run.parent / "expansion-final"
+    final.mkdir()
+    if kind == "graph":
+        links = [folder / ("s%d" % index) for index in range(size + 1)]
+        for index, link in enumerate(links):
+            link.symlink_to("." if index == 0 else "s%d/s%d" % (index - 1, index - 1))
+        return links[-1], links, folder
+    links = [folder / ("c%d" % index) for index in range(size)]
+    for index, link in enumerate(links):
+        link.symlink_to(links[index + 1].name if index + 1 < len(links) else final)
+    return links[0], links, final
+
+
+def bound_readlink_probe(m):
+    original, calls = os.readlink, []
+
+    def readlink(path, *args, **kwargs):
+        calls.append(os.fspath(path))
+        # Deterministic sentinel prevents the pre-fix implementation from executing the exponential graph.
+        assert len(calls) <= 40, "public resolution exceeded the 40-expansion test ceiling"
+        return original(path, *args, **kwargs)
+
+    m.setattr(os, "readlink", readlink)
+    return calls
+
+
+@pytest.mark.parametrize("kind,size", [("graph", 5), ("graph", 30), ("chain", 41)])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_symlink_expansion_budget_refuses(adapter, layout, monkeypatch, kind, size, engine, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    entry, _, _ = expansion_links(layout, kind, size)
+    path = str(entry)
+    rows = [{"source": path, "destination": path, "rw": True}]
+    expected["mounts"] = rows
+    value = inspect_for(expected)
+    with monkeypatch.context() as m:
+        calls = bound_readlink_probe(m)
+        if surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + path) + "$"):
+                getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
+        assert 0 < len(calls) <= 40
+
+
+@pytest.mark.parametrize("kind,size", [("graph", 5), ("graph", 30), ("chain", 40)])
+@pytest.mark.parametrize("owner", ["home", "passwd_home", "configured"])
+def test_local_symlink_expansion_budget_refuses(adapter, layout, monkeypatch, kind, size, owner):
+    entry, _, _ = expansion_links(layout, kind, size)
+    home = getattr(layout, owner) if owner != "configured" else layout.run.parent / "expansion-owner"
+    home.mkdir(exist_ok=True)
+    (home / ".local").symlink_to(entry, target_is_directory=True)
+    with monkeypatch.context() as m:
+        calls = bound_readlink_probe(m)
+        with pytest.raises(OSError) as error:
+            mounts(adapter, layout, home=home if owner == "configured" else layout.home)
+        assert error.value.errno == errno.ELOOP
+        assert 0 < len(calls) <= 40
+
+
+@pytest.mark.parametrize("size", [1, 4, 40])
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_symlink_expansion_short_and_limit_chains_stay_valid(adapter, layout, size, engine):
+    entry, _, _ = expansion_links(layout, "chain", size)
+    path = str(entry)
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    rows = [{"source": path, "destination": path, "rw": True}]
+    assert adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=rows)
+    assert adapter.verify(inspect_for(expected), expected) == []
+
+
+@pytest.mark.parametrize("size", [1, 4, 39])
+def test_local_symlink_expansion_short_chains_stay_valid(adapter, layout, size):
+    entry, _, _ = expansion_links(layout, "chain", size)
+    (layout.home / ".local").symlink_to(entry, target_is_directory=True)
+    plan = mounts(adapter, layout)
+    assert {"source": str(layout.project), "destination": str(layout.project), "rw": True} in plan
+
+
+def test_symlink_completed_resolution_memoizes_each_link(adapter, layout, monkeypatch):
+    entry, links, _ = expansion_links(layout, "graph", 4)  # 31 logical follows, five unique links.
+    original, calls = os.readlink, []
+
+    def readlink(path, *args, **kwargs):
+        calls.append(os.fspath(path))
+        return original(path, *args, **kwargs)
+
+    path = str(entry)
+    with monkeypatch.context() as m:
+        m.setattr(os, "readlink", readlink)
+        assert adapter.create_argv(ISOLATION, run=layout.run,
+                                   mounts=[{"source": path, "destination": path, "rw": True}])
+    top_level_resolutions = calls.count(path)
+    assert top_level_resolutions > 0
+    assert all(calls.count(str(link)) == top_level_resolutions for link in links)
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+def test_symlink_memo_does_not_survive_top_level_call(adapter, layout, engine):
+    alias = layout.run.parent / "memo-scope-alias"
+    alias.symlink_to(layout.project, target_is_directory=True)
+    path = str(alias)
+    rows = [{"source": path, "destination": path, "rw": True}]
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    assert adapter.create_argv(isolation, run=layout.run, mounts=rows)
+    local = layout.home / ".local"
+    local.mkdir()
+    alias.unlink()
+    alias.symlink_to(local, target_is_directory=True)
+    with pytest.raises(ValueError, match="^" + re.escape("mount replaces image system directory: " + path) + "$"):
+        adapter.create_argv(isolation, run=layout.run, mounts=rows)
+
+
+@pytest.mark.parametrize("engine", ["podman", "docker"])
+@pytest.mark.parametrize("surface", ["create_argv", "expected_plan", "verify"])
+def test_symlink_memo_hit_still_checks_link_metadata(adapter, layout, monkeypatch, engine, surface):
+    isolation = {**ISOLATION, "engine": engine, "allow_unqualified": engine == "docker"}
+    expected = expected_for(adapter, isolation, run=layout.run, mounts=mounts(adapter, layout))
+    entry, links, _ = expansion_links(layout, "graph", 1)
+    path, repeated = str(entry), str(links[0])
+    rows = [{"source": path, "destination": path, "rw": True}]
+    expected["mounts"] = rows
+    value = inspect_for(expected)
+    original, visits = os.lstat, []
+
+    def lstat(target, *args, **kwargs):
+        if os.fspath(target) == repeated:
+            visits.append(repeated)
+            if len(visits) == 2:
+                raise OSError(errno.EIO, "modelled repeated-link metadata failure", repeated)
+        return original(target, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "lstat", lstat)
+        if surface == "verify":
+            assert adapter.verify(value, expected) == ["mounts"]
+        else:
+            kwargs = {"image_inspect": image_info(IMAGE)} if surface == "expected_plan" else {}
+            with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + path) + "$"):
+                getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
+        assert len(visits) == 2

@@ -53,6 +53,7 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 NETWORK_MODE = "bridge"
 # user_namespaces(7): (uid_t)-1 is deliberately unmapped. Endpoints below are exclusive.
 LINUX_ID_LIMIT = 4294967295
+SYMLINK_FOLLOW_LIMIT = 40
 EXPECTED_FIELDS = frozenset(("run", "engine", "image", "user", "read_only", "mounts", "cpus", "memory", "pids",
                              "image_info", "environment"))
 IMAGE_INFO_FIELDS = frozenset(("id", "digest", "repo_digests", "env_fingerprints"))
@@ -75,6 +76,70 @@ def _absolute(value, label):
     from hierarchy_team import absolute
 
     return absolute(os.fspath(value) if isinstance(value, os.PathLike) else value, label)
+
+
+def _canonical_path(value):
+    """Strict realpath, bounded to 40 logical follows per call; only ENOENT permits a missing tail."""
+    active = set()
+    completed = {}
+    followed = 0
+
+    def spend(cost, candidate):
+        nonlocal followed
+        if cost > SYMLINK_FOLLOW_LIMIT - followed:
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(candidate))
+        followed += cost
+
+    def walk(base, parts):
+        for part in parts:
+            if part in ("", ".", ".."):
+                # Do not normalize file/.. or file/. into a usable directory. A missing prefix is allowed,
+                # but every observed non-ENOENT traversal error must propagate.
+                try:
+                    os.lstat(str(base) + "/.")
+                except FileNotFoundError:
+                    pass
+                if part == "..":
+                    base = base.parent
+                continue
+            candidate = base / part
+            try:
+                info = os.lstat(candidate)
+            except FileNotFoundError:
+                base = candidate
+                continue
+            if not stat.S_ISLNK(info.st_mode):
+                base = candidate
+                continue
+            if candidate in active:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(candidate))
+            if candidate in completed:
+                # Cached work still consumes all logical follows. Probe the link's metadata above first;
+                # a previous successful visit must not turn a later lstat failure into usable absence.
+                base, cost = completed[candidate]
+                spend(cost, candidate)
+                continue
+            before = followed
+            spend(1, candidate)
+            active.add(candidate)
+            try:
+                target = os.readlink(candidate)
+                absolute = os.path.isabs(target)
+                base = walk(Path("/") if absolute else base, target.split("/")[1:] if absolute else target.split("/"))
+            finally:
+                active.remove(candidate)
+            completed[candidate] = (base, followed - before)
+        return base
+
+    return walk(Path("/"), os.fspath(value).split("/")[1:])
+
+
+def _home():
+    """Keep Path.home's environment/fallback behavior and normalize unavailable home-lookup errors."""
+    try:
+        return Path.home()
+    except (KeyError, RuntimeError, OSError):
+        raise ValueError("cannot find the owner's password-database home") from None
 
 
 def _cpus_limit(cpus):
@@ -163,6 +228,14 @@ def _overlap(left, right, left_ids, right_ids):
             or _inside_alias(right, left, right_ids, left_ids))
 
 
+def _check_mount_overlap(mounts):
+    """Check one path namespace; empty identities mean lexical paths. Equal-access overlaps stay permitted."""
+    for index, (path, rw, identities) in enumerate(mounts):
+        for other, other_rw, other_ids in mounts[index + 1:]:
+            require(rw == other_rw or not _overlap(path, other, identities, other_ids),
+                    "read-write and read-only mounts overlap: %s and %s" % (path, other))
+
+
 def _owner_roots(home):
     import pwd  # Linux/POSIX only; host-mode parsing still works without pwd.
 
@@ -170,13 +243,13 @@ def _owner_roots(home):
         passwd = pwd.getpwuid(os.getuid()).pw_dir
     except KeyError:
         raise ValueError("cannot find the owner's password-database home") from None
-    owners = (_absolute(home, "home"), _absolute(Path.home(), "HOME"), _absolute(passwd, "password home"))
-    homes = {Path(os.path.realpath(owner)) for owner in owners}
-    # Probe named entries without following the final link: dangling secrets still protect their targets.
+    owners = (_absolute(home, "home"), _absolute(_home(), "HOME"), _absolute(passwd, "password home"))
+    homes = {_canonical_path(owner) for owner in owners}
+    # Probe named entries without following the final link: dangling exclusions still protect their targets.
     # Only confirmed absence is missing; unreadable metadata must never remove an exclusion.
-    secrets = set()
+    roots = {"secret": set(), "local": set()}
     for owner in owners:
-        for name in SECRET_PATHS:
+        for name in (*SECRET_PATHS, ".local"):
             secret = owner / name
             try:
                 os.lstat(secret)
@@ -188,9 +261,9 @@ def _owner_roots(home):
                 if not stat.S_ISDIR(os.stat(owner).st_mode):
                     continue
                 raise
-            secrets.add(Path(os.path.realpath(secret)))
-    return ([(path, _ancestors(path), True) for path in sorted(homes)]
-            + [(path, _ancestors(path), False) for path in sorted(secrets)])
+            roots["local" if name == ".local" else "secret"].add(_canonical_path(secret))
+    return ([(path, _ancestors(path), "home") for path in sorted(homes)]
+            + [(path, _ancestors(path), kind) for kind in ("secret", "local") for path in sorted(roots[kind])])
 
 
 def _image_tree(path):
@@ -199,19 +272,29 @@ def _image_tree(path):
             or not scratch and any(_inside(path, tree) for tree in IMAGE_PROTECTED_TREES))
 
 
-def _system_mount(path, homes=()):
+def _system_mount(path, homes=(), *, resolved=None):
     require(not str(path).startswith("//"), "mount path has double leading slash: " + str(path))
     require(path != Path("/dev/shm"), "mount conflicts with mandatory scratch tmpfs: " + str(path))
-    require(not _image_tree(path) and all(path != home / ".local" for home in homes),
+    candidates = (path,) if resolved is None else (path, resolved)
+    require(all(not _image_tree(candidate) and all(candidate != home / ".local" for home in homes)
+                for candidate in candidates),
             "mount replaces image system directory: " + str(path))
 
 
 def _owner_exclusions(path, protected):
-    """Refuse a mount containing an owner home or overlapping a listed secret, including identity aliases."""
-    real = Path(os.path.realpath(path))
+    """Home/local containment and secret overlap, including represented directory-identity aliases."""
+    real = _canonical_path(path)
     identities = _ancestors(real)
-    for owner, owner_ids, is_home in protected:
-        unsafe = (_inside_alias(owner, real, owner_ids, identities) if is_home else
+    for owner, owner_ids, kind in protected:
+        if kind == "local":
+            # Preserve root equality and reject containing mounts too, without rejecting descendants. Missing
+            # roots have no leaf identity; ancestor identities can still identify a containing mount alias.
+            root_id = owner_ids.get(owner)
+            require(real != owner and (root_id is None or identities.get(real) != root_id)
+                    and not _inside_alias(owner, real, owner_ids, identities),
+                    "mount replaces image system directory: " + str(path))
+            continue
+        unsafe = (_inside_alias(owner, real, owner_ids, identities) if kind == "home" else
                   _overlap(real, owner, identities, owner_ids))
         require(not unsafe, "mount overlaps protected home: " + str(path))
     return real, identities
@@ -337,11 +420,12 @@ def _trusted_source(path, private_groups):
 
 
 def _mount_rows(mounts):
-    """Structure plus the shared system and home/secret exclusions. Missing paths stay legal; source trust and
+    """Structure plus shared system, home/secret and .local exclusions. Missing paths stay legal; source trust and
     ACL checks remain in mount_plan, which C4 recomputes from config immediately before run."""
     require(isinstance(mounts, list), "mounts must be a list")
     protected = None
     checked = []
+    boundaries = []
     for row in mounts:
         require(isinstance(row, dict) and row.keys() == {"source", "destination", "rw"},
                 "mount row must contain only source, destination and rw")
@@ -352,23 +436,28 @@ def _mount_rows(mounts):
         require(not any(char in str(source) for char in (",", ":", "\r", "\n")),
                 "mount source contains an unsupported character: " + str(source))
         require(type(row["rw"]) is bool, "mount row rw must be a bool")
-        _system_mount(source, (Path.home(),))
+        _system_mount(source, (_home(),))
         try:
             # Stored rows may name symlinks. Canonicalization and exclusion metadata are one refusal boundary;
-            # neither filesystem errors nor Python's recursive realpath limit may escape row validation.
-            require(not _image_tree(Path(os.path.realpath(source))),
+            # neither filesystem errors nor recursive resolution limits may escape row validation.
+            require(not _image_tree(_canonical_path(source)),
                     "mount replaces image system directory: " + str(source))
-            protected = _owner_roots(Path.home()) if protected is None else protected
-            _owner_exclusions(source, protected)
+            protected = _owner_roots(_home()) if protected is None else protected
+            resolved, identities = _owner_exclusions(source, protected)
         except (OSError, RecursionError):
             # Unreadable or unresolvable metadata cannot prove the exclusions. A row error keeps verify's
             # named "mounts" result for expected rows and recorded requests, as well as builder refusals.
             raise ValueError("mount overlaps protected home: " + str(source)) from None
-        # The early check knows only HOME; repeat it with mount_plan's resolved homes so the password-database
-        # home's .local refuses here too when HOME differs from it.
-        _system_mount(source, [Path.home()] + [owner for owner, _, is_home in protected if is_home])
+        # Conjoin supplied and resolved paths with both owner homes. Checking only the supplied spelling
+        # would miss an alias into .local, including when the password-database home traverses a symlink.
+        _system_mount(source, [_home()] + [owner for owner, _, kind in protected if kind == "home"], resolved=resolved)
         checked.append({"source": str(source), "destination": str(destination), "rw": row["rw"]})
+        boundaries.append((resolved, row["rw"], identities))
     require(len({row["destination"] for row in checked}) == len(checked), "duplicate mount destination")
+    # Container destinations retain their supplied path hierarchy even when host symlinks resolve sources
+    # outside it. Check that namespace without host identities, then conjoin resolved source/identity safety.
+    _check_mount_overlap([(Path(row["destination"]), row["rw"], {}) for row in checked])
+    _check_mount_overlap(boundaries)
     return sorted(checked, key=lambda row: row["source"])
 
 
@@ -398,7 +487,7 @@ def _planned_mounts(*, run, project, source, python_prefix, live_checkouts, home
     checked = []
     for value, label, rw in requested:
         path = _absolute(value, label)
-        _system_mount(path, [owner for owner, _, is_home in protected if is_home])
+        _system_mount(path, [owner for owner, _, kind in protected if kind == "home"])
         for ancestor in (path, *path.parents):
             try:
                 info = os.lstat(ancestor)
@@ -408,13 +497,10 @@ def _planned_mounts(*, run, project, source, python_prefix, live_checkouts, home
         # --mount uses comma-separated fields; these characters would change its meaning or make bad argv.
         require(not any(char in str(path) for char in (",", ":", "\n", "\r")),
                 "mount source contains an unsupported character: " + str(path))
-        path, identities = _owner_exclusions(Path(os.path.realpath(path)), protected)
+        path, identities = _owner_exclusions(_canonical_path(path), protected)
         _trusted_source(path, private_groups)
         checked.append((path, rw, identities))
-    for index, (path, rw, identities) in enumerate(checked):
-        for other, other_rw, other_ids in checked[index + 1:]:
-            require(rw == other_rw or not _overlap(path, other, identities, other_ids),
-                    "read-write and read-only mounts overlap: %s and %s" % (path, other))
+    _check_mount_overlap(checked)
     rows = {(str(path), rw) for path, rw, _ in checked}
     return [{"source": path, "destination": path, "rw": rw} for path, rw in sorted(rows)]
 
@@ -463,7 +549,7 @@ def _valid_user_record(value):
 
 
 def _container_isolation(isolation, run):
-    value = read_isolation(isolation, run=run, home=Path.home())
+    value = read_isolation(isolation, run=run, home=_home())
     require(value is not None, "container isolation is required")
     return value
 
@@ -1052,8 +1138,10 @@ def _namespace_witnesses(host, expected, requested_bad):
             actual_ok = _keep_id(host, expected["user"]) if podman else host.get(key) == ""
         elif flag == "--network":
             actual_ok = host.get(key) == NETWORK_MODE
+        elif flag == "--pid" and not podman:
+            actual_ok = host.get(key) in ("", "private")  # Docker alone admits the private PID default.
         else:
-            actual_ok = host.get(key) in ("", "private")
+            actual_ok = host.get(key) == "private"
         if not actual_ok or label in requested_bad:
             bad.append(label)
     return bad
@@ -1141,7 +1229,11 @@ def _plan(config):
     if "isolation" in config:
         require(isinstance(config["isolation"], dict), "isolation must be a JSON object")
         require(config.get("schema") == "aegis.team-run/v2", "isolation requires schema aegis.team-run/v2")
-    isolation = read_isolation(config.get("isolation"), run=config.get("run"), home=Path.home())
+    raw = config.get("isolation")
+    # Host parsing never uses a home. Keep the placeholder on that branch instead of looking up the owner
+    # before read_isolation can return None; container validation retains the real lookup and its refusals.
+    home = _home() if raw is not None and raw.get("mode") == "container" else "/"
+    isolation = read_isolation(raw, run=config.get("run"), home=home)
     if isolation is None:
         return {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
     recipes = config.get("recipes")
@@ -1149,7 +1241,7 @@ def _plan(config):
     python = _absolute(recipes.get("python"), "recipes.python")
     require(python.parent.name == "bin", "recipes.python must be in a Python or venv bin directory")
     prefix = _absolute(config.get("python_prefix", str(python.parent.parent)), "python_prefix")
-    _system_mount(prefix, (Path.home(),))
+    _system_mount(prefix, (_home(),))
     if "python_prefix" not in config:
         try:
             marker = os.stat(prefix / "pyvenv.cfg")
@@ -1159,7 +1251,7 @@ def _plan(config):
                 "python_prefix requires pyvenv.cfg or an explicit config key")
     plan = mount_plan(run=config.get("run"), project=config.get("project"),
                       source=config.get("source", str(HERE.parent)), python_prefix=prefix,
-                      live_checkouts=config.get("live_checkouts", []), home=Path.home())
+                      live_checkouts=config.get("live_checkouts", []), home=_home())
     return {"mode": "container", "isolation": isolation, "mounts": plan,
             "run": str(_absolute(config["run"], "run")),
             "create_argv": create_argv(isolation, run=config["run"], mounts=plan)}

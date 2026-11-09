@@ -2,7 +2,7 @@
 
 C1 supplies a library and a read-only planning/verification CLI. It does not yet change `aegis team`, start a
 container, check engine availability, or build an image. Team config/init integration arrives in C3 and run
-lifecycle integration in C4. Missing isolation keeps host mode.
+lifecycle integration in C4. Missing isolation keeps host mode, which requires no owner-home lookup.
 
 ## Prerequisites
 
@@ -18,8 +18,11 @@ lifecycle integration in C4. Missing isolation keeps host mode.
   resolved targets too. Named entries are probed with `lstat`; only confirmed absence is treated as missing.
   Unreadable or failed secret metadata refuses, including when an owner home cannot be searched. Planning never
   creates or enumerates secret paths. Source-symlink and inferred-venv marker checks also refuse metadata errors
-  rather than treating them as missing paths. Path-resolution recursion limits refuse too: shorten or revalidate
-  the symlink chain. Builders return a mount-row validation error, and verification reports `mounts`, including
+  rather than treating them as missing paths. Each path resolution permits at most 40 total logical symlink
+  follows, including repeated links in an acyclic graph; exceeding this budget raises `ELOOP`. Completed
+  resolutions are memoized within that call, with their logical follow costs still charged to the budget.
+  Shorten or revalidate a refused chain. Builders return a mount-row validation error, and verification reports
+  `mounts`, including
   for forged expected rows and recorded requests; these failures never establish a safe bind.
   Every existing source component, from `/` down, must be owned by root or the effective user. Write-bit checks
   apply to ancestors, since a leaf's write permission cannot replace its own directory entry. Effective group
@@ -48,7 +51,9 @@ in `0..7`. Named entries require a mask. Owner/other permissions must match thei
 must match the mask when present or the owning-group entry otherwise. ACL failures are refusals, never absence.
 
 Keep the runtime source and Python/venv separate from the writable run/project: read-only and read-write mounts
-may not overlap. For example, use `/srv/aegis-runs/demo`, `/srv/aegis-projects/demo`, `/opt/aegis-runtime`,
+may not overlap in either the supplied container destinations or the resolved host sources and their identities.
+A symlinked child that resolves outside a parent still has a nested supplied destination and cannot cross the
+access boundary. For example, use `/srv/aegis-runs/demo`, `/srv/aegis-projects/demo`, `/opt/aegis-runtime`,
 `/opt/aegis-python` and `/srv/live-project`. Non-secret paths inside owner homes are allowed, including project
 clones and venvs under `~/Documents`. The adapter checks real paths and directory identities of every existing
 ancestor to reject aliases of home/secret roots and their represented ancestors, including missing tails. A bind
@@ -56,7 +61,15 @@ of a secret's descendant is not discovered without its original ancestors. Plann
 under trusted private ancestors; executing the plan requires preparing them first and recomputing the plan.
 
 An inferred Python prefix must contain `pyvenv.cfg`. Otherwise set the explicit top-level `python_prefix` key.
-Mounts of `/` and any owner home's `.local` refuse. Any mount equal to or containing an image system directory
+Mounts of `/` and any owner home's `.local` refuse. A mount containing a relocated `.local` also refuses:
+if `~/.local` links to `~/dotfiles/.local`, mounting `~/dotfiles` refuses. Symlink aliases of relocated or dangling
+roots are resolved with the strict metadata handling below. Identity aliases of an **existing `.local` leaf** also
+refuse. Owner-created host bind aliases of a missing `.local` or its ancestors are outside the threat model;
+see [Protection and limits](#protection-and-limits). Descendants such as `~/.local/share/x` remain allowed under
+the other mount rules. Canonicalization probes components with `lstat` and reads symlink targets explicitly,
+tolerating only confirmed ENOENT for missing tails. Intermediate metadata errors, cycles and non-directory
+traversals refuse; a dangling link cannot hide an unreadable intermediate component.
+Any mount equal to or containing an image system directory
 also refuses: `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr`, `/etc`, `/var`, `/opt`, `/run`, `/proc`, `/sys`, `/dev`,
 `/tmp`. Any mount equal to or inside a protected image tree refuses as well: `/bin`, `/sbin`, `/lib`, `/lib32`,
 `/lib64`, `/libx32`, `/usr` (including all of `/usr/local`), `/etc`, `/boot`, `/proc`, `/sys`, `/run`, `/dev`
