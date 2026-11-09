@@ -34,8 +34,10 @@ The orchestrator predicts `expected_tree` with the runner's pinned config and no
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c merge.renames=true -c merge.directoryRenames=false \
     -c merge.renameLimit=7000 -c merge.renormalize=false merge-tree --write-tree <commit> <merge>
 
-A heavy job takes a ledger slot, and processes the
-census finds outside the ledger count against the same limit. A slot is freed only with evidence: a
+A heavy job takes a ledger slot, and by default processes the
+census finds outside the ledger count against the same limit. Recipes reviewed through check-recipes can instead
+report or ignore outside load with census_outside_policy for this pass's own jobs. Pass run-open
+--expect-recipes-sha256 to enforce the reviewed recipes hash before admission. A slot is freed only with evidence: a
 lost runner leaves `unknown` and keeps the slot until root runs `resolve`.
 
 Every result lands in `<store>/jobs/<initiative>/<message-id>/` before its receipt goes out, so a
@@ -81,7 +83,7 @@ from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, SHA256, SLUG,
                                publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                status_entries, writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
-from hierarchy_workspace import (Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
+from hierarchy_workspace import (MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
                                  verify_evidence)
 
 
@@ -110,6 +112,10 @@ MAX_PATHS_BYTES = 65536
 MAX_STEPS = 20
 MAX_RESULT_BYTES = 4194304
 MAX_JOBS_DEFAULT = 20
+# Outside observations are a bounded, PID-only view; counting always uses the full list.
+MAX_OUTSIDE_ROWS = 64
+MAX_CENSUS_RECORD_BYTES = 8192
+CENSUS_REQUEST_ID = re.compile(r"req-[0-9]{8}")
 MAX_TIMEOUT_SECONDS = 86400
 DEFAULT_LOCK_WAIT_SECONDS = 30.0
 # A leading dash would become an option, and pathspec and glob characters would widen what is named.
@@ -249,9 +255,14 @@ def existing_folders(value, label):
 def load_recipes(path):
     raw = read_bytes(path)
     recipes = strict_json(raw.decode("utf-8"))
-    fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
+    fields(recipes, {"schema", "python", "path", "recipes"},
+           {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes", "census_outside_policy"})
     if "min_free_gigabytes" in recipes:
         integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
+    if "census_outside_policy" in recipes:
+        policy = recipes["census_outside_policy"]
+        require(isinstance(policy, str) and policy in ("count", "report", "ignore"),
+                "invalid census_outside_policy: expected count, report or ignore")
     require(recipes["schema"] == RECIPES_SCHEMA, "unsupported recipes schema")
     require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
     strings(recipes["path"], "path", nonempty=True)
@@ -946,13 +957,14 @@ def check_dependency(store, initiative, message, packet, recipes):
         raise DependencyPending(str(exc), "dependency_held") from exc
 
 
-def pending_dependency(store, job, exc, wait, recipes_sha256):
+def pending_dependency(store, job, exc, wait, recipes_sha256, *, outside_policy=None):
     """A reserved job needs a durable no-effect refusal, not an orphaned slot or release from absence."""
     try:
         if any(r["holder"] == job.holder and r["state"] in ("queued", "granted")
                for r in store.load().requests.values()):
             # refuse takes the exclusive claim first. A competing runner keeps its claim and capacity.
-            return refuse(store, job, "dependency changed after capacity admission: " + str(exc), wait, recipes_sha256)
+            return refuse(store, job, "dependency changed after capacity admission: " + str(exc), wait, recipes_sha256,
+                          outside_policy=outside_policy)
         return exc.row(job)
     except ERRORS as failure:
         return blocked_row(job, failure)
@@ -975,6 +987,9 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
     name = packet["recipe"]
     require(isinstance(name, str) and name in recipes["recipes"], "unknown recipe: " + str(name)[:128])
     recipe = recipes["recipes"][name]
+    if job is not None:
+        job.census_kind = job_kind(recipe) if is_heavy(recipe) else "none"
+        job.census_policy = recipes.get("census_outside_policy")
     kind = recipe["kind"]
     derive = "derive" in packet
     if derive:
@@ -1213,6 +1228,13 @@ class Job:
         self.process_path = self.folder / "process.json"
         self.execution_path = self.folder / "execution.json"
         self.admission_owned = False
+        self.census_capacity = None
+        self.census_request_id = None
+        self.census_kind = None
+        self.census_policy = None
+        self.census_publication = None
+        self.census_requests = None
+        self.written_result = None
 
     def result(self):
         """Read with the same limit it was written with, or a valid large result could never be settled."""
@@ -1271,8 +1293,10 @@ class Job:
         except FileExistsError:
             return False
         ticks = process_start(os.getpid())
+        extra = ({"census_kind": self.census_kind}
+                 if self.census_policy is not None and self.census_kind is not None else {})
         publish_file(self.claim_path, encoded({"pid": os.getpid(), "start": ticks, "job": self.id, "at": timestamp(),
-                                             "process_scope": process_scope(), "recipes_sha256": recipes_sha256}) + b"\n")
+                                             "process_scope": process_scope(), "recipes_sha256": recipes_sha256, **extra}) + b"\n")
         if packet_raw is not None:
             publish_file(self.folder / "packet.md", packet_raw)
         return True
@@ -1480,14 +1504,17 @@ def settle(store, job, wait):
     row = {"job": job.id, "state": state, "exit_code": result["exit_code"], "result": str(job.result_path)}
     if result.get("reason"):
         row["reason"] = result["reason"]
-    return row
+    return census_result_row(row, job)
 
 
 def write_result(job, state, exit_code, *, reason=None, recipe=None, steps=(), before=None, after=None, commit=None, **extra):
+    if job.census_capacity is not None:
+        extra["capacity"] = job.census_capacity
     result = {"schema": RESULT_SCHEMA, "job": job.id, "state": state, "exit_code": exit_code, "reason": reason,
               "recipe": recipe, "steps": list(steps), "before": before, "after": after, "commit": commit,
               "finished_at": timestamp(), **extra}
     publish_file(job.result_path, encoded(result) + b"\n", limit=MAX_RESULT_BYTES)
+    job.written_result = result
 
 
 def remove_work_folders(job, names=CLEANUP_FOLDERS):
@@ -1560,11 +1587,13 @@ def keep_evidence(job, keep):
     return rows
 
 
-def refuse(store, job, reason, wait, recipes_sha256=None):
+def refuse(store, job, reason, wait, recipes_sha256=None, *, outside_policy=None):
+    job.census_policy = outside_policy
     if not job.admission_owned and not job.take_execution(None, recipes_sha256):
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     if job.admission_owned:
         check_settlement_processes(job, {"steps": []})
+    job.census_capacity = job_grant_census(store, job, policy=outside_policy)
     write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256, **derivation_provenance(job))
     return settle(store, job, wait)
 
@@ -1961,6 +1990,8 @@ def checkout_state(checkout, commit, created, view):
 
 def run_job(store, job, packet, packet_raw, recipes, wait):
     recipe = recipes["recipes"][packet["recipe"]]
+    job.census_kind = job_kind(recipe) if is_heavy(recipe) else "none"
+    job.census_policy = recipes.get("census_outside_policy")
     if packet["schema"] == DEPENDENT_PACKET_SCHEMA:
         # Capacity may have delayed this request. Revalidate before taking an irreversible execution claim.
         try:
@@ -1968,13 +1999,15 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
                 check_dependency(store, job.initiative, job.message, packet, recipes)
                 claimed = job.take_execution(packet_raw, recipes["recipes_sha256"])
         except DependencyPending as exc:
-            return pending_dependency(store, job, exc, wait, recipes["recipes_sha256"])
+            return pending_dependency(store, job, exc, wait, recipes["recipes_sha256"],
+                                      outside_policy=recipes.get("census_outside_policy"))
     else:
         claimed = job.take_execution(packet_raw, recipes["recipes_sha256"])
     if not claimed:
         if packet.get("derived_by") == "runner" and job.result_path.exists():
             return settle(store, job, wait)
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
+    job.census_capacity = job_grant_census(store, job, job.census_kind, job.census_policy)
     mailbox = Mailbox(job.initiative["mailbox_root"])
     checkout = packet["checkout"]
     view = MERGE_VIEW_ENV if recipe["kind"] == "merge" else None
@@ -2134,7 +2167,7 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
 
 
 def blocked_row(job, exc):
-    return {"job": job.id, "state": "settle_pending", "error": str(exc)[:2048]}
+    return census_result_row({"job": job.id, "state": "settle_pending", "error": str(exc)[:2048]}, job)
 
 
 def visit_existing(store, job, wait):
@@ -2216,11 +2249,13 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
                              "process_alive": None, "reason": str(exc)})
                 continue
             except DependencyPending as exc:
-                rows.append(pending_dependency(store, job, exc, wait, recipes["recipes_sha256"]))
+                rows.append(pending_dependency(store, job, exc, wait, recipes["recipes_sha256"],
+                                               outside_policy=recipes.get("census_outside_policy")))
                 continue
             except ERRORS as exc:
                 try:
-                    rows.append(refuse(store, job, str(exc), wait, recipes["recipes_sha256"]))
+                    rows.append(refuse(store, job, str(exc), wait, recipes["recipes_sha256"],
+                                       outside_policy=recipes.get("census_outside_policy")))
                 except ERRORS as failure:
                     rows.append(blocked_row(job, failure))
                 continue
@@ -2258,25 +2293,50 @@ def fixture_roots(fixture, kind):
     return sorted(roots.get(kind, []))
 
 
-def census(store_path, ledger, fixture, kind):
+def census(store_path, ledger, fixture, kind, outside_policy=None):
+    """Observe a kind's capacity; absent policy keeps the raw count view, including recovery-status.
+
+    check-recipes shows explicit policies and marks non-default values; job results record recipes_sha256.
+    run-open can enforce the reviewed hash with --expect-recipes-sha256. Known gap: the team loop does not yet
+    pass that flag, so reviewers must compare the init and result hashes there. The policy comes from recipes,
+    including templates selected by team configuration, not env or job packets. Under the grant lock, run_kind
+    applies report/ignore only when the next eligible holder belongs to this pass; otherwise it counts outside
+    load. Relaxed admission knowingly accepts outside load, including another team's work or a container seeing
+    only its own namespace (container spec amendment 7). Count stays the default.
+    """
     held = ledger.held(kind)
+    view = {"limit": ledger.limits[kind], "held": len(held), "external_roots": [],
+            "census": "fixture" if fixture is not None else "proc"}
+    if outside_policy == "ignore":
+        # Do not read the fixture or walk /proc for outside roots under this reviewed policy.
+        view["census"] = "none"
+        return {**view, "outside_policy": "ignore"}
     if fixture is not None:
-        return {"limit": ledger.limits[kind], "held": len(held), "external_roots": fixture_roots(fixture, kind),
-                "census": "fixture"}
-    owners = set()
-    # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
-    for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
-        if request["holder"].startswith("job:"):
-            claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
-            if claim.exists():
-                record = read_json(claim)
-                require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
-                        and type(record.get("pid")) is int and record["pid"] > 0
-                        and isinstance(record.get("start"), str) and record["start"].isdigit(),
-                        "invalid runner claim: " + request["holder"][4:])
-                if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
-                    owners.add(record["pid"])
-    return {"limit": ledger.limits[kind], "held": len(held), "external_roots": outside_roots(owners, kind), "census": "proc"}
+        roots = fixture_roots(fixture, kind)
+    else:
+        owners = set()
+        # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
+        for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
+            if request["holder"].startswith("job:"):
+                claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
+                if claim.exists():
+                    record = read_json(claim)
+                    require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
+                            and type(record.get("pid")) is int and record["pid"] > 0
+                            and isinstance(record.get("start"), str) and record["start"].isdigit(),
+                            "invalid runner claim: " + request["holder"][4:])
+                    if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
+                        owners.add(record["pid"])
+        roots = outside_roots(owners, kind)
+    view["external_roots"] = [] if outside_policy == "report" else roots
+    if outside_policy is not None:
+        require(all(type(pid) is int and pid > 0 for pid in roots), "invalid census fixture pid")
+        view["outside_policy"] = outside_policy
+        view["outside"] = [{"pid": pid, "class": "pytest" if kind == "heavy" else "cargo"}
+                           for pid in sorted(roots)[:MAX_OUTSIDE_ROWS]]
+        if len(roots) > MAX_OUTSIDE_ROWS:
+            view["outside_truncated"] = len(roots) - MAX_OUTSIDE_ROWS
+    return view
 
 
 def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=False):
@@ -2286,6 +2346,218 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
                    if job_kind(recipes["recipes"][entry[1]["recipe"]]) == kind}
         budget = run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy)
     return budget
+
+
+def census_request_id(value):
+    return value if isinstance(value, str) and CENSUS_REQUEST_ID.fullmatch(value) else "invalid_request_id"
+
+
+def census_record_path(store, request_id):
+    # Ledger replay predates this file format and does not validate request IDs as path components.
+    reference = census_request_id(request_id)
+    require(reference != "invalid_request_id", "invalid census request id")
+    return safe_path(store.path / "census" / (reference + ".json"))
+
+
+def validate_census_record(record, request):
+    fields(record, {"request_id", "holder", "kind", "capacity"})
+    require(census_request_id(record["request_id"]) != "invalid_request_id", "invalid census request id")
+    require(all(record[key] == request[key] for key in ("request_id", "holder", "kind")),
+            "census record does not match its grant")
+    require(record["kind"] in HEAVY_KINDS, "invalid census record kind")
+    view = record["capacity"]
+    fields(view, {"outside_policy", "census", "limit", "held", "external_roots"},
+           {"outside", "outside_truncated", "outside_policy_applied"})
+    policy = view["outside_policy"]
+    require(isinstance(policy, str) and policy in ("count", "report", "ignore"), "invalid census record policy")
+    if "outside_policy_applied" in view:
+        require(view["outside_policy_applied"] == "count" and policy == "count", "invalid applied census record policy")
+    limit = integer(view["limit"], "census limit", maximum=MAX_HEAVY if record["kind"] == "heavy" else MAX_HEAVY_TESTS)
+    integer(view["held"], "census held", minimum=0, maximum=limit - 1)
+    roots = view["external_roots"]
+    require(isinstance(roots, list) and len(roots) < limit
+            and all(type(pid) is int and pid > 0 for pid in roots) and roots == sorted(roots),
+            "invalid census record roots")
+    if policy == "ignore":
+        require(view["census"] == "none" and roots == [] and "outside" not in view
+                and "outside_truncated" not in view, "invalid ignored census record")
+        return view
+    require(view["census"] in ("fixture", "proc"), "invalid census record source")
+    outside = view.get("outside")
+    require(isinstance(outside, list) and len(outside) <= MAX_OUTSIDE_ROWS, "invalid census record outside rows")
+    for row in outside:
+        fields(row, {"pid", "class"})
+        require(type(row["pid"]) is int and row["pid"] > 0
+                and row["class"] == ("pytest" if record["kind"] == "heavy" else "cargo"),
+                "invalid census record outside row")
+    pids = [row["pid"] for row in outside]
+    require(pids == sorted(pids), "unsorted census record outside rows")
+    if "outside_truncated" in view:
+        integer(view["outside_truncated"], "census truncation", maximum=2 ** 63 - 1)
+        require(len(outside) == MAX_OUTSIDE_ROWS, "invalid census record truncation")
+    if policy == "report":
+        require(roots == [], "report census record counts outside roots")
+    else:
+        require(roots == pids and "outside_truncated" not in view and view["held"] + len(roots) < limit,
+                "count census record does not match its roots")
+    return view
+
+
+def census_marker(request, policy, census="unrecorded", reason=None):
+    marker = {"census": census, "request_id": census_request_id(request.get("request_id"))}
+    if policy is not None:
+        marker = {"outside_policy": policy, **marker}
+    if reason is not None:
+        marker["reason"] = reason
+    if census == "publish_failed":
+        marker["publish_failed"] = True
+    return marker
+
+
+def read_census_record_bytes(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(safe_path(path), flags)
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= MAX_CENSUS_RECORD_BYTES,
+                "census record is not a regular file within its limit")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_CENSUS_RECORD_BYTES + 1)
+        require(len(raw) <= MAX_CENSUS_RECORD_BYTES, "census record exceeds size limit")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def read_grant_census(store, request, policy=None):
+    marker = census_marker(request, policy)
+    if marker["request_id"] == "invalid_request_id":
+        return {**marker, "census": "invalid_record", "reason": "invalid_request_id"}
+    try:
+        path = census_record_path(store, request["request_id"])
+        try:
+            raw = read_census_record_bytes(path)
+        except FileNotFoundError:
+            return marker if policy is not None else None
+        return validate_census_record(strict_json(raw.decode("utf-8")), request)
+    except ERRORS:
+        # Do not echo attacker-written keys, values, filenames or parser excerpts into a result.
+        return {**marker, "census": "invalid_record",
+                "reason": "Grant census record failed strict validation; inspect census/<request_id>.json."}
+
+
+def publish_grant_census(store, request, view):
+    if census_request_id(request.get("request_id")) == "invalid_request_id":
+        return census_marker(request, view["outside_policy"], "invalid_record", "invalid_request_id")
+    try:
+        record = {key: request[key] for key in ("request_id", "holder", "kind")}
+        record["capacity"] = view
+        validate_census_record(record, request)
+        path = census_record_path(store, request["request_id"])
+        raw = encoded(record) + b"\n"
+        try:
+            publish_file(path, raw, limit=MAX_CENSUS_RECORD_BYTES)
+        except FileExistsError:
+            # A retry must match bytes, not merely the record's shape. Preserve conflicting files untouched.
+            if read_census_record_bytes(path) != raw:
+                return census_marker(request, view["outside_policy"], "invalid_record", "conflict")
+    except ValueError:
+        return census_marker(request, view["outside_policy"], "invalid_record", "invalid_record")
+    except ERRORS:
+        # The grant is already durable. Audit I/O cannot abort the pass, and raw OS errors may contain paths.
+        return census_marker(request, view["outside_policy"], "publish_failed", "publish_failed")
+    return None
+
+
+def job_grant_census(store, job, kind=None, policy=None):
+    # Legacy stores pay no ledger replay for an optional feature they have never used. A retained grant record,
+    # however, belongs to the grant even if an executor later changes or removes its recipes policy.
+    try:
+        if policy is None and not (store.path / "census").exists():
+            return None
+        kind = kind if kind is not None else job.census_kind
+        if kind is None and job.claim_path.exists():
+            kind = read_json(job.claim_path).get("census_kind")
+        if kind not in HEAVY_KINDS:
+            return None
+        requests = job.census_requests
+        if requests is None:
+            requests = store.load().requests.values()
+        grants = [r for r in requests if r["holder"] == job.holder and r["state"] == "granted" and r["kind"] == kind]
+        if not grants:
+            return None
+        if policy is None:
+            # Only this job's records activate historical provenance; unrelated files never change legacy bytes.
+            references = [census_request_id(r["request_id"]) for r in grants]
+            if not any(reference != "invalid_request_id" and
+                       os.path.lexists(store.path / "census" / (reference + ".json")) for reference in references):
+                return None
+        if len(grants) > 1:
+            return census_marker({}, policy, "invalid_record", "ambiguous_grant")
+        request = grants[0]
+        job.census_request_id = census_request_id(request["request_id"])
+        if job.census_request_id == "invalid_request_id":
+            return census_marker(request, policy, "invalid_record", "invalid_request_id")
+        publication = job.census_publication
+        if publication is not None:
+            if census_request_id(publication.get("request_id")) == job.census_request_id:
+                return publication
+            return census_marker(request, policy, "invalid_record", "invalid_record")
+        return read_grant_census(store, request, policy)
+    except ERRORS:
+        # An unavailable lookup does not prove that this job was granted or had an audit record.
+        return None
+
+
+def census_summary(view, request_id=None):
+    # Sorts after every actionable row field in the loop's 512-character JSON prefix. No PID lists or free text.
+    summary = {key: view[key] for key in ("outside_policy", "outside_policy_applied", "census", "limit", "held") if key in view}
+    summary.update({"external_roots_count": len(view.get("external_roots", [])),
+                    "outside_count": len(view.get("outside", [])) + view.get("outside_truncated", 0),
+                    "outside_truncated": view.get("outside_truncated", 0)})
+    if view["census"] in ("unrecorded", "invalid_record", "publish_failed"):
+        summary.update({key: None for key in ("external_roots_count", "outside_count", "outside_truncated")})
+    if view.get("publish_failed") is True:
+        summary["publish_failed"] = True
+    if view.get("reason") in ("publish_failed", "conflict", "ambiguous_grant", "invalid_request_id"):
+        summary["reason"] = view["reason"]
+    if request_id is not None:
+        summary["request_id"] = census_request_id(request_id)
+    return summary
+
+
+def census_result_row(row, job):
+    # Only a result atomically published by this Job instance can add a summary to this pass's row.
+    result = job.written_result
+    if result is not None and result.get("capacity") is not None:
+        row["z_census"] = census_summary(result["capacity"], job.census_request_id)
+    return row
+
+
+def admission_outside_policy(ledger, kind, waiting, policy):
+    if policy not in ("report", "ignore"):
+        return policy
+    # Match hierarchy_workspace.grant_next's eligibility and (priority, seq) ordering exactly, on its locked
+    # snapshot. No public selection helper exists. Tied keys are ambiguous even if min() would pick one.
+    eligible = []
+    for request in ledger.requests.values():
+        if request["kind"] != kind or request["state"] != "queued":
+            continue
+        initiative = ledger.initiatives[request["initiative"]]
+        blockers = ledger.unresolved(initiative)
+        if initiative["state"] == "active" and not blockers:
+            eligible.append(request)
+    if not eligible:
+        return "count"
+
+    def order(request):
+        return ledger.initiatives[request["initiative"]]["priority"], request["seq"]
+
+    chosen = min(eligible, key=order)
+    chosen_key = order(chosen)
+    if sum(order(request) == chosen_key for request in eligible) != 1 or chosen["holder"] not in waiting:
+        return "count"
+    return policy
 
 
 def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy):
@@ -2298,6 +2570,8 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             held_reason = "low_disk"
             break
         ledger = store.load()
+        census_requests = ledger.requests.values()
+        publication = None
         granted = next((holder for holder in waiting
                         if any(r["holder"] == holder and r["state"] == "granted" for r in ledger.requests.values())), None)
         if granted is None:
@@ -2306,7 +2580,12 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             def outside(locked):
                 # Counted under the store lock, together with the grant, so another runner cannot take the
                 # same free slot between this count and the grant.
-                seen.update(census(store.path, locked, fixture, kind))
+                seen.clear()
+                policy = recipes.get("census_outside_policy")
+                applied = admission_outside_policy(locked, kind, waiting, policy)
+                seen.update(census(store.path, locked, fixture, kind, applied))
+                if applied != policy:
+                    seen["outside_policy_applied"] = applied
                 return seen["external_roots"]
 
             try:
@@ -2321,19 +2600,32 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                 held_reason = answer.get("reason", "not_granted")
                 break
             granted = answer["granted"]["holder"]
+            census_requests = [answer["granted"]]
+            request_id = census_request_id(answer["granted"]["request_id"])
+            if "census_outside_policy" in recipes:
+                publication = publish_grant_census(store, answer["granted"], seen)
             if granted not in waiting:
-                rows.append({"state": "granted_elsewhere", "holder": granted, "request_id": answer["granted"]["request_id"]})
+                row = {"state": "granted_elsewhere", "holder": granted, "request_id": request_id}
+                if "census_outside_policy" in recipes:
+                    row["z_census"] = census_summary(publication or seen, request_id)
+                rows.append(row)
                 continue
         job, packet, raw = waiting.pop(granted)
+        job.census_publication = publication
+        job.census_requests = census_requests
         budget -= 1
         try:
-            rows.append(run_job(store, job, packet, raw, recipes, wait))
+            row = run_job(store, job, packet, raw, recipes, wait)
         except ERRORS as exc:
-            rows.append(blocked_row(job, exc))
+            row = blocked_row(job, exc)
+        rows.append(row)
     for job, _, _ in waiting.values():
         row = {"job": job.id, "state": "waiting", "kind": kind, "reason": held_reason or "job_limit"}
         if capacity is not None:
-            row["capacity"] = capacity
+            if "census_outside_policy" in recipes:
+                row["z_census"] = census_summary(capacity)
+            else:
+                row["capacity"] = capacity
         rows.append(row)
     return budget
 
@@ -2341,9 +2633,13 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
 NEEDS_ROOT = {"waiting", "running", "abandoned", "settle_pending", "mailbox_error", "granted_elsewhere"}
 
 
-def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait):
+def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait, expect_recipes_sha256=None):
     require(type(max_jobs) is int and max_jobs > 0, "invalid max-jobs")
     recipes = load_recipes(recipes_path)
+    if expect_recipes_sha256 is not None:
+        matching(expect_recipes_sha256, SHA256, "expected recipes sha256")
+        require(recipes["recipes_sha256"] == expect_recipes_sha256,
+                "recipes changed since team init; re-run the reviewed team init")
     require(Path("/proc/self/stat").exists(), "the job runner needs /proc")
     store = Store(store_path)
     ledger = store.load()
@@ -2405,6 +2701,7 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
         recipes_sha256 = read_json(job.claim_path).get("recipes_sha256")
         require(recipes_sha256 is None or (isinstance(recipes_sha256, str) and SHA256.fullmatch(recipes_sha256) is not None),
                 "invalid recipes_sha256 in the claim of job: " + identifier)
+        job.census_capacity = job_grant_census(store, job)
         write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
                      process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256, **derivation_provenance(job))
     return 0, settle(store, job, wait)
@@ -2629,6 +2926,7 @@ def main(argv=None):
     opened = commands.add_parser("run-open", help="Run every job request that can run now")
     opened.add_argument("--initiative", action="append", default=[], help="Only this initiative; can repeat")
     opened.add_argument("--max-jobs", type=int, default=MAX_JOBS_DEFAULT)
+    opened.add_argument("--expect-recipes-sha256", help="Refuse changed recipes; pass the reviewed init hash")
     recovery = commands.add_parser("recovery-status", help="Read retained reservations, source and unknown job effects")
     recovery.add_argument("--initiative", action="append", default=[])
     commands.add_parser("check-recipes", help="Validate the recipe file and summarize it")
@@ -2671,8 +2969,13 @@ def main(argv=None):
                                                       "expects_tests": recipe.get("expects_tests", False),
                                                       "export_git": recipe.get("export_git", False)}
                                                for name, recipe in recipes["recipes"].items()}}
+                if "census_outside_policy" in recipes:
+                    result["census_outside_policy"] = recipes["census_outside_policy"]
+                    if recipes["census_outside_policy"] != "count":
+                        result["census_outside_policy_non_default"] = True
             else:
-                code, result = run_open(args.store, args.recipes, args.initiative, args.max_jobs, args.census_fixture, args.lock_wait)
+                code, result = run_open(args.store, args.recipes, args.initiative, args.max_jobs, args.census_fixture,
+                                        args.lock_wait, args.expect_recipes_sha256)
     except ERRORS as exc:
         code, result = 2, {"error": str(exc)}
     print(json.dumps(result, sort_keys=True))
