@@ -571,6 +571,705 @@ def test_a_full_ledger_makes_the_job_wait(shop):
     assert shop.receipts("job-1") == []
 
 
+JOB_HOLDER = "job:pilot/job-1"
+# (kind the job asks for, another kind its holder already has). Each kind is a slot class of its own.
+OTHER_KIND_CASES = [("heavy", "writer"), ("heavy", "heavy-tests"), ("heavy-tests", "writer"), ("heavy-tests", "heavy")]
+
+
+@pytest.fixture
+def kind_shop(tmp_path_factory):
+    # A fresh, uniquely named store per case; nothing is keyed to a reusable path.
+    return Shop(tmp_path_factory.mktemp("jobs-kind-" + uuid.uuid4().hex))
+
+
+def request_kind_job(shop, kind):
+    """Job "job-1" asks for `kind`; its only side effect is shop.sentinel, written only if its command runs."""
+    touch = "open(%r, 'a').write('ran\\n')" % str(shop.sentinel)
+    shop.recipes["recipes"]["heavy-touch"] = shop.command(["$python", "-c", touch], heavy=True,
+                                                          heavy_tests=kind == "heavy-tests")
+    shop.save_recipes()
+    shop.request_job("job-1", "heavy-touch")
+
+
+def fill_with_other_holders(shop, kind):
+    """Grant every `kind` slot to a holder that is not the job. Returns their request ids."""
+    taken = []
+    for _ in range(shop.workspace.run("status")["capacity"][kind]["limit"]):
+        taken.append(shop.workspace.ask("pilot", kind, "other-" + uuid.uuid4().hex[:12]))
+        assert shop.workspace.grant(kind)["request_id"] == taken[-1]
+    return taken
+
+
+def hold_only_other_kind(shop, kind, state):
+    """Unlike manual_grant, the job's holder gets nothing of the kind it asks for: only `kind`, queued or granted."""
+    request_id = shop.workspace.ask("pilot", kind, JOB_HOLDER)
+    if state == "granted":
+        assert shop.workspace.grant(kind)["request_id"] == request_id
+    return request_id
+
+
+def ledger_rows(shop, holder=JOB_HOLDER, initiative="pilot"):
+    """The holder's requests filed by `initiative` (None: any), replayed from the event log: request_id -> {kind, state}."""
+    rows = {}
+    states = {"grant": "granted", "release": "released", "withdraw": "withdrawn"}
+    for event in shop.events():
+        data = event["data"]
+        if event["kind"] == "request" and data["holder"] == holder and initiative in (None, data["initiative"]):
+            rows[data["request_id"]] = {"kind": data["kind"], "state": "queued"}
+        elif event["kind"] in states and data.get("request_id") in rows:
+            rows[data["request_id"]]["state"] = states[event["kind"]]
+    return rows
+
+
+def requests_of(shop, kind, holder=JOB_HOLDER):
+    return {identifier: row["state"] for identifier, row in ledger_rows(shop, holder).items() if row["kind"] == kind}
+
+
+def assert_did_not_run(shop, identifier="job-1"):
+    folder = shop.workspace.store / "jobs" / "pilot" / identifier
+    assert not (folder / "result.json").exists() and not (folder / "claim.json").exists()
+    assert not shop.sentinel.exists(), "the job's command ran while its own kind had no free slot"
+    assert shop.receipts(identifier) == [] and identifier in shop.open_jobs()
+
+
+@pytest.mark.parametrize("state", ["granted", "queued"])
+@pytest.mark.parametrize("kind, other", OTHER_KIND_CASES)
+def test_a_reservation_of_another_kind_never_lets_a_job_past_its_own_full_ledger(kind_shop, kind, other, state):
+    shop = kind_shop
+    fill_with_other_holders(shop, kind)
+    other_request = hold_only_other_kind(shop, other, state)
+    request_kind_job(shop, kind)
+    row = next(row for row in shop.run_open(expect=3)["rows"] if row.get("job") == "pilot/job-1")
+    if other in ("heavy", "heavy-tests") and state == "granted":
+        assert (row["state"], row["reason"], row["request_id"]) == ("waiting", "stale_grant", other_request)
+        assert requests_of(shop, kind) == {}, "no second slot while the stale grant is held"
+        assert_did_not_run(shop)
+        return
+    assert (row["state"], row["reason"], row["kind"]) == ("waiting", "capacity_full", kind)
+    assert row["capacity"]["held"] == row["capacity"]["limit"]
+    assert_did_not_run(shop)
+    # The job asked for its own kind even though its holder already had a request of another kind.
+    assert list(requests_of(shop, kind).values()) == ["queued"]
+    other_state = "withdrawn" if other in ("heavy", "heavy-tests") else state
+    assert ledger_rows(shop)[other_request] == {"kind": other, "state": other_state}
+    if other_state == "withdrawn":
+        assert withdrawals(shop)[other_request] == "job runner"
+    shop.run_open(expect=3)
+    assert len(requests_of(shop, kind)) == 1, "a waiting job must not queue its own kind twice"
+    assert_did_not_run(shop)
+
+
+@pytest.mark.parametrize("kind, other", OTHER_KIND_CASES)
+def test_a_job_holding_another_kind_gets_its_own_grant_once_a_slot_frees(kind_shop, kind, other):
+    shop = kind_shop
+    taken = fill_with_other_holders(shop, kind)
+    other_request = hold_only_other_kind(shop, other, "granted")
+    request_kind_job(shop, kind)
+    assert shop.run_open(expect=3)["rows"][0]["state"] == "waiting"
+    if other in ("heavy", "heavy-tests"):
+        assert requests_of(shop, kind) == {}
+        shop.workspace.release(other_request)  # Root's evidence-backed settlement of the stale grant.
+    shop.workspace.release(taken[0])
+    row = shop.run_open()["rows"][0]
+    assert row["state"] == "completed" and shop.sentinel.exists()
+    assert shop.states("job-1") == ["started", "completed"]
+    (own_request, own_state), = requests_of(shop, kind).items()
+    grants = [event["data"]["request_id"] for event in shop.events() if event["kind"] == "grant"]
+    assert own_request in grants, "the job ran on a grant of its own kind, written by the normal grant path"
+    # Settlement is holder-wide: a finished job's one-use holder keeps nothing, so no slot is stranded.
+    assert own_state == "released" and ledger_rows(shop)[other_request]["state"] == "released"
+    released = [event["data"] for event in shop.events() if event["kind"] == "release"
+                and event["data"]["request_id"] in (own_request, other_request)]
+    own_evidence = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "result.json")
+    assert next(data for data in released if data["request_id"] == own_request)["evidence"]["path"] == own_evidence
+    if other == "writer":
+        assert [data["evidence"]["path"] for data in released] == [own_evidence] * 2
+    assert shop.workspace.run("status")["capacity"][kind]["used"] == len(taken) - 1
+
+
+FOREIGN = "intruder"
+
+
+def file_foreign_row(shop, kind, state, holder=JOB_HOLDER):
+    """Another initiative files a request carrying this job's holder. The workspace accepts any holder string and
+    de-duplicates on (kind, holder) across the whole ledger, so the job's own initiative cannot file that kind meanwhile."""
+    shop.workspace.register(FOREIGN)
+    request_id = shop.workspace.ask(FOREIGN, kind, holder)
+    if state == "granted":
+        assert shop.workspace.grant(kind)["request_id"] == request_id
+    return request_id
+
+
+def clear_foreign_row(shop, request_id, state):
+    if state == "granted":
+        shop.workspace.release(request_id)
+    else:
+        shop.workspace.run("withdraw", {"request_id": request_id, "source": "root checked who filed it"})
+
+
+def job_row(answer, identifier="job-1"):
+    return next(row for row in answer["rows"] if row.get("job") == "pilot/" + identifier)
+
+
+def request_dependent(shop, parent, identifier, recipe="touch"):
+    packet = {"schema": "aegis.hierarchy-job-packet/v2", "recipe": recipe, **shop.head(),
+              "recipes_sha256": hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest(),
+              "after": {"message_id": "first-check", "sha256": parent["sha256"]}}
+    return shop.request_job(identifier, recipe, raw=json.dumps(packet))
+
+
+def foreign_touches(shop, request_id):
+    return [event["kind"] for event in shop.events() if event["kind"] in ("grant", "release", "withdraw")
+            and event["data"]["request_id"] == request_id]
+
+
+@pytest.mark.parametrize("state", ["granted", "queued"])
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_another_initiatives_row_carrying_the_jobs_holder_never_admits_the_job(kind_shop, kind, state):
+    shop = kind_shop
+    foreign = file_foreign_row(shop, kind, state)
+    request_kind_job(shop, kind)
+    for _ in range(2):
+        row = job_row(shop.run_open(expect=3))
+        assert (row["state"], row["reason"], row["kind"]) == ("waiting", "holder_conflict", kind)
+        assert (row["request_id"], row["initiative"]) == (foreign, FOREIGN)
+        assert foreign in row["next_action"] and "withdraw or release" in row["next_action"]
+        assert_did_not_run(shop)
+        assert ledger_rows(shop) == {}, "the job filed nothing and borrowed nothing"
+        assert ledger_rows(shop, initiative=FOREIGN)[foreign] == {"kind": kind, "state": state}
+        assert foreign_touches(shop, foreign) == (["grant"] if state == "granted" else [])
+    # Once root clears the foreign row, the job takes the normal path under its own initiative.
+    clear_foreign_row(shop, foreign, state)
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.exists()
+    assert list(ledger_rows(shop).values()) == [{"kind": kind, "state": "released"}]
+
+
+@pytest.mark.parametrize("state", ["granted", "queued"])
+def test_settlement_frees_only_its_own_initiatives_rows_and_reports_a_foreign_one(kind_shop, state):
+    shop = kind_shop
+    foreign = file_foreign_row(shop, "writer", state)
+    request_kind_job(shop, "heavy")
+    assert job_row(shop.run_open())["state"] == "completed"
+    assert list(ledger_rows(shop).values()) == [{"kind": "heavy", "state": "released"}]
+    # The job's result is no evidence about another initiative's row: it is neither released nor withdrawn.
+    assert ledger_rows(shop, initiative=FOREIGN)[foreign] == {"kind": "writer", "state": state}
+    assert foreign_touches(shop, foreign) == (["grant"] if state == "granted" else [])
+    assert shop.run_open()["rows"] == [], "the finished job is not settled again on every pass"
+    report = shop.jobs("recovery-status", expect=3)
+    # The filing initiative retains it; the affected initiative's own foreign_reservation blocker is pinned separately.
+    blocker = next(row for row in report["blockers"]
+                   if row.get("request_id") == foreign and row["reason"] == "retained_reservation")
+    assert (blocker["initiative"], blocker["holder"]) == (FOREIGN, JOB_HOLDER)
+    job = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert job["state"] == "finished"
+    assert [row["initiative"] for row in job["reservations"]] == ["pilot"]
+    assert job["foreign_reservations"] == [{"request_id": foreign, "initiative": FOREIGN, "kind": "writer", "state": state}]
+
+
+def test_a_foreign_row_under_a_predecessors_holder_holds_its_dependent_with_a_named_reason(kind_shop):
+    shop = kind_shop
+    parent = shop.request_job("first-check", "ok")
+    assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+    foreign = file_foreign_row(shop, "writer", "queued", holder="job:pilot/first-check")
+    request_dependent(shop, parent, "job-2")
+    row = job_row(shop.run_open(expect=3), "job-2")
+    assert (row["state"], row["reason"]) == ("waiting", "foreign_reservation")
+    assert foreign in row["detail"] and FOREIGN in row["detail"] and "withdraw or release" in row["detail"]
+    assert_did_not_run(shop, "job-2")
+    clear_foreign_row(shop, foreign, "queued")
+    assert job_row(shop.run_open(), "job-2")["state"] == "completed"
+
+
+def test_a_foreign_row_under_a_pending_dependents_holder_never_refuses_it(kind_shop):
+    shop = kind_shop
+    parent = shop.request_job("first-check", "ok")
+    foreign = file_foreign_row(shop, "writer", "granted", holder="job:pilot/job-2")
+    request_dependent(shop, parent, "job-2")
+    row = job_row(shop.run_open(expect=3), "job-2")
+    # Another initiative's row is not this job's reservation: no terminal refusal, nothing released.
+    assert (row["state"], row["reason"]) == ("waiting", "dependency_pending")
+    assert_did_not_run(shop, "job-2")
+    assert job_row(shop.run_open(), "job-2")["state"] == "completed" and shop.sentinel.exists()
+    assert foreign_touches(shop, foreign) == ["grant"]
+
+
+def ledger_row(**changes):
+    return {"request_id": "req-00000001", "initiative": "pilot", "kind": "heavy", "holder": JOB_HOLDER,
+            "state": "granted", **changes}
+
+
+MALFORMED_ROWS = [None, "row", ["list"], 7, ledger_row(holder=None), ledger_row(holder=7), ledger_row(kind=None),
+                  ledger_row(state=["granted"]), ledger_row(initiative=None),
+                  {key: value for key, value in ledger_row().items() if key != "holder"},
+                  {key: value for key, value in ledger_row().items() if key != "initiative"}]
+
+
+@pytest.mark.parametrize("wide", ["kind", "holder"])
+@pytest.mark.parametrize("malformed", MALFORMED_ROWS, ids=lambda value: repr(value)[:40])
+def test_wide_ledger_lookups_refuse_a_malformed_row_and_exact_lookups_match_nothing_in_it(malformed, wide):
+    jobs = load_jobs_module()
+    good = ledger_row(request_id="req-00000002")
+    filters = {"kind": jobs.ANY_KIND if wide == "kind" else "heavy", "initiative": "pilot", "states": jobs.OPEN_STATES}
+    holder = jobs.ANY_HOLDER if wide == "holder" else JOB_HOLDER
+    with pytest.raises(ValueError, match="malformed ledger request row") as raised:
+        jobs.holder_requests([good, malformed], holder, **filters)
+    assert "event log" in str(raised.value) and "req-" not in str(raised.value)
+    exact = {"kind": "heavy", "initiative": "pilot", "states": jobs.OPEN_STATES}
+    assert jobs.holder_requests([malformed, good], JOB_HOLDER, **exact) == [good]
+
+
+@pytest.mark.parametrize("changes, message", [
+    ({"kind": "Heavy"}, "use one of writer, heavy, heavy-tests, or ANY_KIND"),
+    ({"kind": None}, "use one of writer, heavy, heavy-tests, or ANY_KIND"),
+    ({"kind": ""}, "use one of writer, heavy, heavy-tests, or ANY_KIND"),
+    ({"initiative": ""}, "pass the job's initiative id, or ANY_INITIATIVE"),
+    ({"initiative": None}, "pass the job's initiative id, or ANY_INITIATIVE"),
+    ({"holder": ""}, "pass a holder string, or ANY_HOLDER"),
+    ({"holder": None}, "pass a holder string, or ANY_HOLDER"),
+    ({"states": ()}, "non-empty tuple of queued, granted, released, withdrawn"),
+    ({"states": ["granted"]}, "non-empty tuple of queued, granted, released, withdrawn"),
+    ({"states": ("granted", "held")}, "non-empty tuple of queued, granted, released, withdrawn"),
+])
+def test_holder_requests_refuses_an_unclear_filter_and_says_what_to_pass(changes, message):
+    jobs = load_jobs_module()
+    arguments = {"holder": JOB_HOLDER, "kind": "heavy", "initiative": "pilot", "states": ("granted",), **changes}
+    holder = arguments.pop("holder")
+    with pytest.raises(ValueError, match=message):
+        jobs.holder_requests([ledger_row()], holder, **arguments)
+
+
+def test_holder_requests_has_no_default_kind_or_initiative_and_binds_both():
+    jobs = load_jobs_module()
+    with pytest.raises(TypeError):
+        jobs.holder_requests([ledger_row()], JOB_HOLDER, kind="heavy", states=("granted",))
+    with pytest.raises(TypeError):
+        jobs.holder_requests([ledger_row()], JOB_HOLDER, initiative="pilot", states=("granted",))
+    own, foreign, other = ledger_row(), ledger_row(request_id="req-2", initiative=FOREIGN), ledger_row(kind="writer")
+    rows = [own, foreign, other]
+    assert jobs.holder_requests(rows, JOB_HOLDER, kind="heavy", initiative="pilot", states=("granted",)) == [own]
+    assert jobs.holder_requests(rows, JOB_HOLDER, kind="heavy", initiative=jobs.ANY_INITIATIVE,
+                                states=("granted",)) == [own, foreign]
+    assert jobs.holder_requests(rows, JOB_HOLDER, kind=jobs.ANY_KIND, initiative="pilot",
+                                states=("granted",)) == [own, other]
+
+
+# case: (filing initiative, holder, claim folder under <store>/jobs, the claim's "job", exempt from the census).
+# REFUSED: the census refuses. A claim in a job's own folder that names another job is corruption, not outside load.
+REFUSED = "refused"
+CENSUS_EXEMPTION_CASES = {
+    "own-initiative": ("pilot", JOB_HOLDER, "pilot/job-1", "pilot/job-1", True),
+    "foreign-initiative": (FOREIGN, JOB_HOLDER, "pilot/job-1", "pilot/job-1", False),
+    "holder-names-another-initiative": ("pilot", "job:" + FOREIGN + "/job-1", FOREIGN + "/job-1", FOREIGN + "/job-1", False),
+    "holder-without-initiative": ("pilot", "job:job-1", "job-1", "job-1", False),
+    "holder-with-extra-segment": ("pilot", "job:pilot/job-1/extra", "pilot/job-1/extra", "pilot/job-1/extra", False),
+    "other-holders-claim": ("pilot", JOB_HOLDER, "pilot/job-1", "pilot/job-2", REFUSED),
+    # A foreign row never reads the claim, so it can neither exempt a process nor make the census refuse.
+    "foreign-initiative-other-holders-claim": (FOREIGN, JOB_HOLDER, "pilot/job-1", "pilot/job-2", False),
+}
+
+
+def live_claim(jobs, pid, job_id):
+    return {"pid": pid, "start": jobs.process_start(pid), "job": job_id, "at": "2026-11-09T00:00:00Z",
+            "process_scope": jobs.process_scope(), "recipes_sha256": None}
+
+
+@pytest.mark.parametrize("row_kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("case", sorted(CENSUS_EXEMPTION_CASES))
+def test_only_a_canonical_own_initiative_grant_exempts_a_live_process_from_the_real_census(kind_shop, case, row_kind):
+    """The /proc branch, not the fixture: a granted row's holder names whose live processes are ledger work."""
+    shop = kind_shop
+    filer, holder, folder, claimed, exempt = CENSUS_EXEMPTION_CASES[case]
+    shop.workspace.register(FOREIGN)
+    request_id = shop.workspace.ask(filer, row_kind, holder)
+    assert shop.workspace.grant(row_kind)["request_id"] == request_id
+    jobs = load_jobs_module()
+    child = None
+    try:
+        child, _ = spawn_fake_heavy(shop.tmp, "pytest")
+        claim = shop.workspace.store / "jobs" / folder / "claim.json"
+        claim.parent.mkdir(parents=True)
+        claim.write_text(json.dumps(live_claim(jobs, child, claimed)))
+        ledger = jobs.Store(str(shop.workspace.store)).load()
+        if exempt == REFUSED:
+            with pytest.raises(ValueError, match="invalid runner claim: pilot/job-1"):
+                jobs.census(shop.workspace.store, ledger, None, "heavy")
+            report = shop.jobs("recovery-status", expect=3)
+            assert report["process_census"]["heavy"]["state"] == "unavailable"
+            assert any(row["reason"] == "census_unavailable" and row["kind"] == "heavy" for row in report["blockers"])
+            shop.request_job("job-k", "heavy")
+            assert shop.run_open(census=None, expect=2) == {"error": "invalid runner claim: pilot/job-1"}
+            assert list(requests_of(shop, "heavy", holder="job:pilot/job-k").values()) == ["queued"]
+            assert shop.receipts("job-k") == []
+            return
+        # Other pytest processes on the host may be outside roots too; only this child's membership is asserted.
+        view = jobs.census(shop.workspace.store, ledger, None, "heavy")
+        assert view["census"] == "proc"
+        assert (child not in view["external_roots"]) is exempt
+        if case == "holder-with-extra-segment":
+            # Existing fail-closed rule: an initiative's own row under its job prefix must name a job id.
+            assert shop.jobs("recovery-status", expect=2) == {"error": "invalid job message id"}
+        else:
+            observed = shop.jobs("recovery-status", expect=3)["process_census"]["heavy"]
+            assert observed["state"] == "observed", observed
+            assert (child not in observed["external_roots"]) is exempt
+    finally:
+        if child is not None:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            assert finished(child), "census child %d did not stop" % child
+
+
+@pytest.mark.parametrize("state", ["granted", "queued"])
+@pytest.mark.parametrize("with_job", [True, False], ids=["finished-job", "no-job"])
+def test_scoped_and_unscoped_recovery_agree_that_a_foreign_reservation_blocks(kind_shop, state, with_job):
+    shop = kind_shop
+    if with_job:
+        request_kind_job(shop, "heavy")
+        assert job_row(shop.run_open())["state"] == "completed"
+    foreign = file_foreign_row(shop, "writer", state)
+    for flags in ((), ("--initiative", "pilot")):
+        report = shop.jobs("recovery-status", *flags, expect=3)
+        blockers = [row for row in report["blockers"] if row["reason"] == "foreign_reservation"]
+        assert len(blockers) == 1, report["blockers"]
+        blocker = blockers[0]
+        assert {key: blocker[key] for key in ("initiative", "job", "request_id", "filing_initiative", "kind", "state",
+                                              "holder")} == {
+            "initiative": "pilot", "job": "pilot/job-1", "request_id": foreign, "filing_initiative": FOREIGN,
+            "kind": "writer", "state": state, "holder": JOB_HOLDER}
+        assert blocker["owner"] and foreign in blocker["next_action"] and "withdraw or release" in blocker["next_action"]
+        if with_job:
+            job = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+            assert job["state"] == "finished" and foreign in job["next_action"], "no clean verdict while it is open"
+    clear_foreign_row(shop, foreign, state)
+    for flags in ((), ("--initiative", "pilot")):
+        assert shop.jobs("recovery-status", *flags)["blockers"] == []
+
+
+KIND_CHANGES = [("heavy", "heavy-tests"), ("heavy-tests", "heavy")]
+
+
+def add_recipe_of_kind(shop, name, kind):
+    shop.recipes["recipes"][name] = shop.command(["$python", "-c", "print(%r)" % name], heavy=True,
+                                                 heavy_tests=kind == "heavy-tests")
+    shop.save_recipes()
+
+
+def withdrawals(shop):
+    return {event["data"]["request_id"]: event["data"]["source"] for event in shop.events() if event["kind"] == "withdraw"}
+
+
+@pytest.mark.parametrize("old, new", KIND_CHANGES)
+def test_a_recipe_kind_change_withdraws_the_jobs_stale_queued_request(kind_shop, old, new):
+    """The job keeps at most one open request, for the kind it needs now; a stale one never takes a slot."""
+    shop = kind_shop
+    taken = fill_with_other_holders(shop, old)
+    request_kind_job(shop, old)
+    assert job_row(shop.run_open(expect=3))["reason"] == "capacity_full"
+    (stale,) = requests_of(shop, old)
+    # Nothing binds a waiting job to the recipe file it was queued under. Its new kind is full, so it keeps waiting.
+    shop.recipes["recipes"]["heavy-touch"]["heavy_tests"] = new == "heavy-tests"
+    add_recipe_of_kind(shop, "stay", old)
+    shop.request_job("job-k", "stay")
+    shop.workspace.release(taken[0])
+    blocking = fill_with_other_holders(shop, new)
+    rows = shop.run_open(expect=3)["rows"]
+    assert not any(row["state"] == "granted_elsewhere" for row in rows), rows
+    assert (job_row({"rows": rows})["state"], job_row({"rows": rows})["kind"]) == ("waiting", new)
+    assert job_row({"rows": rows}, "job-k")["state"] == "completed", "the freed slot went to the job that needs it"
+    assert requests_of(shop, old) == {stale: "withdrawn"} and withdrawals(shop)[stale] == "job runner"
+    assert list(requests_of(shop, new).values()) == ["queued"], "exactly one open request, for the kind it needs"
+    shop.workspace.release(blocking[0])
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.exists()
+    assert list(requests_of(shop, new).values()) == ["released"]
+
+
+@pytest.mark.parametrize("old, new", KIND_CHANGES)
+def test_a_granted_request_for_a_kind_the_recipe_no_longer_needs_holds_the_job_until_settlement(kind_shop, old, new):
+    shop = kind_shop
+    request_kind_job(shop, new)
+    # Granted under the old recipe and never claimed, as after a crash between grant and claim.
+    stale = shop.workspace.ask("pilot", old, JOB_HOLDER)
+    assert shop.workspace.grant(old)["request_id"] == stale
+    for _ in range(2):
+        row = job_row(shop.run_open(expect=3))
+        assert (row["state"], row["reason"], row["kind"], row["request_id"]) == ("waiting", "stale_grant", new, stale)
+        assert all(word in row["next_action"] for word in (stale, old, new, "settle"))
+        assert_did_not_run(shop)
+        assert requests_of(shop, new) == {}, "never a second slot while the stale one is held"
+        assert requests_of(shop, old) == {stale: "granted"}, "a wait is not settlement evidence"
+    shop.workspace.release(stale)
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.exists()
+    assert list(requests_of(shop, new).values()) == ["released"]
+
+
+def test_a_grant_to_a_waiting_jobs_stale_kind_is_reported_with_its_reason(kind_shop, monkeypatch, capsys):
+    shop = kind_shop
+    request_kind_job(shop, "heavy-tests")
+    add_recipe_of_kind(shop, "stay", "heavy")
+    shop.request_job("job-k", "stay")
+    jobs = load_jobs_module()
+    original = jobs.enqueue
+
+    def racing(store, job, kind, wait):
+        answer = original(store, job, kind, wait)
+        if job.holder == JOB_HOLDER:
+            # A runner still on the old recipes files the job's heavy request after this runner's own check.
+            shop.workspace.ask("pilot", "heavy", JOB_HOLDER)
+        return answer
+
+    monkeypatch.setattr(jobs, "enqueue", racing)
+    assert jobs.main(shop.argv("run-open", census=[])[3:]) == 3
+    rows = json.loads(capsys.readouterr().out)["rows"]
+    (stale,) = requests_of(shop, "heavy")
+    elsewhere = [row for row in rows if row["state"] == "granted_elsewhere"]
+    assert len(elsewhere) == 1 and elsewhere[0]["request_id"] == stale
+    assert (elsewhere[0]["stale_job"], elsewhere[0]["reason"]) == ("pilot/job-1", "stale_kind")
+    assert "job" not in elsewhere[0], "a job keeps exactly one row of its own per pass"
+    assert "heavy-tests" in elsewhere[0]["next_action"]
+    assert job_row({"rows": rows}, "job-k")["state"] == "completed"
+    row = job_row({"rows": rows})
+    assert (row["state"], row["reason"], row["request_id"]) == ("waiting", "stale_grant", stale)
+    assert_did_not_run(shop)
+    assert requests_of(shop, "heavy") == {stale: "granted"}, "no release without settlement evidence"
+    assert list(requests_of(shop, "heavy-tests").values()) == ["withdrawn"], "a stale-only job leaves no grantable queue"
+
+
+DEPENDENT_PATHS = ["admit-queued", "admit-granted", "pre-claim-recheck"]
+
+
+def test_a_stale_grant_appearing_during_current_kind_admission_runs_on_the_current_grant(kind_shop, monkeypatch, capsys):
+    shop = kind_shop
+    request_kind_job(shop, "heavy-tests")
+    jobs = load_jobs_module()
+    original, filed = jobs.grant_next, []
+
+    def appearing(store, kind, **kwargs):
+        answer = original(store, kind, **kwargs)
+        # Both kinds are already granted when admission resumes: round 6 requires execution on the matching grant.
+        if kind == "heavy-tests" and not filed:
+            filed.append(shop.workspace.ask("pilot", "heavy", JOB_HOLDER))
+            assert shop.workspace.grant("heavy")["request_id"] == filed[0]
+        return answer
+
+    monkeypatch.setattr(jobs, "grant_next", appearing)
+    assert jobs.main(shop.argv("run-open", census=[])[3:]) == 0
+    row = job_row(json.loads(capsys.readouterr().out))
+    assert row["state"] == "completed" and shop.sentinel.exists()
+    assert filed[0] in row["detail"]
+    assert requests_of(shop, "heavy") == {filed[0]: "released"}
+    assert list(requests_of(shop, "heavy-tests").values()) == ["released"]
+    evidence = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "result.json")
+    releases = [event["data"] for event in shop.events() if event["kind"] == "release"]
+    assert len(releases) == 2 and all(data["evidence"]["path"] == evidence for data in releases)
+    assert shop.states("job-1") == ["started", "completed"]
+
+
+@pytest.mark.parametrize("kind, other", KIND_CHANGES)
+@pytest.mark.parametrize("current_first", [True, False], ids=["current-first", "other-first"])
+def test_a_current_kind_grant_runs_despite_another_heavy_grant(kind_shop, kind, other, current_first):
+    shop = kind_shop
+    request_kind_job(shop, kind)
+    grants = {}
+    for requested in ((kind, other) if current_first else (other, kind)):
+        grants[requested] = shop.workspace.ask("pilot", requested, JOB_HOLDER)
+        assert shop.workspace.grant(requested)["request_id"] == grants[requested]
+    row = job_row(shop.run_open())
+    assert row["state"] == "completed" and shop.sentinel.exists()
+    assert grants[other] in row["detail"]
+    assert ledger_rows(shop) == {request_id: {"kind": requested, "state": "released"}
+                                 for requested, request_id in grants.items()}
+    evidence = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "result.json")
+    releases = [event["data"] for event in shop.events() if event["kind"] == "release"]
+    assert {data["request_id"] for data in releases} == set(grants.values())
+    assert all(data["evidence"]["path"] == evidence for data in releases)
+    assert shop.states("job-1") == ["started", "completed"]
+    assert shop.run_open()["rows"] == [], "the job runs and settles once"
+
+
+@pytest.mark.parametrize("path", DEPENDENT_PATHS)
+@pytest.mark.parametrize("foreign_state", ["queued", "granted"])
+def test_another_initiatives_row_under_a_predecessors_holder_never_ends_a_capacity_admitted_dependent(
+        kind_shop, monkeypatch, capsys, path, foreign_state):
+    shop = kind_shop
+    touch = "open(%r, 'a').write('ran\\n')" % str(shop.sentinel)
+    shop.recipes["recipes"]["heavy-touch"] = shop.command(["$python", "-c", touch], heavy=True)
+    shop.save_recipes()
+    parent = shop.request_job("first-check", "ok")
+    assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+    request_dependent(shop, parent, "job-1", recipe="heavy-touch")
+    predecessor = "job:pilot/first-check"
+    taken = []
+    if path == "admit-queued":
+        taken = fill_with_other_holders(shop, "heavy")
+        assert job_row(shop.run_open(expect=3))["reason"] == "capacity_full"
+        foreign = file_foreign_row(shop, "writer", foreign_state, holder=predecessor)
+    elif path == "admit-granted":
+        own_request = shop.workspace.ask("pilot", "heavy", JOB_HOLDER)
+        assert shop.workspace.grant("heavy")["request_id"] == own_request
+        foreign = file_foreign_row(shop, "writer", foreign_state, holder=predecessor)
+    else:
+        # The row appears after admission, between the grant and the dependent's re-check before its claim.
+        jobs = load_jobs_module()
+        original, calls, filed = jobs.check_dependency, [], []
+
+        def appearing(store, initiative, message, packet, recipes):
+            if message["message_id"] == "job-1":
+                calls.append(message["message_id"])
+                if len(calls) == 2:  # The first call is admission; the second is the re-check before the claim.
+                    assert list(requests_of(shop, "heavy").values()) == ["granted"]
+                    filed.append(file_foreign_row(shop, "writer", foreign_state, holder=predecessor))
+            return original(store, initiative, message, packet, recipes)
+
+        monkeypatch.setattr(jobs, "check_dependency", appearing)
+        assert jobs.main(shop.argv("run-open", census=[])[3:]) == 3
+        row = job_row(json.loads(capsys.readouterr().out))
+        (foreign,) = filed
+        assert (row["state"], row["reason"], row["request_id"]) == ("waiting", "foreign_reservation", foreign)
+    own = dict(requests_of(shop, "heavy"))
+    for _ in range(2):
+        row = job_row(shop.run_open(expect=3))
+        assert (row["state"], row["reason"]) == ("waiting", "foreign_reservation")
+        assert (row["request_id"], row["initiative"]) == (foreign, FOREIGN) and foreign in row["detail"]
+        assert_did_not_run(shop)
+        assert requests_of(shop, "heavy") == own, "the dependent keeps its own reservation while it waits"
+    clear_foreign_row(shop, foreign, foreign_state)
+    if taken:
+        shop.workspace.release(taken[0])
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.exists()
+
+
+def test_a_closed_job_with_two_open_rows_is_settled_once_per_pass(kind_shop):
+    shop = kind_shop
+    lock = shop.workspace.store / ".write.lock"
+    shop.recipes["recipes"]["locks"] = shop.command(["$python", "-c", lock_after_started_receipt(shop, lock)], heavy=True)
+    shop.save_recipes()
+    writer = shop.workspace.ask("pilot", "writer", JOB_HOLDER)
+    assert shop.workspace.grant("writer")["request_id"] == writer
+    shop.request_job("job-1", "locks")
+    row = shop.run_open(lock_wait=0.2, expect=3)["rows"][0]
+    assert row["state"] == "settle_pending" and "busy" in row["error"]
+    lock.unlink()
+    rows = shop.run_open()["rows"]
+    assert [(row["job"], row["state"]) for row in rows] == [("pilot/job-1", "completed")]
+    assert sorted(row["state"] for row in ledger_rows(shop).values()) == ["released", "released"]
+    assert shop.states("job-1") == ["started", "completed"]
+    assert shop.run_open()["rows"] == []
+
+
+@pytest.mark.parametrize("order", ["stale-first", "matching-after-wait", "matching-first"])
+def test_sibling_admission_rederives_grants_without_stranding_a_slot(kind_shop, monkeypatch, capsys, order):
+    shop = kind_shop
+    request_kind_job(shop, "heavy-tests")
+    add_recipe_of_kind(shop, "sibling", "heavy-tests")
+    add_recipe_of_kind(shop, "heavy-neighbor", "heavy")
+    shop.request_job("job-b", "sibling")
+    shop.request_job("job-h", "heavy-neighbor")
+    jobs = load_jobs_module()
+    original_enqueue, original_grant = jobs.enqueue, jobs.grant_next
+    extra, appeared = [], []
+
+    def old_runner(store, job, kind, wait):
+        result = original_enqueue(store, job, kind, wait)
+        if job.holder == JOB_HOLDER:
+            if order == "matching-first":
+                shop.workspace.grant("heavy-tests")
+            extra.append(shop.workspace.ask("pilot", "heavy", JOB_HOLDER))
+        return result
+
+    def matching_arrives(store, kind, **kwargs):
+        if order == "matching-after-wait" and kind == "heavy-tests" and not appeared:
+            assert list(requests_of(shop, kind).values()) == ["withdrawn"]
+            # Root changes the queue while this runner is outside the grant lock: A receives a matching grant,
+            # then B requeues. The pass must reconsider A even though its earlier state was stale-only.
+            (sibling,) = requests_of(shop, kind, holder="job:pilot/job-b")
+            shop.workspace.run("withdraw", {"request_id": sibling, "source": "root race fixture"})
+            appeared.append(shop.workspace.ask("pilot", kind, JOB_HOLDER))
+            assert shop.workspace.grant(kind)["request_id"] == appeared[0]
+            shop.workspace.ask("pilot", kind, "job:pilot/job-b")
+        answer = original_grant(store, kind, **kwargs)
+        if kind == "heavy" and answer[0] == 0 and answer[1]["granted"]["holder"] == JOB_HOLDER:
+            expected = "granted" if order == "matching-first" else "withdrawn"
+            assert list(requests_of(shop, "heavy-tests").values()) == [expected], "reconcile before grant unlocks"
+        return answer
+
+    monkeypatch.setattr(jobs, "enqueue", old_runner)
+    monkeypatch.setattr(jobs, "grant_next", matching_arrives)
+    assert jobs.main(shop.argv("run-open", census=[])[3:]) in (0, 3)
+    report = json.loads(capsys.readouterr().out)
+    assert job_row(report, "job-b")["state"] == "completed", "A's stale queue must not consume B's free slot"
+    assert job_row(report, "job-h")["state"] == "completed"
+    for row in report["rows"]:
+        if row.get("reason") == "stale_kind":
+            assert row["request_id"] == extra[0], "a matching heavy-tests grant is never called stale_kind"
+        if row["state"] == "granted_elsewhere":
+            assert row["request_id"] not in requests_of(shop, "heavy-tests"), "A's matching grant must execute"
+    first = job_row(report)
+    if order == "stale-first":
+        assert (first["state"], first["reason"]) == ("waiting", "stale_grant")
+        assert list(requests_of(shop, "heavy-tests").values()) == ["withdrawn"]
+        assert requests_of(shop, "heavy") == {extra[0]: "granted"}
+        assert_did_not_run(shop)
+        second = shop.run_open(expect=3)
+        assert (job_row(second)["state"], job_row(second)["reason"]) == ("waiting", "stale_grant")
+        assert list(requests_of(shop, "heavy-tests").values()) == ["withdrawn"]
+        shop.workspace.release(extra[0])
+        assert job_row(shop.run_open())["state"] == "completed"
+    else:
+        assert first["state"] == "completed" and shop.sentinel.exists()
+        assert all(row["state"] in ("released", "withdrawn") for row in ledger_rows(shop).values())
+        assert shop.run_open()["rows"] == []
+        evidence = str(shop.workspace.store / "jobs" / "pilot" / "job-1" / "result.json")
+        release = next(event["data"] for event in shop.events()
+                       if event["kind"] == "release" and event["data"]["request_id"] == extra[0])
+        assert release["evidence"]["path"] == evidence
+    assert shop.sentinel.read_text() == "ran\n"
+    assert shop.states("job-1") == ["started", "completed"]
+    assert shop.states("job-b") == ["started", "completed"]
+
+
+@pytest.mark.parametrize("kind, other", KIND_CHANGES)
+def test_stale_only_grant_withdraws_existing_current_queue_at_admission(kind_shop, kind, other):
+    shop = kind_shop
+    request_kind_job(shop, kind)
+    current = shop.workspace.ask("pilot", kind, JOB_HOLDER)
+    stale = shop.workspace.ask("pilot", other, JOB_HOLDER)
+    assert shop.workspace.grant(other)["request_id"] == stale
+    for _ in range(2):
+        row = job_row(shop.run_open(expect=3))
+        assert (row["state"], row["reason"]) == ("waiting", "stale_grant")
+        assert requests_of(shop, kind) == {current: "withdrawn"}
+        assert withdrawals(shop)[current] == "job runner"
+        assert requests_of(shop, other) == {stale: "granted"}
+        assert_did_not_run(shop)
+    shop.workspace.release(stale)
+    assert job_row(shop.run_open())["state"] == "completed"
+
+
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_a_matching_grant_released_without_an_execution_claim_never_starts_the_job(kind_shop, monkeypatch, capsys, kind):
+    shop = kind_shop
+    request_kind_job(shop, kind)
+    jobs = load_jobs_module()
+    original, released = jobs.grant_next, []
+
+    def release_before_claim(store, granted_kind, **kwargs):
+        answer = original(store, granted_kind, **kwargs)
+        if answer[0] == 0 and not released:
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[0])
+        return answer
+
+    monkeypatch.setattr(jobs, "grant_next", release_before_claim)
+    assert jobs.main(shop.argv("run-open", census=[])[3:]) == 3
+    row = job_row(json.loads(capsys.readouterr().out))
+    assert row["state"] == "waiting" and row["reason"] == "queue_empty"
+    assert requests_of(shop, kind) == {released[0]: "released"}
+    assert_did_not_run(shop)
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.exists()
+
+
 def cargo_and_pytest_jobs(shop):
     """Job "cargo" stands in for a cargo test: it takes Heavy-Tests without running cargo. Job "pytest" takes heavy."""
     shop.recipes["recipes"]["fake-cargo"] = shop.command(["$python", "-c", "print('cargo output')"], heavy=True,
