@@ -14,7 +14,9 @@ Payload shapes follow the host docs (cited in tests/unit/core/test_hook_events.p
 """
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timedelta, timezone
+import errno
 import gc
 import json
 import os
@@ -476,7 +478,9 @@ def test_the_deadline_leaves_the_callers_timer_and_handler_as_they_were(ws, caps
 
 # ── through the CLI ──────────────────────────────────────────────────────────
 
-def _cli(args, payload, cwd, home, extra_env=None, timeout=60):
+def _cli(args, payload, cwd, home, extra_env=None, timeout=60, *, popen_options=None):
+    """Run `aegis hook run <args>` with ``payload`` on stdin; ``popen_options`` (the timing
+    test's start options) are passed on to subprocess.run, and by default nothing is."""
     env = dict(os.environ)
     env.update({"HOME": str(home), "USERPROFILE": str(home)})
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p)
@@ -485,7 +489,7 @@ def _cli(args, payload, cwd, home, extra_env=None, timeout=60):
     env.update(extra_env or {})
     data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
     return subprocess.run([sys.executable, "-m", "aegis_cli", "hook", "run", *args], input=data, cwd=str(cwd),
-                          env=env, capture_output=True, timeout=timeout)
+                          env=env, capture_output=True, timeout=timeout, **(popen_options or {}))
 
 
 @pytest.fixture
@@ -669,45 +673,461 @@ def overhead(timings, baseline) -> float:
     return median(timings) - median(baseline)
 
 
+def paired_overhead(pairs) -> float:
+    """Median of ``hook - python`` over (hook, python) pairs, each pair timed back to back.
+    Load that comes and goes adds the same delay to both members of a pair and cancels, where
+    ``overhead`` of two batches timed one after the other counts it as Aegis cost. A stall on one
+    member of k < N/2 pairs moves the median at most k places among the other pairs' differences:
+    hook stalls up to a neighbouring clean difference, Python stalls down to one, so Python
+    stalls can understate the cost by up to the spread of the clean differences (the old
+    median-of-batches method had the same weakness). A uniformly slow runner does not fail and a
+    real regression still does. (A CPU slowdown that stretches all work by a factor stretches
+    the difference too: that is real cost under load, not cancelled.)"""
+    differences = sorted(hook - python for hook, python in pairs)
+    return differences[len(differences) // 2]
+
+
+_LOCK_BUSY = {errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
+
+
+@contextlib.contextmanager
+def hook_timing_lock(path, timeout=600.0):
+    """Hold an exclusive lock on the file ``path`` against every other process (``flock`` on
+    POSIX; one byte locked with ``msvcrt.locking`` on Windows), waiting at most ``timeout``
+    seconds for it, and yield the seconds waited. No lock in time fails the test, never skips it."""
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        started = time.monotonic()
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in _LOCK_BUSY:
+                    raise
+                if time.monotonic() - started > timeout:
+                    pytest.fail(f"no exclusive lock on {path} within {timeout:.0f} s", pytrace=False)
+                time.sleep(0.05)
+
+        def unlock():
+            if sys.platform == "win32":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+
+        try:
+            yield time.monotonic() - started
+        except BaseException:
+            with contextlib.suppress(OSError):  # report the failure inside the lock, not the unlock's
+                unlock()
+            raise
+        unlock()  # after a clean body an unlock error is raised; closing the fd below still releases
+    finally:
+        os.close(fd)
+
+
+def _timed_start_options(platform) -> dict:
+    """Extra subprocess.run options for every timed start, the hook and the bare Python start
+    alike. On Windows, HIGH_PRIORITY_CLASS (not REALTIME): both members of a pair are scheduled
+    the same way, ahead of the other xdist workers' normal-priority processes, so CPU
+    contention stretches them less; what is timed and the bound are unchanged. Windows does
+    not pass a priority class on (a child gets NORMAL unless its parent is IDLE or
+    BELOW_NORMAL), so the hook's own `git rev-parse` runs at normal priority; that is part of
+    what the hook costs and is accepted. For the same reason, inside a Windows venv, where
+    ``sys.executable`` is a launcher that starts the real interpreter, the interpreter of both
+    members runs at normal priority: no boost, but no bias either (CI uses setup-python's
+    interpreter, not a venv). On POSIX nothing: raising priority needs privileges, and other
+    processes are never lowered."""
+    if platform == "win32":
+        return {"creationflags": getattr(subprocess, "HIGH_PRIORITY_CLASS", 0x00000080)}
+    return {}
+
+
+def _sample_pairs(hook_start, python_start, options, count):
+    """Warm each start once (OS file cache, interpreter), then ``count`` (hook, python) pairs
+    timed back to back, hook first on even i, Python first on odd i; every call gets ``options``."""
+    hook_start(options)
+    python_start(options)
+    pairs = []
+    for i in range(count):
+        if i % 2 == 0:
+            hook = hook_start(options)
+            pairs.append((hook, python_start(options)))
+        else:
+            python = python_start(options)
+            pairs.append((hook_start(options), python))
+    return pairs
+
+
+def _hook_start(data, cwd, home, expected):
+    """A timed `aegis hook run pre-tool --host claude-code` start that must end with ``expected``
+    (returncode, stdout, stderr)."""
+    def start(options) -> float:
+        started = time.perf_counter()
+        proc = _cli(["pre-tool", "--host", "claude-code"], data, cwd, home, popen_options=options)
+        elapsed = time.perf_counter() - started
+        assert (proc.returncode, proc.stdout, proc.stderr.replace(b"\r\n", b"\n")) == expected  # Windows text stderr
+        return elapsed
+    return start
+
+
+def _python_start(cwd):
+    """A timed bare `python -c "import sys"` start."""
+    def start(options) -> float:
+        started = time.perf_counter()
+        subprocess.run([sys.executable, "-c", "import sys"], cwd=str(cwd), capture_output=True, timeout=60,
+                       check=True, **options)
+        return time.perf_counter() - started
+    return start
+
+
+def _communicate_all(procs, timeout):
+    """communicate() with each process, ``timeout`` seconds each; if any fails or times out,
+    kill and reap them all before raising, so a stuck child never hangs the suite."""
+    try:
+        return [proc.communicate(timeout=timeout) for proc in procs]
+    except BaseException:
+        for proc in procs:
+            proc.kill()
+            proc.communicate()
+        raise
+
+
+def _shared_tmp(tmp_path_factory) -> Path:
+    """The temp directory every xdist worker of this run shares: the run's base temp, of which
+    xdist (3.6.1, workermanage.py) makes each local worker's ``popen-<id>``, with or without an
+    explicit --basetemp (``<tmp>/pytest-of-<user>/pytest-<n>``, or the --basetemp itself).
+    Otherwise (no xdist, a remote worker) this process's own base temp: never above it."""
+    base = tmp_path_factory.getbasetemp()
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    return base.parent if worker and base.name == f"popen-{worker}" else base
+
+
 @pytest.mark.parametrize("baseline, ok", [([0.4] * 12, False), ([0.7] * 12, True)], ids=["regression", "slow-runner"])
 def test_overhead_subtracts_the_interpreter_start(baseline, ok):
     assert (overhead([0.9] * 12, baseline) < 0.25) is ok
 
 
+HOOK_PAIRS = 13  # (hook, Python start) pairs the timing test samples; odd, so the median is one pair
+# A common load per pair, 0-1 s on most pairs: run 42491904451's Windows 3.12 hook samples
+# (deep-scan-row, 221-1250 ms) less their 221 ms minimum, plus one quiet pair.
+LOADS = [0.0, 0.0, 0.027, 0.037, 0.106, 0.176, 0.177, 0.191, 0.193, 0.207, 0.379, 0.97, 1.029]
+
+
+# What Aegis adds in each pair when nothing stalls: spread out (median 0.18 s, all under 0.25 s),
+# in an order where the unpaired medians of the same pairs come out different.
+CLEAN = [0.21, 0.15, 0.14, 0.19, 0.16, 0.12, 0.2, 0.18, 0.1, 0.24, 0.22, 0.17, 0.23]
+STALLED = [0, 4, 6, 7, 8, 10]  # (N-1)//2 pairs where one member stalls for 1 s (Defender, a page-in)
+
+
+def _loaded_pairs(clean):
+    """(hook, python) pairs whose members share pair i's load LOADS[i]."""
+    return [(0.02 + load + extra, 0.02 + load) for load, extra in zip(LOADS, clean)]
+
+
+def test_paired_overhead_ignores_load_that_hits_only_the_hook_phase():
+    """Run 42491904451: the 12 hook starts ran under load, the 12 Python starts after it, quiet.
+    The unpaired medians call that load Aegis cost; pairs taken back to back share it, and
+    the paired result is exactly the median clean difference."""
+    hooks = [0.02 + load + extra for load, extra in zip(LOADS, CLEAN)]
+    assert overhead(hooks, [0.02] * len(LOADS)) >= 0.25
+    assert paired_overhead(_loaded_pairs(CLEAN)) == pytest.approx(sorted(CLEAN)[HOOK_PAIRS // 2])
+
+
+def test_paired_overhead_still_fails_a_real_regression_under_any_load():
+    """Every clean difference over the bound, and the Python start stalled on a minority of
+    pairs: the paired median drops to the lowest clean difference, still a failure, where the
+    unpaired medians would hide the regression."""
+    regressed = [extra + 0.15 for extra in CLEAN]  # 0.25-0.39 s, median 0.33 s
+    assert min(regressed) >= 0.25
+    pairs = [(hook, python + 1.0) if i in STALLED else (hook, python)
+             for i, (hook, python) in enumerate(_loaded_pairs(regressed))]
+    assert paired_overhead(pairs) >= 0.25
+
+
+@pytest.mark.parametrize("member", ["hook", "python", "both"])
+def test_paired_overhead_stays_among_the_clean_differences_with_stalls_on_a_minority_of_pairs(member):
+    """A 1 s stall on one member of each of (N-1)//2 pairs moves the median by at most that many
+    places among the unstalled pairs' clean differences: hook stalls up, Python stalls down,
+    alternating ones not past the middle. The unpaired medians of the same pairs leave that range."""
+    pairs, down = [], 0
+    for i, (hook, python) in enumerate(_loaded_pairs(CLEAN)):
+        if i in STALLED:
+            on_hook = member == "hook" or (member == "both" and STALLED.index(i) % 2 == 0)
+            hook, python = (hook + 1.0, python) if on_hook else (hook, python + 1.0)
+            down += not on_hook
+        pairs.append((hook, python))
+    unstalled = sorted(extra for i, extra in enumerate(CLEAN) if i not in STALLED)
+    result = paired_overhead(pairs)
+    assert unstalled[0] - 1e-9 <= result <= unstalled[-1] + 1e-9
+    assert result == pytest.approx(unstalled[HOOK_PAIRS // 2 - down])  # the neighbour it is pulled to
+
+
+def test_paired_overhead_is_unchanged_on_a_uniformly_slow_runner():
+    pairs = _loaded_pairs(CLEAN)
+    assert paired_overhead([(h + 0.7, p + 0.7) for h, p in pairs]) == pytest.approx(paired_overhead(pairs))
+
+
+_LOCK_PROBE = r"""
+import importlib.util, json, os, sys, time
+module_path, lock, flags, me, other = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location("hook_run_lock_probe", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+def mark(name):
+    open(os.path.join(flags, name), "w").close()
+
+
+def marked(name):
+    return os.path.exists(os.path.join(flags, name))
+
+
+mark("asking-" + me)  # immediately before asking for the lock
+with module.hook_timing_lock(lock):
+    entered = time.time()
+    overlap = marked("inside-" + other)
+    mark("inside-" + me)
+    deadline = time.monotonic() + 60
+    while not marked("asking-" + other):  # hold the lock until the other asks: contention by construction
+        if time.monotonic() > deadline:
+            sys.exit("the other probe never asked for the lock within 60 s")
+        time.sleep(0.005)
+    time.sleep(0.2)
+    overlap = overlap or marked("inside-" + other)
+    os.remove(os.path.join(flags, "inside-" + me))
+    left = time.time()
+print(json.dumps([entered, left, overlap]))
+"""
+
+
+def test_the_hook_timing_lock_excludes_another_process(tmp_path):
+    """Two processes take the real lock (imported from this file). Whoever gets it first holds
+    it until the other has asked for it, so they always contend; the second enters only after
+    the first has left, and neither ever sees the other inside."""
+    lock, flags = tmp_path / "timing.lock", tmp_path / "flags"
+    flags.mkdir()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO), env.get("PYTHONPATH", "")) if p)
+    procs = [subprocess.Popen([sys.executable, "-c", _LOCK_PROBE, __file__, str(lock), str(flags), me, other],
+                              cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+             for me, other in (("a", "b"), ("b", "a"))]
+    outs = _communicate_all(procs, timeout=120)
+    assert [proc.returncode for proc in procs] == [0, 0], outs
+    # (entered, left, saw the other inside) per process, in the order they entered
+    first, second = sorted((json.loads(out) for out, _ in outs), key=lambda probe: probe[0])
+    assert not first[2] and not second[2], f"one saw the other inside the lock: {first} {second}"
+    assert first[1] <= second[0], f"both held the lock at once: {first} {second}"
+
+
+def _unlock_fails(monkeypatch):
+    """Make this platform's unlock call raise; return the list of fds os.close is called with."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        real_locking = msvcrt.locking
+
+        def locking(fd, mode, nbytes):
+            if mode == msvcrt.LK_UNLCK:
+                raise OSError(errno.EBADF, "unlock failed")
+            return real_locking(fd, mode, nbytes)
+
+        monkeypatch.setattr(msvcrt, "locking", locking)
+    else:
+        import fcntl
+
+        real_flock = fcntl.flock
+
+        def flock(fd, operation):
+            if operation == fcntl.LOCK_UN:
+                raise OSError(errno.EBADF, "unlock failed")
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", flock)
+    closed, real_close = [], os.close
+    monkeypatch.setattr(os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    return closed
+
+
+def test_an_unlock_error_does_not_hide_the_failure_inside_the_lock(tmp_path, monkeypatch):
+    with monkeypatch.context() as patch:
+        closed = _unlock_fails(patch)
+        with pytest.raises(ValueError, match="the measurement failed"), hook_timing_lock(tmp_path / "timing.lock"):
+            raise ValueError("the measurement failed")
+        assert len(closed) == 1  # the lock's fd
+    taken = False
+    with hook_timing_lock(tmp_path / "timing.lock", timeout=10.0):  # closing the fd released it
+        taken = True
+    assert taken
+
+
+def test_an_unlock_error_after_a_clean_body_is_raised_and_the_fd_closed(tmp_path, monkeypatch):
+    with monkeypatch.context() as patch:
+        closed = _unlock_fails(patch)
+        with pytest.raises(OSError, match="unlock failed"), hook_timing_lock(tmp_path / "timing.lock"):
+            pass
+        assert len(closed) == 1
+
+
+def test_a_child_that_outlives_the_timeout_is_killed_not_waited_for():
+    """Two children that would sleep 60 s and exit 0: past the timeout both are killed and
+    reaped (SIGKILL on POSIX, TerminateProcess's exit code 1 on Windows) before it raises."""
+    procs = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) for _ in range(2)]
+    with pytest.raises(subprocess.TimeoutExpired):
+        _communicate_all(procs, timeout=0.5)
+    killed = 1 if sys.platform == "win32" else -signal.SIGKILL
+    assert [proc.returncode for proc in procs] == [killed, killed]
+
+
+@pytest.mark.parametrize("platform, options", [("win32", {"creationflags": 0x00000080}), ("linux", {}),
+                                               ("darwin", {})])
+def test_timed_starts_are_raised_to_high_priority_on_windows_only(platform, options):
+    assert _timed_start_options(platform) == options
+
+
+def test_both_members_of_every_pair_and_both_warm_ups_get_the_same_start_options():
+    calls, options = [], {"creationflags": 0x80}
+
+    def start(name, value):
+        def run(given):
+            calls.append((name, given))
+            return value
+        return run
+
+    pairs = _sample_pairs(start("hook", 0.3), start("python", 0.1), options, 4)
+    assert [name for name, _ in calls] == ["hook", "python", "hook", "python", "python", "hook",
+                                           "hook", "python", "python", "hook"]  # warm-ups, then alternating
+    assert all(given is options for _, given in calls)
+    assert pairs == [(0.3, 0.1)] * 4  # (hook, python) whichever ran first
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_the_timed_hook_and_python_starts_pass_the_options_to_the_process(ws, home, monkeypatch, platform):
+    """Without Windows: the hook start (through _cli) and the bare Python start hand the same
+    extra options to subprocess.run, and nothing extra when there are none."""
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    options = _timed_start_options(platform)
+    _sample_pairs(_hook_start(b"{}", ws, home, (0, b"", b"")), _python_start(ws), options, 2)
+    assert len(seen) == 6
+    assert ["aegis_cli" in argv for argv, _ in seen] == [True, False, True, False, False, True]
+    for _, kwargs in seen:
+        assert {key: kwargs[key] for key in kwargs if key == "creationflags"} == options
+
+
+def test_the_cli_helper_passes_nothing_extra_by_default(ws, home, monkeypatch):
+    seen = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: seen.append(kwargs))
+    _cli(["pre-tool", "--host", "claude-code"], b"{}", ws, home)
+    _cli(["pre-tool", "--host", "claude-code"], b"{}", ws, home, popen_options={"creationflags": 0x80})
+    assert sorted(seen[0]) == ["capture_output", "cwd", "env", "input", "timeout"]
+    assert {key: value for key, value in seen[1].items() if key not in seen[0]} == {"creationflags": 0x80}
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_the_measurement_times_every_start_under_the_lock_with_the_same_options(ws, home, tmp_path, monkeypatch,
+                                                                               platform):
+    """What the timing test runs: the lock in the shared directory is held for every timed start
+    (2 warm-ups + 2 per pair) and for the log line, and both members get this platform's options."""
+    held, lock_log, starts = [False], [], []
+
+    @contextlib.contextmanager
+    def lock(path, timeout=600.0):
+        lock_log.append(("enter", Path(path)))
+        held[0] = True
+        try:
+            yield 0.0
+        finally:
+            log = tmp_path / "aegis-hook-timing.jsonl"
+            lock_log.append(("exit", len(log.read_text(encoding="utf-8").splitlines()) if log.exists() else 0))
+            held[0] = False
+
+    def run(argv, **kwargs):
+        starts.append(("aegis_cli" in argv, held[0], kwargs.get("creationflags")))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setitem(_measure_hook_overhead.__globals__, "hook_timing_lock", lock)
+    monkeypatch.setattr(subprocess, "run", run)
+    pairs, waited, options = _measure_hook_overhead(ws, home, b"{}", (0, b"", b""), tmp_path, platform, "case")
+    assert options == _timed_start_options(platform)
+    assert lock_log == [("enter", tmp_path / "aegis-hook-timing.lock"), ("exit", 1)]  # log line written inside
+    assert (len(starts), len(pairs), waited) == (2 + 2 * HOOK_PAIRS, HOOK_PAIRS, 0.0)
+    assert [inside for _, inside, _ in starts] == [True] * len(starts)
+    assert [flags for _, _, flags in starts] == [options.get("creationflags")] * len(starts)
+    assert sum(hook for hook, _, _ in starts) == 1 + HOOK_PAIRS
+
+
+def _measure_hook_overhead(ws, home, data, expected, shared, platform, label):
+    """The timing test's measurement. Holding the lock in ``shared`` (the directory every xdist
+    worker shares) for all of it: warm both starts, time HOOK_PAIRS back-to-back (hook, python)
+    pairs with ``platform``'s start options for both members, and append the samples to
+    ``shared``/aegis-hook-timing.jsonl. Returns (pairs, seconds waited for the lock, options)."""
+    options = _timed_start_options(platform)
+    with hook_timing_lock(Path(shared) / "aegis-hook-timing.lock") as waited:
+        entered = time.time()
+        pairs = _sample_pairs(_hook_start(data, ws, home, expected), _python_start(ws), options, HOOK_PAIRS)
+        left = time.time()
+        with open(Path(shared) / "aegis-hook-timing.jsonl", "a", encoding="utf-8") as log:  # diagnostics only
+            log.write(json.dumps({"case": label, "worker": os.environ.get("PYTEST_XDIST_WORKER"), "waited": waited,
+                                  "entered": entered, "left": left, "paired": paired_overhead(pairs),
+                                  "unpaired": overhead([h for h, _ in pairs], [p for _, p in pairs]),
+                                  "start_options": options, "pairs": pairs}) + "\n")
+    return pairs, waited, options
+
+
 @pytest.mark.timing
 @pytest.mark.parametrize("covered", [True, False], ids=["deep-scan-row", "no-scan-row"])
-def test_hook_run_overhead_is_under_250_ms(ws, home, covered):
+def test_hook_run_overhead_is_under_250_ms(ws, home, covered, tmp_path_factory):
     """One Python start per matching tool call (v4.1 §2 Behaviour 3), timed as the hosts
     run it (`aegis hook run pre-tool --host claude-code`, payload on stdin) on the
     expensive path: an edit in a governed repository whose activity log is a full, busy
     tail (the covering scan row deep in it, or none), and an event to append. The only
     wall-clock assertion on this path; the spawn counters in test_scan_spawn_budget pin the
-    regression class."""
+    regression class.
+
+    Under `pytest -n auto` other workers load the machine while this runs, so each hook start
+    is paired with a bare Python start taken right next to it (order alternating) and the
+    median pair difference is what Aegis adds. On Windows both members of every pair start
+    at high priority (``_timed_start_options``). The two cases take a lock in the temp
+    directory all workers share, so they never time each other."""
     _busy_log(ws, "src/a.py" if covered else None)
     assert scan_compliance.activity_path(ws).stat().st_size > 3.5 * 1024 * 1024
     data = json.dumps(claude(ws, "Write", {"file_path": str(ws / "src" / "a.py")})).encode("utf-8")
     expected = (0, b"", b"") if covered else (2, b"", b"aegis: call aegis_scan with src/a.py before editing "
                                                       b"(or run: aegis scan src/a.py)\n")
 
-    def once() -> float:
-        started = time.perf_counter()
-        proc = _cli(["pre-tool", "--host", "claude-code"], data, ws, home)
-        elapsed = time.perf_counter() - started
-        assert (proc.returncode, proc.stdout, proc.stderr.replace(b"\r\n", b"\n")) == expected  # Windows text stderr
-        return elapsed
+    pairs, waited, options = _measure_hook_overhead(ws, home, data, expected, _shared_tmp(tmp_path_factory),
+                                                    sys.platform, "deep-scan-row" if covered else "no-scan-row")
+    extra = paired_overhead(pairs)
+    hooks, pythons = [h for h, _ in pairs], [p for _, p in pairs]
+    unpaired = overhead(hooks, pythons)
 
-    def noop() -> float:
-        started = time.perf_counter()
-        subprocess.run([sys.executable, "-c", "import sys"], cwd=str(ws), capture_output=True, timeout=60, check=True)
-        return time.perf_counter() - started
+    def ms(values):
+        return [round(v * 1000) for v in sorted(values)]
 
-    once()  # warm the OS file cache
-    timings = [once() for _ in range(12)]
-    baseline = [noop() for _ in range(12)]
-    extra = overhead(timings, baseline)
-    assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start: "
-                          f"{[round(t * 1000) for t in sorted(timings)]} vs {[round(t * 1000) for t in sorted(baseline)]}")
-    assert [r["result"] for r in events.read(ws, "scan_gate").rows] == ["pass" if covered else "block"] * 13
+    assert extra < 0.25, (f"Aegis adds {extra * 1000:.0f} ms over a Python start (median of {HOOK_PAIRS} "
+                          f"back-to-back pair differences {ms(h - p for h, p in pairs)}); hook {ms(hooks)} vs "
+                          f"python {ms(pythons)}; unpaired medians {unpaired * 1000:.0f} ms; "
+                          f"waited {waited:.1f} s for the timing lock; start options {options}")
+    expected_rows = ["pass" if covered else "block"] * (1 + HOOK_PAIRS)  # the warm-up and every pair
+    assert [r["result"] for r in events.read(ws, "scan_gate").rows] == expected_rows
 
 
 # ── what the busy-log path costs, in counts (X-hook-windows-cost) ────────────
