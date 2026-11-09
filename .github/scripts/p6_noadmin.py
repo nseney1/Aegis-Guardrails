@@ -286,334 +286,73 @@ def validate_receipt(receipt, source, facts, audit, tree):
         require(digest == row.get('sha256') and size == row.get('bytes'), 'source receipt raw bytes differ: ' + name)
 
 
-
-class _P6Step:
-    def __init__(self, diagnostic, operation, phase):
-        self.diagnostic, self.operation, self.phase = diagnostic, operation, phase
-
-    def __enter__(self):
-        self.diagnostic.event(self.operation, 'attempted')
-
-    def __exit__(self, kind, error, tb):
-        if error is None:
-            self.diagnostic.event(self.operation, 'completed')
-        else:
-            self.diagnostic.error(error, self.operation, self.phase)
-        return False
-
-
-class _P6Diagnostic:
-    """Bounded cached facts only. No OS queries, exception formatting or authority."""
-    EVENT_LIMIT = 64
-    ERROR_LIMIT = 4
-    OPERATIONS = (
-        'result_open', 'platform_check', 'windows_facts', 'product_load', 'token_construct',
-        'token_prepare', 'preflight_enter', 'preflight_proof', 'preflight_revert',
-        'operation_enter', 'operation_proof', 'fixture_mkdir', 'target_mkdir', 'sentinel_write',
-        'sentinel_read_verify', 'junction_create', 'junction_lstat', 'junction_readlink',
-        'junction_tag_verify', 'junction_target_verify', 'junction_traversal_verify',
-        'junction_lstat_recheck', 'junction_identity_verify', 'junction_remove',
-        'target_preservation_verify', 'operation_revert', 'normal_token_close',
-        'final_revert', 'final_token_close')
-
-    def __init__(self, config):
-        self.data = {'schema': 'P6_CACHED_PROGRESS_V1',
-            'coverage': 'SELECTED_WORKER_STEPS_AND_ERROR_OBSERVATIONS',
-            'capture_status': 'COMPLETE', 'events': [], 'errors': [],
-            'reported_error': None, 'reported_error_state': 'NONE',
-            'omitted_events': 0, 'omitted_errors': 0}
-        self._refs = [None] * self.ERROR_LIMIT
-        self._pending = None
-        self._capture_failed = False
-        self._roles = []
-        root, source = config.get('evidence'), config.get('source')
-        if type(root) is str and type(source) is str:
-            fixture = os.path.join(root, 'fixture')
-            target = os.path.join(fixture, 'target')
-            self._roles = [(root, 'EVIDENCE_ROOT'), (fixture, 'FIXTURE_DIR'), (target, 'TARGET_DIR'),
-                (os.path.join(target, 'sentinel.txt'), 'SENTINEL_FILE'),
-                (os.path.join(fixture, 'junction'), 'JUNCTION_ENTRY'),
-                (os.path.join(fixture, 'junction', 'sentinel.txt'), 'JUNCTION_SENTINEL'),
-                (os.path.join(source, 'aegis_core', 'verification', 'windows_junction.py'), 'PRODUCT_MODULE')]
-        self._steps = {}
-        for operation in self.OPERATIONS:
-            phase = ('recovery' if 'revert' in operation or 'close' in operation else
-                     'preflight' if operation.startswith('preflight_') else
-                     'outer' if operation in self.OPERATIONS[:6] else 'operation')
-            self._steps[operation] = _P6Step(self, operation, phase)
-
-    def unknown(self):
-        self.data['capture_status'] = 'UNKNOWN'
-
-    def step(self, operation):
-        return self._steps[operation]
-
-    def event(self, operation, event):
-        try:
-            if len(self.data['events']) < self.EVENT_LIMIT:
-                self.data['events'].append({'operation': operation, 'event': event})
-            else:
-                self.data['omitted_events'] += 1
-                self.unknown()
-        except Exception:
-            self.unknown()
-
-    def _role(self, filename):
-        if filename is None:
-            return 'NONE'
-        if type(filename) is str:
-            for value, role in self._roles:
-                if filename == value:
-                    return role
-        self.unknown()
-        return 'UNKNOWN'
-
-    def _number(self, value, lower, upper):
-        if value is None:
-            return None, 'ABSENT'
-        if type(value) is int and lower <= value <= upper:
-            return value, 'PRESENT'
-        self.unknown()
-        return None, 'UNSUPPORTED'
-
-    def error(self, error, operation=None, phase=None):
-        try:
-            if self._capture_failed:
-                return None
-            if operation is None and phase is None:
-                return self._capture_error(error)
-            return self._capture_error(error, operation, 'outer' if phase is None else phase)
-        except Exception:
-            # This last-resort path only writes existing slots: no ticket allocation or helper call.
-            self._capture_failed = True
-            self.data['capture_status'] = 'UNKNOWN'
-            self._pending = None
-            return None
-
-    def _capture_error(self, error, operation='UNATTRIBUTED_WORKER_STATEMENT', phase='outer'):
-        try:
-            if self._pending is not None and self._pending[0] is error:
-                return self._pending[1]
-            for index, known in enumerate(self._refs):
-                if known is error:
-                    self._pending = (error, index + 1)
-                    return index + 1
-            previous = self._pending[1] if self._pending is not None else None
-            if len(self.data['errors']) >= self.ERROR_LIMIT:
-                self.data['omitted_errors'] += 1
-                self.unknown()
-                self._pending = (error, None, 'OMITTED')
-                return None
-            ordinal = len(self.data['errors']) + 1
-            label, os_error = 'UNKNOWN', None
-            for kind, name in (
-                (OSError, 'OSError'), (PermissionError, 'PermissionError'),
-                (FileExistsError, 'FileExistsError'), (FileNotFoundError, 'FileNotFoundError'),
-                (NotADirectoryError, 'NotADirectoryError'), (IsADirectoryError, 'IsADirectoryError'),
-                (BlockingIOError, 'BlockingIOError'), (InterruptedError, 'InterruptedError'),
-                (TimeoutError, 'TimeoutError'), (ProcessLookupError, 'ProcessLookupError')):
-                if type(error) is kind:
-                    label, os_error = name, True
-                    break
-            if os_error is None:
-                for kind, name in (
-                    (RuntimeError, 'RuntimeError'), (ValueError, 'ValueError'), (TypeError, 'TypeError'),
-                    (KeyError, 'KeyError'), (AssertionError, 'AssertionError'), (ImportError, 'ImportError'),
-                    (ModuleNotFoundError, 'ModuleNotFoundError'), (KeyboardInterrupt, 'KeyboardInterrupt'),
-                    (SystemExit, 'SystemExit'), (MemoryError, 'MemoryError'), (RevertFailed, 'RevertFailed')):
-                    if type(error) is kind:
-                        label, os_error = name, False
-                        break
-            row = {'ordinal': ordinal, 'operation': operation, 'phase': phase, 'exception_type': label,
-                   'is_oserror': os_error, 'errno': None, 'errno_state': 'ABSENT',
-                   'winerror': None, 'winerror_state': 'ABSENT',
-                   'filename_role': 'NONE', 'filename2_role': 'NONE',
-                   'prior_error': previous if phase == 'recovery' else None}
-            if label == 'UNKNOWN':
-                self.unknown()
-                row.update(errno_state='UNSUPPORTED', winerror_state='UNSUPPORTED',
-                           filename_role='UNKNOWN', filename2_role='UNKNOWN')
-            elif os_error:
-                row['errno'], row['errno_state'] = self._number(getattr(error, 'errno', None), -(2**31), 2**31 - 1)
-                row['winerror'], row['winerror_state'] = self._number(getattr(error, 'winerror', None), 0, 2**32 - 1)
-                row['filename_role'] = self._role(getattr(error, 'filename', None))
-                row['filename2_role'] = self._role(getattr(error, 'filename2', None))
-            if operation == 'UNATTRIBUTED_WORKER_STATEMENT':
-                self.unknown()
-            self.data['errors'].append(row)
-            self._refs[ordinal - 1] = error
-            self._pending = (error, ordinal)
-            return ordinal
-        except Exception:
-            self.unknown()
-            self._pending = (error, None, 'UNAVAILABLE')
-            return None
-
-    def selecting(self, error):
-        self.data['reported_error'] = None
-        self.data['reported_error_state'] = 'UNAVAILABLE'
-        self.error(error)
-
-    def reported(self, error):
-        ordinal = self.error(error)
-        self.data['reported_error'] = ordinal
-        self.data['reported_error_state'] = ('RECORDED' if ordinal is not None else
-            self._pending[2] if self._pending is not None and self._pending[0] is error else 'UNAVAILABLE')
-
-    def final_events(self, revert_attempted, revert_completed, close_attempted, close_completed):
-        for operation, attempted, completed in (
-                ('final_revert', revert_attempted, revert_completed),
-                ('final_token_close', close_attempted, close_completed)):
-            if attempted:
-                self.event(operation, 'attempted')
-            if completed:
-                self.event(operation, 'completed')
-
-    def clear(self):
-        # Fixed slots avoid allocating an iterator while preserving a writer failure.
-        index = 0
-        self._refs[index] = None
-        if self.ERROR_LIMIT > 1:
-            self._refs[1] = None
-        if self.ERROR_LIMIT > 2:
-            self._refs[2] = None
-        if self.ERROR_LIMIT > 3:
-            self._refs[3] = None
-        self._pending = None
-
-
 def worker(config):
-    root, source = (Path(config['evidence']), Path(config['source']))
-    result = {'status': 'FAIL', 'windows_acceptance': False, 'scope': 'M0 P6 junction rights only', 'token': {}, 'junction_called': False, 'platform': sys.platform}
+    root, source = Path(config['evidence']), Path(config['source'])
+    result = {'status': 'FAIL', 'windows_acceptance': False, 'scope': 'M0 P6 junction rights only',
+              'token': {}, 'junction_called': False, 'platform': sys.platform}
     token = None
-    diagnostic = _P6Diagnostic(config)
-    result['diagnostic'] = diagnostic.data
-    diagnostic.event('result_open', 'attempted')
+    # Open diagnostics before impersonation; no junction handle is pre-opened.
     with (root / 'worker-result.json').open('w', encoding='utf-8') as output:
-        diagnostic.event('result_open', 'completed')
         try:
-            with diagnostic.step('platform_check'):
-                require(sys.platform == 'win32', 'P6 requires Windows; no Windows acceptance on this host')
-            with diagnostic.step('windows_facts'):
-                windows_facts(root, result)
-            with diagnostic.step('product_load'):
-                junction = load(source / 'aegis_core/verification/windows_junction.py', 'p6_product_junction')
-            with diagnostic.step('token_construct'):
-                token = Token(result['token'])
-            with diagnostic.step('token_prepare'):
-                token.prepare()
-            with diagnostic.step('preflight_enter'):
-                token.enter()
+            require(sys.platform == 'win32', 'P6 requires Windows; no Windows acceptance on this host')
+            windows_facts(root, result)
+            junction = load(source / 'aegis_core/verification/windows_junction.py', 'p6_product_junction')
+            token = Token(result['token'])
+            token.prepare()
+            token.enter()
             try:
-                with diagnostic.step('preflight_proof'):
-                    token.proof('preflight')
-            except BaseException as exc:
-                diagnostic.error(exc)
-                raise
+                token.proof('preflight')
             finally:
-                with diagnostic.step('preflight_revert'):
-                    token.revert()
-            with diagnostic.step('operation_enter'):
-                token.enter()
+                token.revert()
+            token.enter()
             try:
-                with diagnostic.step('operation_proof'):
-                    token.proof('operation')
+                token.proof('operation')
                 fixture = root / 'fixture'
-                with diagnostic.step('fixture_mkdir'):
-                    fixture.mkdir()
+                fixture.mkdir()
                 target = fixture / 'target'
-                with diagnostic.step('target_mkdir'):
-                    target.mkdir()
+                target.mkdir()
                 sentinel = target / 'sentinel.txt'
-                with diagnostic.step('sentinel_write'):
-                    sentinel.write_text('P6 owned sentinel\n', encoding='utf-8')
-                with diagnostic.step('sentinel_read_verify'):
-                    require(sentinel.read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'restricted ordinary-file control failed')
+                sentinel.write_text('P6 owned sentinel\n', encoding='utf-8')
+                require(sentinel.read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'restricted ordinary-file control failed')
                 link = fixture / 'junction'
                 result['junction_called'] = True
-                with diagnostic.step('junction_create'):
-                    junction.create_directory_junction(target, link)
-                with diagnostic.step('junction_lstat'):
-                    owned = link.lstat()
-                with diagnostic.step('junction_readlink'):
-                    destination = os.readlink(link)
-                result['junction'] = {'device': owned.st_dev, 'inode': owned.st_ino, 'tag': getattr(owned, 'st_reparse_tag', None), 'target': destination, 'attributes': getattr(owned, 'st_file_attributes', None)}
-                with diagnostic.step('junction_tag_verify'):
-                    require(result['junction']['tag'] == 2684354563 and result['junction']['attributes'] & 1024, 'created entry is not a mount-point junction')
-                with diagnostic.step('junction_target_verify'):
-                    require(Path(os.path.realpath(link)) == Path(os.path.realpath(target)), 'junction target differs')
-                with diagnostic.step('junction_traversal_verify'):
-                    require((link / 'sentinel.txt').read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'junction traversal failed')
-                with diagnostic.step('junction_lstat_recheck'):
-                    current = link.lstat()
-                with diagnostic.step('junction_identity_verify'):
-                    require((current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino) and os.readlink(link) == destination and (current.st_reparse_tag == 2684354563), 'owned junction changed before cleanup')
-                with diagnostic.step('junction_remove'):
-                    link.rmdir()
-                with diagnostic.step('target_preservation_verify'):
-                    require(not os.path.lexists(link) and sentinel.read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'junction cleanup changed its target')
+                junction.create_directory_junction(target, link)
+                owned = link.lstat()
+                destination = os.readlink(link)
+                result['junction'] = {'device': owned.st_dev, 'inode': owned.st_ino,
+                    'tag': getattr(owned, 'st_reparse_tag', None), 'target': destination,
+                    'attributes': getattr(owned, 'st_file_attributes', None)}
+                require(result['junction']['tag'] == 0xA0000003 and result['junction']['attributes'] & 0x400,
+                        'created entry is not a mount-point junction')
+                # Python 3.9's Path.resolve() raises under this token; 3.10+ resolve() is realpath.
+                require(Path(os.path.realpath(link)) == Path(os.path.realpath(target)), 'junction target differs')
+                require((link / 'sentinel.txt').read_text(encoding='utf-8') == 'P6 owned sentinel\n', 'junction traversal failed')
+                current = link.lstat()
+                require((current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino)
+                        and os.readlink(link) == destination and current.st_reparse_tag == 0xA0000003,
+                        'owned junction changed before cleanup')
+                link.rmdir()
+                require(not os.path.lexists(link) and sentinel.read_text(encoding='utf-8') == 'P6 owned sentinel\n',
+                        'junction cleanup changed its target')
                 result['junction_removed_target_preserved'] = True
-            except BaseException as exc:
-                diagnostic.error(exc)
-                raise
             finally:
-                with diagnostic.step('operation_revert'):
-                    token.revert()
-            with diagnostic.step('normal_token_close'):
-                token.close()
+                token.revert()
+            token.close()
             result.update(status='PASS', windows_acceptance=True)
         except BaseException as exc:
-            diagnostic.selecting(exc)
-            result.update(status='FAIL', windows_acceptance=False, error_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc())
-            diagnostic.reported(exc)
+            result.update(status='FAIL', windows_acceptance=False, error_type=type(exc).__name__,
+                          error=str(exc), traceback=traceback.format_exc())
         finally:
-            cleanup_error = None
-            cleanup_operation = None
-            revert_attempted = revert_completed = close_attempted = close_completed = False
-            if token is not None and (not token.fatal):
+            if token is not None and not token.fatal:
                 try:
-                    revert_attempted = True
-                    try:
-                        token.revert()
-                    except BaseException as exc:
-                        cleanup_error, cleanup_operation = (exc, 'final_revert')
-                        raise
-                    revert_completed = True
-                    close_attempted = True
-                    try:
-                        token.close()
-                    except BaseException as exc:
-                        cleanup_error, cleanup_operation = (exc, 'final_token_close')
-                        raise
-                    close_completed = True
+                    token.revert()
+                    token.close()
                 except BaseException as exc:
-                    try:
-                        if cleanup_error is exc:
-                            diagnostic.error(exc, cleanup_operation, 'recovery')
-                        diagnostic.selecting(exc)
-                        diagnostic.final_events(revert_attempted, revert_completed, close_attempted, close_completed)
-                    except Exception:
-                        diagnostic.unknown()
                     result.update(status='FAIL', windows_acceptance=False, error_type=type(exc).__name__, error=str(exc))
-                    try:
-                        diagnostic.reported(exc)
-                    except Exception:
-                        diagnostic.unknown()
-                else:
-                    try:
-                        diagnostic.final_events(revert_attempted, revert_completed, close_attempted, close_completed)
-                    except Exception:
-                        diagnostic.unknown()
-            if diagnostic.data['reported_error_state'] == 'UNAVAILABLE':
-                diagnostic.unknown()
-            try:
-                output.write(json.dumps(result, indent=2, sort_keys=True) + '\n')
-                output.flush()
-            finally:
-                diagnostic.clear()
-                cleanup_error = None
+            output.write(json.dumps(result, indent=2, sort_keys=True) + '\n')
+            output.flush()
     if token is not None and token.fatal:
-        os._exit(3)
+        os._exit(3)  # Required shutdown after failed reversion; diagnostics already flushed.
     return 0 if result['status'] == 'PASS' else 1
 
 

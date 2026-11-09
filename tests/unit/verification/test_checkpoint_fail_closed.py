@@ -1,6 +1,7 @@
 """Fail-closed and read-only regression tests for CLI/MCP checkpoint."""
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -112,20 +113,25 @@ def test_checkpoint_is_recursively_read_only_on_pass_and_fail(tmp_path, malforme
     _write_invariant(tmp_path, content)
     marker = tmp_path / '.marker'
     marker.write_bytes(b'unchanged bytes\x00\xff')
-    external = tmp_path.parent / f'{tmp_path.name}-external'
-    external.mkdir()
-    link = tmp_path / '.snapshot-link'
-    try:
-        link.symlink_to(external, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip('symlinks are unavailable')
+    # Passing tmp_path directories can be deleted and their names reused. Give
+    # the external target its own unique name and clean it on pass/fail/skip.
+    with TemporaryDirectory(prefix='checkpoint-external-', dir=tmp_path.parent) as directory:
+        external = Path(directory)
+        (external / '.marker').write_bytes(b'external bytes\x00\xff')
+        link = tmp_path / '.snapshot-link'
+        try:
+            link.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip('symlinks are unavailable')
 
-    before = _snapshot(tmp_path)
-    result = _run_cli(tmp_path)
-    after = _snapshot(tmp_path)
+        before = _snapshot(tmp_path)
+        external_before = _snapshot(external)
+        result = _run_cli(tmp_path)
+        after = _snapshot(tmp_path)
 
-    assert after == before
-    assert result == (1 if malformed else 0)
+        assert after == before
+        assert _snapshot(external) == external_before
+        assert result == (1 if malformed else 0)
 
 
 def test_resolve_canonical_test_candidates(tmp_path: Path):
