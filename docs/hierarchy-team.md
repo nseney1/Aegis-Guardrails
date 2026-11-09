@@ -244,8 +244,11 @@ file-backed stdout/stderr. `status` reports the hold; another approve or turn on
 launching anything. Teardown also retains resources while a model operation is unresolved.
 
 Use `approve <request-id> --reconcile` for ROOT, or `turn <endpoint> --reconcile` for a role. These commands never
-replay a prompt. They require the recorded process to have exited and fresh transcript entries to show a completed
-or failed turn. Process exit alone, an older completed turn, or missing transcript evidence keeps the hold.
+replay a prompt. Before a completion seal exists they require positive evidence that the original process exited,
+and fresh transcript entries proving the submitted turn completed or failed. Process exit alone, an older completed
+turn, or missing transcript evidence keeps the hold and names the recovery action. An unavailable original process
+scope is recorded before launch: it does not prevent a normal synchronous native wait, but it prevents automatic
+reconciliation after a deadline or lost caller. A completion record cannot override a live bound session.
 Reconciliation releases the operation's wake marker once the outcome is known; a failed turn returns 3.
 
 Owner operations retain one identity from intent through launch, accounting and release. Codex-only state writers
@@ -276,11 +279,94 @@ deadline expiry, record usage as null. Reconciliation does not append a second i
 `usage-ledger.json` belongs to PR7. Codex retains its existing event rows and argv.
 
 Governed team child environments use an allowlist: PATH, HOME, LANG, LC_*, TERM, TMPDIR, USER, LOGNAME and the run's
-host home variables. Historical v1 Codex bases without a host plan retain inherited settings such as HTTPS_PROXY
-and SSL_CERT_FILE. Provider credential names, Claude session variables, SSH_AUTH_SOCK and test-control variables
-are still excluded. A missing v2 plan refuses binding and owner turns; it never enables legacy inheritance.
+host home variables. Historical v1 Codex-only bases without a host plan use the original environment construction:
+copy the entire parent environment, then apply the run's CODEX_HOME, bytecode flag and optional PATH override.
+This compatibility exception includes SSH_AUTH_SOCK, AWS settings and other inherited names. It does not apply
+to Claude or to any plan-governed run, whose provider/session/test-control exclusions remain strict. A missing
+v2 plan refuses binding and owner turns; it never enables legacy inheritance. Owner-held plan history also prevents
+a formerly governed v1 run from inheriting secrets after its public plan is deleted. A genuine older v1 run with
+neither a plan nor any record of an issued plan retains baseline inheritance. The run root is canonicalized once
+so operating-system parent aliases work; symlinks below that root remain refused.
 The command sets its own Python bytecode flag. `evidence/child-environment.json` records every dropped variable's
 name, never its value. Refusals do not update this evidence or the command log.
+
+The private `.owner-custody` directory retains custody, interpreter bytes and the source revision returned by provision,
+each active intent, and its original launch records. It is outside the homes, connections and evidence directories
+exposed to models. Owner commands verify
+its ownership, permissions and regular files before trusting it. New records are staged at mode0600, synced,
+published by a hard link that cannot replace an existing record, then the staging name is removed and the directory
+is synced. The reader permits only one same-directory staging alias matching that publication's finite filename
+and inode checks; arbitrary hard links remain refused. A known failure before model launch retires only its own
+intent and marker. A lost launch reply remains unknown. Bad records appear as endpoint-specific custody errors in
+`status`; a neighboring bad record does not prevent inspection or another endpoint's work.
+
+The threat model treats model children and their editable files as hostile and the owner UID as trusted. Generated
+Claude profiles retain restricted/manual permissions, exact tools and MCP connections, and no extra writable
+directories. Governed Codex readers retain a read-only sandbox; writers retain explicit worktree roots, no network,
+and excluded ambient temporary directories. At provision and turn time, every declared worktree, cwd, extra write
+directory and temporary directory must be disjoint from run controls: evidence, lifecycle, mailbox, profiles,
+connections, owner records and other hosts' homes. Lane worktrees remain allowed. Governed
+turns validate the complete registry argv, connection, source scope, delivery directory, interpreter and executable
+before claiming a wake marker. Governed PATH entries must be absolute and nonempty; both their original spelling
+and resolved directory must be disjoint from every role's write roots and model homes, including ancestors of
+those roots. Executable targets must also be outside those roots. The final child environment is checked after
+recipe-directory prepends, and children execute the validated absolute program. An immutable read-only system
+mount can establish that an executable is protected even when a container maps its owner differently; executable
+hardlinks remain refused. Changing mutable config,
+plan, provision and launch publications together cannot repin owner records. The local host adapter table selects
+resume/session/home/event recognition without silently falling back to another provider.
+
+The tests inspect generated profiles and use test hosts; they do not qualify native permission enforcement.
+An arbitrary hostile process already running as the owner UID can rewrite owner files. Protecting against that
+requires a separately qualified OS principal or equivalent isolation, an open coordinator item. No adjacent hash or
+private filename authenticates such a process. Claude's native path confinement, Codex sandbox enforcement and
+process layouts require their own qualification.
+
+Interpreter drift refuses with the action to restore the recorded interpreter bytes or preserve the run and init
+a new folder; realpath changes, missing interpreters and changed bytes use the same guidance, without repinning
+live work. Runs predating these records, missing runtime records, or a lost
+custody directory receive a structured hold with the same preserve-and-migrate action. `down` keeps their resources.
+Preserve state, marker, output and accounting; finish or stop original sessions using their originating version's
+qualified owner controls, then init a new run folder. There is no force-release or replay permission. In particular,
+the legacy Claude launcher stop path is not qualified for safe signalling: that exit remains held for reviewed PR4b
+integration. Do not use it as a workaround. A surviving private intent can be reconciled under its original id even
+when its public state slot was lost, but only with the original process and sealed accounting evidence.
+
+An operation whose launch publication was interrupted can recover from its original private intent. Recovery
+requires unchanged original scope, confirmed absence of processes bound to that session, and fresh terminal proof
+for that session and submitted turn. It invents neither a PID nor a native exit. An existing public launch without
+its private witness remains a custody problem. Definitely unstarted operations (including output staging and exec
+failures before `Popen` returned) retire only their matching intent and wake marker and return a structured refusal.
+Any failure after `Popen` returned remains unresolved until reconciliation; the prompt is never replayed.
+
+Observed native waits also check for surviving processes bound to the session before sealing or release. A live or
+uninspectable bound process keeps the original custody and marker. Measured exit/usage accounting stays recorded.
+The private `turn-<id>.exit.json` records a returned native wait independently of release. If publishing that witness
+fails, the same measured exit is retained in the invocation receipt when accounting can be written. A lost wait
+reply still records native exit as null; a transcript verdict never supplies that missing measurement.
+
+Owner records and credentials have a 256 KiB budget; markers have 16 KiB. Stdout, stderr and turn logs have 16 MiB
+budgets, with at most 65,536 stdout events. Transcript confirmation/recovery permits 64 MiB of history, 4 MiB per
+record, and at most 1,024 fresh recovery events totaling 8 MiB. Reads use chunks no larger than 1 MiB; JSON nesting
+is limited to 32 levels. An over-budget record gives a typed hold/refusal and preserves the files and custody.
+Markers are opened nonblocking and must be regular files. Codex event boundaries are byte newlines; malformed
+events remain counted unknown events with their raw bytes retained. `status` localizes damaged owner/state records.
+A malformed child-environment evidence record during finalization returns a typed failure with the completed
+command's partial result, rather than losing that result.
+
+The local host adapter table supplies credentials, argv/stdin, profile checks, output/usage/accounting and startup
+policy. Moving that table into the shared host registry remains coordinator work.
+
+If a launch record is published before its PID state transaction, reconciliation can recover that same PID only
+when every original intent field agrees. Before removing a wake marker, a completed operation retains bounded
+file identities and prefixes, native exit evidence and its accounting receipt hash. A lost release reply can then
+retire the original operation after a later wake, without counting that wake's transcript as the original turn,
+charging again, or deleting its marker. After that seal, transcript rotation, edits, removal or hard links do not
+invalidate the completed invocation. Retirement audits such drift as `post_seal_evidence: changed` or `missing`;
+an unchanged sealed prefix needs no extra field. Output, accounting, native exit and original launch evidence stay
+immutable. Process liveness is checked before this branch. Before a seal, unknown or changed transcript evidence
+keeps custody; conflicting accounting or a foreign wake marker cannot authorize removal of another wake. No path
+replays a prompt or invents a native exit code from a transcript verdict.
 
 If launcher stop reports nonempty `unowned_pids`, teardown carries those pids into its result and returns 3 while
 keeping resources. It cannot report that endpoint as cleanly stopped merely because the owned host was not found.

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -47,7 +48,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
-from hierarchy_mailbox import (GIT_ID, SLUG, Mailbox, endpoint_parts, fields, matching, read_json, require,  # noqa: E402
+from hierarchy_mailbox import (GIT_ID, SLUG, Mailbox, endpoint_parts, fields, matching, require,  # noqa: E402
                                strict_json, text, timestamp)
 import hierarchy_hosts  # noqa: E402
 import hierarchy_lifecycle  # noqa: E402
@@ -106,6 +107,438 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 # The aegis team commands read these; the run names --workspace itself, so none may redirect them.
 AEGIS_OVERRIDES = ("AEGIS_WORKSPACE", "AEGIS_MANAGER_CONFIG", "AEGIS_MANAGER_CONFIG_SHA256", "GITHUB_BASE_REF")
 PUBLISH_ID = re.compile(r'message_id\\*"?\s*:\s*\\*"([^"\\]+)')
+
+
+# Owner-side adapters stay local until the registry can accept the reviewed successor table.
+
+def codex_events(raw):
+    for line in output_lines(raw):
+        try:
+            value = record_json(line, "model stdout")
+        except CustodyProblem:
+            raise
+        except (ValueError, UnicodeError):
+            value = None
+        if isinstance(value, dict):
+            yield value
+        else:
+            yield {"type": "unknown", "raw": line.decode("utf-8", "replace"), "raw_hex": line.hex()}
+
+
+OWNER_ADAPTERS = {
+    CODEX: {
+        "program": "codex", "resume_word": b"resume", "home_attribute": "codex_home", "label": "Codex",
+        "events": codex_events, "error": lambda event: event.get("type") == "turn.failed", "prefix_kind": "session_meta",
+        "terminal": lambda *args: prove_codex_turn(*args), "usage": lambda raw: codex_usage(raw),
+        "items": lambda raw: agent_items(raw), "log_records": lambda raw: raw_log_records(raw),
+        "account": lambda *args: account_native_events(*args), "receipt_fields": {"log_span"}, "owns_receipt": True,
+        "credentials": lambda run: None, "root_argv": lambda *args: codex_root_argv(*args),
+        "root_validate": lambda *args: codex_root_validate(*args), "turn_profile": lambda *args: codex_turn_profile(*args),
+        "resume_profile": lambda *args: codex_resume_profile(*args), "bind_root": lambda *args: codex_bind_root(*args),
+        "failure": lambda *_args: None, "strict_root_tools": False, "exit_field": "codex_exit",
+        "up_error": None, "allows_tmpdir": True, "isolated_homes": False, "transactional": False,
+        "home_check": lambda run: safe_codex_home(run), "env_always": True, "check_home_always": True,
+        "purge_flag": "purge_codex_home", "purge": lambda run: purge(run), "purge_check": lambda run: check_codex_purge(run),
+        "tmpdir_error": None,
+        "login_preflight": lambda run: None, "login": lambda run, _timeout: login_codex(run),
+        "billing": lambda run: codex_billing(run),
+        "expected_profile": lambda *args: expected_profile(*args), "check_role": lambda *args: check_role(*args),
+    },
+    CLAUDE: {
+        "program": "claude", "resume_word": b"--resume", "home_attribute": "claude_home", "label": "Claude",
+        "events": hierarchy_hosts.claude_events, "error": lambda event: event.get("type") == "result" and event.get("is_error") is True,
+        "prefix_kind": None, "terminal": lambda *args: prove_claude_turn(*args), "usage": hierarchy_hosts.claude_usage,
+        "items": hierarchy_hosts.claude_turn_items, "log_records": lambda raw: accounting_lines(raw),
+        "account": lambda *args: account_usage_rows(*args), "receipt_fields": set(), "owns_receipt": False,
+        "credentials": lambda run: claude_pin(run), "root_argv": lambda *args: claude_root_argv(*args),
+        "root_validate": lambda *args: claude_root_validate(*args), "turn_profile": lambda *args: claude_turn_profile(*args),
+        "resume_profile": lambda *args: claude_resume_profile(*args), "bind_root": lambda *args: claude_bind_root(*args),
+        "failure": lambda *args: claude_turn_failure(*args), "strict_root_tools": True, "exit_field": "claude_exit",
+        "up_error": "this team command starts claude-code team roles from T2(a) PR 6",
+        "allows_tmpdir": False, "isolated_homes": True, "transactional": True,
+        "home_check": lambda run: safe_claude_home(run), "env_always": False, "check_home_always": False,
+        "purge_flag": "purge_claude_home", "purge": lambda run: purge_claude(run), "purge_check": lambda run: check_claude_purge(run),
+        "tmpdir_error": "lane %s: tmpdir is only for a Codex writer, and this run\'s team host is claude-code",
+        "login_preflight": lambda run: claude_login_preconditions(run), "login": lambda run, timeout: login_claude(run, timeout),
+        "billing": lambda run: claude_billing(run),
+        "expected_profile": None, "check_role": None,
+    },
+}
+MAX_CUSTODY_INTEGER = (1 << 63) - 1
+CUSTODY_RECOVERY = ("preserve this run; finish or stop its original sessions with the originating version, then init "
+                    "a new run folder; do not replay")
+INTERPRETER_RECOVERY = ("restore the recorded interpreter bytes or preserve this run and init a new run folder; "
+                        "never repin a live run")
+
+
+class CustodyProblem(ValueError):
+    def __init__(self, message, reason, record, next_action=CUSTODY_RECOVERY):
+        super().__init__(message)
+        self.problem = {"reason": reason, "record": record, "error": message}
+        self.next_action = next_action
+
+    def detail(self):
+        return {"custody_problem": self.problem, "next_action": self.next_action}
+
+
+# Resource budgets bound owner memory/I/O, never truncate or rewrite provider evidence.
+RECORD_BYTES = 262144
+MARKER_BYTES = 16384
+OUTPUT_BYTES = 16 << 20
+OUTPUT_EVENTS = 65536
+TURN_LOG_BYTES = 16 << 20
+TRANSCRIPT_BYTES = 64 << 20
+TRANSCRIPT_LINE_BYTES = 4 << 20
+FRESH_BYTES = 8 << 20
+FRESH_EVENTS = 1024
+JSON_DEPTH = 32
+UNINSPECTED = object()
+
+
+def budget_problem(path, reason="byte budget"):
+    return CustodyProblem("owner evidence exceeds its %s; retain the hold and preserve the original files" % reason,
+                          reason, Path(path).name)
+
+
+def bounded_read(stream, path, limit):
+    if os.fstat(stream.fileno()).st_size > limit:
+        raise budget_problem(path)
+    blocks, length = [], 0
+    while length <= limit:
+        block = stream.read(min(1 << 20, limit + 1 - length))
+        if not block:
+            return b"".join(blocks)
+        length += len(block)
+        blocks.append(block)
+    raise budget_problem(path)
+
+
+def bounded_bytes(path, limit=RECORD_BYTES):
+    path = Path(path)
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise CustodyProblem("owner evidence is not a regular file; retain the hold", "record type", path.name)
+        return bounded_read(stream, path, limit)
+
+
+def bounded_tail(path, limit):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise CustodyProblem("owner evidence is not a regular file; retain the hold", "record type", Path(path).name)
+        stream.seek(max(0, info.st_size - limit))
+        return stream.read(limit)
+
+
+def record_json(raw, record):
+    # Check depth before json.loads allocates nested objects; quoted/escaped brackets are data.
+    depth, quoted, escaped = 0, False, False
+    for value in raw if isinstance(raw, bytes) else raw.encode("utf-8"):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif value == 92:
+                escaped = True
+            elif value == 34:
+                quoted = False
+        elif value == 34:
+            quoted = True
+        elif value in (91, 123):
+            depth += 1
+            if depth > JSON_DEPTH:
+                raise CustodyProblem("owner record exceeds the supported JSON depth", "record depth", str(record))
+        elif value in (93, 125):
+            depth -= 1
+    try:
+        return strict_json(raw)
+    except RecursionError as exc:
+        raise CustodyProblem("owner record exceeds the supported JSON depth", "record depth", str(record)) from exc
+
+
+def read_json(path):
+    return record_json(bounded_bytes(path), Path(path).name)
+
+
+def environment_record(value):
+    try:
+        record_fields(value, {"dropped_names"}, kind="child environment")
+        names = value["dropped_names"]
+        require(isinstance(names, list) and len(names) <= 4096 and
+                all(record_string(name, 512) and "=" not in name for name in names) and
+                len(set(names)) == len(names), "invalid child environment record")
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise CustodyProblem("invalid child environment record", "record shape", "child-environment.json") from exc
+    return value
+
+
+def record_line(stream, path, limit=TRANSCRIPT_LINE_BYTES):
+    blocks, length = [], 0
+    while length <= limit:
+        block = stream.readline(min(1 << 20, limit + 1 - length))
+        length += len(block)
+        blocks.append(block)
+        if not block or block.endswith(b"\n"):
+            if length > limit:
+                raise budget_problem(path)
+            return b"".join(blocks)
+    raise budget_problem(path)
+
+
+def transcript_lines(stream, path, *, byte_limit=TRANSCRIPT_BYTES, count_limit=None):
+    total = count = 0
+    while True:
+        line = record_line(stream, path)
+        if not line:
+            return
+        total += len(line)
+        count += 1
+        if len(line) > TRANSCRIPT_LINE_BYTES or total > byte_limit:
+            raise budget_problem(path)
+        if count_limit is not None and count > count_limit:
+            raise budget_problem(path, "event budget")
+        yield line
+
+
+def native_output(operation, field="stdout"):
+    return bounded_bytes(operation[field], OUTPUT_BYTES)
+
+
+def output_lines(raw):
+    raw = raw.encode("utf-8") if isinstance(raw, str) else raw
+    if len(raw) > OUTPUT_BYTES:
+        raise budget_problem("model stdout")
+    if raw.count(b"\n") + bool(raw and not raw.endswith(b"\n")) > OUTPUT_EVENTS:
+        raise budget_problem("model stdout", "event budget")
+    lines = raw.split(b"\n")
+    if lines and not lines[-1]:
+        lines.pop()
+    for line in lines:
+        if len(line) > TRANSCRIPT_LINE_BYTES:
+            raise budget_problem("model stdout")
+        yield line
+
+
+def validate_output(raw):
+    for line in output_lines(raw):
+        try:
+            record_json(line, "model stdout")
+        except CustodyProblem:
+            raise
+        except (ValueError, UnicodeError):
+            # Provider adapters retain their own malformed-event policy; budgets apply before decoding there.
+            pass
+
+
+def host_home(run, host):
+    homes = getattr(run, "validated_homes", {})
+    return homes.get(host, str(getattr(run, OWNER_ADAPTERS[host]["home_attribute"])))
+
+
+def owner_events(host, raw):
+    validate_output(raw)
+    return OWNER_ADAPTERS[host]["events"](raw)
+
+
+def owner_result_failed(host, raw):
+    return any(OWNER_ADAPTERS[host]["error"](event) for event in owner_events(host, raw))
+
+
+def bounded_integer(value, minimum=0, maximum=MAX_CUSTODY_INTEGER):
+    return type(value) is int and minimum <= value <= maximum
+
+
+def bounded_record_tree(value, depth=0):
+    if depth > 32:
+        return False
+    if value is None or type(value) is bool or isinstance(value, str):
+        return True
+    if type(value) is int:
+        return -MAX_CUSTODY_INTEGER <= value <= MAX_CUSTODY_INTEGER
+    if isinstance(value, (list, dict)):
+        items = value.values() if isinstance(value, dict) else value
+        return len(value) <= 4096 and all(bounded_record_tree(item, depth + 1) for item in items)
+    return False
+
+
+def record_string(value, maximum=4096):
+    return isinstance(value, str) and bool(value) and "\0" not in value and len(value) <= maximum
+
+
+def record_fields(value, required, optional=(), kind="operation"):
+    require(isinstance(value, dict) and required <= value.keys() and
+            value.keys() <= required | set(optional), "invalid %s record" % kind)
+    return value
+
+
+def record_digest(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def load_file_witness(value, kind="transcript"):
+    record_fields(value, {"device", "inode", "offset", "prefix_sha256"}, kind=kind)
+    require(all(bounded_integer(value[key]) for key in ("device", "inode", "offset")) and
+            record_digest(value["prefix_sha256"]), "invalid %s record" % kind)
+    return value
+
+
+def load_operation(value, kind="operation"):
+    required = {"id", "endpoint", "host", "session", "generation", "started_at", "pid", "process_scope",
+                "stdout", "stderr", "transcripts", "prompt_sha256", "cwd", "turn_log", "marker", "marker_witness"}
+    optional = () if kind == "active" else ("pid_start", "approval", "intent_recovery") if kind == "launch" else ("pid_start", "approval", "release", "intent_recovery")
+    # An active intent may retain ROOT's approval request, but never a PID or release phase.
+    if kind == "active":
+        optional = ("approval",)
+    record_fields(value, required, optional, kind)
+    error = "invalid %s record" % kind
+    require(isinstance(value["id"], str) and re.fullmatch(r"[0-9a-f]{32}", value["id"]) is not None and
+            isinstance(value["host"], str) and value["host"] in OWNER_ADAPTERS and record_string(value["endpoint"]) and
+            record_string(value["session"], 512) and bounded_integer(value["generation"], 1, (1 << 31) - 1) and
+            all(record_string(value[key]) for key in ("started_at", "stdout", "stderr", "cwd", "turn_log")) and
+            record_digest(value["prompt_sha256"]) and
+            (value["pid"] is None or bounded_integer(value["pid"], 1, (1 << 31) - 1)), error)
+    endpoint_parts(value["endpoint"])
+    if kind == "active":
+        require(value["pid"] is None, error)
+    if "intent_recovery" in value:
+        require(value["intent_recovery"] is True and value["pid"] is None and "pid_start" not in value, error)
+    if "pid_start" in value:
+        birth = value["pid_start"]
+        require(birth is None or (isinstance(birth, str) and birth.isdigit() and len(birth) <= 19 and
+                                  0 < int(birth) <= MAX_CUSTODY_INTEGER), error)
+    scope = value["process_scope"]
+    require(isinstance(scope, dict), error)
+    if scope.get("state") == "UNAVAILABLE":
+        require(set(scope) == {"state", "reason"} and isinstance(scope["reason"], str) and scope["reason"] in OPERATION_SCOPE_REASONS, error)
+    else:
+        require(set(scope) == {"boot_id", "pid_namespace", "proc_device", "proc_inode", "effective_uid"} and
+                isinstance(scope["boot_id"], str) and re.fullmatch(r"[0-9a-f-]{36}", scope["boot_id"]) is not None and
+                isinstance(scope["pid_namespace"], str) and re.fullmatch(r"pid:\[\d{1,20}\]", scope["pid_namespace"]) is not None and
+                all(bounded_integer(scope[key]) for key in ("proc_device", "proc_inode", "effective_uid")), error)
+    require(isinstance(value["transcripts"], dict) and len(value["transcripts"]) <= 128 and
+            all(record_string(key) for key in value["transcripts"]), "invalid transcript record")
+    for witness in value["transcripts"].values():
+        load_file_witness(witness)
+    marker, witness = value["marker"], value["marker_witness"]
+    require((marker is None and witness is None) or (record_string(marker) and isinstance(witness, dict)), error)
+    if witness is not None:
+        record_fields(witness, {"device", "inode", "ctime_ns", "sha256", "operation_id"}, kind=kind)
+        require(all(bounded_integer(witness[key]) for key in ("device", "inode", "ctime_ns")) and
+                record_digest(witness["sha256"]) and witness["operation_id"] == value["id"], error)
+    if "release" in value:
+        release = value["release"]
+        record_fields(release, {"accounting_sha256", "terminal_sha256"}, kind=kind)
+        require(all(record_digest(item) for item in release.values()), error)
+    if "approval" in value:
+        approval = value["approval"]
+        record_fields(approval, {"request_id", "decision", "request_sha256", "previous"}, kind=kind)
+        require(record_string(approval["request_id"]) and approval["decision"] in ("approve", "deny") and
+                record_digest(approval["request_sha256"]) and isinstance(approval["previous"], list) and
+                all(isinstance(item, dict) and bounded_record_tree(item) for item in approval["previous"]), error)
+    return value
+
+
+def load_completion(value):
+    record_fields(value, {"schema", "operation_id", "launch_sha256", "accounting_sha256", "files", "failed", "native_exit"},
+                  kind="completion")
+    require(value["schema"] == "aegis.team-owner-completion/v1" and isinstance(value["operation_id"], str) and
+            re.fullmatch(r"[0-9a-f]{32}", value["operation_id"]) is not None and
+            all(record_digest(value[key]) for key in ("launch_sha256", "accounting_sha256")) and
+            type(value["failed"]) is bool and
+            (value["native_exit"] is None or bounded_integer(value["native_exit"], -255, 255)) and
+            isinstance(value["files"], dict) and len(value["files"]) <= 132 and
+            all(record_string(key) for key in value["files"]), "invalid completion record")
+    for witness in value["files"].values():
+        load_file_witness(witness, "completion")
+    return value
+
+
+def load_runtime(value):
+    record_fields(value, {"schema", "run", "initiative", "python", "source", "python_realpath", "custody",
+                          "python_sha256", "source_commit", "source_tree"}, kind="runtime")
+    require(value["schema"] == "aegis.team-owner-runtime/v1" and
+            all(record_string(value[key]) for key in ("run", "initiative", "python", "source", "python_realpath")) and
+            isinstance(value["custody"], dict) and bounded_record_tree(value["custody"]) and record_digest(value["python_sha256"]) and
+            all(isinstance(value[key], str) and re.fullmatch(r"[0-9a-f]{40,64}", value[key]) is not None
+                for key in ("source_commit", "source_tree")), "invalid runtime record")
+    return value
+
+
+def load_native_record(value, kind):
+    # Finite layouts used by the existing native reader/fake; unknown host extensions remain HOLD, not proof.
+    required = {"id"} if kind == "metadata" else {"turn_id", "cwd"}
+    optional = ({"session_id", "timestamp", "cwd", "originator", "source", "cli_version", "model_provider", "git"}
+                if kind == "metadata" else
+                {"root_turn_id", "model", "effort", "approval_policy", "approvals_reviewer", "sandbox_policy",
+                 "permission_profile", "summary", "service_tier", "multi_agent_version"})
+    record_fields(value, required, optional, "Codex " + kind)
+    error = "invalid Codex %s record" % kind
+    require(all(record_string(value[key]) for key in required), error)
+    for key, item in value.items():
+        if key in ("sandbox_policy", "permission_profile", "git"):
+            require(item is None or (isinstance(item, dict) and bounded_record_tree(item)), error)
+        elif key == "source":
+            require(isinstance(item, (str, dict)) and bounded_record_tree(item), error)
+        elif key == "multi_agent_version":
+            require(item is None or record_string(item) or bounded_integer(item, 0, 100), error)
+        else:
+            require(item is None or record_string(item), error)
+    return value
+
+
+def load_owner_value(name, value):
+    if name == "runtime.json":
+        return load_runtime(value)
+    if name == "plan-issued.json":
+        record_fields(value, {"schema", "plan_issued"}, kind="plan history")
+        require(value["schema"] == "aegis.team-plan-issued/v1" and value["plan_issued"] is True,
+                "invalid plan history record")
+        return value
+    if name.endswith(".exit.json"):
+        return load_native_exit(value)
+    if name.startswith("active-"):
+        return load_operation(value, "active")
+    if name.endswith(".launch.json"):
+        return load_operation(value, "launch")
+    return load_completion(value)
+
+
+
+def owner_expected(run, state=UNINSPECTED):
+    state = load_state(run) if state is UNINSPECTED else state
+    return run.isolated_homes or bool(state and state.get("owner_custody"))
+
+
+def plan_was_issued(run):
+    state = load_state(run)
+    folder = run.run / ".owner-custody"
+    if folder.exists() or folder.is_symlink() or owner_expected(run):
+        folder = owner_folder(run)
+        if (folder / "plan-issued.json").exists() or (folder / "plan-issued.json").is_symlink():
+            return owner_read(run, "plan-issued.json")["plan_issued"]
+    if state and state.get("host_plan_issued"):
+        raise CustodyProblem("this run's plan history is missing; preserve it and init a new run folder",
+                             "record missing", "plan-issued.json")
+    # Public evidence identifies transitional runs which issued plans before owner records existed.
+    path = run.evidence / "index.json"
+    value = read_json(path) if path.is_file() else {}
+    return isinstance(value, dict) and isinstance(value.get("files"), dict) and hierarchy_hosts.PLAN_FILE in value["files"]
+
+
+def governed_run(run):
+    return run.raw["schema"] != SCHEMA or hierarchy_hosts.read_plan(run.base) is not None or plan_was_issued(run)
+
+
+def legacy_environment(run):
+    if run.raw["schema"] != SCHEMA or hierarchy_hosts.read_plan(run.base) is not None:
+        return False
+    if plan_was_issued(run):
+        if init_complete(load_state(run)):
+            refuse("this run's issued host plan is missing; restore host-plan.json before continuing")
+        return False
+    return True
 
 
 class Stop(Exception):
@@ -206,7 +639,9 @@ class Run:
     """The parsed team-run.json and the paths it implies."""
 
     def __init__(self, path):
-        self.config_path = absolute(path, "--config")
+        candidate = absolute(path, "--config")
+        require(not candidate.is_symlink(), "symlink paths are not supported: " + str(candidate))
+        self.config_path = Path(os.path.realpath(candidate))
         try:
             value = read_json(self.config_path)
         except FileNotFoundError:
@@ -222,9 +657,11 @@ class Run:
         self.hosts = self.check_hosts()
         require(value["schema"] == SCHEMA_V2 or "claude_home" not in value, "claude_home needs schema " + SCHEMA_V2)
         self.run = absolute(value["run"], "run")
-        if self.uses(CLAUDE):
-            # Before state reads or command logging, and before deriving paths passed to tools that reject symlinks.
+        if self.isolated_homes:
+            # Preserve the reviewed owner-home diagnostics, then canonicalize safe parent aliases.
             self.run = safe_run_folder(self)
+        else:
+            self.run = Path(os.path.realpath(self.run))
         self.codex_home = absolute(value.get("codex_home", str(self.run / "codex-home")), "codex_home")
         # Made and checked only when the plan uses claude-code (ADR T2(a) section 3).
         self.claude_home = absolute(value.get("claude_home", str(self.run / "claude-home")), "claude_home")
@@ -290,8 +727,8 @@ class Run:
         self.log_path = self.run / "loop.log"
         self.commands_log = self.run / "team-commands.jsonl"
         self.inputs = self.run / "inputs"
-        if self.uses(CLAUDE):
-            self.validated_homes = {CODEX: safe_codex_home(self), CLAUDE: safe_claude_home(self)}
+        if self.isolated_homes:
+            self.validated_homes = {host: adapter["home_check"](self) for host, adapter in OWNER_ADAPTERS.items()}
 
     def check_hosts(self):
         if self.raw["schema"] == SCHEMA:
@@ -311,6 +748,15 @@ class Run:
     def uses(self, kind):
         """Whether ROOT or the team runs on this host kind; a v1 config uses codex-cli alone."""
         return kind in self.hosts.values()
+
+
+    @property
+    def isolated_homes(self):
+        return any(OWNER_ADAPTERS[host]["isolated_homes"] for host in set(self.hosts.values()))
+
+    @property
+    def transactional(self):
+        return any(OWNER_ADAPTERS[host]["transactional"] for host in set(self.hosts.values()))
 
     def check_preflight(self):
         preflight = self.preflight
@@ -365,11 +811,11 @@ def recipe_file(run):
     """The run's recipe file: the template with the home folder filled in, the configured python and commit identity,
     and only the kept recipes. The jobs tool validates the result (check-recipes)."""
     try:
-        raw = run.template.read_text(encoding="utf-8")
+        raw = bounded_bytes(run.template).decode("utf-8")
     except FileNotFoundError:
         refuse("the recipe template is missing: %s" % run.template)
     home = json.dumps(str(Path.home()))[1:-1]
-    value = strict_json(raw.replace(HOME_PLACEHOLDER, home))
+    value = record_json(raw.replace(HOME_PLACEHOLDER, home), run.template.name)
     require(isinstance(value, dict) and isinstance(value.get("recipes"), dict),
             "the recipe template has no recipes: %s" % run.template)
     for name in run.keep:
@@ -441,7 +887,7 @@ def safe_home(run, home, label, variable, owners, apart=()):
     or an owner folder, apart from the run's other folders and from each (label, path) in `apart`, and no symlink."""
     real = os.path.realpath(home)
     for owner in owners:
-        if inside_owner(real, owner, run.uses(CLAUDE)):
+        if inside_owner(real, owner, run.isolated_homes):
             refuse("%s %s is inside ~/%s (%s); a team run uses its own folder" % (variable, home, owner.name, owner))
     candidate = Path(real)
     def contains(parent, child):
@@ -498,44 +944,70 @@ def safe_run_folder(run):
     return real
 
 
+
 def revalidate_homes(run):
-    """Narrow accidental changes between the start-time checks, host spawns and login persistence (ADR section 3)."""
-    if not run.uses(CLAUDE):
+    if not run.isolated_homes:
         return
-    for kind, check, label in ((CODEX, safe_codex_home, "codex_home"), (CLAUDE, safe_claude_home, "claude_home")):
-        if check(run) != run.validated_homes[kind]:
-            refuse("%s changed since it was validated for this command" % label)
+    for host, adapter in OWNER_ADAPTERS.items():
+        if adapter["home_check"](run) != run.validated_homes[host]:
+            refuse("%s changed since it was validated for this command" % adapter["home_attribute"])
 
 
 def revalidate_run(run):
-    if run.uses(CLAUDE) and safe_run_folder(run) != run.run:
+    if run.isolated_homes and safe_run_folder(run) != run.run:
         refuse("run folder changed since it was validated for this command")
 
 
+def active_adapters(run):
+    return [(host, adapter) for host, adapter in OWNER_ADAPTERS.items() if run.uses(host)]
+
+
+def home_environment(run):
+    return {hierarchy_hosts.entry(host)["home"]["variable"]: host_home(run, host)
+            for host, adapter in OWNER_ADAPTERS.items() if adapter["env_always"] or run.uses(host)}
+
+
+def codex_billing(run):
+    keys = [key for key in API_KEYS if key in hierarchy_hosts.billing_set(CODEX, os.environ)]
+    if keys:
+        refuse("unset OPENAI_API_KEY and CODEX_API_KEY: codex could bill this run to the key instead of the run's "
+               "login (set: %s)" % ", ".join(keys))
+
+
+def claude_billing(run):
+    names = hierarchy_hosts.billing_set(CLAUDE, os.environ)
+    if names:
+        refuse("unset %s: claude could bill this run to them instead of the run's login" % ", ".join(names))
+
+
+
 def guard(run, command):
-    real = safe_codex_home(run)
-    claude_real = safe_claude_home(run) if run.uses(CLAUDE) else None
+    homes = [(host, adapter, adapter["home_check"](run)) for host, adapter in OWNER_ADAPTERS.items()
+             if adapter["check_home_always"] or run.uses(host)]
     if command == "down":
         return {}
-    ambient = os.environ.get("CODEX_HOME")
-    if ambient and os.path.realpath(ambient) != real:
-        refuse("CODEX_HOME in this shell is %s, not this run's codex_home %s; unset it or export the run's"
-               % (ambient, run.codex_home))
-    ambient = os.environ.get("CLAUDE_CONFIG_DIR") if claude_real else None
-    if ambient and os.path.realpath(ambient) != claude_real:
-        refuse("CLAUDE_CONFIG_DIR in this shell is %s, not this run's claude_home %s; unset it or export the run's"
-               % (ambient, run.claude_home))
+    for host, adapter, real in homes:
+        variable = hierarchy_hosts.entry(host)["home"]["variable"]
+        ambient = os.environ.get(variable)
+        if ambient and os.path.realpath(ambient) != real:
+            label = adapter["home_attribute"]
+            refuse("%s in this shell is %s, not this run's %s %s; unset it or export the run's" %
+                   (variable, ambient, label, getattr(run, label)))
     if command == "status":
         return {}
+    if command == "init":
+        validate_role_write_roots(run)
     probe = nearest(run.run)
     free = shutil.disk_usage(str(probe)).free / 2 ** 30
     if free < run.min_free_gb:
         refuse("only %.1f GB free at %s; this run needs min_free_gb %g" % (free, probe, run.min_free_gb))
     tools = {}
-    for name in ("git", "bwrap") + (("codex",) if run.uses(CODEX) else ()) + (("claude",) if run.uses(CLAUDE) else ()):
+    for name in ("git", "bwrap", *[adapter["program"] for _, adapter in active_adapters(run)]):
         found = shutil.which(name)
         if found is None:
             refuse("required tool not found on PATH: " + name)
+        if governed_run(run):
+            validated_command(run, [found], {"PATH": os.environ.get("PATH", os.defpath)})
         tools[name] = found
     recipes = current_recipes(run)
     cargo, nextest = recipe_needs(recipes)
@@ -546,23 +1018,19 @@ def guard(run, command):
             if found is None:
                 refuse("required tool not found on the recipes' path: %s (kept recipe %s runs %s)" % (name, recipe, what))
             tools[name] = found
-    if command in SPENDS_TURNS and run.uses(CODEX):
-        # In API_KEYS order, so the message stays what it was before the registry listed them.
-        keys = [key for key in API_KEYS if key in hierarchy_hosts.billing_set(CODEX, os.environ)]
-        if keys:
-            refuse("unset OPENAI_API_KEY and CODEX_API_KEY: codex could bill this run to the key instead of the run's "
-                   "login (set: %s)" % ", ".join(keys))
-    if command in SPENDS_TURNS and run.uses(CLAUDE):
-        names = hierarchy_hosts.billing_set(CLAUDE, os.environ)
-        if names:
-            refuse("unset %s: claude could bill this run to them instead of the run's login" % ", ".join(names))
+    if command in SPENDS_TURNS:
+        for _, adapter in active_adapters(run):
+            adapter["billing"](run)
     return tools
 
 
 # -- state, evidence and child processes ----------------------------------------------------------------------------------
 
 def load_state(run):
-    return read_json(run.state_path) if run.state_path.is_file() else None
+    value = read_json(run.state_path) if run.state_path.is_file() else None
+    require(value is None or (isinstance(value, dict) and isinstance(value.get("init"), dict) and
+            isinstance(value.get("down", {}), dict)), "invalid team state record")
+    return value
 
 
 def custody(run):
@@ -578,12 +1046,14 @@ def custody(run):
 
 
 def save_state(run, state):
-    write_atomic(run.state_path, as_json(state))
+    raw = as_json(state)
+    require(len(raw) <= 262144, "team state exceeds its bounded size; preserve this run and init a new run folder")
+    write_atomic(run.state_path, raw)
 
 
 def update_state(run, mutate):
     """Reload/mutate/save in a short transaction; mutate must not run a child or wait for browser/model work."""
-    if not run.uses(CLAUDE):
+    if not run.transactional:
         state = load_state(run)
         mutate(state)
         save_state(run, state)
@@ -634,6 +1104,7 @@ def require_init(run, *, record_command=True, state=None):
         refuse("init has not completed; run init first", record_command=record_command)
     if state.get("down", {}).get("started_at") or state.get("down", {}).get("done"):
         refuse("teardown has started; a new run needs a new run folder", record_command=record_command)
+    require(isinstance(state.get("operations", {}), dict), "invalid operations record")
     return state
 
 
@@ -663,32 +1134,33 @@ def append_evidence(run, name, raw):
 
 def child_env(run, path=None):
     revalidate_homes(run)
-    # Historical, unplanned Codex bases inherit owner settings such as proxies and trust stores. Keep the
-    # credential/session exclusions even there; a missing v2 plan never opts a governed run into inheritance.
-    legacy = run.raw["schema"] == SCHEMA and hierarchy_hosts.read_plan(run.base) is None
+    # The owner-approved compatibility exception is exactly the historical v1/no-plan construction. A missing
+    # v2 plan never opts a governed run into inheritance; Claude and all planned runs retain the allowlist.
+    legacy = legacy_environment(run)
     if legacy:
-        env = {name: value for name, value in os.environ.items() if not (
-            name.startswith(("CLAUDE", "ANTHROPIC_", "FAKE_", "WRAP_", "AWS_", "AZURE_", "GOOGLE_", "GEMINI_")) or
-            name == "SSH_AUTH_SOCK" or re.search(r"(?:^|_)(?:API_KEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS)(?:_|$)", name))}
+        env = dict(os.environ)
     else:
+        validate_owner_path(run, Path.cwd())
         env = {name: value for name, value in os.environ.items()
                if name in CHILD_ENVIRONMENT or name.startswith("LC_")}
-    env["CODEX_HOME"] = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
-    if run.uses(CLAUDE):
-        env["CLAUDE_CONFIG_DIR"] = run.validated_homes[CLAUDE]
+    env.update(home_environment(run))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     if path is not None:
         env["PATH"] = path
+    if not legacy:
+        validate_child_environment(run, env, Path.cwd())
     run.dropped_names = getattr(run, "dropped_names", set()) | (os.environ.keys() - env.keys())
     return env
+
 
 
 def environment_evidence(run):
     names = getattr(run, "dropped_names", None)
     if names is not None:
         name = "child-environment.json"
-        previous = read_json(run.evidence / name) if (run.evidence / name).is_file() else {}
-        value = {"dropped_names": sorted(set(previous.get("dropped_names", [])) | names)}
+        path = run.evidence / name
+        previous = environment_record(read_json(path)) if path.exists() else {"dropped_names": []}
+        value = environment_record({"dropped_names": sorted(set(previous["dropped_names"]) | names)})
         if value != previous:
             save(run, name, value)
 
@@ -707,7 +1179,9 @@ def last_json(stdout):
 def tool(run, name, *arguments):
     """(exit code, last JSON object of stdout, process) of one hierarchy tool run as a child."""
     argv = [sys.executable, "-I", "-B", str(HERE / ("hierarchy_%s.py" % name)), *map(str, arguments)]
-    proc = subprocess.run(argv, capture_output=True, text=True, env=child_env(run), stdin=subprocess.DEVNULL)
+    env = child_env(run)
+    argv = validated_command(run, argv, env)
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
     return proc.returncode, last_json(proc.stdout), proc
 
 
@@ -725,9 +1199,13 @@ def request_file(run, name, value):
     return path
 
 
-def git(cwd, *arguments, ok=False):
-    proc = subprocess.run(["git", "-C", str(cwd), *arguments], capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL)
+
+def git(cwd, *arguments, ok=False, run=None):
+    env = child_env(run) if run is not None and governed_run(run) else None
+    argv = ["git", "-C", str(cwd), *arguments]
+    if env is not None:
+        argv = validated_command(run, argv, env, cwd)
+    proc = subprocess.run(argv, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
     if not ok and proc.returncode != 0:
         raise ValueError("git %s failed in %s: %s" % (arguments[0], cwd, proc.stderr.strip()[-400:]))
     return proc if ok else proc.stdout.strip()
@@ -740,7 +1218,8 @@ def aegis(run, *arguments):
     env = child_env(run)
     for name in AEGIS_OVERRIDES:
         env.pop(name, None)
-    proc = subprocess.run([sys.executable, "-I", "-B", "-c", code, *arguments], cwd=str(REPO), capture_output=True,
+    argv = validated_command(run, [sys.executable, "-I", "-B", "-c", code, *arguments], env, REPO)
+    proc = subprocess.run(argv, cwd=str(REPO), capture_output=True,
                           text=True, env=env, stdin=subprocess.DEVNULL)
     try:
         answer = json.loads(proc.stdout)
@@ -758,26 +1237,26 @@ def preconditions(run):
             refuse("run folder already holds %s; init needs a fresh run folder" % name)
     if run.codex_home.exists():
         refuse("codex_home %s already exists; init needs a new folder" % run.codex_home)
-    if run.uses(CLAUDE) and run.claude_home.exists():
+    if run.isolated_homes and run.claude_home.exists():
         refuse("claude_home %s already exists; init needs a new folder" % run.claude_home)
     real = os.path.realpath(run.project)
     for live in run.live:
         mine = os.path.realpath(live)
         if real == mine or real.startswith(mine.rstrip(os.sep) + os.sep):
             refuse("project is the owner's live checkout %s; use a fresh clone" % live)
-    top = git(run.project, "rev-parse", "--show-toplevel", ok=True)
+    top = git(run.project, "rev-parse", "--show-toplevel", ok=True, run=run)
     if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != real:
         refuse("project %s is not the root of a git checkout" % run.project)
-    head = git(run.project, "rev-parse", "HEAD")
+    head = git(run.project, "rev-parse", "HEAD", run=run)
     if head != run.base_commit:
         refuse("project HEAD is %s, not the configured base %s" % (head, run.base_commit))
-    tree = git(run.project, "rev-parse", run.base_commit + "^{tree}")
+    tree = git(run.project, "rev-parse", run.base_commit + "^{tree}", run=run)
     if run.base_tree is not None and tree != run.base_tree:
         refuse("base tree is %s, not the configured base_tree %s" % (tree, run.base_tree))
-    if git(run.project, "status", "--porcelain", "--untracked-files=all"):
+    if git(run.project, "status", "--porcelain", "--untracked-files=all", run=run):
         refuse("project has uncommitted changes; a run starts from a clean clone")
     for lane in run.implementers:
-        if git(run.project, "rev-parse", "--verify", "--quiet", "refs/heads/" + lane.branch, ok=True).returncode == 0:
+        if git(run.project, "rev-parse", "--verify", "--quiet", "refs/heads/" + lane.branch, ok=True, run=run).returncode == 0:
             refuse("branch %s already exists in the project" % lane.branch)
     return tree
 
@@ -810,17 +1289,16 @@ def make_home(run, home, label):
     write_atomic(home / OWNER_MARK, as_json(mark))
 
 
+
 def step_codex_home(run, state):
-    """Named for Codex, as runs already past it recorded it: it makes each home the plan uses."""
+    """Keep the recorded legacy step name; each active adapter supplies its home policy."""
     detail = {}
-    if run.uses(CODEX):
-        safe_codex_home(run)
-        make_home(run, run.codex_home, "codex_home")
-        detail["codex_home"] = str(run.codex_home)
-    if run.uses(CLAUDE):
-        safe_claude_home(run)
-        make_home(run, run.claude_home, "claude_home")
-        detail["claude_home"] = str(run.claude_home)
+    for host, adapter in active_adapters(run):
+        adapter["home_check"](run)
+        home = Path(host_home(run, host))
+        label = adapter["home_attribute"]
+        make_home(run, home, label)
+        detail[label] = str(home)
     return detail
 
 
@@ -852,6 +1330,10 @@ def step_provision(run, state):
     # write) resumes past it on --continue instead of running it again.
     answer = once(run, state, "provision-init", lambda: checked(run, "provision init", "provision", "init", "--request",
                                                                request_file(run, "provision-init.json", request)))
+    owner_runtime(run, initialize=True, provisioned=answer)
+    if not (owner_folder(run) / "plan-issued.json").exists():
+        owner_publish(run, "plan-issued.json", {"schema": "aegis.team-plan-issued/v1", "plan_issued": True})
+    state["owner_custody"] = state["host_plan_issued"] = True
     save(run, "provision-init.json", answer)
     # Here rather than as a step of its own, so a run already past this step keeps today's unchecked bindings. Provision
     # init refuses an existing base, so the plan can only follow it, before the first add-role.
@@ -881,8 +1363,8 @@ def policy_value(run, authority):
                                            "tier": "ultrafast" if router else "default",
                                            "filesystem": "workspace-write" if role == "operator" else "read-only",
                                            "tools": ["read", "decide"] if role == "root" else []}}
-    commit = git(run.source, "rev-parse", "HEAD")
-    tree = git(run.source, "rev-parse", "HEAD^{tree}")
+    commit = git(run.source, "rev-parse", "HEAD", run=run)
+    tree = git(run.source, "rev-parse", "HEAD^{tree}", run=run)
     return {"schema": hierarchy_lifecycle.POLICY, "source": {"commit": commit, "tree": tree, "dirty_sha256": EMPTY_SHA256},
             "authority": [authority], "actors": actors, "current": {role: role + "-1" for role in roles},
             "successors": {}}
@@ -931,11 +1413,11 @@ def step_worktrees(run, state):
     for lane in run.implementers:
         def add(lane=lane):
             lane.worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            git(run.project, "worktree", "add", "-q", "-b", lane.branch, str(lane.worktree), run.base_commit)
+            git(run.project, "worktree", "add", "-q", "-b", lane.branch, str(lane.worktree), run.base_commit, run=run)
             if lane.tmpdir is not None:
                 lane.tmpdir.mkdir(parents=True, exist_ok=True, mode=0o700)
             save(run, "worktree-%s.json" % lane.id, {
-                "path": str(lane.worktree), "branch": lane.branch, "head": git(lane.worktree, "rev-parse", "HEAD"),
+                "path": str(lane.worktree), "branch": lane.branch, "head": git(lane.worktree, "rev-parse", "HEAD", run=run),
                 "tmpdir": None if lane.tmpdir is None else str(lane.tmpdir)})
             return {"path": str(lane.worktree), "branch": lane.branch}
         once(run, state, "worktree:" + lane.id, add)
@@ -1062,11 +1544,13 @@ def next_step(state):
 
 
 def init(run, args):
-    if run.hosts["team"] == CLAUDE:
+    validate_role_write_roots(run)
+    validate_owner_path(run, Path.cwd())
+    if not OWNER_ADAPTERS[run.hosts["team"]]["allows_tmpdir"]:
         # Provision makes tmpdir Codex-only, so a Claude team refuses one here rather than at up (ADR T2(a) section 1).
         for lane in run.implementers:
             if lane.tmpdir is not None:
-                refuse("lane %s: tmpdir is only for a Codex writer, and this run's team host is claude-code" % lane.id)
+                refuse(OWNER_ADAPTERS[run.hosts["team"]]["tmpdir_error"] % lane.id)
     state = load_state(run)
     if state and (state.get("down", {}).get("started_at") or state.get("down", {}).get("done")):
         refuse("teardown has started; a new run needs a new run folder")
@@ -1091,6 +1575,8 @@ def init(run, args):
             # its first state save too, so two initializers cannot outlive one another and erase later operations.
             with operation_lock(run):
                 return init(run, args)
+        owner_folder(run, create=True)
+        state["owner_custody"] = True
         save_state(run, state)
     revalidate_run(run)
     ran = []
@@ -1146,19 +1632,19 @@ def claude_login_preconditions(run):
     return timeout
 
 
+
 def login(run, args):
-    """Each host the plan uses, logged in to the run's own home. A Codex-only plan answers as it always did."""
     require_init(run)
-    if not run.uses(CLAUDE):
-        return OK, login_codex(run)
+    if not run.transactional:
+        host = run.hosts["root"]
+        return OK, OWNER_ADAPTERS[host]["login"](run, None)
     with login_lock(run):
         require_init(run)
-        timeout = claude_login_preconditions(run)
+        timeouts = {host: adapter["login_preflight"](run) for host, adapter in active_adapters(run)}
         logins = {}
         try:
-            if run.uses(CODEX):
-                logins[CODEX] = login_codex(run)
-            logins[CLAUDE] = login_claude(run, timeout)
+            for host, adapter in active_adapters(run):
+                logins[host] = adapter["login"](run, timeouts[host])
         except Stop as stop:
             if logins:
                 stop.detail.setdefault("logins", logins)
@@ -1168,11 +1654,12 @@ def login(run, args):
 
 def login_codex(run):
     import hierarchy_native_probe as probe
-    proc = subprocess.run(["codex", "login"], env=child_env(run))
+    env = child_env(run)
+    proc = subprocess.run(validated_command(run, ["codex", "login"], env), env=env)
     if proc.returncode != 0:
         fail("codex login exited %d" % proc.returncode)
     revalidate_homes(run)
-    home = Path(run.validated_homes[CODEX]) if run.uses(CLAUDE) else run.codex_home
+    home = Path(host_home(run, CODEX))
     # The probe's real-login folder rules, less its own owner mark, with this run's mark and its sessions/ allowed.
     allowed = (set(probe.EXISTING_LOGIN_ENTRIES) - {probe.OWNER_MARK}) | {OWNER_MARK, "sessions"}
     entries = sorted(os.listdir(home))
@@ -1220,7 +1707,7 @@ def credentials_digest(run, missing_ok=False):
         if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_uid) !=
                 (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid)):
             refuse("%s in claude_home changed while it was checked: %s" % (CLAUDE_CREDENTIALS, path))
-        return hashlib.sha256(stream.read()).hexdigest()
+        return hashlib.sha256(bounded_read(stream, path, RECORD_BYTES)).hexdigest()
 
 
 def credential_observation(run):
@@ -1238,7 +1725,7 @@ def credential_observation(run):
         if ((opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_uid) !=
                 (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid)):
             refuse("%s in claude_home changed while it was observed: %s" % (CLAUDE_CREDENTIALS, path))
-        digest = hashlib.sha256(stream.read()).hexdigest()
+        digest = hashlib.sha256(bounded_read(stream, path, RECORD_BYTES)).hexdigest()
     return {"identity": (info.st_dev, info.st_ino, digest),
             "version": (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)}
 
@@ -1273,13 +1760,13 @@ def discard_claude_login_evidence(run):
             write_atomic(path, as_json(value))
 
 
-def login_claude(run, timeout):
+def login_claude(run, timeout, host=CLAUDE):
     """claude auth login in the run's CLAUDE_CONFIG_DIR, which the owner finishes in the browser, then its status. The
     evidence keeps the filtered auth record (no email or organization) and the credentials' hash, never the file."""
     revalidate_homes(run)
     credentials_digest(run, missing_ok=True)
     state = require_init(run)
-    if CLAUDE in state.get("logins", {}):
+    if host in state.get("logins", {}):
         def invalidate(current):
             require_init(run, state=current)
             current.get("logins", {}).pop(CLAUDE, None)
@@ -1289,7 +1776,8 @@ def login_claude(run, timeout):
     before = credential_observation(run)
     written = None
     try:
-        proc = subprocess.run(["claude", "auth", "login", "--claudeai"], env=child_env(run))
+        env = child_env(run)
+        proc = subprocess.run(validated_command(run, ["claude", "auth", "login", "--claudeai"], env), env=env)
         written = credential_observation(run)
         if proc.returncode != 0:
             fail("claude auth login exited %d" % proc.returncode)
@@ -1297,7 +1785,8 @@ def login_claude(run, timeout):
         require_init(run, record_command=False)
         revalidate_homes(run)
         credentials_digest(run)
-        proc = subprocess.run(["claude", "auth", "status", "--json"], env=child_env(run), capture_output=True, text=True,
+        env = child_env(run)
+        proc = subprocess.run(validated_command(run, ["claude", "auth", "status", "--json"], env), env=env, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=timeout)
         try:
             parsed = strict_json(proc.stdout)
@@ -1334,8 +1823,10 @@ def adapter_tools(run, connection):
     server = read_json(Path(connection))["mcpServers"]["aegis_decision"]
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
               {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}]
-    proc = subprocess.run([server["command"], *server["args"]], input="".join(json.dumps(f) + "\n" for f in frames),
-                          capture_output=True, text=True, timeout=60, env=child_env(run))
+    env = child_env(run)
+    command = validated_command(run, [server["command"], *server["args"]], env)
+    proc = subprocess.run(command, input="".join(json.dumps(f) + "\n" for f in frames),
+                          capture_output=True, text=True, timeout=60, env=env)
     for line in proc.stdout.splitlines():
         reply = json.loads(line)
         if reply.get("id") == 2 and "result" in reply:
@@ -1357,12 +1848,28 @@ def claude_pin(run):
             require(not (Path(folder) / name).is_symlink(), "claude_home contains a symlink: " + str(Path(folder) / name))
 
 
+
 def claude_transcript(run, session):
     found = hierarchy_hosts.transcripts(CLAUDE, run.validated_homes[CLAUDE], session)
     require(len(found) == 1, "Claude session is not confirmed by one transcript in the run's claude_home/projects")
-    events = list(hierarchy_hosts.claude_events(found[0].read_bytes()))
-    identities = {event["sessionId"] for event in events if "sessionId" in event and isinstance(event["sessionId"], str)}
-    require(identities == {session}, "Claude session is not confirmed by its transcript sessionId")
+    confirmed = False
+    descriptor = os.open(str(found[0]), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode), "Claude transcript must be a regular file")
+        if info.st_size > TRANSCRIPT_BYTES:
+            raise budget_problem(found[0])
+        for line in transcript_lines(stream, found[0]):
+            try:
+                event = record_json(line, found[0].name)
+            except CustodyProblem:
+                raise
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(event, dict) and isinstance(event.get("sessionId"), str):
+                require(event["sessionId"] == session, "Claude session is not confirmed by its transcript sessionId")
+                confirmed = True
+    require(confirmed, "Claude session is not confirmed by its transcript sessionId")
     return found[0]
 
 
@@ -1374,66 +1881,116 @@ def planned_binding(run, endpoint, host):
         expected = hierarchy_hosts.plan_record(run.id, run.hosts["root"], run.hosts["team"],
             {run.endpoint("front-door"): FRONT_DOOR_HOST}, sha_file(run.config_path))
         require(plan == expected, "v2 MAIN host plan is missing or differs from team-run.json")
+    if plan is None and run.raw["schema"] == SCHEMA and plan_was_issued(run):
+        refuse("this run's issued host plan is missing; restore host-plan.json before continuing")
     hierarchy_hosts.require_binding(plan, endpoint, host, hierarchy_roles.writer(entry))
     return mailbox
 
 
-def claude_runtime(run):
-    """Validate interpreter and bootstrap authority before binding or probing a Claude connection."""
+def governed_runtime(run):
+    trusted = owner_runtime(run)
+    validate_role_write_roots(run)
+    validate_owner_path(run, Path.cwd())
     setup = read_json(run.base / "provision.json")
-    # provision.json and the connection are mutable records, not interpreter/bootstrap authority. The owner
-    # configuration selects those paths; the runtime verifier checks committed source and the retained bootstrap.
+    require(isinstance(setup, dict) and set(setup) == {"schema", "created_at", "store", "source", "source_commit",
+            "source_tree", "python", "initiative", "mailbox_root", "delivery_dir"} and
+            setup.get("schema") == hierarchy_provision.SCHEMA and isinstance(setup.get("created_at"), str),
+            "invalid team provision record")
     require(setup.get("python") == run.python and setup.get("source") == str(run.source) and
             setup.get("mailbox_root") == str(run.mailbox_root) and setup.get("delivery_dir") == str(run.delivery) and
             setup.get("store") == str(run.store) and setup.get("initiative") == run.id,
-            "Claude runtime differs from team-run.json")
+            "team runtime differs from team-run.json")
+    require(all(setup.get(key) == trusted[key] for key in ("source_commit", "source_tree")),
+            "team runtime differs from the owner-held record")
     hierarchy_provision.hierarchy_runtime_source.verify(setup, run.base)
     return setup
 
 
-def claude_connection(run, binding, connection):
-    """Only provision's own team servers may enter a restricted Claude invocation."""
-    setup = claude_runtime(run)
-    endpoint = binding["endpoint"]
-    servers = read_json(Path(connection))
-    require(set(servers) == {"mcpServers"}, "Claude connection has unexpected fields")
+def connection_spec(run, binding, setup):
+    host, endpoint = binding["host"], binding["endpoint"]
     if endpoint_parts(endpoint)[1] == "root":
         request = {"lifecycle": str(run.lifecycle), "actor": current_actor(run, "root"),
                    "loop_state": str(run.loop_state), "evidence": str(run.evidence)}
-        arguments = hierarchy_provision.decision_args(setup, endpoint, CLAUDE, binding["session"], binding["generation"], request)
-        expected = {"aegis_decision": {"command": setup["python"], "args": arguments}}
-        allowed = ["mcp__aegis_decision__" + name for name in ROOT_TOOLS]
-    else:
-        mailbox = Mailbox(run.mailbox_root)
-        entry = hierarchy_provision.registry_role(mailbox, endpoint)
-        actual = servers["mcpServers"].get("aegis_mailbox", {}).get("args", [])
-        options = {}
-        for flag, key in (("--lifecycle", "lifecycle"), ("--actor", "actor"), ("--source-repo", "source_repo")):
-            if flag in actual:
-                offset = actual.index(flag)
-                require(offset + 1 < len(actual), "incomplete Claude connection argument: " + flag)
-                options[key] = actual[offset + 1]
-        if "lifecycle" in options:
-            require(options["lifecycle"] == str(run.lifecycle), "Claude connection names another lifecycle")
-        if "actor" in options:
-            require(options["actor"] == current_actor(run, endpoint_parts(endpoint)[1]), "Claude connection names another actor")
-        if "source_repo" in options:
-            hierarchy_roles.require_source_views(endpoint, mailbox.endpoint(endpoint).get("kind"))
-        arguments = hierarchy_provision.adapter_args(setup, endpoint, CLAUDE, binding["session"], binding["generation"],
-                                                       options.get("source_repo"), hierarchy_provision.lifecycle_args(options))
-        expected = {"aegis_mailbox": {"command": setup["python"], "args": arguments}}
-        tools = hierarchy_provision.MAILBOX_TOOLS + list(hierarchy_provision.role_workspace_tools(mailbox, endpoint))
-        if "lifecycle" in options:
-            tools += list(hierarchy_roles.lifecycle_tools(entry))
-        if "source_repo" in options:
-            tools += list(hierarchy_roles.SOURCE_VIEW_TOOLS)
-        allowed = ["mcp__aegis_mailbox__" + name for name in tools]
-        if hierarchy_provision.takes_board(setup, mailbox, endpoint):
-            expected["aegis_board"] = {"command": setup["python"], "args": hierarchy_provision.board_args(
-                setup, endpoint, CLAUDE, binding["session"], binding["generation"])}
-            allowed += ["mcp__aegis_board__" + name for name in hierarchy_provision.BOARD_TOOL_SPECS]
-    require(servers["mcpServers"] == expected, "Claude connection differs from the team's provisioned servers")
-    return allowed
+        arguments = hierarchy_provision.decision_args(setup, endpoint, host, binding["session"], binding["generation"], request)
+        return {"aegis_decision": {"command": setup["python"], "args": arguments}}, list(ROOT_TOOLS), request
+    mailbox = Mailbox(run.mailbox_root)
+    request = next((dict(value) for name, value in plan_roles(run) if name == endpoint), None)
+    require(request is not None, "endpoint is outside this team's approved role plan")
+    entry = hierarchy_provision.registry_role(mailbox, endpoint)
+    arguments = hierarchy_provision.adapter_args(setup, endpoint, host, binding["session"], binding["generation"],
+        request.get("source_repo"), hierarchy_provision.lifecycle_args(request))
+    servers = {"aegis_mailbox": {"command": setup["python"], "args": arguments}}
+    enabled = hierarchy_provision.MAILBOX_TOOLS + list(hierarchy_provision.role_workspace_tools(mailbox, endpoint))
+    if "lifecycle" in request:
+        enabled += list(hierarchy_roles.lifecycle_tools(entry))
+    if request.get("source_repo"):
+        enabled += list(hierarchy_roles.SOURCE_VIEW_TOOLS)
+    return servers, enabled, request
+
+
+def governed_connection(run, binding, connection, setup=None):
+    label = OWNER_ADAPTERS[binding["host"]]["label"]
+    setup = governed_runtime(run) if setup is None else setup
+    canonical = run.base / "connections" / ("%s-g%d.json" %
+        (binding["endpoint"].replace("/", "%2F"), binding["generation"]))
+    require(str(connection) == str(canonical), label + " connection path differs from the team's canonical connection")
+    servers = read_json(canonical)
+    require(isinstance(servers, dict) and set(servers) == {"mcpServers"}, label + " connection has unexpected fields")
+    require(isinstance(servers["mcpServers"], dict) and bool(servers["mcpServers"]) and
+            all(isinstance(name, str) and isinstance(server, dict) and set(server) == {"command", "args"} and
+                record_string(server["command"]) and isinstance(server["args"], list) and
+                all(isinstance(word, str) and "\0" not in word for word in server["args"])
+                for name, server in servers["mcpServers"].items()), "invalid " + label + " connection servers")
+    expected, enabled, request = connection_spec(run, binding, setup)
+    for server in servers["mcpServers"].values():
+        if "--source-repo" in server["args"]:
+            words = server["args"]
+            offset = words.index("--source-repo")
+            require(offset + 1 < len(words) and words[offset + 1] == request.get("source_repo"),
+                    label + " connection names an unauthorized source repository")
+    require(servers["mcpServers"] == expected, label + " connection differs from the team's provisioned servers")
+    server_name = "aegis_decision" if endpoint_parts(binding["endpoint"])[1] == "root" else "aegis_mailbox"
+    return ["mcp__%s__%s" % (server_name, name) for name in enabled]
+
+
+def codex_resume_profile(run, binding, profile):
+    setup = governed_runtime(run)
+    connection = run.base / "connections" / ("%s-g%d.json" %
+        (binding["endpoint"].replace("/", "%2F"), binding["generation"]))
+    governed_connection(run, binding, connection, setup)
+    servers, enabled, request = connection_spec(run, binding, setup)
+    mailbox = Mailbox(run.mailbox_root)
+    request, fixed = hierarchy_provision.fixed_profile(request, mailbox, binding["endpoint"], CODEX)
+    request, _team = hierarchy_provision.team_settings(run.base, CODEX, request,
+        hierarchy_provision.role_kind(mailbox, binding["endpoint"]))
+    _tools, writer = hierarchy_provision.role_tools(binding["endpoint"], mailbox, None)
+    expected_servers = hierarchy_provision.codex_servers(setup, servers["aegis_mailbox"]["args"], enabled)
+    expected = hierarchy_provision.codex_profile(str(Path(request["cwd"]).resolve()), writer=writer,
+        servers=expected_servers, options=request, endpoint=binding["endpoint"],
+        role=hierarchy_roles.role_name(binding["endpoint"], mailbox.endpoint(binding["endpoint"]).get("kind")),
+        session=binding["session"], generation=binding["generation"], tier=hierarchy_provision.applied_tier(fixed))
+    recorded = connection.parent.parent / "profiles" / (connection.stem + ".codex.json")
+    require(read_json(recorded) == expected and profile["cwd"] == expected["cwd"] and profile["prompt_via"] == "argv" and
+            profile.get("mode", "print") == "print" and
+            profile["argv"] == hierarchy_provision.codex_argv(expected, ["resume", binding["session"]]),
+            "Codex print profile differs from the registry argv")
+    # The configured worktree and optional explicit tmpdir are the only writer roots; no parent run capability.
+    for root in [expected["cwd"], *expected["writable_roots"], *expected["add_dirs"],
+                 *([expected["tmpdir"]] if expected["tmpdir"] else [])]:
+        real = Path(root).resolve()
+        control = run.run / ".owner-custody"
+        require(real != control and real not in control.parents and control not in real.parents,
+                "Codex sandbox includes owner custody or an ancestor")
+    return profile["argv"]
+
+
+def codex_root_config(run, binding, connection):
+    setup = governed_runtime(run)
+    governed_connection(run, binding, connection, setup)
+    servers, enabled, _request = connection_spec(run, binding, setup)
+    server = {**servers["aegis_decision"], "required": True, "enabled_tools": enabled,
+              "tools": {name: hierarchy_provision.APPROVE for name in enabled}}
+    return "mcp_servers=" + hierarchy_provision.toml_value({"aegis_decision": server})
 
 
 def claude_resume_profile(run, binding, profile):
@@ -1443,7 +2000,7 @@ def claude_resume_profile(run, binding, profile):
     argv = profile["argv"]
     require(isinstance(argv, list) and all(isinstance(word, str) for word in argv), "invalid Claude print argv")
     connection = str(run.base / "connections" / ("%s-g%d.json" % (binding["endpoint"].replace("/", "%2F"), binding["generation"])))
-    allowed = claude_connection(run, binding, connection)
+    allowed = governed_connection(run, binding, connection)
     mailbox = Mailbox(run.mailbox_root)
     tool_words = [word[len("--tools="):] for word in argv if word.startswith("--tools=")]
     require(len(tool_words) == 1, "Claude print profile differs from the registry argv")
@@ -1471,6 +2028,8 @@ def root(run, args):
     require(hierarchy_provision.SESSION.fullmatch(args.session) is not None, "invalid session: " + args.session[:80])
     host = run.hosts["root"]
     mailbox = planned_binding(run, run.endpoint("root"), host)
+    if governed_run(run):
+        governed_runtime(run)
     request = {"base": str(run.base), "endpoint": run.endpoint("root"), "host": host, "session": args.session,
                "lifecycle": str(run.lifecycle), "actor": current_actor(run, "root"), "loop_state": str(run.loop_state),
                "evidence": str(run.evidence)}
@@ -1478,40 +2037,18 @@ def root(run, args):
     require(not history or (history[-1]["session"] == args.session and history[-1]["host"] == host),
             "endpoint is bound to another session; hand it off first")
     hierarchy_roles.require_independent_session(mailbox, request["endpoint"], host, args.session)
-    if host == CLAUDE:
-        claude_pin(run)
-        claude_transcript(run, args.session)
-        offered = (hierarchy_provision.DECISION_TOOL, *hierarchy_roles.decision_tools(hierarchy_roles.role(request["endpoint"])))
-        require(offered == ROOT_TOOLS, "ROOT tools mismatch: expected " + ", ".join(ROOT_TOOLS))
-        setup = claude_runtime(run)
-        hierarchy_provision.check_role_request(request, setup)
-        # Provision stages its session record and validates the request before binding. Avoid a request-file write
-        # on this path: an unconfirmed conversation or mismatched binding must leave no files behind.
-        try:
-            answer = hierarchy_provision.add_role(request)
-        except (ValueError, OSError) as exc:
-            fail("ROOT provisioning failed: %s; inspect the retained binding, connection and session records" % exc)
-        answer["mcp_config"] = answer["connection"]
-    else:
-        # Stage the input outside the run until provision accepts it. A refusal (for example runtime source drift)
-        # cannot leave inputs/root.json behind. The accepted run retains exactly the same request bytes as before.
-        with tempfile.TemporaryDirectory() as folder:
-            staged = Path(folder) / "root.json"
-            staged.write_bytes(as_json(request))
-            code, answer, _ = tool(run, "provision", "add-role", "--request", staged)
-        if code != 0:
-            (refuse if code == REFUSED else fail)(answer.get("error", "provision add-role exited %d" % code))
-        request_file(run, "root.json", request)
+    adapter = OWNER_ADAPTERS[host]
+    answer = adapter["bind_root"](run, request, args.session)
     try:
         tools = adapter_tools(run, answer["connection"])
     except (Stop, ValueError, OSError, subprocess.SubprocessError) as exc:
         fail("ROOT was bound but its tool probe failed: %s; binding, connection and session record retained" % exc)
-    if host == CLAUDE and tuple(tools) != ROOT_TOOLS:
+    if adapter["strict_root_tools"] and tuple(tools) != ROOT_TOOLS:
         fail("ROOT tools mismatch after binding; binding and session record retained for inspection", tools=tools)
     save(run, "root-binding.json", {**answer, "tools": tools})
     binding = {"session": args.session, "generation": answer["generation"], "connection": answer["connection"],
                "mcp_config": answer["mcp_config"], "tools": tools, "at": timestamp()}
-    if run.uses(CLAUDE):
+    if run.transactional:
         def bind(current):
             require_init(run, state=current)
             current["root"] = binding
@@ -1595,7 +2132,7 @@ def expected_profile(run, mailbox, endpoint):
 
 
 def find_rollout(run, endpoint, session):
-    home = Path(run.validated_homes[CODEX]) if run.uses(CLAUDE) else run.codex_home
+    home = Path(host_home(run, CODEX))
     found = sorted((home / "sessions").glob("**/rollout-*%s.jsonl" % session))
     if len(found) != 1:
         fail("%s rollout%s for %s's session %s under %s" % ("no" if not found else str(len(found)),
@@ -1641,7 +2178,7 @@ def check_role(run, endpoint, session, want, accept):
             "tier": observed["served_tier"], "tier_asked": want["tier"] or "default", "agent_tools": offered}
 
 
-def start_loop(run):
+def loop_environment(run):
     recipes = read_json(run.recipes)
     cargo_recipe, _ = recipe_needs(recipes)
     env = child_env(run)
@@ -1652,16 +2189,26 @@ def start_loop(run):
         parts = env.get("PATH", "").split(os.pathsep)
         if parts[:1] != [cargo_dir]:
             env["PATH"] = os.pathsep.join([cargo_dir] + [p for p in parts if p])
+    validate_child_environment(run, env, run.run)
+    if governed_run(run):
+        for program in ["git", *[OWNER_ADAPTERS[host]["program"] for host in dict.fromkeys(run.hosts.values())]]:
+            validated_command(run, [program], env, run.run)
+    return env, cargo_dir
+
+
+def start_loop(run):
+    env, cargo_dir = loop_environment(run)
     run.loop_state.mkdir(parents=True, exist_ok=True, mode=0o700)
     argv = [sys.executable, "-I", "-B", str(HERE / "hierarchy_loop.py"), *map(str, loop_flags(run)), "run",
             "--interval", str(run.interval)]
+    argv = validated_command(run, argv, env, run.run)
     with open(run.log_path, "ab") as log:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
                                    cwd=str(run.run), start_new_session=True)
     write_atomic(run.pid_path, ("%d\n" % process.pid).encode("ascii"))
     time.sleep(0.5)
     if process.poll() is not None:
-        tail = run.log_path.read_bytes()[-800:].decode("utf-8", "replace")
+        tail = bounded_tail(run.log_path, 800).decode("utf-8", "replace")
         fail("the loop exited at once (exit %d); see %s: %s" % (process.returncode, run.log_path, tail))
     environ = {}
     for item in Path("/proc/%d/environ" % process.pid).read_bytes().split(b"\0"):
@@ -1669,22 +2216,17 @@ def start_loop(run):
         if key:
             environ[key] = value
     problems = []
-    codex_home = run.validated_homes[CODEX] if run.uses(CLAUDE) else str(run.codex_home)
-    if environ.get("CODEX_HOME") != codex_home:
-        problems.append("its CODEX_HOME is %s, not %s" % (environ.get("CODEX_HOME"), codex_home))
-    # The pinned wake passes no env=, so every Claude wake inherits this home from the loop (ADR T2(a) section 3).
-    if run.uses(CLAUDE) and environ.get("CLAUDE_CONFIG_DIR") != run.validated_homes[CLAUDE]:
-        problems.append("its CLAUDE_CONFIG_DIR is %s, not %s" % (environ.get("CLAUDE_CONFIG_DIR"),
-                                                              run.validated_homes[CLAUDE]))
+    expected_homes = home_environment(run)
+    for variable, expected in expected_homes.items():
+        if environ.get(variable) != expected:
+            problems.append("its %s is %s, not %s" % (variable, environ.get(variable), expected))
     if cargo_dir is not None and cargo_dir not in environ.get("PATH", "").split(os.pathsep):
         problems.append("its PATH lacks %s, where the recipes' cargo is" % cargo_dir)
     if problems:
         process.terminate()
         process.wait(timeout=LOOP_WAIT_SECONDS)
         fail("the loop (pid %d) was stopped: %s" % (process.pid, "; ".join(problems)))
-    lines = "CODEX_HOME=%s\n" % environ["CODEX_HOME"]
-    if run.uses(CLAUDE):
-        lines += "CLAUDE_CONFIG_DIR=%s\n" % environ["CLAUDE_CONFIG_DIR"]
+    lines = "".join("%s=%s\n" % (key, environ[key]) for key in expected_homes)
     save(run, "loop-environ.txt", (lines + "PATH=%s\n" % environ.get("PATH", "")).encode("utf-8"))
     return {"state": "started", "pid": process.pid, "interval": run.interval, "log": str(run.log_path),
             "cargo_on_path": cargo_dir}
@@ -1693,8 +2235,16 @@ def start_loop(run):
 def up(run, args):
     require_init(run)
     # Before the loop status check, which runs a child: nothing is started or written for a Claude team yet.
-    if run.hosts["team"] == CLAUDE:
-        refuse("this team command starts claude-code team roles from T2(a) PR 6")
+    host = run.hosts["team"]
+    adapter = OWNER_ADAPTERS[host]
+    if adapter["up_error"]:
+        refuse(adapter["up_error"])
+    if governed_run(run):
+        validate_owner_path(run, Path.cwd())
+        for role_cwd in [run.project, *[lane.worktree for lane in run.implementers]]:
+            validate_model_executable(run, host, [adapter["program"]], str(role_cwd))
+    if not args.no_loop:
+        loop_environment(run)
     pid, alive, ours = loop_process(run)
     running, _ = loop_state(run)
     if (alive and ours) or running in ("running", "stale"):
@@ -1705,16 +2255,25 @@ def up(run, args):
     if team_path.is_file() and read_json(team_path) != run.team and any(mailbox.bindings(e) for e, _ in roles):
         refuse("team.json differs from this config's team, and roles already started under it keep their settings; "
                "restore it or hand those roles off")
+    if governed_run(run):
+        governed_runtime(run)
+        from hierarchy_wake import load_profile
+        for endpoint, _request in roles:
+            history = mailbox.bindings(endpoint)
+            if history:
+                binding = history[-1]
+                profile_path = run.base / "profiles" / ("%s-g%d.wake.json" %
+                    (endpoint.replace("/", "%2F"), binding["generation"]))
+                adapter["resume_profile"](run, binding, load_profile(profile_path, endpoint, binding))
     write_atomic(team_path, as_json(run.team))
     save(run, "team.json", run.team)
-    wanted = {endpoint: expected_profile(run, mailbox, endpoint) for endpoint, _ in roles}
+    wanted = {endpoint: adapter["expected_profile"](run, mailbox, endpoint) for endpoint, _ in roles}
     rows, accepted = [], {}
     for endpoint, request in roles:
         history = mailbox.bindings(endpoint)
         if history:
-            if history[-1]["host"] != CODEX:
-                refuse("%s is bound to a %s session, not a Codex role the launcher starts" % (endpoint,
-                                                                                              history[-1]["host"]))
+            if history[-1]["host"] != host:
+                refuse("%s is bound to a %s session, not a %s role the launcher starts" % (endpoint, history[-1]["host"], adapter["label"]))
             session, label = history[-1]["session"], "already_bound"
         else:
             path = request_file(run, "start-%s.json" % endpoint.replace("/", "%2F"), {"endpoint": endpoint, **request})
@@ -1725,7 +2284,7 @@ def up(run, args):
                                                                                   answer.get("state"))
                 (refuse if code == REFUSED else fail)(message, record=answer)
             session, label = answer["session"], "bound"
-        checked_role = check_role(run, endpoint, session, wanted[endpoint], args.accept_agent_tools)
+        checked_role = adapter["check_role"](run, endpoint, session, wanted[endpoint], args.accept_agent_tools)
         if checked_role["agent_tools"]:
             accepted[endpoint] = checked_role["agent_tools"]
         rows.append({"endpoint": endpoint, "state": label, "session": session, **checked_role})
@@ -1789,12 +2348,10 @@ def request(run, args):
 def agent_items(stdout):
     """What a codex --json turn did, as role_turn.py showed it: its messages and tool calls."""
     items = []
-    for line in stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
+    for event in codex_events(stdout):
         item = event.get("item") if isinstance(event, dict) and event.get("type") == "item.completed" else None
+        if event.get("type") == "unknown":
+            items.append(event)
         if not isinstance(item, dict):
             continue
         if item.get("type") == "agent_message":
@@ -1833,8 +2390,20 @@ def turn_deadline():
 
 
 def require_resolved(run, endpoint, *, state=None):
-    operation = require_init(run, state=state).get("operations", {}).get(endpoint)
-    if operation:
+    current = require_init(run, state=state)
+    slots = current.get("operations", {})
+    require(isinstance(slots, dict), "invalid operations record")
+    operation = slots.get(endpoint)
+    if state is None:
+        try:
+            if operation is not None and owner_expected(run) and governed_run(run):
+                owner_read(run, "runtime.json")
+            if operation is None:
+                operation = owner_pending(run, endpoint=endpoint).get(endpoint)
+        except CustodyProblem as exc:
+            refuse(str(exc), operation=operation, **exc.detail())
+    if operation is not None:
+        require(isinstance(operation, dict) and isinstance(operation.get("id"), str), "invalid operation record")
         refuse("%s has unresolved operation %s; inspect status, then use approve/turn --reconcile; never replay an "
                "unknown turn" % (endpoint, operation["id"]), operation=operation)
 
@@ -1888,17 +2457,20 @@ def operation_process_observation(run, operation):
     """
     unavailable = {"state": "UNAVAILABLE"}
     try:
-        witness = read_json(run.evidence / ("turn-%s.launch.json" % operation["id"]))
+        witness = original_launch(run, operation)
+    except CustodyProblem:
+        raise
     except (OSError, ValueError):
-        return {**unavailable, "reason": "durable launch witness is missing or unreadable"}
-    if witness != launch_identity(operation):
         return {**unavailable, "reason": "launch identity differs from its durable witness"}
+    operation = witness
     original_scope = operation.get("process_scope")
     if isinstance(original_scope, dict) and original_scope.get("state") == "UNAVAILABLE":
         reason = original_scope.get("reason")
         return {**unavailable, "reason": "original process scope unavailable: " + reason
                 if set(original_scope) == {"state", "reason"} and isinstance(reason, str) and
                    reason in OPERATION_SCOPE_REASONS else "original process scope capture is invalid"}
+    if operation.get("intent_recovery") is True:
+        return bound_session_observation(run, operation)
     pid, start = operation.get("pid"), operation.get("pid_start")
     if type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start.isdigit() or int(start) <= 0:
         return {**unavailable, "reason": "original process identity is missing or invalid"}
@@ -1933,7 +2505,10 @@ def operation_process_observation(run, operation):
             if birth == start:
                 observed.append(("zombie" if fields[0] == "Z" else "present", birth))
             elif int(birth) > int(start):
-                observed.append(("later_instance", birth))
+                # Birth evidence alone cannot dismiss a process still naming this bound session. Consult the
+                # real argv, home and cwd independently of both mutable publication records.
+                live = bound_process_session(run, operation)
+                observed.append(("present" if live else "later_instance", birth))
             else:
                 return {**unavailable, "reason": "process birth precedes the recorded original instance"}
         if operation_process_scope() != scope or observed[0] != observed[1]:
@@ -1941,6 +2516,476 @@ def operation_process_observation(run, operation):
     except (OSError, ValueError, UnicodeError, IndexError):
         return {**unavailable, "reason": "process metadata is unreadable or malformed"}
     return {"state": "PRESENT" if observed[0][0] == "present" else "CONFIRMED_ABSENT", "reason": observed[0][0]}
+
+
+def bound_process_session(run, operation):
+    folder = Path("/proc/%d" % operation["pid"])
+    argv = folder.joinpath("cmdline").read_bytes().split(b"\0")
+    adapter = OWNER_ADAPTERS[operation["host"]]
+    session = operation["session"].encode("utf-8")
+    if not any(argv[i:i + 2] == [adapter["resume_word"], session] for i in range(len(argv) - 1)):
+        return False
+    home = host_home(run, operation["host"])
+    variable = hierarchy_hosts.entry(operation["host"])["home"]["variable"]
+    settings = folder.joinpath("environ").read_bytes().split(b"\0")
+    require((variable + "=" + home).encode("utf-8") in settings and
+            os.path.realpath(os.readlink(str(folder / "cwd"))) == os.path.realpath(operation["cwd"]),
+            "bound process session metadata is unavailable or conflicting")
+    return True
+
+
+
+def publication_aliases(folder, name, info):
+    # The sole allowed extra link is our atomic publisher's private, UUID-named staging entry.
+    # A backup/foreign hardlink, including any link outside this owner-only directory, is not an exemption.
+    aliases = []
+    for path in folder.glob(".owner-" + name + "-*.tmp"):
+        if re.fullmatch(r"\.owner-" + re.escape(name) + r"-[0-9a-f]{32}\.tmp", path.name) is None:
+            continue
+        try:
+            other = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISREG(other.st_mode) and other.st_uid == os.getuid() and stat.S_IMODE(other.st_mode) == 0o600 and
+                (other.st_dev, other.st_ino) == (info.st_dev, info.st_ino)):
+            aliases.append(path)
+    return aliases
+
+
+
+def model_write_roots(run):
+    roots = [run.project, *[lane.worktree for lane in run.implementers]]
+    for adapter in OWNER_ADAPTERS.values():
+        roots.append(getattr(run, adapter["home_attribute"]))
+    for lane in run.implementers:
+        if lane.tmpdir is not None:
+            roots.append(lane.tmpdir)
+    for path, value in model_profiles(run):
+        roots.extend(profile_roots(value, path.name))
+    return tuple(dict.fromkeys(Path(path).absolute() for path in roots))
+
+
+def model_profiles(run):
+    folder = run.base / "profiles"
+    paths = sorted(folder.glob("*.json")) if folder.is_dir() else []
+    if len(paths) > 256:
+        raise budget_problem("profiles", "event budget")
+    for path in paths:
+        value = read_json(path)
+        if not isinstance(value, dict) or not isinstance(value.get("host"), str) or value["host"] not in OWNER_ADAPTERS:
+            raise CustodyProblem("invalid role write scope", "role write scope", path.name)
+        endpoint = value.get("endpoint")
+        if isinstance(endpoint, str) and endpoint == run.endpoint("front-door"):
+            plan = hierarchy_hosts.read_plan(run.base)
+            # The sole exemption is the verified non-model front-door stand-in, never an arbitrary role/profile.
+            if (plan is not None and hierarchy_hosts.plan_host(plan, endpoint)[1] and
+                    re.fullmatch(re.escape(endpoint.replace("/", "%2F")) + r"-g[1-9][0-9]*\.(?:wake|codex)\.json", path.name)):
+                continue
+        yield path, value
+
+
+def profile_roots(value, record):
+    roots = []
+    for key in ("cwd", "tmpdir", "writable_roots", "add_dirs"):
+        entries = value.get(key, []) if key in ("writable_roots", "add_dirs") else (
+            [value[key]] if value.get(key) is not None else [])
+        if not isinstance(entries, list) or len(entries) > 128 or any(
+                not record_string(item) or not Path(item).is_absolute() or ".." in Path(item).parts for item in entries):
+            raise CustodyProblem("invalid role write roots", "role write scope", record)
+        roots.extend(Path(item) for item in entries)
+    return roots
+
+
+def paths_overlap(first, second):
+    return first == second or first in second.parents or second in first.parents
+
+
+def resolve_scope(path):
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise CustodyProblem("model write or executable scope cannot be resolved; restore the approved paths",
+                             "model executable scope", Path(path).name) from exc
+
+
+def control_paths(run, host):
+    paths = [run.evidence, run.lifecycle, run.base, run.store, run.inputs, run.loop_state,
+             run.run / ".owner-custody", run.run / "requests", run.run / "events", run.run / "starts",
+             run.state_path, run.commands_log, run.config_path, run.recipes, run.source, Path(run.python), resolve_scope(run.python)]
+    paths.extend(getattr(run, adapter["home_attribute"]) for kind, adapter in OWNER_ADAPTERS.items() if kind != host)
+    return paths
+
+
+def validate_role_write_roots(run):
+    requests = [(lane.endpoint, run.hosts["team"], [lane.worktree, *([lane.tmpdir] if lane.tmpdir else [])])
+                for lane in run.implementers]
+    for path, value in model_profiles(run):
+        requests.append((value.get("endpoint", path.name), value["host"], profile_roots(value, path.name)))
+    for endpoint, host, roots in requests:
+        for root in roots:
+            for candidate in (Path(root).absolute(), resolve_scope(root)):
+                for control in control_paths(run, host):
+                    for protected in (Path(control).absolute(), resolve_scope(control)):
+                        if paths_overlap(candidate, protected):
+                            raise CustodyProblem("role write root overlaps run control data; restore the approved worktree",
+                                                 "role write scope", endpoint)
+
+
+def validate_child_environment(run, env, cwd):
+    if not legacy_environment(run):
+        validate_owner_path(run, cwd, env)
+    return env
+
+
+
+def validate_owner_path(run, cwd, env=None):
+    settings = os.environ if env is None else env
+    roots = model_write_roots(run)
+    directories = []
+    for word in settings.get("PATH", os.defpath).split(os.pathsep):
+        if not word or not Path(word).is_absolute() or ".." in Path(word).parts:
+            raise CustodyProblem("PATH must contain only absolute nonempty trusted directories",
+                                 "model executable scope", "PATH")
+        written, resolved = Path(word).absolute(), resolve_scope(word)
+        for directory in (written, resolved):
+            if any(paths_overlap(directory, root) or paths_overlap(directory, resolve_scope(root)) for root in roots):
+                raise CustodyProblem("PATH includes a model-writable directory or ancestor; use absolute trusted program directories",
+                                     "model executable scope", "PATH")
+        directories.append(str(resolved))
+    path = os.pathsep.join(directories)
+    if env is not None:
+        env["PATH"] = path
+    return path
+
+
+
+def validated_command(run, argv, env, cwd=None):
+    if not governed_run(run):
+        return list(argv)
+    validate_owner_path(run, cwd or Path.cwd(), env)
+    selected = str(Path(argv[0]).absolute()) if Path(argv[0]).is_absolute() else shutil.which(argv[0], path=env["PATH"])
+    if selected is None:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), argv[0])
+    written, executable = Path(selected).absolute(), resolve_scope(selected)
+    for root in model_write_roots(run):
+        for candidate in (root, resolve_scope(root)):
+            if any(path == candidate or candidate in path.parents for path in (written, executable)):
+                raise CustodyProblem("executable is model-writable; restore a trusted program outside role roots",
+                                     "model executable scope", Path(argv[0]).name)
+    info = executable.stat()
+    immutable = bool(os.statvfs(executable).f_flag & os.ST_RDONLY)
+    if not (stat.S_ISREG(info.st_mode) and (immutable or info.st_uid in (0, os.getuid())) and
+            info.st_nlink == 1 and
+            not info.st_mode & (stat.S_ISUID | stat.S_ISGID | 0o022)):
+        raise CustodyProblem("executable has unsafe ownership, links or permissions; restore a trusted executable",
+                             "model executable scope", Path(argv[0]).name)
+    # Keep an absolute venv interpreter spelling: resolving it for exec would lose its venv configuration.
+    # Both the spelling and target are outside every model write root; no bare-name lookup remains at Popen.
+    return [str(written), *argv[1:]]
+
+
+
+def validate_model_executable(run, host, argv, cwd, env=None):
+    program = OWNER_ADAPTERS[host]["program"]
+    require(argv and (argv[0] == program or Path(argv[0]).is_absolute()),
+            "owner turn executable differs from the host registry")
+    settings = child_env(run) if env is None else env
+    selected = shutil.which(program, path=validate_owner_path(run, cwd, settings))
+    require(selected is not None, "host executable is unavailable; restore the trusted program on PATH")
+    if Path(argv[0]).is_absolute():
+        require(resolve_scope(argv[0]) == resolve_scope(selected), "owner turn executable differs from the validated host program")
+    return Path(validated_command(run, [selected], settings, cwd)[0])
+
+
+def bound_session_census(run, operation):
+    # This veto is independent of the PID stored in any record. It observes only the original PID namespace.
+    # Scope/census failures are unavailable evidence, never proof that a session ended.
+    unavailable = {"state": "UNAVAILABLE", "reason": "bound session metadata is unavailable"}
+    try:
+        mounted = Path("/proc").stat()
+        identity = (mounted.st_dev, mounted.st_ino, os.geteuid())
+    except OSError:
+        return unavailable
+    wanted = operation["session"].encode("utf-8")
+    flag = OWNER_ADAPTERS[operation["host"]]["resume_word"]
+    variable = hierarchy_hosts.entry(operation["host"])["home"]["variable"].encode("utf-8") + b"="
+    try:
+        for folder in Path("/proc").iterdir():
+            if not folder.name.isdigit():
+                continue
+            try:
+                uid = folder.stat().st_uid
+                if uid != os.geteuid():
+                    if uid != 0:
+                        continue
+                    # Linux changes proc directory ownership for non-dumpable processes. Kernel Uid identifies
+                    # their effective owner without reading another user's command/environment.
+                    rows = [line.split()[1:] for line in (folder / "status").read_bytes().splitlines()
+                            if line.startswith(b"Uid:")]
+                    require(len(rows) == 1 and len(rows[0]) == 4 and all(item.isdigit() for item in rows[0]),
+                            "invalid kernel process credentials")
+                    if int(rows[0][1]) != os.geteuid():
+                        continue
+                words = (folder / "cmdline").read_bytes().split(b"\0")
+                if not any(words[i:i + 2] == [flag, wanted] for i in range(len(words) - 1)):
+                    continue
+                settings = (folder / "environ").read_bytes().split(b"\0")
+                homes = [word[len(variable):] for word in settings if word.startswith(variable)]
+                require(len(homes) == 1, "bound session home unavailable")
+                if os.path.realpath(os.fsdecode(homes[0])) != os.path.realpath(host_home(run, operation["host"])):
+                    continue  # The same legacy textual session id in a positively observed different run home.
+                require(os.path.realpath(os.readlink(str(folder / "cwd"))) == os.path.realpath(operation["cwd"]),
+                        "bound session cwd changed")
+                return {"state": "PRESENT", "reason": "bound session is running"}
+            except FileNotFoundError:
+                continue
+        mounted = Path("/proc").stat()
+        if (mounted.st_dev, mounted.st_ino, os.geteuid()) != identity:
+            return unavailable
+    except (OSError, ValueError, UnicodeError):
+        return unavailable
+    return {"state": "CONFIRMED_ABSENT", "reason": "no live bound session in the original observer scope"}
+
+
+def bound_session_observation(run, operation):
+    unavailable = {"state": "UNAVAILABLE", "reason": "bound session metadata is unavailable"}
+    scope = operation_process_scope()
+    if scope.get("state") == "UNAVAILABLE" or scope != operation["process_scope"]:
+        return unavailable
+    result = bound_session_census(run, operation)
+    return result if operation_process_scope() == scope else unavailable
+
+
+def native_wait_veto(run, operation):
+    observation = bound_session_census(run, operation)
+    if observation["state"] != "CONFIRMED_ABSENT":
+        fail("operation %s finished its launcher but a bound host may still be running; accounting, state and marker retained" %
+             operation["id"], operation=operation, spawned=True, process_observation=observation,
+             next_action="let the bound session finish, then reconcile; do not replay")
+
+
+def native_exit_record(run, operation, code=None):
+    name = "turn-%s.exit.json" % operation["id"]
+    value = {"schema": "aegis.team-native-exit/v1", "operation_id": operation["id"],
+             "launch_sha256": digest_bytes(as_json(launch_identity(operation))), "native_exit": code}
+    path = owner_folder(run) / name
+    if code is not None and not path.exists():
+        owner_publish(run, name, value)
+    if not path.exists():
+        return None
+    observed = owner_read(run, name)
+    require(observed["operation_id"] == operation["id"] and
+            observed["launch_sha256"] == value["launch_sha256"] and
+            (code is None or observed["native_exit"] == code), "native exit witness conflicts; retain the hold")
+    return observed["native_exit"]
+
+
+def load_native_exit(value):
+    record_fields(value, {"schema", "operation_id", "launch_sha256", "native_exit"}, kind="native exit")
+    require(value["schema"] == "aegis.team-native-exit/v1" and record_digest(value["launch_sha256"]) and
+            isinstance(value["operation_id"], str) and re.fullmatch(r"[0-9a-f]{32}", value["operation_id"]) and
+            bounded_integer(value["native_exit"], -255, 255), "invalid native exit record")
+    return value
+
+
+def reconciliation_observation(run, operation):
+    original = operation_process_observation(run, operation)
+    return bound_session_observation(run, operation) if original["state"] == "CONFIRMED_ABSENT" else original
+
+
+def require_exited(run, operation):
+    observation = reconciliation_observation(run, operation)
+    if observation["state"] == "PRESENT":
+        refuse("operation %s is unresolved: its process is still running" % operation["id"], operation=operation,
+               process_observation=observation, next_action="let the bound session finish, then reconcile; do not replay")
+    if observation["state"] != "CONFIRMED_ABSENT":
+        refuse("operation %s is unresolved: its process exit cannot be confirmed; retain the hold" % operation["id"],
+               operation=operation, process_observation=observation)
+
+
+
+def owner_folder(run, create=False):
+    from hierarchy_mailbox import safe_path
+    folder = safe_path(run.run / ".owner-custody")
+    if not folder.exists():
+        if create:
+            state = load_state(run)
+            if state and state.get("owner_custody"):
+                raise CustodyProblem("this run predates or lost owner custody records; preserve it and init a new run folder",
+                                     "directory missing", ".owner-custody")
+            folder.mkdir(mode=0o700)
+        else:
+            raise CustodyProblem("this run predates or lost owner custody records; preserve it and init a new run folder",
+                                 "directory missing", ".owner-custody")
+    info = folder.stat()
+    if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700):
+        raise CustodyProblem("unsafe owner-held control directory", "directory permissions", ".owner-custody")
+    return folder
+
+
+def owner_read(run, name):
+    require(re.fullmatch(r"runtime\.json|plan-issued\.json|turn-[0-9a-f]{32}\.(?:launch|release|exit)\.json|active-[A-Za-z0-9_.%\-]+\.json", name) is not None,
+            "invalid owner-held record name")
+    path = owner_folder(run) / name
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise CustodyProblem("unsafe owner-held record: " + name, "record permissions", name)
+            if info.st_nlink != 1:
+                aliases = publication_aliases(path.parent, name, info)
+                current = os.fstat(stream.fileno())
+                if current.st_nlink != 1 and not (current.st_nlink == 2 and len(aliases) == 1):
+                    raise CustodyProblem("unsafe owner-held record: " + name, "record hardlink", name)
+            raw = bounded_read(stream, path, RECORD_BYTES)
+        return load_owner_value(name, record_json(raw, name))
+    except CustodyProblem:
+        raise
+    except FileNotFoundError as exc:
+        raise CustodyProblem("this run predates or lost owner custody records; preserve it and init a new run folder",
+                             "record missing", name) from exc
+    except OSError as exc:
+        if path.is_symlink():
+            raise CustodyProblem("owner-held record is a symlink: " + name, "record symlink", name) from exc
+        raise CustodyProblem("owner-held record is unavailable: " + name, "record unreadable", name) from exc
+    except ValueError as exc:
+        raise CustodyProblem(str(exc), "record shape", name) from exc
+
+
+def owner_publish(run, name, value):
+    load_owner_value(name, value)
+    folder = owner_folder(run, create=True)
+    path = folder / name
+    temporary = folder / (".owner-" + name + "-" + uuid.uuid4().hex + ".tmp")
+    raw = as_json(value)
+    require(len(raw) <= 262144, "owner record exceeds its bounded size; preserve this run and init a new run folder")
+    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publication is complete and never replaces an existing authority record.
+        os.link(temporary, path, follow_symlinks=False)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    descriptor = os.open(str(folder), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def owner_runtime(run, initialize=False, provisioned=None):
+    error = "team runtime differs from the owner-held record"
+    expected = {"schema": "aegis.team-owner-runtime/v1", "run": str(run.run), "initiative": run.id,
+                "python": run.python, "source": str(run.source), "python_realpath": os.path.realpath(run.python),
+                "custody": custody(run)}
+    if initialize:
+        folder = owner_folder(run, create=True)
+        if not (folder / "runtime.json").exists():
+            require(provisioned is not None and os.access(run.python, os.X_OK), error)
+            owner_publish(run, "runtime.json", {**expected, "python_sha256": sha_file(run.python),
+                "source_commit": provisioned["source_commit"], "source_tree": provisioned["source_tree"]})
+    recorded = owner_read(run, "runtime.json")
+    try:
+        interpreter_changed = (recorded["python"] != run.python or
+                               recorded["python_realpath"] != os.path.realpath(run.python) or
+                               not os.access(run.python, os.X_OK) or recorded["python_sha256"] != sha_file(run.python))
+    except OSError:
+        interpreter_changed = True
+    if interpreter_changed:
+        raise CustodyProblem(error, "interpreter drift", "runtime.json", INTERPRETER_RECOVERY)
+    require(all(recorded.get(key) == value for key, value in expected.items() if key not in ("python", "python_realpath")), error)
+    if provisioned is not None:
+        require(all(recorded[key] == provisioned.get(key) for key in ("source_commit", "source_tree")),
+                "source changed during provisioning; restore the provisioned revision or init a new run folder")
+    return recorded
+
+
+def active_name(endpoint):
+    endpoint_parts(endpoint)
+    return "active-%s.json" % endpoint.replace("/", "%2F")
+
+
+def intent_identity(operation):
+    value = launch_identity(operation)
+    value.pop("intent_recovery", None)
+    value["pid"] = None
+    value.pop("pid_start", None)
+    return value
+
+
+def owner_pending(run, *, endpoint=None, problems=None, state=UNINSPECTED):
+    pending = {}
+    folder = run.run / ".owner-custody"
+    if not folder.exists() and not folder.is_symlink() and not owner_expected(run, state=state):
+        return pending
+    try:
+        folder = owner_folder(run)
+    except (ValueError, OSError) as exc:
+        if problems is None:
+            raise
+        problems["_owner"] = {"error": str(exc), "next_action": CUSTODY_RECOVERY}
+        return pending
+    for path in folder.glob("active-*.json"):
+        slot = path.name[len("active-"):-len(".json")].replace("%2F", "/")
+        if endpoint is not None and slot != endpoint:
+            continue
+        try:
+            value = owner_read(run, path.name)
+            require(path.name == active_name(value["endpoint"]), "invalid active record")
+            pending[value["endpoint"]] = value
+        except (ValueError, OSError) as exc:
+            # Listing is a snapshot. A retirement that removed this entry is not damaged custody.
+            if not path.exists() and not path.is_symlink():
+                continue
+            if problems is None:
+                raise
+            problems[slot] = {"record": path.name, "error": str(exc), "next_action": CUSTODY_RECOVERY, **(exc.problem if isinstance(exc, CustodyProblem) else {})}
+    return pending
+
+
+
+def original_launch(run, operation):
+    load_operation(operation)
+    name = "turn-%s.launch.json" % operation["id"]
+    folder = owner_folder(run)
+    public = run.evidence / name
+    active = owner_pending(run, endpoint=operation["endpoint"]).get(operation["endpoint"])
+    if not (folder / name).exists() and not (folder / name).is_symlink():
+        if public.exists() or public.is_symlink():
+            raise CustodyProblem("this run predates or lost owner custody records; preserve it and init a new run folder",
+                                 "record missing", name)
+        require(active is not None and active == intent_identity(operation),
+                "original private intent is missing or changed; retain the hold")
+        require(not public.exists() and not public.is_symlink(), "untrusted launch publication without an owner witness")
+        # No fabricated PID/exit. This survives only through original-scope session absence AND fresh turn proof.
+        return {**active, "intent_recovery": True}
+    recorded = owner_read(run, name)
+    if active is not None:
+        require(active == intent_identity(recorded), "active owner-held intent differs from launch publication")
+    else:
+        require(operation.get("release") and (folder / ("turn-%s.release.json" % operation["id"])).exists(),
+                "active owner-held intent is missing")
+    pending = operation.get("pid") is None and "pid_start" not in operation
+    if public.exists():
+        require(read_json(public) == recorded, "launch identity differs from its durable witness")
+    else:
+        require(pending, "durable launch publication is missing")
+    expected = dict(recorded)
+    if pending:
+        expected["pid"] = None
+        expected.pop("pid_start", None)
+        if operation.get("intent_recovery") is not True:
+            expected.pop("intent_recovery", None)
+    require(launch_identity(operation) == expected, "launch identity differs from its durable witness")
+    return recorded
 
 
 def digest_bytes(raw):
@@ -1968,7 +3013,19 @@ def accounting_lines(raw):
     error = "operation accounting is incomplete or conflicting; retain the hold"
     require(not raw or raw.endswith(b"\n"), error)
     try:
-        rows = [strict_json(line) for line in raw.split(b"\n") if line]
+        if len(raw) > TURN_LOG_BYTES:
+            raise budget_problem("turn log")
+        if raw.count(b"\n") > OUTPUT_EVENTS:
+            raise budget_problem("turn log", "event budget")
+        rows = []
+        for line in raw.split(b"\n"):
+            if not line:
+                continue
+            if len(line) > TRANSCRIPT_LINE_BYTES:
+                raise budget_problem("turn log")
+            rows.append(record_json(line, "turn log"))
+    except CustodyProblem:
+        raise
     except (ValueError, UnicodeError):
         refuse(error)
     require(all(isinstance(row, dict) for row in rows), error)
@@ -2000,29 +3057,177 @@ def launch_identity(operation):
     return {key: value for key, value in operation.items() if key != "release"}
 
 
+def codex_usage(raw):
+    return next((event.get("usage") for event in reversed(list(codex_events(raw)))
+                 if event.get("type") == "turn.completed"), None)
+
+
+def raw_log_records(raw):
+    require(not raw or raw.endswith(b"\n"), "operation accounting is incomplete or conflicting; retain the hold")
+    return []
+
+
+def account_usage_rows(log, operation, before, rows, receipt, identity, usage, code, desired, receipt_path, stdout):
+    error = "operation accounting is incomplete or conflicting; retain the hold"
+    row = {key: identity[key] for key in ("operation_id", "endpoint", "host", "session", "started_at", "stdout")}
+    row.update(exit_code=code, usage=usage)
+    keys = set(row)
+    require(all(set(item) == keys and isinstance(item["operation_id"], str) for item in rows), error)
+    matches = [i for i, item in enumerate(rows) if item["operation_id"] == operation["id"]]
+    require(len(matches) <= 1, error)
+    if matches:
+        old = rows[matches[0]]
+        require(all(old[key] == value for key, value in row.items() if key not in ("exit_code", "usage")) and
+                (old["usage"] is None or old["usage"] == usage) and
+                (old["exit_code"] is None or (type(old["exit_code"]) is int and
+                 (code is None or old["exit_code"] == code))), error)
+        # A row may have been durably published before its receipt reply was lost. Keep a known native
+        # status immutable; neither an unknown caller exit nor a transcript verdict can replace it.
+        if code is None:
+            code = old["exit_code"]
+            row["exit_code"] = desired["exit_code"] = code
+        rows[matches[0]] = row
+    else:
+        require(receipt is None, error)
+        rows.append(row)
+    raw = b"".join(as_json_line(item) for item in rows)
+    if len(raw) > TURN_LOG_BYTES:
+        raise budget_problem(log)
+    if raw != before:
+        durable_write(log, raw)
+    return code
+
+
+def account_native_events(log, operation, before, rows, receipt, identity, usage, code, desired, receipt_path, stdout):
+    error = "operation accounting is incomplete or conflicting; retain the hold"
+    # Keep the historical Codex event bytes, extending the same invocation as its output grows. A receipt
+    # can precede its log write: only an exact, complete-line prefix of this stdout can finish that append.
+    raw = stdout[:stdout.rfind(b"\n") + 1]
+    span = receipt.get("log_span") if receipt else None
+    if span is None:
+        span = {"offset": len(before), "prefix_sha256": digest_bytes(before),
+                "length": 0, "sha256": digest_bytes(b"")}
+    else:
+        require(isinstance(span, dict) and set(span) == {"offset", "prefix_sha256", "length", "sha256"} and
+                type(span["offset"]) is int and span["offset"] >= 0 and type(span["length"]) is int and
+                0 <= span["length"] <= len(raw) and digest_bytes(raw[:span["length"]]) == span["sha256"], error)
+    offset = span["offset"]
+    require(len(before) >= offset and digest_bytes(before[:offset]) == span["prefix_sha256"], error)
+    require(raw.startswith(before[offset:]), error)
+    if offset + len(raw) > TURN_LOG_BYTES:
+        raise budget_problem(log)
+    span = {**span, "length": len(raw), "sha256": digest_bytes(raw)}
+    desired["log_span"] = span
+    if receipt != desired:
+        durable_write(receipt_path, as_json(desired))
+    if not log.exists() or before[offset:] != raw:
+        durable_write(log, before[:offset] + raw)
+    return code
+
+
+def codex_root_argv(run, binding, bound, prompt):
+    argv = ["codex"]
+    for feature in hierarchy_provision.CODEX_DISABLED + hierarchy_provision.CODEX_SHELL:
+        argv += ["--disable", feature]
+    argv += ["exec", "--ignore-user-config", "--sandbox", "read-only", "-c", 'approval_policy="never"',
+             "-c", bound["mcp_config"], "--json", "-C", str(run.project), "resume", binding["session"], prompt]
+    return argv, None
+
+
+def claude_root_argv(run, binding, bound, prompt):
+    return hierarchy_provision.claude_argv(["--resume", binding["session"]], bound["connection"], [],
+                 ["mcp__aegis_decision__" + name for name in ROOT_TOOLS], {}, None), prompt
+
+
+def codex_root_validate(run, binding, bound):
+    if governed_run(run):
+        require(tuple(bound["tools"]) == ROOT_TOOLS, "ROOT tools mismatch")
+        require(bound["mcp_config"] == codex_root_config(run, binding, bound["connection"]),
+                "Codex ROOT connection differs from the registry argv")
+
+
+def claude_root_validate(run, binding, bound):
+    claude_pin(run)
+    claude_transcript(run, binding["session"])
+    require(tuple(bound["tools"]) == ROOT_TOOLS, "ROOT tools mismatch")
+    governed_connection(run, binding, bound["connection"])
+    require(tuple(adapter_tools(run, bound["connection"])) == ROOT_TOOLS, "ROOT tools mismatch")
+
+
+def codex_turn_profile(run, binding, path, profile):
+    if governed_run(run):
+        from hierarchy_wake import load_profile
+        profile = load_profile(path, binding["endpoint"], binding)
+        codex_resume_profile(run, binding, profile)
+    return profile
+
+
+def claude_turn_profile(run, binding, path, profile):
+    from hierarchy_wake import load_profile
+    profile = load_profile(path, binding["endpoint"], binding)
+    claude_pin(run)
+    claude_transcript(run, binding["session"])
+    require(profile.get("mode", "print") == "print" and profile["prompt_via"] == "stdin",
+            "a Claude owner turn requires a print profile")
+    claude_resume_profile(run, binding, profile)
+    return profile
+
+
+def claude_turn_failure(code, raw, root=False):
+    if code == 0 and not owner_result_failed(CLAUDE, raw):
+        return None
+    return (("Claude ROOT turn failed; journal decisions, transcript and output were retained", {"claude_exit": code})
+            if root else ("Claude owner turn failed; transcript and output were retained", {}))
+
+
+def codex_bind_root(run, request, session):
+    with tempfile.TemporaryDirectory() as folder:
+        staged = Path(folder) / "root.json"
+        staged.write_bytes(as_json(request))
+        code, answer, _ = tool(run, "provision", "add-role", "--request", staged)
+    if code != 0:
+        (refuse if code == REFUSED else fail)(answer.get("error", "provision add-role exited %d" % code))
+    request_file(run, "root.json", request)
+    return answer
+
+
+def claude_bind_root(run, request, session):
+    claude_pin(run)
+    claude_transcript(run, session)
+    offered = (hierarchy_provision.DECISION_TOOL, *hierarchy_roles.decision_tools(hierarchy_roles.role(request["endpoint"])))
+    require(offered == ROOT_TOOLS, "ROOT tools mismatch: expected " + ", ".join(ROOT_TOOLS))
+    hierarchy_provision.check_role_request(request, governed_runtime(run))
+    try:
+        answer = hierarchy_provision.add_role(request)
+    except (ValueError, OSError) as exc:
+        fail("ROOT provisioning failed: %s; inspect the retained binding, connection and session records" % exc)
+    answer["mcp_config"] = answer["connection"]
+    return answer
+
+
 def record_turn(run, operation, stdout, code):
     """One durable invocation receipt per id, with an idempotent provider log. A null pending usage may become
     known, but a recorded charge cannot be reset or changed. Raw output remains in the invocation's own file.
     """
+    validate_output(stdout)
     error = "operation accounting is incomplete or conflicting; retain the hold"
     operation_paths(run, operation)
     log = run.evidence / operation["turn_log"]
     receipt_path = run.evidence / ("turn-%s.accounting.json" % operation["id"])
     require(not log.is_symlink() and not receipt_path.is_symlink(), error)
-    before = log.read_bytes() if log.exists() else b""
-    rows = accounting_lines(before)
+    before = bounded_bytes(log, TURN_LOG_BYTES) if log.exists() else b""
+    adapter = OWNER_ADAPTERS[operation["host"]]
+    rows = adapter["log_records"](before)
     receipt = read_json(receipt_path) if receipt_path.exists() else None
     require(code is None or type(code) is int, error)
     identity = {"operation_id": operation["id"], "endpoint": operation["endpoint"], "host": operation["host"],
                 "session": operation["session"], "generation": operation["generation"],
                 "started_at": operation["started_at"], "stdout": operation["stdout"]}
-    usage = hierarchy_hosts.claude_usage(stdout) if operation["host"] == CLAUDE else next(
-        (event.get("usage") for event in reversed(list(hierarchy_hosts.claude_events(stdout)))
-         if event.get("type") == "turn.completed"), None)
+    usage = adapter["usage"](stdout)
     if receipt is not None:
         require(isinstance(receipt, dict) and set(receipt) == {
                     "operation_id", "identity", "usage", "output_sha256", "output_bytes", "exit_code"} |
-                    ({"log_span"} if operation["host"] == CODEX else set()) and
+                    adapter["receipt_fields"] and
                 receipt.get("operation_id") == operation["id"] and receipt.get("identity") == identity and
                 type(receipt.get("output_bytes")) is int and 0 <= receipt["output_bytes"] <= len(stdout) and
                 digest_bytes(stdout[:receipt["output_bytes"]]) == receipt["output_sha256"] and
@@ -2033,75 +3238,34 @@ def record_turn(run, operation, stdout, code):
             code = receipt["exit_code"]
     desired = {"operation_id": operation["id"], "identity": identity, "usage": usage,
                "output_sha256": digest_bytes(stdout), "output_bytes": len(stdout), "exit_code": code}
-    if operation["host"] == CLAUDE:
-        row = {key: identity[key] for key in ("operation_id", "endpoint", "host", "session", "started_at", "stdout")}
-        row.update(exit_code=code, usage=usage)
-        keys = set(row)
-        require(all(set(item) == keys and isinstance(item["operation_id"], str) for item in rows), error)
-        matches = [i for i, item in enumerate(rows) if item["operation_id"] == operation["id"]]
-        require(len(matches) <= 1, error)
-        if matches:
-            old = rows[matches[0]]
-            require(all(old[key] == value for key, value in row.items() if key not in ("exit_code", "usage")) and
-                    (old["usage"] is None or old["usage"] == usage) and
-                    (old["exit_code"] is None or (type(old["exit_code"]) is int and
-                     (code is None or old["exit_code"] == code))), error)
-            # A row may have been durably published before its receipt reply was lost. Keep a known native
-            # status immutable; neither an unknown caller exit nor a transcript verdict can replace it.
-            if code is None:
-                code = old["exit_code"]
-                row["exit_code"] = desired["exit_code"] = code
-            rows[matches[0]] = row
-        else:
-            require(receipt is None, error)
-            rows.append(row)
-        raw = b"".join(as_json_line(item) for item in rows)
-        if raw != before:
-            durable_write(log, raw)
-    else:
-        # Keep the historical Codex event bytes, extending the same invocation as its output grows. A receipt
-        # can precede its log write: only an exact, complete-line prefix of this stdout can finish that append.
-        raw = stdout[:stdout.rfind(b"\n") + 1]
-        span = receipt.get("log_span") if receipt else None
-        if span is None:
-            span = {"offset": len(before), "prefix_sha256": digest_bytes(before),
-                    "length": 0, "sha256": digest_bytes(b"")}
-        else:
-            require(isinstance(span, dict) and set(span) == {"offset", "prefix_sha256", "length", "sha256"} and
-                    type(span["offset"]) is int and span["offset"] >= 0 and type(span["length"]) is int and
-                    0 <= span["length"] <= len(raw) and digest_bytes(raw[:span["length"]]) == span["sha256"], error)
-        offset = span["offset"]
-        require(len(before) >= offset and digest_bytes(before[:offset]) == span["prefix_sha256"], error)
-        require(raw.startswith(before[offset:]), error)
-        span = {**span, "length": len(raw), "sha256": digest_bytes(raw)}
-        desired["log_span"] = span
-        if receipt != desired:
-            durable_write(receipt_path, as_json(desired))
-        if not log.exists() or before[offset:] != raw:
-            durable_write(log, before[:offset] + raw)
-    if receipt != desired:
+    code = adapter["account"](log, operation, before, rows, receipt, identity, usage, code, desired, receipt_path, stdout)
+    if not adapter["owns_receipt"] and receipt != desired:
         durable_write(receipt_path, as_json(desired))
     return code
 
 
-def record_unresolved_turn(run, operation):
+def record_unresolved_turn(run, operation, native_exit=None):
     try:
         operation_paths(run, operation)
-        record_turn(run, operation, Path(operation["stdout"]).read_bytes(), None)
+        record_turn(run, operation, native_output(operation), native_exit)
+    except CustodyProblem as exc:
+        fail("operation %s is unresolved and accounting failed: %s; team-state, marker and output retained" %
+             (operation["id"], exc), operation=operation, spawned=True, **exc.detail())
     except (Stop, ValueError, OSError) as exc:
         fail("operation %s is unresolved and accounting failed: %s; team-state, marker and output retained" %
              (operation["id"], exc), operation=operation)
 
 
+
 def marker_witness(path):
-    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and
-                stat.S_IMODE(info.st_mode) == 0o600, "unsafe owner wake marker")
-        raw = stream.read()
+    raw = bounded_bytes(path, MARKER_BYTES)
+    info = os.lstat(path)
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and
+            stat.S_IMODE(info.st_mode) == 0o600, "unsafe owner wake marker")
+    value = record_json(raw, Path(path).name)
+    require(isinstance(value, dict), "unsafe owner wake marker")
     return {"device": info.st_dev, "inode": info.st_ino, "ctime_ns": info.st_ctime_ns,
-            "sha256": digest_bytes(raw), "operation_id": json.loads(raw)["operation_id"]}
+            "sha256": digest_bytes(raw), "operation_id": value.get("operation_id")}
 
 
 def require_owned_marker(operation):
@@ -2111,6 +3275,8 @@ def require_owned_marker(operation):
         return False  # A durable release intent follows terminal proof and durable accounting, never a model retry.
     try:
         observed = marker_witness(path)
+    except CustodyProblem as exc:
+        refuse(error, **exc.detail())
     except (OSError, ValueError, KeyError, Stop):
         refuse(error)
     require(observed == operation.get("marker_witness") and observed["operation_id"] == operation["id"], error)
@@ -2118,13 +3284,19 @@ def require_owned_marker(operation):
 
 
 def transcript_witness(path):
-    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "unsafe operation transcript")
-        raw = stream.read()
-    require(not raw or raw.endswith(b"\n"), "operation transcript has an incomplete boundary; retain the hold")
-    return {"device": info.st_dev, "inode": info.st_ino, "offset": len(raw), "prefix_sha256": digest_bytes(raw)}
+        if info.st_size > TRANSCRIPT_BYTES:
+            raise budget_problem(path)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and bounded_integer(info.st_size),
+                "unsafe operation transcript")
+        digest = bounded_prefix(stream, info.st_size)
+        require(digest is not None, "operation transcript was truncated; retain the hold")
+        if info.st_size:
+            stream.seek(info.st_size - 1)
+            require(stream.read(1) == b"\n", "operation transcript has an incomplete boundary; retain the hold")
+    return {"device": info.st_dev, "inode": info.st_ino, "offset": info.st_size, "prefix_sha256": digest}
 
 
 def message_text(content):
@@ -2136,83 +3308,120 @@ def message_text(content):
     return None
 
 
-def terminal_proof(run, operation, stdout):
-    """Continuity hashes detect file changes; they do not authenticate provider outcomes. Require the submitted
-    user text and the invocation's stream message/turn evidence too. Unsupported or ambiguous layouts stay unknown.
-    """
-    error = "operation %s transcript cannot prove this session's submitted turn; retain the hold and do not replay" % operation["id"]
-    stream = list(hierarchy_hosts.claude_events(stdout))
-    answers = [event for event in stream if event.get("type") == "assistant" and
+
+def prove_claude_turn(events, prefix, stdout, operation, error):
+    relevant = [event for event in events if event.get("type") in ("user", "assistant", "system")]
+    require(all(event.get("sessionId") == operation["session"] for event in relevant), error)
+    users = [event for event in relevant if event.get("type") == "user"]
+    require(all(isinstance(event.get("message"), dict) for event in users), error)
+    prompts = []
+    for event in users:
+        content = event["message"].get("content")
+        if message_text(content) is not None:
+            prompts.append(event)
+        else:
+            require(isinstance(content, list) and bool(content) and
+                    all(isinstance(item, dict) and item.get("type") == "tool_result" for item in content), error)
+    require(len(prompts) == 1 and relevant[0] == prompts[0] and isinstance(prompts[0].get("uuid"), str), error)
+    prompt = message_text(prompts[0]["message"].get("content"))
+    require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
+    require(not any(event.get("type") == "system" and event.get("subtype") in ("turn_failed", "turn_aborted")
+                    for event in relevant), error)
+    terminals = [event for event in relevant if event.get("type") == "assistant" and
+                 isinstance(event.get("message"), dict) and
+                 event["message"].get("stop_reason") in ("end_turn", "max_tokens", "stop_sequence")]
+    if not terminals:
+        return None
+    require(len(terminals) == 1 and relevant[-1] == terminals[0], error)
+    message_id = terminals[0]["message"].get("id")
+    answers = [event for event in owner_events(CLAUDE, stdout) if event.get("type") == "assistant" and
                event.get("session_id") == operation["session"] and isinstance(event.get("message"), dict)]
+    require(isinstance(message_id, str) and any(event["message"].get("id") == message_id for event in answers), error)
+    return False
+
+
+def prove_codex_turn(events, prefix, stdout, operation, error):
+    metadata = [load_native_record(event.get("payload"), "metadata") for event in prefix]
+    require(len(metadata) == 1 and metadata[0]["id"] == operation["session"], error)
+    users = [event.get("payload") for event in events if event.get("type") == "response_item" and
+             isinstance(event.get("payload"), dict) and event["payload"].get("role") == "user"]
+    require(len(users) == 1, error)
+    prompt = message_text(users[0].get("content"))
+    require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
+    messages = [event["payload"] for event in events if event.get("type") == "event_msg" and
+                isinstance(event.get("payload"), dict)]
+    starts = [event for event in messages if event.get("type") == "task_started"]
+    require(len(starts) == 1 and isinstance(starts[0].get("turn_id"), str), error)
+    turn = starts[0]["turn_id"]
+    contexts = [load_native_record(event.get("payload"), "context") for event in events if event.get("type") == "turn_context"]
+    require(len(contexts) == 1 and contexts[0]["turn_id"] == turn and contexts[0]["cwd"] == operation["cwd"], error)
+    terminals = [event for event in messages if event.get("type") in ("task_complete", "task_failed", "turn_aborted")]
+    if not terminals:
+        return None
+    require(len(terminals) == 1 and terminals[0].get("turn_id") == turn, error)
+    return terminals[0]["type"] != "task_complete"
+
+
+def terminal_proof(run, operation, stdout, terminal_files=None):
+    error = ("operation %s transcript cannot prove this session's submitted turn; retain the hold and do not replay"
+             % operation["id"])
     proofs = []
+    total_bytes = 0
     for filename, witness in operation["transcripts"].items():
+        load_file_witness(witness)
         path = Path(filename)
-        home = run.validated_homes[CLAUDE] if operation["host"] == CLAUDE else run.codex_home
-        require(path in hierarchy_hosts.transcripts(operation["host"], home, operation["session"]), error)
-        descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "rb") as transcript:
-            info = os.fstat(transcript.fileno())
-            raw = transcript.read()
-        offset = witness["offset"]
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
-                (info.st_dev, info.st_ino) == (witness["device"], witness["inode"]) and len(raw) >= offset and
-                digest_bytes(raw[:offset]) == witness["prefix_sha256"] and (not raw or raw.endswith(b"\n")), error)
+        home = host_home(run, operation["host"])
+        require(path in hierarchy_hosts.transcripts(operation["host"], home, operation["session"]),
+                error + "; restore the original transcript before reconciliation")
         try:
-            events = [strict_json(line) for line in raw[offset:].split(b"\n") if line]
-        except (ValueError, UnicodeError):
-            refuse(error)
-        require(all(isinstance(event, dict) for event in events), error)
+            descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as transcript:
+                info = os.fstat(transcript.fileno())
+                require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                        (info.st_dev, info.st_ino) == (witness["device"], witness["inode"]), error)
+                total_bytes += info.st_size
+                if total_bytes > TRANSCRIPT_BYTES:
+                    raise budget_problem(path)
+                digest, remaining, prefix = hashlib.sha256(), witness["offset"], []
+                prefix_kind = OWNER_ADAPTERS[operation["host"]]["prefix_kind"]
+                while remaining:
+                    block = record_line(transcript, path, min(TRANSCRIPT_LINE_BYTES, remaining)) if prefix_kind else transcript.read(min(1 << 20, remaining))
+                    require(bool(block), error)
+                    if prefix_kind and len(block) > TRANSCRIPT_LINE_BYTES:
+                        raise budget_problem(path)
+                    digest.update(block)
+                    remaining -= len(block)
+                    if prefix_kind:
+                        require(block.endswith(b"\n"), error)
+                        event = record_json(block, path.name)
+                        require(isinstance(event, dict), error)
+                        if event.get("type") == prefix_kind:
+                            prefix.append(event)
+                require(digest.hexdigest() == witness["prefix_sha256"], error)
+                events, length = [], witness["offset"]
+                for line in transcript_lines(transcript, path, byte_limit=FRESH_BYTES, count_limit=FRESH_EVENTS):
+                    require(line.endswith(b"\n"), error)
+                    digest.update(line)
+                    length += len(line)
+                    event = record_json(line, path.name)
+                    require(isinstance(event, dict), error)
+                    events.append(event)
+                after = os.fstat(transcript.fileno())
+                require((after.st_dev, after.st_ino) == (info.st_dev, info.st_ino) and after.st_size == length, error)
+        except CustodyProblem:
+            raise
+        except OSError as exc:
+            raise ValueError(error + "; restore the original transcript before reconciliation") from exc
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError(error) from exc
         if not events:
             continue
-        if operation["host"] == CLAUDE:
-            relevant = [event for event in events if event.get("type") in ("user", "assistant", "system")]
-            require(all(event.get("sessionId") == operation["session"] for event in relevant), error)
-            users = [event for event in relevant if event.get("type") == "user"]
-            require(all(isinstance(event.get("message"), dict) for event in users), error)
-            prompts = []
-            for event in users:
-                content = event["message"].get("content")
-                if message_text(content) is not None:
-                    prompts.append(event)
-                else:
-                    require(isinstance(content, list) and bool(content) and
-                            all(isinstance(item, dict) and item.get("type") == "tool_result" for item in content), error)
-            require(len(prompts) == 1 and relevant[0] == prompts[0] and isinstance(prompts[0].get("uuid"), str), error)
-            prompt = message_text(prompts[0]["message"].get("content"))
-            require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
-            terminals = [event for event in relevant if event.get("type") == "assistant" and
-                         isinstance(event.get("message"), dict) and
-                         event["message"].get("stop_reason") in ("end_turn", "max_tokens", "stop_sequence")]
-            # These fixture-era rows are not a supported native Claude terminal shape. Neither their presence
-            # nor a session-only error result proves that this invocation's submitted turn ended.
-            require(not any(event.get("type") == "system" and event.get("subtype") in ("turn_failed", "turn_aborted")
-                            for event in relevant), error)
-            if terminals:
-                require(len(terminals) == 1 and relevant[-1] == terminals[0], error)
-                message_id = terminals[0]["message"].get("id")
-                require(isinstance(message_id, str) and any(event["message"].get("id") == message_id for event in answers), error)
-                proofs.append(False)
-        else:
-            prefix = list(hierarchy_hosts.claude_events(raw[:offset]))
-            metadata = [event["payload"] for event in prefix if event.get("type") == "session_meta"]
-            require(len(metadata) == 1 and metadata[0].get("id") == operation["session"], error)
-            users = [event.get("payload") for event in events if event.get("type") == "response_item" and
-                     isinstance(event.get("payload"), dict) and event["payload"].get("role") == "user"]
-            require(len(users) == 1, error)
-            prompt = message_text(users[0].get("content"))
-            require(prompt is not None and digest_bytes(prompt.encode("utf-8")) == operation["prompt_sha256"], error)
-            messages = [event["payload"] for event in events if event.get("type") == "event_msg" and
-                        isinstance(event.get("payload"), dict)]
-            starts = [event for event in messages if event.get("type") == "task_started"]
-            require(len(starts) == 1 and isinstance(starts[0].get("turn_id"), str), error)
-            turn = starts[0]["turn_id"]
-            contexts = [event["payload"] for event in events if event.get("type") == "turn_context"]
-            require(len(contexts) == 1 and contexts[0].get("turn_id") == turn and
-                    contexts[0].get("cwd") == operation["cwd"], error)
-            terminals = [event for event in messages if event.get("type") in ("task_complete", "task_failed", "turn_aborted")]
-            if terminals:
-                require(len(terminals) == 1 and terminals[0].get("turn_id") == turn, error)
-                proofs.append(terminals[0]["type"] != "task_complete")
+        result = OWNER_ADAPTERS[operation["host"]]["terminal"](events, prefix, stdout, operation, error)
+        if result is not None:
+            proofs.append(result)
+        if terminal_files is not None:
+            terminal_files[filename] = {"device": info.st_dev, "inode": info.st_ino, "offset": length,
+                                        "prefix_sha256": digest.hexdigest()}
     require(len(proofs) == 1, "operation %s is unresolved: the transcript has no completed or failed turn; "
             "retain the hold and do not replay" % operation["id"])
     return proofs[0]
@@ -2227,6 +3436,8 @@ def operation_record(state, operation, *, pending_pid=False):
     recorded = operations.get(operation["endpoint"]) if isinstance(operations, dict) else None
     expected = dict(operation)
     if pending_pid:
+        if recorded and recorded.get("intent_recovery") is not True:
+            expected.pop("intent_recovery", None)
         # Only the PID transaction may replace the unpublished PID fields after Popen returns.
         expected["pid"] = None
         expected.pop("pid_start", None)
@@ -2236,30 +3447,172 @@ def operation_record(state, operation, *, pending_pid=False):
     return recorded
 
 
-def finish_operation(run, operation, stdout, code):
+def file_prefix(path, limit=TRANSCRIPT_BYTES):
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and bounded_integer(info.st_size),
+                "unsafe completion evidence; retain the hold")
+        if info.st_size > limit:
+            raise budget_problem(path)
+        digest = bounded_prefix(stream, info.st_size)
+    require(digest is not None, "completion evidence was truncated; retain the hold")
+    return {"device": info.st_dev, "inode": info.st_ino, "offset": info.st_size, "prefix_sha256": digest}
+
+
+def bounded_prefix(stream, count):
+    digest, remaining = hashlib.sha256(), count
+    while remaining:
+        block = stream.read(min(1 << 20, remaining))
+        if not block:
+            return None
+        digest.update(block)
+        remaining -= len(block)
+    return digest.hexdigest()
+
+
+def sealed_transcript_status(operation, proof):
+    outcome = "unchanged"
+    for filename in operation["transcripts"]:
+        witness = proof["files"][filename]
+        try:
+            descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                same = (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                        (info.st_dev, info.st_ino) == (witness["device"], witness["inode"]) and
+                        bounded_prefix(stream, witness["offset"]) == witness["prefix_sha256"])
+            if not same and outcome != "missing":
+                outcome = "changed"
+        except FileNotFoundError:
+            outcome = "missing"
+        except OSError:
+            if outcome != "missing":
+                outcome = "changed"
+    return outcome
+
+
+def completion_files(run, operation):
+    return {operation["stdout"], operation["stderr"], str(run.evidence / operation["turn_log"]),
+            *operation["transcripts"]}
+
+
+def validate_completion(run, operation, proof):
+    load_completion(proof)
+    error = "operation completion evidence changed; retain the hold"
+    require(proof["operation_id"] == operation["id"] and
+            proof["launch_sha256"] == digest_bytes(as_json(launch_identity(operation))) and
+            set(proof["files"]) == completion_files(run, operation), error)
+    require(digest_bytes(bounded_bytes(run.evidence / ("turn-%s.accounting.json" % operation["id"]))) == proof["accounting_sha256"],
+            "operation accounting changed after release intent; retain the hold")
+    for filename, witness in proof["files"].items():
+        limit = TRANSCRIPT_BYTES if filename in operation["transcripts"] else OUTPUT_BYTES
+        if witness["offset"] > limit:
+            raise budget_problem(filename)
+        # Host transcripts are not authority after the seal. Their drift is audited separately, never a replay gate.
+        if filename in operation["transcripts"]:
+            continue
+        descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            digest = bounded_prefix(stream, witness["offset"])
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                (info.st_dev, info.st_ino) == (witness["device"], witness["inode"]) and digest == witness["prefix_sha256"], error)
+    expected = {"accounting_sha256": proof["accounting_sha256"], "terminal_sha256": digest_bytes(as_json(proof))}
+    require(not operation.get("release") or operation["release"] == expected, error)
+    return expected
+
+
+def finish_operation(run, operation, stdout, code, *, pending_pid=False, outcome=None, recover_private=False,
+                     terminal_files=None, observed_wait=False):
     from hierarchy_mailbox import writer_lock
     operation_paths(run, operation)
     # Lock order: owner directory -> mailbox -> short Claude state transaction. Never acquire a mailbox lock
     # from a state callback, or keep a state lock over provider/accounting I/O or any child wait.
     with writer_lock(run.mailbox_root):
-        operation_record(require_init(run), operation)
-        if operation.get("release"):
-            require(sha_file(run.evidence / ("turn-%s.accounting.json" % operation["id"])) ==
-                    operation["release"]["accounting_sha256"],
-                    "operation accounting changed after release intent; retain the hold")
-        remove = require_owned_marker(operation) if operation.get("marker") else False
-        code = record_turn(run, operation, stdout, code)
-        index(run, Path(operation["stdout"]).name, Path(operation["stderr"]).name,
-              "turn-%s.accounting.json" % operation["id"], "turn-%s.launch.json" % operation["id"], operation["turn_log"])
+        if not observed_wait:
+            require_exited(run, operation)
+        current = require_init(run)
+        # Preserve an actually observed native status/usage even if a foreign public slot prevents retirement.
+        # Accounting is keyed by this immutable invocation, not by the mutable current endpoint slot.
+        original_launch(run, operation)
+        sealed = (owner_folder(run) / ("turn-%s.release.json" % operation["id"])).exists()
+        if not sealed:
+            # Reconciliation refusals have no effects. Check the original wake before upgrading its accounting;
+            # an observed native wait still records its measured exit even when later release checks fail.
+            if not observed_wait and operation.get("marker"):
+                require_owned_marker(operation)
+            code = record_turn(run, operation, stdout, code)
+        if observed_wait:
+            native_wait_veto(run, operation)
+        absent = current.get("operations", {}).get(operation["endpoint"]) is None
+        if recover_private and absent:
+            original_launch(run, intent_identity(operation))
+        else:
+            operation_record(current, operation, pending_pid=pending_pid)
+            original_launch(run, current["operations"][operation["endpoint"]])
+        name = "turn-%s.release.json" % operation["id"]
+        recorded = (owner_folder(run) / name).exists()
+        if recorded:
+            proof = owner_read(run, name)
+            release_value = validate_completion(run, operation, proof)
+            require(code is None or code == proof["native_exit"], "operation native exit changed; retain the hold")
+            code = proof["native_exit"]
+        else:
+            require(not operation.get("release"), "owner-held completion evidence is missing; retain the hold")
+            # A foreign marker before a verified release remains unknown. After a durable release, recovery may
+            # retire the old operation but must never unlink a replacement created by a subsequent wake.
+            if operation.get("marker"):
+                require_owned_marker(operation)
+            public_launch = run.evidence / ("turn-%s.launch.json" % operation["id"])
+            private_launch = owner_folder(run) / public_launch.name
+            if operation.get("intent_recovery") is True and not private_launch.exists():
+                owner_publish(run, private_launch.name, launch_identity(operation))
+            if pending_pid and not public_launch.exists():
+                durable_write(public_launch, as_json(launch_identity(operation)))
+            require(code is not None or type(outcome) is bool, "unknown operation completion; retain the hold")
+            index(run, Path(operation["stdout"]).name, Path(operation["stderr"]).name,
+                  "turn-%s.accounting.json" % operation["id"], public_launch.name, operation["turn_log"])
+            failed = bool(code is not None and code != 0) if outcome is None else outcome
+            failed |= owner_result_failed(operation["host"], stdout)
+            proof = {"schema": "aegis.team-owner-completion/v1", "operation_id": operation["id"],
+                     "launch_sha256": digest_bytes(as_json(launch_identity(operation))),
+                     "accounting_sha256": digest_bytes(bounded_bytes(run.evidence / ("turn-%s.accounting.json" % operation["id"]))),
+                     "files": {filename: (terminal_files or {}).get(filename) or file_prefix(
+                                   filename, TRANSCRIPT_BYTES if filename in operation["transcripts"] else OUTPUT_BYTES)
+                               for filename in sorted(completion_files(run, operation))},
+                     "failed": failed, "native_exit": code}
+            owner_publish(run, name, proof)
+            release_value = validate_completion(run, operation, proof)
+        remove = False
+        if operation.get("marker"):
+            path = Path(operation["marker"])
+            if path.exists() and not path.is_symlink():
+                remove = marker_witness(path) == operation["marker_witness"]
         releasing = dict(operation)
-        releasing["release"] = {"accounting_sha256": sha_file(run.evidence / ("turn-%s.accounting.json" % operation["id"]))}
+        releasing["release"] = release_value
         def release(current):
             require_init(run, state=current)
-            operation_record(current, operation)
-            current["operations"][operation["endpoint"]] = releasing
+            if recover_private and current.get("operations", {}).get(operation["endpoint"]) is None:
+                require(owner_pending(run, endpoint=operation["endpoint"]).get(operation["endpoint"]) ==
+                        intent_identity(operation), "private intent changed; retain the hold")
+                current.setdefault("operations", {})[operation["endpoint"]] = releasing
+            else:
+                operation_record(current, operation, pending_pid=pending_pid)
+                current["operations"][operation["endpoint"]] = releasing
         update_state(run, release)
         if remove:
             Path(operation["marker"]).unlink()
+        active = owner_folder(run) / active_name(operation["endpoint"])
+        if active.exists() or active.is_symlink():
+            require(owner_read(run, active.name) == intent_identity(operation),
+                    "active owner-held intent changed; retain the hold")
+            active.unlink()
+            descriptor = os.open(str(active.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         def finish(current):
             require_init(run, state=current)
             operation_record(current, releasing)
@@ -2268,64 +3621,124 @@ def finish_operation(run, operation, stdout, code):
     return code
 
 
+
+
+def retire_unlaunched(run, operation, endpoint, identifier, marker, witness):
+    from hierarchy_mailbox import writer_lock
+    with writer_lock(run.mailbox_root):
+        current = load_state(run)
+        slot = (current or {}).get("operations", {}).get(endpoint)
+        present = operation is not None and slot == operation
+        if present:
+            path = run.run / ".owner-custody" / active_name(endpoint)
+            if path.exists() or path.is_symlink():
+                require(owner_read(run, path.name) == intent_identity(operation), "foreign owner intent was retained")
+                for alias in publication_aliases(path.parent, path.name, path.stat()):
+                    alias.unlink()
+                path.unlink()
+        if marker:
+            owned = operation or {"id": identifier, "marker": str(marker), "marker_witness": witness}
+            if require_owned_marker(owned):
+                marker.unlink()
+        if present:
+            def retire(fresh):
+                operation_record(fresh, operation)
+                fresh["operations"].pop(endpoint)
+            update_state(run, retire)
+    return True
+
+
+
 def model_turn(run, endpoint, binding, argv, cwd, prompt, timeout, marker=None, approval=None,
                operation_id=None, owned_marker=None):
-    """Bound the owner's wait, never the host's life. Files survive this command and cannot fill a pipe or SIGPIPE
-    the host after a deadline. Persist intent before Popen and the pid immediately afterwards; lost replies hold.
-    """
+    """Keep one custody identity: known no-spawn retires only its staging; any returned Popen is UNKNOWN on loss."""
+    from contextlib import ExitStack
+    operation = None
+    identifier = operation_id or uuid.uuid4().hex
+    created = []
+
+    def unstarted(exc):
+        retired = False
+        try:
+            retired = retire_unlaunched(run, operation, endpoint, identifier, marker, owned_marker)
+            for path, device, inode in created:
+                info = path.lstat()
+                require((info.st_dev, info.st_ino) == (device, inode), "foreign output file was retained")
+                path.unlink()
+        except (Stop, ValueError, OSError):
+            retired = False
+        detail = {"spawned": False, "custody_retired": retired}
+        if operation is not None:
+            detail["operation"] = operation
+        if isinstance(exc, CustodyProblem):
+            detail.update(exc.detail())
+        if isinstance(exc, Stop) and exc.code == REFUSED and retired:
+            raise Stop(REFUSED, str(exc), **{**detail, **exc.detail})
+        message = "model was not started: %s; %s" % (exc, "owned intent and marker retired" if retired else "custody retained; inspect status")
+        raise Stop(REFUSED if retired else FAILED, message, **detail)
+
     try:
         env = child_env(run)
-        if binding["host"] == CLAUDE:
-            claude_pin(run)
-        home = run.validated_homes[CLAUDE] if binding["host"] == CLAUDE else run.codex_home
+        if governed_run(run):
+            validate_role_write_roots(run)
+            argv = [str(validate_model_executable(run, binding["host"], argv, cwd, env)), *argv[1:]]
+        OWNER_ADAPTERS[binding["host"]]["credentials"](run)
+        home = host_home(run, binding["host"])
         transcripts = {str(path): transcript_witness(path) for path in
                        hierarchy_hosts.transcripts(binding["host"], home, binding["session"])}
         process_scope = operation_process_scope()
-    except (Stop, ValueError):
-        if marker:
-            from hierarchy_mailbox import writer_lock
-            with writer_lock(run.mailbox_root):
-                if require_owned_marker({"id": operation_id, "marker": str(marker), "marker_witness": owned_marker}):
-                    marker.unlink()
-        raise
-    identifier = operation_id or uuid.uuid4().hex
-    operation = {"id": identifier, "endpoint": endpoint, "host": binding["host"], "session": binding["session"],
-                 "generation": binding["generation"], "started_at": timestamp(), "pid": None,
-                 "process_scope": process_scope,
-                 "stdout": str(run.evidence / ("turn-%s.stdout.jsonl" % identifier)),
-                 "stderr": str(run.evidence / ("turn-%s.stderr.txt" % identifier)),
-                 "transcripts": transcripts,
-                 "prompt_sha256": digest_bytes((prompt if prompt is not None else argv[-1]).encode("utf-8")), "cwd": cwd,
-                 "turn_log": "root-turns.jsonl" if endpoint_parts(endpoint)[1] == "root" else
-                             "role-turns-%s.jsonl" % endpoint.replace("/", "%2F"),
-                 "marker": str(marker) if marker else None, "marker_witness": owned_marker}
-    if approval is not None:
-        operation["approval"] = approval
-    def intend(current):
-        require_init(run, state=current)
-        require_resolved(run, endpoint, state=current)
-        current.setdefault("operations", {})[endpoint] = operation
-    try:
+        owner_folder(run, create=True)
+        operation = {"id": identifier, "endpoint": endpoint, "host": binding["host"], "session": binding["session"],
+                     "generation": binding["generation"], "started_at": timestamp(), "pid": None,
+                     "process_scope": process_scope,
+                     "stdout": str(run.evidence / ("turn-%s.stdout.jsonl" % identifier)),
+                     "stderr": str(run.evidence / ("turn-%s.stderr.txt" % identifier)),
+                     "transcripts": transcripts,
+                     "prompt_sha256": digest_bytes((prompt if prompt is not None else argv[-1]).encode("utf-8")), "cwd": cwd,
+                     "turn_log": "root-turns.jsonl" if endpoint_parts(endpoint)[1] == "root" else
+                                 "role-turns-%s.jsonl" % endpoint.replace("/", "%2F"),
+                     "marker": str(marker) if marker else None, "marker_witness": owned_marker}
+        if approval is not None:
+            operation["approval"] = approval
+        def intend(current):
+            require_init(run, state=current)
+            require_resolved(run, endpoint, state=current)
+            current["owner_custody"] = True
+            current.setdefault("operations", {})[endpoint] = operation
         update_state(run, intend)
-    except Stop as stop:
-        if stop.code == REFUSED and marker:
-            from hierarchy_mailbox import writer_lock
-            with writer_lock(run.mailbox_root):
-                if require_owned_marker(operation):
-                    marker.unlink()
-        raise
-    # Input is a private anonymous file too; writing a long prompt to a pipe could consume the deadline before wait.
-    with tempfile.TemporaryFile() as stdin, open(operation["stdout"], "wb") as stdout, open(operation["stderr"], "wb") as stderr:
-        if prompt is not None:
-            stdin.write(prompt.encode("utf-8"))
-            stdin.seek(0)
+        owner_publish(run, active_name(endpoint), intent_identity(operation))
+    except BaseException as exc:
+        unstarted(exc)
+
+    with ExitStack() as stack:
+        try:
+            stdin = stack.enter_context(tempfile.TemporaryFile())
+            outputs = []
+            for field in ("stdout", "stderr"):
+                path = Path(operation[field])
+                stream = stack.enter_context(open(path, "xb"))
+                info = os.fstat(stream.fileno())
+                created.append((path, info.st_dev, info.st_ino))
+                outputs.append(stream)
+            stdout, stderr = outputs
+            if prompt is not None:
+                stdin.write(prompt.encode("utf-8"))
+                stdin.seek(0)
+        except BaseException as exc:
+            # Close staged descriptors before unlinking them. No Popen was called.
+            stack.close()
+            unstarted(exc)
         try:
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin if prompt is not None else subprocess.DEVNULL,
                                        stdout=stdout, stderr=stderr, start_new_session=True)
+        except (OSError, ValueError, Stop) as exc:
+            stack.close()
+            unstarted(exc)
+        observed_native = None
+        try:
             operation.update(pid=process.pid, pid_start=process_identity(process.pid))
+            owner_publish(run, "turn-%s.launch.json" % identifier, launch_identity(operation))
             launch_path = run.evidence / ("turn-%s.launch.json" % identifier)
-            # Publish before team-state's PID transaction; a caller loss before publication remains unknown.
-            # The owner operation lock serializes writers and an invocation id never reuses an existing witness.
             if launch_path.exists() or launch_path.is_symlink():
                 raise OSError("operation launch witness already exists")
             durable_write(launch_path, as_json(launch_identity(operation)))
@@ -2334,61 +3747,101 @@ def model_turn(run, endpoint, binding, argv, cwd, prompt, timeout, marker=None, 
                 recorded = operation_record(current, operation, pending_pid=True)
                 recorded.update(pid=operation["pid"], pid_start=operation["pid_start"])
             update_state(run, record_pid)
-            process.wait(timeout=timeout)
+            observed_native = process.wait(timeout=timeout)
+            native_exit_record(run, operation, observed_native)
         except subprocess.TimeoutExpired:
             record_unresolved_turn(run, operation)
             fail("operation %s on %s is unresolved after its deadline; process pid %d was left running, output and "
                  "team-state were retained. Inspect status, then use approve/turn --reconcile; do not replay" %
-                 (identifier, endpoint, process.pid), operation=operation)
-        except (OSError, subprocess.SubprocessError) as exc:
-            record_unresolved_turn(run, operation)
+                 (identifier, endpoint, process.pid), operation=operation, spawned=True)
+        except BaseException as exc:
+            try:
+                record_unresolved_turn(run, operation, observed_native)
+            except (Stop, ValueError, OSError) as accounting:
+                detail = accounting.detail if isinstance(accounting, Stop) else (
+                    accounting.detail() if isinstance(accounting, CustodyProblem) else {})
+                fail("operation %s is unresolved: %s; accounting unavailable: %s; team-state and output retained" %
+                     (identifier, exc, accounting), **{**detail, "operation": operation, "spawned": True})
             fail("operation %s is unresolved: %s; team-state and output retained; inspect before reconciliation" %
-                 (identifier, exc), operation=operation)
-    raw, errors = Path(operation["stdout"]).read_bytes(), Path(operation["stderr"]).read_bytes()
+                 (identifier, exc), operation=operation, spawned=True)
     try:
-        finish_operation(run, operation, raw, process.returncode)
+        raw, errors = native_output(operation), native_output(operation, "stderr")
+        finish_operation(run, operation, raw, process.returncode, observed_wait=True)
     except (Stop, ValueError, OSError) as exc:
         if isinstance(exc, Stop) and exc.code == FAILED:
             raise
-        fail("operation %s finished but custody release failed: %s; state, marker and output retained" %
-             (identifier, exc), operation=operation)
+        detail = exc.detail() if isinstance(exc, CustodyProblem) else {}
+        fail("operation %s finished but custody release failed: %s; state, marker, accounting and output retained" %
+             (identifier, exc), operation=operation, spawned=True, **detail)
     return subprocess.CompletedProcess(argv, process.returncode, raw, errors)
+
+
+def approval_journal_failed(run, operation):
+    approval = operation.get("approval")
+    if not approval:
+        return False
+    _policy, journal = hierarchy_router.locked_load(hierarchy_lifecycle.Lifecycle(run.lifecycle), 5.0)
+    previous = approval["previous"]
+    added = journal["decisions"][len(previous):]
+    return journal["decisions"][:len(previous)] != previous or len(added) != 1 or any(
+        entry["request_id"] != approval["request_id"] or entry["decision"] != approval["decision"] or
+        entry["request_sha256"] != approval["request_sha256"] for entry in added)
 
 
 def reconcile(run, endpoint):
     state = require_init(run)
+    recover_private = state.get("operations", {}).get(endpoint) is None
     operation = state.get("operations", {}).get(endpoint)
+    if operation is None:
+        operation = owner_pending(run, endpoint=endpoint).get(endpoint)
     require(operation is not None, "%s has no unresolved operation" % endpoint)
-    require(operation.get("endpoint") == endpoint, "operation endpoint differs from its custody slot; retain the hold")
+    owner_folder(run)
+    try:
+        load_operation(operation)
+    except ValueError as exc:
+        refuse(str(exc), operation=operation, process_observation={"state": "UNAVAILABLE", "reason": str(exc)},
+               next_action="inspect status and restore the named custody record before reconciliation; do not replay")
+    require(operation["endpoint"] == endpoint, "operation endpoint differs from its custody slot; retain the hold")
     operation_paths(run, operation)
     binding = Mailbox(run.mailbox_root).current_binding(endpoint)
-    require(all(operation.get(key) == binding.get(key) for key in ("host", "session", "generation")),
+    require(all(operation[key] == binding.get(key) for key in ("host", "session", "generation")),
             "operation binding changed; retain the hold")
-    observation = operation_process_observation(run, operation)
-    require(observation["state"] != "PRESENT", "operation %s is unresolved: its process is still running" % operation["id"])
-    if observation["state"] != "CONFIRMED_ABSENT":
-        refuse("operation %s is unresolved: its process exit cannot be confirmed; retain the hold" % operation["id"],
-               operation=operation, process_observation=observation)
-    stdout = Path(operation["stdout"]).read_bytes()
-    failed = terminal_proof(run, operation, stdout)
-    events = hierarchy_hosts.claude_events(stdout)
-    failed |= any(event.get("type") == "result" and event.get("is_error") is True for event in events)
-    approval = operation.get("approval")
-    if approval:
-        _policy, journal = hierarchy_router.locked_load(hierarchy_lifecycle.Lifecycle(run.lifecycle), 5.0)
-        previous = approval["previous"]
-        added = journal["decisions"][len(previous):]
-        failed |= journal["decisions"][:len(previous)] != previous or len(added) != 1 or any(
-            entry["request_id"] != approval["request_id"] or entry["decision"] != approval["decision"] or
-            entry["request_sha256"] != approval["request_sha256"] for entry in added)
+    # Positive original-instance absence is mandatory even when a perfectly formed seal is present.
+    require_exited(run, operation)
+    pending = operation.get("pid") is None and "pid_start" not in operation
+    effective = original_launch(run, operation)
+    if operation.get("release"):
+        effective = {**effective, "release": operation["release"]}
+    completion_path = owner_folder(run) / ("turn-%s.release.json" % operation["id"])
+    if operation.get("release") or completion_path.exists():
+        proof = owner_read(run, completion_path.name)
+        validate_completion(run, effective, proof)
+        evidence = sealed_transcript_status(effective, proof)
+        failed = proof["failed"] | approval_journal_failed(run, effective)
+        finish_operation(run, effective, b"", proof["native_exit"], pending_pid=pending, outcome=proof["failed"],
+                         recover_private=recover_private)
+        answer = {"endpoint": endpoint, "reconciled": operation["id"],
+                  "outcome": "failed" if failed else "completed", "replayed": False}
+        if evidence != "unchanged":
+            answer["post_seal_evidence"] = evidence
+        return (FAILED if failed else OK), answer
+    operation = effective
+    stdout = native_output(operation)
+    terminal_files = {}
+    failed = terminal_proof(run, operation, stdout, terminal_files)
+    failed |= owner_result_failed(operation["host"], stdout) | approval_journal_failed(run, operation)
     receipt_path = run.evidence / ("turn-%s.accounting.json" % operation["id"])
     receipt = read_json(receipt_path) if receipt_path.exists() else {}
     require(isinstance(receipt, dict) and (receipt.get("exit_code") is None or type(receipt["exit_code"]) is int),
             "operation accounting has an invalid exit code; retain the hold")
     native_exit = receipt.get("exit_code")
+    observed_exit = native_exit_record(run, operation)
+    require(native_exit is None or observed_exit is None or native_exit == observed_exit, "native exit conflicts with accounting; retain the hold")
+    if observed_exit is not None:
+        native_exit = observed_exit
     failed |= native_exit is not None and native_exit != 0
-    # A known native exit (for example 1) is immutable even though reconciliation's public failure exit is 3.
-    native_exit = finish_operation(run, operation, stdout, native_exit)
+    native_exit = finish_operation(run, operation, stdout, native_exit, pending_pid=pending, outcome=failed,
+                                   recover_private=recover_private, terminal_files=terminal_files)
     failed |= native_exit is not None and native_exit != 0
     return (FAILED if failed else OK), {"endpoint": endpoint, "reconciled": operation["id"],
                                        "outcome": "failed" if failed else "completed", "replayed": False}
@@ -2408,12 +3861,8 @@ def approve(run, args):
         return reconcile(run, endpoint)
     require_resolved(run, endpoint)
     timeout = turn_deadline()
-    if binding["host"] == CLAUDE:
-        claude_pin(run)
-        claude_transcript(run, binding["session"])
-        require(tuple(bound["tools"]) == ROOT_TOOLS, "ROOT tools mismatch")
-        claude_connection(run, binding, bound["connection"])
-        require(tuple(adapter_tools(run, bound["connection"])) == ROOT_TOOLS, "ROOT tools mismatch")
+    adapter = OWNER_ADAPTERS[binding["host"]]
+    adapter["root_validate"](run, binding, bound)
     reason = args.reason
     text(reason, "reason", 512)
     require(not set('"\r\n') & set(reason), "the reason may not contain double quotes or line breaks")
@@ -2430,24 +3879,16 @@ def approve(run, args):
         else:
             refuse("request %s is not pending a ROOT decision (journal state: %s)" % (
                 args.id, existing["state"] if existing else "not published"))
-    argv = ["codex"]
-    # ROOT reads and decides only: no shell, as provision gives any reader without reader_shell.
-    for feature in hierarchy_provision.CODEX_DISABLED + hierarchy_provision.CODEX_SHELL:
-        argv += ["--disable", feature]
-    argv += ["exec", "--ignore-user-config", "--sandbox", "read-only", "-c", 'approval_policy="never"',
-             "-c", bound["mcp_config"], "--json", "-C", str(run.project), "resume", bound["session"],
-             (ROOT_PROMPT if not args.deny else ROOT_PROMPT.replace("Call team_pending", "Call team_status"))
-             % (args.id, decision, reason)]
-    prompt = None
-    if binding["host"] == CLAUDE:
-        prompt = argv[-1]
-        argv = hierarchy_provision.claude_argv(["--resume", binding["session"]], bound["connection"], [],
-                                              ["mcp__aegis_decision__" + name for name in ROOT_TOOLS], {}, None)
+    text_prompt = (ROOT_PROMPT if not args.deny else ROOT_PROMPT.replace("Call team_pending", "Call team_status")) % (
+        args.id, decision, reason)
+    argv, prompt = adapter["root_argv"](run, binding, bound, text_prompt)
+    if governed_run(run):
+        validate_model_executable(run, binding["host"], argv, str(run.project))
     proc = model_turn(run, endpoint, binding, argv, str(run.project), prompt, timeout,
                       approval={"request_id": args.id, "decision": decision, "request_sha256": row["request_sha256"],
                                 "previous": before["decisions"]})
     stdout = proc.stdout.decode("utf-8", "replace")
-    items = hierarchy_hosts.claude_turn_items(stdout) if binding["host"] == CLAUDE else agent_items(stdout)
+    items = adapter["items"](stdout)
     messages = [item["text"] for item in items if item["type"] == "agent_message"]
     last = messages[-1] if messages else None
     _policy, journal = hierarchy_router.locked_load(lifecycle, 5.0)
@@ -2457,18 +3898,17 @@ def approve(run, args):
             entry["request_id"] != args.id or entry["decision"] != decision or
             entry["request_sha256"] != row["request_sha256"] for entry in added) or len(added) > 1:
         fail("ROOT recorded unexpected journal decisions; inspect retained journal before continuing",
-             decisions=added, codex_exit=proc.returncode)
+             decisions=added, **{adapter["exit_field"]: proc.returncode})
     recorded = [entry for entry in journal["decisions"] if entry["request_id"] == args.id]
     if not (recorded and recorded[-1]["decision"] == decision and
             recorded[-1]["request_sha256"] == row["request_sha256"]):
         fail("ROOT did not record %s on %s (sha256 %s); its last message: %s" % (decision, args.id,
                                                                                  row["request_sha256"], last),
-             root_last_message=last, codex_exit=proc.returncode,
+             root_last_message=last, **{adapter["exit_field"]: proc.returncode},
              stderr=proc.stderr.decode("utf-8", "replace")[-800:])
-    if binding["host"] == CLAUDE and (proc.returncode != 0 or any(
-            event.get("type") == "result" and event.get("is_error") is True
-            for event in hierarchy_hosts.claude_events(stdout))):
-        fail("Claude ROOT turn failed; journal decisions, transcript and output were retained", claude_exit=proc.returncode)
+    failure = adapter["failure"](proc.returncode, proc.stdout, True)
+    if failure:
+        fail(failure[0], **failure[1])
     return OK, {"request_id": args.id, "decision": decision, "request_sha256": row["request_sha256"],
                 "event_id": row["root_decide"]["event_id_" + decision], "root_last_message": last}
 
@@ -2485,6 +3925,9 @@ def turn(run, args):
         refuse("%s is not bound; start it with up first" % endpoint)
     binding = history[-1]
     planned_binding(run, endpoint, binding["host"])
+    require(isinstance(binding["host"], str) and binding["host"] in OWNER_ADAPTERS and
+            binding["host"] == run.hosts["team"],
+            "owner turn host differs from configured team host; restore the configured host binding")
     if args.reconcile:
         require(args.prompt is None, "--reconcile does not accept a prompt")
         return reconcile(run, endpoint)
@@ -2499,22 +3942,18 @@ def turn(run, args):
     marker = mailbox.wake_marker(endpoint)
     if marker.exists():
         refuse("a wake is running for %s (%s); try again after it ends" % (endpoint, marker))
-    setup = read_json(run.base / "provision.json")
+    setup = governed_runtime(run) if governed_run(run) else read_json(run.base / "provision.json")
     unread = mailbox.delivery(setup["delivery_dir"], endpoint)["endpoints"][endpoint]["unread_count"]
     if unread:
         refuse("%s has %d unread message%s; the loop's wake reads %s, so an owner turn now would race it"
                % (endpoint, unread, "" if unread == 1 else "s", "it" if unread == 1 else "them"))
     profile = read_json(profile_path)
-    require(all(profile[key] == binding[key] for key in ("host", "session", "generation")),
+    require(isinstance(profile, dict) and all(profile.get(key) == binding[key] for key in ("host", "session", "generation")),
             "binding changed before owner turn; the outgoing session was not started")
-    if binding["host"] == CLAUDE:
-        from hierarchy_wake import load_profile
-        profile = load_profile(profile_path, endpoint, binding)
-        claude_pin(run)
-        claude_transcript(run, binding["session"])
-        require(profile.get("mode", "print") == "print" and profile["prompt_via"] == "stdin",
-                "a Claude owner turn requires a print profile")
-        claude_resume_profile(run, binding, profile)
+    adapter = OWNER_ADAPTERS[binding["host"]]
+    profile = adapter["turn_profile"](run, binding, profile_path, profile)
+    if governed_run(run):
+        validate_model_executable(run, binding["host"], profile["argv"], profile["cwd"])
     by_argv = profile["prompt_via"] == "argv"
     argv = profile["argv"] + ([args.prompt] if by_argv else [])
     from hierarchy_mailbox import writer_lock
@@ -2532,15 +3971,17 @@ def turn(run, args):
     proc = model_turn(run, endpoint, binding, argv, profile["cwd"], None if by_argv else args.prompt, timeout, marker,
                       operation_id=identifier, owned_marker=owned_marker)
     log = run.evidence / ("role-turns-%s.jsonl" % quoted)
-    items = hierarchy_hosts.claude_turn_items if binding["host"] == CLAUDE else agent_items
+    items = adapter["items"]
     answer = {"endpoint": endpoint, "exit_code": proc.returncode, "items": items(proc.stdout.decode("utf-8", "replace")),
               "log": str(log)}
+    unknown = sum(event.get("type") == "unknown" for event in owner_events(binding["host"], proc.stdout))
+    if unknown:
+        answer["unknown_events"] = unknown
     if proc.stderr:
         answer["stderr"] = proc.stderr.decode("utf-8", "replace")[-800:]
-    if binding["host"] == CLAUDE and (proc.returncode != 0 or any(
-            event.get("type") == "result" and event.get("is_error") is True
-            for event in hierarchy_hosts.claude_events(proc.stdout))):
-        return FAILED, {**answer, "error": "Claude owner turn failed; transcript and output were retained"}
+    failure = adapter["failure"](proc.returncode, proc.stdout, False)
+    if failure:
+        return FAILED, {**answer, "error": failure[0], **failure[1]}
     return (OK if proc.returncode == 0 else FAILED), answer
 
 
@@ -2558,22 +3999,75 @@ def launcher_roles(run):
     return rows
 
 
+def custody_inspection(run, state):
+    errors = {}
+    pending = owner_pending(run, problems=errors, state=state)
+    slots = (state or {}).get("operations", {})
+    operations = {}
+    if not isinstance(slots, dict):
+        errors["_state"] = {"error": "invalid operations record", "next_action": CUSTODY_RECOVERY}
+        slots = {}
+    if init_complete(state) and (run.isolated_homes or (state or {}).get("host_plan_issued")):
+        try:
+            owner_read(run, "runtime.json")
+        except (ValueError, OSError) as exc:
+            errors["_runtime"] = {"error": str(exc), "next_action": CUSTODY_RECOVERY}
+    for endpoint, raw in slots.items():
+        try:
+            operation = load_operation(raw)
+            require(operation["endpoint"] == endpoint, "invalid operation record")
+            operation_paths(run, operation)
+            operations[endpoint] = operation
+            original_launch(run, operation)
+            exit_path = run.run / ".owner-custody" / ("turn-%s.exit.json" % operation["id"])
+            if exit_path.exists() or exit_path.is_symlink():
+                native_exit_record(run, operation)
+            path = run.run / ".owner-custody" / ("turn-%s.release.json" % operation["id"])
+            if path.exists() or path.is_symlink() or operation.get("release"):
+                load_completion(owner_read(run, path.name))
+        except (ValueError, OSError, Stop) as exc:
+            errors[endpoint] = {"error": str(exc), "next_action": CUSTODY_RECOVERY}
+    for endpoint, intent in pending.items():
+        operations.setdefault(endpoint, intent)
+    environment = run.evidence / "child-environment.json"
+    if environment.exists() or environment.is_symlink():
+        try:
+            environment_record(read_json(environment))
+        except (ValueError, OSError) as exc:
+            errors["_environment"] = {"error": str(exc), "next_action": CUSTODY_RECOVERY, **(exc.problem if isinstance(exc, CustodyProblem) else {})}
+    return operations, errors
+
+
 def status(run, args):
-    state = load_state(run)
+    problems = {}
+    state = getattr(run, "inspected_state", None)
+    if getattr(run, "state_problem", None):
+        problems["_state"] = run.state_problem
     complete = init_complete(state)
+    operations, custody_errors = custody_inspection(run, state)
+    problems.update(custody_errors)
     pid, alive, ours = loop_process(run)
-    running = loop_state(run)[0] if complete else "not_running"
+    def inspect(name, call, default):
+        try:
+            return call()
+        except (Stop, ValueError, OSError, KeyError, TypeError, AttributeError, OverflowError) as exc:
+            problems[name] = {"error": str(exc), "next_action": "restore the named records and inspect status again"}
+            return default
+    running = inspect("_loop", lambda: loop_state(run)[0], "unknown") if complete else "not_running"
     answer = {"schema": STATUS_SCHEMA, "run": str(run.run), "initiative": run.id,
-              "init": {"complete": complete, "next_step": None if complete else next_step(state)},
+              "init": {"complete": complete, "next_step": None if complete else inspect("_init", lambda: next_step(state), None)},
               "root": (state or {}).get("root"),
               "loop": {"state": running, "pid": pid if alive and ours else None, "pid_alive": bool(alive and ours)},
-              "roles": launcher_roles(run) if complete else {}, "team": None, "pending": []}
-    if (state or {}).get("operations"):
-        answer["unresolved_operations"] = state["operations"]
+              "roles": inspect("_roles", lambda: launcher_roles(run), {}) if complete else {}, "team": None, "pending": []}
+    if operations:
+        answer["unresolved_operations"] = operations
     if complete:
         lifecycle = hierarchy_lifecycle.Lifecycle(run.lifecycle)
-        answer["team"] = hierarchy_team_view.status(lifecycle, loop_state=run.loop_state, evidence=run.evidence)
-        answer["pending"] = hierarchy_team_view.pending(lifecycle)["pending"]
+        answer["team"] = inspect("_team", lambda: hierarchy_team_view.status(
+            lifecycle, loop_state=run.loop_state, evidence=run.evidence), None)
+        answer["pending"] = inspect("_pending", lambda: hierarchy_team_view.pending(lifecycle)["pending"], [])
+    if problems:
+        answer["custody_errors"] = problems
     if not args.text:
         return OK, answer
     print(status_text(run, answer), end="")
@@ -2582,6 +4076,8 @@ def status(run, args):
 
 def status_text(run, answer):
     lines = ["team %s at %s" % (run.id, run.run)]
+    for slot, problem in sorted(answer.get("custody_errors", {}).items()):
+        lines.append("custody: %s: %s; %s" % (slot, problem["error"], problem.get("next_action", CUSTODY_RECOVERY)))
     init_state = answer["init"]
     lines.append("init: " + ("complete" if init_state["complete"] else "next step " + str(init_state["next_step"])))
     loop = answer["loop"]
@@ -2653,7 +4149,7 @@ def stop_roles(run):
     for endpoint in names:
         binding = started[endpoint]["binding"]
         # ROOT is the owner's session and the launcher never stops it; a refused ROOT start still leaves a record.
-        if not binding or binding["host"] not in (CODEX, CLAUDE) or endpoint_parts(endpoint)[1] == "root":
+        if not binding or binding["host"] not in OWNER_ADAPTERS or endpoint_parts(endpoint)[1] == "root":
             continue
         code, answer, _ = tool(run, "launcher", "--base", run.base, "stop", "--endpoint", endpoint)
         rows.append({"endpoint": endpoint, "state": answer.get("state"), "pids": answer.get("pids", [])})
@@ -2683,10 +4179,14 @@ def rollout_turns(path):
     mailbox_publish, refused attempts included, so a repeated id is a retry."""
     keys = ("input_tokens", "cached_input_tokens", "output_tokens")
     rows, current, totals, named, session = [], None, dict.fromkeys(keys, 0), None, None
-    with open(path, encoding="utf-8", errors="replace") as stream:
-        for line in stream:
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "rollout must be a regular file")
+        for line in transcript_lines(stream, path, count_limit=OUTPUT_EVENTS):
             try:
-                event = json.loads(line)
+                event = record_json(line.decode("utf-8", "replace"), path.name)
+            except CustodyProblem:
+                raise
             except ValueError:
                 continue
             if not isinstance(event, dict):
@@ -2749,8 +4249,10 @@ def turn_ledger(run, state, sessions):
     total["all_tokens"] = total["input_tokens"] + total["output_tokens"]
     by_command = {}
     if run.commands_log.is_file():
-        for line in run.commands_log.read_text(encoding="utf-8").splitlines():
-            row = json.loads(line)
+        for line in bounded_bytes(run.commands_log, TURN_LOG_BYTES).split(b"\n"):
+            if not line:
+                continue
+            row = record_json(line, run.commands_log.name)
             if row.get("exit") == OK:
                 by_command[row["command"]] = by_command.get(row["command"], 0) + 1
     return {"schema": LEDGER_SCHEMA, "at": timestamp(), "roles": roles, "total": total,
@@ -2864,7 +4366,7 @@ def remove_worktrees(run, state):
             rows.append({"lane": lane.id, "state": "already_removed", "path": str(worktree)})
             continue
         # Only this run's worktree, by path; never prune or repair, which touch every worktree of the clone.
-        removed = git(run.project, "worktree", "remove", str(worktree), ok=True)
+        removed = git(run.project, "worktree", "remove", str(worktree), ok=True, run=run)
         if removed.returncode != 0:
             fail("git worktree remove refused %s: %s; clean it by hand, never with prune or repair"
                  % (worktree, removed.stderr.strip()[-400:]))
@@ -2888,7 +4390,7 @@ def remove_review_copies(run):
 def parsed_sums(run):
     path = run.evidence / "SHA256SUMS"
     found = {}
-    for line in path.read_text(encoding="utf-8").splitlines() if path.is_file() else []:
+    for line in bounded_bytes(path, TURN_LOG_BYTES).decode("utf-8").splitlines() if path.is_file() else []:
         digest, _, name = line.partition("  ")
         found[name] = digest
     return found
@@ -2957,11 +4459,11 @@ def purge_claude(run):
 
 def down(run, args):
     require(args.loop_wait >= 1, "--loop-wait must be at least 1 second")
-    for requested, kind, flag in ((args.purge_codex_home, CODEX, "--purge-codex-home"),
-                                  (args.purge_claude_home, CLAUDE, "--purge-claude-home")):
-        if requested and not run.uses(kind):
-            refuse("%s requires a plan that uses %s" % (flag, kind))
-    if run.uses(CLAUDE) and load_state(run) is not None:
+    for host, adapter in OWNER_ADAPTERS.items():
+        flag = adapter["purge_flag"]
+        if getattr(args, flag) and not run.uses(host):
+            refuse("--%s requires a plan that uses %s" % (flag.replace("_", "-"), host))
+    if run.transactional and load_state(run) is not None:
         with login_lock(run, busy_message="a login is in progress"):
             return down_run(run, args)
     return down_run(run, args)
@@ -2972,12 +4474,16 @@ def down_run(run, args):
     if state is None:
         return OK, {"state": "nothing to take down: init has not run in %s" % run.run}
 
-    if state.get("operations"):
+    pending, problems = custody_inspection(run, state)
+    if problems:
+        fail("owner custody is unavailable; resources retained; inspect status before down",
+             custody_errors=problems, operations=pending, next_action=CUSTODY_RECOVERY)
+    if pending:
         fail("unresolved model operations retain this run's resources; inspect status and reconcile before down",
-             operations=state["operations"])
+             operations=pending)
 
     def persist():
-        if run.uses(CLAUDE):
+        if run.transactional:
             return update_state(run, lambda current: current.update(down=state["down"]))
         save_state(run, state)
         return state
@@ -3012,14 +4518,11 @@ def down_run(run, args):
     if run.evidence.is_dir():
         answer["sha256sums"] = write_sums(run)
     # Validate every requested home before deleting either: one host's refusal must keep both homes intact.
-    if args.purge_codex_home:
-        check_codex_purge(run)
-    if args.purge_claude_home:
-        check_claude_purge(run)
-    if run.uses(CODEX):
-        answer["codex_home"] = purge(run) if args.purge_codex_home else "kept"
-    if run.uses(CLAUDE):
-        answer["claude_home"] = purge_claude(run) if args.purge_claude_home else "kept"
+    for host, adapter in active_adapters(run):
+        if getattr(args, adapter["purge_flag"]):
+            adapter["purge_check"](run)
+    for host, adapter in active_adapters(run):
+        answer[adapter["home_attribute"]] = adapter["purge"](run) if getattr(args, adapter["purge_flag"]) else "kept"
     done["last"] = timestamp()
     state = persist()
     return OK, answer
@@ -3081,14 +4584,22 @@ def main(argv=None):
     record_command = True
     try:
         run = Run(args.config)
-        state = load_state(run)
+        try:
+            state = load_state(run)
+        except (ValueError, OSError) as exc:
+            if args.command != "status":
+                raise
+            state = None
+            run.state_error = str(exc)
+            run.state_problem = {"error": str(exc), **(exc.problem if isinstance(exc, CustodyProblem) else {})}
+        run.inspected_state = state
         if args.command != "status" and state and "custody" in state and state["custody"] != custody(run):
             refuse("run custody changed since init; restore the recorded configuration")
         guard(run, args.command)
         # All direct state writers on an initialized Codex-only run share the stable directory lock. Claude
         # login/up merge through short state transactions instead, keeping browser-login ROOT concurrency.
         serialized = args.command in ("init", "root", "approve", "turn", "down") or (
-            not run.uses(CLAUDE) and args.command == "up")
+            not run.transactional and args.command == "up")
         if serialized and run.run.is_dir():
             busy = {"login": "another login is running for this run", "down": "a login is in progress"}
             with operation_lock(run, busy.get(args.command, "another team command is running for this run")):
@@ -3098,16 +4609,19 @@ def main(argv=None):
     except Stop as stop:
         code, result = stop.code, {"error": str(stop), **stop.detail}
         record_command = stop.record_command
-    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
+    except CustodyProblem as exc:
+        code, result = REFUSED, {"error": str(exc), **exc.detail()}
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError, OverflowError, AttributeError) as exc:
         code, result = REFUSED, {"error": str(exc)}
     except (OSError, subprocess.SubprocessError) as exc:
         code, result = FAILED, {"error": str(exc)}
     if code != REFUSED and record_command and run is not None and args.command != "status" and run.run.is_dir():
         try:
             environment_evidence(run)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, RecursionError, TypeError, AttributeError) as exc:
+            problem = exc.problem if isinstance(exc, CustodyProblem) else {"record": "child-environment.json", "reason": "finalisation", "error": str(exc)}
             code, result = FAILED, {"error": "child environment evidence failed: %s; command effects were retained" % exc,
-                                    "partial_result": result}
+                                    "partial_result": result, "finalisation_error": problem}
         log_command(run, args.command, code)
     if result is not None:
         print(json.dumps(result, sort_keys=True))

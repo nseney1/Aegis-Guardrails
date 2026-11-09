@@ -952,13 +952,14 @@ def test_owner_turn_holds_the_wake_marker_until_its_process_finishes(run, capsys
     marker = run.mailbox().wake_marker(REVIEWER)
     seen = []
     def inspect(argv, *args, **kwargs):
-        if argv[0] == "codex":
+        if Path(argv[0]).name == "codex":
             seen.append(marker.exists())
         return original(argv, *args, **kwargs)
     run.monkeypatch.setattr(subprocess, "Popen", inspect)
     for key, value in run.env().items():
         run.monkeypatch.setenv(key, value)
     code, answer = in_process(run, "turn", REVIEWER, "Check in.", capsys=capsys)
+    assert len(seen) == 1, "owner model process observer did not fire"
     assert code == 0, answer
     assert seen == [True]
     assert not marker.exists()

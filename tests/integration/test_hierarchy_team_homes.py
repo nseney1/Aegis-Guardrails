@@ -853,16 +853,19 @@ def test_round2_a_home_swap_after_codex_login_is_caught_before_evidence_or_claud
     run.team("init")
     cli_environment(run)
     original = subprocess.run
+    invoked = []
 
     def rehome(argv, *args, **kwargs):
         result = original(argv, *args, **kwargs)
-        if list(argv[:2]) == ["codex", "login"]:
+        if os.path.basename(argv[0]) == "codex" and list(argv[1:2]) == ["login"]:
+            invoked.append(argv[0])
             alias.unlink()
             alias.symlink_to(run.home)
         return result
 
     run.monkeypatch.setattr(subprocess, "run", rehome)
     code, answer = in_process(run, "login", capsys=capsys)
+    assert len(invoked) == 1 and os.path.isabs(invoked[0])
     assert code == 2 and "inside ~/%s" % owner.name in answer["error"]
     assert credential.read_bytes() == b"untouched owner credential\n" and not run.claude_calls()
     assert not (run.evidence / "login.json").exists()
@@ -1087,16 +1090,19 @@ def test_round3_a_login_finishing_after_a_completed_down_refuses_and_keeps_teard
     cli_environment(run)
     original = subprocess.run
     after_down = {}
+    invoked = []
 
     def finish_down_after_auth(argv, *args, **kwargs):
         result = original(argv, *args, **kwargs)
-        if list(argv[:3]) == ["claude", "auth", "login"]:
+        if os.path.basename(argv[0]) == "claude" and list(argv[1:3]) == ["auth", "login"]:
+            invoked.append(argv[0])
             state_path.write_bytes(completed)
             after_down.update(files=files(run.run), commands=(run.run / "team-commands.jsonl").read_bytes())
         return result
 
     run.monkeypatch.setattr(subprocess, "run", finish_down_after_auth)
     code, answer = in_process(run, "login", capsys=capsys)
+    assert len(invoked) == 1 and os.path.isabs(invoked[0])
     assert code == 2 and answer == {"error": "teardown has started; a new run needs a new run folder" + CLEANED}
     assert state_path.read_bytes() == completed
     assert not (run.claude_home / ".credentials.json").exists()

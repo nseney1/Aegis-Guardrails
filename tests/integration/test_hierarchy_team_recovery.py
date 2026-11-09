@@ -141,7 +141,7 @@ def test_owner_turn_retains_its_marker_after_a_lost_reply(run, monkeypatch, caps
 
     def lose_reply(argv, *args, **kwargs):
         result = original(argv, *args, **kwargs)
-        if argv[0] == "codex":
+        if Path(argv[0]).name == "codex":
             executed.append(list(argv))
             wait = result.wait
 
@@ -157,6 +157,7 @@ def test_owner_turn_retains_its_marker_after_a_lost_reply(run, monkeypatch, caps
     for key, value in run.env().items():
         monkeypatch.setenv(key, value)
     code, answer = in_process(run, "turn", REVIEWER, "Check in.", capsys=capsys)
+    assert len(executed) == 1, "lost reply process hook did not fire"
     assert code == 3
     operation = answer["operation"]
     assert isinstance(operation["id"], str) and operation["id"]
