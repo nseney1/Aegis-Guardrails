@@ -1123,6 +1123,8 @@ def test_round3_codex_only_login_preserves_the_legacy_lock_file_behaviour(make, 
 # so login's test hook can resume without a sleep or a deadlock while it holds the transaction lock.
 ROOT_TRANSACTION = r'''
 import fcntl, os, runpy, sys
+# Python 3.9's pathlib accessor must capture native os.open, before the hook becomes a bound method.
+from pathlib import Path
 team, config, state, event = sys.argv[1:]
 lock = os.path.join(os.path.dirname(state), ".state.lock")
 state_descriptors = set()
@@ -1170,15 +1172,39 @@ def test_round4_root_competing_after_logins_final_reload_keeps_both_bindings(mak
     original = os.replace
     roots = []
     signals = []
+    child_evidence = run.tmp / "root-child-evidence"
+    child_evidence.mkdir(mode=0o700)
+    (child_evidence / ".keep").touch(mode=0o600)
+    stdout_path, stderr_path = child_evidence / "stdout", child_evidence / "stderr"
+    diagnostic_path = child_evidence / "diagnostics.json"
+    diagnostic_path.touch(mode=0o600)
+    observations = []
+
+    def child_diagnostic(process, phase):
+        detail = {"phase": phase, "pid": process.pid, "exit_status": process.poll(),
+                  "signals": [value.decode("ascii") for value in signals]}
+        for name, path in (("stdout", stdout_path), ("stderr", stderr_path)):
+            # A separate reader leaves the live child's output descriptor offset untouched.
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 4096))
+                detail[name + "_tail"] = stream.read(4096).decode("utf-8", "replace")
+        observations.append(detail)
+        diagnostic_path.write_text(json.dumps(observations, indent=2), encoding="utf-8")
+        return json.dumps(detail, sort_keys=True)
 
     def root_after_reload(source, destination, *args, **kwargs):
         if (Path(destination) == state_path and not roots and
                 CLAUDE in json.loads(Path(source).read_text()).get("logins", {})):
-            process = subprocess.Popen([sys.executable, "-I", "-B", "-c", ROOT_TRANSACTION,
-                                        str(TEAM), str(run.config_path), str(state_path), str(event_path)],
-                                       env=run.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            with os.fdopen(os.open(stdout_path, flags, 0o600), "wb") as stdout, \
+                    os.fdopen(os.open(stderr_path, flags, 0o600), "wb") as stderr:
+                process = subprocess.Popen([sys.executable, "-I", "-B", "-c", ROOT_TRANSACTION,
+                                            str(TEAM), str(run.config_path), str(state_path), str(event_path)],
+                                           env=run.env(), stdout=stdout, stderr=stderr, text=True)
             roots.append(process)
-            assert select.select([event], [], [], 2)[0], "ROOT neither saved nor reached the state lock"
+            assert select.select([event], [], [], 2)[0], (
+                "ROOT neither saved nor reached the state lock; " + child_diagnostic(process, "readiness"))
             signals.append(os.read(event, 1))
             assert signals[-1] in (b"B", b"S")
             if fail_login_save:
@@ -1189,14 +1215,20 @@ def test_round4_root_competing_after_logins_final_reload_keeps_both_bindings(mak
     try:
         code, answer = in_process(run, "login", capsys=capsys)
         assert roots, "login did not reach its final state write"
-        stdout, stderr = roots[0].communicate(timeout=2)
-        assert roots[0].returncode == 0 and stderr == "", stdout + stderr
+        try:
+            roots[0].wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pytest.fail("ROOT did not finish within two seconds; " + child_diagnostic(roots[0], "completion-timeout"))
+        detail = child_diagnostic(roots[0], "completed")
+        stdout, stderr = stdout_path.read_text(encoding="utf-8"), stderr_path.read_text(encoding="utf-8")
+        assert roots[0].returncode == 0 and stderr == "", detail
         assert json.loads(stdout.splitlines()[-1])["session"] == "root-after-login-read"
     finally:
         for process in roots:
             if process.poll() is None:
                 process.kill()
-                process.communicate(timeout=2)
+                process.wait(timeout=2)
+            child_diagnostic(process, "cleanup")
         os.close(event)
     current = state(run)
     assert current["root"] is not None, "login overwrote the ROOT binding saved after its final state reload"
