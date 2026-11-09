@@ -22,6 +22,7 @@ NON_AEGIS_WRITERS = {
     ("aegis_cli/hooks/commitmsg.py", "install"): "the git prepare-commit-msg hook (.git/hooks)",
     ("aegis_core/baseline.py", "Sources._ast"): "a staged non-Python blob copied into a temporary directory for the AST driver",
     ("aegis_core/ast/gobuild.py", "_build"): "the compiled executable in a confined private user-cache build directory; writable handle only for fsync before atomic publication",
+    ("aegis_core/message_codec.py", "Store.write"): "content-addressed message records in a caller-bound directory; stdlib-only MC-1 leaf",
     ("aegis_core/verification/runner.py", "snapshot_index"): "staged blobs in a temporary directory (aegis check --hook)",
     ("aegis_core/testexec.py", "run_tests"): "the test run's output in a temporary directory (aegis check --record)",
     ("aegis_core/unittest_runner.py", "_JUnitRunner.run"): "a unittest JUnit report in the caller's temporary directory",
