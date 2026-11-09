@@ -83,8 +83,8 @@ from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, SHA256, SLUG,
                                publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                status_entries, writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
-from hierarchy_workspace import (MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view, check_paths, grant_next, initiative_view,  # noqa: E402
-                                 verify_evidence)
+from hierarchy_workspace import (KINDS as LEDGER_KINDS, MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view,  # noqa: E402
+                                 check_paths, grant_next, initiative_view, verify_evidence)
 
 
 RECIPES_SCHEMA = "aegis.hierarchy-job-recipes/v1"
@@ -405,6 +405,76 @@ def is_heavy(recipe):
 def job_kind(recipe):
     """The ledger kind a heavy job waits for. Cargo has the single Heavy-Tests slot; other test jobs share heavy."""
     return "heavy-tests" if recipe.get("heavy_tests", False) else "heavy"
+
+
+# The explicit opt-outs of holder_requests. No ledger row can carry one of these objects as a value.
+ANY_KIND = object()
+ANY_HOLDER = object()
+ANY_INITIATIVE = object()
+OPEN_STATES = ("queued", "granted")
+REQUEST_STATES = ("queued", "granted", "released", "withdrawn")
+REQUEST_FIELDS = ("request_id", "initiative", "kind", "holder", "state")
+
+
+def holder_requests(requests, holder, *, kind, initiative, states):
+    """The ledger rows of `holder`, `kind` and `initiative` in one of `states`. Every caller names all three.
+
+    A row is this job's only when it matches every named value exactly. The workspace accepts any holder string from
+    any initiative, so a row that carries the job's holder for another initiative, another kind, an unknown kind or a
+    malformed row never matches a named kind: it can neither stand in for a grant nor suppress a request. Exact
+    lookups skip malformed rows because they match nothing. ANY_KIND and ANY_HOLDER are for deliberately wide safety,
+    settlement and reporting scans; there a malformed row raises ValueError instead, because a scan that cannot read a
+    row cannot prove the row is not open. ANY_INITIATIVE is only for naming another initiative's conflicting row,
+    detecting an ambiguous audit and mirroring grant_next's queue; a permission or audit decision still requires the
+    job's own initiative.
+    """
+    require(kind is ANY_KIND or (isinstance(kind, str) and kind in LEDGER_KINDS),
+            "invalid ledger kind filter: use one of %s, or ANY_KIND for a deliberately kind-independent check"
+            % ", ".join(LEDGER_KINDS))
+    require(holder is ANY_HOLDER or (isinstance(holder, str) and holder),
+            "invalid holder filter: pass a holder string, or ANY_HOLDER for a deliberately holder-independent scan")
+    require(initiative is ANY_INITIATIVE or (isinstance(initiative, str) and initiative),
+            "invalid initiative filter: pass the job's initiative id, or ANY_INITIATIVE to name another "
+            "initiative's conflicting row")
+    require(isinstance(states, tuple) and states and all(isinstance(state, str) and state in REQUEST_STATES
+                                                         for state in states),
+            "invalid states filter: pass a non-empty tuple of " + ", ".join(REQUEST_STATES))
+    wide = kind is ANY_KIND or holder is ANY_HOLDER
+    # A wide scan needs every field readable. An exact lookup needs the fields it compares; any other gap matches nothing.
+    needed = REQUEST_FIELDS if wide else ("holder", "kind", "state") + (() if initiative is ANY_INITIATIVE else ("initiative",))
+    found = []
+    for request in requests:
+        if not (isinstance(request, dict) and all(isinstance(request.get(key), str) for key in needed)):
+            # Never echo the row: its values may be attacker-written.
+            require(not wide, "malformed ledger request row: stop and inspect the workspace store's event log; "
+                              "no reservation is released, granted or reported from an unreadable ledger")
+            continue
+        if ((holder is ANY_HOLDER or request["holder"] == holder) and (kind is ANY_KIND or request["kind"] == kind)
+                and (initiative is ANY_INITIATIVE or request["initiative"] == initiative)
+                and request["state"] in states):
+            found.append(request)
+    return found
+
+
+def request_summary(request):
+    """A bounded, validated name for a ledger row in a refusal, a waiting row or recovery output."""
+    initiative = request.get("initiative")
+    return {"request_id": census_request_id(request.get("request_id")),
+            "initiative": initiative if isinstance(initiative, str) and SLUG.fullmatch(initiative) else "invalid_initiative",
+            "kind": request["kind"] if request.get("kind") in LEDGER_KINDS else "invalid_kind",
+            "state": request["state"] if request.get("state") in REQUEST_STATES else "invalid_state"}
+
+
+def foreign_rows(requests, job, *, kind, states=OPEN_STATES):
+    """Rows that carry this job's holder but were filed by another initiative. They are never this job's."""
+    return [request for request in holder_requests(requests, job.holder, kind=kind, initiative=ANY_INITIATIVE,
+                                                   states=states) if request.get("initiative") != job.initiative["id"]]
+
+
+def foreign_reason(request):
+    summary = request_summary(request)
+    return ("request %s of initiative %s holds this job's holder for %s; root must check who filed it, then "
+            "withdraw or release it" % (summary["request_id"], summary["initiative"], summary["kind"]))
 
 
 def packet_text(raw):
@@ -888,12 +958,13 @@ def derivation_provenance(job):
 class DependencyPending(ValueError):
     """No dependent effect was admitted; keep the original request available for reconciliation."""
 
-    def __init__(self, detail, reason="dependency_pending"):
+    def __init__(self, detail, reason="dependency_pending", fields=None):
         super().__init__(detail)
         self.reason = reason
+        self.fields = dict(fields or {})
 
     def row(self, job):
-        return {"job": job.id, "state": "waiting", "reason": self.reason, "detail": str(self)[:2048]}
+        return {"job": job.id, "state": "waiting", "reason": self.reason, "detail": str(self)[:2048], **self.fields}
 
 
 def check_dependency(store, initiative, message, packet, recipes):
@@ -941,8 +1012,18 @@ def check_dependency(store, initiative, message, packet, recipes):
                     "predecessor source witness mismatch")
         check_settlement_processes(job, result)
         require(job.runner_alive() is False, "predecessor runner is still live or unknown")
-        require(not any(r["holder"] == job.holder and r["state"] in ("queued", "granted")
-                        for r in store.load().requests.values()), "predecessor reservation is not settled")
+        # Deliberately kind-independent: any open reservation under the predecessor's one-use holder means its
+        # settlement is unfinished, whichever kind it is. Fail closed on another initiative's row under that holder
+        # too, but name it: the predecessor's settlement can never free it, so only root can.
+        requests = list(store.load().requests.values())
+        require(not holder_requests(requests, job.holder, kind=ANY_KIND, initiative=job.initiative["id"],
+                                    states=OPEN_STATES), "predecessor reservation is not settled")
+        foreign = foreign_rows(requests, job, kind=ANY_KIND)
+        if foreign:
+            # Held, never refused: another initiative must not be able to end the dependent by filing this row.
+            summary = request_summary(foreign[0])
+            raise DependencyPending("predecessor " + foreign_reason(foreign[0]), "foreign_reservation",
+                                    {"request_id": summary["request_id"], "initiative": summary["initiative"]})
         receipt = {"state": "completed", "exit_code": 0, "evidence": job.evidence()}
         if result.get("reason") is not None:
             receipt["reason"] = result["reason"][:4096]
@@ -960,8 +1041,16 @@ def check_dependency(store, initiative, message, packet, recipes):
 def pending_dependency(store, job, exc, wait, recipes_sha256, *, outside_policy=None):
     """A reserved job needs a durable no-effect refusal, not an orphaned slot or release from absence."""
     try:
-        if any(r["holder"] == job.holder and r["state"] in ("queued", "granted")
-               for r in store.load().requests.values()):
+        if exc.reason == "foreign_reservation":
+            # Not a change in this job's dependency evidence, only another initiative's row that root must clear:
+            # wait with no effect and keep the job's own reservations, whether at admission or the pre-claim re-check.
+            return exc.row(job)
+        # Deliberately kind-independent: a reservation of any kind this job's initiative holds for it is retained,
+        # and only the terminal no-effect refusal lets settlement free it; a pending row would strand it. Bound to
+        # the initiative: another initiative's row under this holder is not this job's, settlement would not free
+        # it, and it must not let that initiative end this job (recovery-status names it).
+        if holder_requests(store.load().requests.values(), job.holder, kind=ANY_KIND, initiative=job.initiative["id"],
+                           states=OPEN_STATES):
             # refuse takes the exclusive claim first. A competing runner keeps its claim and capacity.
             return refuse(store, job, "dependency changed after capacity admission: " + str(exc), wait, recipes_sha256,
                           outside_policy=outside_policy)
@@ -1489,17 +1578,20 @@ def settle(store, job, wait):
     def release():
         with store.lock():
             ledger = store.load()
-            for request in ledger.requests.values():
-                if request["holder"] != job.holder:
-                    continue
+            # Deliberately kind-independent, bound to the initiative: the job's terminal result is the correlated
+            # evidence for every row its own initiative holds under its one-use holder (a retained kind would be
+            # stranded for good), and is no evidence at all about another initiative's row (recovery-status names it).
+            for request in holder_requests(list(ledger.requests.values()), job.holder, kind=ANY_KIND,
+                                           initiative=job.initiative["id"], states=OPEN_STATES):
                 if request["state"] == "granted":
                     verify_evidence(reference)
                     store.append(ledger, "release", {"request_id": request["request_id"], "evidence": reference})
                 elif request["state"] == "queued":
                     store.append(ledger, "withdraw", {"request_id": request["request_id"], "source": "job runner"})
 
-    # Most jobs hold no slot, and a job that holds nothing should not wait on the store's lock.
-    if any(r["holder"] == job.holder and r["state"] in ("queued", "granted") for r in store.load().requests.values()):
+    # Most jobs hold no slot, and a job that holds nothing should not wait on the store's lock. Same scope as release.
+    if holder_requests(store.load().requests.values(), job.holder, kind=ANY_KIND, initiative=job.initiative["id"],
+                       states=OPEN_STATES):
         patient(release, wait)
     row = {"job": job.id, "state": state, "exit_code": result["exit_code"], "result": str(job.result_path)}
     if result.get("reason"):
@@ -2210,9 +2302,16 @@ def visit_existing(store, job, wait):
 def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows):
     """A receipt can go out before a busy store lets the slot go. The request is closed by then, so the ledger is the record."""
     prefix = "job:" + initiative["id"] + "/"
-    for request in ledger.requests.values():
+    # Deliberately kind-independent, bound to the initiative: an open row of any kind that this initiative holds
+    # under a closed job's holder is settled. Another initiative's row under that holder is not, or it would make
+    # the finished job settle again on every pass; recovery-status names it as that initiative's retained reservation.
+    # One settlement per job and pass: settle covers all of the job's own rows, however many there are.
+    settled = set()
+    for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=ANY_KIND, initiative=initiative["id"],
+                                   states=OPEN_STATES):
         identifier = request["holder"][len(prefix):] if request["holder"].startswith(prefix) else None
-        if identifier and identifier not in open_ids and request["state"] in ("queued", "granted") and identifier in records:
+        if identifier and identifier not in open_ids and identifier in records and identifier not in settled:
+            settled.add(identifier)
             job = Job(store.path, initiative, records[identifier]["message"])
             if job.result_path.exists():
                 try:
@@ -2264,14 +2363,65 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
 
 
 def enqueue(store, job, kind, wait):
+    """Leave the job with exactly one open heavy request, for the `kind` its recipe needs now. Returns None, or why not:
+
+    ("stale_grant", row): the job's own initiative holds a granted row of another heavy kind (its recipe changed after
+    the grant). Nothing is filed; the caller waits for root to reconcile and settle the stale slot with evidence.
+    ("holder_conflict", row): another initiative has an open `kind` row carrying this job's holder. The ledger
+    de-duplicates on (kind, holder) across initiatives, so that row blocks the job's own request and is never its."""
+    outcome = []
+
     def attempt():
+        outcome.clear()
         with store.lock():
             ledger = store.load()
-            if not any(r["holder"] == job.holder and r["state"] in ("queued", "granted") for r in ledger.requests.values()):
-                store.append(ledger, "request", {"request_id": "req-%08d" % (ledger.seq + 1), "initiative": job.initiative["id"],
-                                                 "kind": kind, "holder": job.holder, "reference": job.id})
+            own = job.initiative["id"]
+            stale = [request for other in HEAVY_KINDS if other != kind for request in
+                     holder_requests(ledger.requests.values(), job.holder, kind=other, initiative=own, states=OPEN_STATES)]
+            granted = [request for request in stale if request["state"] == "granted"]
+            if granted:
+                outcome.append(("stale_grant", granted[0]))
+                return
+            # A queued row of a kind the job no longer needs would otherwise be granted a slot it never uses.
+            for request in stale:
+                store.append(ledger, "withdraw", {"request_id": request["request_id"], "source": "job runner"})
+            # Kind- and initiative-aware: only an open request of this kind filed by the job's own initiative is the
+            # job's place in this kind's queue. Another kind's reservation must not suppress it.
+            if holder_requests(ledger.requests.values(), job.holder, kind=kind, initiative=own, states=OPEN_STATES):
+                return
+            conflict = foreign_rows(ledger.requests.values(), job, kind=kind)
+            if conflict:
+                outcome.append(("holder_conflict", conflict[0]))
+                return
+            store.append(ledger, "request", {"request_id": "req-%08d" % (ledger.seq + 1), "initiative": own,
+                                             "kind": kind, "holder": job.holder, "reference": job.id})
 
     patient(attempt, wait)
+    return outcome[0] if outcome else None
+
+
+def stale_heavy_grant(ledger, job, kind):
+    return next((request for request in holder_requests(
+        ledger.requests.values(), job.holder, kind=ANY_KIND, initiative=job.initiative["id"], states=("granted",))
+        if request["kind"] in HEAVY_KINDS and request["kind"] != kind), None)
+
+
+def stale_grant_row(job, request, kind):
+    summary = request_summary(request)
+    return {"job": job.id, "state": "waiting", "kind": kind, "reason": "stale_grant",
+            "request_id": summary["request_id"], "initiative": summary["initiative"],
+            "next_action": ("Job %s now needs %s but holds granted request %s for %s. Root must reconcile and settle "
+                            "that reservation with evidence before this job can request or run its current kind."
+                            % (job.id, kind, summary["request_id"], summary["kind"]))}
+
+
+def holder_conflict_row(job, kind, request):
+    """Waiting, not refused: another initiative must not be able to end this job by filing a row under its holder."""
+    summary = request_summary(request)
+    return {"job": job.id, "state": "waiting", "kind": kind, "reason": "holder_conflict",
+            "request_id": summary["request_id"], "initiative": summary["initiative"],
+            "next_action": "The job has not started: " + foreign_reason(request)
+            + ". The next run-open then files this job's own request."}
 
 
 def fixture_roots(fixture, kind):
@@ -2291,6 +2441,32 @@ def fixture_roots(fixture, kind):
     unknown = sorted(set(roots) - set(HEAVY_KINDS))
     require(not unknown, "unknown census fixture kind: " + ", ".join(unknown)[:256])
     return sorted(roots.get(kind, []))
+
+
+def census_owner(store_path, request):
+    """The live runner PID a granted row exempts from the outside census, or None: its processes then count as outside.
+
+    A held slot is held whoever filed it, but an exemption names whose live processes are ledger work, so it needs
+    more: a canonical job:<initiative>/<id> holder filed by that same initiative, and that job's own claim from this
+    process scope, still naming the same process. Another initiative's row and a holder that is not canonical exempt
+    nothing and never read a claim. For a canonical own-initiative row, a claim in the job's folder that is malformed or
+    names another job still refuses the census, as before."""
+    holder = request["holder"]
+    identifier = holder[len("job:"):] if holder.startswith("job:") else None
+    if identifier is None or JOB_ID.fullmatch(identifier) is None or identifier.split("/")[0] != request["initiative"]:
+        return None
+    claim = safe_path(Path(store_path) / "jobs" / identifier / "claim.json")
+    if not claim.exists():
+        return None
+    record = read_json(claim)
+    # Only a canonical own-initiative row reaches its job's folder, so a claim there that names another job, or is
+    # malformed, is corruption: refuse the census, as before, rather than count or exempt.
+    require(isinstance(record, dict) and record.get("job") == identifier
+            and type(record.get("pid")) is int and record["pid"] > 0
+            and isinstance(record.get("start"), str) and record["start"].isdigit(), "invalid runner claim: " + identifier)
+    if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
+        return record["pid"]
+    return None
 
 
 def census(store_path, ledger, fixture, kind, outside_policy=None):
@@ -2315,18 +2491,14 @@ def census(store_path, ledger, fixture, kind, outside_policy=None):
         roots = fixture_roots(fixture, kind)
     else:
         owners = set()
-        # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
-        for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
-            if request["holder"].startswith("job:"):
-                claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
-                if claim.exists():
-                    record = read_json(claim)
-                    require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
-                            and type(record.get("pid")) is int and record["pid"] > 0
-                            and isinstance(record.get("start"), str) and record["start"].isdigit(),
-                            "invalid runner claim: " + request["holder"][4:])
-                    if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
-                        owners.add(record["pid"])
+        # Whatever any running job of this ledger started is its own work, not outside work, whichever heavy kind it
+        # holds. Every initiative's grants are read, but census_owner exempts only a job its own initiative granted.
+        for name in HEAVY_KINDS:
+            for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=name, initiative=ANY_INITIATIVE,
+                                           states=("granted",)):
+                owner = census_owner(store_path, request)
+                if owner is not None:
+                    owners.add(owner)
         roots = outside_roots(owners, kind)
     view["external_roots"] = [] if outside_policy == "report" else roots
     if outside_policy is not None:
@@ -2344,7 +2516,7 @@ def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=Fal
     for kind in HEAVY_KINDS:
         waiting = {holder: entry for holder, entry in heavy.items()
                    if job_kind(recipes["recipes"][entry[1]["recipe"]]) == kind}
-        budget = run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy)
+        budget = run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy, everyone=heavy)
     return budget
 
 
@@ -2483,7 +2655,9 @@ def job_grant_census(store, job, kind=None, policy=None):
         requests = job.census_requests
         if requests is None:
             requests = store.load().requests.values()
-        grants = [r for r in requests if r["holder"] == job.holder and r["state"] == "granted" and r["kind"] == kind]
+        # Every granted row of this kind under the holder, whoever filed it, so a partial match makes the audit
+        # ambiguous instead of silently choosing; only a lone row of the job's own initiative is its grant (below).
+        grants = holder_requests(requests, job.holder, kind=kind, initiative=ANY_INITIATIVE, states=("granted",))
         if not grants:
             return None
         if policy is None:
@@ -2495,6 +2669,9 @@ def job_grant_census(store, job, kind=None, policy=None):
         if len(grants) > 1:
             return census_marker({}, policy, "invalid_record", "ambiguous_grant")
         request = grants[0]
+        if request.get("initiative") != job.initiative["id"]:
+            # Another initiative's grant under this holder, and its census record, are never this job's audit.
+            return None
         job.census_request_id = census_request_id(request["request_id"])
         if job.census_request_id == "invalid_request_id":
             return census_marker(request, policy, "invalid_record", "invalid_request_id")
@@ -2534,15 +2711,23 @@ def census_result_row(row, job):
     return row
 
 
+def waiting_owner(waiting, request):
+    """The waiting job a ledger row is for: its holder and filed by that job's own initiative. Otherwise None."""
+    entry = waiting.get(request.get("holder")) if isinstance(request.get("holder"), str) else None
+    if entry is None or request.get("initiative") != entry[0].initiative["id"]:
+        return None
+    return entry[0]
+
+
 def admission_outside_policy(ledger, kind, waiting, policy):
     if policy not in ("report", "ignore"):
         return policy
     # Match hierarchy_workspace.grant_next's eligibility and (priority, seq) ordering exactly, on its locked
     # snapshot. No public selection helper exists. Tied keys are ambiguous even if min() would pick one.
     eligible = []
-    for request in ledger.requests.values():
-        if request["kind"] != kind or request["state"] != "queued":
-            continue
+    # Every holder and initiative: grant_next's own queue for this kind.
+    for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=kind, initiative=ANY_INITIATIVE,
+                                   states=("queued",)):
         initiative = ledger.initiatives[request["initiative"]]
         blockers = ledger.unresolved(initiative)
         if initiative["state"] == "active" and not blockers:
@@ -2555,12 +2740,13 @@ def admission_outside_policy(ledger, kind, waiting, policy):
 
     chosen = min(eligible, key=order)
     chosen_key = order(chosen)
-    if sum(order(request) == chosen_key for request in eligible) != 1 or chosen["holder"] not in waiting:
+    # Relax only for a row this pass's own job filed; another initiative's row under its holder counts.
+    if sum(order(request) == chosen_key for request in eligible) != 1 or waiting_owner(waiting, chosen) is None:
         return "count"
     return policy
 
 
-def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy):
+def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_busy, everyone=None):
     """Grant in the ledger's own order, which applies the owner's priorities, until nothing more can start."""
     held_reason = "store_busy" if store_busy else None
     capacity = None
@@ -2570,10 +2756,22 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             held_reason = "low_disk"
             break
         ledger = store.load()
+        # A stale grant may have appeared since enqueue (including during the other kind's pass). Never grant a
+        # second kind or start this job while that reservation still needs settlement.
+        for holder, (job, _, _) in list(waiting.items()):
+            stale = stale_heavy_grant(ledger, job, kind)
+            if stale is not None:
+                del waiting[holder]
+                rows.append(stale_grant_row(job, stale, kind))
+        if not waiting:
+            break
         census_requests = ledger.requests.values()
         publication = None
-        granted = next((holder for holder in waiting
-                        if any(r["holder"] == holder and r["state"] == "granted" for r in ledger.requests.values())), None)
+        # Kind- and initiative-aware: only a grant of this kind filed by the job's own initiative lets a job skip
+        # this kind's census, grant_next and limit.
+        granted = next((holder for holder, entry in waiting.items()
+                        if holder_requests(ledger.requests.values(), holder, kind=kind,
+                                           initiative=entry[0].initiative["id"], states=("granted",))), None)
         if granted is None:
             seen = {}
 
@@ -2604,13 +2802,27 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             request_id = census_request_id(answer["granted"]["request_id"])
             if "census_outside_policy" in recipes:
                 publication = publish_grant_census(store, answer["granted"], seen)
-            if granted not in waiting:
+            # A grant to another initiative's row is never this pass's job's, even under the same holder.
+            if waiting_owner(waiting, answer["granted"]) is None:
                 row = {"state": "granted_elsewhere", "holder": granted, "request_id": request_id}
+                stale = waiting_owner(everyone or {}, answer["granted"])
+                if stale is not None:
+                    # This pass's own job, whose recipe now needs another kind (e.g. a runner on older recipes filed it).
+                    row.update(stale_job=stale.id, reason="stale_kind", next_action=(
+                        "Job %s now needs %s; this %s grant is stale. The job waits for root to reconcile and settle "
+                        "this reservation with evidence before it can request or run its current kind."
+                        % (stale.id, job_kind(recipes["recipes"][everyone[granted][1]["recipe"]]), kind)))
                 if "census_outside_policy" in recipes:
                     row["z_census"] = census_summary(publication or seen, request_id)
                 rows.append(row)
                 continue
         job, packet, raw = waiting.pop(granted)
+        # A competing runner can grant the old kind between our observation and grant_next. Keep both reservations
+        # visible for reconciliation rather than run on them or manufacture settlement evidence.
+        stale = stale_heavy_grant(store.load(), job, kind)
+        if stale is not None:
+            rows.append(stale_grant_row(job, stale, kind))
+            continue
         job.census_publication = publication
         job.census_requests = census_requests
         budget -= 1
@@ -2657,12 +2869,22 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait, expect_r
         if is_heavy(recipe):
             heavy[job.holder] = (job, packet, raw)
             try:
-                enqueue(store, job, job_kind(recipe), wait)
+                outcome = enqueue(store, job, job_kind(recipe), wait)
             except ValueError as exc:
                 # Nothing has started, so this job just waits. Other work still gets done and reported.
                 if "busy" not in str(exc):
                     raise
                 store_busy = True
+                continue
+            if outcome is None:
+                continue
+            # Out of this kind's grant pass entirely: another initiative's row, or a stale kind, is never run on.
+            del heavy[job.holder]
+            reason, request = outcome
+            if reason == "holder_conflict":
+                rows.append(holder_conflict_row(job, job_kind(recipe), request))
+                continue
+            rows.append(stale_grant_row(job, request, job_kind(recipe)))
         elif budget > 0:
             budget -= 1
             try:
@@ -2788,11 +3010,20 @@ def recovery_source(job, mailbox, result):
 
 def recovery_job(store, ledger, initiative, message, records, mailbox):
     job = Job(store.path, initiative, message)
-    reservations = [dict(r) for r in ledger.requests.values() if r["holder"] == job.holder]
-    held = any(r["state"] in ("queued", "granted") for r in reservations)
+    # Deliberately kind-independent and every state, bound to the initiative: recovery reports every row this job's
+    # initiative filed under its holder, and any open one keeps it settle_pending/reserved_not_started. Another
+    # initiative's open rows under the holder never hold or settle this job; they are named separately.
+    requests = list(ledger.requests.values())
+    reservations = [dict(r) for r in holder_requests(requests, job.holder, kind=ANY_KIND, initiative=initiative["id"],
+                                                     states=REQUEST_STATES)]
+    held = any(r["state"] in OPEN_STATES for r in reservations)
     row = {"job": job.id, "owner": initiative["id"] + "/orchestrator", "reservations": reservations,
            "claim": None, "runner_alive": None, "process_alive": None, "receipt": "not_published",
            "source": {"state": "unavailable"}, "next_action": "Revalidate the original source and admission before run-open."}
+    foreign = foreign_rows(requests, job, kind=ANY_KIND)
+    if foreign:
+        # Also a retained_reservation blocker of the initiative that filed it.
+        row["foreign_reservations"] = [request_summary(request) for request in foreign]
     result = None
     try:
         if job.folder.exists():
@@ -2841,7 +3072,22 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
     except ERRORS as exc:
         row.update(state="evidence_error", error=str(exc)[:2048],
                    next_action="Preserve all evidence and capacity; reconcile the unavailable or inconsistent record.")
+    if foreign and row["state"] == "finished" and row["source"]["state"] != "changed":
+        # Settled for its own initiative, but not clean while another initiative's row holds its dependents.
+        row["next_action"] = "Retain evidence for independent acceptance; first " + foreign_reason(foreign[0]) + "."
     return row
+
+
+def foreign_reservation_blocker(initiative_id, request):
+    """A recovery blocker in the affected initiative's own report; the filing one reports retained_reservation."""
+    summary = request_summary(request)
+    identifier = request["holder"][len("job:"):] if request["holder"].startswith("job:") else ""
+    canonical = JOB_ID.fullmatch(identifier) is not None
+    return {"initiative": initiative_id, "job": identifier if canonical else "invalid_job",
+            "holder": request["holder"] if canonical else "invalid_holder", "request_id": summary["request_id"],
+            "filing_initiative": summary["initiative"], "kind": summary["kind"], "state": summary["state"],
+            "owner": "root", "reason": "foreign_reservation",
+            "next_action": "Root: " + foreign_reason(request) + ". Until then this job's dependents are held."}
 
 
 def recovery_status(store_path, chosen=()):
@@ -2881,9 +3127,9 @@ def recovery_status(store_path, chosen=()):
         messages = {identifier: record["message"] for identifier, record in records.items()
                     if record["message"]["type"] == "job_request"}
         prefix = "job:" + initiative["id"] + "/"
-        for request in ledger.requests.values():
-            if request["initiative"] != initiative["id"]:
-                continue
+        # Every holder, kind and state this initiative filed: its jobs' rows, and anything else it retains.
+        for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=ANY_KIND, initiative=initiative["id"],
+                                       states=REQUEST_STATES):
             if request["holder"].startswith(prefix):
                 identifier = request["holder"][len(prefix):]
                 matching(identifier, SLUG, "job message id")
@@ -2892,6 +3138,12 @@ def recovery_status(store_path, chosen=()):
                 blockers.append({"initiative": initiative["id"], "request_id": request["request_id"],
                                  "holder": request["holder"], "owner": owner, "reason": "retained_reservation",
                                  "next_action": "Correlate original actor/source and terminal evidence; TTL is not release evidence."})
+        # Open rows another initiative filed under this initiative's job holders. They are never this initiative's to
+        # settle, yet they hold its dependents (check_dependency), so a report scoped to it must not read as clean.
+        for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=ANY_KIND, initiative=ANY_INITIATIVE,
+                                       states=OPEN_STATES):
+            if request["initiative"] != initiative["id"] and request["holder"].startswith(prefix):
+                blockers.append(foreign_reservation_blocker(initiative["id"], request))
         base = safe_path(store.path / "jobs" / initiative["id"])
         for folder in sorted(base.iterdir()) if base.is_dir() else []:
             safe_path(folder)
