@@ -316,8 +316,9 @@ def test_missing_secrets_are_not_created_or_enumerated(adapter, layout, monkeypa
     def no_enumeration(*args, **kwargs):
         raise AssertionError("mount planning must not enumerate directories")
 
-    monkeypatch.setattr(os, "scandir", no_enumeration)
-    mounts(adapter, layout)
+    with monkeypatch.context() as m:
+        m.setattr(os, "scandir", no_enumeration)
+        mounts(adapter, layout)
     assert not missing.exists()
 
 
@@ -2743,12 +2744,13 @@ def test_expected_record_keeps_missing_non_secret_home_path(adapter, layout, mon
     def no_enumeration(*args, **kwargs):
         raise AssertionError("expected-record validation must not enumerate directories")
 
-    monkeypatch.setattr(os, "scandir", no_enumeration)
-    monkeypatch.setattr(os, "listdir", no_enumeration)
-    rows = [{"source": path, "destination": path, "rw": True}] + mounts(adapter, layout)
-    assert "type=bind,src=" + path + ",dst=" + path in adapter.create_argv(ISOLATION, run=layout.run, mounts=rows)
-    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
-    assert adapter.verify(inspect_for(expected), expected) == []
+    with monkeypatch.context() as m:
+        m.setattr(os, "scandir", no_enumeration)
+        m.setattr(os, "listdir", no_enumeration)
+        rows = [{"source": path, "destination": path, "rw": True}] + mounts(adapter, layout)
+        assert "type=bind,src=" + path + ",dst=" + path in adapter.create_argv(ISOLATION, run=layout.run, mounts=rows)
+        expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=rows)
+        assert adapter.verify(inspect_for(expected), expected) == []
     assert not Path(path).exists()
 
 
