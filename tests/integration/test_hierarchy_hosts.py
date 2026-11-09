@@ -893,3 +893,10 @@ def test_r2_all_claude_builder_optional_combinations_preserve_opaque_atoms():
 ])
 def test_r2_unknown_host_or_node_options_cannot_establish_ownership(kind, argv):
     assert not hierarchy_hosts.matches_session(kind, argv, SESSION)
+
+
+@pytest.mark.parametrize("family", [None, "", "unknown", "codex-with-empty-options"])
+def test_r13_unknown_grammar_family_refuses(monkeypatch, family):
+    grammar = hierarchy_hosts._HOSTS["claude-code"]["session_selectors"]["grammar"]
+    monkeypatch.setitem(grammar, "family", family)
+    assert hierarchy_hosts.session_verdict("claude-code", ["claude", "--resume", SESSION], SESSION) == "HOLD"

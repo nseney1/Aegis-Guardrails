@@ -1,4 +1,5 @@
 """Provisioned entry points check their pinned checkout before executing peer source."""
+import ast
 import importlib.util
 import json
 import os
@@ -10,11 +11,118 @@ import sys
 
 import pytest
 
-from tests.integration.test_hierarchy_mailbox import git, invoke
+from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration.test_hierarchy_provision import Setup, provision, start_connection
 from tests.integration.test_hierarchy_launcher import Launch, REVIEW, LINUX_HOST_PROGRAMS, owned_pids, wait_until
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="provisioned runtime profiles are POSIX only")
+
+
+def py39_api_violations(source):
+    """Finite stdlib API guard, not a replacement for running the real Python 3.9 gate."""
+    try:
+        tree = ast.parse(source, feature_version=(3, 9))
+    except SyntaxError as exc:
+        return ["Python 3.9 grammar: " + str(exc)]
+    # Version references: docs.python.org/3.10/whatsnew/3.10.html and /3.11/whatsnew/3.11.html.
+    # removeprefix/removesuffix, functools.cache and Path.is_relative_to ARE Python 3.9 APIs.
+    symbols = {"itertools.pairwise", "itertools.batched", "pathlib.Path.hardlink_to", "pathlib.Path.walk",
+               "pathlib.Path.is_junction", "enum.StrEnum", "enum.ReprEnum", "typing.Self", "typing.TypeAlias",
+               "typing.ParamSpec", "typing.Concatenate", "typing.TypeGuard", "typing.Never", "typing.LiteralString",
+               "typing.Required", "typing.NotRequired", "typing.Unpack", "typing.TypeVarTuple",
+               "typing.assert_type", "typing.reveal_type", "datetime.UTC", "types.UnionType",
+               "inspect.get_annotations", "asyncio.TaskGroup", "asyncio.Runner", "asyncio.timeout",
+               "asyncio.timeout_at", "ExceptionGroup", "BaseExceptionGroup", "aiter", "anext"}
+    keywords = {"zip": {"strict"}, "dataclasses.dataclass": {"slots", "kw_only"},
+                "subprocess.Popen": {"pipesize", "process_group"}, "pathlib.Path.write_text": {"newline"},
+                "tempfile.TemporaryDirectory": {"ignore_cleanup_errors", "delete"}}
+    aliases, problems = {}, []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+                if alias.name == "tomllib":
+                    problems.append("%d: tomllib requires Python 3.11" % node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                full = node.module + "." + alias.name
+                aliases[alias.asname or alias.name] = full
+                if node.module == "tomllib" or full in symbols:
+                    problems.append("%d: post-3.9 import %s" % (node.lineno, full))
+
+    def qualified(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return qualified(node.value) + "." + node.attr
+        if isinstance(node, ast.Call):
+            return qualified(node.func)
+        return "?"
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = qualified(node.func)
+        if name in symbols:
+            problems.append("%d: post-3.9 call %s" % (node.lineno, name))
+        if name.endswith(".subprocess.Popen"):
+            name = "subprocess.Popen"
+        if any(key.arg in keywords.get(name, ()) for key in node.keywords):
+            problems.append("%d: post-3.9 keyword in %s" % (node.lineno, name))
+        # Paths are often local variables, so also guard their distinctive post-3.9 member APIs.
+        if isinstance(node.func, ast.Attribute) and (node.func.attr in ("hardlink_to", "is_junction") or
+                node.func.attr == "write_text" and any(key.arg == "newline" for key in node.keywords)):
+            problems.append("%d: post-3.9 pathlib API %s" % (node.lineno, node.func.attr))
+    return problems
+
+
+def py39_runtime_sources():
+    """Read local peer imports and named CLI entries without executing any of that source."""
+    pending = [ROOT / "tools" / (name + ".py") for name in
+               ("hierarchy_launcher", "hierarchy_hosts", "hierarchy_handoff")]
+    sources = {}
+    while pending:
+        path = pending.pop()
+        if path in sources:
+            continue
+        source = path.read_text()
+        sources[path] = source
+        for node in ast.walk(ast.parse(source)):
+            names = ([alias.name for alias in node.names] if isinstance(node, ast.Import) else
+                     [node.module] if isinstance(node, ast.ImportFrom) else
+                     [node.value[:-3]] if isinstance(node, ast.Constant) and isinstance(node.value, str) and
+                     node.value.startswith("hierarchy_") and node.value.endswith(".py") else [])
+            for name in names:
+                if name and name.startswith("hierarchy_"):
+                    peer = ROOT / "tools" / (name.split(".")[0] + ".py")
+                    if peer.is_file() and peer not in sources:
+                        pending.append(peer)
+    return sources
+
+
+@pytest.mark.parametrize("source", [
+    "import itertools as it\nit.pairwise([])",
+    "from pathlib import Path\nPath('x').hardlink_to('y')",
+    "list(zip([], [], strict=True))",
+    "from dataclasses import dataclass\n@dataclass(slots=True)\nclass Example: pass",
+    "from typing import Self",
+    "from subprocess import Popen\nPopen([], process_group=0)",
+    "import tomllib",
+    "from pathlib import Path\nPath('x').write_text('data', newline='\\n')",
+])
+def test_py39_api_guard_rejects_known_newer_stdlib_features(source):
+    assert py39_api_violations(source), source
+
+
+def test_py39_api_guard_preserves_features_added_in_python39():
+    assert py39_api_violations("from functools import cache\n'a'.removeprefix('a')\n'a'.removesuffix('a')\n"
+                               "from pathlib import Path\nPath('x').is_relative_to(Path('.'))") == []
+
+
+def test_admitted_tool_runtime_imports_use_python39_apis():
+    problems = {str(path.relative_to(ROOT)): violations for path, source in py39_runtime_sources().items()
+                if (violations := py39_api_violations(source))}
+    assert problems == {}
 
 
 def drift(built, kind, marker):

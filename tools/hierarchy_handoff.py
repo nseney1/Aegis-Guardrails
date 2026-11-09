@@ -33,6 +33,7 @@ profile. Roots without a host plan keep today's unchecked host choice.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -102,6 +103,8 @@ def stop_evidence(mailbox, current):
     command = shlex.join(["hierarchy_launcher.py", "--base", str(base), "stop", "--endpoint", endpoint])
     guidance = "obtain evidence with: " + command
     try:
+        guidance = "retry after resolving stop custody"
+        hierarchy_launcher.require_resolved_custody(str(base), endpoint)
         profile = base / "profiles" / ("%s-g%d.wake.json" % (hierarchy_launcher.quoted(endpoint), current["generation"]))
         guidance = "inspect %s; %s will not change this wake profile; correct the profile and retry" % (profile, command)
         # Same path and predicate as hierarchy_launcher.bound_session()/stop(); no exported predicate exists.
@@ -172,7 +175,7 @@ def stop_evidence(mailbox, current):
         # Unlike stop(), we signal nothing, so exclude no ancestors that could still be the outgoing writer.
         try:
             found = hierarchy_launcher.session_processes(current["session"], set())
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        except (ValueError, OSError, hierarchy_launcher.CensusUnavailable, subprocess.SubprocessError) as exc:
             guidance = command + " cannot fix it; repair the process census and retry"
             raise ValueError("process census failed; error: " + str(exc)) from exc
         require(not found, "live process remains for session %s: %s"
@@ -199,24 +202,34 @@ def preflight_stops(spec):
             current = history[-1]
             if current["host"] != spec["host"] or current["session"] != spec["session"]:
                 stop_evidence(mailbox, current)
+            else:
+                # Idempotent reruns must not bypass unresolved custody either.
+                hierarchy_launcher.require_resolved_custody(str(root.parent), entry["endpoint"])
 
 
 def hand_off(spec, entry):
     fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir", "kind"})
     root = safe_path(text(entry["root"], "root"))
     plan = host_plan(root)
-    with writer_lock(root):
+    with writer_lock(root), ExitStack() as locks:
         mailbox = Mailbox(root)
         mailbox.endpoint(entry["endpoint"])
         if "kind" in entry:
             mailbox.require_kind(entry["endpoint"], entry["kind"])
         history = mailbox.bindings(entry["endpoint"])
         require(bool(history), "endpoint has no binding to replace: " + entry["endpoint"])
+        # Legacy host labels cannot be stopped by the launcher and require no POSIX stop provider.
+        # Once either side is a launcher host, binding selection/checks/publication share its endpoint lock.
+        if history[-1]["host"] in hierarchy_hosts.TEAM_HOSTS or spec["host"] in hierarchy_hosts.TEAM_HOSTS:
+            locks.enter_context(hierarchy_launcher.stop_endpoint_lock(root, entry["endpoint"]))
+            history = mailbox.bindings(entry["endpoint"])
+            require(bool(history), "endpoint has no binding to replace: " + entry["endpoint"])
         current = history[-1]
         # A re-run is checked too, so it reports a binding the plan does not allow even if an unchecked path made it.
         if plan is not None:
             check_successor(plan, mailbox, entry["endpoint"], spec)
         if current["host"] == spec["host"] and current["session"] == spec["session"]:
+            hierarchy_launcher.require_resolved_custody(str(root.parent), entry["endpoint"])
             return {"already_bound": True, "generation": current["generation"], "ready": mailbox.ready(current),
                     "checkpoint_sha256": current["checkpoint_sha256"], "acknowledge": acknowledgment(current),
                     "stop_evidence": None}

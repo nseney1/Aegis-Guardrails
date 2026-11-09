@@ -6,16 +6,74 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import uuid
 
 import pytest
 
 from tests.integration.test_hierarchy_handoff import HANDOFF, handoff, mailbox_files
-from tests.integration.test_hierarchy_launcher import Launch, REVIEW, census, hold, launch, wait_until  # noqa: F401
+from tests.integration.test_hierarchy_launcher import (  # noqa: F401
+    Launch, REVIEW, LINUX_HOST_PROGRAMS, R2Facade, R2Processes, launch, wait_until,
+)
 from tests.integration.test_hierarchy_mailbox import invoke
 
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="launcher process matching is POSIX only")
+pytestmark = [pytest.mark.skipif(os.name == "nt", reason="launcher process matching is POSIX only"),
+              LINUX_HOST_PROGRAMS]
+
+
+@pytest.fixture(autouse=True)
+def modelled_processes(launch, monkeypatch, capsys):
+    """Only complete logical argv is MODELLED; real READY/birth/UID/raw custody owns every test child."""
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
+
+    case = R2Case(launch)
+    cases, constructor = [case], Launch
+    factory = handoff_module
+
+    def scoped_launch(*args, **kwargs):
+        # A second explicit checkout has separate receipts/custody, never a Python/native fallback.
+        built = constructor(*args, **kwargs)
+        cases.append(R2Case(built))
+        return built
+
+    def scoped_module(ps_fallback=False):
+        control = factory()
+        control.hierarchy_launcher = case.module(pidfds=False)
+        if ps_fallback:
+            # MODELLED loss of the /proc argv provider at its census boundary. Boot evidence remains physical.
+            reader = control.hierarchy_launcher
+            reader.process_census = lambda _session: reader.ProcessCensus(reader.ps_census(), "unproven")
+
+            def ps(command, **options):
+                environment = {**case.env, "PATH": os.environ.get("PATH", "")}
+                return subprocess.run(command, **{**options, "env": environment, "stdin": subprocess.DEVNULL})
+            control.hierarchy_launcher.subprocess = R2Facade(subprocess, run=ps)
+        return control
+
+    def scoped_handoff(tmp_path, spec, expected, ps_fallback=False):
+        path = tmp_path / "handoff-spec.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        code = scoped_module(ps_fallback).main(["--spec", str(path)])
+        captured = capsys.readouterr()
+        assert not captured.err, captured.err
+        assert code == expected, captured.out
+        return json.loads(captured.out)
+
+    monkeypatch.setattr(sys.modules[__name__], "handoff_module", scoped_module)
+    monkeypatch.setattr(sys.modules[__name__], "handoff", scoped_handoff)
+    monkeypatch.setattr(sys.modules[__name__], "Launch", scoped_launch)
+    try:
+        yield case
+    finally:
+        errors = []
+        for owned in reversed(cases):
+            try:
+                owned.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("handoff fixture custody cleanup: " + "; ".join(str(exc) for exc in errors)) from errors[0]
 
 
 def spec_for(launch, endpoints=(REVIEW,), **changes):
@@ -37,9 +95,9 @@ def change_record(path, **changes):
     path.write_text(json.dumps({**record, **changes}) + "\n", encoding="utf-8")
 
 
-def refused_unchanged(launch, spec, reason, endpoint=REVIEW):
+def refused_unchanged(launch, spec, reason, endpoint=REVIEW, ps_fallback=False):
     before = mailbox_files(launch.base)
-    result = handoff(launch.tmp, spec, 2)
+    result = handoff(launch.tmp, spec, 2, ps_fallback=ps_fallback)
     assert mailbox_files(launch.base) == before
     assert endpoint in result["error"] and reason in result["error"]
     assert stop_command(launch, endpoint) in result["error"]
@@ -87,9 +145,14 @@ def assert_evidence(entry, status, activity=None):
 
 
 def held_session(launch, session):
-    process = hold(launch, session, 'exec codex exec --json hold "$0"', session, start_new_session=True)
+    case = launch.stop_case
+    host = launch.binding()["host"]
+    argv = ["claude", "--resume", session] if host == "claude-code" else ["codex", "exec", "resume", session]
+    process = case.spawn(argv)
+    process.stop_custody = case
+    module = case.module(pidfds=False)
     try:
-        wait_until(lambda: process.pid in census(session))
+        wait_until(lambda: process.pid in {pid for pid, _ in module.session_processes(session, set(), host)})
     except BaseException:
         finish(process)
         raise
@@ -98,7 +161,9 @@ def held_session(launch, session):
 
 def finish(process):
     if process.poll() is None:
-        os.killpg(process.pid, signal.SIGKILL)
+        custody = process.stop_custody.custody
+        slot = next(slot for slot, entry in custody.entries.items() if entry["pid"] == process.pid)
+        custody.kill_owned(slot)
     process.wait(timeout=5)
 
 
@@ -235,7 +300,7 @@ def test_a_failed_census_explains_that_stop_cannot_fix_it(launch, monkeypatch): 
     ps.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     ps.chmod(0o700)
     monkeypatch.setenv("PATH", str(launch.bin) + os.pathsep + os.environ["PATH"])
-    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    result = refused_unchanged(launch, spec_for(launch), "process census failed", ps_fallback=True)
     assert result["error"] == (
         "stop evidence for %s: process census failed; error: process census failed; "
         "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
@@ -244,7 +309,7 @@ def test_a_failed_census_explains_that_stop_cannot_fix_it(launch, monkeypatch): 
 def test_a_missing_ps_explains_the_census_error_and_recovery(launch, monkeypatch):  # noqa: F811
     stopped(launch)
     monkeypatch.setenv("PATH", str(launch.bin))
-    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    result = refused_unchanged(launch, spec_for(launch), "process census failed", ps_fallback=True)
     assert result["error"] == (
         "stop evidence for %s: process census failed; error: [Errno 2] No such file or directory: 'ps'; "
         "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
@@ -254,7 +319,7 @@ def test_a_census_timeout_preserves_the_error_and_changes_nothing(launch, monkey
     stopped(launch)
     spec = spec_for(launch)
     before = mailbox_files(launch.base)
-    module = handoff_module()
+    module = handoff_module(ps_fallback=True)
     run = module.hierarchy_launcher.subprocess.run
 
     def timeout(argv, **options):
@@ -267,7 +332,7 @@ def test_a_census_timeout_preserves_the_error_and_changes_nothing(launch, monkey
         result = run_main(module, launch, spec, capsys, 2)
     assert result["error"] == (
         "stop evidence for %s: process census failed; error: "
-        "Command '['ps', '-ax', '-ww', '-o', 'pid=,pgid=,stat=,args=']' timed out after 10 seconds; "
+        "Command '['ps', '-ax', '-ww', '-o', 'pid=,pgid=,ppid=,ruid=,uid=,stat=,lstart=,args=']' timed out after 10 seconds; "
         "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))
     assert mailbox_files(launch.base) == before
 
@@ -485,7 +550,7 @@ def test_a_background_session_still_requires_a_successful_census(launch, monkeyp
     ps.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     ps.chmod(0o700)
     monkeypatch.setenv("PATH", str(launch.bin) + os.pathsep + os.environ["PATH"])
-    result = refused_unchanged(launch, spec_for(launch), "process census failed")
+    result = refused_unchanged(launch, spec_for(launch), "process census failed", ps_fallback=True)
     assert result["error"] == (
         "stop evidence for %s: process census failed; error: process census failed; "
         "%s cannot fix it; repair the process census and retry" % (REVIEW, stop_command(launch)))

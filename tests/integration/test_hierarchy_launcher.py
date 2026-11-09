@@ -77,9 +77,32 @@ class Launch(Setup):
             result = subprocess.CompletedProcess(words, process.returncode, out, err)
         else:
             result = subprocess.run(self.argv(*words), capture_output=True, text=True, timeout=timeout, env=self.env(**extra))
+        if words and words[0] == "resume" and result.returncode != expect:
+            self.report_resume_child_errors()
         assert not result.stderr, result.stderr
         assert result.returncode == expect, result.stdout
         return json.loads(result.stdout)
+
+    def report_resume_child_errors(self):
+        # Keep the original assertions/outcome. A disposable container must not discard the real child's
+        # import error when pytest prints only the launcher's summary. Read only this fixture's own logs.
+        folder = self.base / "delivery" / "wake-logs"
+        if self.tmp not in folder.parents:
+            raise RuntimeError("test wake log folder escapes its owned fixture")
+        current = folder
+        while current != self.tmp:
+            if current.is_symlink():
+                raise RuntimeError("test wake log folder contains a symlink")
+            current = current.parent
+        for path in sorted(folder.rglob("*.stderr"))[:8]:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                raise RuntimeError("test wake log is not an owned regular file")
+            with path.open("rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - 8192))
+                tail = stream.read(8192).decode("utf-8", "replace")
+            print("owned wake child stderr (%s):\n%s" % (path.relative_to(self.tmp), tail), file=sys.stderr)
 
     def start_request(self, **request):
         path = self.tmp / ("start-%s.json" % uuid.uuid4().hex)
@@ -466,6 +489,19 @@ def test_resume_runs_the_wake_with_the_bound_profile_and_records_it(launch):
     hosted = [json.loads(line) for line in launch.host_log.read_text().splitlines()]
     assert [row["endpoint"] for row in hosted] == [REVIEW] and hosted[0]["argv"][-2] == started["session"]
     assert [row["state"] for row in launch.records()] == ["bound", "resumed"]
+
+
+def test_unexpected_resume_failure_reports_the_owned_wake_child_stderr(launch, capsys):
+    launch.start()
+    launch.publish_to(REVIEW, "for-review")
+    # MODELLED failed launcher, not a running session host. Preserve the actual wake child's exit/stderr.
+    (launch.bin / "codex").write_text("#!/bin/sh\nprintf 'modelled wake import error\\n' >&2\nexit 7\n")
+    with pytest.raises(AssertionError, match="resumed_unread"):
+        launch.run("resume", "--endpoint", REVIEW)
+    captured = capsys.readouterr()
+    assert "owned wake child stderr" in captured.err
+    assert "modelled wake import error" in captured.err
+    assert launch.records()[-1]["wake"]["exit_code"] == 7
 
 
 def test_resume_dry_run_launches_nothing(launch):
@@ -869,8 +905,80 @@ class WitnessedPopen(subprocess.Popen):
             raise RuntimeError("R2 fixture: wait status is not for the original child")
         self.native_wait_evidence = {"wait_pid": pid, "wait_status": status}
         self.returncode = os.waitstatus_to_exitcode(status)
+        self.capture_event("native_wait", pid=pid, status=status)
         self.close_native_handle()
         return self.returncode
+
+    def capture_event(self, event, **details):
+        path = getattr(self, "capture_trace_path", None)
+        if path is not None:
+            events = getattr(self, "capture_events", [])
+            events.append(dict(event=event, at_ns=time.monotonic_ns(), **details))
+            self.capture_events = events
+            path.write_text(json.dumps(events) + "\n")
+
+    def communicate(self, *args, **kwargs):
+        self.capture_event("communicate_enter")
+        try:
+            if hasattr(self, "pipe_capture"):
+                out, err = self.captured_communicate(*args, **kwargs)
+            else:
+                out, err = super().communicate(*args, **kwargs)
+            self.capture_event("communicate_return", stdout_size=len(out or ""), stderr_size=len(err or ""))
+            return out, err
+        except BaseException as exc:
+            self.capture_event("communicate_error", kind=type(exc).__name__)
+            raise
+
+    def start_capture(self):
+        """Drain both runner pipes before staging observations can block their writer. No signal authority."""
+        import threading
+
+        if hasattr(self, "pipe_capture"):
+            raise RuntimeError("R2 fixture: runner capture already started")
+        self.pipe_capture = []
+        for stream in (self.stdout, self.stderr):
+            if stream is None:
+                raise RuntimeError("R2 fixture: runner capture requires both pipes")
+            state = dict(stream=stream, chunks=[], size=0, error=None, done=threading.Event())
+            self.pipe_capture.append(state)
+
+            def drain(state=state):
+                try:
+                    while True:
+                        raw = os.read(state["stream"].fileno(), 65536)
+                        if not raw:
+                            break
+                        state["size"] += len(raw)
+                        if state["size"] <= 16 * 1024 * 1024:
+                            state["chunks"].append(raw)
+                        else:
+                            # Keep draining to avoid pipe deadlock, but never return truncated output as success.
+                            state["error"] = RuntimeError("R2 fixture: runner capture exceeds 16 MiB")
+                except BaseException as exc:
+                    state["error"] = exc
+                finally:
+                    state["done"].set()
+
+            threading.Thread(target=drain, daemon=True).start()
+
+    def captured_communicate(self, input=None, timeout=None):
+        if input is not None:
+            raise RuntimeError("R2 fixture: captured runner has no input protocol")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None or not all(row["done"].is_set() for row in self.pipe_capture):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout,
+                                                *(b"".join(row["chunks"]) for row in self.pipe_capture))
+            time.sleep(.005)
+        values = []
+        for row in self.pipe_capture:
+            if row["error"] is not None:
+                raise row["error"]
+            raw, stream = b"".join(row["chunks"]), row["stream"]
+            values.append(self._translate_newlines(raw, stream.encoding, stream.errors) if self.text_mode else raw)
+            stream.close()
+        return tuple(values)
 
     def close_native_handle(self):
         if self.native_handle is not None:
@@ -1581,7 +1689,54 @@ def r2_stop_main(arguments):
     projection = R2Processes.load(path, nonce)
     if len(words) < 3 or words[0] != "--base" or words[2] != "stop":
         raise RuntimeError("R2 fixture: non-stop runner request")
-    return launcher_module(projection).main(words)
+    module = launcher_module(projection)
+    # Passive, bounded diagnostics: mmap updates add no fsync/pipe write to the measured path. They never
+    # affect identity, projection, signal authorization or the production API's decisions.
+    import mmap
+    import stat
+    trace = Path(path).parent / ("stop-timing-%d-evidence.json" % os.getpid())
+    fd = os.open(trace, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.ftruncate(fd, 65536)
+    region = mmap.mmap(fd, 65536)
+    os.close(fd)
+    region[:] = b" " * 65536
+    events, phase = [], ["main"]
+
+    def event(name, **details):
+        if len(events) < 256:
+            events.append(dict(event=name, at_ns=time.monotonic_ns(), phase=phase[0], **details))
+            raw = json.dumps(events).encode()
+            if len(raw) > len(region):
+                raise RuntimeError("R2 fixture: timing evidence exceeds its bound")
+            region[:len(raw)] = raw
+
+    syncing, saving = module.os.fsync, module.StopCustody.save
+
+    def fsync(descriptor):
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        event("fsync_enter", kind=kind)
+        try:
+            return syncing(descriptor)
+        finally:
+            event("fsync_return", kind=kind)
+
+    def save(custody, observed, attempted, active=True):
+        previous, phase[0] = phase[0], "checkpoint" if active else "terminal_clear"
+        event("save_enter")
+        try:
+            return saving(custody, observed, attempted, active)
+        finally:
+            event("save_return")
+            phase[0] = previous
+
+    module.os.fsync, module.StopCustody.save = fsync, save
+    try:
+        event("main_enter")
+        code = module.main(words)
+        event("main_return", code=code)
+        return code
+    finally:
+        region.close()
 
 
 def r2_legacy_child_gate(config, slot):
@@ -1828,6 +1983,8 @@ def r2_actor_main(config, slot):
                                    stderr=subprocess.PIPE, text=True, pass_fds=tuple(config["inherited"]))
         birth = r2_kernel_process(created.pid)["birth"]
         emit("created", child=requested, child_pid=created.pid, child_birth=birth)
+        if config["nodes"][requested]["kind"] == "R":
+            created.start_capture()
         if requested == child_slot:
             child, child_birth = created, birth
     Path(node["started"]).write_text("RUNNING", encoding="utf-8")
@@ -1857,12 +2014,27 @@ def r2_actor_main(config, slot):
              child=child_slot, child_pid=child.pid, child_birth=child_birth, **(proof or {}))
         sys.stdout.write(out)
         sys.stderr.write(err)
+        if config.get("runner_action") == "burst":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            Path(node["started"]).with_suffix(".capture-ready").touch()
         if config.get("echo_exit"):
             print("exit=%d" % child.returncode)
         return child.returncode
     if node["kind"] == "R" and config.get("runner_action") != "hang":
+        if config.get("runner_action") == "burst":
+            # Test-only transport pressure; whitespace preserves the real public stop JSON verbatim.
+            sys.stdout.write(" " * (2 * 1024 * 1024))
+            sys.stdout.flush()
+            sys.stderr.write("E" * (2 * 1024 * 1024))
+            sys.stderr.flush()
         request = config["runner_request"]
-        return r2_stop_main([request["receipt"], request["nonce"], *request["words"]])
+        code = r2_stop_main([request["receipt"], request["nonce"], *request["words"]])
+        if config.get("runner_action") == "burst":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            Path(node["started"]).with_suffix(".capture-ready").touch()
+        return code
     while not Path(config["exit_file"]).exists():
         time.sleep(0.02)
     return 0

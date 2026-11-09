@@ -108,7 +108,7 @@ _HOSTS = {
                         "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",),
                         "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": ("--resume", "--session-id"), "commands": (),
-                              "grammar": {"stage": "C", "flags": CLAUDE_STOP_FLAGS,
+                              "grammar": {"family": "claude", "stage": "C", "flags": CLAUDE_STOP_FLAGS,
                                           "split_one": CLAUDE_STOP_VALUES, "equals_one": ("--tools",),
                                           "repeatable": ("--add-dir", "--plugin-dir"),
                                           "exclusive_modes": ("--print", "--bg")},
@@ -135,7 +135,7 @@ _HOSTS = {
         "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex", "codex.js"),
                         "node_script_suffixes": (), "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": (), "commands": (("resume",), ("exec", "resume")),
-                              "grammar": {"options": CODEX_STOP_OPTIONS, "exec": "exec", "resume": "resume"},
+                              "grammar": {"family": "codex", "options": CODEX_STOP_OPTIONS, "exec": "exec", "resume": "resume"},
                               "conflicting_flags": (),
                               "value_options": ("-c", "--config", "--disable", "--enable", "--sandbox", "-s",
                                                 "-C", "--cd", "--add-dir", "--model", "-m", "--profile", "-p",
@@ -382,6 +382,10 @@ def _claude_selection(selectors, arguments, session):
 
 def session_verdict(kind, argv, session, argv_boundaries="proven"):
     """Closed complete-atom grammar; flattened ps text never establishes first ownership."""
+    if kind is None:
+        # Discovery callers may not have a binding. Never silently choose a host for them.
+        verdicts = [session_verdict(host, argv, session, argv_boundaries) for host in TEAM_HOSTS]
+        return "OWNED" if "OWNED" in verdicts else "HOLD" if "HOLD" in verdicts else "NOT_OWNED"
     selectors = _host(kind)["session_selectors"]
     if argv_boundaries != "proven":
         return "HOLD"
@@ -392,8 +396,12 @@ def session_verdict(kind, argv, session, argv_boundaries="proven"):
         return "HOLD"
     if arguments is None:
         return "NOT_OWNED"
-    return (_claude_selection(selectors, arguments, session) if selectors["options"]
-            else _codex_selection(selectors, arguments, session))
+    family = selectors.get("grammar", {}).get("family")
+    if family == "claude":
+        return _claude_selection(selectors, arguments, session)
+    if family == "codex":
+        return _codex_selection(selectors, arguments, session)
+    return "HOLD"
 
 
 def matches_session(kind, argv, session, argv_boundaries="proven"):

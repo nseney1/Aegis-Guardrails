@@ -23,7 +23,10 @@ CHILD = """
 import os, time
 with open(os.environ["STOP_OWNERSHIP_READY"], "w") as ready:
     ready.write("ready")
-time.sleep(5)
+# The admitted gate's private EOF watchdog owns lifetime; elapsed test setup must not end a held process.
+import signal
+while True:
+    signal.pause()
 """
 
 # Bounded selector-state table from the registry/builders and round6 modelled cases.
@@ -129,6 +132,1075 @@ def test_stop_matches_the_bound_hosts_program(launch, children, host, program):
     assert stopped["state"] == "stopped" and stopped["pids"] == [owned.pid]
     assert stopped["host"] == host and stopped["session"] == session
     assert owned.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_public_handoff_without_a_host_sees_live_claude(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    code, record = r2_case.stop(r2_case.module(), capsys, grace=0)
+    assert code == 0 and record["state"] == "not_running"
+    held = r2_case.spawn(["claude", "--resume", session])
+    control = handoff_module()
+    control.hierarchy_launcher = r2_case.module()
+    spec = spec_for(r2_case.launch)
+    before = mailbox_files(r2_case.launch.base)
+    answer = run_main(control, r2_case.launch, spec, capsys, 2)
+    assert "live process remains" in answer["error"] and str(held.pid) in answer["error"]
+    assert mailbox_files(r2_case.launch.base) == before and held.poll() is None
+
+
+@pytest.mark.parametrize("fault", ["unreadable", "unproven"])
+def test_public_probe_cleanup_holds_unresolved_census(r2_case, capsys, fault):
+    import builtins
+    from types import ModuleType, SimpleNamespace
+    from tests.integration.test_hierarchy_native_probe import PROBE, Probe
+
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    held = r2_case.spawn(["codex", "exec", "resume", session], ignore=True)
+    launcher = r2_case.module()
+    if fault == "unreadable":
+        def deny(path, raw):
+            if str(path) == "/proc/%d/status" % held.pid:
+                raise PermissionError("modelled unreadable cleanup candidate")
+            return raw
+        r2_case.projection.path_view(launcher, deny)
+    else:
+        snapshot = launcher.read_process(held.pid).snapshot
+        launcher.process_census = lambda _session: launcher.ProcessCensus([snapshot], "unproven")
+    folder = r2_case.launch.tmp / "cleanup-probe"
+    folder.mkdir()
+    probe = Probe(folder)
+    try:
+        plan = probe.plan([{"role": "implementer"}])
+        planned = plan["roles"][0]
+        logs = Path(planned["base"]) / "launches" / planned["endpoint"].replace("/", "%2F")
+        logs.mkdir(parents=True)
+        (logs / "record.json").write_text(json.dumps({"session": session}))
+        auth = probe.codex_home / "auth.json"
+        auth.write_text("test-owned fake login")
+        importing = builtins.__import__
+
+        def isolated(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 0 and name == "hierarchy_launcher":
+                return launcher
+            if level == 0 and name == "pwd":
+                return SimpleNamespace(getpwuid=lambda _uid: SimpleNamespace(pw_dir=str(probe.passwd_home)))
+            return importing(name, globals, locals, fromlist, level)
+
+        control = ModuleType("_cleanup_under_test")
+        control.__dict__.update(__file__=str(PROBE), __package__="",
+                                __builtins__={**vars(builtins), "__import__": isolated})
+        exec(compile(PROBE.read_bytes(), str(PROBE), "exec"), control.__dict__)
+        control.os = R2Facade(os, environ=probe.env())
+        code = control.main(["cleanup", "--probe-root", str(probe.root)])
+        answer = json.loads(capsys.readouterr().out)
+        assert code in (2, 3) and "process census unresolved" in answer.get("error", "")
+        assert held.poll() is None and auth.exists() and Path(plan["worktree"]).is_dir()
+    finally:
+        probe.close()
+
+
+def test_second_stop_recovers_an_unreadable_orphan_from_the_first_stop(r2_case, capsys):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    leader, worker = family["H"], family["W"]
+    first = r2_case.module(pidfds=False)
+    term = []
+
+    def after_signal(pid, number):
+        if number == signal.SIGTERM:
+            term.append(pid)
+            if pid == leader.pid:
+                first.os.kill(pid, signal.SIGKILL)
+                assert leader.wait(timeout=5) == -signal.SIGKILL
+
+    def denied(path, raw):
+        if worker.pid in term and str(path) == "/proc/%d/cmdline" % worker.pid:
+            raise PermissionError("modelled unreadable orphan")
+        return raw
+
+    r2_case.projection.after_signal.append(after_signal)
+    r2_case.projection.path_view(first, denied)
+    code, stopped = r2_case.stop(first, capsys, grace=0)
+    assert code == 3 and stopped["state"] == "stop_failed" and worker.poll() is None
+    assert worker.pid in stopped["pids"] and worker.pid in stopped["unresolved_pids"]
+    second = r2_case.module(pidfds=False)  # New loaded launcher: only durable evidence can supply the orphan.
+    code, recovered = r2_case.stop(second, capsys, grace=0)
+    assert code == 0 and recovered["state"] == "stopped" and worker.poll() == "CONFIRMED_EXIT"
+    assert worker.pid in recovered["pids"] and worker.pid not in recovered.get("unowned_pids", [])
+
+
+def r7_pending_attempt(case, capsys):
+    """MODELLED interruption after one real TERM; READY/physical custody remains independent."""
+    session = str(uuid.uuid4())
+    case.bind("claude-code", session)
+    held = case.spawn(["claude", "--resume", session], ignore=True)
+    module = case.module(pidfds=False)
+
+    def interrupted(pid, number):
+        if pid == held.pid and number == signal.SIGTERM:
+            raise KeyboardInterrupt("modelled launcher loss after real TERM")
+
+    case.projection.after_signal.append(interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="modelled launcher loss after real TERM"):
+            case.stop(module, capsys, grace=0)
+    finally:
+        case.projection.after_signal.remove(interrupted)
+    capsys.readouterr()
+    path = module.Launches(str(case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    saved = json.loads(path.read_text())
+    assert saved["active"] and saved["entries"][0]["attempted"]
+    assert saved["entries"][0]["snapshot"]["start_time"] == r2_kernel_process(held.pid)["birth"]
+    assert held.poll() is None and case.projection.events == [(held.pid, signal.SIGTERM)]
+    return held, path, saved
+
+
+def r13_seed_empty_journal(module, case):
+    """Negative-only journal fixture. Empty public stops deliberately no longer create this file."""
+    launches = module.Launches(str(case.launch.base))
+    known = {key: case.launch.binding()[key] for key in ("host", "session", "generation")}
+    state = dict(candidates={}, initial_unavailable={}, blocked=set(), identity_lost=set(), resolved={})
+    with module.StopCustody(launches, REVIEW, known) as custody:
+        custody.save(state, set(), active=False)
+    return custody.path
+
+
+@pytest.mark.parametrize("field", ["schema", "host", "session", "boot", "state", "start_time", "argv", "cmdline",
+                                 "coverage", "resolved", "partial-state", "partial-start_time", "partial-argv",
+                                 "partial-cmdline"])
+def test_r13_raw_non_ascii_journal_refuses_before_effect(r2_case, capsys, field):
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    # All string-bearing schema locations are attacker inputs, including negative evidence.
+    if field.startswith("partial-"):
+        key = field[len("partial-"):]
+        saved["entries"][0]["partial"][key] = ["é"] if key == "argv" else "é"
+    elif field in ("host", "session"):
+        saved["binding"][field] += "é"
+    elif field in ("state", "start_time", "cmdline"):
+        saved["entries"][0]["snapshot"][field] += "é"
+    elif field == "argv":
+        saved["entries"][0]["snapshot"]["argv"].append("é")
+    elif field == "resolved":
+        saved["entries"][0][field] = "é"
+    else:
+        saved[field] = "é"
+    path.write_text(json.dumps(saved, ensure_ascii=False))
+    before = list(r2_case.projection.events)
+    code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
+    assert code == 2 and "error" in answer
+    assert r2_case.projection.events == before and held.poll() is None
+
+
+@pytest.mark.parametrize("field,value", [("state", "?"), ("state", "Running"), ("start_time", "1x"),
+                                       ("start_time", "１２")])
+def test_r13_invalid_physical_scalar_refuses(r2_case, capsys, field, value):
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    saved["entries"][0]["snapshot"][field] = value
+    path.write_text(json.dumps(saved))
+    before = list(r2_case.projection.events)
+    code, answer = r2_case.stop(r2_case.module(False), capsys, 0)
+    assert code == 2 and "invalid stop custody " + field in answer["error"]
+    assert r2_case.projection.events == before and held.poll() is None
+
+
+@pytest.mark.parametrize("attack", ["mode", "owner", "hardlink", "symlink"])
+def test_r13_opened_journal_descriptor_is_validated(r2_case, capsys, attack):
+    import stat
+
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    module = r2_case.module(False)
+    opening, reading, fstat = module.os.open, module.read_json, module.os.fstat
+    swapped, target = [], path.with_name("attacker.json")
+    target.write_text(json.dumps(saved))
+    target.chmod(0o600 if attack != "mode" else 0o644)
+    if attack == "hardlink":
+        os.link(target, target.with_suffix(".link"))
+
+    def swap():
+        if not swapped:
+            path.unlink()
+            if attack == "symlink":
+                path.symlink_to(target)
+            else:
+                os.replace(target, path)
+            swapped.append(True)
+
+    def opened(source, flags, *args, **kwargs):
+        if str(source) == "state.json" or Path(source) == path:
+            swap()
+        return opening(source, flags, *args, **kwargs)
+
+    def read(source):
+        if Path(source) == path:
+            swap()  # Old pathname reader's equivalent OS-open boundary.
+        return reading(source)
+
+    def info(fd):
+        value = fstat(fd)
+        if attack == "owner" and stat.S_ISREG(value.st_mode) and Path(os.readlink("/proc/self/fd/%d" % fd)) == path:
+            parts = list(value)
+            parts[4] = os.geteuid() + 1  # MODELLED descriptor owner; no chown authority or positive evidence.
+            return os.stat_result(parts)
+        return value
+
+    module.os.open, module.read_json, module.os.fstat = opened, read, info
+    before = list(r2_case.projection.events)
+    code, answer = r2_case.stop(module, capsys, 0)
+    assert swapped and code == 2 and "error" in answer
+    assert r2_case.projection.events == before and held.poll() is None
+
+
+@pytest.mark.parametrize("attack", ["mode", "owner", "symlink", "mode-at-state-open"])
+def test_r13_custody_directory_is_pinned_and_private(r2_case, capsys, attack):
+    import stat
+
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    module = r2_case.module(False)
+    opening, fstat = module.os.open, module.os.fstat
+    replaced = []
+
+    def open_directory(source, flags, *args, **kwargs):
+        if attack == "mode-at-state-open" and str(source) == "state.json" and not replaced:
+            path.parent.chmod(0o755)
+            replaced.append(True)
+        if (str(source) == ".stop-custody" or Path(source) == path.parent / "lock") and not replaced and attack != "mode-at-state-open":
+            if attack == "symlink":
+                backup = path.parent.with_name("original-custody")
+                path.parent.rename(backup)
+                path.parent.symlink_to(backup, target_is_directory=True)
+            elif attack == "mode":
+                path.parent.chmod(0o755)
+            replaced.append(True)
+        return opening(source, flags, *args, **kwargs)
+
+    def info(fd):
+        value = fstat(fd)
+        if (attack == "owner" and stat.S_ISDIR(value.st_mode) and
+                Path(os.readlink("/proc/self/fd/%d" % fd)) == path.parent):
+            parts = list(value)
+            parts[4] = os.geteuid() + 1  # MODELLED directory owner at the real descriptor boundary.
+            return os.stat_result(parts)
+        return value
+
+    module.os.open, module.os.fstat = open_directory, info
+    before = list(r2_case.projection.events)
+    code, answer = r2_case.stop(module, capsys, 0)
+    assert replaced and code == 2 and "error" in answer
+    assert r2_case.projection.events == before and held.poll() is None
+
+
+@pytest.mark.parametrize("attack", ["file-mode", "file-owner", "file-hardlink", "directory-mode", "directory-owner",
+                                  "directory-mode-at-open"])
+@pytest.mark.parametrize("present", [True, False], ids=["journal", "empty-directory"])
+def test_r13_readonly_consumer_validates_private_custody(r2_case, capsys, attack, present):
+    import stat
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module(False)
+    assert r2_case.stop(module, capsys, 0)[0] == 0
+    path = r13_seed_empty_journal(module, r2_case)
+    if not present:
+        path.unlink()
+    if attack == "file-mode" and present:
+        path.chmod(0o644)
+    elif attack == "file-hardlink" and present:
+        os.link(path, r2_case.launch.tmp / "outside-custody-link")
+    elif attack == "directory-mode":
+        path.parent.chmod(0o755)
+    fstat = module.os.fstat
+
+    def info(fd):
+        value = fstat(fd)
+        observed = Path(os.readlink("/proc/self/fd/%d" % fd))
+        if ((attack == "file-owner" and stat.S_ISREG(value.st_mode) and observed == path) or
+                (attack == "directory-owner" and stat.S_ISDIR(value.st_mode) and observed == path.parent)):
+            parts = list(value)
+            parts[4] = os.geteuid() + 1  # MODELLED negative filesystem owner, never process UID or authority.
+            return os.stat_result(parts)
+        return value
+
+    module.os.fstat = info
+    opening = module.os.open
+
+    def change_directory(source, *args, **kwargs):
+        if attack == "directory-mode-at-open" and str(source) == "state.json":
+            path.parent.chmod(0o755)
+        return opening(source, *args, **kwargs)
+
+    module.os.open = change_directory
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    # No file means file-only attacks have no input to validate. The directory itself still must be private.
+    invalid = present or attack.startswith("directory-")
+    result = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 2 if invalid else 0)
+    if invalid:
+        assert "stop custody" in result["error"] and "manual reconciliation" in result["error"]
+    else:
+        assert result["entries"][0]["generation"] == 2
+    assert r2_case.projection.events == []
+
+
+def test_r13_writer_escaped_unicode_remains_readable(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session, "-p", "é"])
+    module = r2_case.module(False)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    assert path.read_bytes().isascii() and b"\\u00e9" in path.read_bytes()
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    answer = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 0)
+    assert answer["entries"][0]["generation"] == 2
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_r13_forged_resolution_does_not_release_live_custody(r2_case, capsys, active):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    saved["active"] = active
+    saved["entries"][0]["resolved"] = "matching_birth_zombie"
+    path.write_text(json.dumps(saved))
+    module = r2_case.module(False)
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    answer = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 2)
+    assert "stop custody" in answer["error"] and held.poll() is None
+    before = list(r2_case.projection.events)
+    code, answer = r2_case.stop(module, capsys, 0)
+    assert code == 2 and "resolved" in answer["error"]
+    assert r2_case.projection.events == before and held.poll() is None
+
+
+def test_r13_noop_creates_no_custody(r2_case, capsys):
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module(False)
+    code, answer = r2_case.stop(module, capsys, 0)
+    assert code == 0 and answer["state"] == "not_running"
+    assert not (module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody").exists()
+
+
+def test_r13_identity_loss_is_persisted_once_across_polls(r2_case, capsys):
+    import stat
+
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    module, writes = r2_case.module(False), []
+    syncing = module.os.fsync
+
+    def changed(pid, count, row):
+        return row._replace(start_time=str(int(row.start_time) + 1)) if pid == held.pid else row
+
+    def fsync(fd):
+        result = syncing(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and Path(os.readlink("/proc/self/fd/%d" % fd)) == path.parent:
+            writes.append(json.loads(path.read_text()))
+        return result
+
+    module.os.fsync = fsync
+    r2_case.projection.after_present.append(changed)
+    before = list(r2_case.projection.events)
+    code, stopped = r2_case.stop(module, capsys, 1)
+    assert code == 3 and stopped["pids"] == [held.pid] and held.poll() is None
+    assert r2_case.projection.events == before
+    assert len(writes) == 1 and writes[0]["entries"][0]["identity_lost"]
+    assert json.loads(path.read_text())["entries"][0]["snapshot"] == saved["entries"][0]["snapshot"]
+
+
+def test_r13_incomplete_birth_latch_survives_immediate_loss(r2_case, capsys):
+    from types import SimpleNamespace
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    worker = family["W"]
+    module, reads, changed = r2_case.module(False), {}, []
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+
+    def before(pid, count):
+        reads[pid] = count
+
+    def incomplete(path, physical):
+        if str(path) == "/proc/%d/status" % worker.pid and reads.get(worker.pid) == 1:
+            return b"\n".join(line for line in physical.splitlines() if not line.startswith(b"Uid:"))
+        return physical
+
+    def replaced(pid, count, row):
+        if pid == worker.pid and count >= 2:
+            changed.append(True)
+            return row._replace(start_time=str(int(row.start_time) + 1))
+        return row
+
+    clock = module.time
+
+    def crash():
+        if changed:
+            entry = next(row for row in json.loads(path.read_text())["entries"] if row["pid"] == worker.pid)
+            assert entry["identity_lost"], "replacement birth must already be durable at the next OS clock boundary"
+            raise R10Interrupted("modelled loss immediately after the new birth latch")
+        return clock.monotonic()
+
+    module.time = SimpleNamespace(monotonic=crash, sleep=clock.sleep)
+    r2_case.projection.before_read.append(before)
+    r2_case.projection.path_view(module, incomplete)
+    r2_case.projection.after_present.append(replaced)
+    with pytest.raises(R10Interrupted, match="immediately after the new birth latch"):
+        r2_case.stop(module, capsys, 1)
+    capsys.readouterr()
+    assert changed and worker.poll() is None
+    assert all(pid != worker.pid for pid, _ in r2_case.projection.events)
+
+
+def test_r13_crash_before_initial_parent_fsync_never_signals(r2_case, capsys):
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(False)
+    folder = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody"
+    syncing, cuts = module.os.fsync, []
+
+    def cut(fd):
+        if (folder.exists() and stat.S_ISDIR(os.fstat(fd).st_mode) and
+                Path(os.readlink("/proc/self/fd/%d" % fd)) == folder.parent):
+            cuts.append(True)
+            raise R10Interrupted("modelled crash before custody parent fsync")
+        return syncing(fd)
+
+    module.os.fsync = cut
+    with pytest.raises(R10Interrupted, match="before custody parent fsync"):
+        r2_case.stop(module, capsys, 0)
+    capsys.readouterr()
+    assert cuts and not (folder / "state.json").exists()
+    assert held.poll() is None and r2_case.projection.events == []
+    recovered, parents = r2_case.module(False), []
+    syncing = recovered.os.fsync
+
+    def synced(fd):
+        result = syncing(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            parents.append(Path(os.readlink("/proc/self/fd/%d" % fd)))
+        return result
+
+    recovered.os.fsync = synced
+    r2_case.projection.after_signal.append(lambda pid, number: parents.append("signal"))
+    code, stopped = r2_case.stop(recovered, capsys)
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGTERM
+    assert parents.index(folder.parent) < parents.index("signal")
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_r13_previous_boot_has_an_actionable_outcome(r2_case, capsys, active):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(False)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 0 and held.wait(timeout=5) == -signal.SIGTERM
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    saved = json.loads(path.read_text())
+    saved.update(boot="modelled previous boot", active=active)
+    path.write_text(json.dumps(saved))
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    answer = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 2 if active else 0)
+    if active:
+        assert str(path) in answer["error"] and "boot changed" in answer["error"]
+        assert "manual" in answer["error"] and "retry" in answer["error"]
+        assert "obtain evidence with" not in answer["error"]
+    else:
+        assert answer["entries"][0]["generation"] == 2
+
+
+def test_r13_discovery_and_handoff_share_endpoint_lock(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    module = r2_case.module(False)
+    assert r2_case.stop(module, capsys, 0)[0] == 0
+    held = r2_case.spawn(["claude", "--resume", session])
+    control = handoff_module()
+    reader = r2_case.module(False)
+    # MODELLED stale/empty census in the independent handoff reader, never signal authority.
+    reader.process_census = lambda session: reader.ProcessCensus([], "proven")
+    control.hierarchy_launcher = reader
+    discover, concurrent = module.session_processes, []
+
+    def paused(*args):
+        found = discover(*args)
+        assert found == [(held.pid, r2_kernel_process(held.pid)["pgid"])]
+        result = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 3)
+        concurrent.append(result)
+        assert "busy" in result["entries"][0]["error"]
+        assert r2_case.launch.binding()["session"] == session
+        return found
+
+    module.session_processes = paused
+    code, stopped = r2_case.stop(module, capsys)
+    assert concurrent and code == 0 and stopped["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r13_census_unavailable_guidance_names_repair(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module(False)
+    assert r2_case.stop(module, capsys, 0)[0] == 0
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    module.process_census = lambda session: module.ProcessCensus([], "unproven")
+    result = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 2)
+    assert "repair the process census" in result["error"]
+
+
+@pytest.mark.parametrize("stage", ["replacement", "idempotent-preflight", "idempotent-recheck"])
+@pytest.mark.parametrize("fault", ["pending", "corrupt"])
+def test_r13_all_custody_refusals_give_the_right_next_action(r2_case, capsys, stage, fault):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    module = r2_case.module(False)
+    assert r2_case.stop(module, capsys, 0)[0] == 0
+    path = r13_seed_empty_journal(module, r2_case)
+    saved = json.loads(path.read_text())
+    saved["active"] = True
+    queried, injected = module.unresolved_stop_custody, []
+
+    def faulted(base, endpoint):
+        if not injected and (stage != "idempotent-recheck" or (r2_case.launch.root / ".write.lock").exists()):
+            path.write_text("{" if fault == "corrupt" else json.dumps(saved))
+            injected.append(True)
+        return queried(base, endpoint)
+
+    module.unresolved_stop_custody = faulted
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    spec = (spec_for(r2_case.launch) if stage == "replacement" else
+            spec_for(r2_case.launch, host="claude-code", session=session))
+    code = 3 if stage == "idempotent-recheck" else 2
+    result = run_main(control, r2_case.launch, spec, capsys, code)
+    error = result["error"] if code == 2 else result["entries"][0]["error"]
+    assert injected and REVIEW in error and "stop custody" in error
+    if fault == "pending":
+        assert "run hierarchy_launcher.py" in error and "stop --endpoint" in error
+    else:
+        assert str(path) in error and "manual reconciliation" in error and "mv -i --" in error
+        assert "obtain evidence with" not in error
+
+
+def test_r13_same_length_file_edit_before_publish_never_authorizes_signal(r2_case, capsys):
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module, changed = r2_case.module(False), []
+    syncing = module.os.fsync
+
+    def fsync(fd):
+        result = syncing(fd)
+        path = Path(os.readlink("/proc/self/fd/%d" % fd))
+        if not changed and stat.S_ISREG(os.fstat(fd).st_mode) and path.parent.name == ".stop-custody":
+            raw = path.read_bytes()
+            edited = raw.replace(b'"active": true', b'"active": null', 1)
+            assert len(edited) == len(raw) and edited != raw
+            path.write_bytes(edited)  # MODELLED same-length attacker write at the file-fsync boundary.
+            changed.append(True)
+        return result
+
+    module.os.fsync = fsync
+    code, refused = r2_case.stop(module, capsys, 0)
+    assert changed and code == 2 and "stop custody changed during durable commit" in refused["error"]
+    assert held.poll() is None and r2_case.projection.events == []
+
+
+def test_r13_published_file_identity_is_checked_on_the_opened_descriptor(r2_case, capsys):
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module(False)
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    opening, syncing, armed, swapped = module.os.open, module.os.fsync, [], []
+
+    def fsync(fd):
+        result = syncing(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and Path(os.readlink("/proc/self/fd/%d" % fd)) == path.parent:
+            armed.append(True)
+        return result
+
+    def replace_at_open(source, flags, *args, **kwargs):
+        if str(source) == "state.json" and armed and not swapped:
+            replacement = path.with_name("same-content.json")
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o600)
+            original = path.stat().st_ino
+            os.replace(replacement, path)
+            assert path.stat().st_ino != original
+            swapped.append(True)  # Actual inode replacement after lstat, before the descriptor read.
+        return opening(source, flags, *args, **kwargs)
+
+    module.os.open, module.os.fsync = replace_at_open, fsync
+    code, refused = r2_case.stop(module, capsys, 0)
+    assert swapped and code == 2 and "stop custody changed during durable commit" in refused["error"]
+    assert held.poll() is None and r2_case.projection.events == []
+
+
+def test_r13_recovery_syncs_legacy_directory_entries_before_effect(r2_case, capsys):
+    import stat
+
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    # A v1 journal has no evidence that an earlier writer synced its parent entries (including old writers).
+    module, events = r2_case.module(False), []
+    syncing = module.os.fsync
+
+    def fsync(fd):
+        result = syncing(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(Path(os.readlink("/proc/self/fd/%d" % fd)))
+        return result
+
+    module.os.fsync = fsync
+    r2_case.projection.after_signal.append(lambda pid, number: events.append("signal"))
+    code, stopped = r2_case.stop(module, capsys, 0)
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGKILL
+    for parent in (path.parent.parent, path.parent.parent.parent, path.parent.parent.parent.parent):
+        assert parent in events and events.index(parent) < events.index("signal")
+
+
+@pytest.mark.parametrize("tears", [1, 2])
+def test_r13_parent_read_retry_is_bounded(r2_case, capsys, tears):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module, reads = r2_case.module(False), []
+
+    def torn(path, physical):
+        if str(path) == "/proc/%d/stat" % held.pid:
+            reads.append(True)
+            if len(reads) <= 2 * tears and len(reads) % 2 == 0:
+                prefix, _, tail = physical.rpartition(b")")
+                words = tail.split()
+                words[1] = str(os.getpid() + 1).encode()
+                return prefix + b") " + b" ".join(words)
+        return physical
+
+    r2_case.projection.path_view(module, torn)
+    code, answer = r2_case.stop(module, capsys, 0)
+    assert code == (0 if tears == 1 else 3)
+    if tears == 1:
+        assert held.wait(timeout=5) == -signal.SIGTERM
+    else:
+        assert held.poll() is None and r2_case.projection.events == []
+        assert answer["unresolved_pids"] == [held.pid]
+
+
+@pytest.mark.parametrize("pidfds", [False, True], ids=["start-time", "pidfd"])
+def test_r7_interrupted_stop_recovers_real_orphan_without_an_outcome(r2_case, capsys, pidfds):
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    module = r2_case.module(pidfds)
+    recovery = r2_case.module(pidfds)  # Qualify capability before H is intentionally reaped.
+    worker = family["W"]
+
+    def interrupted(pid, number):
+        if pid == worker.pid and number == signal.SIGTERM:
+            # Independent physical fixture custody ends H/M; it does not enter the PUBLIC signal audit.
+            for label in ("H", "M"):
+                slot = next(slot for slot, entry in r2_case.custody.entries.items()
+                            if entry["pid"] == family[label].pid)
+                r2_case.custody.kill_owned(slot)
+            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
+            raise KeyboardInterrupt("modelled launcher loss with orphan")
+
+    r2_case.projection.after_signal.append(interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="modelled launcher loss with orphan"):
+            r2_case.stop(module, capsys, grace=0)
+    finally:
+        r2_case.projection.after_signal.remove(interrupted)
+    capsys.readouterr()
+    assert not r2_case.launch.records() and worker.poll() is None
+    assert r2_case.projection.events == [(worker.pid, signal.SIGTERM)]
+    code, stopped = r2_case.stop(recovery, capsys, grace=0)
+    assert code == 0 and stopped["state"] == "stopped" and worker.poll() == "CONFIRMED_EXIT"
+    assert stopped["pids"] == [worker.pid]
+
+
+def test_r7_failed_pre_effect_custody_write_sends_nothing(r2_case, capsys):
+    import errno
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+    module = r2_case.module()
+    replacing, faults = module.os.replace, []
+
+    def failed(source, target):
+        if Path(target).parent.name == ".stop-custody":
+            faults.append(str(target))
+            raise OSError(errno.EIO, "modelled custody write failure before effects")
+        return replacing(source, target)
+
+    module.os.replace = failed
+    code, refused = r2_case.stop(module, capsys, grace=0)
+    assert code == 2 and refused["state"] == "refused"
+    assert "modelled custody write failure before effects" in refused["error"]
+    assert faults and held.poll() is None and r2_case.projection.events == []
+    assert not Path(faults[0]).exists()
+
+
+def test_r7_failed_custody_write_after_term_retains_public_accounting(r2_case, capsys):
+    import errno
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+    module = r2_case.module()
+    replacing, faults, sent = module.os.replace, [], []
+
+    def failed(source, target):
+        if sent and Path(target).parent.name == ".stop-custody":
+            faults.append(str(target))
+            raise OSError(errno.EIO, "modelled persistent custody write failure after TERM")
+        return replacing(source, target)
+
+    module.os.replace = failed
+    r2_case.projection.after_signal.append(lambda pid, number: sent.append(pid)
+                                          if pid == held.pid and number == signal.SIGTERM else None)
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    assert faults and sent == [held.pid] and held.poll() is None
+    assert r2_case.projection.events == [(held.pid, signal.SIGTERM)]
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
+    assert stopped["unresolved_pids"] == [held.pid] and "custody write failure after TERM" in stopped["error"]
+    pending = json.loads(Path(faults[0]).read_text())
+    assert pending["active"] and pending["entries"][0]["attempted"]
+    code, recovered = r2_case.stop(r2_case.module(), capsys, grace=0)
+    assert code == 0 and recovered["state"] == "stopped" and recovered["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGKILL
+
+
+def test_r7_failed_terminal_custody_write_records_failure_with_attempted_pids(r2_case, capsys):
+    import errno
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module()
+    replacing, faults = module.os.replace, []
+
+    def failed(source, target):
+        if Path(target).parent.name == ".stop-custody" and not json.loads(Path(source).read_text())["active"]:
+            faults.append(str(target))
+            raise OSError(errno.EIO, "modelled terminal custody update failure")
+        return replacing(source, target)
+
+    module.os.replace = failed
+    code, stopped = r2_case.stop(module, capsys, grace=1)
+    assert faults and held.wait(timeout=5) == -signal.SIGTERM
+    assert code == 3 and stopped["state"] == "stop_failed" and stopped["pids"] == [held.pid]
+    assert "terminal custody update failure" in stopped["error"]
+    assert r2_case.launch.records()[-1] == stopped
+    assert json.loads(Path(faults[0]).read_text())["active"]
+
+
+@pytest.mark.parametrize("corruption", ["unknown-field", "duplicate-pid", "raw-hex", "inactive-invalid-entry",
+                                      "boot-mismatch", "boot-missing", "unknown-proof", "inactive-pending",
+                                      "boolean-generation"])
+def test_r7_corrupt_custody_refuses_before_any_new_signal(r2_case, capsys, corruption):
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    if corruption == "unknown-field":
+        saved["unknown"] = True
+    elif corruption == "duplicate-pid":
+        saved["entries"].append(saved["entries"][0].copy())
+    elif corruption == "raw-hex":
+        saved["entries"][0]["snapshot"]["cmdline"] = "not hex"
+    elif corruption == "inactive-invalid-entry":
+        saved["active"] = False
+        saved["entries"][0]["attempted"] = "unexpected"
+    elif corruption == "unknown-proof":
+        saved["entries"][0]["resolved"] = "modelled unrecognized proof"
+    elif corruption == "inactive-pending":
+        saved["active"] = False
+    elif corruption == "boolean-generation":
+        saved["binding"]["generation"] = True
+    else:
+        saved["boot"] = "modelled different boot" if corruption == "boot-mismatch" else None
+    raw = json.dumps(saved)
+    path.write_text(raw)
+    before = list(r2_case.projection.events)
+    code, refused = r2_case.stop(r2_case.module(), capsys, grace=0)
+    assert code == 2 and "error" in refused
+    assert path.read_text() == raw and r2_case.projection.events == before and held.poll() is None
+
+
+@pytest.mark.parametrize("attempted", [False, True], ids=["candidate", "attempted"])
+def test_r7_reused_pid_keeps_original_birth_across_recovery(r2_case, capsys, attempted):
+    if attempted:
+        held, path, saved = r7_pending_attempt(r2_case, capsys)
+    else:
+        session = str(uuid.uuid4())
+        r2_case.bind("claude-code", session)
+        held = r2_case.spawn(["claude", "--resume", session], ignore=True)
+        first = r2_case.module(pidfds=False)
+
+        def drift(pid, count, row):
+            return row._replace(start_time=str(int(row.start_time) + 1)) if pid == held.pid and count >= 2 else row
+
+        r2_case.projection.after_present.append(drift)
+        code, stopped = r2_case.stop(first, capsys, grace=0)
+        r2_case.projection.after_present.remove(drift)
+        assert code == 3 and stopped["pids"] == [] and r2_case.projection.events == []
+        path = first.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+        saved = json.loads(path.read_text())
+    birth = saved["entries"][0]["snapshot"]["start_time"]
+    before = list(r2_case.projection.events)
+
+    def replacement(pid, count, row):
+        # MODELLED replacement birth ONLY; the independent fixture always owns the real original child.
+        return row._replace(start_time=str(int(birth) + 1)) if pid == held.pid else row
+
+    r2_case.projection.after_present.append(replacement)
+    code, stopped = r2_case.stop(r2_case.module(pidfds=False), capsys, grace=0)
+    assert code == 3 and stopped["pids"] == ([held.pid] if attempted else [])
+    assert stopped["unresolved_pids"] == [held.pid] and held.poll() is None
+    assert r2_case.projection.events == before
+    pending = json.loads(path.read_text())
+    assert pending["entries"][0]["snapshot"]["start_time"] == birth
+    assert pending["entries"][0]["identity_lost"]
+    r2_case.projection.after_present.remove(replacement)
+    # Even actual later numeric absence cannot recover proof lost to an observed replacement.
+    r2_case.configs[0].with_suffix(".exit").touch()
+    assert held.wait(timeout=5) == 0
+    code, unresolved = r2_case.stop(r2_case.module(pidfds=False), capsys, grace=0)
+    assert code == 3 and unresolved["unresolved_pids"] == [held.pid]
+    assert r2_case.projection.events == before
+
+
+def test_r7_recovery_never_signals_an_excluded_ancestor(r2_case, capsys):
+    held, path, saved = r7_pending_attempt(r2_case, capsys)
+    before = list(r2_case.projection.events)
+    module = r2_case.module()
+    ancestors = module.ancestors
+    module.ancestors = lambda: ancestors() | {held.pid}  # MODELLED ancestor overlay at the OS boundary.
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    assert held.poll() is None and r2_case.projection.events == before
+    assert code == 3 and stopped["pids"] == [held.pid] and stopped["unresolved_pids"] == [held.pid]
+    assert json.loads(path.read_text())["active"] and saved["entries"][0]["attempted"]
+
+
+def test_r7_public_handoff_cannot_ignore_interrupted_orphan_custody(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    code, previous = r2_case.stop(r2_case.module(pidfds=False), capsys, grace=0)
+    assert code == 0 and previous["state"] == "not_running"
+    family = r2_case.spawn(["claude", "--resume", session], tree=True)
+    worker = family["W"]
+    stopping, discovery = r2_case.module(pidfds=False), r2_case.module(pidfds=False)
+
+    def interrupted(pid, number):
+        if pid == worker.pid and number == signal.SIGTERM:
+            # Independent physical custody, not public stop attempts, deliberately leaves the real W orphan.
+            for label in ("H", "M"):
+                slot = next(slot for slot, entry in r2_case.custody.entries.items()
+                            if entry["pid"] == family[label].pid)
+                r2_case.custody.kill_owned(slot)
+            assert family["H"].wait(timeout=5) == -signal.SIGKILL
+            wait_until(lambda: family["M"].poll() == "CONFIRMED_EXIT")
+            raise KeyboardInterrupt("modelled interruption before stop outcome")
+
+    r2_case.projection.after_signal.append(interrupted)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="modelled interruption before stop outcome"):
+            r2_case.stop(stopping, capsys, grace=0)
+    finally:
+        r2_case.projection.after_signal.remove(interrupted)
+    capsys.readouterr()
+    pending_path = stopping.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    pending = json.loads(pending_path.read_text())
+    assert pending["active"] and any(row["pid"] == worker.pid and row["attempted"] for row in pending["entries"])
+    assert worker.poll() is None and r2_case.projection.events == [(worker.pid, signal.SIGTERM)]
+    assert r2_case.launch.records()[-1] == previous
+    control = handoff_module()
+    control.hierarchy_launcher = discovery
+    spec = spec_for(r2_case.launch)
+    before = mailbox_files(r2_case.launch.base)
+    # A previous terminal record is insufficient while a newer attempted instance remains unresolved.
+    run_main(control, r2_case.launch, spec, capsys, 2)
+    assert mailbox_files(r2_case.launch.base) == before and worker.poll() is None
+
+
+@pytest.mark.parametrize("fault", ["active", "unreadable", "corrupt", "unknown-schema", "boot-mismatch",
+                                 "symlink", "dangling-symlink"])
+def test_r8_public_handoff_refuses_uncertain_custody_and_preserves_resources(r2_case, capsys, fault):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    module = r2_case.module(pidfds=False)
+    code, previous = r2_case.stop(module, capsys, grace=0)
+    assert code == 0 and previous["state"] == "not_running"
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    r13_seed_empty_journal(module, r2_case)
+    saved = json.loads(path.read_text())
+    if fault == "unreadable":
+        opening = module.os.open
+
+        def unreadable(source, *args, **kwargs):
+            if str(source) == "state.json" and kwargs.get("dir_fd") is not None:
+                raise PermissionError("modelled custody file read denial")
+            return opening(source, *args, **kwargs)
+        module.os.open = unreadable  # MODELLED descriptor I/O boundary, confined to this loaded reader.
+    elif fault in ("symlink", "dangling-symlink"):
+        target = path.with_name("untrusted.json")
+        if fault == "symlink":
+            target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+    elif fault == "corrupt":
+        path.write_text("{")
+    else:
+        if fault == "unknown-schema":
+            saved["schema"] = "aegis.hierarchy-stop-custody/unknown"
+        else:
+            saved["active"] = True
+            if fault == "boot-mismatch":
+                saved["boot"] = "modelled different boot"
+        path.write_text(json.dumps(saved))
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    spec = spec_for(r2_case.launch)
+    work = r2_case.launch.source / "retain-custody.txt"
+    work.write_text("test-owned worktree data")
+    login = r2_case.home / "codex" / "auth.json"
+    login.parent.mkdir()
+    login.write_text('{"test_owned": true}')
+    before = mailbox_files(r2_case.launch.base)
+    files = (work.read_bytes(), login.read_bytes())
+    answer = run_main(control, r2_case.launch, spec, capsys, 2)
+    assert "stop custody" in answer["error"]
+    assert mailbox_files(r2_case.launch.base) == before
+    assert (work.read_bytes(), login.read_bytes()) == files and r2_case.projection.events == []
+
+
+@pytest.mark.parametrize("scope", ["other-base", "other-endpoint"])
+@pytest.mark.parametrize("state", ["absent", "resolved"])
+def test_r8_handoff_ignores_unrelated_custody(r2_case, capsys, scope, state):
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    module = r2_case.module(pidfds=False)
+    code, previous = r2_case.stop(module, capsys, grace=0)
+    assert code == 0 and previous["state"] == "not_running"
+    launches = module.Launches(str(r2_case.launch.base))
+    own = launches.folder(REVIEW) / ".stop-custody" / "state.json"
+    r13_seed_empty_journal(module, r2_case)
+    saved = json.loads(own.read_text())
+    if state == "absent":
+        own.unlink()
+    if scope == "other-base":
+        folder = r2_case.launch.tmp / "unrelated-base" / "launches" / module.quoted(REVIEW) / ".stop-custody"
+    else:
+        folder = launches.folder("pilot/lane/f2") / ".stop-custody"
+    folder.mkdir(parents=True, mode=0o700)
+    unrelated = folder / "state.json"
+    saved["active"] = True  # Negative-only modelled pending custody; never signal authority.
+    unrelated.write_text(json.dumps(saved))
+    unrelated.chmod(0o600)
+    raw = unrelated.read_bytes()
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    answer = run_main(control, r2_case.launch, spec_for(r2_case.launch), capsys, 0)
+    assert answer["entries"][0]["generation"] == 2 and unrelated.read_bytes() == raw
+    assert r2_case.projection.events == []
+
+
+def test_r8_handoff_refuses_custody_disappearing_during_its_read(r2_case, capsys):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module(pidfds=False)
+    code, previous = r2_case.stop(module, capsys, grace=0)
+    assert code == 0 and previous["state"] == "not_running"
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    r13_seed_empty_journal(module, r2_case)
+    reading, deleted = module.read_json, []
+
+    def disappeared(source):
+        if Path(source) == r2_case.launch.base / "provision.json" and path.exists():
+            path.unlink()  # MODELLED file loss after the consumer's initial positive existence observation.
+            deleted.append(True)
+        return reading(source)
+
+    module.read_json = disappeared
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    spec = spec_for(r2_case.launch)
+    before = mailbox_files(r2_case.launch.root)
+    result = run_main(control, r2_case.launch, spec, capsys, 2)
+    assert deleted == [True] and "stop custody" in result["error"]
+    assert mailbox_files(r2_case.launch.root) == before and r2_case.projection.events == []
+
+
+@pytest.mark.parametrize("stage", ["preflight", "recheck"])
+def test_r8_idempotent_handoff_also_checks_custody(r2_case, capsys, stage):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    r2_case.bind("claude-code", str(uuid.uuid4()))
+    module = r2_case.module(pidfds=False)
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    assert code == 0 and stopped["state"] == "not_running"
+    control = handoff_module()
+    control.hierarchy_launcher = module
+    spec = spec_for(r2_case.launch)
+    assert run_main(control, r2_case.launch, spec, capsys, 0)["entries"][0]["generation"] == 2
+    code, stopped = r2_case.stop(module, capsys, grace=0)
+    assert code == 0 and stopped["state"] == "not_running"
+    path = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    r13_seed_empty_journal(module, r2_case)
+    saved = json.loads(path.read_text())
+    saved["active"] = True
+    before = mailbox_files(r2_case.launch.root)
+    queried, inject = module.unresolved_stop_custody, []
+
+    def during_read(base, endpoint):
+        if not inject and (stage == "preflight" or (r2_case.launch.root / ".write.lock").exists()):
+            path.write_text(json.dumps(saved))  # MODELLED pending custody appears at this reader boundary.
+            inject.append(True)
+        return queried(base, endpoint)
+
+    module.unresolved_stop_custody = during_read
+    expected = 2 if stage == "preflight" else 3  # Existing mid-batch refusal contract preserves prior entries.
+    result = run_main(control, r2_case.launch, spec, capsys, expected)
+    error = result["error"] if expected == 2 else result["entries"][0]["error"]
+    assert inject == [True] and "stop custody" in error
+    assert mailbox_files(r2_case.launch.root) == before and r2_case.projection.events == []
 
 
 @pytest.mark.parametrize("with_host", [False, True])
@@ -299,7 +1371,11 @@ def test_ps_fallback_ignores_unrelated_quotes(monkeypatch, noise):
                              "123 123 1 {uid} {uid} S Sat Nov 7 12:00:00 2026 /opt/codex exec resume {session} {noise}\n").format(
                                  uid=os.geteuid(), noise=noise, session=session)))
 
-    assert module.session_processes(session, set()) == []
+    observed = {}
+    assert module.session_processes(session, set(), observed=observed) == []
+    assert observed["coverage"] == "argv_boundaries_unavailable"
+    with pytest.raises(TypeError, match="process census unresolved"):
+        module.session_processes(session, set())
 
 
 def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
@@ -315,8 +1391,12 @@ def test_ps_fallback_does_not_reconstruct_paths_with_spaces(monkeypatch):
                             (os.geteuid(), os.geteuid(), session)))
     unowned = []
 
-    assert module.session_processes(session, set(), "codex-cli", unowned) == []
+    observed = {}
+    assert module.session_processes(session, set(), "codex-cli", unowned, observed) == []
+    assert observed["coverage"] == "argv_boundaries_unavailable"
     assert unowned == [123]
+    with pytest.raises(TypeError, match="process census unresolved"):
+        module.session_processes(session, set(), "codex-cli")
 
 
 @pytest.mark.parametrize("argv,matched", [
@@ -562,8 +1642,12 @@ def test_ps_fallback_checks_uid_and_positional_selectors(monkeypatch, uid_offset
         stdout="123 123 1 %d %d S Sat Nov 7 12:00:00 2026 %s\n" %
                (os.geteuid() + uid_offset, os.geteuid() + uid_offset, arguments.format(session=session))))
     unowned = []
-    assert module.session_processes(session, set(), "claude-code", unowned) == []
+    observed = {}
+    assert module.session_processes(session, set(), "claude-code", unowned, observed) == []
+    assert observed["coverage"] == "argv_boundaries_unavailable"
     assert unowned == [123]
+    with pytest.raises(TypeError, match="process census unresolved"):
+        module.session_processes(session, set(), "claude-code")
 
 
 @pytest.mark.parametrize("uid_offset", [0, 1])
@@ -1386,6 +2470,9 @@ class R2Case:
         try:
             root = self.custody.launch(config, root_slot, self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        argv=command)
+            root.capture_trace_path = self.launch.tmp / ("capture-%d-evidence.json" % root.pid)
+            root.capture_event("captured")
+            root.start_capture()
             self.admit(root_slot, root, ["codex", "exec", "resume", session] if session else None)
             if session:
                 self.custody.await_event(tag + "R", "hello")
@@ -2178,6 +3265,272 @@ def test_r2_projection_runner_uses_the_public_stop_entrypoint(r2_case):
     assert err == "" and runner.returncode == 0, out + err
     answer = json.loads(out)
     assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+@pytest.mark.parametrize("caller", [False, True], ids=["direct", "through-caller"])
+def test_r9_public_runner_capture_drains_before_communicate(r2_case, caller):
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    held = r2_case.spawn(["codex", "exec", "resume", session])
+    root, _ = r2_case.runner(session=session if caller else None, action="burst")
+    slot = next(slot for slot, entry in r2_case.custody.entries.items() if entry["pid"] == root.pid)
+    completed_output = r2_case.custody.folder / (slot + ".capture-ready")
+    # This is a transport liveness guard, not a wall-clock performance assertion. The real writer must
+    # finish both streams while the fixture stages observations, before communicate begins draining.
+    wait_until(completed_output.exists)
+    out, err = root.communicate(timeout=5)
+    assert root.returncode == 0 and err == "E" * (2 * 1024 * 1024)
+    assert out.startswith(" " * (2 * 1024 * 1024))
+    answer = json.loads(out)
+    assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+
+
+def test_r9_identical_checkpoint_does_not_repeat_durable_io(r2_case, capsys):
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module()
+    journal = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    syncing, commits, before_effect = module.os.fsync, [], []
+
+    def fsync(descriptor):
+        answer = syncing(descriptor)
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) and Path(os.readlink("/proc/self/fd/%d" % descriptor)) == journal.parent:
+            commits.append(json.loads(journal.read_text()))
+        return answer
+
+    def sent(pid, number):
+        if pid == held.pid and number == signal.SIGTERM:
+            before_effect.extend(commits)
+
+    module.os.fsync = fsync
+    r2_case.projection.after_signal.append(sent)
+    code, stopped = r2_case.stop(module, capsys)
+    assert code == 0 and stopped["state"] == "stopped" and held.wait(timeout=5) == -signal.SIGTERM
+    assert len(before_effect) == 1, "the A checkpoint carries C; no separate candidate checkpoint is needed"
+    assert before_effect[0]["active"] and before_effect[0]["entries"][0]["attempted"]
+
+
+def test_r9_a_commit_changed_during_fsync_refuses_before_signalling(r2_case, capsys):
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module()
+    journal = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    syncing, changed = module.os.fsync, []
+
+    def fsync(descriptor):
+        syncing(descriptor)
+        if (not changed and stat.S_ISDIR(os.fstat(descriptor).st_mode) and
+                Path(os.readlink("/proc/self/fd/%d" % descriptor)) == journal.parent):
+            # MODELLED unexpected file update at the OS boundary; never affirmative host evidence.
+            with journal.open("ab") as stream:
+                stream.write(b"\n")
+            changed.append(True)
+
+    module.os.fsync = fsync
+    code, answer = r2_case.stop(module, capsys)
+    assert changed and code == 2
+    assert answer["error"] == "stop custody unavailable: stop custody changed during durable commit"
+    assert answer["state"] == "refused" and "pids" not in answer
+    assert r2_case.projection.events == [] and held.poll() is None
+
+
+def test_r9_visible_checkpoint_from_failed_fsync_is_not_a_durable_cache(r2_case, capsys):
+    import errno
+    import stat
+
+    session = str(uuid.uuid4())
+    r2_case.bind("claude-code", session)
+    held = r2_case.spawn(["claude", "--resume", session])
+    module = r2_case.module()
+    journal = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    syncing, failed = module.os.fsync, []
+
+    def fsync(descriptor):
+        if (not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode) and
+                Path(os.readlink("/proc/self/fd/%d" % descriptor)) == journal.parent):
+            failed.append(True)
+            raise OSError(errno.EIO, "modelled directory fsync failure")
+        return syncing(descriptor)
+
+    module.os.fsync = fsync
+    code, answer = r2_case.stop(module, capsys)
+    assert code == 2 and answer["error"] == "stop custody unavailable: [Errno 5] modelled directory fsync failure"
+    assert answer["state"] == "refused" and "pids" not in answer
+    assert failed and journal.exists() and held.poll() is None and r2_case.projection.events == []
+    recovered, committed = r2_case.module(), []
+    syncing = recovered.os.fsync
+
+    def committed_fsync(descriptor):
+        result = syncing(descriptor)
+        if (stat.S_ISDIR(os.fstat(descriptor).st_mode) and
+                Path(os.readlink("/proc/self/fd/%d" % descriptor)) == journal.parent):
+            committed.append(json.loads(journal.read_text()))
+        return result
+
+    recovered.os.fsync = committed_fsync
+    r2_case.projection.after_signal.append(lambda pid, number: committed.append("signal"))
+    code, stopped = r2_case.stop(recovered, capsys)
+    assert code == 0 and stopped["pids"] == [held.pid] and held.wait(timeout=5) == -signal.SIGTERM
+    assert committed[0]["active"] and committed[0]["entries"][0]["attempted"]
+    assert committed.index("signal") >= 1
+
+
+class R10Interrupted(BaseException):
+    """MODELLED launcher loss after a real OS durability barrier; fixture custody remains independent."""
+
+
+def r10_observe_fsync(module, journal, events, interrupt=None):
+    import stat
+    import time
+
+    syncing = module.os.fsync
+
+    def fsync(descriptor):
+        path = Path(os.readlink("/proc/self/fd/%d" % descriptor))
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        if kind == "directory" and path in journal.parents and path != journal.parent and not journal.exists():
+            phase = "initialize"
+        elif path == journal.parent or path.parent == journal.parent:
+            data = json.loads((journal if kind == "directory" else path).read_text())
+            phase = ("clear" if not data["active"] else "resolved-active" if
+                     all(row["resolved"] for row in data["entries"]) else "A" if
+                     any(row["attempted"] for row in data["entries"]) else "C")
+        else:
+            phase = "outcome"
+        start = time.monotonic_ns()
+        result = syncing(descriptor)
+        events.append(dict(phase=phase, kind=kind, elapsed_ms=(time.monotonic_ns() - start) / 1e6))
+        if (phase, kind) == interrupt:
+            raise R10Interrupted("modelled interruption after %s/%s" % interrupt)
+        return result
+
+    module.os.fsync = fsync
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+def test_r10_ordinary_stop_has_six_durable_barriers_plus_initialization(r2_case, capsys, host):
+    import time
+
+    session = str(uuid.uuid4())
+    r2_case.bind(host, session)
+    held = r2_case.spawn(["claude", "--resume", session] if host == "claude-code" else
+                         ["codex", "exec", "resume", session])
+    module = r2_case.module()
+    journal = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    events = []
+    r10_observe_fsync(module, journal, events)
+    start = time.monotonic_ns()
+    code, stopped = r2_case.stop(module, capsys)
+    elapsed = (time.monotonic_ns() - start) / 1e6
+    (r2_case.launch.tmp / "r10-cost-evidence.json").write_text(json.dumps(
+        dict(host=host, elapsed_ms=elapsed, fsync_count=len(events), fsyncs=events)) + "\n")
+    assert code == 0 and stopped["state"] == "stopped" and stopped["pids"] == [held.pid]
+    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert r2_case.launch.records() == [stopped]
+    assert [(event["phase"], event["kind"]) for event in events] == [
+        ("initialize", "directory"), ("initialize", "directory"), ("initialize", "directory"),
+        ("A", "file"), ("A", "directory"),
+        ("outcome", "file"), ("outcome", "directory"), ("clear", "file"), ("clear", "directory")]
+
+
+@pytest.mark.parametrize("phase,kind,live,journal_state", [
+    ("initialize", "directory", True, None),
+    ("A", "file", True, None), ("A", "directory", True, True),
+    ("outcome", "file", False, True), ("outcome", "directory", False, True),
+    ("clear", "file", False, True), ("clear", "directory", False, False),
+])
+def test_r10_interrupted_barriers_keep_stop_and_handoff_safe(r2_case, capsys, phase, kind, live, journal_state):
+    from tests.integration.test_hierarchy_handoff import mailbox_files
+    from tests.integration.test_hierarchy_handoff_stop_evidence import handoff_module, run_main, spec_for
+
+    session = str(uuid.uuid4())
+    # A real managed start makes stop evidence mandatory; unmanaged caller-asserted legacy behavior is separate.
+    assert r2_case.launch.start(thread=session, cwd=str(r2_case.launch.source))["session"] == session
+    held = r2_case.spawn(["codex", "exec", "resume", session])
+    module = r2_case.module(pidfds=False)
+    journal = module.Launches(str(r2_case.launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
+    events = []
+    r10_observe_fsync(module, journal, events, (phase, kind))
+    with pytest.raises(R10Interrupted, match="^modelled interruption after %s/%s$" % (phase, kind)):
+        r2_case.stop(module, capsys)
+    capsys.readouterr()
+    if live:
+        physical = r2_kernel_process(held.pid)
+        receipt = r2_case.projection.receipts[str(held.pid)]
+        assert not physical["state"].startswith(("Z", "X"))
+        assert physical["birth"] == receipt["birth"] and physical["digest"] == receipt["digest"]
+        assert physical["uid"] == physical["euid"] == os.geteuid()
+    else:
+        # Sending TERM / observing a pidfd does not mean this parent's non-blocking wait has reaped yet.
+        # Establish the actual native wait PID/status before asserting any post-effect "not live" row.
+        assert held.wait(timeout=5) == -signal.SIGTERM
+        assert held.native_wait_evidence["wait_pid"] == held.pid
+    assert (held.poll() is None) is live
+    if journal_state is None:
+        assert not journal.exists()
+    else:
+        assert json.loads(journal.read_text())["active"] is journal_state
+    assert r2_case.projection.events == ([] if live else [(held.pid, signal.SIGTERM)])
+    control = handoff_module()
+    control.hierarchy_launcher = r2_case.module(pidfds=False)
+    spec, before = spec_for(r2_case.launch), mailbox_files(r2_case.launch.base)
+    if journal_state is not False:
+        refused = run_main(control, r2_case.launch, spec, capsys, 2)
+        assert ("stop custody unresolved" if journal_state else
+                "a stopped or not_running stop record is required") in refused["error"]
+        assert mailbox_files(r2_case.launch.base) == before
+        if live:
+            assert not r2_kernel_process(held.pid)["state"].startswith(("Z", "X"))
+            assert held.poll() is None and r2_case.projection.events == []
+    code, recovered = r2_case.stop(r2_case.module(pidfds=False), capsys)
+    assert code == 0 and recovered["state"] == ("not_running" if journal_state is False else "stopped")
+    assert recovered["pids"] == ([] if journal_state is False else [held.pid])
+    assert held.wait(timeout=5) == -signal.SIGTERM
+    assert not json.loads(journal.read_text())["active"]
+    granted = run_main(control, r2_case.launch, spec, capsys, 0)
+    assert granted["entries"][0]["generation"] == 2
+
+
+@pytest.mark.parametrize("phase,kind", [("outcome", "file"), ("outcome", "directory"),
+                                      ("clear", "file"), ("clear", "directory")])
+def test_r11_crash_cuts_observe_exit_before_asserting_dead(r2_case, capsys, monkeypatch, phase, kind):
+    import select
+
+    spawning, delayed, held_children = r2_case.spawn, [], []
+
+    def spawn(*args, **kwargs):
+        held = spawning(*args, **kwargs)
+        held_children.append(held)
+        polling = held.poll
+
+        def poll():
+            # MODELLED one delayed WNOHANG result at the Popen observation boundary. The pidfd first proves
+            # the REAL original exit; no status/UID/birth/argv or signal authority is fabricated.
+            if not delayed and held.native_handle is not None:
+                watcher = select.poll()
+                watcher.register(held.native_handle, select.POLLIN)
+                if watcher.poll(0):
+                    delayed.append(held.pid)
+                return None
+            return polling()
+
+        held.poll = poll
+        return held
+
+    monkeypatch.setattr(r2_case, "spawn", spawn)
+    test_r10_interrupted_barriers_keep_stop_and_handoff_safe(r2_case, capsys, phase, kind, False, True if
+                                                           (phase, kind) != ("clear", "directory") else False)
+    [held] = held_children
+    assert delayed == [held.pid], "fixture prerequisite: one actual exited-child poll was deferred"
+    assert held.native_wait_evidence["wait_pid"] == held.pid
     assert held.wait(timeout=5) == -signal.SIGTERM
 
 

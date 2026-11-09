@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 import select
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -64,7 +65,7 @@ if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import (Mailbox, endpoint_parts, fields, integer, read_json, require, safe_path, text,  # noqa: E402
+from hierarchy_mailbox import (Mailbox, endpoint_parts, fields, integer, read_json, require, safe_path, strict_json, text,  # noqa: E402
                                timestamp)
 from hierarchy_provision import CLAUDE, CODEX, NATIVE, SESSION, add_role, claude_start, codex_start  # noqa: E402
 import hierarchy_hosts  # noqa: E402
@@ -81,6 +82,8 @@ MAX_RECORDS = 10000
 DEFAULT_START_TIMEOUT_SECONDS = 300
 KILL_WAIT_SECONDS = 5.0
 POLL_SECONDS = 0.05
+STOP_EXIT_PROOFS = ("original_pidfd_exit", "qualified_namespace_ESRCH", "matching_birth_zombie",
+                    "matching_partial_birth_zombie", "confirmed_instance_exit", "signal_ESRCH")
 # The mailbox writer lock is held only for a moment; a start already paid for should outlast that.
 BIND_WAIT_SECONDS = 10.0
 INTERRUPTS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGHUP") if hasattr(signal, name))
@@ -659,6 +662,386 @@ class ProcessCensus(list):
         self.unavailable = unavailable or {}
 
 
+@contextmanager
+def directory_descriptor(path, create=False, durable_from=None):
+    """Pin every directory in the chain. A pathname check cannot protect a subsequent open."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts, "invalid directory path")
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current = current / part
+            if create:
+                made = False
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                else:
+                    made = True
+                if made or (durable_from is not None and
+                            (current == durable_from or durable_from in current.parents)):
+                    # Also repeat initialization after a crash which made the entry but never synced it.
+                    os.fsync(fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def stop_endpoint_lock(root, endpoint):
+    """Shared with handoff. Lock order: mailbox writer (handoff only), endpoint, custody.
+
+    Bindings already have a directory. Locking that inode creates no file for an otherwise no-op stop.
+    Direct mailbox bind/draft callers are outside this serialization contract.
+    """
+    import fcntl
+
+    endpoint_parts(endpoint)
+    with directory_descriptor(Path(root) / "bindings" / endpoint) as fd:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("stop custody endpoint is busy: " + endpoint) from exc
+        yield
+
+
+def custody_refusal(base, endpoint, cause=None):
+    import shlex
+
+    path = Path(base) / "launches" / quoted(endpoint) / ".stop-custody" / "state.json"
+    command = shlex.join(["hierarchy_launcher.py", "--base", str(base), "stop", "--endpoint", endpoint])
+    if cause is None:
+        return "stop custody unresolved for %s; run %s" % (endpoint, command)
+    return ("stop custody unavailable for %s: %s; inspect %s; manual reconciliation: preserve this file and "
+            "its process/boot evidence, have the owner verify every original instance has exited, then archive "
+            "with %s; retry %s" % (endpoint, cause, path, shlex.join([
+                "mv", "-i", "--", str(path), str(Path(base) / ("reconciled-stop-custody-" + quoted(endpoint) + ".json"))]),
+                                   command))
+
+
+def require_resolved_custody(base, endpoint):
+    require(not unresolved_stop_custody(base, endpoint), custody_refusal(base, endpoint))
+
+
+class StopCustody:
+    """Endpoint-local, pre-effect custody. A lost launcher must not lose a possibly signalled orphan.
+
+    Descriptors cannot survive a new invocation. Recovery therefore uses the original boot/birth/raw/UID
+    evidence and retains the numeric-PID residual race; an observed replacement latches loss of identity.
+    The lock serializes read/merge/write, and the hidden subdirectory is outside immutable launch records.
+    """
+
+    def __init__(self, launches, endpoint, binding, create=True):
+        self.base, self.endpoint = launches.base, endpoint
+        self.folder = safe_path(launches.folder(endpoint) / ".stop-custody")
+        self.path, self.binding = self.folder / "state.json", binding
+        self.fd, self.directory_fd = None, None
+        self.entered = False
+
+    def __enter__(self):
+        self.entered = True
+        if self.folder.exists():
+            self.lock()
+        return self
+
+    def lock(self):
+        # Only the POSIX stop writer needs flock; read-only consumers must remain importable without it.
+        import fcntl
+
+        with directory_descriptor(self.folder) as directory:
+            self.fd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            self.private(os.fstat(self.fd))
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("stop custody is busy") from exc
+            return self
+        except BaseException:
+            os.close(self.fd)
+            self.fd = None
+            raise
+
+    def __exit__(self, *unused):
+        if self.fd is not None:
+            os.close(self.fd)
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+
+    @staticmethod
+    def private(info):
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1, "invalid stop custody file")
+
+    @staticmethod
+    def boot():
+        path = Path("/proc/sys/kernel/random/boot_id")
+        return path.read_text().strip() if Path("/proc").is_dir() else None
+
+    @staticmethod
+    def encode(facts):
+        return {key: value.hex() if key == "cmdline" else value for key, value in facts.items()}
+
+    @staticmethod
+    def decode(facts):
+        require(isinstance(facts, dict), "invalid stop custody evidence")
+        allowed = set(ProcessSnapshot._fields) | {"coherent_birth", "exit_observed"}
+        require(facts.keys() <= allowed, "unexpected stop custody evidence")
+        facts = dict(facts)
+        for key, value in facts.items():
+            if key in ("pid", "pgid", "ppid", "uid", "euid"):
+                require(type(value) is int and value >= 0, "invalid stop custody " + key)
+            elif key in ("coherent_birth", "exit_observed"):
+                require(type(value) is bool, "invalid stop custody " + key)
+            elif key == "argv":
+                require(isinstance(value, list) and all(isinstance(word, str) and "\0" not in word for word in value),
+                        "invalid stop custody argv")
+                facts[key] = tuple(value)
+            elif key == "cmdline":
+                require(isinstance(value, str) and re.fullmatch(r"(?:[0-9a-f]{2})*", value) is not None,
+                        "invalid stop custody cmdline")
+                facts[key] = bytes.fromhex(value)
+            elif key == "state":
+                require(isinstance(value, str) and value in tuple("RSDZTtXxKWPI") and len(value) == 1,
+                        "invalid stop custody state")
+            elif key == "start_time":
+                require(isinstance(value, str) and re.fullmatch(r"[0-9]+", value) is not None,
+                        "invalid stop custody start_time")
+            else:
+                require(isinstance(value, str) and value and "\0" not in value, "invalid stop custody " + key)
+        return facts
+
+    def read(self):
+        try:
+            return self.read_evidence()
+        except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+            raise ValueError(custody_refusal(self.base, self.endpoint, exc)) from exc
+
+    def read_evidence(self):
+        """Read and validate without creating a directory/lock or interpreting unreadability as absence."""
+        try:
+            with directory_descriptor(self.folder) as directory:
+                directory_info = os.fstat(directory)
+                require(directory_info.st_uid == os.geteuid() and stat.S_IMODE(directory_info.st_mode) == 0o700,
+                        "invalid stop custody directory")
+                try:
+                    fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                    try:
+                        info = os.fstat(fd)
+                        self.private(info)
+                        with os.fdopen(os.dup(fd), "rb") as stream:
+                            raw = stream.read(262145)
+                        require(len(raw) <= 262144 and raw.isascii(), "invalid stop custody bytes: bounded ASCII required")
+                        require(self.identity(os.fstat(fd)) == self.identity(info), "stop custody changed while reading")
+                    finally:
+                        os.close(fd)
+                finally:
+                    # Missing state is absence only when the pinned directory remained unchanged too.
+                    require(self.identity(os.fstat(directory)) == self.identity(directory_info),
+                            "stop custody directory changed while reading")
+        except FileNotFoundError:
+            return None
+        saved = strict_json(raw.decode("ascii"))
+        fields(saved, ("schema", "binding", "boot", "active", "entries", "coverage"))
+        require(saved["schema"] == "aegis.hierarchy-stop-custody/v1" and type(saved["active"]) is bool and
+                isinstance(saved["entries"], list) and len(saved["entries"]) <= MAX_RECORDS and
+                saved["coverage"] in (None, "argv_boundaries_unavailable"), "invalid stop custody")
+        fields(saved["binding"], ("host", "session", "generation"))
+        require(saved["binding"]["host"] in hierarchy_hosts.TEAM_HOSTS and
+                isinstance(saved["binding"]["session"], str) and SESSION.fullmatch(saved["binding"]["session"]),
+                "invalid stop custody binding")
+        integer(saved["binding"]["generation"], "stop custody generation")
+        entries, seen = [], set()
+        for entry in saved["entries"]:
+            fields(entry, ("pid", "snapshot", "partial", "attempted", "blocked", "identity_lost", "resolved"))
+            pid = entry["pid"]
+            require(type(pid) is int and pid > 0 and pid not in seen, "invalid stop custody pid")
+            seen.add(pid)
+            require(all(type(entry[key]) is bool for key in ("attempted", "blocked", "identity_lost")) and
+                    (entry["resolved"] is None or entry["resolved"] in STOP_EXIT_PROOFS), "invalid stop custody state")
+            facts = self.decode(entry["snapshot"]) if entry["snapshot"] is not None else None
+            if facts is not None:
+                require(facts.keys() == set(ProcessSnapshot._fields) and facts["pid"] == pid,
+                        "invalid stop custody snapshot")
+            require(not entry["attempted"] or facts is not None, "attempted stop custody has no identity")
+            entries.append((entry, ProcessSnapshot(**facts) if facts is not None else None,
+                            self.decode(entry["partial"])))
+        # Inactive evidence is still validated. A corrupt file is never an absent configuration.
+        if not saved["active"]:
+            require(saved["coverage"] is None and all(entry["resolved"] for entry, _, _ in entries),
+                    "inactive stop custody has unresolved evidence")
+        boot = self.boot()
+        require(isinstance(saved["boot"], str) and saved["boot"] and boot is not None,
+                "stop custody boot identity unavailable")
+        if saved["boot"] != boot:
+            require(not saved["active"], "stop custody boot changed with active evidence: " + str(self.path))
+        else:
+            for entry, expected, partial in entries:
+                if not entry["resolved"]:
+                    continue
+                current = read_process(entry["pid"])
+                if current.kind == "CONFIRMED_ABSENT" and not entry["identity_lost"]:
+                    continue
+                row = current.snapshot if current.kind == "PRESENT" else None
+                birth = expected.start_time if expected is not None else partial.get("start_time")
+                require(row is not None and birth == row.start_time and row.state.startswith("Z"),
+                        "resolved stop custody lacks physical exit proof for pid %d" % entry["pid"])
+        return saved, entries
+
+    def restore(self, observed, attempted):
+        retained = self.read()
+        if retained is None:
+            return
+        saved, entries = retained
+        if not saved["active"]:
+            return
+        require(saved["binding"] == self.binding, "unresolved stop custody belongs to another binding")
+        for entry, expected, partial in entries:
+            pid = entry["pid"]
+            current = observed["census"].get(pid)
+            observed["candidates"][pid] = expected
+            observed["initial_unavailable"][pid] = partial
+            if entry["attempted"]:
+                attempted.add(pid)
+            for key in ("blocked", "identity_lost"):
+                if entry[key]:
+                    observed[key].add(pid)
+            if entry["resolved"]:
+                observed["resolved"][pid] = entry["resolved"]
+                observed["unresolved"].pop(pid, None)
+            else:
+                unresolved(observed, pid, "recovery", "original_instance_pending")
+            if expected is not None and current is not None and (
+                    (current.start_time, current.cmdline, current.uid, current.euid) !=
+                    (expected.start_time, expected.cmdline, expected.uid, expected.euid) or
+                    (not entry["attempted"] and current.pgid != expected.pgid)):
+                if current.start_time != expected.start_time:
+                    observed["identity_lost"].add(pid)
+                observed["blocked"].add(pid)
+                observed["resolved"].pop(pid, None)
+                unresolved(observed, pid, "recovery", "original_instance_replaced")
+        if saved["coverage"]:
+            observed["coverage"] = saved["coverage"]
+
+    def save(self, observed, attempted, active=True):
+        entries = []
+        for pid, row in sorted(observed["candidates"].items()):
+            entries.append(dict(pid=pid, snapshot=self.encode(row._asdict()) if row is not None else None,
+                                partial=self.encode(observed["initial_unavailable"].get(pid, {})),
+                                attempted=pid in attempted, blocked=pid in observed["blocked"],
+                                identity_lost=pid in observed["identity_lost"], resolved=observed["resolved"].get(pid)))
+        data = dict(schema="aegis.hierarchy-stop-custody/v1", binding=self.binding, boot=self.boot(), active=active,
+                    entries=entries, coverage=observed.get("coverage"))
+        raw = (json.dumps(data, sort_keys=True) + "\n").encode("utf-8")
+        require(len(entries) <= MAX_RECORDS and len(raw) <= 262144, "stop custody exceeds evidence limit")
+        # No acknowledged-byte cache: every request here is an actual transition or pre-effect barrier.
+        with directory_descriptor(self.folder, create=True,
+                                  durable_from=self.folder.parent.parent if self.directory_fd is None else None) as directory:
+            info = os.fstat(directory)
+            require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                    "invalid stop custody directory")
+            if self.directory_fd is None:
+                # v1 has no durable-parent receipt. Revalidate initialization once per writer, including
+                # recovery from old/failed writers; pin the inode through every subsequent checkpoint.
+                self.directory_fd = os.dup(directory)
+            else:
+                require(self.directory_identity(info) == self.directory_identity(os.fstat(self.directory_fd)),
+                        "stop custody directory changed during durable commit")
+        if self.entered and self.fd is None:
+            self.lock()
+        temporary = self.folder / ("." + uuid.uuid4().hex + ".tmp")
+        fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+                written = os.fstat(stream.fileno())
+            os.replace(temporary, self.path)
+            published = self.commit_identity()
+            require(published[:3] == (written.st_dev, written.st_ino, len(raw)),
+                    "stop custody changed during durable commit")
+            directory = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                require(self.directory_identity(os.fstat(directory)) ==
+                        self.directory_identity(os.fstat(self.directory_fd)),
+                        "stop custody directory changed during durable commit")
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            require(self.commit_identity() == published and self.read_committed_bytes(published) == raw,
+                    "stop custody changed during durable commit")
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def commit_identity(self):
+        info = safe_path(self.path).lstat()
+        self.private(info)
+        return self.identity(info)
+
+    @staticmethod
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                info.st_mode, info.st_uid, info.st_nlink)
+
+    @staticmethod
+    def directory_identity(info):
+        return info.st_dev, info.st_ino
+
+    def read_committed_bytes(self, expected):
+        with directory_descriptor(self.folder) as directory:
+            require(self.directory_identity(os.fstat(directory)) ==
+                    self.directory_identity(os.fstat(self.directory_fd)),
+                    "stop custody directory changed during durable commit")
+            fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                self.private(info)
+                raw = os.read(fd, 262145)
+                require(self.identity(info) == expected and self.identity(os.fstat(fd)) == expected,
+                        "stop custody changed during durable commit")
+                return raw
+            finally:
+                os.close(fd)
+
+
+def unresolved_stop_custody(base, endpoint):
+    """Read-only consumer check. False means absent or validated resolved custody; unknown always refuses.
+
+    The explicit base/endpoint confines discovery. A session-only census cannot find an orphan retained by
+    an interrupted stop, and checking this must not create state in a legacy base with no custody file.
+    """
+    try:
+        base = safe_path(text(base, "base"))
+        endpoint_parts(endpoint)
+        path = safe_path(base / "launches" / quoted(endpoint) / ".stop-custody" / "state.json")
+        present = True
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            present = False
+            try:
+                path.parent.lstat()
+            except FileNotFoundError:
+                return False
+        launches = Launches(str(base))
+        # Schema/boot validation is independent from restoring signal authority for the current binding.
+        # Any active custody blocks a consumer, including custody left by an earlier binding.
+        retained = StopCustody(launches, endpoint, None, create=False).read()
+        require(retained is not None or not present, "stop custody disappeared while reading")
+        return retained[0]["active"] if retained is not None else False
+    except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
+        if str(exc).startswith("stop custody unavailable for " + endpoint + ":"):
+            raise
+        raise ValueError(custody_refusal(base, endpoint, exc)) from exc
+
+
 def ps_census(pid=None):
     command = ["ps", "-p", str(pid)] if pid is not None else ["ps", "-ax"]
     shown = subprocess.run([*command, "-ww", "-o", "pid=,pgid=,ppid=,ruid=,uid=,stat=,lstart=,args="],
@@ -689,7 +1072,15 @@ def process_existence(pid, reason, partial=None):
 
 
 def read_process(pid, argv_boundaries="proven"):
-    """One coherent multipart read, never retrying unreadable or torn evidence into apparent absence."""
+    """Retry a torn multipart observation once, never turn unreadable evidence into absence."""
+    first = read_process_once(pid, argv_boundaries)
+    if (first.kind == "UNAVAILABLE" and first.reason.partition("; existence_")[0] ==
+            "evidence_unavailable: unstable parent/group evidence"):
+        return read_process_once(pid, argv_boundaries)
+    return first
+
+
+def read_process_once(pid, argv_boundaries="proven"):
     if argv_boundaries == "unproven":
         rows = ps_census(pid)
         return (ProcessObservation("PRESENT", pid, rows[0]) if rows else
@@ -775,9 +1166,30 @@ def unresolved(observed, pid, stage, reason):
     observed["unresolved"][pid] = {"pid": pid, "stage": stage, "reason": reason}
 
 
-def session_processes(session, excluded, host=CODEX, unowned=None, observed=None):
+class CustodyUnavailable(OSError):
+    """A failed checkpoint forbids subsequent effects but must not erase public attempt accounting."""
+
+
+def persist_custody(observed, proposed=None):
+    if observed is not None and "custody" in observed:
+        if observed.get("custody_error"):
+            raise CustodyUnavailable(observed["custody_error"])
+        try:
+            observed["custody"].save(observed, observed["attempted"] if proposed is None else proposed)
+            observed["checkpoint_pending"] = False
+        except (OSError, ValueError) as exc:
+            observed["custody_error"] = "stop custody unavailable: " + str(exc)
+            raise CustodyUnavailable(observed["custody_error"]) from exc
+
+
+class CensusUnavailable(TypeError):
+    """An incomplete census cannot be represented as a legacy list of owned roots."""
+
+
+def session_processes(session, excluded, host=None, unowned=None, observed=None):
     """Owned roots only; retain unresolved candidates independently from attempted signals."""
-    hierarchy_hosts.entrypoints(host)
+    if host is not None:
+        hierarchy_hosts.entrypoints(host)
     state = observed if observed is not None else {}
     census = process_census(session)
     state.update(census={row.pid: row for row in census}, argv_boundaries=census.argv_boundaries,
@@ -815,6 +1227,9 @@ def session_processes(session, excluded, host=CODEX, unowned=None, observed=None
                 facts.get("argv", ()), session):
             # A current, complete cmdline can prove the name was observed without proving signal ownership.
             unowned.append(pid)
+    if observed is None and (state.get("coverage") or state["unresolved"]):
+        raise CensusUnavailable("process census unresolved: " +
+                                (state.get("coverage") or ",".join(map(str, sorted(state["unresolved"])))))
     return found
 
 
@@ -825,6 +1240,7 @@ def original_exit(expected, observed):
     poller = select.poll()
     poller.register(handle["fd"], select.POLLIN)
     if any(event & select.POLLIN for _, event in poller.poll(0)):
+        observed["checkpoint_pending"] = True
         observed["resolved"][expected.pid] = "original_pidfd_exit"
         observed["unresolved"].pop(expected.pid, None)
         return True
@@ -867,8 +1283,11 @@ def note_identity_loss(expected, observation, observed):
     else:
         facts = observation.partial or {}
         birth = facts.get("start_time") if facts.get("coherent_birth") else None
-    if birth is not None and birth != expected.start_time:
+    if birth is not None and birth != expected.start_time and expected.pid not in observed["identity_lost"]:
         observed["identity_lost"].add(expected.pid)
+        observed["blocked"].add(expected.pid)
+        observed["checkpoint_pending"] = True
+        persist_custody(observed)
 
 
 def retained_state(expected, boundaries, session, host, unowned, observed=None):
@@ -882,6 +1301,7 @@ def retained_state(expected, boundaries, session, host, unowned, observed=None):
     result = process_state(expected, current, boundaries, session, host, unowned,
                            require_host=False, retained=True)
     if observed is not None and result == "gone":
+        observed["checkpoint_pending"] = True
         observed["resolved"][expected.pid] = current.proof or "matching_birth_zombie"
         observed["unresolved"].pop(expected.pid, None)
     return result
@@ -890,6 +1310,9 @@ def retained_state(expected, boundaries, session, host, unowned, observed=None):
 def signal_process(chain, number, boundaries, session, host, unowned, retained=False, observed=None, attempted=None):
     state = observed
     target, opened = chain[0], {}
+    if state is not None and any(row.pid in state.get("excluded", ()) for row in chain):
+        unresolved(state, target.pid, "before_signal", "ancestor_excluded")
+        return False
     try:
         for expected in chain:
             kept = state["handles"].get(expected.pid) if state is not None else None
@@ -931,7 +1354,11 @@ def signal_process(chain, number, boundaries, session, host, unowned, retained=F
                         reason = "evidence_unavailable" if result == "unavailable" else "instance_or_parent_changed"
                         unresolved(state, target.pid, "before_signal", reason)
                         if result == "changed":
+                            if target.pid not in state["blocked"]:
+                                state["checkpoint_pending"] = True
                             state["blocked"].add(target.pid)
+                    if state.get("checkpoint_pending", True):
+                        persist_custody(state)
                 return False
             if expected.pid in opened:
                 opened[expected.pid]["verified"] = True
@@ -942,11 +1369,14 @@ def signal_process(chain, number, boundaries, session, host, unowned, retained=F
         handle = opened.get(target.pid)
         if state is not None and handle is not None:
             state["handles"][target.pid] = handle
-        if attempted is not None:
-            # Enter A before the syscall: an error or lost reply must never erase a possible effect.
-            attempted.add(target.pid)
         if state is not None:
             state["unresolved"].pop(target.pid, None)
+            # Durable A precedes the effect. A crash between this fsync and the syscall is a possible attempt.
+            persist_custody(state, set(attempted or ()) | {target.pid})
+        if attempted is not None:
+            # The journal carries possible A before the syscall. This invocation has made no attempt when
+            # the barrier fails; recovery still retains an A whose acknowledgement was lost.
+            attempted.add(target.pid)
         if handle is None:
             if state is not None:
                 state["numeric"] = True
@@ -1020,12 +1450,13 @@ def signal_all(found, number, observed, session, host, unowned, attempted=None):
                     if names_session(member, session):
                         # An ambiguous S-naming host cannot vanish from scope merely because its program is
                         # another host kind. No-S negative exclusions still confer no borrowed authority.
-                        observed["candidates"][member.pid] = member
+                        observed["candidates"].setdefault(member.pid, member)
                         unresolved(observed, member.pid, "census", "descendant_selection_ambiguous")
                 else:
                     targets.append(chain)
     for chain in targets:
-        observed["candidates"][chain[0].pid] = chain[0]
+        pid = chain[0].pid
+        observed["candidates"].setdefault(pid, chain[0])
     # Children first: every parent edge still exists and is freshly checked BEFORE the child's first signal.
     for chain in sorted(targets, key=lambda rows: process_depth(rows[0], census), reverse=True):
         signal_process(chain, number, boundaries, session, host, unowned, observed=observed, attempted=attempted)
@@ -1033,6 +1464,8 @@ def signal_all(found, number, observed, session, host, unowned, attempted=None):
 
 
 def signal_retained(pids, number, observed, session, host, unowned):
+    if observed["argv_boundaries"] != "proven":
+        return  # Lossy discovery cannot renew original-instance signal authority.
     for pid in sorted(pids):
         expected = observed["candidates"][pid]
         if pid not in observed["resolved"] and not original_exit(expected, observed):
@@ -1057,8 +1490,11 @@ def gone_within(session, excluded, pids, seconds, host, observed, unowned):
                 else:
                     current = observation.partial or {}
                 current_birth = current.get("start_time") if current.get("coherent_birth") else None
-                if birth and current_birth and current_birth != birth:
+                if birth and current_birth and current_birth != birth and pid not in observed["identity_lost"]:
                     observed["identity_lost"].add(pid)
+                    observed["blocked"].add(pid)
+                    observed["checkpoint_pending"] = True
+                    persist_custody(observed)
                 if birth and current_birth == birth and current.get("exit_observed"):
                     observed["resolved"][pid] = "matching_partial_birth_zombie"
                     result = "gone"
@@ -1070,12 +1506,15 @@ def gone_within(session, excluded, pids, seconds, host, observed, unowned):
             else:
                 result = retained_state(expected, observed["argv_boundaries"], session, host, unowned, observed)
             if result == "gone":
+                observed["checkpoint_pending"] = True
                 observed["resolved"].setdefault(pid, "confirmed_instance_exit")
                 observed["unresolved"].pop(pid, None)
             else:
                 unresolved(observed, pid, "after_signal" if pid in pids else "before_signal",
                            "evidence_unavailable" if result == "unavailable" else "original_instance_live_or_changed")
                 if result == "changed":
+                    if pid not in observed["blocked"]:
+                        observed["checkpoint_pending"] = True
                     observed["blocked"].add(pid)
         if len(observed["resolved"]) == len(observed["candidates"]):
             return not observed.get("coverage")
@@ -1089,6 +1528,19 @@ def stop(launches, endpoint, grace):
     identifier = launches.new_id()
     if not (type(grace) is int and 0 <= grace <= 60):
         launches.refuse(endpoint, identifier, "stop", "invalid grace_seconds")
+    stop_checks(launches, endpoint, identifier)
+    with stop_endpoint_lock(launches.mailbox.root, endpoint):
+        return stop_locked(launches, endpoint, grace, identifier)
+
+
+def stop_locked(launches, endpoint, grace, identifier):
+    known = stop_checks(launches, endpoint, identifier)
+    with StopCustody(launches, endpoint, known) as custody:
+        return stop_owned(launches, endpoint, identifier, known, grace, custody)
+
+
+def stop_checks(launches, endpoint, identifier):
+    """Pure preflight is repeated under the endpoint lock; only that fresh binding reaches effects."""
     known, profile = bound_session(launches, endpoint, identifier, "stop")
     if endpoint_parts(endpoint)[1] == "root":
         launches.refuse(endpoint, identifier, "stop", ROOT_STOP, **known)
@@ -1101,14 +1553,22 @@ def stop(launches, endpoint, grace):
     if background:
         launches.refuse(endpoint, identifier, "stop",
                         "a background claude session stops through claude stop; use the wake tool's control", **known)
+    return known
+
+
+def stop_owned(launches, endpoint, identifier, known, grace, custody):
     pids, unowned, observed = set(), [], {}
     marker = {"wake_marker_present": launches.mailbox.wake_marker(endpoint).exists(), "grace_seconds": grace}
     error = None
     try:
         excluded = ancestors()
         found = session_processes(known["session"], excluded, known["host"], unowned, observed)
+        custody.restore(observed, pids)
+        observed.update(custody=custody, attempted=pids, excluded=excluded, checkpoint_pending=True)
         if observed["argv_boundaries"] != "proven":
             marker["argv_boundaries"] = "unproven"
+        if pids:
+            signal_retained(pids, signal.SIGTERM, observed, known["session"], known["host"], unowned)
         if found:
             signal_all(found, signal.SIGTERM, observed, known["session"], known["host"], unowned, pids)
         stopped = gone_within(known["session"], excluded, pids, grace, known["host"], observed, unowned)
@@ -1126,6 +1586,16 @@ def stop(launches, endpoint, grace):
     finally:
         for handle in observed.get("handles", {}).values():
             os.close(handle["fd"])
+    # On success no more signals are needed: retain durable active custody through the immutable outcome,
+    # then commit all exit proofs and terminal clear together. An intermediate resolved-active write adds
+    # no recovery protection. Failures still checkpoint, and every escalation keeps its pre-effect barrier.
+    # A failed checkpoint is never retried into success or allowed to erase possible attempts.
+    if (not stopped and not observed.get("custody_error") and observed.get("checkpoint_pending", True) and
+            (observed.get("candidates") or observed.get("coverage"))):
+        try:
+            persist_custody(observed)
+        except CustodyUnavailable as exc:
+            error = str(exc)
     spared = sorted(set(unowned) - pids)
     if spared:
         marker["unowned_pids"] = spared
@@ -1144,7 +1614,19 @@ def stop(launches, endpoint, grace):
     state = "stopped" if pids else "not_running"
     if not stopped:
         state = "stop_failed"
-    return (0 if stopped else 3), launches.record(endpoint, identifier, "stop", state, **known, pids=sorted(pids), **marker)
+    # Keep active custody until the immutable outcome is durable, including failure/interruption windows.
+    record = launches.record(endpoint, identifier, "stop", state, **known, pids=sorted(pids), **marker)
+    if (not observed.get("custody_error") and (stopped or observed.get("checkpoint_pending", True)) and
+            (observed.get("candidates") or observed.get("coverage") or custody.path.exists())):
+        try:
+            custody.save(observed, pids, active=not stopped)
+        except (OSError, ValueError) as exc:
+            # The earlier record cannot be changed. A later immutable failure prevents a terminal success
+            # claim while active custody remains, including loss of the state-file commit acknowledgement.
+            marker["error"] = "stop custody unavailable: " + str(exc)
+            return 3, launches.record(endpoint, launches.new_id(), "stop", "stop_failed", **known,
+                                      pids=sorted(pids), **marker)
+    return (0 if stopped else 3), record
 
 
 def status(launches, endpoint):
