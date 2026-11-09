@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 import pytest
 
@@ -23,6 +24,96 @@ KINDS = ("heavy", "heavy-tests")
 PIDS = [103, 101, 102]
 POLICY_ERROR = "invalid census_outside_policy: expected count, report or ignore"
 POLICIES = [None, "count", "report", "ignore"]
+
+
+@pytest.fixture
+def policy_shop(tmp_path_factory):
+    return job_fixtures.Shop(tmp_path_factory.mktemp("census-0500-" + uuid.uuid4().hex))
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("target", ["own", "other-initiative", "other-runner", "manual",
+                                    "lower-priority", "inactive", "blocked", "other-kind"])
+def test_shared_store_relaxation_only_admits_this_pass_next_holder(policy_shop, policy, target):
+    shop = policy_shop
+    if target != "own":
+        initiative = "pilot" if target == "other-runner" else "urgent"
+        if initiative != "pilot":
+            options = {}
+            if target == "blocked":
+                shop.workspace.register("blocker")
+                options["blocked_by"] = ["blocker"]
+            shop.workspace.register(initiative, priority=99 if target == "lower-priority" else 1, **options)
+        holder = "manual-holder" if target == "manual" else "job:" + initiative + "/other-runner"
+        # This request precedes A's request, including when B shares A's initiative.
+        shop.workspace.run("request", {"initiative": initiative, "kind": "writer" if target == "other-kind" else "heavy",
+                                       "holder": holder})
+        if target == "inactive":
+            shop.workspace.run("update", {"initiative": initiative, "source": "owner", "state": "paused"})
+    request_heavy_jobs(shop, "heavy", policy)
+    foreign_first = target in ("other-initiative", "other-runner", "manual")
+    relaxed = policy in ("report", "ignore") and not foreign_first
+    rows = shop.run_open("--initiative", "pilot", census=PIDS, expect=0 if relaxed else 3)["rows"]
+    row = next(row for row in rows if row.get("job") == "pilot/job-1")
+    if relaxed:
+        assert row["state"] == "completed"
+        assert result_for(shop)["capacity"] == grant_view(policy, PIDS)
+        assert "outside_policy_applied" not in row["z_census"]
+    else:
+        assert row["state"] == "waiting" and row["reason"] == "capacity_full"
+        assert not any(event["kind"] == "grant" for event in shop.events())
+        assert not (shop.workspace.store / "jobs" / "pilot" / "job-1" / "claim.json").exists()
+        if policy is None:
+            assert "z_census" not in row
+            assert row["capacity"]["external_roots"] == sorted(PIDS)
+        else:
+            expected = expected_summary("count", PIDS)
+            if policy in ("report", "ignore"):
+                expected["outside_policy_applied"] = "count"
+            assert row["z_census"] == expected
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+def test_check_recipes_makes_explicit_policy_reviewable_and_preserves_absent_bytes(policy_shop, policy):
+    shop = policy_shop
+    if policy is not None:
+        shop.recipes["census_outside_policy"] = policy
+    shop.save_recipes()
+    expected = {"recipes_sha256": hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest(),
+                "recipes": {name: {"kind": recipe["kind"], "heavy": name == "heavy", "heavy_tests": False,
+                                    "sandbox": "none", "require_clean": False, "expects_tests": False,
+                                    "export_git": False} for name, recipe in shop.recipes["recipes"].items()}}
+    if policy is not None:
+        expected["census_outside_policy"] = policy
+    if policy in ("report", "ignore"):
+        expected["census_outside_policy_non_default"] = True
+    result = subprocess.run(shop.argv("check-recipes"), capture_output=True, text=True, timeout=30, env=shop.env())
+    assert result.returncode == 0 and result.stderr == ""
+    assert result.stdout == json.dumps(expected, sort_keys=True) + "\n"
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("expectation", ["absent", "match", "mismatch", "short", "non-hex", "uppercase"])
+def test_run_open_checks_expected_recipes_hash_before_any_job_or_ledger_change(policy_shop, policy, expectation):
+    shop = policy_shop
+    request_heavy_jobs(shop, "heavy", policy)
+    digest = hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+    value = {"match": digest, "mismatch": "0" * 64, "short": digest[:-1],
+             "non-hex": "g" * 64, "uppercase": digest.upper()}.get(expectation)
+    flags = [] if expectation == "absent" else ["--expect-recipes-sha256", value]
+    before = {path.name: path.read_bytes() for path in (shop.workspace.store / "events").iterdir()}
+    allowed = expectation in ("absent", "match")
+    answer = shop.run_open(*flags, census=[101], expect=0 if allowed else 2)
+    if allowed:
+        assert answer["rows"][0]["state"] == "completed"
+        assert result_for(shop)["recipes_sha256"] == digest
+    else:
+        error = ("recipes changed since team init; re-run the reviewed team init" if expectation == "mismatch"
+                 else "invalid expected recipes sha256")
+        assert answer == {"error": error}
+        assert {path.name: path.read_bytes() for path in (shop.workspace.store / "events").iterdir()} == before
+        assert not (shop.workspace.store / "jobs" / "pilot" / "job-1").exists()
+        assert shop.states("job-1") == []
 
 
 @pytest.fixture(autouse=True)
@@ -413,6 +504,9 @@ def test_filtered_grant_keeps_its_own_durable_census_for_the_later_executor(shop
                                              "holder": "job:urgent/job-high"})["request"]
     rows = shop.run_open("--initiative", "pilot", census=[101], expect=3)["rows"]
     elsewhere = next(row for row in rows if row["state"] == "granted_elsewhere")
+    applied = grant_view("count")
+    if policy in ("report", "ignore"):
+        applied["outside_policy_applied"] = "count"
     path = shop.workspace.store / "census" / (request["request_id"] + ".json")
     if policy is None:
         assert "z_census" not in elsewhere and "capacity" not in elsewhere
@@ -420,9 +514,10 @@ def test_filtered_grant_keeps_its_own_durable_census_for_the_later_executor(shop
     else:
         record = json.loads(path.read_bytes())
         assert record == {"request_id": request["request_id"], "holder": request["holder"], "kind": "heavy",
-                          "capacity": grant_view(policy)}
+                          "capacity": applied}
         assert elsewhere["z_census"]["request_id"] == request["request_id"]
-        assert elsewhere["z_census"]["outside_policy"] == policy
+        assert elsewhere["z_census"] == expected_summary("count", [101], request_id=request["request_id"]) | (
+            {"outside_policy_applied": "count"} if policy in ("report", "ignore") else {})
     # This later invocation must recover the original 101 observation, not its new 202 fixture.
     assert shop.run_open("--initiative", "urgent", census=[202])["rows"][0]["state"] == "completed"
     result = result_for(shop, "urgent/job-high")
@@ -430,7 +525,7 @@ def test_filtered_grant_keeps_its_own_durable_census_for_the_later_executor(shop
         assert "capacity" not in result
         assert not (shop.workspace.store / "census").exists()
     else:
-        assert result["capacity"] == grant_view(policy)
+        assert result["capacity"] == applied
 
 
 @pytest.mark.parametrize("policy", POLICIES)
@@ -448,7 +543,8 @@ def test_existing_grant_without_a_record_is_explicitly_unrecorded(shop, policy):
 
 @pytest.mark.parametrize("policy", POLICIES)
 @pytest.mark.parametrize("broken", ["request_id", "holder", "kind", "extra", "pid", "oversize",
-                                    "unicode_id", "path_id", "policy", "symlink", "duplicate"])
+                                    "unicode_id", "path_id", "policy", "symlink", "duplicate",
+                                    "applied-policy", "applied-type", "applied-mismatch"])
 def test_attacker_written_grant_records_are_marked_invalid_without_borrowing_or_blocking(shop, policy, broken):
     request = manual_grant(shop, policy)
     folder = shop.workspace.store / "census"
@@ -472,6 +568,12 @@ def test_attacker_written_grant_records_are_marked_invalid_without_borrowing_or_
         record["request_id"] = "../must-not-be-read"
     elif broken == "policy":
         record["capacity"]["outside_policy"] = "REPORT"
+    elif broken == "applied-policy":
+        record["capacity"] = grant_view("count") | {"outside_policy_applied": "ignore"}
+    elif broken == "applied-type":
+        record["capacity"] = grant_view("count") | {"outside_policy_applied": ["count"]}
+    elif broken == "applied-mismatch":
+        record["capacity"]["outside_policy_applied"] = "count"
     raw = json.dumps(record)
     if broken == "oversize":
         raw += " " * 16384
@@ -518,7 +620,7 @@ def test_changed_executor_policy_still_reads_the_original_grant_record(shop, exe
         shop.recipes["census_outside_policy"] = executor_policy
     shop.save_recipes()
     shop.run_open("--initiative", "urgent", census=[202])
-    assert result_for(shop, "urgent/job-high")["capacity"] == grant_view("report")
+    assert result_for(shop, "urgent/job-high")["capacity"] == grant_view("count") | {"outside_policy_applied": "count"}
 
 
 @pytest.mark.parametrize("policy", POLICIES)

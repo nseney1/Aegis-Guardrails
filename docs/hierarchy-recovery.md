@@ -27,17 +27,21 @@ work reduces its observed available slots. Unavailable census evidence leaves
 available capacity unknown. The census sees the current process namespace; it
 does not qualify a host-wide observer or discover processes hidden by an
 unsupported host boundary.
+Admission with `"report"` or `"ignore"` may therefore proceed when this count-only
+recovery view shows no available slots.
 
 For job admission, the optional top-level `census_outside_policy` in
 `aegis.hierarchy-job-recipes/v1` accepts `"count"`, `"report"` or `"ignore"`.
 Absent means `"count"`: it creates no census record and preserves legacy recipe
 parsing, hash input, waiting-row capacity and result bytes when no earlier grant
-record exists. Explicit `"count"` counts outside roots as before. `"report"`
+record exists. Explicit `"count"` counts outside roots as before. When the next
+eligible grant belongs to this pass's waiting holders, `"report"`
 observes the same roots but returns no outside roots to the grant callback:
 its full view records `external_roots: []`, `outside_policy: "report"` and the
 observed `outside` rows.
-`"ignore"` skips outside observation entirely, including fixture reads and the
-outside `/proc` walk, records `external_roots: []`, `outside_policy: "ignore"` and
+Under the same condition, `"ignore"` skips outside observation entirely,
+including fixture reads and the outside `/proc` walk, records
+`external_roots: []`, `outside_policy: "ignore"` and
 `census: "none"`, and has no `outside` key. Observing policies label `census` as
 `"fixture"` or `"proc"` according to the source actually read. Each kind is
 separate: full outside observations for `heavy` have class `pytest`, and those for
@@ -49,6 +53,17 @@ jobs, limits, process ownership, `low_disk` and `store_busy` retain their rules.
 Unknown or non-string policy values refuse recipe loading with
 `invalid census_outside_policy: expected count, report or ignore`; misspelled
 keys are refused as unexpected fields.
+
+On a shared store, the grant callback checks the locked ledger using
+`grant_next`'s exact eligibility rules and `(priority, seq)` order. `"report"`
+and `"ignore"` relax counting only for an unambiguous next request whose holder
+belongs to this pass's waiting jobs. A foreign job (including another runner's
+job in the same initiative), manual holder, absent candidate or tied selection
+uses count semantics instead. That view records `outside_policy: "count"` and
+`outside_policy_applied: "count"`, observes the real roots, and labels the
+census source accordingly. When outside load fills the limit, no grant is
+written. When capacity permits a foreign grant, its record and eventual result
+retain this count view, regardless of the executor's recipes policy.
 
 For every grant published under an explicit policy, including `granted_elsewhere`,
 the runner attempts to publish `<store>/census/<request_id>.json`. Exact keys are
@@ -96,8 +111,10 @@ census. Structural checks do not authenticate a same-user writer.
 Explicit-policy waiting rows and `granted_elsewhere` rows carry a small
 `z_census` summary; no full view or PID list is attached. The summary contains
 `outside_policy`, `census`, `limit`, `held`, `external_roots_count`, `outside_count`,
-`outside_truncated` when known, and the request ID for a grant record. Publication
-failures also include `publish_failed: true`; short `"publish_failed"`,
+`outside_truncated` when known, and the request ID for a grant record.
+Count fallback also includes `outside_policy_applied: "count"` in the
+full view and summary. Publication failures also include `publish_failed: true`;
+short `"publish_failed"`,
 `"conflict"`, `"ambiguous_grant"` and `"invalid_request_id"` reason codes remain visible. Counts
 include truncated observations; unavailable counts in audit markers are `null`.
 Summaries are at most 384 JSON characters and
@@ -133,13 +150,23 @@ the store's 10000-event limit and the per-file limit; retained records and any
 interrupted atomic-publication files require normal store archival, not a new
 pruning operation in `run-open`.
 
-This policy protects against misconfiguration and accidents only. The setting is
-reviewed through `check-recipes`, and each job result records the loaded recipes'
-`recipes_sha256`. A hash differing from the hash pinned at team init is detectable
-after the fact; reviewers must compare the hashes. **Known gap:** `run-open` does
-not yet refuse an edited recipes file. Enforcing the init hash requires a
-follow-up in the team runner; this policy does not provide that enforcement.
-Team state, environment variables and job packets do not select this policy.
+This policy protects against misconfiguration and accidents only. `check-recipes`
+shows `census_outside_policy` whenever it is explicitly set and adds
+`census_outside_policy_non_default: true` for `"report"` and `"ignore"`.
+With no key, the check output keeps its legacy bytes. Each job result records
+the loaded recipes' `recipes_sha256`.
+
+Use `run-open --expect-recipes-sha256 HEX` with the reviewed init hash to refuse
+changed recipes before admission, job claims or ledger changes. The optional
+value must be a 64-character lowercase hexadecimal SHA-256. A mismatch returns
+`recipes changed since team init; re-run the reviewed team init`; malformed
+values return `invalid expected recipes sha256`. Without the flag, `run-open`
+accepts any recipes file that passes validation. **Known gap:** the team loop
+does not yet pass the init hash; wiring it to this flag remains a follow-up in
+`hierarchy_loop.py`. Until then, reviewers must compare each result's hash with
+the hash pinned at init to detect edits after the fact. The setting comes from
+the recipes file, including templates selected by team configuration;
+environment variables and job packets do not select it.
 `"report"` and `"ignore"` knowingly accept outside load, such as another
 team's work on a shared machine or a container whose census sees only its own
 namespace (container spec amendment 7). The default stays `"count"`.
