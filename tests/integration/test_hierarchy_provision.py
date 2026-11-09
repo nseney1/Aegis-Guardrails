@@ -603,6 +603,966 @@ def unbound(setup, endpoint):
     return invoke(setup.root, "status")["bindings"][endpoint] is None
 
 
+# MR-1: claude_start is a public launcher function, not a provision CLI subcommand.
+def mr1_provision(command, request, expect=0):
+    if command != "claude-start":
+        return provision(command, request, expect=expect)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_provision
+    request.pop("_request_path")
+    if expect == 2:
+        with pytest.raises(ValueError) as caught:
+            hierarchy_provision.claude_start(request)
+        return {"error": str(caught.value)}
+    return hierarchy_provision.claude_start(request)
+
+
+# Exercise the JSON entry point in-process where the data-file OS boundary is patched.
+@pytest.fixture
+def mr1_cli(capsys):
+    sys.path.insert(0, str(ROOT / "tools"))
+    import hierarchy_provision
+
+    def call(command, request, expect=0):
+        if command == "claude-start":
+            return mr1_provision(command, request, expect=expect)
+        path = Path(request.pop("_request_path"))
+        path.write_text(json.dumps(request), encoding="utf-8")
+        code = hierarchy_provision.main([command, "--request", str(path)])
+        captured = capsys.readouterr()
+        assert not captured.err, captured.err
+        answer = json.loads(captured.out)
+        assert code == expect, answer
+        return answer
+
+    return hierarchy_provision, call
+
+
+def mr1_plan(setup, host="claude-code"):
+    (setup.base / "host-plan.json").write_text(json.dumps({
+        "schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "pilot", "root": "codex-cli",
+        "team": host, "stand_ins": {}, "config_sha256": "ab" * 32}), encoding="utf-8")
+
+
+def mr1_request(setup, command, endpoint="pilot/orchestrator", host="claude-code", **changes):
+    body = {"base": str(setup.base), "endpoint": endpoint, "cwd": str(setup.source)}
+    if command == "add-role":
+        body.update(host=host, session=CODEX_SESSION if host == "codex-cli" else str(uuid.uuid4()))
+    elif command == "claude-start":
+        body["session"] = str(uuid.uuid4())
+    return setup.request(**dict(body, **changes))
+
+
+MR1_BAD_EFFORTS = ["bogus", "ultra", "ULTRA", "High", " high", "high\n", "", None, 7, ["high"],
+                   "x" * 129, "ｈｉｇｈ", "\x01"]
+
+
+@pytest.mark.parametrize("command", ["add-role", "codex-start", "claude-start"])
+@pytest.mark.parametrize("value", MR1_BAD_EFFORTS)
+def test_mr1_request_effort_refusals_leave_endpoint_unbound(setup, command, value):
+    shown = ascii(value)
+    shown = shown if len(shown) <= 80 else shown[:77] + "..."
+    error = ("request effort 'ultra' is a deprecated alias accepted only in team.json; "
+             "ask for max, or set team.json reasoning to ultra; allowed request efforts: low, medium, high, xhigh, max"
+             if value == "ultra" else
+             "invalid request effort %s; choose one of: low, medium, high, xhigh, max" % shown)
+    refused = mr1_provision(command, mr1_request(setup, command, model="claude-opus-5-5", effort=value), expect=2)
+    assert refused == {"error": error}
+    assert refused["error"].isascii() and "\n" not in refused["error"] and "\x01" not in refused["error"]
+    assert unbound(setup, "pilot/orchestrator")
+
+
+def mr1_bindings():
+    levels = dict(zip(("light", "standard", "deep", "extended", "max"), ("low", "medium", "high", "xhigh", "max")))
+    return {"schema": "aegis.model-bindings/v1", "roles": [
+        {"kind": kind, "model_class": "coding", "band": dict(zip(("floor", "default", "ceiling"), band))}
+        for kind, band in [("orchestrator", ("light", "standard", "standard")),
+                           ("decider", ("light", "standard", "standard")),
+                           ("implementer", ("standard", "deep", "max")),
+                           ("integrator", ("standard", "deep", "max")),
+                           ("reviewer", ("deep", "deep", "max"))]], "hosts": [
+        {"host": host, "class": cls, "model": model, "levels": dict(levels),
+         "admission": {intent: "unprobed" for intent in levels}}
+        for host, models in [("claude-code", ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"]),
+                             ("codex-cli", ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"])]
+        for cls, model in zip(("coding", "frontier", "scout", "mechanical"), models)]}
+
+
+@pytest.mark.parametrize("case,problem", [
+    ("missing", "cannot read file"), ("json", "invalid JSON"), ("duplicate-key", "duplicate JSON key 'schema'"),
+    ("schema", "unsupported schema"), ("top-key", "unexpected top-level keys"),
+    ("kind", "unknown role kind 'wizard'"), ("class", "unknown model class 'wizard'"),
+    ("intent", "unknown intent 'ultra'"), ("order", "band must satisfy floor <= default <= ceiling"),
+    ("native", "unknown native level 'ultra'"), ("duplicate-host", "duplicate host/class row"),
+    ("missing-intent", "binding claude-code/coding lacks band ceiling max for implementer"),
+    ("role-key", "unexpected role keys"), ("host-key", "unexpected host keys"),
+    ("duplicate-role", "duplicate role row"), ("band-key", "unexpected band keys"),
+    ("ceiling", "band must satisfy floor <= default <= ceiling"),
+    ("duplicate-level", "levels must map to distinct native levels"),
+    ("host", "unknown host 'other'"), ("shape", "top-level must be an object"),
+    ("roles-shape", "roles must be a list"), ("hosts-shape", "hosts must be a list"),
+    ("model-type", "model must be a nonempty ASCII identifier"),
+    ("admission-type", "admission must map exactly supported intents"),
+    ("missing-coding", "missing host/class rows: claude-code/coding"),
+    ("missing-codex-coding", "missing host/class rows: codex-cli/coding"),
+    ("duplicate-model", "duplicate host/model row: claude-code/claude-opus-5-5"),
+    ("missing-orchestrator", "missing role kinds: orchestrator"),
+    ("missing-decider", "missing role kinds: decider"),
+    ("missing-implementer", "missing role kinds: implementer"),
+    ("missing-integrator", "missing role kinds: integrator"),
+    ("missing-reviewer", "missing role kinds: reviewer"),
+    ("empty-roles", "missing role kinds: decider, implementer, integrator, orchestrator, reviewer"),
+    ("missing-scout", "missing host/class rows: codex-cli/scout"),
+])
+def test_mr1_broken_bindings_refuse_before_binding(setup, mr1_cli, monkeypatch, case, problem):
+    module, call = mr1_cli
+    mr1_plan(setup)
+    data = mr1_bindings()
+    if case == "schema":
+        data["schema"] = "v2"
+    elif case == "top-key":
+        data["extra"] = True
+    elif case == "kind":
+        data["roles"][0]["kind"] = "wizard"
+    elif case == "class":
+        data["hosts"][0]["class"] = "wizard"
+    elif case == "intent":
+        data["roles"][0]["band"]["floor"] = "ultra"
+    elif case == "order":
+        data["roles"][0]["band"]["floor"] = "deep"
+    elif case == "native":
+        data["hosts"][0]["levels"]["max"] = "ultra"
+    elif case == "duplicate-host":
+        data["hosts"].append(data["hosts"][0])
+    elif case == "missing-intent":
+        del data["hosts"][0]["levels"]["max"]
+        del data["hosts"][0]["admission"]["max"]
+    elif case == "role-key":
+        data["roles"][0]["extra"] = True
+    elif case == "host-key":
+        data["hosts"][0]["extra"] = True
+    elif case == "duplicate-role":
+        data["roles"].append(data["roles"][0])
+    elif case == "band-key":
+        data["roles"][0]["band"]["extra"] = True
+    elif case == "ceiling":
+        data["roles"][0]["band"]["ceiling"] = "light"
+    elif case == "duplicate-level":
+        data["hosts"][0]["levels"]["max"] = "high"
+    elif case == "host":
+        data["hosts"][0]["host"] = "other"
+    elif case == "shape":
+        data = []
+    elif case == "roles-shape":
+        data["roles"] = {}
+    elif case == "hosts-shape":
+        data["hosts"] = {}
+    elif case == "model-type":
+        data["hosts"][0]["model"] = ["bad"]
+    elif case == "admission-type":
+        data["hosts"][0]["admission"] = None
+    elif case == "missing-coding":
+        data["hosts"].pop(0)
+    elif case == "missing-codex-coding":
+        data["hosts"] = [row for row in data["hosts"] if (row["host"], row["class"]) != ("codex-cli", "coding")]
+    elif case == "duplicate-model":
+        data["hosts"][1]["model"] = data["hosts"][0]["model"]
+    elif case.startswith("missing-") and case[8:] in {row["kind"] for row in data["roles"]}:
+        data["roles"] = [row for row in data["roles"] if row["kind"] != case[8:]]
+    elif case == "empty-roles":
+        data["roles"] = []
+    elif case == "missing-scout":
+        data["roles"][0]["model_class"] = "scout"
+        data["hosts"] = [row for row in data["hosts"] if (row["host"], row["class"]) != ("codex-cli", "scout")]
+    path = setup.tmp / "model-bindings.json"
+    if case != "missing":
+        raw = "{" if case == "json" else '{"schema":1,"schema":2}' if case == "duplicate-key" else json.dumps(data)
+        path.write_text(raw, encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path, raising=False)
+    refused = call("add-role", mr1_request(setup, "add-role", model="claude-opus-5-5", effort="medium"), expect=2)
+    assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command", ["add-role", "codex-start", "claude-start"])
+@pytest.mark.parametrize("endpoint,effort,intent,band", [
+    ("pilot/orchestrator", "high", "deep", "light..standard"),
+    ("pilot/lane/review", "medium", "standard", "deep..max"),
+    ("pilot/lane/f2", "low", "light", "standard..max"),
+    ("pilot/lane/integration", "low", "light", "standard..max"),
+])
+def test_mr1_plan_bands_check_explicit_requests_before_binding(setup, command, endpoint, effort, intent, band):
+    host = "codex-cli" if command == "codex-start" else "claude-code"
+    model = "gpt-6.1-sol" if host == "codex-cli" else "claude-opus-5-5"
+    mr1_plan(setup, host)
+    kind = {"f2": "implementer", "review": "reviewer", "integration": "integrator"}.get(endpoint.split("/")[-1], "orchestrator")
+    refused = mr1_provision(command, mr1_request(setup, command, endpoint, host, model=model, effort=effort), expect=2)
+    assert refused == {"error": "%s effort %s maps to intent %s outside band %s; choose an effort within the band" %
+                       (kind, effort, intent, band)}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("by_kind", [False, True])
+def test_mr1_plan_refuses_team_ultra_above_orchestrator_band(setup, by_kind):
+    mr1_plan(setup)
+    write_team(setup, model="claude-opus-5-5", reasoning="medium" if by_kind else "ultra",
+               **({"reasoning_by_kind": {"orchestrator": "ultra"}} if by_kind else {}))
+    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2)
+    assert refused == {"error": "orchestrator effort max maps to intent max outside band light..standard; "
+                       "choose an effort within the band" +
+                       ("; set team.json reasoning_by_kind.orchestrator to an in-band effort" if not by_kind else "")}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
+@pytest.mark.parametrize("endpoint,effort,intent,band", [
+    ("pilot/orchestrator", "low", "light", ("light", "standard", "standard")),
+    ("pilot/lane/f2", "medium", "standard", ("standard", "deep", "max")),
+    ("pilot/lane/integration", "xhigh", "extended", ("standard", "deep", "max")),
+    ("pilot/lane/review", "high", "deep", ("deep", "deep", "max")),
+    ("pilot/lane/review", "max", "max", ("deep", "deep", "max")),
+])
+def test_mr1_in_band_requests_record_provenance(setup, host, model, endpoint, effort, intent, band):
+    mr1_plan(setup, host)
+    answer = provision("add-role", mr1_request(setup, "add-role", endpoint, host, model=model, effort=effort))
+    assert answer["team"] == {"model": model, "effort": effort, "reasoning": effort, "model_from": "request",
+                              "effort_from": "request", "reasoning_from": "request", "model_class": "coding",
+                              "intent": intent, "band": dict(zip(("floor", "default", "ceiling"), band)),
+                              "bindings_sha256": hashlib.sha256((ROOT / "tools/hierarchy_templates/model-bindings.json").read_bytes()).hexdigest(),
+                              "admission": "unprobed"}
+
+
+@pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
+def test_mr1_team_ultra_keeps_argv_and_records_deprecation_under_plan(setup, host, model):
+    write_team(setup, model=model, reasoning="ultra")
+    command = "claude-start" if host == "claude-code" else "codex-start"
+    request = mr1_request(setup, command, "pilot/lane/f2", host)
+    before = mr1_provision(command, dict(request))
+    mr1_plan(setup, host)
+    after = mr1_provision(command, dict(request))
+    assert after["start_argv"] == before["start_argv"]
+    assert after["team"]["deprecated"] == "ultra" and after["team"]["intent"] == "max"
+    assert {key: after["team"][key] for key in before["team"]} == before["team"]
+
+
+@pytest.mark.parametrize("model,error", [
+    ("unknown", "model unknown is not bound for host claude-code; choose a model bound in model-bindings.json"),
+    ("gpt-6.1-sol", "team.json model gpt-6.1-sol needs host codex-cli, not claude-code"),
+    ("bad\nｘ", "model 'bad\\n\\uff58' is not bound for host claude-code; choose a model bound in model-bindings.json"),
+])
+@pytest.mark.parametrize("source", ["request", "team.json"])
+def test_mr1_plan_refuses_models_outside_host_bindings(setup, source, model, error):
+    mr1_plan(setup)
+    write_team(setup, model=model, reasoning="medium")
+    changes = {"model": model, "effort": "medium"} if source == "request" else {}
+    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2, **changes)
+    if error.startswith("model "):
+        error = source + " " + error
+    if source == "request":
+        error = error.replace("team.json model ", "request model ")
+    assert refused == {"error": error}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command", ["add-role", "codex-start", "claude-start"])
+def test_mr1_planless_does_not_open_bindings_and_preserves_answers(setup, mr1_cli, monkeypatch, command):
+    module, call = mr1_cli
+    request = mr1_request(setup, command, model="gpt-5.5-codex" if command == "codex-start" else "claude-opus-5-5",
+                          effort="high")
+    before = call(command, dict(request))
+    garbage = setup.tmp / "garbage.json"
+    garbage.write_text("not JSON", encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", garbage, raising=False)
+    original = Path.open
+
+    def open_file(path, *args, **kwargs):
+        assert path != garbage, "plan-less provision must never open the bindings file"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_file)
+    assert call(command, dict(request)) == before
+    assert "team" not in before
+
+
+@pytest.mark.parametrize("endpoint", ["pilot/orchestrator", "pilot/lane/f2", "pilot/lane/integration", "pilot/lane/review"])
+def test_mr1_shipped_defaults_have_identical_argv_with_and_without_plan(setup, endpoint):
+    defaults = json.loads((ROOT / "tools/hierarchy_templates/team-run.json").read_text())["team"]
+    write_team(setup, **defaults)
+    request = mr1_request(setup, "codex-start", endpoint, "codex-cli")
+    before = provision("codex-start", dict(request))
+    mr1_plan(setup, "codex-cli")
+    after = provision("codex-start", dict(request))
+    assert after["start_argv"] == before["start_argv"]
+    assert after["codex_profile"] == before["codex_profile"]
+    assert after["team"]["model_class"] == "coding"
+    assert {key: after["team"][key] for key in before["team"]} == before["team"]
+
+
+def test_mr1_binding_bytes_and_generic_rows_drive_resolution(setup, mr1_cli, monkeypatch):
+    module, call = mr1_cli
+    mr1_plan(setup)
+    data = mr1_bindings()
+    data["hosts"][0]["model"] = "custom-code"
+    data["hosts"][0]["levels"].update(standard="high", deep="medium")
+    path = setup.tmp / "recalibrated.json"
+    raw = (json.dumps(data, indent=3) + "\n\n").encode("utf-8")
+    path.write_bytes(raw)
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path, raising=False)
+    answer = call("add-role", mr1_request(setup, "add-role", model="custom-code", effort="high"))
+    assert flag(answer["start_argv"], "--model") == "custom-code"
+    assert flag(answer["start_argv"], "--effort") == "high"
+    assert answer["team"]["intent"] == "standard"
+    assert answer["team"]["bindings_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("value,shown", [(None, "None"), (["high"], "['high']"),
+                                         ("ｈｉｇｈ", "'\\uff48\\uff49\\uff47\\uff48'"), ("high\n", "'high\\n'")])
+def test_mr1_bad_team_reasoning_has_safe_refusal_before_binding(setup, value, shown):
+    mr1_plan(setup)
+    write_team(setup, model="claude-opus-5-5", reasoning=value)
+    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2)
+    assert refused == {"error": "unknown reasoning level in team.json: " + shown}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("endpoint,effort", [("pilot/front-door", "max"), ("pilot/router", "medium")])
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "unbound-model"])
+def test_mr1_unbanded_roles_keep_legacy_model_and_effort(team, endpoint, effort, model):
+    mr1_plan(team)
+    request = mr1_request(team, "add-role", endpoint, model=model, effort=effort)
+    answer = provision("add-role", request)
+    assert flag(answer["start_argv"], "--effort") == effort
+    assert "team" not in answer
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_mr1_decider_uses_coordination_band(team, effort):
+    mr1_plan(team)
+    request = mr1_request(team, "add-role", "pilot/decider", model="claude-opus-5-5", effort=effort)
+    if effort == "high":
+        refused = provision("add-role", request, expect=2)
+        assert refused == {"error": "decider effort high maps to intent deep outside band light..standard; "
+                           "choose an effort within the band"}
+        assert unbound(team, "pilot/decider")
+    else:
+        answer = provision("add-role", request)
+        assert answer["team"]["band"] == {"floor": "light", "default": "standard", "ceiling": "standard"}
+
+
+@pytest.mark.parametrize("raw", ['{"model":"claude-opus-5-5","reasoning":"medium","bad\\nｘ":0}',
+                                '{"model":"claude-opus-5-5","reasoning":"medium","bad\\nｘ":0,"bad\\nｘ":1}'])
+def test_mr1_malformed_team_keys_never_reach_errors_raw(setup, raw):
+    mr1_plan(setup)
+    (setup.base / "team.json").write_text(raw, encoding="utf-8")
+    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2)
+    assert refused["error"].isascii() and "\n" not in refused["error"]
+    assert "\\n" in refused["error"] and "\\uff58" in refused["error"]
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.fixture
+def mr1_r2_setup(tmp_path):
+    built = Setup(tmp_path)
+    provision("init", built.init_request(roles=["decider", "router"]))
+    return built
+
+
+MR1_R2_ENTRY_POINTS = [("add-role", "claude-code"), ("add-role", "codex-cli"),
+                    ("claude-start", "claude-code"), ("codex-start", "codex-cli")]
+MR1_R2_BANDED_ROLES = [("orchestrator", "pilot/orchestrator", "medium"), ("decider", "pilot/decider", "medium"),
+                    ("implementer", "pilot/lane/f2", "high"), ("integrator", "pilot/lane/integration", "high"),
+                    ("reviewer", "pilot/lane/review", "high")]
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("kind,endpoint,effort", MR1_R2_BANDED_ROLES)
+@pytest.mark.parametrize("model_class", ["frontier", "scout", "mechanical"])
+@pytest.mark.parametrize("source", ["team.json", "request"])
+def test_mr1_r2_every_banded_role_refuses_models_of_other_classes(mr1_r2_setup, mr1_cli, command, host, kind, endpoint,
+                                                             effort, model_class, source):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    rows = [row for row in mr1_bindings()["hosts"] if row["host"] == host]
+    model = next(row["model"] for row in rows if row["class"] == model_class)
+    coding_model = next(row["model"] for row in rows if row["class"] == "coding")
+    write_team(setup, model=model if source == "team.json" else coding_model, reasoning=effort)
+    changes = {"model": model, "effort": effort} if source == "request" else {}
+    refused = call(command, mr1_request(setup, command, endpoint, host, **changes), expect=2)
+    assert refused == {"error": "%s model %s has class %s, requires class coding; choose model %s" %
+                       (kind, model, model_class, coding_model)}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("endpoint,effort", [("pilot/root", "max"), ("pilot/front-door", "max"),
+                                            ("pilot/router", "medium")])
+def test_mr1_r2_exempt_roles_keep_exact_answers_even_with_broken_bindings(mr1_r2_setup, mr1_cli, monkeypatch,
+                                                                     command, host, endpoint, effort):
+    setup = mr1_r2_setup
+    module, call = mr1_cli
+    request = mr1_request(setup, command, endpoint, host, model="outside-bindings", effort=effort)
+    before = call(command, dict(request))
+    mr1_plan(setup, host)
+    # ROOT follows its own plan host; only the model policy is being tested here.
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["root"] = host
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    garbage = setup.tmp / "broken-bindings.json"
+    garbage.write_text("not JSON", encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", garbage)
+    assert call(command, dict(request)) == before
+    assert "team" not in before
+
+
+
+
+def test_mr1_r2_provenance_and_levels_come_from_validated_class_binding(setup, mr1_cli, monkeypatch):
+    module, call = mr1_cli
+    mr1_plan(setup)
+    data = mr1_bindings()
+    next(row for row in data["roles"] if row["kind"] == "implementer")["model_class"] = "scout"
+    scout = next(row for row in data["hosts"] if row["host"] == "claude-code" and row["class"] == "scout")
+    scout["levels"].update(light="high", deep="low")
+    scout["admission"]["deep"] = "admitted"
+    path = setup.tmp / "class-bindings.json"
+    raw = json.dumps(data, indent=1).encode("utf-8")
+    path.write_bytes(raw)
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    answer = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", model=scout["model"], effort="low"))
+    assert flag(answer["start_argv"], "--effort") == "low"
+    assert answer["team"]["model_class"] == "scout" and answer["team"]["intent"] == "deep"
+    assert answer["team"]["admission"] == "admitted"
+    assert answer["team"]["bindings_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("kind", [None, "unexpected-kind"])
+def test_mr1_r2_unknown_policy_kind_never_gets_an_implicit_exemption(setup, mr1_cli, host, kind):
+    module, _ = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    plan = module.hierarchy_hosts.governing_plan(setup.base, setup.root, "pilot")
+    with pytest.raises(ValueError) as caught:
+        module.team_settings(setup.base, host, {"model": model, "effort": "medium"}, kind=kind, plan=plan)
+    assert str(caught.value) == "invalid model bindings %s: no role policy for %s; repair model-bindings.json" % (
+        module.MODEL_BINDINGS, ascii(kind))
+    assert unbound(setup, "pilot/orchestrator")
+
+
+
+
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("source", ["request", "team.json"])
+def test_mr1_r3_cross_host_model_refusal_names_its_source(setup, mr1_cli, command, host, source):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    own = next(row for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    other = next(row for row in mr1_bindings()["hosts"] if row["host"] != host and row["class"] == "coding")
+    write_team(setup, model=other["model"] if source == "team.json" else own["model"], reasoning="medium")
+    changes = {"model": other["model"], "effort": "medium"} if source == "request" else {}
+    refused = call(command, mr1_request(setup, command, host=host, **changes), expect=2)
+    assert refused == {"error": "%s model %s needs host %s, not %s" % (source, other["model"], other["host"], host)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+def test_mr1_r3_exemptions_equal_registry_endpoints_without_team_policy(mr1_cli):
+    module, _ = mr1_cli
+    roles = json.loads((ROOT / "tools/hierarchy_templates/role-registry.json").read_text(encoding="utf-8"))["roles"]
+    expected = {name for name, row in roles.items() if row["endpoint"] is not None and row["provision"]["team_kind"] is False}
+    assert set(module.MODEL_POLICY_EXEMPT_ROLES) == expected
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("shape,error", [("empty", "missing fields: model, reasoning"),
+                                         ("model-only", "missing fields: reasoning"),
+                                         ("reasoning-only", "missing fields: model")])
+def test_mr1_r3_present_incomplete_team_file_is_never_host_defaults(setup, mr1_cli, command, host, shape, error):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    team = {"model": model} if shape == "model-only" else {"reasoning": "medium"} if shape == "reasoning-only" else {}
+    write_team(setup, **team)
+    refused = call(command, mr1_request(setup, command, host=host), expect=2)
+    assert refused == {"error": error}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+def mr1_r4_copy_base(setup, tmp_path_factory):
+    copied = tmp_path_factory.mktemp("mr1-copy-" + uuid.uuid4().hex)
+    for name in ("provision.json", "runtime-source.py"):
+        shutil.copyfile(setup.base / name, copied / name)
+    return copied
+
+
+def mr1_r4_request(setup, copied, command, host, **changes):
+    request = mr1_request(setup, command, host=host, **changes)
+    request["base"] = str(copied)
+    if command in ("add-role", "claude-start"):
+        request["session"] = str(uuid.uuid4())
+    return request
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("case", ["out-of-band", "malformed", "differing", "format-only", "copy-only"])
+def test_mr1_r4_copied_base_cannot_replace_canonical_policy(setup, mr1_cli, tmp_path_factory, command, host, case):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    team = {"model": model, "reasoning": "high" if case == "out-of-band" else "medium"}
+    if case == "malformed":
+        (setup.base / "team.json").write_text("not JSON", encoding="utf-8")
+        error = "invalid JSON file %s: invalid JSON; repair team.json" % (setup.base / "team.json")
+    elif case == "out-of-band":
+        write_team(setup, **team)
+        error = ("orchestrator effort high maps to intent deep outside band light..standard; "
+                 "choose an effort within the band; set team.json reasoning_by_kind.orchestrator to an in-band effort")
+    else:
+        if case != "copy-only":
+            write_team(setup, **team)
+        local = dict(team, reasoning="low") if case == "differing" else team
+        (copied / "team.json").write_text(json.dumps(local, indent=3), encoding="utf-8")
+        error = "copied base team.json differs from canonical team.json; use the governing mailbox's team.json"
+    refused = call(command, mr1_r4_request(setup, copied, command, host), expect=2)
+    assert refused == {"error": error}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("copy_team", [False, True])
+def test_mr1_r4_copied_base_uses_canonical_resolution_and_provenance(setup, mr1_cli, tmp_path_factory,
+                                                                  command, host, copy_team):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    write_team(setup, model=model, reasoning="max", reasoning_by_kind={"orchestrator": "medium"})
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    if copy_team:
+        (copied / "team.json").write_bytes((setup.base / "team.json").read_bytes())
+    answer = call(command, mr1_r4_request(setup, copied, command, host))
+    assert answer["team"]["model"] == model and answer["team"]["effort"] == "medium"
+    assert answer["team"]["reasoning_from"] == "kind" and answer["team"]["intent"] == "standard"
+    assert answer["team"]["admission"] == "unprobed"
+    argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
+    if host == "codex-cli":
+        assert codex_config(argv)["model"] == model and codex_config(argv)["model_reasoning_effort"] == "medium"
+    else:
+        assert flag(argv, "--model") == model and flag(argv, "--effort") == "medium"
+
+
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("copied_base", [False, True])
+@pytest.mark.parametrize("full_request", [False, True])
+@pytest.mark.parametrize("shape", ["invalid-json", "empty-file", "directory", "dangling-symlink"])
+def test_mr1_r4_present_canonical_team_is_always_validated(setup, mr1_cli, tmp_path_factory, command, host,
+                                                        copied_base, full_request, shape):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    path = setup.base / "team.json"
+    if shape in ("invalid-json", "empty-file"):
+        path.write_text("not JSON" if shape == "invalid-json" else "", encoding="utf-8")
+        error = "invalid JSON"
+    elif shape == "directory":
+        path.mkdir()
+        error = "input must be a regular file"
+    else:
+        target = tmp_path_factory.mktemp("mr1-missing-" + uuid.uuid4().hex) / (uuid.uuid4().hex + ".json")
+        path.symlink_to(target)
+        error = "symlink paths are not supported: " + str(path)
+    base = mr1_r4_copy_base(setup, tmp_path_factory) if copied_base else setup.base
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    options = {"model": model, "effort": "medium"} if full_request else {}
+    refused = call(command, mr1_r4_request(setup, base, command, host, **options), expect=2)
+    assert refused == {"error": "invalid JSON file %s: %s; repair team.json" % (path, error)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+def test_mr1_r4_full_request_cannot_ignore_conflicting_local_team(setup, mr1_cli, tmp_path_factory, command, host):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    write_team(setup, model=model, reasoning="medium")
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    (copied / "team.json").write_text("not JSON", encoding="utf-8")
+    refused = call(command, mr1_r4_request(setup, copied, command, host, model=model, effort="medium"), expect=2)
+    assert refused == {"error": "copied base team.json differs from canonical team.json; use the governing mailbox's team.json"}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("source", ["request", "team.json"])
+def test_mr1_r4_unbound_model_message_names_its_source(setup, mr1_cli, command, host, source):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    write_team(setup, model="unbound-model" if source == "team.json" else model, reasoning="medium")
+    options = {"model": "unbound-model", "effort": "medium"} if source == "request" else {}
+    refused = call(command, mr1_r4_request(setup, setup.base, command, host, **options), expect=2)
+    assert refused == {"error": "%s model unbound-model is not bound for host %s; choose a model bound in model-bindings.json" %
+                       (source, host)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+MR1_R5_BAD_JSON = [
+    pytest.param(b'{"unused_probe": 1e9999}', "non-finite JSON is not supported", id="overflow-positive"),
+    pytest.param(b'{"unused_probe": -1e9999}', "non-finite JSON is not supported", id="overflow-negative"),
+    pytest.param(b'{"unused_probe": 1e400}', "non-finite JSON is not supported", id="overflow-small-exponent"),
+    pytest.param(b"[" * 10000, "JSON nesting exceeds supported limit", id="deep-array"),
+    pytest.param(b"{" * 10000, "invalid JSON", id="deep-object"),
+    pytest.param(b"\xff", "invalid UTF-8 JSON", id="invalid-utf8"),
+    pytest.param(b"\xef\xbb\xbf{}", "invalid JSON", id="bom"),
+    pytest.param(b"NaN", "non-finite JSON is not supported", id="nan"),
+    pytest.param(b"Infinity", "non-finite JSON is not supported", id="infinity"),
+    pytest.param(b"-Infinity", "non-finite JSON is not supported", id="negative-infinity"),
+    pytest.param(b"9" * 10000, "integer literal exceeds 128 digits", id="huge-integer"),
+    pytest.param(b" " * 262145, "input exceeds 262144 bytes", id="oversize"),
+]
+
+
+@pytest.mark.parametrize("token", ["1e9999", "-1e9999", "1e400"])
+@pytest.mark.parametrize("location", ["bootstrap-request", "bootstrap-provision", "ordinary-record", "carry-record"])
+def test_mr1_r6_overflow_numbers_refuse_at_every_record_boundary(setup, mr1_cli, token, location):
+    module, _ = mr1_cli
+    request = mr1_r4_request(setup, setup.base, "codex-start", "codex-cli")
+    request_path = Path(request.pop("_request_path"))
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    path = setup.base / "provision.json"
+    if location == "bootstrap-request":
+        path = request_path
+    elif location == "carry-record":
+        path = setup.base / "carried" / "carry.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps({"old_root": str(setup.root), "endpoints": [], "message_ids": [],
+                                    "generations": {}}), encoding="utf-8")
+    value = json.loads(path.read_text())
+    value["unused_probe"] = "OVERFLOW_TOKEN"
+    path.write_text(json.dumps(value).replace('"OVERFLOW_TOKEN"', token), encoding="utf-8")
+    expected = "invalid JSON file %s: non-finite JSON is not supported; repair %s" % (path, path.name)
+    if location == "ordinary-record":
+        with pytest.raises(ValueError) as caught:
+            module.codex_start(request)
+        assert str(caught.value) == expected
+    else:
+        command = "carry-check" if location == "carry-record" else "codex-start"
+        if location == "carry-record":
+            request_path.write_text(json.dumps({"base": str(setup.base)}), encoding="utf-8")
+        done = subprocess.run([sys.executable, "-I", str(PROVISION), command, "--request", str(request_path)],
+                              capture_output=True, text=True, timeout=10)
+        assert not done.stderr
+        assert done.returncode == 2, done.stdout
+        assert json.loads(done.stdout) == {"error": expected}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO boundary")
+def test_mr1_r6_bootstrap_refuses_fifo_without_waiting_for_a_writer(setup):
+    path = setup.tmp / ("fifo-" + uuid.uuid4().hex)
+    os.mkfifo(path)
+    done = subprocess.run([sys.executable, "-I", str(PROVISION), "codex-start", "--request", str(path)],
+                          capture_output=True, text=True, timeout=3)
+    assert not done.stderr
+    assert done.returncode == 2
+    assert json.loads(done.stdout) == {"error": "invalid JSON file %s: not a regular file; repair %s" % (path, path.name)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("reader", ["host-plan.json", "mailbox manifest"])
+def test_mr1_r6_delegated_deep_json_refuses_before_binding(setup, mr1_cli, command, host, reader):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    path = setup.base / "host-plan.json" if reader == "host-plan.json" else setup.root / "manifest.json"
+    original = path.read_bytes()
+    path.write_bytes(b"[" * 10000)
+    try:
+        refused = call(command, mr1_r4_request(setup, setup.base, command, host), expect=2)
+        assert refused == {"error": "invalid delegated JSON read (%s): JSON nesting exceeds supported limit; repair the input" % reader}
+    finally:
+        path.write_bytes(original)
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("reader", ["session record", "lifecycle policy"])
+def test_mr1_r6_other_delegated_readers_refuse_deep_json(setup, mr1_cli, reader):
+    module, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    endpoint = "pilot/orchestrator" if reader == "session record" else "pilot/root"
+    options = {"model": "gpt-6.1-sol", "effort": "medium"}
+    if reader == "session record":
+        path = module.hierarchy_hosts.session_record_path(setup.base, endpoint, 1)
+    else:
+        journal = setup.tmp / ("journal-" + uuid.uuid4().hex)
+        options.update(lifecycle=str(journal), actor="root")
+        path = journal / "policy.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(b"[" * 10000)
+    refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "codex-cli",
+                                            endpoint=endpoint, **options), expect=2)
+    assert refused == {"error": "invalid delegated JSON read (%s): JSON nesting exceeds supported limit; repair the input" % reader}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+def test_mr1_r6_copied_base_launcher_records_delegated_plan_refusal(tmp_path_factory, host):
+    from tests.integration.test_hierarchy_launcher_hosts import Hosts
+    launch = Hosts(tmp_path_factory.mktemp("mr1-r6-launch-" + uuid.uuid4().hex))
+    launch.init()
+    mr1_plan(launch, host)
+    (launch.base / "host-plan.json").write_bytes(b"[" * 10000)
+    original_root = launch.root
+    launch.base = mr1_r4_copy_base(launch, tmp_path_factory)
+    refused = launch.start(endpoint="pilot/lane/f2", expect=2)
+    assert refused["state"] == "refused"
+    assert refused["error"] == "invalid delegated JSON read (host-plan.json): JSON nesting exceeds supported limit; repair the input"
+    assert launch.records("pilot/lane/f2") == [refused]
+    assert invoke(original_root, "status")["bindings"]["pilot/lane/f2"] is None
+    assert not launch.codex_log.exists() and not launch.claude_log.exists()
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("planned", [False, True])
+@pytest.mark.parametrize("raw,problem", MR1_R5_BAD_JSON)
+def test_mr1_r5_team_parse_failures_are_normal_refusals(setup, mr1_cli, command, host, planned, raw, problem):
+    _, call = mr1_cli
+    if planned:
+        mr1_plan(setup, host)
+    path = setup.base / "team.json"
+    path.write_bytes(raw)
+    refused = call(command, mr1_r4_request(setup, setup.base, command, host), expect=2)
+    assert refused == {"error": "invalid JSON file %s: %s; repair team.json" % (path, problem)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("raw,problem", MR1_R5_BAD_JSON)
+def test_mr1_r5_bindings_parse_failures_are_normal_refusals(setup, mr1_cli, monkeypatch, command, host, raw, problem):
+    module, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    write_team(setup, model=model, reasoning="medium")
+    path = setup.tmp / (uuid.uuid4().hex + "-bindings.json")
+    path.write_bytes(raw)
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    refused = call(command, mr1_r4_request(setup, setup.base, command, host), expect=2)
+    assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+def test_mr1_r5_launcher_records_deep_team_parse_refusal(tmp_path_factory, host):
+    from tests.integration.test_hierarchy_launcher_hosts import Hosts
+    launch = Hosts(tmp_path_factory.mktemp("mr1-launch-" + uuid.uuid4().hex))
+    launch.init()
+    mr1_plan(launch, host)
+    path = launch.base / "team.json"
+    path.write_bytes(b"[" * 10000)
+    refused = launch.start(endpoint="pilot/lane/f2", expect=2)
+    assert refused["state"] == "refused"
+    assert refused["error"] == "invalid JSON file %s: JSON nesting exceeds supported limit; repair team.json" % path
+    assert launch.records("pilot/lane/f2") == [refused]
+    assert launch.binding("pilot/lane/f2") is None
+    assert not launch.codex_log.exists() and not launch.claude_log.exists()
+
+
+@pytest.mark.parametrize("case,problem", [
+    ("missing-admission", "admission must map exactly supported intents"),
+    ("extra-admission", "admission must map exactly supported intents"),
+    ("unknown-admission", "unknown admission value 'allowed'"),
+    ("typed-admission", "unknown admission value 7"),
+    ("empty-levels", "levels must map a nonempty subset of light, standard, deep, extended, max"),
+    ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max"),
+    ("missing-default", "binding claude-code/coding lacks band default standard for orchestrator"),
+    ("missing-ceiling", "binding claude-code/coding lacks band ceiling max for implementer"),
+    ("rejected-default", "binding claude-code/coding has rejected band default standard for orchestrator"),
+    ("rejected-ceiling", "binding claude-code/coding has rejected band ceiling max for implementer"),
+])
+def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeypatch, case, problem):
+    module, call = mr1_cli
+    mr1_plan(setup)
+    data = mr1_bindings()
+    row = data["hosts"][0]
+    if case == "missing-admission":
+        del row["admission"]["deep"]
+    elif case == "extra-admission":
+        row["admission"]["other"] = "unprobed"
+    elif case == "unknown-admission":
+        row["admission"]["standard"] = "allowed"
+    elif case == "typed-admission":
+        row["admission"]["standard"] = 7
+    elif case.startswith("rejected-"):
+        row["admission"]["standard" if case == "rejected-default" else "max"] = "rejected"
+    elif case == "empty-levels":
+        row["levels"] = {}
+        row["admission"] = {}
+    elif case == "unknown-intent":
+        row["levels"]["other"] = "high"
+        row["admission"]["other"] = "unprobed"
+    else:
+        intent = "standard" if case == "missing-default" else "max"
+        del row["levels"][intent]
+        del row["admission"][intent]
+    path = setup.tmp / (uuid.uuid4().hex + ".json")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
+                                            model="claude-opus-5-5", effort="medium"), expect=2)
+    assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("state", ["unprobed", "admitted", "rejected"])
+def test_mr1_r5_selected_admission_is_recorded_or_refused(setup, mr1_cli, monkeypatch, command, host, state):
+    module, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
+    row["admission"]["extended"] = state
+    row["admission"]["light"] = "rejected"  # Neither a required default nor ceiling.
+    path = setup.tmp / (uuid.uuid4().hex + ".json")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
+                             model=row["model"], effort="xhigh")
+    answer = call(command, request, expect=2 if state == "rejected" else 0)
+    if state == "rejected":
+        assert answer == {"error": "%s intent extended (effort xhigh) is rejected for %s; choose a different supported level" %
+                          (row["model"], host)}
+        assert unbound(setup, "pilot/lane/f2")
+    else:
+        assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("effort", ["low", "medium"])
+def test_mr1_r5_partial_binding_accepts_supported_levels_and_names_unsupported_ones(setup, mr1_cli, monkeypatch,
+                                                                                command, host, effort):
+    module, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    for row in data["hosts"]:
+        intents = ("standard", "deep", "max") if row["class"] == "coding" else ("deep",)
+        row["levels"] = {key: row["levels"][key] for key in intents}
+        row["admission"] = {key: "unprobed" for key in intents}
+    row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
+    path = setup.tmp / (uuid.uuid4().hex + ".json")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    answer = call(command, mr1_r4_request(setup, setup.base, command, host, model=row["model"], effort=effort),
+                  expect=2 if effort == "low" else 0)
+    if effort == "low":
+        assert answer == {"error": "orchestrator effort low has no supported intent; supported intents: standard, deep, max; "
+                          "choose a supported effort"}
+        assert unbound(setup, "pilot/orchestrator")
+    else:
+        assert answer["team"]["intent"] == "standard" and answer["team"]["effort"] == "medium"
+
+
+@pytest.mark.parametrize("which", ["team", "bindings"])
+def test_mr1_r5_unicode_paths_and_repair_text_survive_refusals(tmp_path_factory, mr1_cli, monkeypatch, which):
+    module, call = mr1_cli
+    folder = tmp_path_factory.mktemp("mr1-unicode-" + uuid.uuid4().hex) / "José"
+    folder.mkdir()
+    setup = Setup(folder)
+    setup.init()
+    mr1_plan(setup)
+    if which == "team":
+        path = setup.base / "team.json"
+        path.write_text('{"bad-ｘ":1,"bad-ｘ":2}', encoding="utf-8")
+        error = "invalid JSON file %s: duplicate JSON key 'bad-\\uff58'; repair team.json" % path
+    else:
+        path = folder / "model-bindings.json"
+        data = mr1_bindings()
+        data["hosts"][0]["class"] = "ｘ" * 100
+        path.write_text(json.dumps(data), encoding="utf-8")
+        monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+        shown = ascii("ｘ" * 100)[:77] + "..."
+        error = "invalid model bindings %s: unknown model class %s; repair model-bindings.json" % (path, shown)
+    refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
+                                            model="claude-opus-5-5", effort="medium"), expect=2)
+    assert refused == {"error": error}
+    assert str(path) in refused["error"] and "José" in refused["error"] and "ｘ" not in refused["error"]
+    assert unbound(setup, "pilot/orchestrator")
+
+
+
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("kind,endpoint,default", MR1_R2_BANDED_ROLES)
+def test_mr1_r2_missing_effort_names_band_default_without_applying_it(mr1_r2_setup, mr1_cli, command, host, kind, endpoint,
+                                                                  default):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    refused = call(command, mr1_request(setup, command, endpoint, host, model=model), expect=2)
+    intent = "standard" if default == "medium" else "deep"
+    assert refused == {"error": "%s has no effort; set %s (intent %s, band default) in request effort or team.json reasoning" %
+                       (kind, default, intent)}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("kind,endpoint,effort", MR1_R2_BANDED_ROLES)
+def test_mr1_r3_host_defaults_keep_exact_answers_without_policy_provenance(mr1_r2_setup, mr1_cli, monkeypatch,
+                                                                        command, host, kind, endpoint, effort):
+    setup = mr1_r2_setup
+    module, call = mr1_cli
+    request = mr1_request(setup, command, endpoint, host)
+    before = call(command, dict(request))
+    mr1_plan(setup, host)
+    garbage = setup.tmp / "unused-bindings.json"
+    garbage.write_text("not JSON", encoding="utf-8")
+    monkeypatch.setattr(module, "MODEL_BINDINGS", garbage)
+    after = call(command, dict(request))
+    assert after == before
+    assert "team" not in after
+    argv = json.loads(Path(after["wake_profile"]).read_text())["argv"] if command == "add-role" else after["start_argv"]
+    if host == "codex-cli":
+        config = codex_config(argv)
+        assert "model" not in config and "model_reasoning_effort" not in config
+    else:
+        assert "--model" not in argv and "--effort" not in argv
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("kind,endpoint,effort", MR1_R2_BANDED_ROLES)
+def test_mr1_r3_effort_without_model_refuses_with_binding_instruction(mr1_r2_setup, mr1_cli, command, host,
+                                                                   kind, endpoint, effort):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    refused = call(command, mr1_request(setup, command, endpoint, host, effort=effort), expect=2)
+    assert refused == {"error": "no model: set the request model or team.json model (coding binding for %s: %s)" %
+                       (host, model)}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("planned", [False, True])
+def test_mr1_r4_copy_without_any_team_file_keeps_host_defaults(setup, mr1_cli, tmp_path_factory, command, host, planned):
+    _, call = mr1_cli
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    request = mr1_r4_request(setup, copied, command, host)
+    before = call(command, dict(request))
+    if planned:
+        mr1_plan(setup, host)
+    else:
+        # Without a plan only the caller's own team.json applies, as before.
+        (setup.base / "team.json").write_text("not JSON", encoding="utf-8")
+    assert call(command, dict(request)) == before
+    assert "team" not in before
+
+
 ROOT_TOOLS = ["root_decide", "team_status", "team_pending", "team_request"]
 ROOT_READS = "loop_state and evidence are only for ROOT's decision adapter, with its lifecycle and actor"
 
