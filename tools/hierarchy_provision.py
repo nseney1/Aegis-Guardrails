@@ -560,7 +560,7 @@ def planned_model_settings(bindings, host, kind, options, record):
     row = roles.get(kind)
     if row is None and kind not in UNBANDED_MODEL_ROLES:
         raise bindings_error("no role policy for " + safe_value(kind))
-    model_class = row["model_class"] if row is not None else "coding" if kind == "front-door" else None
+    model_class = row["model_class"] if row is not None else "coding"
     binding = hosts.get((host, model_class)) if model_class is not None else None
     if model_class is not None and binding is None:
         raise bindings_error("no %s binding for host %s" % (model_class, safe_value(host)))
@@ -660,6 +660,15 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
     full_request = "model" in request and "effort" in request
     if plan is None and full_request:
         return request, None
+    if plan is not None and kind == "root":
+        # ROOT is owner-chosen, recorded rather than resolved from the team's settings. Keep complete explicit
+        # requests' existing return shape; otherwise name the host defaults for dimensions the owner left out.
+        if full_request:
+            return request, None
+        effort = request.get("effort")
+        return request, {"model": request.get("model"), "model_from": "request" if "model" in request else "host-default",
+                         "effort": effort, "effort_from": "request" if "effort" in request else "host-default",
+                         "reasoning": effort, "reasoning_from": "request" if "effort" in request else "host-default"}
     try:
         if plan is not None:
             # Provision/start callers pass the exact mailbox_root they supplied to governing_plan. Direct callers

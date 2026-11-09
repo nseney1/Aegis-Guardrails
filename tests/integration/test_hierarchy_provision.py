@@ -2033,3 +2033,90 @@ def test_a_launched_codex_role_records_its_codex_profile(tmp_path):
     profile = json.loads(Path(answer["codex_profile"]).read_text())
     assert profile["session"] == thread and profile["role"] == "reviewer"
     assert_argv_follows_profile(json.loads(Path(answer["wake_profile"]).read_text())["argv"], profile)
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("model", ["gpt-6-luna", "claude-haiku-5-5", "claude-sonnet-5-5", "gpt-6.1-terra"])
+@pytest.mark.parametrize("source", ["request", "team.json"])
+def test_mr1_r8_router_refuses_cheap_product_seats(mr1_r2_setup, mr1_cli, command, host, model, source):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    row = next(item for item in mr1_bindings()["hosts"] if item["model"] == model)
+    coding = next(item for item in mr1_bindings()["hosts"] if item["host"] == host and item["class"] == "coding")
+    options = {"model": model} if source == "request" else {}
+    if source == "team.json":
+        write_team(setup, model=model, reasoning="high")
+    refused = call(command, mr1_request(setup, command, "pilot/router", host, **options), expect=2)
+    error = ("%s model %s needs host %s, not %s" % (source, model, row["host"], host)
+             if row["host"] != host else
+             "router model %s has class %s, requires class coding; choose model %s" %
+             (model, row["class"], coding["model"]))
+    assert refused == {"error": error}
+    assert unbound(setup, "pilot/router")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("source", ["request", "team.json"])
+def test_mr1_r8_router_accepts_coding_with_fixed_effort_and_tier(mr1_r2_setup, mr1_cli, command, host, source):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(item["model"] for item in mr1_bindings()["hosts"] if item["host"] == host and item["class"] == "coding")
+    options = {"model": model} if source == "request" else {}
+    if source == "team.json":
+        write_team(setup, model=model, reasoning="max")
+    answer = call(command, mr1_request(setup, command, "pilot/router", host, **options))
+    argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
+    assert ("model=" + json.dumps(model)) in argv if host == "codex-cli" else flag(argv, "--model") == model
+    assert ("model_reasoning_effort=" + json.dumps("medium")) in argv if host == "codex-cli" else flag(argv, "--effort") == "medium"
+    assert answer["team"]["model_class"] == "coding" and answer["team"]["effort"] == "medium"
+    assert answer["model_profile"] == {"source": "registry", "effort": "medium", "tier": "ultrafast",
+                                       "tier_applied": host == "codex-cli"}
+
+
+@pytest.mark.parametrize("command,host,team_host,team_model", [
+    ("codex-start", "codex-cli", "claude-code", "claude-opus-5-5"),
+    ("claude-start", "claude-code", "codex-cli", "gpt-6.1-sol"),
+])
+@pytest.mark.parametrize("model", [None, "owner-selected-model"])
+@pytest.mark.parametrize("effort", [None, "xhigh"])
+def test_mr1_r8_planned_root_never_resolves_team_settings(setup, mr1_cli, command, host, team_host, team_model,
+                                                       model, effort):
+    _, call = mr1_cli
+    mr1_plan(setup, team_host)
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["root"] = host
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    write_team(setup, model=team_model, reasoning="high")
+    options = {}
+    if model is not None:
+        options["model"] = model
+    if effort is not None:
+        options["effort"] = effort
+    answer = call(command, mr1_request(setup, command, "pilot/root", host, **options))
+    argv = answer["start_argv"]
+    if host == "codex-cli":
+        assert [word for word in argv if word.startswith("model=")] == ([] if model is None else ["model=" + json.dumps(model)])
+        assert answer["codex_profile"]["model"] == model
+        assert answer["codex_profile"]["effort"] == effort
+    else:
+        assert flag(argv, "--model") == model and flag(argv, "--effort") == effort
+    if model is None or effort is None:
+        assert answer["team"] == {"model": model, "model_from": "host-default" if model is None else "request",
+                                  "effort": effort, "effort_from": "host-default" if effort is None else "request",
+                                  "reasoning": effort, "reasoning_from": "host-default" if effort is None else "request"}
+    assert unbound(setup, "pilot/root")
+
+
+@pytest.mark.parametrize("command,host,team_host,team_model", [
+    ("codex-start", "codex-cli", "claude-code", "claude-opus-5-5"),
+    ("claude-start", "claude-code", "codex-cli", "gpt-6.1-sol"),
+])
+def test_mr1_r8_planless_root_keeps_legacy_cross_host_refusal(setup, mr1_cli, command, host, team_host, team_model):
+    _, call = mr1_cli
+    write_team(setup, model=team_model, reasoning="high")
+    refused = call(command, mr1_request(setup, command, "pilot/root", host), expect=2)
+    assert refused == {"error": "team.json model %s needs host %s, not %s" % (team_model, team_host, host)}
+    assert unbound(setup, "pilot/root")
