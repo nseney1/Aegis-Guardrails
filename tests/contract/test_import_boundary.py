@@ -42,6 +42,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
+    # Canonical message records and untrusted views (stdlib only).
+    "aegis_core.message_codec": 0,
     # Pure data, no aegis imports: the host table and the bootstrap text.
     "aegis_core.hosts": 0,
     "aegis_core.bootstrap": 0,
