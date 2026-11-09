@@ -110,6 +110,8 @@ MAX_PATHS_BYTES = 65536
 MAX_STEPS = 20
 MAX_RESULT_BYTES = 4194304
 MAX_JOBS_DEFAULT = 20
+# Outside observations are a bounded, PID-only view; counting always uses the full list.
+MAX_OUTSIDE_ROWS = 64
 MAX_TIMEOUT_SECONDS = 86400
 DEFAULT_LOCK_WAIT_SECONDS = 30.0
 # A leading dash would become an option, and pathspec and glob characters would widen what is named.
@@ -249,9 +251,14 @@ def existing_folders(value, label):
 def load_recipes(path):
     raw = read_bytes(path)
     recipes = strict_json(raw.decode("utf-8"))
-    fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
+    fields(recipes, {"schema", "python", "path", "recipes"},
+           {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes", "census_outside_policy"})
     if "min_free_gigabytes" in recipes:
         integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
+    if "census_outside_policy" in recipes:
+        policy = recipes["census_outside_policy"]
+        require(isinstance(policy, str) and policy in ("count", "report", "ignore"),
+                "invalid census_outside_policy: expected count, report or ignore")
     require(recipes["schema"] == RECIPES_SCHEMA, "unsupported recipes schema")
     require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
     strings(recipes["path"], "path", nonempty=True)
@@ -2258,25 +2265,46 @@ def fixture_roots(fixture, kind):
     return sorted(roots.get(kind, []))
 
 
-def census(store_path, ledger, fixture, kind):
+def census(store_path, ledger, fixture, kind, outside_policy=None):
+    """Observe a kind's capacity; absent policy keeps the raw count view, including recovery-status.
+
+    The policy protects against misconfiguration and accidents only. It comes from reviewed recipes whose
+    check-recipes/recipes_sha256 hash team init pins; changing it requires re-running the reviewed init. Team state,
+    env and job packets cannot disable counting. Report and ignore knowingly accept outside load, including another
+    team's work or a container seeing only its own namespace (container spec amendment 7). Count stays the default.
+    """
     held = ledger.held(kind)
+    view = {"limit": ledger.limits[kind], "held": len(held), "external_roots": [],
+            "census": "fixture" if fixture is not None else "proc"}
+    if outside_policy == "ignore":
+        # Do not read the fixture or walk /proc for outside roots under this reviewed policy.
+        return {**view, "outside_policy": "ignore"}
     if fixture is not None:
-        return {"limit": ledger.limits[kind], "held": len(held), "external_roots": fixture_roots(fixture, kind),
-                "census": "fixture"}
-    owners = set()
-    # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
-    for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
-        if request["holder"].startswith("job:"):
-            claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
-            if claim.exists():
-                record = read_json(claim)
-                require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
-                        and type(record.get("pid")) is int and record["pid"] > 0
-                        and isinstance(record.get("start"), str) and record["start"].isdigit(),
-                        "invalid runner claim: " + request["holder"][4:])
-                if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
-                    owners.add(record["pid"])
-    return {"limit": ledger.limits[kind], "held": len(held), "external_roots": outside_roots(owners, kind), "census": "proc"}
+        roots = fixture_roots(fixture, kind)
+    else:
+        owners = set()
+        # Whatever any running job of this ledger started is its own work, not outside work, whichever kind it holds.
+        for request in [r for name in HEAVY_KINDS for r in ledger.held(name)]:
+            if request["holder"].startswith("job:"):
+                claim = safe_path(Path(store_path) / "jobs" / request["holder"][4:] / "claim.json")
+                if claim.exists():
+                    record = read_json(claim)
+                    require(isinstance(record, dict) and record.get("job") == request["holder"][4:]
+                            and type(record.get("pid")) is int and record["pid"] > 0
+                            and isinstance(record.get("start"), str) and record["start"].isdigit(),
+                            "invalid runner claim: " + request["holder"][4:])
+                    if record.get("process_scope") == process_scope() and process_start(record["pid"]) == record["start"]:
+                        owners.add(record["pid"])
+        roots = outside_roots(owners, kind)
+    view["external_roots"] = [] if outside_policy == "report" else roots
+    if outside_policy is not None:
+        require(all(type(pid) is int and pid > 0 for pid in roots), "invalid census fixture pid")
+        view["outside_policy"] = outside_policy
+        view["outside"] = [{"pid": pid, "class": "pytest" if kind == "heavy" else "cargo"}
+                           for pid in sorted(roots)[:MAX_OUTSIDE_ROWS]]
+        if len(roots) > MAX_OUTSIDE_ROWS:
+            view["outside_truncated"] = len(roots) - MAX_OUTSIDE_ROWS
+    return view
 
 
 def run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy=False):
@@ -2306,7 +2334,7 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             def outside(locked):
                 # Counted under the store lock, together with the grant, so another runner cannot take the
                 # same free slot between this count and the grant.
-                seen.update(census(store.path, locked, fixture, kind))
+                seen.update(census(store.path, locked, fixture, kind, recipes.get("census_outside_policy")))
                 return seen["external_roots"]
 
             try:

@@ -21,11 +21,39 @@ store cannot be read. None of these codes establishes native qualification,
 independent acceptance, or permission to execute. An empty mailbox is not proof
 that the resource ledger or retained job directories are empty.
 
-The capacity view describes ledger reservations. The process census separately
-reports outside work and observed available slots. Unavailable census evidence
-leaves available capacity unknown. The census sees the current process namespace;
-it does not qualify a host-wide observer or discover processes hidden by an
+The capacity view describes ledger reservations. `recovery-status` takes no
+recipes and always reports the raw process census with count semantics: outside
+work reduces its observed available slots. Unavailable census evidence leaves
+available capacity unknown. The census sees the current process namespace; it
+does not qualify a host-wide observer or discover processes hidden by an
 unsupported host boundary.
+
+For job admission, the optional top-level `census_outside_policy` in
+`aegis.hierarchy-job-recipes/v1` accepts `"count"`, `"report"` or `"ignore"`.
+Absent means `"count"` and preserves the existing recipe parsing, hash input and
+waiting-row capacity. Explicit `"count"` counts outside roots as before and adds
+`outside_policy` and `outside` to waiting-row capacity. `"report"` observes the
+same roots but returns no outside roots to the grant callback: capacity records
+`external_roots: []`, `outside_policy: "report"` and the observed `outside` rows.
+`"ignore"` skips outside observation entirely, including fixture reads and the
+outside `/proc` walk, records `external_roots: []` and `outside_policy: "ignore"`,
+and has no `outside` key. Each kind is separate: `heavy` rows have class `pytest`,
+and `heavy-tests` rows have class `cargo`. Rows contain only integer `pid` and
+`class`, sorted by PID and capped at 64; `outside_truncated` records the omitted
+count when nonzero. Counting uses the full root list. No argv, paths or
+environment are recorded. The fixture census obeys the same policy. Ledger-held
+jobs, limits, process ownership, `low_disk` and `store_busy` retain their rules.
+Unknown or non-string policy values refuse recipe loading with
+`invalid census_outside_policy: expected count, report or ignore`; misspelled
+keys are refused as unexpected fields.
+
+This policy protects against misconfiguration and accidents only. It is reviewed
+because it sits in the recipes file, whose sha256 (`check-recipes`,
+`recipes_sha256`) team init pins; changing it means re-running the reviewed init.
+Unreviewed team state, environment variables and job packets can never switch off
+counting. `"report"` and `"ignore"` knowingly accept outside load, such as another
+team's work on a shared machine or a container whose census sees only its own
+namespace (container spec amendment 7). The default stays `"count"`.
 
 ## Recovery invariants
 
