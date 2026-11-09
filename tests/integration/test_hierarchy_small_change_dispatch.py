@@ -3713,3 +3713,1580 @@ def test_r6_attachment_capture_preserves_hash_and_mailbox_byte_bound(tmp_path, d
     assert (row["state"], row.get("reason")) == ("held", "small_change_message_conflict"), row
     assert ("brief sha256 mismatch" if damage == "hash" else "input exceeds 262144 bytes") in row["detail"], row
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+
+@pytest.mark.parametrize("entry", ["dispatch-with-recipes", "status-without-recipes"])
+def test_r7_expects_tests_semantics_cannot_be_skipped_by_status_without_recipes(tmp_path, entry):
+    (tmp_path / ".keep").write_text("R7 admitted recipe semantics and optional status configuration\n")
+    program = ("from pathlib import Path; import sys; p=Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); "
+               "p.write_text('<testsuite tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\"/>')")
+    world = DispatchWorld(tmp_path, recipe_changes={"expects_tests": True, "keep": ["run/junit.xml"],
+        "steps": [["$python", "-c", program, "$scratch/junit.xml"]]})
+    folder = formal_completed_job(world)
+    result_path = folder / "result.json"
+    result = json.loads(result_path.read_text())
+    assert result["state"] == "completed" and result["reason"] is None
+    assert result["tests"]["total"] == 1 and result["tests"]["passed"] == 1
+    result["tests"] = None
+    result_path.write_text(json.dumps(result))
+    receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(result_path.read_bytes()).hexdigest())
+                    for ref in m["receipt"]["evidence"] if ref["path"] == str(result_path)])
+    path = Path(receipt["path"])
+    header, body = path.read_text()[4:].split("\n---\n\n", 1)
+    assert any(part.startswith("Tests: ") for part in body.split("\n\n"))
+    body = "\n\n".join(part for part in body.split("\n\n") if not part.startswith("Tests: "))
+    path.write_text("---\n" + header + "\n---\n\n" + body)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    report = world.dispatch() if entry == "dispatch-with-recipes" else world.run("status")
+    row = report["small_changes"][0]
+    if entry == "dispatch-with-recipes":
+        assert row["state"] == "held", row
+        assert row["reason"] == "small_change_receipt_invalid", row
+    assert len(world.messages("dispatch")) == 1, "contradictory expects_tests evidence reached Reviewer"
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def r7_router_probe(world, injection, *, command="dispatch", extra=()):
+    script = """import importlib.util, json, os, pwd, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('hierarchy_router', sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
+telemetry = Path(sys.argv[3]); seen = {}
+""" + injection + """
+try:
+    code = router.main(sys.argv[4:])
+finally:
+    telemetry.write_text(json.dumps(seen))
+sys.exit(code)
+"""
+    telemetry = world.tmp / "r7-io.json"
+    args = ["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), command,
+            "--recipes", str(world.recipes_path), "--wait", "0.1"]
+    if command == "dispatch":
+        args.append("--evidence-only")
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(world.tmp / "home"),
+                        str(telemetry), *args, *extra], env=env, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    return json.loads(p.stdout), json.loads(telemetry.read_text())
+
+
+@pytest.mark.parametrize("stage", ["writer", "check", "reviewer", "check-batch"])
+@pytest.mark.parametrize("damage", ["fifo", "symlink", "content", "steady", "after-capture"])
+def test_r7_publication_uses_one_nonblocking_hash_bound_capture(tmp_path, stage, damage):
+    (tmp_path / ".keep").write_text("R7 publication boundary; owned files, modelled OS substitutions\n")
+    world = DispatchWorld(tmp_path, checks=2 if stage == "check-batch" else 1)
+    if stage != "writer":
+        world.dispatch()
+        world.finish_writer()
+    if stage == "reviewer":
+        world.dispatch()
+        world.run_jobs()
+    original_dispatches, original_checks = world.messages("dispatch"), world.messages("job_request")
+    injection = r"""
+import io, stat
+damage = %r
+seen.update(injected=False, unsafe=False, bytes=0, raw_sha=None, target=None, checks=0, reopened=0)
+link, inspected, opened, descriptor, read = os.replace, os.stat, io.open, os.open, os.read
+def actual(path, kw):
+    if not isinstance(path, (str, bytes, os.PathLike)): return None
+    value = Path(os.fsdecode(path))
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / value
+    return str(value)
+def staged(src, dst, *args, **kw):
+    answer = link(src, dst, *args, **kw)
+    path = Path(actual(dst, {'dir_fd': kw.get('dst_dir_fd')}))
+    if path.parent.name == 'briefs':
+        seen['target'] = str(path)
+        seen['raw_sha'] = __import__('hashlib').sha256(path.read_bytes()).hexdigest()
+    return answer
+def checked(path, *args, **kw):
+    info = inspected(path, *args, **kw)
+    if (damage == 'after-capture' and seen['bytes'] and not seen.get('changed')
+            and '/bindings/engine/orchestrator/' in str(actual(path, kw))):
+        seen['changed'] = True
+        with opened(seen['target'], 'ab') as stream: stream.write(b'changed after capture')
+    frame, reading = sys._getframe(1), False
+    while frame is not None:
+        reading = reading or frame.f_code.co_name in {'read_bytes', '_read_reference'}
+        frame = frame.f_back
+    if actual(path, kw) == seen['target'] and reading: seen['checks'] += 1
+    # Substitute at the content reader's regular-file observation, not at publication's path-return check.
+    if (actual(path, kw) == seen['target'] and reading and not seen['injected']
+            and (kw.get('follow_symlinks', True) or kw.get('dir_fd') is not None)
+            and stat.S_ISREG(info.st_mode)):
+        seen['injected'] = True
+        target = Path(seen['target'])
+        if damage not in {'steady', 'after-capture'}:
+            target.rename(target.with_name(target.name + '.original'))
+            if damage == 'fifo': os.mkfifo(target)
+            elif damage == 'symlink': target.symlink_to(target.with_name(target.name + '.original'))
+            else: target.write_bytes(b'changed after the regular-file observation')
+    return info
+def unsafe(path, *args, **kw):
+    mode = args[0] if args else kw.get('mode', 'r')
+    if actual(path, kw) == seen['target'] and seen['injected'] and 'r' in mode:
+        seen['unsafe'] = True
+        raise OSError('modelled blocking publication open intercepted')
+    return opened(path, *args, **kw)
+watched = set()
+def fdopen(path, flags, *args, **kw):
+    if actual(path, kw) == seen['target'] and seen['injected'] and not flags & os.O_NONBLOCK:
+        seen['unsafe'] = True
+        raise OSError('modelled blocking descriptor publication open intercepted')
+    result = descriptor(path, flags, *args, **kw)
+    if actual(path, kw) == seen['target']: watched.add(result)
+    else: watched.discard(result)
+    return result
+def consumed(fd, amount):
+    data = read(fd, amount)
+    if fd in watched: seen['bytes'] += len(data)
+    return data
+os.replace, os.stat, io.open, os.open, os.read = staged, checked, unsafe, fdopen, consumed
+fdopen_stream = os.fdopen
+def stream(fd, *args, **kw):
+    mode = args[0] if args else kw.get('mode', 'r')
+    if actual(os.readlink('/proc/self/fd/%%d' %% fd), {}) == seen['target'] and 'r' in mode:
+        seen['reopened'] += 1
+    return fdopen_stream(fd, *args, **kw)
+os.fdopen = stream
+""" % damage
+    report, seen = r7_router_probe(world, injection)
+    assert seen["injected"], seen
+    assert not seen["unsafe"], "publication reached the pinned blocking attachment reader"
+    row = report["small_changes"][0]
+    if damage == "steady":
+        assert row["state"] == {"writer": "writer_sent", "check": "checking", "check-batch": "checking", "reviewer": "reviewing"}[stage], row
+        record = (world.messages("job_request") if stage in {"check", "check-batch"} else world.messages("dispatch"))[-1]
+        ref = record["message"]["brief"]
+        assert ref["sha256"] == seen["raw_sha"] == hashlib.sha256(Path(ref["path"]).read_bytes()).hexdigest()
+        assert seen["bytes"] == Path(ref["path"]).stat().st_size, "publication recaptured an attachment"
+        assert seen["reopened"] == 0, "publication staging reread an already captured attachment"
+    else:
+        if damage == "after-capture":
+            assert seen.get("changed"), seen
+        assert row["state"] == "held", row
+        assert world.messages("dispatch") == original_dispatches and world.messages("job_request") == original_checks
+
+
+@pytest.mark.parametrize("extension", [".cmd", ".bat", ".exe", ".com"])
+@pytest.mark.parametrize("damage", ["steady", "type", "identity", "size", "mtime", "reparse"])
+def test_r7_portable_verify_uses_platform_consistent_witnesses(tmp_path, extension, damage):
+    (tmp_path / ".keep").write_text("R7 modelled Windows filename-derived execute bits\n")
+    target = tmp_path / ("tool" + extension)
+    target.write_bytes(b"ordinary executable reference\n")
+    from tests.integration.test_hierarchy_fresh_brief import SECTIONS
+    brief = tmp_path / "portable.md"
+    lines = ["# Fresh thread brief", "<!-- aegis.hierarchy-fresh-brief/v1 -->", "Resume path: Verify first."]
+    for section in SECTIONS:
+        lines += ["## " + section, "- " + json.dumps({"kind": "evidence", "ref": {
+            "path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()}})]
+    brief.write_text("\n".join(lines) + "\n")
+    script = r"""
+import importlib.util, os, stat, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_fresh_brief', sys.argv[1])
+fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+target, brief, damage = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+os.supports_dir_fd = set()
+original_lstat, original_fstat = os.lstat, os.fstat
+class Witness:
+    def __init__(self, original, **changes): self.original, self.changes = original, changes
+    def __getattr__(self, key): return self.changes[key] if key in self.changes else getattr(self.original, key)
+def linked(path, *args, **kw):
+    info = original_lstat(path, *args, **kw)
+    return Witness(info, st_mode=info.st_mode | 0o111) if Path(path) == target else info
+def opened(fd):
+    info = original_fstat(fd)
+    if Path(os.readlink('/proc/self/fd/%%d' %% fd)) != target: return info
+    changes = {}
+    if damage == 'type': changes['st_mode'] = stat.S_IFDIR | 0o644
+    if damage == 'identity': changes['st_ino'] = info.st_ino + 1
+    if damage == 'size': changes['st_size'] = info.st_size + 1
+    if damage == 'mtime': changes['st_mtime_ns'] = info.st_mtime_ns + 1
+    if damage == 'reparse': changes['st_file_attributes'] = stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return Witness(info, **changes)
+os.lstat, os.fstat = linked, opened
+sys.exit(fresh.main(['verify', '--path', str(brief), '--sha256', __import__('hashlib').sha256(brief.read_bytes()).hexdigest()]))
+""".replace("%%", "%")
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools/hierarchy_fresh_brief.py"),
+        str(target), str(brief), damage], env=os.environ.copy(), capture_output=True, text=True, timeout=15)
+    assert p.stderr == "", p.stdout + p.stderr
+    answer = json.loads(p.stdout)
+    if damage == "steady":
+        assert p.returncode == 0 and answer["ok"], answer
+    else:
+        assert p.returncode != 0 and not answer.get("ok", False), answer
+        assert "reference changed while opening" in answer["error"], answer
+
+
+@pytest.mark.parametrize("damage", ["missing", "total-zero", "passed-zero", "reason", "reason-empty", "counts-disagree",
+                                  "new-commit", "valid", "some-failed"])
+def test_r7_completed_recipe_semantics_are_checked_before_publication(tmp_path, damage):
+    (tmp_path / ".keep").write_text("R7 completed result semantics; original runner receipt body recomputed\n")
+    program = ("from pathlib import Path; import sys; p=Path(sys.argv[1]); p.parent.mkdir(parents=True,exist_ok=True); "
+               "p.write_text('<testsuite tests=\"1\"/>')")
+    world = DispatchWorld(tmp_path, recipe_changes={"expects_tests": True, "keep": ["run/junit.xml"],
+        "steps": [["$python", "-c", program, "$scratch/junit.xml"]]})
+    folder = formal_completed_job(world)
+    result_path = folder / "result.json"
+    result = json.loads(result_path.read_text())
+    if damage == "missing": result["tests"] = None
+    elif damage == "total-zero": result["tests"].update(total=0, passed=0)
+    elif damage == "passed-zero": result["tests"].update(passed=0, skipped=1)
+    elif damage == "reason": result["reason"] = "the run passed no tests"
+    elif damage == "reason-empty": result["reason"] = ""
+    elif damage == "counts-disagree": result["tests"]["total"] = 2
+    elif damage == "new-commit": result["commit"] = "f" * 40
+    elif damage == "some-failed": result["tests"].update(total=2, failed=1)
+    result_path.write_text(json.dumps(result))
+    receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(result_path.read_bytes()).hexdigest())
+                    for ref in m["receipt"]["evidence"] if ref["path"] == str(result_path)])
+    # Use the public runner's own unchanged rendering to remove unrelated body mismatches from the probe.
+    from tools.hierarchy_jobs import Job, result_body
+    job = Job(world.workspace.store, {"id": "engine"}, world.messages("job_request")[0]["message"])
+    body = result_body(job, result)
+    path = Path(receipt["path"])
+    header, _body = path.read_text()[4:].split("\n---\n\n", 1)
+    if damage == "reason":
+        message = json.loads(header)
+        message["receipt"]["reason"] = result["reason"]
+        header = json.dumps(message)
+    path.write_text("---\n" + header + "\n---\n\n" + body)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    if damage in {"reason", "reason-empty"}:
+        status = world.run("status")["small_changes"][0]
+        assert (status["state"], status.get("reason")) == ("held", "small_change_receipt_invalid"), status
+    row = world.dispatch()["small_changes"][0]
+    if damage in {"valid", "some-failed"}:
+        assert row["state"] == "reviewing", row
+    else:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+        assert len(world.messages("dispatch")) == 1
+
+
+@pytest.mark.parametrize("liveness", ["live", "dead", "unknown"])
+def test_r7_started_check_observes_claim_before_growing_logs(tmp_path, liveness):
+    (tmp_path / ".keep").write_text("R7 modelled process observation, real public runner's started receipt\n")
+    world = DispatchWorld(tmp_path, checks=2)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    world.run_jobs()
+    record = world.messages("job_request")[0]
+    folder = world.workspace.store / "jobs/engine" / record["message"]["message_id"]
+    terminal = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    Path(terminal["path"]).unlink()
+    (folder / "result.json").unlink()
+    injection = r"""
+import hierarchy_jobs as jobs
+target = Path(%r)
+claim_path = target / 'claim.json'
+claim = json.loads(claim_path.read_text())
+if %r == 'live':
+    claim.update(pid=os.getpid(), start=jobs.process_start(os.getpid()), process_scope=jobs.process_scope())
+elif %r == 'unknown': claim['process_scope'] = {'unknown': 'modelled inaccessible scope'}
+claim_path.write_text(json.dumps(claim))
+seen['log_reads'] = 0
+read = os.read
+def consumed(fd, amount):
+    path = Path(os.readlink('/proc/self/fd/%%d' %% fd))
+    if path.parent == target and path.name.startswith('step-'):
+        seen['log_reads'] += 1
+        with path.open('ab') as stream: stream.write(b'modelled concurrent log append')
+    return read(fd, amount)
+os.read = consumed
+""" % (str(folder), liveness, liveness)
+    before_messages = world.messages()
+    for command in ("status", "dispatch"):
+        report, seen = r7_router_probe(world, injection, command=command)
+        row = report["small_changes"][0]
+        if liveness == "live":
+            assert row["state"] == "checking", row
+            assert row["checks"][0]["state"] == "running", row
+            assert seen["log_reads"] == 0, seen
+            assert not row.get("drafts"), row
+        else:
+            assert (row["state"], row.get("reason")) == ("held", "small_change_unknown_effect"), row
+        assert world.messages() == before_messages, "uncertain/running check allowed missing batch publication"
+
+
+@pytest.mark.parametrize("damage", ["steady", "identity", "type", "reparse"])
+def test_r7_retained_log_and_directory_marks_ignore_only_permissions(tmp_path, damage):
+    (tmp_path / ".keep").write_text("R7 retained snapshot pathname/fstat permission disagreement\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    injection = r"""
+import stat
+target = Path(%r)
+old_stat, old_fstat = os.stat, os.fstat
+class Witness:
+    def __init__(self, real, **changes): self.real, self.changes = real, changes
+    def __getattr__(self, key): return self.changes[key] if key in self.changes else getattr(self.real, key)
+def actual(path, kw):
+    if type(path) is int: return Path(os.readlink('/proc/self/fd/%%d' %% path))
+    value = Path(path)
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / value
+    return value
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    value = actual(path, kw)
+    if value == target or value.parent == target: return Witness(info, st_mode=info.st_mode ^ 0o111)
+    return info
+def opened(fd):
+    info = old_fstat(fd)
+    value = actual(fd, {})
+    changes = {}
+    if value.parent == target and value.name.startswith('step-'):
+        if %r == 'identity': changes['st_ino'] = info.st_ino + 1
+        if %r == 'type': changes['st_mode'] = stat.S_IFIFO | 0o600
+        if %r == 'reparse': changes['st_file_attributes'] = stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return Witness(info, **changes)
+os.stat, os.fstat = inspected, opened
+""" % (str(folder), damage, damage, damage)
+    row = r7_router_probe(world, injection)[0]["small_changes"][0]
+    if damage == "steady":
+        assert row["state"] == "reviewing", row
+    else:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert len(world.messages("dispatch")) == 1
+
+
+def test_r7_public_live_runner_is_running_without_log_capture_or_batch_continuation(tmp_path):
+    import time
+    (tmp_path / ".keep").write_text("R7 concurrent public command runner; temporary fixture process only\n")
+    started, release = tmp_path / "started", tmp_path / "release"
+    program = ("from pathlib import Path; import time; "
+               "Path(%r).write_text('started'); "
+               "exec(\"while not Path(%%r).exists():\\n print('growing log', flush=True)\\n time.sleep(0.01)\" %% %r)"
+               % (str(started), str(release)))
+    world = DispatchWorld(tmp_path, checks=2, recipe_changes={"timeout_seconds": 30,
+        "steps": [["$python", "-c", program]]})
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    requests = world.messages("job_request")
+    env = {k: v for k, v in os.environ.items()
+           if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    process = subprocess.Popen([sys.executable, "-I", "-B", str(JOBS), "--store", str(world.workspace.store),
+        "--recipes", str(world.recipes_path), "run-open"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 10
+        while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert started.exists(), "public runner did not reach the owned fixture step"
+        for command in ("status", "dispatch"):
+            row = world.dispatch(command=command)["small_changes"][0]
+            assert row["state"] == "checking" and row["checks"][0]["state"] == "running", row
+            assert not row["drafts"]
+            assert world.messages("job_request") == requests and len(world.messages("dispatch")) == 1
+    finally:
+        release.write_text("finish original fixture check\n")
+        stdout, stderr = process.communicate(timeout=20)
+    assert process.returncode == 0 and not stderr, stdout + stderr
+    assert json.loads(stdout)["rows"][0]["state"] == "completed"
+    world.dispatch()
+    assert len(world.messages("job_request")) == 2
+    world.run_jobs()
+    assert world.dispatch()["small_changes"][0]["state"] == "reviewing"
+
+
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+def test_r7_lost_completed_receipt_holds_batch_until_original_settlement(tmp_path, command):
+    (tmp_path / ".keep").write_text("R7 completed result is not an original terminal receipt\n")
+    world = DispatchWorld(tmp_path, checks=2)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    original = world.messages("job_request")
+    world.run_jobs()
+    folder = world.workspace.store / "jobs/engine" / original[0]["message"]["message_id"]
+    claim, result = (folder / "claim.json").read_bytes(), (folder / "result.json").read_bytes()
+    terminal = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    Path(terminal["path"]).unlink()
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch(command=command)["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_unknown_effect"), row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    assert world.messages("job_request") == original
+    world.run_jobs()
+    assert (folder / "claim.json").read_bytes() == claim and (folder / "result.json").read_bytes() == result
+    assert world.messages("job_receipt")[-1]["message"]["message_id"] == terminal["message"]["message_id"]
+    world.dispatch()
+    assert len(world.messages("job_request")) == 2
+    world.run_jobs()
+    assert world.dispatch()["small_changes"][0]["state"] == "reviewing"
+
+
+def test_r7_claim_capture_refuses_missing_descriptor_capability_before_open(tmp_path):
+    (tmp_path / ".keep").write_text("R7 modelled host missing a POSIX descriptor flag\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    terminal = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    Path(terminal["path"]).unlink()
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = r7_router_probe(world, "del os.O_CLOEXEC\n", command="status")[0]["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+    assert row["detail"] == "retained descriptor capture requires POSIX directory descriptors", row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    assert (folder / "result.json").is_file()
+
+
+def r8_refresh_receipt(world, folder):
+    """Modelled retained-data tampering, correlated with the unchanged public runner renderer."""
+    from tools.hierarchy_jobs import Job, result_body
+    result_path = folder / "result.json"
+    result = json.loads(result_path.read_text())
+    receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(Path(ref["path"]).read_bytes()).hexdigest())
+                                      for ref in m["receipt"]["evidence"]])
+    rewrite_message(receipt, lambda m: m["receipt"]["evidence"].sort(key=lambda ref: ref["path"]))
+    job = Job(world.workspace.store, {"id": "engine"}, world.messages("job_request")[0]["message"])
+    path = Path(receipt["path"])
+    header, _body = path.read_text()[4:].split("\n---\n\n", 1)
+    path.write_text("---\n" + header + "\n---\n\n" + result_body(job, result))
+
+
+@pytest.mark.parametrize("damage", ["steady", "truncate", "drop-last", "gap", "extra", "process", "reorder"])
+def test_r8_completed_recipe_has_exact_order_and_numbered_logs(tmp_path, damage):
+    world = DispatchWorld(tmp_path, recipe_changes={"steps": [["$python", "-c", "print(%d)" % n] for n in range(3)]})
+    folder = formal_completed_job(world)
+    path = folder / "result.json"
+    result = json.loads(path.read_text())
+    if damage == "truncate": result["steps"] = result["steps"][:1]
+    if damage == "drop-last": result["steps"].pop()
+    if damage == "extra": result["steps"].append(result["steps"][-1])
+    if damage == "reorder": result["steps"].reverse()
+    if damage == "gap":
+        (folder / "step-2.log").rename(folder / "step-4.log")
+        receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+        rewrite_message(receipt, lambda m: [ref.update(path=str(folder / "step-4.log"))
+                        for ref in m["receipt"]["evidence"] if ref["path"] == str(folder / "step-2.log")])
+    if damage == "process":
+        process_path = folder / "process.json"
+        process = json.loads(process_path.read_text())
+        process["step"] = 4
+        process_path.write_text(json.dumps(process))
+    path.write_text(json.dumps(result))
+    r8_refresh_receipt(world, folder)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    if damage == "steady":
+        assert row["state"] == "reviewing", json.dumps(row, indent=2)
+    else:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), json.dumps(row, indent=2)
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+        assert len(world.messages("dispatch")) == 1
+
+
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+def test_r8_live_runner_with_terminal_receipt_holds_until_runner_exits(tmp_path, command):
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    injection = """
+import hierarchy_jobs as jobs
+path = Path(%r) / 'claim.json'
+claim = json.loads(path.read_text())
+claim.update(pid=os.getpid(), start=jobs.process_start(os.getpid()), process_scope=jobs.process_scope())
+path.write_text(json.dumps(claim))
+""" % str(folder)
+    before = world.ledger.files(), world.messages()
+    row = r7_router_probe(world, injection, command=command)[0]["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_unknown_effect"), json.dumps(row, indent=2)
+    assert (world.ledger.files(), world.messages()) == before
+    # The fixture observation process has now exited. Original work settles without replay or a replacement ID.
+    assert world.dispatch()["small_changes"][0]["state"] == "reviewing"
+    assert world.messages("job_request") == [record for record in before[1] if record["message"]["type"] == "job_request"]
+
+
+def test_r8_terminal_capture_checks_descriptor_capabilities_before_constants(tmp_path):
+    world = DispatchWorld(tmp_path)
+    formal_completed_job(world)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = r7_router_probe(world, "del os.O_CLOEXEC\n", command="status")[0]["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), json.dumps(row, indent=2)
+    assert row["detail"] == "retained descriptor capture requires POSIX directory descriptors", json.dumps(row, indent=2)
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_r8_recipe_less_close_has_an_unverified_reason_and_next_action(tmp_path):
+    world = DispatchWorld(tmp_path)
+    review_result(world, ready_reviewer(world))
+    row = world.run("status")["small_changes"][0]
+    assert row["state"] == "held" and row["reason"] == "small_change_close_unverified", json.dumps(row, indent=2)
+    assert row["drafts"] == [] and "rerun with --recipes <file>" in row["detail"], json.dumps(row, indent=2)
+
+
+def r8_compose_probe(world, injection=""):
+    script = """import importlib.util, json, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_fresh_brief', sys.argv[1])
+fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+seen = {}
+""" + injection + """
+try:
+    code = fresh.main(sys.argv[3:])
+finally:
+    Path(sys.argv[2]).write_text(json.dumps(seen))
+sys.exit(code)
+"""
+    telemetry = world.tmp / "r8-compose-io.json"
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+        str(ROOT / "tools/hierarchy_fresh_brief.py"), str(telemetry), "compose", "--root", str(world.root),
+        "--initiative", "engine", "--endpoint", "engine/orchestrator", "--lifecycle", str(world.ledger.path)],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=20)
+    assert process.stderr == "", process.stdout + process.stderr
+    return process.returncode, json.loads(process.stdout), json.loads(telemetry.read_text())
+
+
+@pytest.mark.parametrize("kind", ["brief", "ack", "result", "review", "job_receipt"])
+@pytest.mark.parametrize("damage", ["steady", "oversize", "fifo", "symlink"])
+def test_r8_unread_typed_attachments_are_bounded_and_fail_closed(tmp_path, kind, damage):
+    world = DispatchWorld(tmp_path)
+    formal_completed_job(world)
+    world.dispatch()
+    if kind == "review": review_result(world, next(r["message"] for r in world.messages("dispatch") if r["message"]["to"].endswith("review0")))
+    if kind == "brief":
+        original = world.root.parent / "notice.md"
+        original.write_text("original brief\n")
+        ref = {"path": str(original), "sha256": hashlib.sha256(original.read_bytes()).hexdigest()}
+        invoke(world.root, "publish", {"message_id": "unread-notice", "from": "engine/root",
+            "to": "engine/orchestrator", "host": "host-one", "session": "engine/root",
+            "binding_generation": 1, "type": "brief", "brief": ref, "body": "retained notice"})
+    record = world.messages(kind)[-1]
+    path = world.root.parent / "typed.md"
+    raw = b"unread typed attachment\n"
+    if damage == "oversize": raw = b"x" * (262144 + 1)
+    target = world.root.parent / "target.md"
+    target.write_bytes(raw)
+    if damage == "fifo": os.mkfifo(path)
+    elif damage == "symlink": path.symlink_to(target)
+    else: path.write_bytes(raw)
+    rewrite_message(record, lambda m: m.update(brief={"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}))
+    injection = """
+import io
+target = Path(%r)
+seen['reads'] = 0
+old_read = os.read
+old_open = io.open
+def opened(path, mode='r', *args, **kw):
+    if not isinstance(path, int) and Path(path) == target and 'r' in mode: seen['reads'] += 1
+    return old_open(path, mode, *args, **kw)
+def observed(fd, count):
+    if Path(os.readlink('/proc/self/fd/%%d' %% fd)) == target and count != 1: seen['reads'] += 1
+    return old_read(fd, count)
+os.read, io.open = observed, opened
+""" % str(path)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    code, answer, seen = r8_compose_probe(world, injection)
+    if damage == "steady":
+        assert code == 0 and answer["ok"], answer
+        assert seen["reads"] == 1, seen
+    else:
+        assert code != 0 and not answer.get("ok", False), answer
+        assert any(word in answer["error"] for word in ("regular file", "symlink", "exceeds 262144")), answer
+    assert world.ledger.files() == before[0]
+    after = mailbox_snapshot(world.root)
+    assert all(after.get(key) == value for key, value in before[1].items())
+    assert set(after) - set(before[1]) == ({str(Path(answer["brief"]["path"]).relative_to(world.root.parent))}
+                                        if damage == "steady" else set())
+
+
+def test_r8_recipe_and_event_bytes_are_consumed_once_per_operation(tmp_path):
+    observations = []
+    for checks in (1, 3):
+        run = tmp_path / ("checks-%d" % checks)
+        run.mkdir()
+        world = DispatchWorld(run, checks=checks)
+        world.dispatch()
+        world.finish_writer()
+        injection = r"""
+import io
+recipe = Path(%r)
+events = Path(%r) / 'events'
+seen['reads'] = {}
+seen['journal_phases'] = {}
+seen['recipe_parses'] = 0
+operations = []
+def profiled(frame, event, arg):
+    if event == 'call' and frame.f_code.co_name == 'strict_json' and frame.f_back.f_code.co_name == 'recipe_file':
+        seen['recipe_parses'] += 1
+sys.setprofile(profiled)
+old_open, old_fd = io.open, os.open
+def track(path):
+    path = Path(path)
+    if path == recipe or path.parent == events:
+        key = str(path)
+        seen['reads'][key] = seen['reads'].get(key, 0) + 1
+        if path.parent == events:
+            frame, phase = sys._getframe(1), 'uncaptured'
+            while frame is not None:
+                if frame.f_code.co_name == 'read' and frame.f_code.co_filename.endswith('hierarchy_fresh_brief.py'):
+                    operation = frame.f_locals['self']
+                    if operation not in operations: operations.append(operation)
+                    phase = 'capture-%%d' %% operations.index(operation)
+                    break
+                frame = frame.f_back
+            counts = seen['journal_phases'].setdefault(phase, {})
+            counts[path.name] = counts.get(path.name, 0) + 1
+def opened(path, mode='r', *args, **kw):
+    if not isinstance(path, int) and 'r' in mode: track(path)
+    return old_open(path, mode, *args, **kw)
+def descriptor(path, flags, *args, **kw):
+    target = Path(path)
+    if not target.is_absolute() and kw.get('dir_fd') is not None:
+        target = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / target
+    if flags & os.O_ACCMODE in (os.O_RDONLY, os.O_RDWR) and not flags & os.O_DIRECTORY: track(target)
+    return old_fd(path, flags, *args, **kw)
+io.open, os.open = opened, descriptor
+""" % (str(world.recipes_path), str(world.ledger.path))
+        answer, seen = r7_router_probe(world, injection)
+        assert answer["small_changes"][0]["state"] == "checking", answer
+        assert len(world.messages("job_request")) == checks
+        assert seen["reads"][str(world.recipes_path)] == 1 and seen["recipe_parses"] == 1, seen
+        phases = seen["journal_phases"]
+        assert set(phases) == {"capture-0", "capture-1", "capture-2"}, seen
+        assert all(counts and set(counts.values()) == {1} for counts in phases.values()), seen
+        journal = {Path(path).name: count for path, count in seen["reads"].items()
+                   if Path(path).parent == world.ledger.path / "events"}
+        assert journal and set(journal.values()) == {len(phases)}, seen
+        observations.append((phases, journal))
+    assert observations[0] == observations[1], "journal reads must not grow with checks or publications"
+
+
+@pytest.mark.parametrize("stage", ["writer", "check", "reviewer"])
+@pytest.mark.parametrize("window", ["after-fence", "after-commit"])
+def test_r8_witness_survives_last_mailbox_hook_and_commit(tmp_path, stage, window):
+    world = DispatchWorld(tmp_path, checks=2 if stage == "check" else 1)
+    if stage != "writer":
+        world.dispatch()
+        world.finish_writer()
+    if stage == "reviewer":
+        world.dispatch()
+        world.run_jobs()
+    before = world.messages(), world.ledger.files()
+    injection = r"""
+import io
+window = %r
+seen['changed'] = False
+old_stat, old_link = os.stat, os.link
+def alter(request):
+    if seen['changed']: return
+    seen['changed'] = True
+    with open(request['brief']['path'], 'ab') as stream: stream.write(b'changed after fence')
+def inspected(path, *args, **kw):
+    value = old_stat(path, *args, **kw)
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == 'publish' and frame.f_code.co_filename.endswith('hierarchy_mailbox.py'):
+            request = frame.f_locals['request']
+            if window == 'after-fence' and 'recipient' in frame.f_locals: alter(request)
+            break
+        frame = frame.f_back
+    return value
+def linked(src, dst, *args, **kw):
+    value = old_link(src, dst, *args, **kw)
+    if window == 'after-commit' and Path(dst).suffix == '.md':
+        raw = Path(src).read_text()
+        header = json.loads(raw[4:].split('\n---\n\n', 1)[0])
+        if header['type'] in {'dispatch', 'job_request'}: alter(header)
+    return value
+os.stat, os.link = inspected, linked
+""" % window
+    answer, seen = r7_router_probe(world, injection)
+    assert seen["changed"], seen
+    row = answer["small_changes"][0]
+    assert row["state"] == "held", json.dumps(row, indent=2)
+    assert world.ledger.files() == before[1], "stale assignment acquired a route receipt"
+    delta = len(world.messages()) - len(before[0])
+    assert delta == (1 if window == "after-commit" else 0)
+    if window == "after-commit":
+        assert row["reason"] == "small_change_partial_publication" and row["partial_publication"]["message_id"], row
+    if stage == "writer":
+        assert "engine/lane/fix" in answer["planning_exclusions"] if delta else True
+
+
+@pytest.mark.parametrize("entry", ["message", "event"])
+def test_r8_message_and_event_fifo_swap_never_reaches_blocking_open(tmp_path, entry):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    target = Path(world.messages()[0]["path"]) if entry == "message" else world.ledger.path / "events/000001.json"
+    injection = r"""
+import io, stat
+target = Path(%r)
+seen.update(changed=False, unsafe=False)
+old_stat, old_open, old_fd = os.stat, io.open, os.open
+def actual(path, kw):
+    if isinstance(path, int): return None
+    value = Path(path)
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / value
+    return value
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    frame, reading = sys._getframe(1), False
+    while frame is not None:
+        reading |= frame.f_code.co_name in {'_read_reference', 'read_bytes', 'load_json'}
+        frame = frame.f_back
+    if (reading and actual(path, kw) == target and not seen['changed'] and stat.S_ISREG(info.st_mode)
+            and (kw.get('follow_symlinks', True) or kw.get('dir_fd') is not None)):
+        seen['changed'] = True
+        target.rename(target.with_suffix('.original'))
+        os.mkfifo(target)
+    return info
+def opened(path, *args, **kw):
+    if actual(path, kw) == target and seen['changed']:
+        seen['unsafe'] = True
+        raise OSError('blocking FIFO open intercepted by the test OS boundary')
+    return old_open(path, *args, **kw)
+def descriptor(path, flags, *args, **kw):
+    if actual(path, kw) == target and seen['changed'] and not flags & os.O_NONBLOCK:
+        seen['unsafe'] = True
+        raise OSError('blocking FIFO descriptor open intercepted by the test OS boundary')
+    return old_fd(path, flags, *args, **kw)
+os.stat, io.open, os.open = inspected, opened, descriptor
+""" % str(target)
+    script = """import json, os, pwd, sys
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1]); import hierarchy_router as router
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
+seen = {}
+""" + injection + """
+try: code = router.main(sys.argv[4:])
+finally: Path(sys.argv[3]).write_text(json.dumps(seen))
+sys.exit(code)
+"""
+    telemetry = tmp_path / "entry-io.json"
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"), str(tmp_path / "home"),
+        str(telemetry), "--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), "dispatch",
+        "--recipes", str(world.recipes_path), "--evidence-only", "--wait", "0.1"],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=15)
+    assert not process.stderr, process.stdout + process.stderr
+    answer, seen = json.loads(process.stdout), json.loads(telemetry.read_text())
+    assert seen["changed"] and not seen["unsafe"], seen
+    assert process.returncode == 2 or answer["small_changes"][0]["state"] == "held", answer
+
+
+def test_r8_standalone_composer_keeps_captures_until_output_commit(tmp_path):
+    world = DispatchWorld(tmp_path)
+    path = world.root.parent / "unread.md"
+    path.write_text("unread notice")
+    invoke(world.root, "publish", {"message_id": "standalone-notice", "from": "engine/root",
+        "to": "engine/orchestrator", "host": "host-one", "session": "engine/root", "binding_generation": 1,
+        "type": "brief", "brief": {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}, "body": "notice"})
+    injection = """
+target = Path(%r)
+old_mkdir = os.mkdir
+def created(path, *args, **kw):
+    if Path(path).name == 'briefs':
+        target.write_bytes(b'changed after inspect before output publication')
+        seen['changed'] = True
+    return old_mkdir(path, *args, **kw)
+os.mkdir = created
+""" % str(path)
+    code, answer, seen = r8_compose_probe(world, injection)
+    assert seen["changed"], seen
+    assert code != 0 and "changed" in answer["error"], answer
+    assert not list((world.root.parent / "briefs").glob("fresh-*.md"))
+
+
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+def test_r8_claim_appearing_after_absence_is_running_not_a_lost_receipt(tmp_path, command):
+    world = DispatchWorld(tmp_path, checks=2)
+    world.dispatch()
+    world.finish_writer()
+    world.dispatch(fault="batch")
+    original = world.messages("job_request")
+    world.run_jobs()
+    folder = world.workspace.store / "jobs/engine" / original[0]["message"]["message_id"]
+    claim = json.loads((folder / "claim.json").read_text())
+    (folder / "claim.json").unlink()
+    terminal = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    Path(terminal["path"]).unlink()
+    injection = """
+import hierarchy_jobs as jobs
+folder = Path(%r)
+claim = %r
+claim.update(pid=os.getpid(), start=jobs.process_start(os.getpid()), process_scope=jobs.process_scope())
+old_stat = os.stat
+seen['appeared'] = False
+def observed(path, *args, **kw):
+    value = old_stat(path, *args, **kw)
+    if str(path) == 'result.json' and kw.get('dir_fd') is not None and not seen['appeared']:
+        if Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) == folder:
+            seen['appeared'] = True
+            (folder / 'claim.json').write_text(json.dumps(claim))
+    return value
+os.stat = observed
+""" % (str(folder), claim)
+    answer, seen = r7_router_probe(world, injection, command=command)
+    row = answer["small_changes"][0]
+    assert seen["appeared"], seen
+    assert row["state"] == "checking" and row["checks"][0]["state"] == "running", json.dumps(row, indent=2)
+    assert not row.get("reason") and not row["drafts"]
+    assert world.messages("job_request") == original
+
+
+@pytest.mark.parametrize("window", ["before-route", "after-route"])
+def test_r8b_route_append_rechecks_the_same_captured_assignment(tmp_path, window):
+    (tmp_path / ".keep").write_text("R8b modelled route-append boundary; no new writer effect\n")
+    world = DispatchWorld(tmp_path)
+    before = world.ledger.files()
+    injection = r"""
+window = %r
+seen.update(changed=False, target=None, committed_event=None, event_synced=False)
+old_link, old_stat, old_sync = os.link, os.stat, os.fsync
+def alter():
+    if seen['changed'] or seen['target'] is None: return
+    seen['changed'] = True
+    with open(seen['target'], 'ab') as stream: stream.write(b'changed at route boundary')
+def linked(src, dst, *args, **kw):
+    answer = old_link(src, dst, *args, **kw)
+    if Path(dst).suffix == '.md':
+        message = json.loads(Path(src).read_text()[4:].split('\n---\n\n', 1)[0])
+        if message.get('type') == 'dispatch': seen['target'] = message['brief']['path']
+    if window == 'after-route' and Path(dst).parent.name == 'events':
+        raw = Path(src).read_bytes()
+        event = json.loads(raw)
+        if event['envelope']['event']['type'] == 'route':
+            import hashlib
+            seen['committed_event'] = {'message_id':event['envelope']['id'],
+                'evidence':{'path':str(dst),'sha256':hashlib.sha256(raw).hexdigest()}}
+            alter()
+    return answer
+def inspected(path, *args, **kw):
+    answer = old_stat(path, *args, **kw)
+    if window == 'before-route':
+        frame = sys._getframe(1)
+        while frame is not None:
+            if (frame.f_code.co_name == '_record_under_lock' and 'record' in frame.f_locals
+                    and frame.f_code.co_filename.endswith('hierarchy_fresh_brief.py')):
+                alter()
+                break
+            frame = frame.f_back
+    return answer
+def synced(fd):
+    answer = old_sync(fd)
+    committed = seen['committed_event']
+    if committed and Path(os.readlink('/proc/self/fd/%%d' %% fd)) == Path(committed['evidence']['path']).parent:
+        seen['event_synced'] = True
+    return answer
+os.link, os.stat, os.fsync = linked, inspected, synced
+""" % window
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["changed"], seen
+    if window == "before-route":
+        assert (row["state"], row.get("reason")) == ("held", "delivered_unrecorded"), row
+    else:
+        assert seen["committed_event"] and seen["event_synced"], seen
+        assert (row["state"], row.get("reason")) == ("held", "small_change_committed_event"), row
+        assert row["partial_publication"] == seen["committed_event"], row
+        assert hashlib.sha256(Path(seen["committed_event"]["evidence"]["path"]).read_bytes()).hexdigest() == seen["committed_event"]["evidence"]["sha256"]
+    assert len(world.messages("dispatch")) == 1 and world.messages("job_request") == []
+    assert len(world.ledger.files()) - len(before) == (1 if window == "after-route" else 0)
+    assert "engine/lane/fix" in answer["planning_exclusions"]
+
+
+@pytest.mark.parametrize("stage,which", [("writer", "event"), ("check", "event"), ("reviewer", "event"),
+                                         ("check", "recipe"), ("reviewer", "recipe")])
+def test_r8b_recipe_and_event_witnesses_refuse_stale_publication(tmp_path, stage, which):
+    (tmp_path / ".keep").write_text("R8b modelled mutation after the mailbox fence\n")
+    world = DispatchWorld(tmp_path)
+    if stage != "writer":
+        world.dispatch()
+        world.finish_writer()
+    if stage == "reviewer":
+        world.dispatch()
+        world.run_jobs()
+    target = world.recipes_path if which == "recipe" else world.ledger.path / "events/000001.json"
+    before = world.messages(), set(world.ledger.files())
+    injection = """
+target = Path(%r)
+old_stat = os.stat
+seen['changed'] = False
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == 'publish' and frame.f_code.co_filename.endswith('hierarchy_mailbox.py'):
+            if 'recipient' in frame.f_locals and not seen['changed']:
+                seen['changed'] = True
+                with open(target, 'ab') as stream: stream.write(b'\\n')
+            break
+        frame = frame.f_back
+    return info
+os.stat = inspected
+""" % str(target)
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["changed"] and row["state"] == "held", (seen, row)
+    if which == "recipe":
+        assert row["reason"] == "small_change_recipe_mismatch", row
+    assert world.messages() == before[0]
+    assert set(world.ledger.files()) == before[1]
+
+
+def r9_source(world):
+    import shutil
+    source = world.tmp / "fixture-source"
+    shutil.copytree(ROOT / "tools/hierarchy_templates", source / "tools/hierarchy_templates")
+    # These are mutable, modelled input fixtures, even when the tested source copy is mode-read-only.
+    for path in source.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    source.chmod(0o700)
+    (world.root.parent / "provision.json").write_text(json.dumps({"initiative": "engine",
+        "mailbox_root": str(world.root), "source": str(source), "delivery_dir": str(world.root.parent / "delivery")}))
+    return source
+
+
+@pytest.mark.parametrize("kind", ["contract", "plan"])
+@pytest.mark.parametrize("damage", ["steady", "fifo", "oversize", "symlink"])
+def test_r9_all_composition_inputs_use_bounded_captures(tmp_path, kind, damage):
+    (tmp_path / ".keep").write_text("R9 modelled input boundary, no real owner-home access\n")
+    world = DispatchWorld(tmp_path)
+    source = r9_source(world)
+    if kind == "contract":
+        target = source / "tools/hierarchy_templates/roles/orchestrator.md"
+    else:
+        target = world.root.parent / "host-plan.json"
+        target.write_text(json.dumps({"schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "engine",
+            "root": "codex-cli", "team": "codex-cli", "stand_ins": {}, "config_sha256": "a" * 64}))
+    if damage == "oversize": target.write_bytes(target.read_bytes() + b" " * 262145)
+    if damage == "symlink":
+        original = target.with_suffix(".original")
+        target.rename(original)
+        target.symlink_to(original)
+    injection = r"""
+import io, stat
+target = Path(%r); damage = %r
+seen.update(changed=False, unsafe=False, opens=0)
+old_stat, old_open, old_fd = os.stat, io.open, os.open
+def actual(path, kw):
+    if isinstance(path, int): return None
+    value = Path(path)
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / value
+    return value
+def inspected(path, *args, **kw):
+    return old_stat(path, *args, **kw)
+def replace_at_open(path, kw):
+    if damage == 'fifo' and actual(path, kw) == target and not seen['changed']:
+        seen['changed'] = True
+        target.rename(target.with_suffix('.original'))
+        os.mkfifo(target)
+def opened(path, mode='r', *args, **kw):
+    if actual(path, kw) == target and 'r' in mode:
+        replace_at_open(path, kw)
+        seen['opens'] += 1
+        seen['unsafe'] = True
+        if damage == 'fifo': raise OSError('modelled blocking input open intercepted')
+    return old_open(path, mode, *args, **kw)
+def descriptor(path, flags, *args, **kw):
+    if actual(path, kw) == target:
+        replace_at_open(path, kw)
+        seen['opens'] += 1
+        if not flags & os.O_NONBLOCK:
+            seen['unsafe'] = True
+            if damage == 'fifo': raise OSError('modelled blocking input descriptor intercepted')
+    return old_fd(path, flags, *args, **kw)
+os.stat, io.open, os.open = inspected, opened, descriptor
+""" % (str(target), damage)
+    code, answer, seen = r8_compose_probe(world, injection)
+    if damage == "steady":
+        assert code == 0 and seen["opens"] == 1 and not seen["unsafe"], (answer, seen)
+    else:
+        assert code == 2 and not seen["unsafe"], (answer, seen)
+        if damage == "oversize":
+            expected = ("fresh brief exceeds mailbox brief byte limit (262144)" if kind == "contract"
+                        else "input exceeds 262144 bytes")
+            assert answer["error"] == expected and seen["opens"] == 0, (answer, seen)
+        if damage == "fifo": assert seen["changed"], seen
+
+
+def test_r9_compose_does_not_take_or_remove_a_journal_writer_lock(tmp_path):
+    world = DispatchWorld(tmp_path)
+    lock = world.ledger.path / ".write.lock"
+    lock.write_text("fixture unrelated writer owns this marker")
+    before = lock.read_bytes()
+    code, answer, _seen = r8_compose_probe(world)
+    assert code == 0 and answer["ok"], answer
+    assert lock.read_bytes() == before
+
+
+def test_r9_deny_adopted_during_composition_prevents_writer_publication(tmp_path):
+    world = DispatchWorld(tmp_path)
+    actor = world.ledger.root_actor
+    envelope = {"id": "deny-during-compose", "actor": actor, "generation": 1,
+        "custody": {"cid": actor, "generation": 1}, "event": {"type": "decision", "decision": "deny",
+        "reason": "owner denies before publication", **world.ledger.target(world.change.value)}}
+    event_path = tmp_path / "deny.json"
+    event_path.write_text(json.dumps(envelope))
+    injection = r"""
+import io
+seen['denied'] = False
+old_open, old_fd = io.open, os.open
+def deny(path):
+    if Path(path).name != 'lane.md' or seen['denied']: return
+    seen['denied'] = True
+    import subprocess
+    proc = subprocess.run([sys.executable, '-I', '-B', %r, '--root', %r, 'record', '--event', %r, '--evidence-only'],
+        env=os.environ.copy(), capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+def opened(path, *args, **kw):
+    if not isinstance(path, int): deny(path)
+    return old_open(path, *args, **kw)
+def descriptor(path, *args, **kw):
+    if not isinstance(path, int): deny(path)
+    return old_fd(path, *args, **kw)
+io.open, os.open = opened, descriptor
+""" % (str(ROOT / "tools/hierarchy_lifecycle.py"), str(world.ledger.path), str(event_path))
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["denied"], seen
+    assert (row["state"], row.get("reason")) == ("held", "small_change_revoked"), row
+    assert world.messages() == []
+
+
+@pytest.mark.parametrize("origin", ["lifecycle", "receipt", "attachment-first", "staging"])
+def test_r9_shared_reference_and_attachment_consumer_order(tmp_path, origin):
+    world = DispatchWorld(tmp_path)
+    shared = world.root.parent / "shared.md"
+    shared.write_text("One unchanged file shared by evidence and typed attachment\n")
+    ref = {"path": str(shared), "sha256": hashlib.sha256(shared.read_bytes()).hexdigest()}
+    if origin == "lifecycle":
+        other = tmp_path / "other-journal"
+        other.mkdir()
+        ledger = Ledger(other, policy_changes={"authority": [ref]})
+        # The public composer is allowed to inspect an external journal, independent of dispatcher authority.
+        world.ledger = ledger
+    if origin == "receipt":
+        world.dispatch()
+        world.finish_writer()
+        world.dispatch()
+        parent = world.messages("job_request")[0]["message"]["message_id"]
+        invoke(world.root, "publish", {"message_id": "queued-with-attachment", "from": "engine/root",
+            "to": "engine/orchestrator", "host": "host-one", "session": "engine/root", "binding_generation": 1,
+            "type": "job_receipt", "in_reply_to": parent, "body": "queued", "brief": ref,
+            "receipt": {"state": "started", "evidence": [ref]}})
+    elif origin == "staging":
+        from tools.hierarchy_mailbox import encoded
+        world.dispatch()
+        raw = encoded({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused", "checkout": str(world.checkout),
+                       "commit": world.revision, "tree": world.tree})
+        packet = world.root.parent / "briefs" / ("check-" + hashlib.sha256(raw).hexdigest() + ".md")
+        packet.write_bytes(raw)
+        world.finish_writer(evidence=[{"path": str(packet), "sha256": hashlib.sha256(raw).hexdigest()}])
+        row = world.dispatch()["small_changes"][0]
+        assert row["state"] == "checking" and len(world.messages("job_request")) == 1, row
+        return
+    else:
+        invoke(world.root, "publish", {"message_id": "shared-input", "from": "engine/root", "to": "engine/orchestrator",
+            "host": "host-one", "session": "engine/root", "binding_generation": 1, "type": "brief", "brief": ref, "body": "notice"})
+    code, answer, _seen = r8_compose_probe(world)
+    assert code == 0 and answer["ok"], answer
+
+
+@pytest.mark.parametrize("closed_kind", ["complete", "blocked"])
+def test_r9_recipe_less_closed_audit_is_explicitly_unverified(tmp_path, closed_kind):
+    world = DispatchWorld(tmp_path)
+    reviewer = ready_reviewer(world)
+    if closed_kind == "blocked":
+        world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "owner",
+            "next_decision": "review", "condition": "owner waiting", "evidence": world.ledger.evidence},
+            **world.ledger.target(world.change.value))
+    review_result(world, reviewer)
+    if closed_kind == "complete": record_drafts(world, world.dispatch()["small_changes"][0])
+    row = world.run("status")["small_changes"][0]
+    assert row.get("reason") == "small_change_close_unverified" and not row["drafts"], row
+    assert "rerun with --recipes <file>" in row["detail"], row
+
+
+def test_r9_composer_precommit_change_is_a_refusal_not_an_internal_error(tmp_path):
+    world = DispatchWorld(tmp_path)
+    path = world.root.parent / "notice.md"
+    path.write_text("notice")
+    invoke(world.root, "publish", {"message_id": "notice", "from": "engine/root", "to": "engine/orchestrator",
+        "host": "host-one", "session": "engine/root", "binding_generation": 1, "type": "brief", "body": "notice",
+        "brief": {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}})
+    injection = """
+old_mkdir = os.mkdir
+def created(path, *args, **kw):
+    if Path(path).name == 'briefs':
+        Path(%r).write_text('changed before commit')
+        seen['changed'] = True
+    return old_mkdir(path, *args, **kw)
+os.mkdir = created
+""" % str(path)
+    code, answer, seen = r8_compose_probe(world, injection)
+    assert seen["changed"] and code == 2 and "changed" in answer["error"], (code, answer, seen)
+
+
+@pytest.mark.parametrize("damage", ["content", "fifo"])
+def test_r9_partial_message_identity_does_not_reread_the_committed_path(tmp_path, damage):
+    world = DispatchWorld(tmp_path)
+    before = world.ledger.files()
+    injection = r"""
+import hashlib
+old_link = os.link
+seen['changed'] = False
+def linked(src, dst, *args, **kw):
+    result = old_link(src, dst, *args, **kw)
+    if Path(dst).suffix == '.md' and not seen['changed']:
+        raw = Path(src).read_bytes()
+        header = json.loads(raw[4:].split(b'\n---\n\n', 1)[0])
+        seen.update(changed=True, message_id=header['message_id'], ref={'path':str(dst),'sha256':hashlib.sha256(raw).hexdigest()})
+        if %r == 'fifo':
+            Path(dst).rename(Path(dst).with_suffix('.original'))
+            os.mkfifo(dst)
+        else: Path(dst).write_bytes(b'changed committed message')
+    return result
+os.link = linked
+""" % damage
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["changed"] and row["state"] == "held", (seen, row)
+    assert row["reason"] == "small_change_partial_publication", row
+    assert row["partial_publication"] == {"message_id": seen["message_id"], "evidence": seen["ref"]}, row
+    assert world.ledger.files() == before
+
+
+def r9_read_orchestrator(world):
+    """Read the actual public page, then record exactly the returned IDs through the existing public method."""
+    from tools.hierarchy_mailbox import Mailbox
+    mailbox = Mailbox(world.root)
+    page = mailbox.inbox("engine/orchestrator", limit=100)
+    mailbox.record_read(world.root.parent / "delivery", {"from": "engine/orchestrator", "host": "host-one",
+        "session": "engine/orchestrator", "binding_generation": 1}, [r["message"]["message_id"] for r in page["messages"]])
+    return page
+
+
+@pytest.mark.parametrize("window", ["before", "after"])
+@pytest.mark.parametrize("artifact", ["step-1.log", "result.json", "claim.json", "process.json"])
+def test_r9_retained_job_witnesses_cover_the_actual_publication_boundary(tmp_path, window, artifact):
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    page = r9_read_orchestrator(world)
+    assert any(r["message"]["type"] == "job_receipt" for r in page["messages"])
+    injection = r"""
+target = Path(%r); window = %r
+old_stat, old_link = os.stat, os.link
+seen['changed'] = False
+def change():
+    if seen['changed']: return
+    seen['changed'] = True
+    with open(target, 'ab') as stream: stream.write(b'\n')
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    if window == 'before':
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == 'publish' and frame.f_code.co_filename.endswith('hierarchy_mailbox.py'):
+                if 'recipient' in frame.f_locals: change()
+                break
+            frame = frame.f_back
+    return info
+def linked(src, dst, *args, **kw):
+    result = old_link(src, dst, *args, **kw)
+    if window == 'after' and Path(dst).suffix == '.md': change()
+    return result
+os.stat, os.link = inspected, linked
+""" % (str(folder / artifact), window)
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["changed"] and row["state"] == "held", (seen, row)
+    assert len(world.messages("dispatch")) == (2 if window == "after" else 1)
+    if window == "after":
+        assert row["partial_publication"]["message_id"].startswith("scr-"), row
+        assert row["reason"] == "small_change_receipt_invalid", row
+
+
+def test_r9_read_only_status_rechecks_recipe_before_delivery_drafts(tmp_path):
+    world = DispatchWorld(tmp_path)
+    review_result(world, ready_reviewer(world))
+    injection = r"""
+target = Path(%r)
+old_stat = os.stat
+seen['changed'] = False
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    frame, final = sys._getframe(1), False
+    while frame is not None:
+        final |= frame.f_code.co_name == 'recheck_jobs'
+        frame = frame.f_back
+    if str(path) == 'result.json' and final and not seen['changed']:
+        seen['changed'] = True
+        with open(target, 'ab') as stream: stream.write(b'\n')
+    return info
+os.stat = inspected
+""" % str(world.recipes_path)
+    answer, seen = r7_router_probe(world, injection, command="status")
+    row = answer["small_changes"][0]
+    assert seen["changed"], seen
+    assert row["reason"] != "small_change_close_due", row
+    assert not any(d["event"].get("status") == "FINAL" or d["event"]["type"] == "delivery" for d in row["drafts"]), row
+
+
+@pytest.mark.parametrize("optional", ["delivery", "provision"])
+def test_r9_absent_inputs_are_witnessed_until_composer_publication(tmp_path, optional):
+    world = DispatchWorld(tmp_path)
+    injection = """
+old_mkdir = os.mkdir
+seen['created'] = False
+def created(path, *args, **kw):
+    if Path(path).name == 'briefs' and not seen['created']:
+        seen['created'] = True
+        if %r == 'delivery': Path(%r).mkdir(parents=True)
+        else: Path(%r).write_text(json.dumps({'initiative':'engine','mailbox_root':%r,'source':%r}))
+    return old_mkdir(path, *args, **kw)
+os.mkdir = created
+""" % (optional, str(world.root.parent / "delivery/reads/engine/orchestrator"),
+           str(world.root.parent / "provision.json"), str(world.root), str(ROOT))
+    code, answer, seen = r8_compose_probe(world, injection)
+    assert seen["created"] and code == 2, (code, answer, seen)
+    assert "changed" in answer["error"], answer
+
+
+def test_r9_each_row_captures_under_its_own_lock_without_other_team_witnesses(tmp_path):
+    world = DispatchWorld(tmp_path)
+    root = tmp_path / "docs/mailbox"
+    root.parent.mkdir()
+    endpoints = {"docs/" + name: {} for name in ("front-door", "orchestrator", "root", "router")}
+    endpoints.update({"docs/lane/fix": {"kind": "implementer"}, "docs/lane/review0": {"kind": "reviewer"}})
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints, "counterparts": [], "writer_limit": 3})
+    for endpoint in endpoints:
+        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint, "expected_generation": 0})
+    world.workspace.register("docs", mailbox_root=str(root), checkouts=[str(world.checkout)])
+    second = SmallChange(world.ledger, request("zz-docs-change", team="docs"))
+    second.register()
+    second.decide()
+    admission = second.admission()
+    admission["checks"][0]["recipes_sha256"] = world.recipe_hash
+    second.admit(admission)
+    injection = r"""
+target = Path(%r); first = Path(%r)
+old_open = os.open
+seen['changed'] = False
+def opened(path, *args, **kw):
+    value = Path(path)
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd'])) / value
+    if value == target and not seen['changed']:
+        messages = list((first / 'engine/lane').glob('*scw-*.md'))
+        assert len(messages) == 1, messages
+        messages[0].touch()
+        seen['changed'] = True
+    return old_open(path, *args, **kw)
+os.open = opened
+""" % (str(root / "manifest.json"), str(world.root))
+    answer, seen = r7_router_probe(world, injection)
+    rows = {row["request_id"]: row for row in answer["small_changes"]}
+    assert seen["changed"], seen
+    assert rows[second.value["id"]]["state"] == "writer_sent", rows
+    assert len(list((root / "docs/lane").glob("*scw-*.md"))) == 1
+
+
+@pytest.mark.parametrize("variant", ["steady", "schema", "python", "path", "env-name", "env-value", "extra", "recipe-kind",
+                                     "steps", "boolean", "identity", "prefix", "valid-env", "valid-prefix", "valid-identity"])
+def test_r9_recipe_validation_matches_the_public_runner(tmp_path, variant):
+    world = DispatchWorld(tmp_path)
+    table = world.recipes
+    if variant == "schema": table["schema"] = "unexpected/v99"
+    if variant == "python": table["python"] = "relative"
+    if variant == "path": table["path"] = []
+    if variant == "env-name": table["env"] = {"bad-name": "x"}
+    if variant == "env-value": table["env"] = {"VALUE": "$unknown"}
+    if variant == "extra": table["unexpected"] = True
+    if variant == "recipe-kind": table["recipes"]["focused"]["kind"] = "unknown"
+    if variant == "steps": table["recipes"]["focused"]["steps"] = []
+    if variant == "boolean": table["recipes"]["focused"]["heavy"] = 1
+    if variant == "identity":
+        table["recipes"]["other"] = {"kind": "commit", "timeout_seconds": 5, "sandbox": "none"}
+    if variant == "prefix": table["prefix"] = ["relative"]
+    if variant == "valid-env": table["env"] = {"FIXTURE_VALUE": "plain"}
+    if variant == "valid-prefix": table["prefix"] = ["/usr/bin/env"]
+    if variant == "valid-identity":
+        table["recipes"]["other"] = {"kind": "commit", "timeout_seconds": 5, "sandbox": "none"}
+        table["identity"] = {"name": "Fixture", "email": "fixture@example.invalid"}
+    # Malformed configuration refuses before provenance comparison. A valid changed table reaches that comparison.
+    raw = json.dumps(table).encode()
+    world.recipes_path.write_bytes(raw)
+    script = """import json,sys
+sys.path.insert(0,sys.argv[1]); import hierarchy_jobs as jobs
+try:
+    value=jobs.load_recipes(sys.argv[2]); result={'ok':True}
+except (ValueError,OSError,TypeError,KeyError) as error: result={'ok':False,'error':str(error)}
+print(json.dumps(result))
+"""
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools"), str(world.recipes_path)],
+                          env=os.environ.copy(), capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    expected = json.loads(proc.stdout)
+    world.dispatch()
+    world.finish_writer()
+    row = world.dispatch()["small_changes"][0]
+    if expected["ok"] and variant == "steady":
+        assert row["state"] == "checking", row
+    elif expected["ok"]:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_recipe_mismatch"), row
+    else:
+        assert (row["state"], row.get("reason")) == ("held", "small_change_configuration"), row
+        assert row["detail"] == expected["error"], (row, expected)
+
+
+def test_r9_wake_absence_is_rechecked_at_the_final_publication_hook(tmp_path):
+    world = DispatchWorld(tmp_path)
+    before = world.ledger.files()
+    marker = world.root / ".wake-engine%2Forchestrator.lock"
+    injection = r"""
+old_stat = os.stat
+seen['changed'] = False
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    frame = sys._getframe(1)
+    while frame is not None:
+        if (frame.f_code.co_name == 'publish' and frame.f_code.co_filename.endswith('hierarchy_mailbox.py')
+                and 'recipient' in frame.f_locals and not seen['changed']):
+            Path(%r).write_text('modelled planning turn appeared before commit')
+            seen['changed'] = True
+            break
+        frame = frame.f_back
+    return info
+os.stat = inspected
+""" % str(marker)
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["changed"] and row["state"] == "held" and "changed" in row["detail"], (seen, row)
+    assert world.messages() == [] and world.ledger.files() == before
+    assert marker.read_text() == "modelled planning turn appeared before commit"
+
+
+def test_r9_delivery_names_and_values_use_one_captured_listing(tmp_path):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    r9_read_orchestrator(world)
+    injection = r"""
+old_list = os.listdir
+seen['extra'] = 0
+def listed(path):
+    if not isinstance(path, int):
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == 'unread_records':
+                seen['extra'] += 1
+                break
+            frame = frame.f_back
+    return old_list(path)
+os.listdir = listed
+"""
+    code, answer, seen = r8_compose_probe(world, injection)
+    assert code == 0 and answer["ok"] and seen["extra"] == 0, (answer, seen)
+
+
+def test_r9_witness_rechecks_share_one_parent_walk_per_verification(tmp_path):
+    world = DispatchWorld(tmp_path)
+    for number in range(12):
+        path = world.root.parent / ("notice-%d.md" % number)
+        path.write_text("retained notice %d" % number)
+        invoke(world.root, "publish", {"message_id": "notice-%d" % number, "from": "engine/root",
+            "to": "engine/orchestrator", "host": "host-one", "session": "engine/root", "binding_generation": 1,
+            "type": "brief", "body": "notice", "brief": {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}})
+    injection = r"""
+old_open = os.open
+seen['walks'] = {}
+def opened(path, flags, *args, **kw):
+    frame = sys._getframe(1)
+    if path == '/' and frame.f_code.co_name == '_reference_parent' and frame.f_locals['path'] == Path(%r):
+        caller = frame.f_back
+        while caller is not None:
+            if caller.f_code.co_name == 'verify' and caller.f_code.co_filename.endswith('hierarchy_fresh_brief.py'):
+                # Keep frames alive so ids cannot be reused across distinct verification calls.
+                frames.append(caller)
+                key = str(id(caller))
+                seen['walks'][key] = seen['walks'].get(key, 0) + 1
+                break
+            caller = caller.f_back
+    return old_open(path, flags, *args, **kw)
+frames = []
+os.open = opened
+""" % str(world.root.parent)
+    code, answer, seen = r8_compose_probe(world, injection)
+    assert code == 0 and answer["ok"], answer
+    assert seen["walks"] and max(seen["walks"].values()) == 1, seen
+
+
+def test_r9_late_status_change_discards_already_computed_success_drafts(tmp_path):
+    world = DispatchWorld(tmp_path)
+    review_result(world, ready_reviewer(world))
+    injection = r"""
+old_stat = os.stat
+seen['changed'] = False
+def inspected(path, *args, **kw):
+    info = old_stat(path, *args, **kw)
+    if not seen['changed']:
+        frame = sys._getframe(1)
+        while frame is not None:
+            if (frame.f_code.co_name == 'run' and frame.f_code.co_filename.endswith('hierarchy_small_change_dispatch.py')
+                    and frame.f_locals['self'].view.get('drafts')):
+                seen['changed'] = True
+                with open(%r, 'ab') as stream: stream.write(b'\n')
+                break
+            frame = frame.f_back
+    return info
+os.stat = inspected
+""" % str(world.recipes_path)
+    answer, seen = r7_router_probe(world, injection, command="status")
+    row = answer["small_changes"][0]
+    assert seen["changed"] and (row["state"], row["reason"]) == ("held", "small_change_recipe_mismatch"), (seen, row)
+    assert row["drafts"] == [], row
+
+
+@pytest.mark.parametrize("name", [".codex", ".claude"])
+@pytest.mark.parametrize("field", ["hide", "ro_binds"])
+def test_r9_recipe_folder_checks_refuse_private_inputs_before_metadata(tmp_path, name, field):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    private = world.tmp / "home" / name
+    private.mkdir(parents=True)
+    config = json.loads(world.recipes_path.read_text())
+    config[field] = [str(private)]
+    world.recipes_path.write_text(json.dumps(config))
+    injection = r"""
+old_stat = os.stat
+seen['probes'] = 0
+def inspected(path, *args, **kw):
+    if not isinstance(path, int) and Path(path) == Path(%r): seen['probes'] += 1
+    return old_stat(path, *args, **kw)
+os.stat = inspected
+""" % str(private)
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert (row["state"], row["reason"], row["detail"]) == ("held", "small_change_configuration", "owner-private host directory is not an input"), row
+    assert seen["probes"] == 0 and world.messages("job_request") == [], seen
+
+
+@pytest.mark.parametrize("name", [".codex", ".claude"])
+def test_r9_standalone_verify_refuses_private_paths_before_discovery(tmp_path, name):
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    private = tmp_path / "modelled-home" / name
+    private.mkdir(parents=True)
+    path = private / "retained.md"
+    path.write_bytes(Path(world.messages("dispatch")[0]["message"]["brief"]["path"]).read_bytes())
+    script = r"""import importlib.util, json, os, pwd, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('hierarchy_fresh_brief', sys.argv[1])
+fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
+old_stat = os.stat
+probes = []
+def inspected(path, *args, **kw):
+    if not isinstance(path, int) and (Path(sys.argv[4]) == Path(path) or Path(sys.argv[4]) in Path(path).parents):
+        probes.append(str(path))
+    return old_stat(path, *args, **kw)
+os.stat = inspected
+try: code = fresh.main(['verify','--path',sys.argv[5],'--sha256',sys.argv[6]])
+finally: Path(sys.argv[3]).write_text(json.dumps(probes))
+sys.exit(code)
+"""
+    telemetry = tmp_path / "verify-io.json"
+    env = {k:v for k,v in os.environ.items() if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools/hierarchy_fresh_brief.py"),
+        str(private.parent), str(telemetry), str(private), str(path), hashlib.sha256(path.read_bytes()).hexdigest()],
+        capture_output=True, text=True, env=env, timeout=20)
+    assert process.stderr == "", process.stdout + process.stderr
+    assert (process.returncode, json.loads(process.stdout)) == (2, {"error":"owner-private host directory is not an input"})
+    assert json.loads(telemetry.read_text()) == []
+
+
+@pytest.mark.parametrize("command", ["dispatch", "verify"])
+def test_r9_grouped_directory_open_failure_remains_a_public_refusal(tmp_path, command):
+    world = DispatchWorld(tmp_path)
+    entry, arguments = ROUTER, ["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), "dispatch",
+        "--recipes", str(world.recipes_path), "--wait", "0.1", "--evidence-only"]
+    if command == "verify":
+        world.dispatch()
+        brief = world.messages("dispatch")[0]["message"]["brief"]
+        entry, arguments = ROOT / "tools/hierarchy_fresh_brief.py", ["verify", "--path", brief["path"], "--sha256", brief["sha256"]]
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    script = r"""import importlib.util, json, os, pwd, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location(Path(sys.argv[1]).stem, sys.argv[1])
+router = importlib.util.module_from_spec(spec); spec.loader.exec_module(router)
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
+old_open = os.open
+seen = False
+def opened(path, *args, **kw):
+    global seen
+    frame = sys._getframe(1)
+    if path == '/' and frame.f_code.co_name == '_reference_parent' and not seen:
+        caller = frame.f_back
+        if caller.f_code.co_name == 'verify' and caller.f_code.co_filename.endswith('hierarchy_fresh_brief.py'):
+            seen = True
+            raise FileNotFoundError('modelled directory unavailable at recheck')
+    return old_open(path, *args, **kw)
+os.open = opened
+try: code = router.main(sys.argv[4:])
+finally: Path(sys.argv[3]).write_text(json.dumps(seen))
+sys.exit(code)
+"""
+    telemetry = tmp_path / "directory-recheck.json"
+    env = {k:v for k,v in os.environ.items() if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
+    process = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(entry), str(tmp_path / "home"),
+        str(telemetry), *arguments], env=env,
+        capture_output=True, text=True, timeout=20)
+    assert process.stderr == "", process.stdout + process.stderr
+    assert json.loads(telemetry.read_text()) is True
+    assert process.returncode == 2 and json.loads(process.stdout)["error"] == "modelled directory unavailable at recheck", process.stdout
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def test_r9b_committed_route_sync_failure_retains_evidence_without_busy_retry(tmp_path):
+    world = DispatchWorld(tmp_path)
+    before = world.ledger.files()
+    injection = r"""
+import errno, hashlib, time
+seen.update(committed_event=None, event_syncs=0, publications=0)
+old_link, old_sync = os.link, os.fsync
+def linked(src, dst, *args, **kw):
+    answer = old_link(src, dst, *args, **kw)
+    if Path(dst).parent.name == 'events':
+        raw = Path(src).read_bytes()
+        event = json.loads(raw)
+        if event['envelope']['event']['type'] == 'route':
+            seen['publications'] += 1
+            seen['committed_event'] = {'message_id':event['envelope']['id'],
+                'evidence':{'path':str(dst),'sha256':hashlib.sha256(raw).hexdigest()}}
+    return answer
+def synced(fd):
+    committed = seen['committed_event']
+    if committed and Path(os.readlink('/proc/self/fd/%d' % fd)) == Path(committed['evidence']['path']).parent:
+        seen['event_syncs'] += 1
+        raise OSError(errno.EBUSY, 'modelled route directory is busy')
+    return old_sync(fd)
+# A known publication must escape patient() even when its post-commit error says busy.
+# Make the retry budget deterministic; the mutant's next call finds the recorded original receipt.
+time.monotonic = lambda: 0.0
+os.link, os.fsync = linked, synced
+"""
+    answer, seen = r7_router_probe(world, injection)
+    row = answer["small_changes"][0]
+    assert seen["event_syncs"] == 1 and seen["publications"] == 1, seen
+    assert (row["state"], row.get("reason")) == ("held", "small_change_committed_event"), row
+    assert row["partial_publication"] == seen["committed_event"], row
+    assert len(world.ledger.files()) == len(before) + 1
+    assert len(world.messages("dispatch")) == 1 and world.messages("job_request") == []

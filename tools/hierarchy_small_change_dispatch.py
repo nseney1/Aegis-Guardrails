@@ -20,8 +20,9 @@ import hierarchy_fresh_brief as fresh
 import hierarchy_jobs as jobs
 import hierarchy_lifecycle as life
 import hierarchy_router as router
+import hierarchy_workspace as workspace
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, MAX_RECORDS, SLUG, TERMINAL_JOB_STATES, digest, encoded, fields,
-                               matching, parse_time, read_bytes, read_json, require, safe_path, strict_json, timestamp,
+                               matching, parse_time, require, safe_path, strict_json, timestamp,
                                writer_lock)
 
 
@@ -48,21 +49,10 @@ def checked_path(path):
     return safe_path(path)
 
 
-def reference(path):
-    path = checked_path(path)
-    return fresh.file_ref(path)
-
-
 def _attachment(mailbox, ref):
     fields(ref, {"path", "sha256"})
     checked_path(ref["path"])
     return fresh._attachment(mailbox, ref)
-
-
-def verify(ref):
-    fields(ref, {"path", "sha256"})
-    require(reference(ref["path"]) == ref, "evidence reference hash mismatch")
-    return ref
 
 
 def protect_references(value):
@@ -77,11 +67,11 @@ def protect_references(value):
             protect_references(item)
 
 
-def inspect_brief(raw):
+def inspect_brief(raw, mailbox=None):
     for line in raw.decode("utf-8").splitlines():
         if line.startswith("- "):
             protect_references(strict_json(line[2:]))
-    return fresh.inspect(raw)
+    return fresh.inspect(raw, _check_ref=mailbox.check_ref) if mailbox is not None else fresh.inspect(raw)
 
 
 def identifier(stage, row, check_id=None):
@@ -153,14 +143,14 @@ def in_force(mailbox, message):
 
 
 def _artifact_mark(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns)
+    return fresh._reference_mark(info)
 
 
 class _RetainedJob:
     """Captured bytes plus identity witnesses; temporary anchored handles validate publication safety."""
 
-    def __init__(self, store, initiative, message):
+    def __init__(self, store, initiative, message, *, _claim=None):
+        self.descriptors()
         self.id = initiative["id"] + "/" + message["message_id"]
         self.holder = "job:" + self.id
         self.message = message
@@ -180,13 +170,25 @@ class _RetainedJob:
                 for name in self._members:
                     if name.startswith("step-") or name.startswith("derivation") or name in {
                             "claim.json", "process.json", "result.json", "packet.md"}:
-                        self._capture(directory, name)
+                        if name == "claim.json" and _claim is not None and name in _claim.entries:
+                            entry = _claim.entries[name]
+                            require(fresh._same_mark(_artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                                                     entry["mark"]), "retained claim changed")
+                            self.entries[name] = entry
+                        else:
+                            self._capture(directory, name)
             self._validate_snapshot(directory, links, missing)
         self.claim = self._json("claim.json")
         self.process = self._json("process.json")
         require("claim.json" not in self.entries or isinstance(self.claim, dict), "retained claim must be an object")
         require("process.json" not in self.entries or isinstance(self.process, dict), "retained process must be an object")
         self.result = self._result()
+
+    @staticmethod
+    def descriptors():
+        require(os.name == "posix" and all(hasattr(os, name) for name in (
+            "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")),
+            "retained descriptor capture requires POSIX directory descriptors")
 
     @contextmanager
     def _directories(self, *, expected=False):
@@ -204,10 +206,11 @@ class _RetainedJob:
                     break
                 descriptors.append(child)
                 info = os.fstat(child)
-                identity = (info.st_dev, info.st_ino, info.st_mode)
-                require(stat.S_ISDIR(info.st_mode), "retained job ancestor is not a directory")
+                identity = fresh._directory_mark(info)
+                require(stat.S_ISDIR(info.st_mode) and not fresh._reparse(info), "retained job ancestor is not a directory")
                 if expected:
-                    require(index < len(self._ancestors) and (part, identity) == self._ancestors[index],
+                    require(index < len(self._ancestors) and part == self._ancestors[index][0]
+                            and fresh._same_mark(identity, self._ancestors[index][1]),
                             "retained job directory identity changed")
                 links.append((parent, part, child, identity))
                 parent = child
@@ -218,14 +221,15 @@ class _RetainedJob:
 
     def _capture(self, directory, name):
         before = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        require(stat.S_ISREG(before.st_mode), "retained artifact is not a regular file: " + name)
+        require(stat.S_ISREG(before.st_mode) and not fresh._reparse(before), "retained artifact is not a regular file: " + name)
         limit = (jobs.MAX_RESULT_BYTES if name == "result.json" else
                  MAX_BYTES if name in {"claim.json", "process.json", "packet.md"} else None)
         require(limit is None or before.st_size <= limit, "retained metadata exceeds its limit: " + name)
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
         try:
             opened = os.fstat(descriptor)
-            require(stat.S_ISREG(opened.st_mode) and _artifact_mark(opened) == _artifact_mark(before),
+            require(stat.S_ISREG(opened.st_mode) and not fresh._reparse(opened)
+                    and fresh._same_mark(_artifact_mark(opened), _artifact_mark(before)),
                     "retained artifact changed at open: " + name)
             total, tail, chunks = 0, b"", []
 
@@ -241,7 +245,7 @@ class _RetainedJob:
                 sha = fresh._stream_reference(descriptor, before, self.folder / name, consume)
             except ValueError as exc:
                 raise ValueError("retained artifact changed while reading: " + name) from exc
-            require(_artifact_mark(os.fstat(descriptor)) == _artifact_mark(before) and total == before.st_size,
+            require(fresh._same_mark(_artifact_mark(os.fstat(descriptor)), _artifact_mark(before)) and total == before.st_size,
                     "retained artifact changed while reading: " + name)
             self.entries[name] = {"mark": _artifact_mark(before), "sha256": sha,
                                   "tail": tail, "raw": b"".join(chunks) if limit is not None else None}
@@ -249,19 +253,19 @@ class _RetainedJob:
             os.close(descriptor)
 
     def _validate_snapshot(self, directory, links, missing):
-        require(tuple((name, identity) for _parent, name, _child, identity in links) == self._ancestors
+        require(fresh._same_ancestors(tuple((name, identity) for _parent, name, _child, identity in links), self._ancestors)
                 and missing == self._missing, "retained job directory identity changed")
 
         def validate_links():
             for parent, name, child, identity in links:
                 current = os.stat(name, dir_fd=parent, follow_symlinks=False)
                 opened = os.fstat(child)
-                require((current.st_dev, current.st_ino, current.st_mode) == identity
-                        == (opened.st_dev, opened.st_ino, opened.st_mode),
+                require(fresh._same_mark(fresh._directory_mark(current), identity)
+                        and fresh._same_mark(fresh._directory_mark(opened), identity),
                         "retained job directory identity changed")
 
         def validate_directory():
-            require(_artifact_mark(os.fstat(directory)) == self._directory
+            require(fresh._same_mark(_artifact_mark(os.fstat(directory)), self._directory)
                     and sorted(os.listdir(directory)) == sorted(self._members),
                     "retained job directory membership changed")
 
@@ -271,13 +275,14 @@ class _RetainedJob:
         validate_directory()
         for name, entry in self.entries.items():
             current = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            require(stat.S_ISREG(current.st_mode) and _artifact_mark(current) == entry["mark"],
+            require(stat.S_ISREG(current.st_mode) and not fresh._reparse(current)
+                    and fresh._same_mark(_artifact_mark(current), entry["mark"]),
                     "retained artifact identity/content metadata changed: " + name)
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                                  dir_fd=directory)
             try:
-                require(_artifact_mark(os.fstat(descriptor)) == entry["mark"]
-                        == _artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                require(fresh._same_mark(_artifact_mark(os.fstat(descriptor)), entry["mark"])
+                        and fresh._same_mark(_artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)), entry["mark"]),
                         "retained artifact identity/content metadata changed: " + name)
             finally:
                 os.close(descriptor)
@@ -339,6 +344,11 @@ class _RetainedJob:
                 or (result["state"] == "failed" and type(code) is int and code != 0),
                 "job result state and exit code disagree")
         if result["state"] == "completed":
+            require(result.get("reason") is None, "completed job result has a reason")
+            require(result.get("commit") is None, "completed fixed-command result has a new commit")
+            tests = result.get("tests")
+            require(tests is None or tests["total"] == sum(tests[key] for key in ("passed", "failed", "errors", "skipped")),
+                    "completed job result test counts disagree")
             require(bool(result["steps"]) and all(step["exit_code"] == 0 and not step.get("timed_out", False)
                                                 for step in result["steps"]),
                     "completed job result has missing, failed or timed-out steps")
@@ -406,8 +416,86 @@ class _RetainedJob:
                 "job has an unrecorded process effect: " + self.id)
 
 
+class _RunnerClaim(_RetainedJob):
+    """Capture only the original claim before observing liveness; never enumerate or read growing logs."""
+    def __init__(self, store, initiative, message):
+        self.descriptors()
+        self.id = initiative["id"] + "/" + message["message_id"]
+        self.folder = checked_path(Path(store) / "jobs" / initiative["id"] / message["message_id"])
+        self.entries = {}
+        self.result_present = False
+        with self._directories() as (directory, links, missing):
+            self._ancestors = tuple((name, identity) for _parent, name, _child, identity in links)
+            self._missing = missing
+            if missing is None:
+                for name in ("execution.json", "derivation.json", "admitted.json"):
+                    try:
+                        os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise ValueError("unsupported retained v1 metadata: " + name)
+                try:
+                    self._capture(directory, "claim.json")
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.stat("result.json", dir_fd=directory, follow_symlinks=False)
+                    self.result_present = True
+                except FileNotFoundError:
+                    pass
+        self.claim = self._json("claim.json")
+        require(self.claim is None or isinstance(self.claim, dict), "retained claim must be an object")
+
+    def validate(self):
+        with self._directories(expected=True) as (directory, links, missing):
+            require(missing == self._missing and fresh._same_ancestors(
+                tuple((name, identity) for _parent, name, _child, identity in links), self._ancestors),
+                "retained claim directory identity changed")
+            for parent, name, _child, identity in links:
+                require(fresh._same_mark(fresh._directory_mark(os.stat(name, dir_fd=parent, follow_symlinks=False)), identity),
+                        "retained claim directory identity changed")
+            if missing is None:
+                for name in ("execution.json", "derivation.json", "admitted.json"):
+                    try:
+                        os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise ValueError("unsupported retained v1 metadata: " + name)
+            if missing is None and "claim.json" in self.entries:
+                require(fresh._same_mark(_artifact_mark(os.stat("claim.json", dir_fd=directory, follow_symlinks=False)),
+                                         self.entries["claim.json"]["mark"]), "retained claim changed")
+
+
+class _CapturedStore:
+    """Read-only workspace replay from captured bytes using the existing public reducers."""
+    def __init__(self, path, operation):
+        self.path, self.operation = checked_path(path), operation
+
+    def load(self):
+        ledger, count = workspace.Ledger(), 0
+        for path in self.operation.entries(self.path / "events"):
+            if path.name.startswith(".pending-"):
+                checked_path(path)
+                continue
+            name = workspace.EVENT_NAME.fullmatch(path.name)
+            require(name is not None, "unexpected workspace store entry: " + path.name)
+            count += 1
+            require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
+            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + path.name)
+            try:
+                event = self.operation.json(path)
+                fields(event, {"schema", "seq", "at", "kind", "data"})
+                require(event["schema"] == workspace.EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
+                parse_time(event["at"])
+                ledger.apply(event)
+            except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+                raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
+        require(ledger.limits is not None, "workspace store is not initialized")
+        return ledger
+
+
 class Row:
-    def __init__(self, lifecycle, store, ledger, policy, state, key, recipes, wait):
+    def __init__(self, lifecycle, store, ledger, policy, state, key, recipes, wait, operation):
         self.lifecycle, self.store, self.ledger = lifecycle, store, ledger
         self.policy, self.state, self.key = policy, state, key
         self.row = state["requests"][key]
@@ -423,12 +511,73 @@ class Row:
         self.records = {}
         self.proofs = []
         self._retained_jobs = []
+        self._completed_checks = []
         self.setup = {}
+        self.operation = operation
+        self.operation.validators.append(self.recheck_jobs)
+
+    def reference(self, path):
+        return self.operation.reference(checked_path(path))
+
+    def verify(self, ref):
+        fields(ref, {"path", "sha256"})
+        require(self.reference(ref["path"]) == ref, "evidence reference hash mismatch")
+        return ref
+
+    def recipe_file(self):
+        path = checked_path(self.recipes)
+        if path in self.operation.parsed:
+            return self.operation.parsed[path]
+        raw = self.operation.read(path)[1]
+        recipes = strict_json(raw.decode("utf-8"))
+        fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
+        if "min_free_gigabytes" in recipes:
+            jobs.integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
+        require(recipes["schema"] == jobs.RECIPES_SCHEMA, "unsupported recipes schema")
+        require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
+        jobs.strings(recipes["path"], "path", nonempty=True)
+        require(all(Path(folder).is_absolute() for folder in recipes["path"]), "path must list absolute folders")
+        for label in ("hide", "ro_binds"):
+            folders = recipes.get(label, [])
+            jobs.strings(folders, label)
+            for folder in folders:
+                checked_path(folder)
+            jobs.existing_folders(folders, label)
+        prefix = recipes.get("prefix", [])
+        jobs.strings(prefix, "prefix")
+        require(not prefix or Path(prefix[0]).is_absolute(), "prefix must start with an absolute command")
+        env = recipes.get("env", {})
+        require(isinstance(env, dict) and all(isinstance(value, str) for value in env.values()), "invalid env")
+        for key, value in env.items():
+            require(re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is not None, "invalid env name: " + key)
+            require("$" not in value or value in jobs.ENV_TOKENS, "unsupported token in env: " + value)
+        table = recipes["recipes"]
+        require(isinstance(table, dict) and table, "recipes must not be empty")
+        for name, recipe in table.items():
+            jobs.validate_recipe(name, recipe)
+        if any(recipe["kind"] in ("commit", "merge") for recipe in table.values()):
+            identity = recipes.get("identity")
+            require(isinstance(identity, dict), "a commit or merge recipe needs an identity")
+            fields(identity, {"name", "email"})
+            jobs.text(identity["name"], "identity name", 256)
+            jobs.text(identity["email"], "identity email", 256)
+        # Hashed from the bytes that were parsed, so a result names exactly the recipe file it ran under. The key cannot come
+        # from the file: fields() above refuses it there.
+        recipes["recipes_sha256"] = hashlib.sha256(raw).hexdigest()
+        self.operation.parsed[path] = recipes
+        ref, _raw, witness = self.operation.files[path]
+        self.operation.files[path] = ref, None, witness
+        return recipes
 
     def recheck_jobs(self):
         try:
             for job in self._retained_jobs:
                 job.validate()
+            if self.recipes is not None:
+                for admission, job in self._completed_checks:
+                    self.required_tests(admission, job)
+        except Hold:
+            raise
         except (ValueError, OSError) as exc:
             raise Hold("small_change_receipt_invalid", str(exc)) from exc
 
@@ -439,15 +588,14 @@ class Row:
 
     def event_ref(self, kind, mark=None):
         matches = []
-        for sequence in range(1, self.state["sequence"] + 1):
-            path = self.lifecycle.root / "events" / ("%06d.json" % sequence)
-            record = read_json(checked_path(path))
+        for record in self.lifecycle.index.get((self.key, kind), []):
+            path = self.lifecycle.root / "events" / ("%06d.json" % record["sequence"])
             event, envelope = record["envelope"]["event"], record["envelope"]
             target = life.raw_value(event["request"])["id"] if event["type"] == "publish" else event.get("request_id")
             if event["type"] == kind and target == self.key:
                 if mark is None or (envelope["actor"] == mark["actor"] and envelope["generation"] == mark["generation"]
                                     and record["at"] == mark["at"]):
-                    matches.append(reference(path))
+                    matches.append(self.reference(path))
         require(bool(matches), "lifecycle event provenance missing: " + kind)
         return matches[-1]
 
@@ -464,8 +612,8 @@ class Row:
         for value in (self.policy, self.state, self.records):
             protect_references(value)
         provision = checked_path(self.mailbox.root.parent / "provision.json")
-        if provision.exists():
-            setup = read_json(provision)
+        if self.operation.exists(provision):
+            setup = self.operation.json(provision)
             require(isinstance(setup, dict), "provision record must be an object")
             protect_references(setup)
             for key in ("source", "delivery_dir", "store", "board", "mailbox_root"):
@@ -543,9 +691,9 @@ class Row:
                     "stored attachment is not content addressed")
             raw = _attachment(self.mailbox, message["brief"])
             for ref in body["witnesses"]:
-                verify(ref)
+                self.verify(ref)
             if stage != "check":
-                inspect_brief(raw)
+                inspect_brief(raw, self.mailbox)
                 require(("Endpoint: " + to) in raw.decode(), "brief target endpoint mismatch")
                 require(("Target generation: %s" % body["target_generation"]) in raw.decode(), "brief target generation mismatch")
                 require(self.row["raw"]["sha256"] in raw.decode() and self.view["plan_sha256"] in raw.decode(),
@@ -562,14 +710,14 @@ class Row:
         args = SimpleNamespace(root=str(self.mailbox.root), initiative=self.team, endpoint=target,
                                lifecycle=str(self.lifecycle.root), delivery_dir=None, as_of=timestamp(),
                                target_generation=self.mailbox.current_binding(target)["generation"])
-        raw, answer = fresh.prepare(args)
+        raw, answer = fresh.prepare(args, _mailbox=self.mailbox)
         assignment = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **self.metadata(stage, target),
                       "instructions": ("Verify route receipt before intent/start; publish result lane_check as "
                                        "lifecycle-terminal:<raw terminal sha256>. Never repeat an unknown effect."
                                        if stage == "writer" else "Read-only review of the exact writer commit/tree and all check receipts."),
                       "evidence": self.proofs}
         raw = raw.replace(b"## Approved scope\n", b"## Approved scope\n\n- " + encoded(assignment) + b"\n", 1)
-        inspect_brief(raw)
+        inspect_brief(raw, self.mailbox)
         ref = {"path": str(Path(answer["brief"]["path"]).parent / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")),
                "sha256": hashlib.sha256(raw).hexdigest()}
         return raw, ref
@@ -595,7 +743,26 @@ class Row:
 
     def publish(self, request):
         self.recheck_jobs()
-        record = self.mailbox.publish(request)
+        try:
+            record = self.mailbox.publish(request)
+        except fresh.PartialPublication as exc:
+            self.records[request["message_id"]] = exc.record
+            self.view["partial_publication"] = {"message_id": request["message_id"],
+                                                "evidence": {"path": exc.record["path"], "sha256": exc.record["sha256"]}}
+            if isinstance(exc.error, Hold):
+                raise Hold(exc.error.reason, str(exc)) from exc
+            if isinstance(exc.error, fresh.CaptureChanged) and self.recipes is not None and exc.error.path == Path(self.recipes):
+                raise Hold("small_change_recipe_mismatch", str(exc)) from exc
+            # An independently appended deny is durable evidence, not a generic transport failure.
+            # This refresh has no effects; unknown/malformed input still retains the partial-publication hold.
+            try:
+                self.reload()
+                self.live(expiry=request["type"] == "job_request")
+            except Hold as current:
+                raise Hold(current.reason, str(exc) + "; " + str(current)) from exc
+            except (ValueError, OSError, TypeError, KeyError):
+                pass
+            raise Hold("small_change_partial_publication", str(exc)) from exc
         life.sync_directory(Path(record["path"]).parent)
         self.records[request["message_id"]] = record
         return record
@@ -607,7 +774,7 @@ class Row:
             check(self.row["routed"] is None, "small_change_message_conflict", "route exists under a different event identity")
             return None
         path = self.lifecycle.root / "events" / ("%06d.json" % receipt["sequence"])
-        record = read_json(checked_path(path))
+        record = self.operation.json(checked_path(path), limit=life.MAX_BYTES)
         envelope = record["envelope"]
         require(record["event_sha256"] == receipt["event_sha256"], "route receipt hash mismatch")
         expected = {"type": "route", "request_id": self.key, "request_sha256": self.row["raw"]["sha256"], "to": self.writer}
@@ -646,15 +813,25 @@ class Row:
                           and not self.validated_closure(r["message"], history)
                           for r in self.records.values()), "small_change_configuration", "writer lane already has an open dispatch")
             raw, ref = self.compose(self.writer, "writer")
+            self.reload()
+            self.live(writing=True, expiry=True)
+            actor = self.state["current"]["router"]
+            router.router_actor(self.policy, self.state, actor)
+            envelope = router.route_envelope(self.policy, self.state, actor, self.key, self.row["raw"], self.writer)
+            envelope["id"] = msg_id
+            router.journal_accepts(self.policy, self.state, envelope)
             remaining = (parse_time(self.row["request"]["continuation"]["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
             check(remaining > 2 * self.wait + RESERVE_SECONDS, "small_change_expired", "writer expiry margin insufficient")
             require(len(self.records) < MAX_RECORDS, "mailbox history limit reached")
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
             prior = self.publish(self.publication(msg_id, self.writer, "dispatch", self.metadata("writer", self.writer), ref))
             self.view["writer_message_present"] = True
         try:
             receipt = router.patient(lambda: self.lifecycle.record(envelope), self.wait)
+        except fresh._CommittedEvent as exc:
+            self.view["partial_publication"] = exc.record
+            raise Hold("small_change_committed_event", str(exc)) from exc
         except (ValueError, OSError) as exc:
             raise Hold("delivered_unrecorded", str(exc)) from exc
         self.view["route_receipt"] = receipt
@@ -719,8 +896,8 @@ class Row:
         match = TERMINAL_REF.fullmatch(record["message"]["result"]["lane_check"])
         check(match is not None and match.group(1) == terminal["sha256"], "small_change_result_invalid", "terminal/result reference mismatch")
         for ref in terminal["value"]["evidence"]:
-            verify(ref)
-        self.proofs += [reference(record["path"]), self.event_ref("terminal", terminal)]
+            self.verify(ref)
+        self.proofs += [self.reference(record["path"]), self.event_ref("terminal", terminal)]
         self.result_record, self.accepted = record, accepted
         self.review_not_before = max(parse_time(record["message"]["created_at"]), parse_time(terminal["at"]))
         return record
@@ -733,7 +910,7 @@ class Row:
 
     def job_extra(self, admission):
         return {"check": admission["check"], "recipe": admission["recipe"], "recipes_sha256": admission["recipes_sha256"],
-                "result": reference(self.result_record["path"])}
+                "result": self.reference(self.result_record["path"])}
 
     def job_records(self):
         entries = []
@@ -743,7 +920,7 @@ class Row:
             prior = self.prior(msg_id, "check", self.team + "/root", extra=self.job_extra(admission))
             if prior is None:
                 folder = checked_path(self.store.path / "jobs" / self.team / msg_id)
-                check(not folder.exists(), "small_change_message_lost", "check message missing with retained job evidence: " + msg_id)
+                check(not self.operation.exists(folder), "small_change_message_lost", "check message missing with retained job evidence: " + msg_id)
             if prior:
                 check(_attachment(self.mailbox, prior["message"]["brief"]) == encoded(packet),
                       "small_change_message_conflict", "job packet differs from admitted fixed source")
@@ -752,6 +929,7 @@ class Row:
 
     def check_receipts(self, entries):
         complete = True
+        self.running_checks = False
         self.view["checks"] = []
         for admission, packet, msg_id, record in entries:
             item = {"check": admission["check"], "message_id": msg_id, "state": "unpublished"}
@@ -780,7 +958,35 @@ class Row:
                 check(all(s in TERMINAL_JOB_STATES for s in history[settled:]), "small_change_receipt_invalid",
                       "nonterminal job receipt follows a terminal receipt: " + msg_id)
                 check(state != "unknown", "small_change_unknown_effect", "job receipt has unresolved uncertainty: " + msg_id)
-                job = _RetainedJob(self.store.path, self.initiative, record["message"])
+                claim = _RunnerClaim(self.store.path, self.initiative, record["message"])
+                if claim.claim is None and state == "started":
+                    # Absence read no claim bytes. Observe a just-published claim once before classifying a lost effect.
+                    claim = _RunnerClaim(self.store.path, self.initiative, record["message"])
+                if claim.claim is not None:
+                    check(claim.claim.get("recipes_sha256") == admission["recipes_sha256"],
+                          "small_change_recipe_mismatch", "job claim recipe file changed")
+                    alive = claim.runner_alive()
+                    if alive is True:
+                        check(state != "completed", "small_change_unknown_effect", "job runner is live or unknown")
+                        claim.validate()
+                        self._retained_jobs.append(claim)
+                        self.running_checks, complete = True, False
+                        item["state"] = "running"
+                        continue
+                    check(alive is False, "small_change_unknown_effect", "job runner is unknown: " + msg_id)
+                if not any(s in TERMINAL_JOB_STATES for s in history):
+                    if state == "started" or claim.claim is not None:
+                        alive = claim.runner_alive()
+                        if alive is True:
+                            claim.validate()
+                            self._retained_jobs.append(claim)
+                            self.running_checks, complete = True, False
+                            item["state"] = "running"
+                            continue
+                        check(alive is False, "small_change_unknown_effect", "job runner is unknown: " + msg_id)
+                        check(claim.result_present, "small_change_unknown_effect",
+                              "stopped runner lacks terminal result/receipt: " + msg_id)
+                job = _RetainedJob(self.store.path, self.initiative, record["message"], _claim=claim)
                 self._retained_jobs.append(job)
                 if job.claim is not None:
                     claim = job.claim
@@ -790,6 +996,14 @@ class Row:
                     check(result.get("recipes_sha256") == admission["recipes_sha256"], "small_change_recipe_mismatch", "job result recipe file changed")
                     check(result["state"] not in {"failed", "refused"}, "small_change_check_failed",
                           "retained job did not pass: " + msg_id)
+                if state == "started" and result is None:
+                    raise Hold("small_change_unknown_effect", "stopped runner lacks terminal result/receipt: " + msg_id)
+                if settled == len(history) and job.entries:
+                    if job.claim is not None and job.runner_alive() is True:
+                        self.running_checks, complete = True, False
+                        item["state"] = "running"
+                        continue
+                    raise Hold("small_change_unknown_effect", "original terminal job receipt is missing: " + msg_id)
             except Hold:
                 raise
             except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
@@ -802,6 +1016,8 @@ class Row:
                 require(result is not None and result["state"] == "completed" and result["exit_code"] == 0, "missing successful retained job result")
                 require(witness["message"]["message_id"] == jobs.receipt_id(job, "completed"), "completed receipt is not the original runner receipt")
                 require(result["recipe"] == packet["recipe"], "job recipe differs")
+                if self.recipes is not None:
+                    self.required_tests(admission, job)
                 require(job.entries.get("packet.md", {}).get("raw") == encoded(packet), "retained packet differs")
                 for name in ("before", "after"):
                     source = result[name]
@@ -809,8 +1025,6 @@ class Row:
                             and source["source_tree"] == packet["tree"] and source["dirty_content_sha256"] == jobs.EMPTY_STATUS,
                             "retained job source witness differs")
                 expected = {"state": "completed", "exit_code": 0, "evidence": job.evidence()}
-                if result.get("reason") is not None:
-                    expected["reason"] = result["reason"][:4096]
                 require(jobs.receipt_matches(job, witness["message"], expected, job.body()), "receipt does not match retained evidence")
                 check(job.runner_alive() is False, "small_change_unknown_effect", "job runner is live or unknown")
                 job.check_stopped()
@@ -820,24 +1034,50 @@ class Row:
                 raise
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 raise Hold("small_change_receipt_invalid", str(exc)) from exc
-            self.proofs.append(reference(witness["path"]))
+            self.proofs.append(self.reference(witness["path"]))
+            self._completed_checks.append((admission, job))
             self.review_not_before = max(self.review_not_before, parse_time(witness["message"]["created_at"]))
         return complete
+
+    def required_tests(self, admission, job):
+        result = job.result
+        recipe = self.configured_recipe(admission)
+        packet = strict_json(job.entries["packet.md"]["raw"].decode("utf-8"))
+        packet = {"paths": [], **packet}
+        recipes = self.recipe_file()
+        # The runner's list order is its step identity; v1 results have no step-number field.
+        checkout = str(job.folder / jobs.EXPORT_FOLDER) if recipe.get("require_clean") else packet["checkout"]
+        expected = [step.argv for step in jobs.command_steps(recipe, packet, recipes, job, checkout)]
+        require([step["argv"] for step in result["steps"]] == expected,
+                "completed job steps differ from admitted recipe")
+        numbers = sorted(int(name[5:-4]) for name in job.entries
+                         if name.startswith("step-") and name.endswith(".log") and name[5:-4].isdigit())
+        require(numbers == list(range(1, len(expected) + 1)), "completed job log steps differ from admitted recipe")
+        require(job.process is not None and type(job.process.get("step")) is int
+                and job.process["step"] == len(expected), "completed job process step differs from admitted recipe")
+        if recipe.get("expects_tests", False):
+            tests = result.get("tests")
+            require(tests is not None and tests["total"] > 0 and tests["passed"] > 0,
+                    "completed job result lacks required passing tests")
+
+    def configured_recipe(self, admission):
+        require(self.recipes is not None, "dispatch requires configured recipes")
+        recipes = self.recipe_file()
+        check(recipes["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "admitted recipe file changed")
+        recipe = recipes["recipes"].get(admission["recipe"])
+        check(recipe is not None and recipe["kind"] == "command" and recipe.get("require_clean") is True
+              and not any("$paths" in step for step in recipe["steps"]), "small_change_configuration", "unsupported check recipe or $paths")
+        return recipe
 
     def publish_checks(self, entries, mutate=True):
         missing = [entry for entry in entries if entry[3] is None]
         if not missing:
             return
         self.live(expiry=True)
-        require(self.recipes is not None, "dispatch requires configured recipes")
-        recipes = jobs.load_recipes(checked_path(self.recipes))
         staged = []
         check(len(self.records) + len(missing) <= MAX_RECORDS, "small_change_configuration", "mailbox has no batch headroom")
         for admission, packet, msg_id, prior in entries:
-            check(recipes["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "admitted recipe file changed")
-            recipe = recipes["recipes"].get(admission["recipe"])
-            check(recipe is not None and recipe["kind"] == "command" and recipe.get("require_clean") is True
-                  and not any("$paths" in step for step in recipe["steps"]), "small_change_configuration", "unsupported check recipe or $paths")
+            self.configured_recipe(admission)
             raw = encoded(packet)
             ref = {"path": str(self.mailbox.root.parent / "briefs" / ("check-" + hashlib.sha256(raw).hexdigest() + ".md")),
                    "sha256": hashlib.sha256(raw).hexdigest()}
@@ -853,12 +1093,12 @@ class Row:
         if not mutate:
             return
         for admission, raw, ref, request in staged:
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
         for admission, raw, ref, request in staged:
             self.reload()
             self.live(expiry=True)
-            current = jobs.load_recipes(checked_path(self.recipes))
+            current = self.recipe_file()
             check(current["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "recipe changed during batch publication")
             self.publish(request)
 
@@ -872,8 +1112,9 @@ class Row:
         self.live()
         self.view["state"] = "review_ready"
         if mutate:
+            require(self.recipes is not None, "Reviewer publication requires configured recipes")
             raw, ref = self.compose(self.reviewer, "reviewer")
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
             self.reload()
             self.live()
@@ -905,6 +1146,7 @@ class Row:
             raise Hold("small_change_message_conflict", str(exc)) from exc
 
     def drafts(self, reason=None):
+        self.operation.verify()
         blocked = self.row["resolution"] is not None and self.row["resolution"]["kind"] == "blocked"
         if closed(self.row) and not blocked:
             return []
@@ -943,7 +1185,7 @@ class Row:
         delivery = self.mailbox.root.parent / "delivery"
         delivery = checked_path(self.setup.get("delivery_dir", str(delivery)))
         read_ids = set()
-        if delivery.exists():
+        if self.operation.exists(delivery):
             for receipt in self.mailbox.delivery_receipts(delivery, "reads", self.team + "/orchestrator", self.records):
                 read_ids.update(receipt["message_ids"])
         self.view["retained_replies"] = [{"message_id": r["message"]["message_id"], "parent": r["message"]["in_reply_to"],
@@ -1012,7 +1254,7 @@ class Row:
         self.endpoints()
         if not closed(self.row):
             for role in ("orchestrator", "decider"):
-                check(not self.mailbox.wake_marker(self.team + "/" + role).exists(),
+                check(not self.operation.exists(self.mailbox.wake_marker(self.team + "/" + role)),
                       "small_change_configuration", "planning wake requires owner reconciliation: " + role)
         self.retained()
         self.foreign_publications()
@@ -1035,7 +1277,7 @@ class Row:
         complete = self.check_receipts(entries)
         if not complete:
             check(not auditing, "small_change_closed_unverified", "closed row lacks verified checks")
-            if mutate or self.recipes is not None:
+            if not self.running_checks and (mutate or self.recipes is not None):
                 self.publish_checks(entries, mutate)
             self.view["state"] = "checking"
             return
@@ -1056,16 +1298,24 @@ class Row:
         reviewed = completion["message"]["result"]
         original = result["message"]["result"]
         check(all(reviewed[k] == original[k] for k in ("source_revision", "source_tree")), "small_change_result_invalid", "Reviewer source differs")
-        self.proofs += [reference(completion["path"]), self.event_ref("review", review)]
+        self.proofs += [self.reference(completion["path"]), self.event_ref("review", review)]
         if auditing:
             self.view["state"] = "owned_hold" if blocked else "complete"
+            if self.recipes is None:
+                self.view.update(state="owned_hold" if blocked else "held", reason="small_change_close_unverified", drafts=[],
+                                 detail="rerun with --recipes <file> to verify closed evidence")
+                return
             if blocked:
                 self.view["reason"] = "small_change_close_due"
-                self.view["drafts"] = self.drafts("small_change_close_due")
+                self.view["drafts"] = self.drafts("small_change_close_due") if self.recipes is not None else []
             return
         self.live()
         self.view.update(state="held", reason="small_change_close_due", detail="owner records drafted coordinator events")
-        self.view["drafts"] = self.drafts("small_change_close_due")
+        if self.recipes is not None:
+            self.view["drafts"] = self.drafts("small_change_close_due")
+        else:
+            self.view.update(reason="small_change_close_unverified", drafts=[],
+                             detail="rerun with --recipes <file> to verify checks before successful closure drafts")
 
     def run(self, mutate):
         try:
@@ -1075,27 +1325,30 @@ class Row:
             check(self.initiative is not None and "mailbox_root" in self.initiative,
                   "small_change_configuration", "team has no registered mailbox")
             root = self.initiative["mailbox_root"]
-            self.mailbox = Mailbox(checked_path(root))
+            self.mailbox = fresh._CapturedMailbox(checked_path(root), _operation=self.operation)
+            self.mailbox.before_publication = self.publication_authority
             self.records = self.mailbox.messages()
             prior = router.prior_delivery(self.mailbox, self.team, self.key, self.row["raw"])
             if prior is not None:
                 original = self.records[router.route_id(self.row["raw"]["sha256"])]
                 self.view["legacy_delivery"] = {"message_id": original["message"]["message_id"],
-                                                "evidence": reference(original["path"])}
+                                                "evidence": self.reference(original["path"])}
                 raise Hold("small_change_legacy_delivery" if prior == "same" else "route_message_conflict",
                            "retained canonical publication requires owner disposition; never dispatch again")
             _root, reason = router.team_mailbox(self.ledger, self.team)
             check(reason is None, "small_change_configuration", reason or "")
             self.inputs()
             self.progress(mutate)
-            self.recheck_jobs()
+            self.operation.verify()
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
             reason = exc.reason if isinstance(exc, Hold) else "small_change_configuration"
+            if isinstance(exc, fresh.CaptureChanged) and self.recipes is not None and exc.path == Path(self.recipes):
+                reason = "small_change_recipe_mismatch"
             if "malformed mailbox message" in str(exc):
                 reason = "small_change_receipt_invalid" if "receipt" in str(exc) else "small_change_result_invalid"
             if "referenced message does not exist" in str(exc):
                 reason = "small_change_message_lost"
-            self.view.update(state="held", reason=reason, detail=str(exc)[:1024])
+            self.view.update(state="held", reason=reason, detail=str(exc)[:1024], drafts=[])
             if self.mailbox is not None:
                 self.view["writer_message_present"] = identifier("scw", self.row) in self.records
             if self.view.get("writer_message_present") and self.row["routed"] is None and reason in {
@@ -1111,29 +1364,54 @@ class Row:
                 self.view["draft_error"] = str(draft_error)[:1024]
         return self.view
 
+    def publication_authority(self, request):
+        self.reload()
+        writing = request["type"] == "dispatch" and request["to"] == self.writer
+        self.live(writing=writing, expiry=writing or request["type"] == "job_request")
+
 
 def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
     router.preflight_paths(lifecycle.root, store.path)
-    policy, state = router.locked_load(lifecycle, wait)
-    ledger = store.load()
+    root, store_path = lifecycle.root, store.path
+
+    def inputs():
+        operation = fresh._Operation()
+        captured = operation.lifecycle(root)
+        policy, state = router.locked_load(captured, wait)
+        captured_store = _CapturedStore(store_path, operation)
+        ledger = captured_store.load()
+        operation.verify()
+        return operation, captured, captured_store, policy, state, ledger
+
+    _operation, _lifecycle, _store, _policy, state, ledger = inputs()
     rows = []
     for key, row in sorted(state["requests"].items()):
         if "small_change" not in row:
             continue
-        context = Row(lifecycle, store, ledger, policy, state, key, recipes, wait)
+        def context():
+            operation, captured, captured_store, policy, current, current_ledger = inputs()
+            return Row(captured, captured_store, current_ledger, policy, current, key, recipes, wait, operation)
+
         if mutate:
-            root, reason = router.team_mailbox(ledger, row["request"]["team"])
+            mailbox_root, reason = router.team_mailbox(ledger, row["request"]["team"])
             if reason is None:
+                current = None
                 try:
-                    with writer_lock(checked_path(root)):
-                        context.reload()
-                        rows.append(context.run(True))
+                    with writer_lock(checked_path(mailbox_root)):
+                        current = context()
+                        actual, refusal = router.team_mailbox(current.ledger, row["request"]["team"])
+                        check(refusal is None and actual == mailbox_root, "small_change_configuration", "team mailbox changed before lock")
+                        rows.append(current.run(True))
                     continue
                 except (ValueError, OSError) as exc:
-                    context.view.update(state="held", reason="small_change_configuration", detail=str(exc))
-                    rows.append(context.view)
+                    if current is None:
+                        current = Row(_lifecycle, _store, ledger, _policy, state, key, recipes, wait, fresh._Operation())
+                    current.view.update(state="held", reason="small_change_configuration", detail=str(exc))
+                    rows.append(current.view)
                     continue
-        rows.append(context.run(False))
-    _policy, current = router.locked_load(lifecycle, wait)
+        rows.append(context().run(False))
+    final = fresh._Operation()
+    _policy, current = router.locked_load(final.lifecycle(root), wait)
+    final.verify()
     return {"small_changes": rows, "planning_exclusions": exclusions(current, rows),
             "qualification_dependencies": ["D4 registry companion", "D5 lane lifecycle tools", "D7 independent early-release record seam"]}
