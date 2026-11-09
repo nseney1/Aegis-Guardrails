@@ -53,6 +53,12 @@ def reference(path):
     return fresh.file_ref(path)
 
 
+def _attachment(mailbox, ref):
+    fields(ref, {"path", "sha256"})
+    checked_path(ref["path"])
+    return fresh._attachment(mailbox, ref)
+
+
 def verify(ref):
     fields(ref, {"path", "sha256"})
     require(reference(ref["path"]) == ref, "evidence reference hash mismatch")
@@ -221,22 +227,23 @@ class _RetainedJob:
             opened = os.fstat(descriptor)
             require(stat.S_ISREG(opened.st_mode) and _artifact_mark(opened) == _artifact_mark(before),
                     "retained artifact changed at open: " + name)
-            sha, total, tail, chunks = hashlib.sha256(), 0, b"", []
-            remaining = before.st_size
-            while remaining:
-                requested = min(1048576, remaining)
-                chunk = os.read(descriptor, requested)
-                require(len(chunk) == requested, "retained artifact changed while reading: " + name)
-                remaining -= len(chunk)
+            total, tail, chunks = 0, b"", []
+
+            def consume(chunk):
+                nonlocal total, tail
                 total += len(chunk)
                 require(limit is None or total <= limit, "retained metadata grew beyond its limit: " + name)
-                sha.update(chunk)
                 tail = (tail + chunk)[-jobs.TAIL_BYTES:]
                 if limit is not None:
                     chunks.append(chunk)
+
+            try:
+                sha = fresh._stream_reference(descriptor, before, self.folder / name, consume)
+            except ValueError as exc:
+                raise ValueError("retained artifact changed while reading: " + name) from exc
             require(_artifact_mark(os.fstat(descriptor)) == _artifact_mark(before) and total == before.st_size,
                     "retained artifact changed while reading: " + name)
-            self.entries[name] = {"mark": _artifact_mark(before), "sha256": sha.hexdigest(),
+            self.entries[name] = {"mark": _artifact_mark(before), "sha256": sha,
                                   "tail": tail, "raw": b"".join(chunks) if limit is not None else None}
         finally:
             os.close(descriptor)
@@ -307,6 +314,8 @@ class _RetainedJob:
             valid("exit_code" in step and (step["exit_code"] is None or type(step["exit_code"]) is int), field + ".exit_code")
             if "stopped_leftovers" in step:
                 valid(type(step["stopped_leftovers"]) is bool, field + ".stopped_leftovers")
+            if "timed_out" in step:
+                valid(type(step["timed_out"]) is bool, field + ".timed_out")
         for field in ("reason", "commit"):
             valid(result.get(field) is None or isinstance(result[field], str), field)
         if "process_stopped_confirmed" in result:
@@ -329,6 +338,10 @@ class _RetainedJob:
                 or (result["state"] == "completed" and type(code) is int and code == 0)
                 or (result["state"] == "failed" and type(code) is int and code != 0),
                 "job result state and exit code disagree")
+        if result["state"] == "completed":
+            require(bool(result["steps"]) and all(step["exit_code"] == 0 and not step.get("timed_out", False)
+                                                for step in result["steps"]),
+                    "completed job result has missing, failed or timed-out steps")
         return result
 
     def evidence(self):
@@ -528,7 +541,7 @@ class Row:
             prefix = "check-" if stage == "check" else "fresh-"
             require(Path(message["brief"]["path"]).name == prefix + message["brief"]["sha256"] + ".md",
                     "stored attachment is not content addressed")
-            raw = self.mailbox.brief(message["brief"])
+            raw = _attachment(self.mailbox, message["brief"])
             for ref in body["witnesses"]:
                 verify(ref)
             if stage != "check":
@@ -732,7 +745,7 @@ class Row:
                 folder = checked_path(self.store.path / "jobs" / self.team / msg_id)
                 check(not folder.exists(), "small_change_message_lost", "check message missing with retained job evidence: " + msg_id)
             if prior:
-                check(self.mailbox.brief(prior["message"]["brief"]) == encoded(packet),
+                check(_attachment(self.mailbox, prior["message"]["brief"]) == encoded(packet),
                       "small_change_message_conflict", "job packet differs from admitted fixed source")
             entries.append((admission, packet, msg_id, prior))
         return entries
@@ -876,7 +889,7 @@ class Row:
         try:
             message = record["message"]
             body = strict_json(message["body"])
-            raw = self.mailbox.brief(message["brief"])
+            raw = _attachment(self.mailbox, message["brief"])
             assignments = [strict_json(line[2:]) for line in raw.decode("utf-8").splitlines() if line.startswith("- ")]
             assignments = [item for item in assignments if item.get("kind") == "small_change_assignment"]
             expected = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **body,
@@ -984,7 +997,7 @@ class Row:
                 # A job packet is inert data. This reports overlap; it never gates the existing runner.
                 malformed = "malformed foreign job packet: " + message["message_id"]
                 try:
-                    packet = strict_json(jobs.packet_text(self.mailbox.brief(message["brief"])))
+                    packet = strict_json(jobs.packet_text(_attachment(self.mailbox, message["brief"])))
                 except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
                     raise Hold("small_change_mixed_queue", malformed) from exc
                 check(isinstance(packet, dict), "small_change_mixed_queue", malformed)

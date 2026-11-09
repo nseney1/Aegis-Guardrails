@@ -180,11 +180,20 @@ R5 recovery validates the original owned publication's sender interval and hando
 unacknowledged sender cannot acquire a route receipt or release the writer exclusion. Valid publications predating succession still recover
 their original receipt. Every check receipt must likewise come from its sender binding in force and be dated at or after its own request;
 violations hold small_change_receipt_invalid without publishing missing work.
-The shared fresh-brief file_ref reader covers dispatcher verification and composition's prepare/lifecycle/evidence traversal. It anchors
-ancestor directories with no-follow descriptors, opens evidence nonblocking, requires the opened regular-file identity to match discovery,
-hashes at most the initially observed size, then rechecks identity/content metadata and ancestry. FIFO/symlink/replacement/growth refuses;
-large unchanged regular evidence has no mailbox-size cap. Platforms without secure directory-descriptor support refuse rather than use an
-unsafe fallback; native qualification remains separate. No descriptor is held across a wake.
+The shared fresh-brief reader covers dispatcher verification and composition's prepare/lifecycle/evidence traversal. R6 uses anchored,
+nonblocking no-follow descriptors on capable hosts. Other hosts retain portable reference/standalone verification: lstat captures the leaf
+and ancestor identities, open uses no-follow/nonblocking flags wherever available (binary mode on Windows), and fstat must match the regular
+leaf before any content read. Recheck ancestry before reading and leaf/ancestor identity and content metadata afterwards; reject symlinks,
+reparse points, nonregular inputs and changed identities. Publication retains its separate existing descriptor-capability requirement.
+This portable fallback is not an anchored-descriptor or hostile-same-user guarantee; Windows/macOS CI and native qualification remain separate.
+One stream routine hashes/captures at most the initial N bytes plus one EOF probe. Observed growth refuses before that probe; nonempty
+zero-size virtual inputs or any readable content beyond N refuse instead of authenticating an empty/truncated hash. The same routine serves
+retained job artifacts, preserving their limits, log tail and receipt body. Large unchanged regular evidence/logs have no mailbox-size cap.
+Dispatcher and composer attachment consumers first validate the public envelope without content IO, then validate SHA-256 against bounded
+captured bytes; packet comparisons, parsing and brief inspection consume those bytes without reopening through pinned Mailbox readers.
+Attachments keep the 262144-byte limit; result metadata keeps 4 MiB. Completed command results require nonempty steps, every exit code zero,
+and no timed-out step (timed_out, when present, must be boolean). Contradictions hold small_change_receipt_invalid; ordinary failed/refused
+jobs retain small_change_check_failed. No descriptor is held across a wake, and no pinned mailbox/job schema or recording authority changes.
 Before accepting retained scr or surfacing successful closure drafts, require exactly the immutable assignment's verified writer-result,
 terminal and completed-check receipt references, including their hashes. Those references bind the writer's commit/tree transitively through
 the validated result; changing a source/proof reference cannot reuse a valid brief header. Assignment and lifecycle review timestamps must

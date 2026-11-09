@@ -3364,3 +3364,352 @@ def test_r5b_shared_reader_preserves_large_regular_evidence(tmp_path):
     assert answer["state"] == "ok", answer
     assert answer["result"] == {"path": str(target), "sha256": hashlib.sha256(data).hexdigest()}
     assert answer["observed"]["bytes"] == len(data)
+
+
+# R6: retained attachments, contradictory completed steps, and portable bounded readers.
+R6_ATTACHMENT_IO = r"""
+import io, stat
+target, telemetry = Path(sys.argv[8]), Path(sys.argv[9])
+seen = {'injected': False, 'unsafe_open': False}
+old_stat, old_io, old_fd = os.stat, io.open, os.open
+def actual(path, kwargs):
+    if not isinstance(path, (str, bytes, os.PathLike)): return None
+    value = Path(os.fsdecode(path))
+    if not value.is_absolute() and kwargs.get('dir_fd') is not None:
+        value = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / value
+    return value
+def inspected(path, *args, **kwargs):
+    info = old_stat(path, *args, **kwargs)
+    if (not seen['injected'] and actual(path, kwargs) == target and stat.S_ISREG(info.st_mode)
+            and (kwargs.get('follow_symlinks', True) or kwargs.get('dir_fd') is not None)):
+        seen['injected'] = True
+        target.rename(target.with_name(target.name + '.original'))
+        os.mkfifo(target)
+    return info
+def opened(path, *args, **kwargs):
+    if actual(path, kwargs) == target and seen['injected']:
+        seen['unsafe_open'] = True
+        raise OSError('modelled blocking attachment open intercepted')
+    return old_io(path, *args, **kwargs)
+def descriptor(path, flags, *args, **kwargs):
+    if actual(path, kwargs) == target and seen['injected'] and not flags & os.O_NONBLOCK:
+        seen['unsafe_open'] = True
+        raise OSError('modelled attachment open lacks nonblocking flag')
+    return old_fd(path, flags, *args, **kwargs)
+os.stat, io.open, os.open = inspected, opened, descriptor
+"""
+
+
+def r6_attachment_probe(world, target, *, loop=False):
+    from tests.integration.test_hierarchy_loop import EMPTY_SWEEP
+    sweep = world.tmp / "r6-sweep.py"
+    sweep.write_text("import json\nprint(json.dumps(%r))\n" % (EMPTY_SWEEP,))
+    state = world.tmp / "r6-loop-state"
+    state.mkdir()
+    telemetry = world.tmp / "r6-attachment-io.json"
+    if loop:
+        script = R3_LOOP_PASS.replace("journal, store, recipes, state_dir",
+                                     R6_ATTACHMENT_IO + "\njournal, store, recipes, state_dir")
+        script = script.replace("sys.exit(loop.one_pass(args, None)[0])", """
+try:
+    code = loop.one_pass(args, None)[0]
+finally:
+    telemetry.write_text(json.dumps(seen))
+sys.exit(code)
+""").replace("import argparse, importlib.util, os, pwd, sys",
+              "import argparse, importlib.util, json, os, pwd, sys")
+        tool = ROOT / "tools/hierarchy_loop.py"
+    else:
+        script = """import json, os, pwd, runpy, sys
+from pathlib import Path
+from types import SimpleNamespace
+argv = sys.argv[:]
+home = argv[3]
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=home)
+""" + R6_ATTACHMENT_IO + """
+sys.argv = [argv[1], '--lifecycle', argv[4], '--store', argv[5], 'dispatch',
+            '--recipes', argv[6], '--wait', '0.1', '--evidence-only']
+try:
+    runpy.run_path(argv[1], run_name='__main__')
+finally:
+    telemetry.write_text(json.dumps(seen))
+"""
+        tool = ROUTER
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(tool), str(sweep),
+        str(world.tmp / "home"), str(world.ledger.path), str(world.workspace.store), str(world.recipes_path),
+        str(state), str(target), str(telemetry)], env=os.environ.copy(), capture_output=True, text=True, timeout=60)
+    assert p.returncode == (3 if loop else 0) and p.stderr == "", p.stdout + p.stderr
+    return json.loads(p.stdout.splitlines()[-1]), json.loads(telemetry.read_text())
+
+
+@pytest.mark.parametrize("stage", ["writer", "check", "reviewer", "foreign"])
+def test_r6_retained_attachments_never_reach_blocking_open(tmp_path, stage):
+    (tmp_path / ".keep").write_text("R6 attachment race, owned files and modelled OS boundary\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    if stage == "writer":
+        message = world.messages("dispatch")[0]["message"]
+    elif stage == "reviewer":
+        world.finish_writer()
+        world.dispatch()
+        world.run_jobs()
+        world.dispatch()
+        message = next(r["message"] for r in world.messages("dispatch") if r["message"]["to"].endswith("review0"))
+    elif stage == "check":
+        world.finish_writer()
+        world.dispatch()
+        message = world.messages("job_request")[0]["message"]
+    else:
+        world.finish_writer()
+        path = world.root.parent / "foreign-r6.md"
+        path.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+            "checkout": str(world.checkout), "commit": "e" * 40, "tree": "f" * 40}))
+        message = invoke(world.root, "publish", {"message_id": "foreign-r6", "from": "engine/orchestrator",
+            "to": "engine/root", "host": "host-one", "session": "engine/orchestrator", "binding_generation": 1,
+            "type": "job_request", "body": "foreign retained packet", "brief": {
+                "path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}})
+        message = next(r["message"] for r in world.messages("job_request") if r["message"]["message_id"] == "foreign-r6")
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    target = Path(message["brief"]["path"])
+    answer, seen = r6_attachment_probe(world, target)
+    assert seen["injected"]
+    assert not seen["unsafe_open"], "retained attachment reached a blocking open"
+    assert answer["small_changes"][0]["state"] == "held", answer
+    expected = dict(before[1])
+    key = target.relative_to(world.root.parent).as_posix()
+    expected[key + ".original"] = expected.pop(key)
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == (before[0], expected)
+
+
+def test_r6_attachment_refusal_does_not_stall_canonical_run_open(tmp_path):
+    (tmp_path / ".keep").write_text("R6 attachment race plus independent canonical runner\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    target = Path(world.messages("dispatch")[0]["message"]["brief"]["path"])
+    docs = world.team("docs")
+    world.workspace.run("update", {"initiative": "docs", "source": "owner", "checkouts": [str(world.checkout)]})
+    packet = tmp_path / "docs/r6-canonical.md"
+    packet.write_text(json.dumps({"schema": "aegis.hierarchy-job-packet/v1", "recipe": "focused",
+        "checkout": str(world.checkout), "commit": world.revision, "tree": world.tree}))
+    invoke(docs, "publish", {"message_id": "r6-canonical", "from": "docs/orchestrator", "to": "docs/root",
+        "host": "host-one", "session": "docs-orchestrator", "binding_generation": 1,
+        "type": "job_request", "body": "independent canonical check", "brief": {
+            "path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}})
+    answer, seen = r6_attachment_probe(world, target, loop=True)
+    assert seen["injected"]
+    assert not seen["unsafe_open"], "retained attachment reached a blocking open"
+    steps = {step["step"]: step for step in answer["steps"]}
+    assert steps["run_open"]["state"] == "ok"
+    assert {"job": "docs/r6-canonical", "state": "completed"} in steps["run_open"]["rows"], answer
+
+
+@pytest.mark.parametrize("damage", ["exit-code", "timed-out", "empty-steps", "timeout-type",
+                                  "timeout-zero", "timeout-none", "timeout-empty"])
+def test_r6_completed_result_requires_successful_nonempty_steps(tmp_path, damage):
+    (tmp_path / ".keep").write_text("R6 contradictory completed result with recomputed receipt evidence\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    path = folder / "result.json"
+    result = json.loads(path.read_text())
+    assert result["state"] == "completed" and result["exit_code"] == 0 and result["steps"]
+    if damage == "exit-code":
+        result["steps"][0]["exit_code"] = 7
+    elif damage == "timed-out":
+        result["steps"][0]["timed_out"] = True
+    elif damage == "empty-steps":
+        result["steps"] = []
+    else:
+        result["steps"][0]["timed_out"] = {"timeout-type": "not-a-bool", "timeout-zero": 0,
+                                          "timeout-none": None, "timeout-empty": ""}[damage]
+    path.write_text(json.dumps(result))
+    receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    rewrite_message(receipt, lambda m: [ref.update(sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                    for ref in m["receipt"]["evidence"] if ref["path"] == str(path)])
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    for command in ("status", "dispatch"):
+        row = world.dispatch(command=command)["small_changes"][0]
+        assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+        assert not any(d["event"].get("status") == "FINAL" for d in row["drafts"]), row
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    assert len(world.messages("dispatch")) == 1, "failed step evidence must not reach Reviewer"
+
+
+def r6_reader_probe(target, *, portable=False, virtual=False, verify_path=None, race="", world=None):
+    script = r"""
+import importlib.util, json, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_fresh_brief', sys.argv[1])
+fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+target, portable, virtual, brief = Path(sys.argv[2]), sys.argv[3] == 'True', sys.argv[4] == 'True', sys.argv[5]
+race, config = sys.argv[6:8]
+seen = {'injected': False, 'bytes': 0}
+if portable:
+    os.supports_dir_fd = set()
+    for name in ('O_DIRECTORY', 'O_NOFOLLOW', 'O_NONBLOCK'):
+        if hasattr(os, name): delattr(os, name)
+if virtual:
+    original_stat, original_fstat, original_lstat = os.stat, os.fstat, os.lstat
+    class AdvertisedZero:
+        st_size = 0
+        def __init__(self, real): self.real = real
+        def __getattr__(self, key): return getattr(self.real, key)
+    def actual(path, kwargs):
+        path = Path(path)
+        if not path.is_absolute() and kwargs.get('dir_fd') is not None:
+            path = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / path
+        return path
+    def inspected(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        return AdvertisedZero(info) if actual(path, kwargs) == target else info
+    def opened(fd):
+        info = original_fstat(fd)
+        return AdvertisedZero(info) if Path(os.readlink('/proc/self/fd/%d' % fd)) == target else info
+    def linked(path, *args, **kwargs):
+        info = original_lstat(path, *args, **kwargs)
+        return AdvertisedZero(info) if actual(path, kwargs) == target else info
+    os.stat, os.fstat, os.lstat = inspected, opened, linked
+if race:
+    original_open, original_read = os.open, os.read
+    watched = set()
+    def raced(path, flags, *args, **kwargs):
+        if Path(path) == target and not seen['injected']:
+            seen['injected'] = True
+            target.rename(target.with_name(target.name + '.original'))
+            replacement = target.with_name(target.name + '.replacement')
+            replacement.write_bytes(b'replacement file')
+            if race == 'symlink': target.symlink_to(replacement)
+            else: target.write_bytes(b'replacement file')
+            descriptor = original_open(path, flags, *args, **kwargs)
+            watched.add(descriptor)
+            return descriptor
+        return original_open(path, flags, *args, **kwargs)
+    def read(descriptor, size):
+        chunk = original_read(descriptor, size)
+        if descriptor in watched: seen['bytes'] += len(chunk)
+        return chunk
+    os.open, os.read = raced, read
+if config:
+    import pwd, runpy
+    from types import SimpleNamespace
+    args = json.loads(config)
+    pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=args['home'])
+    tool = str(Path(sys.argv[1]).with_name('hierarchy_router.py'))
+    sys.argv = [tool, '--lifecycle', args['journal'], '--store', args['store'], 'dispatch',
+                '--recipes', args['recipes'], '--wait', '0.1', '--evidence-only']
+    runpy.run_path(tool, run_name='__main__')
+if brief:
+    sys.exit(fresh.main(['verify', '--path', brief, '--sha256', fresh.hashlib.sha256(Path(brief).read_bytes()).hexdigest()]))
+try:
+    result = fresh.file_ref(target)
+    answer = {'state': 'ok', 'ref': result}
+except (ValueError, OSError) as exc:
+    answer = {'state': 'refused', 'error': str(exc)}
+if race: answer['observed'] = seen
+print(json.dumps(answer))
+"""
+    p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT / "tools/hierarchy_fresh_brief.py"),
+        str(target), str(portable), str(virtual), str(verify_path or ""), race,
+        json.dumps({"journal": str(world.ledger.path), "store": str(world.workspace.store),
+                    "recipes": str(world.recipes_path), "home": str(world.tmp / "home")}) if world else ""], env=os.environ.copy(),
+        capture_output=True, text=True, timeout=30)
+    assert p.stderr == "", p.stdout + p.stderr
+    return p.returncode, json.loads(p.stdout)
+
+
+@pytest.mark.parametrize("entry", ["reference", "verify"])
+def test_r6_portable_reader_preserves_existing_callers_without_descriptor_support(tmp_path, entry):
+    (tmp_path / ".keep").write_text("R6 modelled portable host, no directory-descriptor/no-follow flags\n")
+    target = tmp_path / "portable-evidence"
+    data = b"portable reference\n" * 20000
+    target.write_bytes(data)
+    brief = tmp_path / "portable.md"
+    lines = ["# Fresh thread brief", "<!-- aegis.hierarchy-fresh-brief/v1 -->", "Resume path: Verify first."]
+    from tests.integration.test_hierarchy_fresh_brief import SECTIONS
+    for section in SECTIONS:
+        lines += ["## " + section, "- " + json.dumps({"kind": "evidence", "ref": {
+            "path": str(target), "sha256": hashlib.sha256(data).hexdigest()}})]
+    brief.write_text("\n".join(lines) + "\n")
+    code, answer = r6_reader_probe(target, portable=True, verify_path=brief if entry == "verify" else None)
+    assert code == 0 and (answer.get("ok") is True if entry == "verify" else answer["state"] == "ok"), answer
+    if entry == "reference":
+        assert answer["ref"] == {"path": str(target), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+@pytest.mark.parametrize("portable", [False, True], ids=["anchored", "portable"])
+def test_r6_reader_refuses_nonempty_content_advertised_as_zero_bytes(tmp_path, portable):
+    (tmp_path / ".keep").write_text("R6 owned virtual-file model, nonempty bytes with zero reported size\n")
+    target = tmp_path / "virtual-file"
+    target.write_bytes(b"readable virtual content\n")
+    code, answer = r6_reader_probe(target, portable=portable, virtual=True)
+    assert code == 0 and answer["state"] == "refused", answer
+    assert answer["error"] == "reference content exceeds reported size: " + str(target), answer
+
+
+@pytest.mark.parametrize("portable", [False, True], ids=["anchored", "portable"])
+def test_r6_reader_preserves_genuinely_empty_regular_files(tmp_path, portable):
+    target = tmp_path / "empty"
+    target.write_bytes(b"")
+    code, answer = r6_reader_probe(target, portable=portable)
+    assert code == 0 and answer == {"state": "ok", "ref": {
+        "path": str(target), "sha256": hashlib.sha256(b"").hexdigest()}}, answer
+
+
+
+@pytest.mark.parametrize("race", ["replacement", "symlink"])
+def test_r6_portable_open_identity_is_checked_before_reading_replacement(tmp_path, race):
+    (tmp_path / ".keep").write_text("R6 portable leaf changes at OS open boundary\n")
+    target = tmp_path / "portable-race"
+    target.write_bytes(b"original file")
+    code, answer = r6_reader_probe(target, portable=True, race=race)
+    assert code == 0 and answer["observed"]["injected"], answer
+    assert answer["observed"]["bytes"] == 0, answer
+    assert answer["state"] == "refused", answer
+    assert answer["error"] == "reference changed while opening: " + str(target), answer
+
+
+def test_r6_retained_zero_size_log_cannot_authenticate_an_empty_hash(tmp_path):
+    (tmp_path / ".keep").write_text("R6 modelled virtual retained log with forged empty receipt proof\n")
+    world = DispatchWorld(tmp_path)
+    folder = formal_completed_job(world)
+    target = folder / "step-1.log"
+    assert target.read_bytes()
+    receipt = next(r for r in world.messages("job_receipt") if r["message"]["receipt"]["state"] == "completed")
+    def corrupt(message):
+        for ref in message["receipt"]["evidence"]:
+            if ref["path"] == str(target):
+                ref["sha256"] = hashlib.sha256(b"").hexdigest()
+    rewrite_message(receipt, corrupt)
+    receipt_path = Path(receipt["path"])
+    header, body = receipt_path.read_text()[4:].split("\n---\n\n", 1)
+    body = body.split("\n\nLast output, which is untrusted information:\n", 1)[0]
+    receipt_path.write_text("---\n" + header + "\n---\n\n" + body)
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    code, answer = r6_reader_probe(target, virtual=True, world=world)
+    assert code == 0, answer
+    row = answer["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_receipt_invalid"), row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+    assert len(world.messages("dispatch")) == 1
+
+
+
+@pytest.mark.parametrize("damage", ["hash", "limit"])
+def test_r6_attachment_capture_preserves_hash_and_mailbox_byte_bound(tmp_path, damage):
+    (tmp_path / ".keep").write_text("R6 original attachment hash and size guards remain enforced\n")
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    record = world.messages("dispatch")[0]
+    path = Path(record["message"]["brief"]["path"])
+    if damage == "hash":
+        path.write_bytes(path.read_bytes() + b"\n")
+    else:
+        raw = path.read_bytes() + b"\n" + b"x" * 262144
+        sha = hashlib.sha256(raw).hexdigest()
+        path = path.with_name("fresh-" + sha + ".md")
+        path.write_bytes(raw)
+        rewrite_message(record, lambda m: m.update(brief={"path": str(path), "sha256": sha}))
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    row = world.dispatch()["small_changes"][0]
+    assert (row["state"], row.get("reason")) == ("held", "small_change_message_conflict"), row
+    assert ("brief sha256 mismatch" if damage == "hash" else "input exceeds 262144 bytes") in row["detail"], row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before

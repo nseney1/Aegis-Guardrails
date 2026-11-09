@@ -17,7 +17,7 @@ import uuid
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, SHA256, SLUG, TERMINAL_JOB_STATES, cli_path, digest, encoded,  # noqa: E402
-                               endpoint_parts, fields, integer, matching, parse_time, read_bytes, read_json, require,
+                               endpoint_parts, fields, integer, matching, parse_time, read_json, require,
                                safe_path, strict_json, text)
 from hierarchy_lifecycle import Lifecycle, load_json as lifecycle_json, raw_value  # noqa: E402
 from hierarchy_roles import role_name  # noqa: E402
@@ -40,11 +40,15 @@ def _reference_mark(info):
             info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _reference_descriptors():
+    names = {function.__name__ for function in os.supports_dir_fd}
+    return (all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+            and {"open", "stat"} <= names)
+
+
 def _reference_parent(path):
     """Walk without following links, with bounded handles and recorded ancestor identities."""
-    names = {function.__name__ for function in os.supports_dir_fd}
-    require(hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_NONBLOCK")
-            and {"open", "stat"} <= names, "secure reference hashing requires directory descriptor support")
+    require(_reference_descriptors(), "secure reference hashing requires directory descriptor support")
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
     descriptor = None
     marks = []
@@ -66,40 +70,102 @@ def _reference_parent(path):
         raise
 
 
-def file_ref(path):
-    """Hash exactly the initially observed regular-file bytes through anchored nonblocking descriptors."""
+def _reparse(info):
+    return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _reference_ancestors(path):
+    """Portable identity witnesses; no path resolution or link traversal."""
+    result = []
+    for parent in reversed(path.parents):
+        info = os.lstat(parent)
+        require(stat.S_ISDIR(info.st_mode) and not _reparse(info), "reference parent must be a directory: " + str(parent))
+        result.append((str(parent), info.st_dev, info.st_ino, info.st_mode))
+    return result
+
+
+def _stream_reference(descriptor, before, path, consume=None):
+    """Finite declared-length read plus one EOF probe; never follow an append stream."""
+    mark = _reference_mark(before)
+    sha, remaining = hashlib.sha256(), before.st_size
+    while remaining:
+        requested = min(65536, remaining)
+        chunk = os.read(descriptor, requested)
+        require(len(chunk) == requested, "reference changed while hashing: " + str(path))
+        remaining -= len(chunk)
+        sha.update(chunk)
+        if consume is not None:
+            consume(chunk)
+    # Refuse observed growth before probing EOF, preserving the initial-size budget on changed files.
+    require(_reference_mark(os.fstat(descriptor)) == mark, "reference changed while hashing: " + str(path))
+    require(os.read(descriptor, 1) == b"", "reference content exceeds reported size: " + str(path))
+    require(_reference_mark(os.fstat(descriptor)) == mark, "reference changed while hashing: " + str(path))
+    return sha.hexdigest()
+
+
+def _read_reference(path, *, limit=None, capture=False):
+    """Consume one opened identity, using anchored descriptors where supported and a portable checked open otherwise."""
     path = safe_path(path)
-    directory, ancestors = _reference_parent(path.parent)
+    anchored = _reference_descriptors()
+    directory = None
     try:
-        before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-        require(stat.S_ISREG(before.st_mode), "reference must be a regular file: " + str(path))
+        if anchored:
+            directory, ancestors = _reference_parent(path.parent)
+            before = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        else:
+            ancestors = _reference_ancestors(path)
+            before = os.lstat(path)
+        require(stat.S_ISREG(before.st_mode) and not _reparse(before), "reference must be a regular file: " + str(path))
+        require(limit is None or before.st_size <= limit, "input exceeds " + str(limit) + " bytes")
         mark = _reference_mark(before)
-        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        descriptor = (os.open(path.name, flags, dir_fd=directory) if anchored else os.open(path, flags))
         try:
-            require(stat.S_ISREG(os.fstat(descriptor).st_mode) and _reference_mark(os.fstat(descriptor)) == mark,
+            opened = os.fstat(descriptor)
+            require(stat.S_ISREG(opened.st_mode) and not _reparse(opened) and _reference_mark(opened) == mark,
                     "reference changed while opening: " + str(path))
-            sha, remaining = hashlib.sha256(), before.st_size
-            while remaining:
-                requested = min(65536, remaining)
-                chunk = os.read(descriptor, requested)
-                require(len(chunk) == requested, "reference changed while hashing: " + str(path))
-                remaining -= len(chunk)
-                sha.update(chunk)
-            require(_reference_mark(os.fstat(descriptor)) == mark
-                    == _reference_mark(os.stat(path.name, dir_fd=directory, follow_symlinks=False)),
-                    "reference changed while hashing: " + str(path))
+            if not anchored:
+                require(_reference_ancestors(path) == ancestors, "reference path changed while opening: " + str(path))
+            chunks = []
+            sha = _stream_reference(descriptor, before, path, chunks.append if capture else None)
+            current = (os.stat(path.name, dir_fd=directory, follow_symlinks=False) if anchored else os.lstat(path))
+            require(_reference_mark(current) == mark, "reference changed while hashing: " + str(path))
         finally:
             os.close(descriptor)
-        returned, current_ancestors = _reference_parent(path.parent)
-        try:
-            require(current_ancestors == ancestors
-                    and _reference_mark(os.stat(path.name, dir_fd=returned, follow_symlinks=False)) == mark,
+        if anchored:
+            returned, current_ancestors = _reference_parent(path.parent)
+            try:
+                require(current_ancestors == ancestors
+                        and _reference_mark(os.stat(path.name, dir_fd=returned, follow_symlinks=False)) == mark,
+                        "reference path changed while hashing: " + str(path))
+            finally:
+                os.close(returned)
+        else:
+            require(_reference_ancestors(path) == ancestors and _reference_mark(os.lstat(path)) == mark,
                     "reference path changed while hashing: " + str(path))
-        finally:
-            os.close(returned)
-        return {"path": str(path), "sha256": sha.hexdigest()}
+        return {"path": str(path), "sha256": sha}, b"".join(chunks) if capture else None
     finally:
-        os.close(directory)
+        if directory is not None:
+            os.close(directory)
+
+
+def file_ref(path):
+    return _read_reference(path)[0]
+
+
+def _brief_bytes(path):
+    try:
+        return _read_reference(path, limit=MAX_BYTES, capture=True)
+    except FileNotFoundError as exc:
+        raise ValueError("file unavailable: " + str(path)) from exc
+
+
+def _attachment(mailbox, reference):
+    """Validate the public envelope without content IO, then consume only the captured bytes."""
+    mailbox.brief(reference, verify=False)
+    actual, raw = _brief_bytes(reference["path"])
+    require(actual["sha256"] == reference["sha256"], "brief sha256 mismatch")
+    return raw
 
 
 def check_ref(ref):
@@ -427,7 +493,7 @@ def job_packet(brief, mailbox, message, origin):
     from hierarchy_jobs import packet_text
 
     reference = message["brief"]
-    raw = mailbox.brief(reference)
+    raw = _attachment(mailbox, reference)
     try:
         content = packet_text(raw)
     except (ValueError, UnicodeError) as exc:
@@ -597,7 +663,7 @@ def mailbox_records(brief, mailbox, endpoint, initiative, delivery, at, generati
             historical.append(record)
             continue
         open_dispatches.add(identifier)
-        mailbox.brief(message["brief"])
+        _attachment(mailbox, message["brief"])
         brief.add("Open obligations", "dispatch", file_ref(record["path"]), message_id=identifier, state="open")
         brief.add("Evidence references", "message_brief", message["brief"], message_id=identifier)
         acknowledgments = [value for value in accepted if value["in_reply_to"] == identifier]
@@ -929,7 +995,7 @@ def main(argv=None):
             path = cli_path(args.path, "--path")
             matching(args.sha256, SHA256, "brief sha256")
             require(path.suffix == ".md", "brief must be a Markdown file")
-            raw = read_bytes(path)
+            _reference, raw = _brief_bytes(path)
             require(hashlib.sha256(raw).hexdigest() == args.sha256, "brief sha256 mismatch")
             answer = {"ok": True, "brief": {"path": str(path), "sha256": args.sha256}, "entries": inspect(raw)}
     except (ValueError, OSError, TypeError, KeyError, UnicodeError, RecursionError) as exc:
