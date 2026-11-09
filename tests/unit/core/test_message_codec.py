@@ -2,6 +2,8 @@
 import copy
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 import sys
 import errno
@@ -14,6 +16,8 @@ import pytest
 from conftest import symlink_or_skip
 
 from aegis_core import message_codec as codec
+from aegis_core import message_codec_format as codec_format
+from aegis_core import message_codec_store as codec_store
 
 
 MARKER = "HOSTILE_MARKER"
@@ -30,9 +34,9 @@ MESSAGES = {
 
 
 def make_store(root):
-    capabilities = {function.__name__ for function in codec.os.supports_dir_fd}
+    capabilities = {function.__name__ for function in os.supports_dir_fd}
     if not ({"open", "stat", "link", "unlink"} <= capabilities and
-            hasattr(codec.os, "O_NOFOLLOW") and hasattr(codec.os, "O_DIRECTORY")):
+            hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
         pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
     return codec.Store(root)
 
@@ -402,7 +406,7 @@ def test_full_id_resolution_does_not_enumerate_store(tmp_path, monkeypatch):
         def refuse_scan(*args, **kwargs):
             raise OSError("enumeration unavailable " + MARKER)
 
-        monkeypatch.setattr(codec.os, "scandir", refuse_scan)
+        monkeypatch.setattr(os, "scandir", refuse_scan)
         assert store.read(rid) == value
 
 
@@ -553,14 +557,14 @@ def test_r3_class_d_fixed_budget_bounds_ref_io(tmp_path, monkeypatch, expanded):
         child = record(body="x" * 10000)
         rid = store.write(child)
         parent = dict(record(), refs={"r%d" % i: rid for i in range(64)})
-        calls, real_open = [], codec.os.open
+        calls, real_open = [], os.open
 
         def counted(path, *args, **kwargs):
             if str(path).endswith(".json"):
                 calls.append(path)
             return real_open(path, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "open", counted)
+        monkeypatch.setattr(os, "open", counted)
         monkeypatch.setattr(codec, "MAX_REF_BYTES", 10000, raising=False)
         assert_error("E_LIMIT", lambda: codec.read_view(parent, store=store,
                      expand=list(parent["refs"]) if expanded else [], max_chars=60000))
@@ -585,7 +589,7 @@ def test_class_a_descriptors_are_lazy_and_expansion_never_reads_grandchildren(tm
             return real_parse(data)
 
         monkeypatch.setattr(store, "read", counted)
-        monkeypatch.setattr(codec, "parse", observed)
+        monkeypatch.setattr(codec_store, "parse", observed)
         output = json.loads(codec.read_view(parent, store=store, expand=["child"] if expanded else []))
         assert calls == ([rid] if expanded else [])
         assert len(parsed) == 1  # describe and expand both validate the complete child.
@@ -601,7 +605,7 @@ def test_class_b_publication_verifies_destination(tmp_path, monkeypatch, race):
         store = make_store(tmp_path)
         value = record(body="original")
         forged = raw(record(body="HOSTILE_MARKER"))
-        real_link = codec.os.link
+        real_link = os.link
 
         def substituted(source, destination, *args, **kwargs):
             path = tmp_path / Path(source).name
@@ -613,7 +617,7 @@ def test_class_b_publication_verifies_destination(tmp_path, monkeypatch, race):
                 path.write_bytes(forged)
             return real_link(source, destination, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "link", substituted)
+        monkeypatch.setattr(os, "link", substituted)
         assert_error("E_HASH", lambda: store.write(value))
         assert not list(tmp_path.glob(".msg-*"))
 
@@ -621,23 +625,23 @@ def test_class_b_publication_verifies_destination(tmp_path, monkeypatch, race):
 @pytest.mark.parametrize("operation", ["read", "write"])
 def test_class_b_entry_operations_use_anchored_directory(tmp_path, monkeypatch, operation):
     with monkeypatch.context() as monkeypatch:
-        if codec.os.name != "posix":
+        if os.name != "posix":
             pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
         value = record(body=MARKER)
         rid = hashlib.sha256(raw(value)).hexdigest()
         (tmp_path / (rid + ".json")).write_bytes(raw(value))
-        real_open, opened, directories = codec.os.open, [], []
+        real_open, opened, directories = os.open, [], []
 
         def observed(path, flags, *args, **kwargs):
             fd = real_open(path, flags, *args, **kwargs)
             if str(path).endswith(".json") or str(path).startswith(".msg-"):
                 opened.append(kwargs.get("dir_fd"))
-                assert flags & codec.os.O_NOFOLLOW
-            elif flags & codec.os.O_DIRECTORY:
+                assert flags & os.O_NOFOLLOW
+            elif flags & os.O_DIRECTORY:
                 directories.append(fd)
             return fd
 
-        monkeypatch.setattr(codec.os, "open", observed)
+        monkeypatch.setattr(os, "open", observed)
         store = make_store(tmp_path)
         getattr(store, operation)(rid if operation == "read" else value)
         assert len(directories) >= 2  # Every resolved component is opened without following symlinks.
@@ -648,9 +652,9 @@ def test_class_b_entry_operations_use_anchored_directory(tmp_path, monkeypatch, 
 def test_r3_class_c_platform_refuses_unanchored_operations(tmp_path, monkeypatch, missing):
     with monkeypatch.context() as monkeypatch:
         if missing == "dir_fd":
-            monkeypatch.setattr(codec.os, "supports_dir_fd", set())
+            monkeypatch.setattr(os, "supports_dir_fd", set())
         else:
-            monkeypatch.delattr(codec.os, missing, raising=False)
+            monkeypatch.delattr(os, missing, raising=False)
         assert_error("E_AUTH", lambda: codec.Store(tmp_path))
 
 
@@ -816,8 +820,8 @@ def test_r3_class_c_link_count_change_is_not_tampering(tmp_path, monkeypatch):
         value = record(body=MARKER)
         rid = store.write(value)
         alias = tmp_path / "temporary-hard-link"
-        codec.os.link(tmp_path / (rid + ".json"), alias)
-        original, calls = codec.os.fstat, []
+        os.link(tmp_path / (rid + ".json"), alias)
+        original, calls = os.fstat, []
 
         def observed(fd):
             calls.append(fd)
@@ -825,7 +829,7 @@ def test_r3_class_c_link_count_change_is_not_tampering(tmp_path, monkeypatch):
                 alias.unlink()
             return original(fd)
 
-        monkeypatch.setattr(codec.os, "fstat", observed)
+        monkeypatch.setattr(os, "fstat", observed)
         assert store.read(rid) == value
         assert not alias.exists()
 
@@ -841,7 +845,7 @@ def test_r3_class_c_prefix_lookup_ignores_foreign_entries(tmp_path, monkeypatch,
             yield iter([SimpleNamespace(name=".msg-temp-%d" % i) for i in range(foreign_count)] +
                        [SimpleNamespace(name="foreign.txt"), SimpleNamespace(name=rid + ".json")])
 
-        monkeypatch.setattr(codec.os, "scandir", directory)
+        monkeypatch.setattr(os, "scandir", directory)
         assert store.resolve(rid[:16]) == rid
 
 
@@ -849,7 +853,7 @@ def test_r3_class_c_prefix_lookup_ignores_foreign_entries(tmp_path, monkeypatch,
 def test_r3_class_c_cleanup_preserves_original_error(tmp_path, monkeypatch, failure):
     with monkeypatch.context() as monkeypatch:
         store = make_store(tmp_path)
-        original_link, original_fsync = codec.os.link, codec.os.fsync
+        original_link, original_fsync = os.link, os.fsync
 
         def forged(source, destination, *args, **kwargs):
             (tmp_path / Path(source).name).write_bytes(b"HOSTILE_MARKER")
@@ -863,11 +867,11 @@ def test_r3_class_c_cleanup_preserves_original_error(tmp_path, monkeypatch, fail
                 raise OSError("HOSTILE_MARKER fsync")
             return original_fsync(fd)
 
-        monkeypatch.setattr(codec.os, "link", forged)
+        monkeypatch.setattr(os, "link", forged)
         if failure in ("unlink", "both"):
-            monkeypatch.setattr(codec.os, "unlink", denied_unlink)
+            monkeypatch.setattr(os, "unlink", denied_unlink)
         if failure in ("fsync", "both"):
-            monkeypatch.setattr(codec.os, "fsync", denied_fsync)
+            monkeypatch.setattr(os, "fsync", denied_fsync)
         assert_error("E_HASH", lambda: store.write(record()))
 
 
@@ -884,14 +888,14 @@ def test_r3_class_d_output_budget_is_independent_of_ref_io(tmp_path, monkeypatch
         child = record(body="x" * 20000)
         rid = store.write(child)
         parent = dict(record(body="parent"), refs={"child": rid})
-        calls, original = [], codec.os.open
+        calls, original = [], os.open
 
         def observed(path, *args, **kwargs):
             if str(path).endswith(".json"):
                 calls.append(path)
             return original(path, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "open", observed)
+        monkeypatch.setattr(os, "open", observed)
         output = codec.read_view(parent, store=store, selectors=["body"] if selected else [], max_chars=1000)
         assert len(output) <= 1000
         if selected:
@@ -939,13 +943,13 @@ def test_r4_class_b_child_failure_is_total(tmp_path, damage, code):
 def test_r3_class_e_validation_work_is_cumulatively_bounded(tmp_path, monkeypatch, entry):
     with monkeypatch.context() as monkeypatch:
         value = record("record", {"value": ["x" * 100000] * 50})
-        examined, original = [], codec._text
+        examined, original = [], codec_format._text
 
         def observed(text):
             examined.append(len(text) if type(text) is str else 0)
             return original(text)
 
-        monkeypatch.setattr(codec, "_text", observed)
+        monkeypatch.setattr(codec_format, "_text", observed)
         function = make_store(tmp_path).write if entry == "write" else getattr(codec, entry)
         assert_record_limit(lambda: function(value))
         assert sum(examined) <= codec.MAX_BYTES
@@ -986,7 +990,7 @@ def test_r4_class_a_selection_refuses_before_materializing(monkeypatch, case):
 
         monkeypatch.setattr(codec, "_child", observed)
         assert_error("E_LIMIT", lambda: codec.read_view(value, selectors=selectors, max_chars=limit))
-        assert len(visits) <= codec.MAX_SELECTION_VISITS
+        assert len(visits) <= codec_format.MAX_SELECTION_VISITS
 
 
 def test_r4_class_a_cumulative_staging_work_is_bounded(monkeypatch):
@@ -1000,7 +1004,7 @@ def test_r4_class_a_cumulative_staging_work_is_bounded(monkeypatch):
 
         monkeypatch.setattr(codec, "_child", observed)
         assert_error("E_LIMIT", lambda: codec.read_view(value, selectors=projections(), max_chars=10000000))
-        assert len(visits) <= codec.MAX_SELECTION_VISITS
+        assert len(visits) <= codec_format.MAX_SELECTION_VISITS
 
 
 @pytest.mark.parametrize("code", ["E_REF", "E_HASH", "E_FORMAT", "E_AUTH", "E_LIMIT"])
@@ -1060,7 +1064,7 @@ def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch
         probe = base / "probe"
         symlink_or_skip(outside, probe, target_is_directory=True)
         probe.unlink()
-        original, original_lstat, swapped = codec.os.stat, codec.os.lstat, []
+        original, original_lstat, swapped = os.stat, os.lstat, []
 
         def observed(path, *args, **kwargs):
             result = original(path, *args, **kwargs)
@@ -1076,8 +1080,8 @@ def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch
                 swapped.append(True)
             return result
 
-        monkeypatch.setattr(codec.os, "stat", observed)
-        monkeypatch.setattr(codec.os, "lstat", observed_lstat)
+        monkeypatch.setattr(os, "stat", observed)
+        monkeypatch.setattr(os, "lstat", observed_lstat)
         assert_error("E_AUTH", lambda: make_store(root))
         assert swapped
 
@@ -1086,14 +1090,14 @@ def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch
 def test_r4_class_c_operational_errors_have_fixed_next_action(tmp_path, monkeypatch, number):
     with monkeypatch.context() as monkeypatch:
         store = make_store(tmp_path)
-        original = codec.os.open
+        original = os.open
 
         def refused(path, flags, *args, **kwargs):
-            if flags & codec.os.O_CREAT:
+            if flags & os.O_CREAT:
                 raise OSError(number, MARKER)
             return original(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "open", refused)
+        monkeypatch.setattr(os, "open", refused)
         assert_error("E_AUTH", lambda: store.write(record()),
                      "store operation unavailable; check permissions, free space, write access and file descriptor limits")
 
@@ -1138,7 +1142,7 @@ def test_r4_class_e_opaque_keys_require_json_strings(key):
 
 def test_r4_class_e_tmp_path_without_store_on_unsupported_platform(tmp_path, monkeypatch):
     with monkeypatch.context() as monkeypatch:
-        monkeypatch.setattr(codec.os, "supports_dir_fd", set())
+        monkeypatch.setattr(os, "supports_dir_fd", set())
         (tmp_path / "input.json").write_bytes(raw(record()))
         assert codec.parse((tmp_path / "input.json").read_bytes()) == record()
 
@@ -1167,14 +1171,14 @@ def test_r4_class_f_existing_write_avoids_temporary_creation(tmp_path, monkeypat
         store = make_store(tmp_path)
         value = record()
         rid = store.write(value)
-        opened, original = [], codec.os.open
+        opened, original = [], os.open
 
         def observed(path, flags, *args, **kwargs):
-            if flags & codec.os.O_CREAT:
+            if flags & os.O_CREAT:
                 opened.append(path)
             return original(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "open", observed)
+        monkeypatch.setattr(os, "open", observed)
         assert store.write(value) == rid
         assert opened == []
 
@@ -1235,7 +1239,7 @@ def test_r5_class_b_intermediate_ancestor_swap_is_refused(tmp_path_factory, monk
         probe = base / "probe"
         symlink_or_skip(outside, probe, target_is_directory=True)
         probe.unlink()
-        original, swapped = codec.os.open, []
+        original, swapped = os.open, []
 
         def observed(path, flags, *args, **kwargs):
             if not swapped and (str(path).startswith(str(ancestor)) or str(path) == "ancestor"):
@@ -1244,7 +1248,7 @@ def test_r5_class_b_intermediate_ancestor_swap_is_refused(tmp_path_factory, monk
                 swapped.append(True)
             return original(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr(codec.os, "open", observed)
+        monkeypatch.setattr(os, "open", observed)
         assert_error("E_AUTH", lambda: make_store(ancestor / "inner" / "store"))
         assert swapped
 
@@ -1253,14 +1257,14 @@ def test_r5_class_b_prefix_scan_uses_fresh_descriptor(tmp_path, monkeypatch):
     with monkeypatch.context() as monkeypatch:
         store = make_store(tmp_path)
         rid = store.write(record())
-        observed, original = [], codec.os.scandir
+        observed, original = [], os.scandir
 
         def scan(fd):
             observed.append(fd)
             assert fd != store.fd
             return original(fd)
 
-        monkeypatch.setattr(codec.os, "scandir", scan)
+        monkeypatch.setattr(os, "scandir", scan)
         assert store.resolve(rid[:16]) == rid
         assert store.resolve(rid[:16]) == rid
         assert len(observed) == 2
@@ -1419,16 +1423,16 @@ def test_r7_class_d_mapping_selector_key_grammar(name):
 def test_r7_class_d_verified_bytes_must_equal_stat_size(tmp_path, monkeypatch, difference):
     store = make_store(tmp_path)
     rid = store.write(record())
-    original = codec.os.fstat
+    original = os.fstat
     with monkeypatch.context() as patch:
         def scheduled(fd):
             info = original(fd)
-            if not codec.stat.S_ISREG(info.st_mode):
+            if not stat.S_ISREG(info.st_mode):
                 return info
             attrs = {key: getattr(info, key) for key in dir(info) if key.startswith("st_")}
             attrs["st_size"] += difference
             return SimpleNamespace(**attrs)
-        patch.setattr(codec.os, "fstat", scheduled)
+        patch.setattr(os, "fstat", scheduled)
         assert_error("E_HASH", lambda: store.describe(rid))
 
 
@@ -1468,7 +1472,7 @@ def test_r7_class_f_writable_store_is_refused(tmp_path, mode):
 
 def test_r7_class_f_store_owner_is_effective_uid(tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
-        patch.setattr(codec.os, "geteuid", lambda: tmp_path.stat().st_uid + 1)
+        patch.setattr(os, "geteuid", lambda: tmp_path.stat().st_uid + 1)
         assert_error("E_AUTH", lambda: make_store(tmp_path), "store access refused; use a private store directory")
 
 
@@ -1561,7 +1565,7 @@ def test_r8_class_d_expansion_caches_and_refuses_before_unbounded_allocation(tmp
         def counted(data):
             calls.append(len(data))
             return original(data)
-        patch.setattr(codec, "parse", counted)
+        patch.setattr(codec_store, "parse", counted)
         tracemalloc.start()
         try:
             rendered = None
@@ -1587,7 +1591,7 @@ def test_r8_class_d_distinct_children_charge_work_before_decode(tmp_path, monkey
         def counted(data):
             calls.append(len(data))
             return original(data)
-        patch.setattr(codec, "parse", counted)
+        patch.setattr(codec_store, "parse", counted)
         assert_error("E_LIMIT", lambda: codec.read_view(parent, store=store, expand=list(parent["refs"]), max_chars=1000000))
     assert len(calls) == 2
 
@@ -1604,7 +1608,7 @@ def test_r8_class_d_unicode_expansion_uses_display_length_and_cached_siblings(tm
         def counted(data):
             calls.append(len(data))
             return original(data)
-        patch.setattr(codec, "parse", counted)
+        patch.setattr(codec_store, "parse", counted)
         assert codec.read_view(parent, store=store, expand=["expanded"], max_chars=len(rendered)) == rendered
     assert calls == [len(raw(child))]
     view = json.loads(rendered)
@@ -1666,7 +1670,7 @@ def test_r9_class_a_close_waits_for_operation_and_closed_store_refuses(tmp_path,
         finally:
             closed.set()
     worker, started = threading.Thread(target=close_in_thread, daemon=True), []
-    original = codec.os.fstat
+    original = os.fstat
     with monkeypatch.context() as patch:
         def boundary(fd):
             info = original(fd)
@@ -1675,15 +1679,15 @@ def test_r9_class_a_close_waits_for_operation_and_closed_store_refuses(tmp_path,
                 worker.start()
                 assert entered.wait(2)
             return info
-        patch.setattr(codec.os, "fstat", boundary)
+        patch.setattr(os, "fstat", boundary)
         for name in ("open", "stat", "link", "unlink"):
-            function = getattr(codec.os, name)
+            function = getattr(os, name)
             def guarded(*args, _function=function, **kwargs):
                 for key in ("dir_fd", "src_dir_fd", "dst_dir_fd"):
                     if key in kwargs:
                         assert kwargs[key] is not None
                 return _function(*args, **kwargs)
-            patch.setattr(codec.os, name, guarded)
+            patch.setattr(os, name, guarded)
         try:
             action()
         except codec.CodecError as error:
@@ -1738,12 +1742,12 @@ def test_r9_class_d_span_coverage_examines_linear_text_and_merges_overlap(monkey
     value = record(body="x" * 99990 + "\n\U0001f600\t\\end")
     end = len(value["body"])
     value["spans"] = [[end - 1, end, "one"] for _ in range(64)]
-    examined, original = [], codec._strings
+    examined, original = [], codec_format._strings
     with monkeypatch.context() as patch:
         def counted(text, *args, **kwargs):
             examined.append(len(text))
             yield from original(text, *args, **kwargs)
-        patch.setattr(codec, "_strings", counted)
+        patch.setattr(codec_format, "_strings", counted)
         view = json.loads(codec.read_view(value, spans=list(range(64))))
     assert sum(examined) < 4 * len(value["body"])
     assert view["omitted_chars"] == len(raw(value)) - len(raw(value["body"][-1:])) + 2
@@ -1758,7 +1762,7 @@ def test_r9_class_d_descriptions_verify_each_call_and_detect_tampering(tmp_path,
         def counted(data):
             calls.append(len(data))
             return original(data)
-        patch.setattr(codec, "parse", counted)
+        patch.setattr(codec_store, "parse", counted)
         first = codec.read_view(parent, store=store)
         assert len(calls) == 4
         assert codec.read_view(parent, store=store) == first
@@ -1800,7 +1804,7 @@ def test_r9_class_d_all_valid_descriptor_records_fit_io_domain(tmp_path, monkeyp
         def counted(data):
             parsed.append(len(data))
             return original(data)
-        patch.setattr(codec, "parse", counted)
+        patch.setattr(codec_store, "parse", counted)
         view = json.loads(codec.read_view(parent, store=store))
     assert len(view["data"]["refs"]) == 64
     assert sum(parsed) <= 64 * codec.MAX_BYTES
@@ -1841,7 +1845,9 @@ def test_r9_class_e_eight_user_parts_are_checked_before_alias_prefix(monkeypatch
         fields = {key: fields}
     custom = {"type": "object", "required": {"a": schema}, "optional": {}}
     with monkeypatch.context() as patch:
-        patch.setattr(codec, "KIND_SCHEMAS", MappingProxyType(dict(codec.KIND_SCHEMAS, text=custom)))
+        schemas = MappingProxyType(dict(codec.KIND_SCHEMAS, text=custom))
+        patch.setattr(codec, "KIND_SCHEMAS", schemas)
+        patch.setattr(codec_format, "KIND_SCHEMAS", schemas)
         value = record(fields=fields)
         view = json.loads(codec.read_view(value, selectors=["a.b.c.d.e.f.g.h"]))
         assert view["data"]["a.b.c.d.e.f.g.h"] == "value"
@@ -1855,7 +1861,7 @@ def test_r10_close_release_error_invalidates_before_fd_reuse(tmp_path, monkeypat
     root, outside = tmp_path / "store", tmp_path / "outside"
     root.mkdir(mode=0o700)
     outside.mkdir(mode=0o700)
-    fd, real_close, real_open = None, codec.os.close, codec.os.open
+    fd, real_close, real_open = None, os.close, os.open
     released, state_at_release, touched = [], [], []
     with monkeypatch.context() as patch:
         def fail_after_release(candidate):
@@ -1863,13 +1869,13 @@ def test_r10_close_release_error_invalidates_before_fd_reuse(tmp_path, monkeypat
                 return real_close(candidate)
             state_at_release.append(store.fd)
             real_close(candidate)
-            replacement = real_open(str(outside), codec.os.O_RDONLY | codec.os.O_DIRECTORY)
+            replacement = real_open(str(outside), os.O_RDONLY | os.O_DIRECTORY)
             if replacement != fd:
-                codec.os.dup2(replacement, fd)
+                os.dup2(replacement, fd)
                 real_close(replacement)
             released.append(fd)
             raise OSError(number, MARKER)
-        patch.setattr(codec.os, "close", fail_after_release)
+        patch.setattr(os, "close", fail_after_release)
         store = make_store(root)
         value = record(body=MARKER)
         rid = store.write(value)
@@ -1882,15 +1888,15 @@ def test_r10_close_release_error_invalidates_before_fd_reuse(tmp_path, monkeypat
             assert state_at_release == [None]
             assert store.fd is None
             for name in ("open", "stat", "link", "unlink", "scandir", "fstat"):
-                function = getattr(codec.os, name)
+                function = getattr(os, name)
                 def guarded(*args, _name=name, _function=function, **kwargs):
                     touched.append(_name)
                     return _function(*args, **kwargs)
-                patch.setattr(codec.os, name, guarded)
+                patch.setattr(os, name, guarded)
             assert_error("E_AUTH", action)
             assert store.close() is None
             assert touched == []
-            assert codec.stat.S_ISDIR(codec.os.fstat(fd).st_mode)
+            assert stat.S_ISDIR(os.fstat(fd).st_mode)
         finally:
             with suppress(OSError):
                 real_close(fd)
@@ -1900,7 +1906,7 @@ def test_r10_close_release_error_invalidates_before_fd_reuse(tmp_path, monkeypat
 def test_r10_finalizer_release_error_never_raises_or_retries(tmp_path, monkeypatch, number):
     import gc
     import weakref
-    fd, real_close = None, codec.os.close
+    fd, real_close = None, os.close
     calls, unraisable = [], []
     with monkeypatch.context() as patch:
         def fail_after_release(candidate):
@@ -1909,7 +1915,7 @@ def test_r10_finalizer_release_error_never_raises_or_retries(tmp_path, monkeypat
                 real_close(candidate)
                 raise OSError(number, MARKER)
             return real_close(candidate)
-        patch.setattr(codec.os, "close", fail_after_release)
+        patch.setattr(os, "close", fail_after_release)
         patch.setattr(sys, "unraisablehook", unraisable.append)
         store = make_store(tmp_path)
         fd, reference = store.fd, weakref.ref(store)
@@ -1927,7 +1933,7 @@ def test_r10_constructor_close_error_preserves_ownership_without_leak(tmp_path, 
     from contextlib import suppress
     outside = tmp_path / "outside"
     outside.mkdir(mode=0o700)
-    real_open, real_close = codec.os.open, codec.os.close
+    real_open, real_close = os.open, os.close
     owned, borrowed, closed_unowned, attempts, failed = set(), [], [], [], []
     with monkeypatch.context() as patch:
         def observed_open(*args, **kwargs):
@@ -1942,16 +1948,16 @@ def test_r10_constructor_close_error_preserves_ownership_without_leak(tmp_path, 
             real_close(fd)
             if not failed and len(attempts) == failure_at:
                 failed.append(fd)
-                replacement = real_open(str(outside), codec.os.O_RDONLY | codec.os.O_DIRECTORY)
+                replacement = real_open(str(outside), os.O_RDONLY | os.O_DIRECTORY)
                 if replacement != fd:
-                    codec.os.dup2(replacement, fd)
+                    os.dup2(replacement, fd)
                     real_close(replacement)
                 borrowed.append(fd)
                 raise OSError(errno.EIO, MARKER)
             if failed and cleanup_error:
                 raise OSError(errno.EINTR, MARKER)
-        patch.setattr(codec.os, "open", observed_open)
-        patch.setattr(codec.os, "close", observed_close)
+        patch.setattr(os, "open", observed_open)
+        patch.setattr(os, "close", observed_close)
         try:
             assert_error("E_AUTH", lambda: make_store(tmp_path),
                 "store operation unavailable; check permissions, free space, write access and file descriptor limits")
@@ -1959,7 +1965,7 @@ def test_r10_constructor_close_error_preserves_ownership_without_leak(tmp_path, 
             assert owned == set()
             assert closed_unowned == []
             assert attempts[failure_at - 1:].count(failed[0]) == 1
-            assert codec.stat.S_ISDIR(codec.os.fstat(borrowed[0]).st_mode)
+            assert stat.S_ISDIR(os.fstat(borrowed[0]).st_mode)
         finally:
             for fd in owned | set(borrowed):
                 with suppress(OSError):
@@ -2027,12 +2033,12 @@ def test_coord1_argon1_unchanged_stamp_never_bypasses_verification(tmp_path, mon
     path = tmp_path / (rid + ".json")
     stamp = path.stat()
     path.write_bytes(raw(record(body="tampered")))
-    real_stat, real_fstat = codec.os.stat, codec.os.fstat
+    real_stat, real_fstat = os.stat, os.fstat
     def frozen(info):
         return stamp if info.st_dev == stamp.st_dev and info.st_ino == stamp.st_ino else info
     with monkeypatch.context() as patch:
-        patch.setattr(codec.os, "stat", lambda *a, **kw: frozen(real_stat(*a, **kw)))
-        patch.setattr(codec.os, "fstat", lambda *a, **kw: frozen(real_fstat(*a, **kw)))
+        patch.setattr(os, "stat", lambda *a, **kw: frozen(real_stat(*a, **kw)))
+        patch.setattr(os, "fstat", lambda *a, **kw: frozen(real_fstat(*a, **kw)))
         action = (lambda: codec.read_view(parent, store=store)) if operation == "view" else lambda: getattr(store, operation)(rid)
         assert_error("E_HASH", action)
 
@@ -2049,7 +2055,7 @@ def test_coord1_argon2_live_root_privacy_is_required(tmp_path, monkeypatch, drif
             tmp_path.chmod(0o777)
         else:
             uid = tmp_path.stat().st_uid
-            patch.setattr(codec.os, "geteuid", lambda: uid + 1)
+            patch.setattr(os, "geteuid", lambda: uid + 1)
         actions = {"resolve": lambda: store.resolve(rid), "scan": lambda: store.resolve(rid[:16]),
             "read": lambda: store.read(rid), "describe": lambda: store.describe(rid),
             "write_existing": lambda: store.write(value), "write_new": lambda: store.write(record(body="new")),
@@ -2140,7 +2146,7 @@ def test_coord3_selection_reported_projection_fits_and_preserves_missing():
 def test_coord3_selection_each_existing_node_is_charged_once():
     value = record("log", {"rows": [{"text": "a"}] * 10})
     visits, previous = [], sys.getprofile()
-    code = codec._Budget.visit.__code__
+    code = codec_format.Budget.visit.__code__
     def observed(frame, event, _arg):
         if event == "call" and frame.f_code is code:
             visits.append(True)
@@ -2203,7 +2209,7 @@ def test_coord3_store_enoent_maps_by_operation(tmp_path, monkeypatch, step):
     root.mkdir(mode=0o700)
     store = make_store(root)
     value = record(body="write race")
-    real_open, real_link, real_stat = codec.os.open, codec.os.link, codec.os.stat
+    real_open, real_link, real_stat = os.open, os.link, os.stat
     rid = store.write(record()) if step in ("store_scan", "root_stat", "root_deleted_during_lookup") else None
     with monkeypatch.context() as patch:
         def opened(path, *args, **kwargs):
@@ -2212,21 +2218,21 @@ def test_coord3_store_enoent_maps_by_operation(tmp_path, monkeypatch, step):
             return real_open(path, *args, **kwargs)
         def linked(source, target, *args, **kwargs):
             if step == "link":
-                codec.os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                os.unlink(source, dir_fd=kwargs["src_dir_fd"])
             result = real_link(source, target, *args, **kwargs)
             if step == "verify":
-                codec.os.unlink(target, dir_fd=kwargs["dst_dir_fd"])
+                os.unlink(target, dir_fd=kwargs["dst_dir_fd"])
             return result
         def stated(path, *args, **kwargs):
             if step == "root_stat" and path == store.root:
                 raise FileNotFoundError(errno.ENOENT, MARKER)
             if step == "root_deleted_during_lookup" and path == rid + ".json":
-                codec.os.unlink(path, dir_fd=store.fd)
+                os.unlink(path, dir_fd=store.fd)
                 root.rmdir()
             return real_stat(path, *args, **kwargs)
-        patch.setattr(codec.os, "open", opened)
-        patch.setattr(codec.os, "link", linked)
-        patch.setattr(codec.os, "stat", stated)
+        patch.setattr(os, "open", opened)
+        patch.setattr(os, "link", linked)
+        patch.setattr(os, "stat", stated)
         action = (lambda: store.resolve(rid[:16])) if step == "store_scan" else (
             lambda: store.read(rid)) if step in ("root_stat", "root_deleted_during_lookup") else lambda: store.write(value)
         assert_error("E_AUTH", action)
@@ -2249,7 +2255,7 @@ def test_coord3_store_replaced_during_successful_operation_refuses(tmp_path, mon
     root.mkdir(mode=0o700)
     store = make_store(root)
     rid = store.write(record())
-    original, real_stat, real_link = tmp_path / "original", codec.os.stat, codec.os.link
+    original, real_stat, real_link = tmp_path / "original", os.stat, os.link
     swapped = []
     def replace():
         if not swapped:
@@ -2267,8 +2273,8 @@ def test_coord3_store_replaced_during_successful_operation_refuses(tmp_path, mon
             if operation == "write":
                 replace()
             return result
-        patch.setattr(codec.os, "stat", stated)
-        patch.setattr(codec.os, "link", linked)
+        patch.setattr(os, "stat", stated)
+        patch.setattr(os, "link", linked)
         action = (lambda: store.write(record(body="new"))) if operation == "write" else lambda: getattr(store, operation)(rid)
         assert_error("E_AUTH", action)
         assert swapped
