@@ -102,7 +102,9 @@ def cli(layout, config, *args, bootstrap=""):
     path.write_text(json.dumps(config), encoding="utf-8")
     # Password database is an OS boundary. Patch it in the child too: changing HOME alone must never hide
     # the real password-database home from production checks, or aim a test at ~/.claude or ~/.codex.
-    code = ("import os, pwd, runpy, sys; from types import SimpleNamespace; "
+    # Python 3.9's pathlib accessor must capture native OS functions before our lstat double; a captured
+    # Python function becomes a bound method and forwards an extra accessor argument to native lstat.
+    code = ("import os, pathlib, pwd, runpy, sys; from types import SimpleNamespace; "
             "pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=%r); " % str(layout.passwd_home)
             + "_lstat = os.lstat; _outer = %r; " % layout.outer
             + "os.lstat = lambda p,*a,**kw: (lambda st: os.stat_result([st.st_mode & ~0o022] + list(st)[1:4] "
@@ -143,6 +145,17 @@ def test_host_cli(layout, raw):
     config = {} if raw is None else {"schema": "aegis.team-run/v2", "isolation": raw}
     proc = cli(layout, config, "plan")
     assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
+
+
+def test_cli_pathlib_lstat_preserves_symlink_metadata(layout):
+    link = layout.home / "dangling-link"
+    link.symlink_to(layout.home / "missing-target")
+    # Probe before main's error boundary so a broken child accessor retains its full traceback.
+    proc = cli(layout, {}, "plan", bootstrap=(
+        "from pathlib import Path; import stat; "
+        "assert stat.S_ISLNK(Path(%r).lstat().st_mode); " % str(link)))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert json.loads(proc.stdout) == {"mode": "host", "isolation": None, "mounts": [], "create_argv": None}
 
 
