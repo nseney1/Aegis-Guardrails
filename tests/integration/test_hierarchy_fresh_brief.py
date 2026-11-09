@@ -1,4 +1,5 @@
 """Fresh-thread briefs through the CLI; records remain inert claims."""
+import errno
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from tests.integration.test_hierarchy_handoff import active_writer, handoff
 from tests.integration.test_hierarchy_host_plan import write_plan
 from tests.integration.test_hierarchy_lifecycle import Ledger, SOURCE, raw_request, request, pytestmark as lifecycle_only
 from tests.integration.test_hierarchy_small_change_admission import SmallChange
-from tools.hierarchy_mailbox import Mailbox
+from tools.hierarchy_mailbox import Mailbox, safe_path
 
 
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
@@ -750,10 +751,27 @@ def test_template_rendering_exactly_matches_launcher_in_a_separate_process(tmp_p
 
 
 @lifecycle_only
-def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pilot, tmp_path):  # noqa: F811
+@pytest.mark.parametrize("path_limit", [None, 1024], ids=["native", "macos-path-limit"])
+def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pilot, tmp_path, monkeypatch, path_limit):  # noqa: F811
+    if path_limit is not None:
+        real_is_symlink = Path.is_symlink
+
+        def limited_is_symlink(path):
+            if len(os.fsencode(path)) >= path_limit:
+                raise OSError(errno.ENAMETOOLONG, "simulated macOS pathname limit", str(path))
+            return real_is_symlink(path)
+
+        monkeypatch.setattr(Path, "is_symlink", limited_is_symlink)
     root, _ = pilot
     ledger = Ledger(tmp_path)
-    paths = [str(tmp_path / "declared" / str(index)) + "/" + "/".join(["p" * 100] * 22) for index in range(128)]
+    # Nested JSON escaping grows the wire record, not the POSIX filename bytes.
+    component = '"\\' * 64
+    paths = [str(tmp_path / "declared" / str(index) / component / component) for index in range(256)]
+    assert len(paths) <= 256
+    assert max(len(os.fsencode(path)) for path in paths) < 1024
+    assert max(len(os.fsencode(part)) for path in paths for part in Path(path).parts) < 255
+    for path in paths:
+        safe_path(path)
     value = request("large-history", paths=paths)
     receipt = ledger.publish(value)
     record = ledger.path / "events" / ("%06d.json" % receipt["sequence"])
@@ -763,6 +781,7 @@ def test_valid_large_settled_lifecycle_record_uses_the_lifecycle_reader_limit(pi
     before = files(tmp_path)
     answer = compose(root)
     assert answer["entries"] < 20
+    assert all(row.get("request_id") != value["id"] for rows in sections(answer["brief"]).values() for row in rows)
     after = files(tmp_path)
     after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
     assert after == before
@@ -854,9 +873,11 @@ def test_search_only_parent_directories_allow_publication(pilot):  # noqa: F811
 
 
 @secure_publication
-def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
+@pytest.mark.parametrize("accessor", ["native", "python39"])
+def test_directory_eacces_is_a_permission_refusal(pilot, accessor):  # noqa: F811
     root, _ = pilot
-    driver = ("import errno,os,runpy,sys\n"
+    # Python 3.9's pathlib accessor must capture the builtin before os.open is patched.
+    driver = ("import errno,os,runpy,sys\nfrom pathlib import Path\n"
               "tool,root=sys.argv[1:]\nreal_open=os.open\n"
               "def opening(path,flags,*args,**kwargs):\n"
               "    if str(path)=='briefs': raise PermissionError(errno.EACCES,'fixture directory denied')\n"
@@ -864,9 +885,30 @@ def test_directory_eacces_is_a_permission_refusal(pilot):  # noqa: F811
               "os.open=opening\n"
               "sys.argv=[tool,'compose','--root',root,'--initiative','a','--endpoint','a/lane/f2']\n"
               "runpy.run_path(tool,run_name='__main__')\n")
+    if accessor == "python39":
+        # Emulate 3.9's class-level os.open capture at pathlib import on newer Python.
+        driver = ("import builtins,io\n"
+                  "real_import=builtins.__import__\naccessor_installed=False\n"
+                  "def importing(name,*args,**kwargs):\n"
+                  "    global accessor_installed\n"
+                  "    module=real_import(name,*args,**kwargs)\n"
+                  "    if name=='pathlib' and not accessor_installed:\n"
+                  "        accessor_installed=True\n"
+                  "        import os\n"
+                  "        class NormalAccessor:\n"
+                  "            open=os.open\n"
+                  "        normal=NormalAccessor()\n"
+                  "        def path_open(self,mode='r',buffering=-1,encoding=None,errors=None,newline=None):\n"
+                  "            return io.open(self,mode,buffering,encoding,errors,newline,\n"
+                  "                           opener=lambda path,flags: normal.open(path,flags,0o666))\n"
+                  "        module.Path.open=path_open\n"
+                  "    return module\n"
+                  "builtins.__import__=importing\n") + driver
+    before = files(root.parent)
     code, answer = faulted_cli(root, driver)
     assert code == 2 and "publication directory permission denied" in answer["error"]
     assert "changed" not in answer["error"]
+    assert files(root.parent) == before
 
 
 def structured_job(tmp_path, changes=None, missing=None):
