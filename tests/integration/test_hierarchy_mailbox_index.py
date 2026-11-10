@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import tracemalloc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -1639,15 +1640,19 @@ def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, defect, recor
     index = index_module().MailboxIndex(mailbox, mode="indexed")
     seed = index.messages()["seed"]
     source = Path(seed["path"])
+    folder = mailbox.root / "a/orchestrator" if defect == "wrong_folder" else source.parent
+    paths = [folder / ("zz-rejected-%04d.md" % number) for number in range(1000)]
+    # CPython 3.12 globally interns Path components. Prepare fixture paths
+    # before tracing so intern-table growth is not charged to reader history.
+    for path in paths:
+        os.fspath(path)
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
     try:
         gc.collect()
         before = tracemalloc.get_traced_memory()[0]
-        for number in range(1000):
-            path = (mailbox.root / "a/orchestrator" if defect == "wrong_folder" else source.parent
-                    ) / ("zz-rejected-%04d.md" % number)
+        for number, path in enumerate(paths):
             message = {**seed["message"], "message_id": "rejected-%04d" % number}
             if defect == "missing_header":
                 path.write_bytes(b"malformed")
@@ -2337,8 +2342,8 @@ def r23_finish_return_coverage(index, state):
     assert not any(item["kind"] == "verification_unavailable" for item in index.verify())
 
 
-def r23_source_reads(monkeypatch, source):
-    """Count byte reads through both PIN's path IO and checked descriptor IO."""
+def r23_source_reads(monkeypatch, source, *, descriptor_only=False):
+    """Count real reads; descriptor_only excludes PIN's path IO."""
     real_open, real_io = os.open, io.open
     descriptors, reads = set(), []
 
@@ -2370,7 +2375,7 @@ def r23_source_reads(monkeypatch, source):
 
     def stream(file, mode="r", *args, **kwargs):
         value = real_io(file, mode, *args, **kwargs)
-        target = file in descriptors if isinstance(file, int) else Path(file) == source
+        target = file in descriptors if isinstance(file, int) else not descriptor_only and Path(file) == source
         return Stream(value) if target and "r" in mode else value
 
     monkeypatch.setattr(os, "open", opened)
@@ -2912,3 +2917,335 @@ def test_r24_unsampled_coverage_survives_clear_and_failed_fallback(mailbox, monk
         assert overflow["unbaselined_reads"] > before["unbaselined_reads"]
     else:
         assert overflow["unbaselined_reads"] == 0
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("mutation", ["delete", "remove_brief"])
+def test_mb7_obsolete_brief_permission_recovers_incremental_reads(mailbox, monkeypatch, tmp_path,
+                                                                 mode, fallback, mutation):
+    folder = tmp_path / "separate-briefs"
+    folder.mkdir()
+    packet = folder / "packet.md"
+    packet.write_bytes(b"Obsolete packet.\n")
+    mailbox.publish(request("obsolete", brief={"path": str(packet), "sha256": hashlib.sha256(
+        packet.read_bytes()).hexdigest()}))
+    mailbox.publish(request("unreturned"))
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    obsolete = Path(records["obsolete"]["path"])
+    if mutation == "delete":
+        obsolete.unlink()
+    else:
+        message = dict(records["obsolete"]["message"])
+        del message["brief"]
+        rewrite(obsolete, message)
+    permission = folder.stat().st_mode & 0o777
+    try:
+        folder.chmod(0)
+        if os.access(folder, os.X_OK):
+            pytest.skip("search permission is not enforced for this uid")
+        expected = mailbox.messages()
+        real_scandir = os.scandir
+        denied = []
+
+        def scandir(path):
+            if fallback and not denied:
+                denied.append(True)
+                raise PermissionError(errno.EACCES, "injected transient routing denial", os.fspath(path))
+            return real_scandir(path)
+
+        # Deny the first indexed listing; canonical reconciliation stays live.
+        with monkeypatch.context() as failure:
+            failure.setattr(os, "scandir", scandir)
+            assert index.get("seed") == expected["seed"]
+        assert bool(index.last_reconciliation) == fallback
+        assert bool(denied) == fallback
+        counts = ReadCounts(monkeypatch, trace)
+        parses = spy_parses(monkeypatch)
+        sources = {record["path"] for record in expected.values()}
+        for position, identifier in enumerate(("seed", "absent", "seed")):
+            trace.reset()
+            counts.reset()
+            parses.clear()
+            assert index.get(identifier) == expected.get(identifier)
+            assert index.last_reconciliation is None
+            # A fallback before listing cannot establish the edited record's
+            # new byte key. Rebuild that header once, then require warm reuse.
+            rebuild = fallback and mutation == "remove_brief" and position == 0
+            assert trace.memo_validations == int(rebuild) and trace.events == []
+            assert parses == ([str(obsolete)] if rebuild else [])
+            assert str(packet) not in counts.lstats
+            if mode == "indexed":
+                assert [path for path in counts.opens if path in sources] == (
+                    ([str(obsolete)] if rebuild else [])
+                    + ([expected[identifier]["path"]] if identifier in expected else []))
+    finally:
+        folder.chmod(permission)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mb7_live_brief_permission_error_still_matches_pin(mailbox, tmp_path, mode):
+    folder = tmp_path / "live-briefs"
+    folder.mkdir()
+    packet = folder / "packet.md"
+    packet.write_bytes(b"Required packet.\n")
+    mailbox.publish(request("required", brief={"path": str(packet), "sha256": hashlib.sha256(
+        packet.read_bytes()).hexdigest()}))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    index.messages()
+    permission = folder.stat().st_mode & 0o777
+    try:
+        folder.chmod(0)
+        if os.access(folder, os.X_OK):
+            pytest.skip("search permission is not enforced for this uid")
+        expected = caught(mailbox.messages)
+        assert expected[0] is PermissionError
+        for _ in range(2):
+            assert caught(lambda: index.get("seed")) == expected
+    finally:
+        folder.chmod(permission)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mb7_obsolete_probe_does_not_retain_exception_traceback(mailbox, monkeypatch, tmp_path, mode):
+    packet = tmp_path / "obsolete-packet.md"
+    packet.write_bytes(b"Obsolete packet.\n")
+    mailbox.publish(request("obsolete", brief={"path": str(packet), "sha256": hashlib.sha256(
+        packet.read_bytes()).hexdigest()}))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    Path(records["obsolete"]["path"]).unlink()
+    real_lstat, real_scandir = os.lstat, os.scandir
+    errors, retained_at_listing = [], []
+
+    class ProbeError(PermissionError):
+        pass
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path) == str(packet):
+            error = ProbeError(errno.EACCES, "injected obsolete dependency denial", str(packet))
+            errors.append(weakref.ref(error))
+            raise error
+        return real_lstat(path, *args, **kwargs)
+
+    def scandir(path):
+        if not retained_at_listing:
+            gc.collect()
+            retained_at_listing.append(any(reference() is not None for reference in errors))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "scandir", scandir)
+    assert index.get("seed") == records["seed"]
+    assert retained_at_listing == [False]
+    assert index.last_reconciliation is None
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mb7_reconciliation_preserves_changed_live_sha_baseline(mailbox, monkeypatch, mode):
+    module = index_module()
+    Path(mailbox.messages()["seed"]["path"]).unlink()
+    for identifier in ("a", "b", "r"):
+        mailbox.publish(request(identifier))
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 1)
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    assert list(records) == ["a", "b", "r"]
+    assert index.evidence_stats()["entries"] == index.evidence_stats()["summary_paths"] == 1
+    source = Path(records["r"]["path"])
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    for identifier in ("a", "b"):
+        Path(records[identifier]["path"]).unlink()
+    rewrite(source, {**records["r"]["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    expected = mailbox.messages()
+    real_scandir = os.scandir
+    denied = []
+
+    def scandir(path):
+        if not denied:
+            denied.append(True)
+            raise PermissionError(errno.EACCES, "injected routing denial before listing", os.fspath(path))
+        return real_scandir(path)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, "scandir", scandir)
+        assert index.messages() == expected
+    assert denied == [True] and index.last_reconciliation["kind"] == "pinned_fallback"
+    changes = index.verify()
+    assert {"kind": "content_changed", "path": str(source), "old_sha256": old_sha,
+            "new_sha256": new_sha} in changes
+    assert all(item["unbaselined_reads"] == 0 for item in changes if item["kind"] == "content_change_overflow")
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("denied", [False, True])
+@pytest.mark.parametrize("platform", ["nt", "unproven"])
+def test_mb7_hashes_current_record_before_observing_dependencies(mailbox, monkeypatch, tmp_path,
+                                                                mode, denied, platform):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 1)
+    seed = mailbox.messages()["seed"]
+    source = Path(seed["path"])
+    packet = tmp_path / "former-packet.md"
+    packet.write_bytes(b"Former packet.\n")
+    rewrite(source, {**seed["message"], "brief": {"path": str(packet), "sha256": hashlib.sha256(
+        packet.read_bytes()).hexdigest()}})
+    index = module.MailboxIndex(mailbox, mode=mode)
+    record = index.messages()["seed"]
+    original = source.read_bytes()
+    old_sha = hashlib.sha256(original).hexdigest()
+    preserve_source_stat(monkeypatch, source.stat())
+    monkeypatch.setattr(module, "os", PlatformOS(platform))
+    message = {**record["message"], "body": "modified body"}
+    del message["brief"]
+    rewrite(source, message)
+    padding = len(original) - len(source.read_bytes())
+    assert padding > 0
+    message["body"] += " " * padding
+    rewrite(source, message)
+    current = source.read_bytes()
+    assert len(current) == len(original)
+    new_sha = hashlib.sha256(current).hexdigest()
+    expected = mailbox.messages()["seed"]
+    real_lstat = os.lstat
+    probes = []
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path) == str(packet):
+            probes.append(os.fspath(path))
+            if denied:
+                raise PermissionError(errno.EACCES, "injected former dependency denial", str(packet))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    assert index.get("seed") == expected
+    assert probes == []
+    assert index.last_reconciliation is None and index.last_divergence == []
+    assert {"kind": "content_changed", "path": str(source), "old_sha256": old_sha,
+            "new_sha256": new_sha} in index.content_changed
+    assert index.get("seed") == expected
+    assert probes == [] and index.last_reconciliation is None
+
+
+@pytest.fixture
+def reply_mailbox(mailbox, monkeypatch):
+    mailbox.publish(request("reply", sender="a/lane/review", recipient="a/orchestrator", in_reply_to="seed"))
+    records = mailbox.messages()
+    Path(records["seed"]["path"]).replace(mailbox.root / "a/lane/1.md")
+    Path(records["reply"]["path"]).replace(mailbox.root / "a/orchestrator/2.md")
+    # Exercise the POSIX keyed-reuse policy on every host, with real file IO.
+    monkeypatch.setattr(index_module(), "os", PlatformOS("posix", getuid=lambda: 1000, geteuid=lambda: 1000,
+                                                      getgid=lambda: 1000, getegid=lambda: 1000,
+                                                      getgroups=lambda: [1000]))
+    return mailbox, records["seed"]["message"], records["reply"]["message"]
+
+
+def rewrite_same_stat(path, message, monkeypatch):
+    metadata = path.stat()
+    # utime cannot restore POSIX ctime; keep that boundary explicit, as in the
+    # existing mmap/privileged same-stat tests. File contents/IO remain real.
+    preserve_source_stat(monkeypatch, metadata)
+    rewrite(path, message)
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    current = path.stat()
+    assert (current.st_dev, current.st_ino, current.st_size, current.st_atime_ns, current.st_mtime_ns) == (
+        metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_atime_ns, metadata.st_mtime_ns)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mb7_relocated_reply_target_invalidates_retained_dependencies(reply_mailbox, monkeypatch, mode):
+    mailbox, seed, reply = reply_mailbox
+    old_target, target, reply_path = (mailbox.root / "a/lane/1.md", mailbox.root / "a/lane/3.md",
+                                    mailbox.root / "a/orchestrator/2.md")
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    assert index.messages() == mailbox.messages()
+    other = {**seed, "message_id": "other", "body": seed["body"][:-1]}
+    rewrite_same_stat(old_target, other, monkeypatch)
+    rewrite(target, seed)
+    assert index.get("other") == mailbox.messages()["other"]
+    assert index.last_reconciliation["kind"] == "pinned_fallback"
+    assert index.get("other") == mailbox.messages()["other"]
+    assert index.last_reconciliation is None
+    rewrite(target, {**seed, "body": "modified body"})
+    rewrite_same_stat(reply_path, {**reply, "type": "evil"}, monkeypatch)
+    expected = caught(mailbox.messages)
+    assert expected[0] is ValueError and "unsupported message type" in expected[1]
+    checked_reads = r23_source_reads(monkeypatch, reply_path, descriptor_only=True)
+    assert caught(lambda: index.get("other")) == expected
+    assert checked_reads
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mb7_deleted_reply_target_is_not_probed_after_reconciliation(reply_mailbox, monkeypatch, mode):
+    mailbox, seed, _ = reply_mailbox
+    old_target, target = mailbox.root / "a/lane/1.md", mailbox.root / "a/lane/3.md"
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    assert index.messages() == mailbox.messages()
+    old_target.unlink()
+    rewrite(target, seed)
+    real_scandir = os.scandir
+    denied = []
+
+    def scandir(path):
+        if not denied:
+            denied.append(True)
+            raise PermissionError(errno.EACCES, "transient indexed listing denial", os.fspath(path))
+        return real_scandir(path)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(os, "scandir", scandir)
+        assert index.get("seed") == mailbox.messages()["seed"]
+    assert denied == [True] and index.last_reconciliation["kind"] == "pinned_fallback"
+    real_lstat, real_path_lstat = os.lstat, Path.lstat
+    probes = []
+
+    def lstat(call, path, *args, **kwargs):
+        probes.append(os.fspath(path))
+        return call(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **kw: lstat(real_lstat, path, *a, **kw))
+    monkeypatch.setattr(Path, "lstat", lambda path, *a, **kw: lstat(real_path_lstat, path, *a, **kw))
+    assert index.get("seed") == mailbox.messages()["seed"]
+    assert index.last_reconciliation is None
+    assert str(old_target) not in probes
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("target_change", ["rewrite", "replace"])
+def test_mb7_normal_rescan_rebinds_relocated_reply_dependencies(reply_mailbox, monkeypatch, mode, target_change):
+    mailbox, seed, reply = reply_mailbox
+    old_target, target, reply_path = (mailbox.root / "a/lane/1.md", mailbox.root / "a/lane/3.md",
+                                    mailbox.root / "a/orchestrator/2.md")
+    packet = mailbox.root.parent / "packet.md"
+    packet.write_bytes(b"Packet A.\n")
+    seed = {**seed, "brief": {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}}
+    rewrite(old_target, seed)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    assert index.messages() == mailbox.messages()
+    packet.write_bytes(b"Packet B.\n")
+    other = {**seed, "message_id": "other", "body": seed["body"][:-1],
+             "brief": {**seed["brief"], "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}}
+    rewrite_same_stat(old_target, other, monkeypatch)
+    rewrite(target, seed)
+    assert index.get("other") == mailbox.messages()["other"]
+    assert index.last_reconciliation is None and index.last_divergence == []
+    if target_change == "replace":
+        previous = target.stat()
+        replacement = mailbox.root.parent / "replacement.md"
+        rewrite(replacement, {**seed, "body": "modified body"})
+        os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        replacement.replace(target)
+        assert target.stat().st_ino != previous.st_ino
+    else:
+        rewrite(target, {**seed, "body": "modified body"})
+    rewrite_same_stat(reply_path, {**reply, "type": "evil"}, monkeypatch)
+    expected = caught(mailbox.messages)
+    assert expected[0] is ValueError and "unsupported message type" in expected[1]
+    checked_reads = r23_source_reads(monkeypatch, reply_path, descriptor_only=True)
+    assert caught(lambda: index.get("other")) == expected
+    assert checked_reads
