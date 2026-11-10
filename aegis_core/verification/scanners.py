@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import collections
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
+import errno
 import hashlib
+import io
 import itertools
 import json
 import os
 from pathlib import Path
 import posixpath
 import re
+import stat
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from aegis_core import gitsafe, pathlookup, primitives
+from aegis_core import atomicio, gitsafe, pathlookup, primitives
+from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import is_within
 from aegis_core.redaction import (
     CANDIDATE_TOKEN_RE,
@@ -370,6 +375,167 @@ def _sarif_arr(value: Any, where: str) -> Sequence[Any]:
     return value or ()
 
 
+_SARIF_LINE_CACHE_BYTES = 8 * 1024 * 1024
+
+
+def _sarif_descriptor_reads_supported() -> bool:
+    return (os.name != "nt" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd)
+
+
+def _sarif_directory_flags() -> int:
+    return getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _sarif_open_artifact(path: Path, root: Path, root_fd: int) -> int:
+    """Open the resolved, confined artifact without following any replacement symlink."""
+    parts = path.relative_to(root).parts
+    if not parts:
+        raise ValueError("artifact must name a file")
+    flags = _sarif_directory_flags()
+    with ExitStack() as leaf_owner:
+        directory = os.dup(root_fd)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, flags, dir_fd=directory)
+                parent, directory = directory, child
+                os.close(parent)
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+                         | getattr(os, "O_CLOEXEC", 0), dir_fd=directory)
+            leaf_owner.callback(os.close, fd)
+        finally:
+            os.close(directory)
+        # Transfer only after the directory descriptor has closed successfully.
+        leaf_owner.pop_all()
+        return fd
+
+
+def _sarif_open_by_path(path: Path, root: Path) -> int:
+    """Compatibility read using the shared regular-file opener and identity checks.
+
+    Search-only directory permissions and hosts without openat keep disk snippets. Check
+    ancestors before and after opening, and compare the leaf to the opened descriptor.
+    """
+    parts = path.relative_to(root).parts
+    if not parts:
+        raise ValueError("artifact must name a file")
+    ancestors = []
+    directory = root
+    for part in (*parts[:-1], None):
+        info = os.lstat(directory)
+        if (not stat.S_ISDIR(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+            raise ValueError("artifact ancestor is not a plain directory")
+        ancestors.append((directory, (info.st_dev, info.st_ino)))
+        if part is not None:
+            directory = directory / part
+    expected = os.lstat(path)
+    fd = atomicio.open_regular(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        opened = os.fstat(fd)
+        if (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("artifact changed while opening")
+        for directory, identity in ancestors:
+            current = os.lstat(directory)
+            if (not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino) != identity
+                    or getattr(current, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                raise ValueError("artifact ancestor changed while opening")
+        current = os.lstat(path)
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("artifact changed while opening")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _sarif_stream_lines(source: Any, requests: dict[int, list[int]]) -> Iterable[tuple[list[int], str]]:
+    """One source pass, retaining only a requested line and a bounded splitlines chunk."""
+    current = 1
+    selected: list[str] = []
+    # Cover decoded characters, split strings and list slots before allocating the chunk.
+    chunk_size = max(1, min(64 * 1024, _SARIF_LINE_CACHE_BYTES // 128))
+    # Universal newline decoding handles CRLF even across read boundaries. splitlines adds
+    # the other Python line separators; a chunk's unfinished final part keeps its number.
+    with io.TextIOWrapper(source, encoding="utf-8", errors="replace", newline=None) as text:
+        while True:
+            chunk = text.read(chunk_size)
+            if not chunk:
+                if selected and current in requests:
+                    yield requests.pop(current), "".join(selected)
+                return
+            for part in chunk.splitlines(keepends=True):
+                ends = part[-1] in "\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                if current in requests:
+                    selected.append(part[:-1] if ends else part)
+                    if ends:
+                        yield requests.pop(current), "".join(selected)
+                        selected.clear()
+                if ends:
+                    current += 1
+
+
+class _SarifLineCache:
+    """Batch references by resolved artifact; each requested line feeds all its findings once.
+
+    Reference indexes scale with the existing findings, not source size. Only a bounded chunk
+    and the requested output line are decoded at a time; no complete source line list survives.
+    """
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self.requests: dict[Path, dict[int, list[int]]] = {}
+
+    def request(self, path: Path, number: int, index: int) -> None:
+        self.requests.setdefault(path, {}).setdefault(number, []).append(index)
+
+    def fill(self, findings: list[Finding]) -> None:
+        if not self.requests or self.root is None:
+            return
+        with ExitStack() as root_owner:
+            root_fd = None
+            if _sarif_descriptor_reads_supported():
+                try:
+                    root_fd = os.open(self.root, _sarif_directory_flags())
+                    root_owner.callback(os.close, root_fd)
+                except OSError as error:
+                    if error.errno != errno.EACCES:
+                        return
+            for path, requests in self.requests.items():
+                updates: list[tuple[int, Finding]] = []
+                try:
+                    with ExitStack() as artifact_owner:
+                        if root_fd is None:
+                            fd = _sarif_open_by_path(path, self.root)
+                        else:
+                            try:
+                                fd = _sarif_open_artifact(path, self.root, root_fd)
+                            except OSError as error:
+                                if error.errno != errno.EACCES:
+                                    raise
+                                fd = _sarif_open_by_path(path, self.root)
+                        artifact_owner.callback(os.close, fd)
+                        if not stat.S_ISREG(os.fstat(fd).st_mode):
+                            continue
+                        # The raw descriptor stays owned even if fdopen rejects it before a
+                        # stream exists. Stream/decoder closure must not close it a second time.
+                        with os.fdopen(fd, "rb", closefd=False) as source:
+                            for indexes, line in _sarif_stream_lines(source, requests):
+                                normalized = " ".join(line.split())
+                                masked = _mask_tier_a(normalized)
+                                for index in indexes:
+                                    finding = findings[index]
+                                    updates.append((index, replace(finding, snippet=masked, fingerprint=sarif_fingerprint(
+                                        finding.rule_id, finding.path, normalized))))
+                except (OSError, ValueError, PathTraversalError):
+                    continue
+                # Like the original whole-file read, a later I/O error discards this artifact's
+                # disk snippets. Do not publish partial results from an incomplete source pass.
+                for index, finding in updates:
+                    findings[index] = finding
+
+
 def ingest_sarif(
     doc: Mapping[str, Any],
     *,
@@ -378,6 +544,7 @@ def ingest_sarif(
     """Ingest a parsed SARIF 2.1.0 document: findings, fingerprints, suppressions. Scanner output is
     untrusted: a document that is not understood is ``unverified``, never raised."""
     root_path = Path(workspace_root).resolve() if workspace_root else None
+    line_cache = _SarifLineCache(root_path)
     all_findings: list[Finding] = []
     sarif_supps = 0
     try:
@@ -401,17 +568,14 @@ def ingest_sarif(
                     raise _SarifError(f"{at}.region.startLine must be an integer")
                 snippet_raw = _sarif_obj(region.get("snippet"), f"{at}.region.snippet").get("text")
                 if snippet_raw is None and readable is not None and line_no > 0:
-                    try:
-                        lines = readable.read_text(encoding="utf-8", errors="replace").splitlines() if readable.is_file() else []
-                    except OSError:
-                        lines = []
-                    snippet_raw = lines[line_no - 1] if 1 <= line_no <= len(lines) else None
+                    line_cache.request(readable, line_no, len(all_findings))
                 norm_line = " ".join(str(snippet_raw if snippet_raw is not None else msg).split())
                 fp = sarif_fingerprint(rule_id, rel_path, norm_line)  # over the raw line; only the masked one is shown
                 all_findings.append(Finding(rule_id, rel_path, line_no, _mask_tier_a(norm_line), "gate", fp,
                                             "error" if level == "error" else "warning", _mask_tier_a(msg)))
     except _SarifError as exc:
         return _sarif_unverified(f"SARIF is malformed: {exc}")
+    line_cache.fill(all_findings)
     return {
         "status": "fail" if all_findings else "pass",
         "findings": all_findings,
