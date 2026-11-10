@@ -11,7 +11,7 @@ from . import message_codec_views as _views
 
 
 __all__ = [
-    "CodecError", "Budget", "canonical", "parse", "record_id", "KIND_SCHEMAS",
+    "CodecError", "Budget", "canonical", "parse", "compose", "record_id", "KIND_SCHEMAS",
     "MAX_BYTES", "MAX_NODES", "MAX_SELECTORS", "MAX_REFS", "MAX_SPANS",
     "MAX_WORK_BYTES", "MAX_REF_BYTES", "MAX_OUTPUT_CHARS", "MAX_SELECTION_VISITS",
     "REF_NAME", "NAME", "INDEX", "KEYS", "STRING", "INTEGER", "HANDLE", "SHA",
@@ -35,7 +35,9 @@ _QUOTED = re.compile(r'["\\\x00-\x1f\x7f-\U0010ffff]')
 MAX_OUTPUT_CHARS = MAX_REFS * MAX_BYTES
 _EXPLICIT = re.compile("[\u034f\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0\u180b-\u180f\ufe00-\ufe0f\U000e0000-\U000e007f\U000e0100-\U000e01ef]")
 _DISPLAY = re.compile(r"[\x00-\x1f\x7f-\x9f]|[^\x00-\x7f]")
-_TOKEN = re.compile(r'(?P<space>[ \n\r\t]+)|(?P<string>"(?:[^"\\]|\\.)*")|(?P<mark>[{}\[\],:])|(?P<atom>[^ \n\r\t{}\[\],:"]+)')
+_TOKEN = re.compile(r'(?P<space>[ \n\r\t]+)|(?P<mark>[{}\[\],:])|(?P<atom>[^ \n\r\t{}\[\],:"]+)')
+_STRING_END = re.compile(r'["\\]')
+_BODY_LINE = re.compile(r'[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z')
 CURSOR_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,4}):[0-9a-f]{64}")
 MAX_SELECTION_VISITS = MAX_SELECTORS * MAX_NODES
 KEY_MARKER = object()
@@ -57,6 +59,7 @@ _SPECIAL_MESSAGES = MappingProxyType({"operation":
     "path": "store access refused; pass a canonical absolute path",
     "resolution": "reference not found or ambiguous; use the full id or a longer handle",
     "record": "record exceeds the size, depth, node or ref limit; split the record",
+    "number": "number cannot be preserved verbatim; use canonical numeric text",
     "option": "unknown option", "handle": "handle must be 16-64 lowercase hex"})
 SHA = re.compile(r"[0-9a-f]{64}")
 HANDLE = re.compile(r"[0-9a-f]{16,64}")
@@ -225,6 +228,7 @@ def _tree(value):
             token = ("null" if current is None else "true" if current is True else
                      "false" if current is False else _number(current))
             budget.charge(len(token))
+    return nodes, budget.used
 
 
 def _validate_type(value, schema):
@@ -248,7 +252,7 @@ def _validate_type(value, schema):
 
 
 def _validate(value):
-    _tree(value)
+    size = _tree(value)
     require(type(value) is dict and value.keys() == KEYS)
     require(value["schema"] == SCHEMA and type(value["kind"]) is str)
     require(value["kind"] in KIND_SCHEMAS)
@@ -264,6 +268,7 @@ def _validate(value):
         start, end, title = span
         require(type(start) is int and type(end) is int and type(title) is str)
         require(0 <= start <= end <= len(value["body"]))
+    return size
 
 
 def escape_char(char):
@@ -347,9 +352,21 @@ def canonical(value):
     return _collect(json_chunks(value, budget=budget), budget).encode("utf-8")
 
 
-def _tokens(text):
+def _tokens(text, *, verbatim_numbers=False):
     index = 0
     while index < len(text):
+        if text[index] == '"':
+            start, index = index, index + 1
+            while True:
+                match = _STRING_END.search(text, index)
+                require(match is not None)
+                index = match.end()
+                if match[0] == '"':
+                    break
+                require(index < len(text))
+                index += 1  # Skip an escaped character without a regex backtracking stack.
+            yield "string", start, index
+            continue
         match = _TOKEN.match(text, index)
         require(match is not None)
         kind, start, index = match.lastgroup, index, match.end()
@@ -359,13 +376,16 @@ def _tokens(text):
         if kind == "atom":
             require(token in ("null", "true", "false") or NUMBER.fullmatch(token) is not None)
             require(token[0] not in "-0123456789" or len(token) <= MAX_NUMBER_CHARS, "E_LIMIT", detail="record")
-        yield token if kind == "mark" else "string" if kind == "string" else "scalar", start, index
+            if verbatim_numbers and token[0] in "-0123456789":
+                value = float(token) if "." in token or "e" in token or "E" in token else int(token)
+                require(_number(value) == token, "E_FORMAT", detail="number")
+        yield token if kind == "mark" else "scalar", start, index
 
 
-def _preflight(text):
+def _preflight(text, *, verbatim_numbers=False):
     """Bound value starts/ref keys before json.loads builds any containers."""
     stack, nodes, seen = [], 0, False
-    for token, start, stop in _tokens(text):
+    for token, start, stop in _tokens(text, verbatim_numbers=verbatim_numbers):
         frame = stack[-1] if stack else None
         state = frame["state"] if frame else None
         if token in ("}", "]"):
@@ -414,20 +434,104 @@ def _nonfinite(_value):
     raise CodecError("E_FORMAT")
 
 
-def parse(data):
-    """Bytes only; byte/node/ref/depth/numeric bounds precede container decoding."""
+def _decode(data, *, verbatim_numbers=False):
+    """One bounded decoder for stored records and caller-authored content."""
     require(type(data) is bytes)
     require(len(data) <= MAX_BYTES, "E_LIMIT", detail="record")
     try:
         text = data.decode("utf-8")
-        _preflight(text)
-        value = json.loads(text, object_pairs_hook=_pairs, parse_constant=_nonfinite)
-        require(canonical(value) == data)
-        return value
+        _preflight(text, verbatim_numbers=verbatim_numbers)
+        return json.loads(text, object_pairs_hook=_pairs, parse_constant=_nonfinite)
     except (UnicodeError, ValueError, OverflowError) as exc:
         if isinstance(exc, CodecError):
             raise
         raise CodecError("E_FORMAT") from None
+
+
+def parse(data):
+    """Bytes only; byte/node/ref/depth/numeric bounds precede container decoding."""
+    value = _decode(data)
+    require(canonical(value) == data)
+    return value
+
+
+def _span_end(spans, end, budget):
+    if spans:
+        budget.charge(len(str(end)) - len(str(spans[-1][1])))
+        spans[-1][1] = end
+
+
+def _append_span(spans, body, offset, start, end, nodes, budget):
+    """Charge the four nodes and exact canonical bytes before slicing a title."""
+    nodes.charge(4)
+    _span_end(spans, offset, budget)
+    budget.charge(4 + 2 * len(str(offset)) + bool(spans) + end - start + 2)
+    for match in _QUOTED.finditer(body, start, end):
+        char = match[0]
+        budget.charge(1 if char in '"\\\b\f\n\r\t' else 5 if ord(char) <= 0xFFFF else 11)
+    spans.append([offset, offset, body[start:end]])
+
+
+def _body_spans(body, nodes, budget):
+    """Lazy CommonMark lines; ATX headings and fences use body-character offsets."""
+    spans, fence, fence_size = [], None, 0
+    for line in _BODY_LINE.finditer(body):
+        offset, end = line.span()
+        while end > offset and body[end - 1] in "\r\n":
+            end -= 1
+        start = offset
+        while start < min(end, offset + 4) and body[start] == " ":
+            start += 1
+        if start == end or start - offset > 3:
+            continue
+        marker, stop = body[start], start
+        if marker in ("`", "~", "#"):
+            while stop < end and body[stop] == marker:
+                stop += 1
+        run = stop - start
+        if marker in ("`", "~") and run >= 3:
+            if fence is None:
+                if marker == "~" or body.find("`", stop, end) == -1:
+                    fence, fence_size = marker, run
+            elif marker == fence and run >= fence_size and all(body[n] in " \t" for n in range(stop, end)):
+                fence = None
+            continue
+        if fence is None and marker == "#" and run <= 6 and (stop == end or body[stop] in " \t"):
+            while stop < end and body[stop] in " \t":
+                stop += 1
+            while end > stop and body[end - 1] in " \t":
+                end -= 1
+            closing = end
+            while closing > stop and body[closing - 1] == "#":
+                closing -= 1
+            if closing == stop or (closing < end and body[closing - 1] in " \t"):
+                end = closing
+                while end > stop and body[end - 1] in " \t":
+                    end -= 1
+            _append_span(spans, body, offset, stop, end, nodes, budget)
+    _span_end(spans, len(body), budget)
+    return spans
+
+
+def compose(kind, content_bytes, meta):
+    """Compose a canonical record from bounded content and code-authored metadata.
+
+    Caller content contains exactly fields/body/refs. Record limits, rather than
+    the read-selection limit, bound the generated fence-aware heading spans.
+    """
+    require(type(kind) is str and kind in KIND_SCHEMAS and type(meta) is dict)
+    content = _decode(content_bytes, verbatim_numbers=True)
+    require(type(content) is dict and content.keys() == {"fields", "body", "refs"})
+    require(type(content["body"]) is str)
+    require(type(content["refs"]) is dict)
+    require(all(type(rid) is str and SHA.fullmatch(rid) for rid in content["refs"].values()), "E_REF")
+    value = dict(content, schema=SCHEMA, kind=kind, meta=meta, spans=[])
+    nodes, size = _validate(value)
+    value["meta"] = dict(meta)
+    value["spans"] = _body_spans(content["body"], Budget(MAX_NODES - nodes, detail="record"),
+                                Budget(MAX_BYTES - size, detail="record"))
+    canonical(value)
+    return value
 
 
 def record_id(value):

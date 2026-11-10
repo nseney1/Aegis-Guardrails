@@ -2867,7 +2867,7 @@ def test_coord4_output_sites_exact_fit_and_one_less(tmp_path, fmt, site):
 
 
 def test_coord4_public_codec_surface_stays_available():
-    assert set(codec.__all__) == {"CodecError", "Store", "canonical", "parse", "record_id", "read_view", "KIND_SCHEMAS", "MAX_BYTES"}
+    assert set(codec.__all__) == {"CodecError", "Store", "canonical", "parse", "compose", "record_id", "read_view", "KIND_SCHEMAS", "MAX_BYTES"}
     assert all(hasattr(codec, name) for name in codec.__all__)
 
 
@@ -2997,3 +2997,197 @@ def test_coord5_outline_only_formats_fit_exact_output_budget(fmt):
         assert "data" not in view and view["untrusted"] is True
     selected = codec.read_view(value, selectors=["verdict"], outline=True, format=fmt)
     assert value["fields"]["verdict"] in selected
+
+
+@pytest.mark.parametrize("kind", list(codec.KIND_SCHEMAS))
+def test_mc2_compose_round_trip_all_kinds(kind):
+    value = copy.deepcopy(next(g["record"] for g in goldens() if g["record"]["kind"] == kind))
+    content = {key: value[key] for key in ("fields", "body", "refs")}
+    assert codec.compose(kind, json.dumps(content).encode(), value["meta"]) == value
+
+
+@pytest.mark.parametrize("token", [
+    b"0.30000000000000000001", b"1e2", b"12345678901234567890.5", b"1.0e0", b"-0",
+])
+def test_mc2_round6_compose_refuses_nonverbatim_numbers(token):
+    payload = b'{"fields":{"value":' + token + b'},"body":"","refs":{}}'
+    with pytest.raises(codec.CodecError) as caught:
+        codec.compose("record", payload, record()["meta"])
+    assert caught.value.as_dict() == {"error": {"code": "E_FORMAT", "message":
+        "number cannot be preserved verbatim; use canonical numeric text"}}
+    assert str(caught.value) == str(codec.CodecError("E_FORMAT", detail="number"))
+
+
+@pytest.mark.parametrize("token", [b"0", b"9007199254740993", b"12345678901234567890", b"0.5", b"-1.25"] + [
+    json.dumps(value).encode("ascii") for value in (0.1, 0.3, 1e+20, 1e-7, 1.2345678901234567)
+])
+def test_mc2_round6_compose_preserves_numeric_bytes(token):
+    payload = b'{"fields":{"value":' + token + b'},"body":"","refs":{}}'
+    expected = raw(record("record", {"value": None})).replace(b'"value":null', b'"value":' + token)
+    assert codec.canonical(codec.compose("record", payload, record()["meta"])) == expected
+
+
+@pytest.mark.parametrize("case", ["arrays", "integer"])
+def test_mc2_compose_preflights_allocation(case):
+    payload = (b'{"fields":{"value":[' + b"[]," * 59999 + b'[]]},"body":"","refs":{}}'
+               if case == "arrays" else b'{"fields":{"value":' + b"9" * 5000 + b'},"body":"","refs":{}}')
+    meta = record()["meta"]
+    assert len(payload) < codec.MAX_BYTES
+    reached, previous = [], sys.getprofile()
+    def observed(frame, event, _arg):
+        if event == "call" and frame.f_code is json.loads.__code__:
+            reached.append(True)
+    tracemalloc.start()
+    try:
+        sys.setprofile(observed)
+        assert_record_limit(lambda: codec.compose("record", payload, meta))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        sys.setprofile(previous)
+        tracemalloc.stop()
+    assert reached == []
+    assert peak < 4 * len(payload) + 100000
+
+
+@pytest.mark.parametrize("payload", [
+    b"[]", b"{}", b"\xff", b'{"fields":{},"body":"a","body":"b","refs":{}}',
+    b'{"fields":{},"body":NaN,"refs":{}}', b'{"fields":{},"body":"\\ud800","refs":{}}',
+    b'{"fields":{},"body":"","refs":{},"meta":{}}',
+    b'{"fields":{},"body":"","refs":{},"spans":[]}',
+    b'{"fields":{},"body":"","refs":{},"schema":"aegis.msg/1"}',
+    b'{"fields":{},"body":"","refs":{},"kind":"text"}',
+    b'{"fields":{},"body":"","refs":{},"HOSTILE_MARKER":true}',
+])
+def test_mc2_compose_refuses_malformed_content(payload):
+    assert_error("E_FORMAT", lambda: codec.compose("text", payload, record()["meta"]))
+
+
+@pytest.mark.parametrize("body,titles", [
+    ("# one\n```py\n# ignored\n~~~\n## ignored\n```\n## two\n", ["one", "two"]),
+    ("# one\n  ~~~~\n# ignored\n~~~\n# still ignored\n   ~~~~  \n# two\n", ["one", "two"]),
+    ("# one\n````\n# ignored\n```\n# still ignored\n````\n# two\n", ["one", "two"]),
+    ("# one\n```\n# ignored to EOF\n", ["one"]),
+    ("# one\r\nalpha\r\n## two ##\r\n", ["one", "two"]),
+    ("preamble α\n#\n## two\n###### six ###\n####### no\n#nospace\n", ["", "two", "six"]),
+    ("# One\nsee x\x85```\n## Two\ntext\n", ["One", "Two"]),
+    ("intro\u2028# fake\n# real\u2028\n", ["real\u2028"]),
+    ("intro\x85# fake\n# real\x85\n", ["real\x85"]),
+    ("intro\f# fake\n# real\f\n", ["real\f"]),
+    ("intro # fake\n   # indented\r  ## two\r\n    # code\n", ["indented", "two"]),
+    ("intro # fake", []),
+])
+def test_mc2_compose_spans_respect_markdown_fences(body, titles):
+    value = codec.compose("text", raw({"fields": {}, "body": body, "refs": {}}), record()["meta"])
+    assert [span[2] for span in value["spans"]] == titles
+    if value["spans"]:
+        assert value["spans"][-1][1] == len(body)
+    for index, (start, end, _title) in enumerate(value["spans"]):
+        assert body[start:start + 4].lstrip(" ").startswith("#")
+        if index + 1 < len(value["spans"]):
+            assert end == value["spans"][index + 1][0]
+
+
+def test_mc2_compose_spans_bounded_by_record_not_selection_limit():
+    body = "# h\n" * 100
+    value = codec.compose("text", raw({"fields": {}, "body": body, "refs": {}}), record()["meta"])
+    assert len(value["spans"]) == 100
+    assert json.loads(codec.read_view(value, spans=[99]))["data"] == {"span:99": "# h\n"}
+    assert_error("E_SPAN", lambda: codec.read_view(value, spans=list(range(65))))
+
+
+def test_mc2_compose_long_heading_has_linear_steps():
+    steps, previous = [], sys.gettrace()
+    for size in (100000, 200000):
+        body = "# title" + " " * size + "x"
+        payload = raw({"fields": {}, "body": body, "refs": {}})
+        count = [0]
+        def traced(frame, event, _arg):
+            if frame.f_code.co_filename == codec_format.__file__:
+                if event == "line":
+                    count[0] += 1
+                    assert count[0] < 100 * (size + 1000)
+                return traced
+        try:
+            sys.settrace(traced)
+            if size == 200000:
+                # The derived title duplicates the body, exceeding record bytes.
+                assert_record_limit(lambda: codec.compose("text", payload, record()["meta"]))
+            else:
+                value = codec.compose("text", payload, record()["meta"])
+        finally:
+            sys.settrace(previous)
+        if size == 100000:
+            assert value["spans"] == [[0, len(body), body[2:]]]
+        steps.append(count[0])
+    assert steps[1] <= 2 * steps[0] + 1000
+
+
+def test_mc2_read_numeric_options_remain_typed():
+    value = dict(record(body="text"), spans=[[0, 4, "all"]])
+    assert codec.read_view(value, spans=[0], max_chars=60000) == codec.read_view(value, spans=[0])
+
+
+@pytest.mark.parametrize("option,value,code", [
+    ("spans", ["bad"], "E_SPAN"), ("spans", ["9" * 5000], "E_SPAN"),
+    ("max_chars", "bad", "E_LIMIT"), ("max_chars", "9" * 5000, "E_LIMIT"),
+    ("spans", ["0"], "E_SPAN"), ("max_chars", "60000", "E_LIMIT"),
+])
+def test_mc2_read_numeric_options_refuse_fixed_errors(option, value, code):
+    source = dict(record(body="text"), spans=[[0, 4, "all"]])
+    assert_error(code, lambda: codec.read_view(source, **{option: value}))
+
+
+@pytest.mark.parametrize("existing_nodes", [9000, 9700])
+def test_mc2_spans_share_the_record_node_budget(existing_nodes):
+    body = "# h\n" * 100
+    source = dict(record(kind="record", fields={"value": [0] * existing_nodes}, body=body),
+                  spans=[[n * 4, (n + 1) * 4 if n < 99 else len(body), "h"] for n in range(100)])
+    payload = raw({key: source[key] for key in ("fields", "body", "refs")})
+    if existing_nodes == 9000:
+        assert codec.compose("record", payload, source["meta"]) == source
+    else:
+        assert_record_limit(lambda: codec.canonical(source))
+        assert_record_limit(lambda: codec.compose("record", payload, source["meta"]))
+
+
+def test_mc2_derived_spans_refuse_before_excess_allocation():
+    body = "#\n" * 80000
+    payload = raw({"fields": {}, "body": body, "refs": {}})
+    meta = record()["meta"]
+    assert len(payload) <= codec.MAX_BYTES
+    tracemalloc.start()
+    try:
+        assert_record_limit(lambda: codec.compose("text", payload, meta))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 6 * len(payload) + 200000
+
+
+@pytest.mark.parametrize("detail", ["workspace", "arguments"])
+def test_mc2_core_errors_are_host_neutral(detail):
+    error = codec.CodecError("E_FORMAT", detail=detail)
+    assert str(error) == MESSAGES["E_FORMAT"]
+
+
+def test_mc2_argon_span_reproducer_linear_growth():
+    steps, previous = [], sys.gettrace()
+    for size in (2000, 4000, 8000):
+        body = "# x" + " " * size + "#" * size + "!"
+        payload = raw({"fields": {}, "body": body, "refs": {}})
+        count = [0]
+        def traced(frame, event, _arg):
+            if frame.f_code.co_filename == codec_format.__file__:
+                if event == "line":
+                    count[0] += 1
+                    assert count[0] < 100 * (len(body) + 1000)
+                return traced
+        try:
+            sys.settrace(traced)
+            value = codec.compose("text", payload, record()["meta"])
+        finally:
+            sys.settrace(previous)
+        assert value["spans"] == [[0, len(body), body[2:]]]
+        assert count[0] > 0
+        steps.append(count[0])
+    assert all(larger <= 2 * smaller + 1000 for smaller, larger in zip(steps, steps[1:]))
