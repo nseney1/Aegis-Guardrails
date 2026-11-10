@@ -778,7 +778,7 @@ def test_mr1_broken_bindings_refuse_before_binding(setup, mr1_cli, monkeypatch, 
     if case != "missing":
         raw = "{" if case == "json" else '{"schema":1,"schema":2}' if case == "duplicate-key" else json.dumps(data)
         path.write_text(raw, encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path, raising=False)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call("add-role", mr1_request(setup, "add-role", model="claude-opus-5-5", effort="medium"), expect=2)
     assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
     assert unbound(setup, "pilot/orchestrator")
@@ -907,7 +907,7 @@ def test_mr1_binding_bytes_and_generic_rows_drive_resolution(setup, mr1_cli, mon
     path = setup.tmp / "recalibrated.json"
     raw = (json.dumps(data, indent=3) + "\n\n").encode("utf-8")
     path.write_bytes(raw)
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path, raising=False)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     answer = call("add-role", mr1_request(setup, "add-role", model="custom-code", effort="high"))
     assert flag(answer["start_argv"], "--model") == "custom-code"
     assert flag(answer["start_argv"], "--effort") == "high"
@@ -1027,17 +1027,16 @@ def test_mr1_r2_provenance_and_levels_come_from_validated_class_binding(setup, m
     module, call = mr1_cli
     mr1_plan(setup)
     data = mr1_bindings()
-    next(row for row in data["roles"] if row["kind"] == "implementer")["model_class"] = "scout"
-    scout = next(row for row in data["hosts"] if row["host"] == "claude-code" and row["class"] == "scout")
-    scout["levels"].update(light="high", deep="low")
-    scout["admission"]["deep"] = "admitted"
+    coding = next(row for row in data["hosts"] if row["host"] == "claude-code" and row["class"] == "coding")
+    coding["levels"].update(light="high", deep="low")
+    coding["admission"]["deep"] = "admitted"
     path = setup.tmp / "class-bindings.json"
     raw = json.dumps(data, indent=1).encode("utf-8")
     path.write_bytes(raw)
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
-    answer = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", model=scout["model"], effort="low"))
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
+    answer = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", model=coding["model"], effort="low"))
     assert flag(answer["start_argv"], "--effort") == "low"
-    assert answer["team"]["model_class"] == "scout" and answer["team"]["intent"] == "deep"
+    assert answer["team"]["model_class"] == "coding" and answer["team"]["intent"] == "deep"
     assert answer["team"]["admission"] == "admitted"
     assert answer["team"]["bindings_sha256"] == hashlib.sha256(raw).hexdigest()
 
@@ -1052,7 +1051,7 @@ def test_mr1_r2_unknown_policy_kind_never_gets_an_implicit_exemption(setup, mr1_
     with pytest.raises(ValueError) as caught:
         module.team_settings(setup.base, host, {"model": model, "effort": "medium"}, kind=kind, plan=plan)
     assert str(caught.value) == "invalid model bindings %s: no role policy for %s; repair model-bindings.json" % (
-        module.MODEL_BINDINGS, ascii(kind))
+        setup.source / "tools/hierarchy_templates/model-bindings.json", ascii(kind))
     assert unbound(setup, "pilot/orchestrator")
 
 
@@ -1125,7 +1124,7 @@ def test_mr1_r7_unbanded_host_defaults_still_validate_bindings(mr1_r2_setup, mr1
     mr1_plan(setup, host)
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text("not JSON", encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call(command, mr1_request(setup, command, endpoint, host), expect=2)
     assert refused == {"error": "invalid model bindings %s: invalid JSON; repair model-bindings.json" % path}
     assert unbound(setup, endpoint)
@@ -1202,7 +1201,7 @@ def test_mr1_r7_unbanded_resolution_uses_rows_instead_of_model_prefixes(mr1_r2_s
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     raw = json.dumps(data).encode("utf-8")
     path.write_bytes(raw)
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     write_team(setup, model="custom-code", reasoning="max")
     answer = call(command, mr1_request(setup, command, endpoint, host))
     argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
@@ -1488,7 +1487,7 @@ def test_mr1_r5_bindings_parse_failures_are_normal_refusals(setup, mr1_cli, monk
     write_team(setup, model=model, reasoning="medium")
     path = setup.tmp / (uuid.uuid4().hex + "-bindings.json")
     path.write_bytes(raw)
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call(command, mr1_r4_request(setup, setup.base, command, host), expect=2)
     assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
     assert unbound(setup, "pilot/orchestrator")
@@ -1549,7 +1548,7 @@ def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeyp
         del row["admission"][intent]
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
                                             model="claude-opus-5-5", effort="medium"), expect=2)
     assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
@@ -1567,7 +1566,7 @@ def test_mr1_r5_selected_admission_is_recorded_or_refused(setup, mr1_cli, monkey
     row["admission"]["light"] = "rejected"  # Neither a required default nor ceiling.
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
                              model=row["model"], effort="xhigh")
     answer = call(command, request, expect=2 if state == "rejected" else 0)
@@ -1593,7 +1592,7 @@ def test_mr1_r5_partial_binding_accepts_supported_levels_and_names_unsupported_o
     row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+    path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     answer = call(command, mr1_r4_request(setup, setup.base, command, host, model=row["model"], effort=effort),
                   expect=2 if effort == "low" else 0)
     if effort == "low":
@@ -1621,7 +1620,7 @@ def test_mr1_r5_unicode_paths_and_repair_text_survive_refusals(tmp_path_factory,
         data = mr1_bindings()
         data["hosts"][0]["class"] = "ｘ" * 100
         path.write_text(json.dumps(data), encoding="utf-8")
-        monkeypatch.setattr(module, "MODEL_BINDINGS", path)
+        path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
         shown = ascii("ｘ" * 100)[:77] + "..."
         error = "invalid model bindings %s: unknown model class %s; repair model-bindings.json" % (path, shown)
     refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
@@ -1674,16 +1673,15 @@ def test_mr1_r3_host_defaults_keep_exact_answers_without_policy_provenance(mr1_r
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
 @pytest.mark.parametrize("kind,endpoint,effort", MR1_R2_BANDED_ROLES)
-def test_mr1_r3_effort_without_model_refuses_with_binding_instruction(mr1_r2_setup, mr1_cli, command, host,
+def test_mr1_r3_effort_without_model_resolves_the_binding(mr1_r2_setup, mr1_cli, command, host,
                                                                    kind, endpoint, effort):
     setup = mr1_r2_setup
     _, call = mr1_cli
     mr1_plan(setup, host)
     model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
-    refused = call(command, mr1_request(setup, command, endpoint, host, effort=effort), expect=2)
-    assert refused == {"error": "no model: set the request model or team.json model (coding binding for %s: %s)" %
-                       (host, model)}
-    assert unbound(setup, endpoint)
+    answer = call(command, mr1_request(setup, command, endpoint, host, effort=effort))
+    assert answer["team"]["model"] == model and answer["team"]["model_from"] == "model-bindings.json"
+    assert answer["team"]["effort"] == effort and answer["team"]["model_class"] == "coding"
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
@@ -2120,3 +2118,724 @@ def test_mr1_r8_planless_root_keeps_legacy_cross_host_refusal(setup, mr1_cli, co
     refused = call(command, mr1_request(setup, command, "pilot/root", host), expect=2)
     assert refused == {"error": "team.json model %s needs host %s, not %s" % (team_model, team_host, host)}
     assert unbound(setup, "pilot/root")
+
+
+def mr1_r9_publish_bindings(setup, raw):
+    """Publish fixture policy through the same source pin a real base requires."""
+    path = setup.source / "tools/hierarchy_templates/model-bindings.json"
+    if raw is None:
+        path.unlink()
+    else:
+        path.write_bytes(raw)
+    git(setup.source, "add", "--", "tools/hierarchy_templates/model-bindings.json")
+    git(setup.source, "commit", "--allow-empty", "-qm", "fixture model bindings")
+    record_path = setup.base / "provision.json"
+    setup_record = json.loads(record_path.read_text())
+    setup_record.update(source_commit=git(setup.source, "rev-parse", "HEAD"),
+                        source_tree=git(setup.source, "rev-parse", "HEAD^{tree}"))
+    record_path.write_text(json.dumps(setup_record), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_mr1_r9_start_host_matches_the_governing_plan(setup, mr1_cli, tmp_path_factory, command, host, copied, matching):
+    _, call = mr1_cli
+    expected = host if matching else "codex-cli" if host == "claude-code" else "claude-code"
+    mr1_plan(setup, expected)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    base = mr1_r4_copy_base(setup, tmp_path_factory) if copied else setup.base
+    answer = call(command, mr1_r4_request(setup, base, command, host, endpoint="pilot/lane/f2", model=model, effort="high"),
+                  expect=0 if matching else 2)
+    if matching:
+        assert answer["team"]["model"] == model and answer["team"]["intent"] == "deep"
+    else:
+        assert answer == {"error": "pilot/lane/f2 runs on %s in this run's host plan, not %s" % (expected, host)}
+        assert not (base / "profiles").exists()
+        assert not (base / "connections" / "pilot%2Flane%2Ff2.start.json").exists()
+        assert unbound(setup, "pilot/lane/f2")
+
+
+def test_mr1_r9_copied_base_launcher_refuses_before_executing_a_host(tmp_path_factory):
+    from tests.integration.test_hierarchy_launcher_hosts import Hosts
+    launch = Hosts(tmp_path_factory.mktemp("mr1-r9-launch-" + uuid.uuid4().hex))
+    launch.init()
+    mr1_plan(launch, "claude-code")
+    write_team(launch, model="claude-opus-5-5", reasoning="high")
+    original_root = launch.root
+    launch.base = mr1_r4_copy_base(launch, tmp_path_factory)
+    refused = launch.start(endpoint="pilot/lane/f2", model="gpt-6.1-sol", effort="high", cwd=str(launch.source), expect=2)
+    assert refused["state"] == "refused"
+    assert refused["error"] == "pilot/lane/f2 runs on claude-code in this run's host plan, not codex-cli"
+    assert launch.records("pilot/lane/f2") == [refused]
+    assert invoke(original_root, "status")["bindings"]["pilot/lane/f2"] is None
+    assert not launch.codex_log.exists() and not launch.claude_log.exists()
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("endpoint,effort", [("pilot/front-door", "xhigh"), ("pilot/router", None),
+                                            ("pilot/lane/f2", "high")])
+def test_mr1_r9_effort_without_model_resolves_the_pinned_binding(mr1_r2_setup, mr1_cli, command, host, endpoint, effort):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    options = {} if effort is None else {"effort": effort}
+    answer = call(command, mr1_request(setup, command, endpoint, host, **options))
+    actual_effort = effort or "medium"
+    assert answer["team"]["model"] == model and answer["team"]["model_from"] == "model-bindings.json"
+    assert answer["team"]["effort"] == actual_effort and answer["team"]["model_class"] == "coding"
+    path = setup.source / "tools/hierarchy_templates/model-bindings.json"
+    assert answer["team"]["bindings_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
+    assert ("model=" + json.dumps(model)) in argv if host == "codex-cli" else flag(argv, "--model") == model
+    assert ("model_reasoning_effort=" + json.dumps(actual_effort)) in argv if host == "codex-cli" else flag(argv, "--effort") == actual_effort
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("endpoint,effort,supported", [("pilot/front-door", "xhigh", "light, standard, deep, max"),
+                                                      ("pilot/router", "medium", "standard, deep, max")])
+def test_mr1_r9_unbound_effort_never_bypasses_supported_levels(mr1_r2_setup, mr1_cli, command, host,
+                                                            endpoint, effort, supported):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
+    if endpoint.endswith("router"):
+        row["levels"] = {"standard": "low", "deep": "high", "max": "max"}
+    else:
+        del row["levels"]["extended"]
+    row["admission"] = {intent: "unprobed" for intent in row["levels"]}
+    mr1_r9_publish_bindings(setup, json.dumps(data).encode("utf-8"))
+    options = {} if endpoint.endswith("router") else {"effort": effort}
+    refused = call(command, mr1_request(setup, command, endpoint, host, **options), expect=2)
+    assert refused == {"error": "%s effort %s has no supported intent; supported intents: %s; choose a supported effort" %
+                       (endpoint.split("/")[-1], effort, supported)}
+    assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("explicit_model", [False, True])
+@pytest.mark.parametrize("copied", [False, True])
+def test_mr1_r9_importer_bindings_cannot_replace_the_governing_pin(setup, tmp_path_factory, explicit_model, copied):
+    import importlib.util
+    mr1_plan(setup, "codex-cli")
+    importer = tmp_path_factory.mktemp("mr1-r9-importer-" + uuid.uuid4().hex)
+    module_path = importer / "hierarchy_provision.py"
+    shutil.copyfile(PROVISION, module_path)
+    local = importer / "hierarchy_templates" / "model-bindings.json"
+    local.parent.mkdir()
+    data = mr1_bindings()
+    next(row for row in data["hosts"] if row["host"] == "codex-cli" and row["class"] == "coding")["model"] = "gpt-6.1-sol-local"
+    local.write_text(json.dumps(data), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("mr1_importer_" + uuid.uuid4().hex, module_path)
+    module = importlib.util.module_from_spec(spec)
+    previous_path = list(sys.path)
+    try:
+        spec.loader.exec_module(module)
+        base = mr1_r4_copy_base(setup, tmp_path_factory) if copied else setup.base
+        request = {"endpoint": "pilot/lane/f2", "effort": "high"}
+        if explicit_model:
+            request["model"] = "gpt-6.1-sol"
+        options, record = module.team_settings(base, "codex-cli", request, "implementer")
+    finally:
+        sys.path[:] = previous_path
+    assert options["model"] == "gpt-6.1-sol" and record["model"] == "gpt-6.1-sol"
+    pinned = setup.source / "tools/hierarchy_templates/model-bindings.json"
+    assert record["bindings_sha256"] == hashlib.sha256(pinned.read_bytes()).hexdigest()
+    assert record["bindings_sha256"] != hashlib.sha256(local.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("damage", ["bytes", "head", "missing", "symlink"])
+def test_mr1_r9_direct_resolution_refuses_an_unverified_pin(setup, mr1_cli, damage):
+    module, _ = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    pinned = setup.source / "tools/hierarchy_templates/model-bindings.json"
+    if damage == "missing":
+        pinned.unlink()
+    elif damage == "symlink":
+        outside = setup.tmp / (uuid.uuid4().hex + ".json")
+        outside.write_bytes(pinned.read_bytes())
+        pinned.unlink()
+        pinned.symlink_to(outside)
+    else:
+        pinned.write_bytes(pinned.read_bytes() + b"\n")
+        if damage == "head":
+            git(setup.source, "add", "--", "tools/hierarchy_templates/model-bindings.json")
+            git(setup.source, "commit", "-qm", "unrecorded policy change")
+    with pytest.raises(ValueError) as caught:
+        module.team_settings(setup.base, "codex-cli", {"endpoint": "pilot/lane/f2", "model": "gpt-6.1-sol", "effort": "high"},
+                             "implementer")
+    assert str(caught.value) == ("invalid model bindings %s: source pin verification failed; "
+                                 "restore the pinned source or reprovision; repair model-bindings.json" % pinned)
+    assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("model_only", [False, True])
+def test_mr1_r10_unbanded_missing_effort_holds_before_profile(setup, mr1_cli, command, host, model_only):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    options = {"model": model} if model_only else {}
+    refused = call(command, mr1_request(setup, command, "pilot/front-door", host, **options), expect=2)
+    assert refused == {"error": "front-door has no effort; provide request effort or team.json reasoning; "
+                       "host defaults are not allowed for an unbanded role"}
+    assert unbound(setup, "pilot/front-door")
+    assert not (setup.base / "profiles").exists()
+
+
+@pytest.mark.parametrize("bad_source", [[], {}])
+def test_mr1_r14a_malformed_generation_provenance_is_a_fixed_refusal(setup, mr1_cli, bad_source):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    endpoint, session = "pilot/lane/f2", str(uuid.uuid4())
+    request = dict(model="gpt-6.1-sol", effort="high", session=session)
+    call("add-role", mr1_request(setup, "add-role", endpoint, "codex-cli", **request))
+    path = setup.base / "sessions/pilot%2Flane%2Ff2-g1.json"
+    record = json.loads(path.read_text())
+    record["model_profile"]["effort_from"] = bad_source
+    path.write_text(json.dumps(record), encoding="utf-8")
+    before = mr1_r12_registered_files(setup)
+    refused = call("add-role", mr1_request(setup, "add-role", endpoint, "codex-cli", **request), expect=2)
+    assert refused == {"error": "session record for pilot/lane/f2 generation 1 differs from this binding"}
+    assert mr1_r12_registered_files(setup) == before
+
+
+@pytest.mark.parametrize("command,host", [("codex-start", "codex-cli"), ("claude-start", "claude-code")])
+@pytest.mark.parametrize("copied", [False, True])
+@pytest.mark.parametrize("complete", [False, True])
+def test_mr1_r10_standin_start_refuses_before_argv(setup, mr1_cli, tmp_path_factory, command, host, copied, complete):
+    _, call = mr1_cli
+    mr1_plan(setup, "claude-code" if host == "codex-cli" else "codex-cli")
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["stand_ins"] = {"pilot/front-door": host}
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    base = mr1_r4_copy_base(setup, tmp_path_factory) if copied else setup.base
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    options = {"model": model, "effort": "medium"} if complete else {}
+    refused = call(command, mr1_r4_request(setup, base, command, host, endpoint="pilot/front-door", **options), expect=2)
+    assert refused == {"error": "pilot/front-door is a stand-in binding that never runs a host; use add-role to register it"}
+    assert unbound(setup, "pilot/front-door")
+    assert not (base / "connections" / "pilot%2Ffront-door.start.json").exists()
+
+
+@pytest.mark.parametrize("host", ["codex-cli", "claude-code"])
+def test_mr1_r10_endpointless_frontdoor_resolver_keeps_standin_fact(setup, mr1_cli, host):
+    module, _ = mr1_cli
+    mr1_plan(setup, "claude-code" if host == "codex-cli" else "codex-cli")
+    path = setup.base / "host-plan.json"
+    plan = json.loads(path.read_text())
+    plan["stand_ins"] = {"pilot/front-door": host}
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    with pytest.raises(ValueError) as caught:
+        module.team_settings(setup.base, host, {}, "front-door")
+    assert str(caught.value) == "pilot/front-door is a stand-in binding that never runs a host; use add-role to register it"
+
+
+def test_mr1_r10_copied_standin_launcher_never_executes(tmp_path_factory):
+    from tests.integration.test_hierarchy_launcher_hosts import Hosts
+    launch = Hosts(tmp_path_factory.mktemp("mr1-r10-standin-" + uuid.uuid4().hex))
+    launch.init()
+    mr1_plan(launch, "codex-cli")
+    path = launch.base / "host-plan.json"
+    plan = json.loads(path.read_text())
+    plan["stand_ins"] = {"pilot/front-door": "codex-cli"}
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    original_root = launch.root
+    launch.base = mr1_r4_copy_base(launch, tmp_path_factory)
+    refused = launch.start(endpoint="pilot/front-door", model="gpt-6.1-sol", effort="medium", expect=2)
+    assert refused["state"] == "refused"
+    assert refused["error"] == "pilot/front-door is a stand-in binding that never runs a host; use add-role to register it"
+    assert launch.records("pilot/front-door") == [refused]
+    assert invoke(original_root, "status")["bindings"]["pilot/front-door"] is None
+    assert not launch.codex_log.exists() and not launch.claude_log.exists()
+
+
+@pytest.mark.parametrize("host", ["codex-cli", "claude-code", "codex"])
+def test_mr1_r10_standin_registration_has_no_executable_profile(setup, mr1_cli, host):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    path = setup.base / "host-plan.json"
+    plan = json.loads(path.read_text())
+    plan["stand_ins"] = {"pilot/front-door": host}
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    request = mr1_request(setup, "add-role", "pilot/front-door", host, session=str(uuid.uuid4()))
+    answer = call("add-role", request)
+    assert answer["stand_in"] is True
+    assert Path(answer["connection"]).is_file()
+    assert not {"start_argv", "wake_profile", "codex_profile"} & answer.keys()
+    assert not (setup.base / "profiles").exists()
+    record = json.loads((setup.base / "sessions" / "pilot%2Ffront-door-g1.json").read_text())
+    assert record["stand_in"] is True and record["start_mode"] is None
+    assert not unbound(setup, "pilot/front-door")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("kind,endpoint,_effort", MR1_R2_BANDED_ROLES + [("root", "pilot/root", None)])
+def test_mr1_r10_default_path_verifies_canonical_pin(mr1_r2_setup, mr1_cli, tmp_path_factory, command, host, kind, endpoint, _effort):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["root"] = host
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    replacement = tmp_path_factory.mktemp("mr1-r10-source-" + uuid.uuid4().hex) / "source"
+    shutil.copytree(setup.source, replacement)
+    canonical_path = setup.base / "provision.json"
+    canonical = json.loads(canonical_path.read_text())
+    canonical["source"] = str(replacement)
+    canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
+    bindings = replacement / "tools/hierarchy_templates/model-bindings.json"
+    bindings.write_bytes(bindings.read_bytes() + b"\n")
+    refused = call(command, mr1_r4_request(setup, copied, command, host, endpoint=endpoint), expect=2)
+    assert refused == {"error": "invalid model bindings %s: source pin verification failed; "
+                       "restore the pinned source or reprovision; repair model-bindings.json" % bindings}
+    assert unbound(setup, endpoint)
+    assert not (copied / "profiles").exists()
+
+
+MR1_R12_PIN_ERROR = "runtime source pin differs from governing provision; use the governing base or reprovision"
+
+
+def mr1_r13_old_source(setup, tmp_path_factory):
+    source = tmp_path_factory.mktemp("mr1-r13-old-" + uuid.uuid4().hex) / "source"
+    shutil.copytree(setup.source, source, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    marker = source.parent / "old-provisioner-ran"
+    # A runnable, permissive older entry without any dependency on this repository's history.
+    (source / "tools/hierarchy_provision.py").write_text(
+        "import argparse\nimport json\nfrom pathlib import Path\n"
+        "Path(%r).write_text('executed\\n', encoding='utf-8')\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('command')\n"
+        "parser.add_argument('--request', required=True)\n"
+        "request = json.loads(Path(parser.parse_args().request).read_text(encoding='utf-8'))\n"
+        "print(json.dumps({'accepted_effort': request.get('effort')}))\n" % str(marker), encoding="utf-8")
+    git(source, "init", "-q", "-b", "develop")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "synthetic older provisioner")
+    return source, marker
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+def test_mr1_r12_old_copied_pin_never_selects_the_old_provisioner(setup, tmp_path_factory, command, host):
+    mr1_plan(setup, host)
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    source, marker = mr1_r13_old_source(setup, tmp_path_factory)
+    setup_path = copied / "provision.json"
+    record = json.loads(setup_path.read_text())
+    record.update(source=str(source), source_commit=git(source, "rev-parse", "HEAD"),
+                  source_tree=git(source, "rev-parse", "HEAD^{tree}"))
+    setup_path.write_text(json.dumps(record), encoding="utf-8")
+    shutil.copyfile(source / "tools/hierarchy_runtime_source.py", copied / "runtime-source.py")
+    model = "claude-fable-5-1" if host == "claude-code" else "gpt-6.1-sol"
+    request = mr1_r4_request(setup, copied, command, host, model=model, effort="ultra")
+    assert not marker.exists()
+    refused = mr1_provision(command, request, expect=2)
+    assert refused == {"error": MR1_R12_PIN_ERROR}
+    assert not marker.exists()
+    assert unbound(setup, "pilot/orchestrator")
+    assert not (copied / "profiles").exists()
+    assert not (copied / "connections").exists()
+    assert not (setup.base / "sessions").exists()
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+def test_mr1_r13_equal_copied_pin_still_resolves_governing_policy(setup, tmp_path_factory, command, host):
+    mr1_plan(setup, host)
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    request = mr1_r4_request(setup, copied, command, host, model=model, effort="medium")
+    answer = mr1_provision(command, request)
+    assert answer["team"]["model"] == model and answer["team"]["effort"] == "medium"
+    assert answer["team"]["intent"] == "standard" and answer["team"]["model_class"] == "coding"
+    assert unbound(setup, "pilot/orchestrator") == (command != "add-role")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("component", ["source_commit", "source_tree"])
+def test_mr1_r12_imported_entry_points_compare_both_governing_pin_components(setup, mr1_cli, tmp_path_factory,
+                                                                         command, host, component):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    path = copied / "provision.json"
+    record = json.loads(path.read_text())
+    record[component] = "0" * 40
+    path.write_text(json.dumps(record), encoding="utf-8")
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    refused = call(command, mr1_r4_request(setup, copied, command, host, model=model, effort="medium"), expect=2)
+    assert refused == {"error": MR1_R12_PIN_ERROR}
+    assert unbound(setup, "pilot/orchestrator")
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("kind,endpoint,effort", MR1_R2_BANDED_ROLES)
+@pytest.mark.parametrize("model_class", ["scout", "mechanical", "frontier"])
+def test_mr1_r12_product_role_class_cannot_be_changed_by_pinned_data(mr1_r2_setup, mr1_cli, host, kind, endpoint,
+                                                                effort, model_class):
+    setup = mr1_r2_setup
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    next(row for row in data["roles"] if row["kind"] == kind)["model_class"] = model_class
+    model = next(row["model"] for row in data["hosts"] if row["host"] == host and row["class"] == model_class)
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode("utf-8"))
+    refused = call("add-role", mr1_request(setup, "add-role", endpoint, host, model=model, effort=effort), expect=2)
+    assert refused == {"error": "invalid model bindings %s: %s requires model class coding; got %s; "
+                       "repair model-bindings.json" % (path, kind, ascii(model_class))}
+    assert unbound(setup, endpoint)
+
+
+def mr1_r12_registered_files(setup):
+    return {str(path.relative_to(setup.base)): path.read_bytes()
+            for folder in ("profiles", "connections", "sessions")
+            for path in (setup.base / folder).rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("source", ["request", "team.json"])
+@pytest.mark.parametrize("dimension", ["model", "effort", "host-default"])
+def test_mr1_r12_live_generation_never_rewrites_model_or_effort(setup, mr1_cli, host, source, dimension):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    session = str(uuid.uuid4())
+    if source == "team.json":
+        write_team(setup, model=model, reasoning="high")
+    options = {"model": model, "effort": "high"} if source == "request" else {}
+    first = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", host, session=session, **options))
+    if dimension == "model":
+        data = mr1_bindings()
+        model += "-recalibrated"
+        next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")["model"] = model
+        mr1_r9_publish_bindings(setup, json.dumps(data).encode("utf-8"))
+    effort = "max" if dimension == "effort" else "high"
+    if dimension == "host-default":
+        options = {}
+        if source == "team.json":
+            (setup.base / "team.json").unlink()
+    elif source == "team.json":
+        write_team(setup, model=model, reasoning=effort)
+    else:
+        options = {"model": model, "effort": effort}
+    before = mr1_r12_registered_files(setup)
+    refused = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", host, session=session, **options), expect=2)
+    assert refused == {"error": "session record for pilot/lane/f2 generation 1 differs from this binding"}
+    assert first["generation"] == 1
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    assert record["model_profile"]["model"] == first["team"]["model"]
+    assert record["model_profile"]["native_effort"] == "high"
+    assert invoke(setup.root, "status")["bindings"]["pilot/lane/f2"]["generation"] == 1
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+def test_mr1_r12_same_generation_is_idempotent_and_successor_can_change_effort(setup, mr1_cli, host):
+    from tests.integration.test_hierarchy_handoff import handoff
+    from tests.integration.test_hierarchy_host_plan import spec
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    session = str(uuid.uuid4())
+    options = {"model": model, "effort": "high", "session": session}
+    first = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", host, **options))
+    before = mr1_r12_registered_files(setup)
+    assert call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", host, **options)) == first
+    assert mr1_r12_registered_files(setup) == before
+    record_path = setup.base / "sessions/pilot%2Flane%2Ff2-g1.json"
+    record = json.loads(record_path.read_text())
+    assert record["model_profile"]["model"] == model and record["model_profile"]["native_effort"] == "high"
+    successor = str(uuid.uuid4())
+    assert handoff(setup.tmp, spec(setup, host, successor, "pilot/lane/f2"), 0)["entries"][0]["generation"] == 2
+    second = call("add-role", mr1_request(setup, "add-role", "pilot/lane/f2", host,
+                                         session=successor, model=model, effort="max"))
+    assert second["generation"] == 2
+    assert json.loads(record_path.read_text()) == record
+    next_record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g2.json").read_text())
+    assert next_record["model_profile"]["model"] == model and next_record["model_profile"]["native_effort"] == "max"
+
+
+def mr1_r14_reasoning(setup, model, level, by_kind):
+    write_team(setup, model=model, reasoning="high" if by_kind else level,
+               **({"reasoning_by_kind": {"implementer": level}} if by_kind else {}))
+
+
+@pytest.mark.parametrize("initial,changed", [("max", "ultra"), ("ultra", "max")])
+@pytest.mark.parametrize("by_kind", [False, True])
+def test_mr1_r14_claude_alias_change_cannot_rewrite_a_live_generation(setup, mr1_cli, initial, changed, by_kind):
+    _, call = mr1_cli
+    mr1_plan(setup, "claude-code")
+    model, endpoint, session = "claude-opus-5-5", "pilot/lane/f2", str(uuid.uuid4())
+    mr1_r14_reasoning(setup, model, initial, by_kind)
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, session=session))
+    first_wake = json.loads(Path(first["wake_profile"]).read_text())
+    assert first["team"]["effort"] == "max"
+    assert ("--settings" in first_wake["argv"]) == (initial == "ultra")
+    before = mr1_r12_registered_files(setup)
+    mr1_r14_reasoning(setup, model, changed, by_kind)
+    refused = call("add-role", mr1_request(setup, "add-role", endpoint, session=session), expect=2)
+    assert refused == {"error": "session record for pilot/lane/f2 generation 1 differs from this binding"}
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    assert record["model_profile"]["model"] == model and record["model_profile"]["native_effort"] == "max"
+    assert record["model_profile"]["ultracode"] is (initial == "ultra")
+    assert invoke(setup.root, "status")["bindings"][endpoint]["generation"] == 1
+
+
+@pytest.mark.parametrize("initial,changed", [("max", "ultra"), ("ultra", "max")])
+@pytest.mark.parametrize("by_kind", [False, True])
+def test_mr1_r14_same_effective_config_is_idempotent_and_alias_change_needs_rotation(setup, mr1_cli,
+                                                                                initial, changed, by_kind):
+    from tests.integration.test_hierarchy_handoff import handoff
+    from tests.integration.test_hierarchy_host_plan import spec
+    _, call = mr1_cli
+    mr1_plan(setup, "claude-code")
+    model, endpoint, session = "claude-opus-5-5", "pilot/lane/f2", str(uuid.uuid4())
+    mr1_r14_reasoning(setup, model, initial, by_kind)
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, session=session))
+    before = mr1_r12_registered_files(setup)
+    assert call("add-role", mr1_request(setup, "add-role", endpoint, session=session)) == first
+    assert mr1_r12_registered_files(setup) == before
+    record_path = setup.base / "sessions/pilot%2Flane%2Ff2-g1.json"
+    record = json.loads(record_path.read_text())
+    assert record["model_profile"]["ultracode"] is (initial == "ultra")
+    successor = str(uuid.uuid4())
+    assert handoff(setup.tmp, spec(setup, "claude-code", successor, endpoint), 0)["entries"][0]["generation"] == 2
+    mr1_r14_reasoning(setup, model, changed, by_kind)
+    second = call("add-role", mr1_request(setup, "add-role", endpoint, session=successor))
+    assert second["generation"] == 2
+    assert json.loads(record_path.read_text()) == record
+    assert Path(first["wake_profile"]).read_bytes() == before["profiles/pilot%2Flane%2Ff2-g1.wake.json"]
+    next_record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g2.json").read_text())
+    assert next_record["model_profile"]["ultracode"] is (changed == "ultra")
+    wake = json.loads(Path(second["wake_profile"]).read_text())
+    assert ("--settings" in wake["argv"]) == (changed == "ultra")
+
+
+@pytest.mark.parametrize("initial,changed", [("max", "ultra"), ("ultra", "max")])
+def test_mr1_r14_codex_alias_provenance_does_not_change_effective_config(setup, mr1_cli, initial, changed):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    model, endpoint, session = "gpt-6.1-sol", "pilot/lane/f2", str(uuid.uuid4())
+    write_team(setup, model=model, reasoning=initial)
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, "codex-cli", session=session))
+    before = mr1_r12_registered_files(setup)
+    write_team(setup, model=model, reasoning=changed)
+    second = call("add-role", mr1_request(setup, "add-role", endpoint, "codex-cli", session=session))
+    assert second["generation"] == 1 and second["team"]["reasoning"] == changed
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    assert record["model_profile"]["ultracode"] is False
+    assert first["team"]["effort"] == second["team"]["effort"] == "max"
+
+
+@pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
+@pytest.mark.parametrize("initial,changed", [("max", "ultra"), ("ultra", "max")])
+def test_mr1_r14_explicit_effort_and_explicit_defaults_keep_the_same_config(setup, mr1_cli, host, model,
+                                                                        initial, changed):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    endpoint, session = "pilot/lane/f2", str(uuid.uuid4())
+    write_team(setup, model=model, reasoning=initial)
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, host, session=session, effort="max"))
+    before = mr1_r12_registered_files(setup)
+    write_team(setup, model=model, reasoning=changed)
+    defaults = ({"background": False, "assistants": False, "add_dirs": []} if host == "claude-code" else
+                {"skip_git_repo_check": False, "writable_roots": [], "add_dirs": []})
+    assert call("add-role", mr1_request(setup, "add-role", endpoint, host,
+                                       session=session, effort="max", **defaults)) == first
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    assert record["model_profile"]["ultracode"] is False
+
+
+@pytest.mark.parametrize("setting", ["reader_shell", "skip_git_repo_check", "add_dirs", "tmpdir",
+                                     "writable_roots", "tools", "cwd", "timeout_seconds", "source_repo"])
+def test_mr1_r14_other_effective_launch_settings_cannot_change_in_generation(setup, mr1_cli, setting):
+    _, call = mr1_cli
+    host = "claude-code" if setting in ("tools", "cwd") else "codex-cli"
+    endpoint = ("pilot/lane/review" if setting in ("reader_shell", "source_repo") else
+                "pilot/orchestrator" if setting == "cwd" else "pilot/lane/f2")
+    model = "claude-opus-5-5" if host == "claude-code" else "gpt-6.1-sol"
+    effort = "medium" if setting == "cwd" else "high"
+    mr1_plan(setup, host)
+    session = str(uuid.uuid4())
+    extra, added = setup.tmp / "extra", setup.tmp / "added"
+    extra.mkdir()
+    added.mkdir()
+    initial, changed = {}, {}
+    if setting == "reader_shell":
+        changed = {"reader_shell": True}
+    elif setting == "skip_git_repo_check":
+        changed = {"skip_git_repo_check": True}
+    elif setting == "add_dirs":
+        initial = {"writable_roots": [str(extra)], "add_dirs": [str(extra), str(added)]}
+        changed = dict(initial, add_dirs=[str(added)])
+    elif setting == "tmpdir":
+        initial = {"writable_roots": [str(extra), str(added)], "tmpdir": str(extra)}
+        changed = dict(initial, tmpdir=str(added))
+    elif setting == "writable_roots":
+        initial = {"writable_roots": [str(extra)]}
+        changed = {"writable_roots": [str(extra), str(extra)]}
+    elif setting == "tools":
+        changed = {"tools": "Read"}
+    elif setting == "cwd":
+        changed = {"cwd": str(extra)}
+    elif setting == "timeout_seconds":
+        changed = {"timeout_seconds": 1200}
+    elif setting == "source_repo":
+        changed = {"source_repo": str(setup.source)}
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, host,
+                                        session=session, model=model, effort=effort, **initial))
+    before = mr1_r12_registered_files(setup)
+    refused = call("add-role", mr1_request(setup, "add-role", endpoint, host,
+                                          session=session, model=model, effort=effort, **changed), expect=2)
+    assert refused == {"error": "session record for %s generation 1 differs from this binding" % endpoint}
+    assert first["generation"] == 1 and mr1_r12_registered_files(setup) == before
+
+
+MR1_R14_GOVERNING_ERROR = "governing source pin check failed; use the governing base or reprovision"
+MR1_R14_FIXED_ROLES = [
+    (entry["endpoint"].get("lane_kind", entry["endpoint"]["role"]), entry["endpoint"]["role"],
+     entry["model_profile"]["effort"])
+    for entry in json.loads((ROOT / "tools/hierarchy_templates/role-registry.json").read_text())["roles"].values()
+    if entry.get("endpoint") is not None and entry.get("model_profile", {}).get("source") == "fixed"]
+
+
+@pytest.mark.parametrize("initial_explicit", [False, True])
+@pytest.mark.parametrize("by_kind", [False, True])
+def test_mr1_r14a_effort_presence_cannot_switch_ultracode_and_profile_has_one_optional_key(setup, mr1_cli,
+                                                                                       initial_explicit, by_kind):
+    _, call = mr1_cli
+    mr1_plan(setup, "claude-code")
+    model, endpoint, session = "claude-opus-5-5", "pilot/lane/f2", str(uuid.uuid4())
+    mr1_r14_reasoning(setup, model, "ultra", by_kind)
+    options = {"effort": "max"} if initial_explicit else {}
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, session=session, **options))
+    before = mr1_r12_registered_files(setup)
+    options = {} if initial_explicit else {"effort": "max"}
+    refused = call("add-role", mr1_request(setup, "add-role", endpoint, session=session, **options), expect=2)
+    assert refused == {"error": "session record for pilot/lane/f2 generation 1 differs from this binding"}
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    base_keys = {"schema", "endpoint", "role_kind", "host_kind", "start_mode", "session", "generation",
+                 "stand_in", "write_scope"}
+    assert set(record) == base_keys | {"model_profile"}
+    profile = record["model_profile"]
+    assert {"model_class", "model", "intent", "native_effort", "band", "model_from", "effort_from",
+            "reasoning_from", "bindings_sha256", "signals"} <= profile.keys()
+    assert profile["native_effort"] == first["team"]["effort"] == "max"
+    assert profile["ultracode"] is (not initial_explicit)
+    assert profile["signals"] == []
+
+
+@pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
+@pytest.mark.parametrize("initial_explicit", [False, True])
+def test_mr1_r14a_effective_equality_keeps_first_selection_provenance(setup, mr1_cli, host, model, initial_explicit):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    endpoint, session = "pilot/lane/f2", str(uuid.uuid4())
+    write_team(setup, model=model, reasoning="max")
+    options = {"effort": "max"} if initial_explicit else {}
+    first = call("add-role", mr1_request(setup, "add-role", endpoint, host, session=session, **options))
+    before = mr1_r12_registered_files(setup)
+    options = {} if initial_explicit else {"effort": "max"}
+    second = call("add-role", mr1_request(setup, "add-role", endpoint, host, session=session, **options))
+    assert second["generation"] == 1 and second["team"]["effort"] == first["team"]["effort"] == "max"
+    assert mr1_r12_registered_files(setup) == before
+    record = json.loads((setup.base / "sessions/pilot%2Flane%2Ff2-g1.json").read_text())
+    assert record["model_profile"]["effort_from"] == ("request" if initial_explicit else "team.json")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("planned", [False, True])
+def test_mr1_r14a_looping_mailbox_preserves_no_plan_json_and_planned_fixed_error(setup, command, host, planned):
+    if planned:
+        mr1_plan(setup, host)
+    loop = setup.base / "loop"
+    loop.symlink_to("loop", target_is_directory=True)
+    mailbox_root = loop / "mailbox"
+    path = setup.base / "provision.json"
+    record = json.loads(path.read_text())
+    record["mailbox_root"] = str(mailbox_root)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    legacy_error = "symlink paths are not supported: " + str(loop)
+    expected = MR1_R14_GOVERNING_ERROR if planned else legacy_error
+    model = "claude-opus-5-5" if host == "claude-code" else "gpt-6.1-sol"
+    request = mr1_request(setup, command, host=host, model=model, effort="medium")
+    if command == "claude-start":
+        assert mr1_provision(command, request, expect=2) == {"error": expected}
+    else:
+        request_path = Path(request.pop("_request_path"))
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-I", str(PROVISION), command, "--request", str(request_path)],
+                                capture_output=True, text=True, timeout=60)
+        assert (result.returncode, result.stdout, result.stderr) == (
+            2, json.dumps({"error": expected}, sort_keys=True) + "\n", "")
+        if not planned:
+            control = subprocess.run([sys.executable, "-I", str(HELPER), "--root", str(mailbox_root), "status"],
+                                     capture_output=True, text=True, timeout=60)
+            assert (result.returncode, result.stdout, result.stderr) == (
+                control.returncode, control.stdout, control.stderr)
+    assert not (setup.base / "profiles").exists() and not (setup.base / "sessions").exists()
+
+
+@pytest.mark.parametrize("fault", [RuntimeError, OSError, ValueError])
+def test_mr1_r14a_governing_check_errors_never_escape_or_echo_details(setup, mr1_cli, tmp_path_factory,
+                                                                  monkeypatch, fault):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    copied = mr1_r4_copy_base(setup, tmp_path_factory)
+    original = Path.resolve
+
+    def broken(path, *args, **kwargs):
+        if path == setup.base:
+            raise fault("detail must not be printed")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "resolve", broken)
+        refused = call("add-role", mr1_r4_request(setup, copied, "add-role", "codex-cli",
+                                                model="gpt-6.1-sol", effort="medium"), expect=2)
+    assert refused == {"error": MR1_R14_GOVERNING_ERROR}
+    assert unbound(setup, "pilot/orchestrator") and not (copied / "profiles").exists()
+
+
+@pytest.mark.parametrize("kind,label,effort", MR1_R14_FIXED_ROLES)
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+def test_mr1_r14a_direct_fixed_roles_refuse_non_registry_effort(mr1_r2_setup, mr1_cli, host, kind, label, effort):
+    setup = mr1_r2_setup
+    module, _ = mr1_cli
+    mr1_plan(setup, host)
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    wrong = "max" if effort != "max" else "low"
+    with pytest.raises(ValueError) as caught:
+        module.team_settings(setup.base, host, {"model": model, "effort": wrong}, kind=kind)
+    assert str(caught.value) == "the %s role runs at effort %s from the role registry" % (label, effort)
+    assert not (setup.base / "profiles").exists()
+
+
+@pytest.mark.parametrize("kind,label,effort", MR1_R14_FIXED_ROLES)
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("model_present,effort_present", [(False, False), (True, False), (False, True), (True, True)])
+def test_mr1_r14a_direct_fixed_roles_record_registry_provenance(mr1_r2_setup, mr1_cli, host, kind, label, effort,
+                                                            model_present, effort_present):
+    setup = mr1_r2_setup
+    module, _ = mr1_cli
+    mr1_plan(setup, host)
+    request = {}
+    model = next(row["model"] for row in mr1_bindings()["hosts"] if row["host"] == host and row["class"] == "coding")
+    if model_present:
+        request["model"] = model
+    if effort_present:
+        request["effort"] = effort
+    options, record = module.team_settings(setup.base, host, request, kind=kind)
+    assert options["model"] == model and options["effort"] == effort
+    assert record["effort_from"] == record["reasoning_from"] == "registry"
+    assert record["model_from"] == ("request" if model_present else "model-bindings.json")
+    assert not (setup.base / "profiles").exists()

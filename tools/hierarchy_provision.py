@@ -102,6 +102,35 @@ def bootstrap_json(path):
         raise json_file_error(path, str(exc)) from exc
 
 
+def check_governing_pin(setup, base):
+    """Reject a copied pin before its retained verifier can select an older provisioner. Stdlib only."""
+    mailbox_root = setup.get("mailbox_root") if isinstance(setup, dict) else None
+    if not isinstance(mailbox_root, str) or not mailbox_root:
+        return  # Ordinary provision validation retains its existing malformed-record diagnostic.
+    try:
+        base, home = Path(base), Path(mailbox_root).parent
+        paths = (base / "host-plan.json", home / "host-plan.json")
+        # No resolution without a plan: the ordinary readers retain their legacy refusal bytes.
+        if not any(path.exists() or path.is_symlink() for path in paths):
+            return
+        if base == home or base.resolve() == home.resolve():
+            return
+        governing = bootstrap_json(home / "provision.json")
+    except JSON_FAILURES + (RuntimeError, KeyError) as exc:
+        # Never expose platform exception text, including symlink-loop RuntimeError on Python 3.12.
+        raise ValueError("governing source pin check failed; use the governing base or reprovision") from exc
+    if (not isinstance(governing, dict) or governing.get("schema") != "aegis.hierarchy-provision/v1" or
+            governing.get("mailbox_root") != mailbox_root or governing.get("initiative") != setup.get("initiative")):
+        raise ValueError("governing provision record does not match this run; reprovision the base")
+    keys = ("source_commit", "source_tree")
+    if not all(isinstance(governing.get(key), str) and
+               re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", governing[key]) for key in keys):
+        raise ValueError("governing provision record has an invalid source pin; reprovision the base")
+    # Identical commit/tree pins may live at different checkout paths; both still undergo byte verification.
+    if any(setup.get(key) != governing[key] for key in keys):
+        raise ValueError("runtime source pin differs from governing provision; use the governing base or reprovision")
+
+
 def delegated_read(label, reader, *args, **kwargs):
     """Normalize parse failures from pinned readers, keeping their ordinary ValueError contracts intact."""
     try:
@@ -129,6 +158,7 @@ if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None
         if guarded:
             provision = base / "provision.json"
             setup = bootstrap_json(provision)
+            check_governing_pin(setup, base)
             verifier = base / "runtime-source.py"
             if not verifier.is_file():
                 raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
@@ -194,8 +224,11 @@ BACKGROUND_NOTE = ("runs as a background session that the owner's session list s
 # Generic levels from ADR-TEAM-CONFIG-20261102. Claude has no "ultra" effort: it runs max with ultracode on.
 NATIVE_LEVELS = ("low", "medium", "high", "xhigh", "max")
 TEAM_LEVELS = NATIVE_LEVELS + ("ultra",)
+# Compatibility name only: planned resolutions use the governing setup's source, never this importer-local path.
 MODEL_BINDINGS = Path(__file__).resolve().parent / "hierarchy_templates" / "model-bindings.json"
+BINDINGS_FILE = "tools/hierarchy_templates/model-bindings.json"
 MODEL_CLASSES = ("frontier", "coding", "scout", "mechanical")
+PRODUCT_MODEL_CLASS = "coding"
 EFFORT_INTENTS = ("light", "standard", "deep", "extended", "max")
 ADMISSION_STATES = ("unprobed", "admitted", "rejected")
 # ROOT is owner-chosen. The other unbanded seats still require host membership under a plan.
@@ -473,20 +506,42 @@ def binding_identifier(value, label):
             label + " must be a nonempty ASCII identifier")
 
 
-def bindings_error(problem):
+def bindings_error(problem, path):
     return ValueError("invalid model bindings %s: %s; repair model-bindings.json" %
-                      (MODEL_BINDINGS, problem))
+                      (path, problem))
 
 
-def load_model_bindings():
-    """Read once per planned resolution; the hash describes the exact validated bytes, not a reserialization."""
+def check_role_model_class(kind, model_class):
+    require(model_class == PRODUCT_MODEL_CLASS, "%s requires model class %s; got %s" %
+            (kind, PRODUCT_MODEL_CLASS, safe_value(model_class)))
+
+
+def read_pinned_bindings(setup, base):
+    """Verify and return the exact policy bytes, including for paths that waive model resolution."""
+    path = Path(setup["source"]) / BINDINGS_FILE
     try:
-        path = safe_path(str(MODEL_BINDINGS))
+        delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise bindings_error("source pin verification failed; restore the pinned source or reprovision", path) from exc
+    try:
+        path = safe_path(path)
         require(path.is_file(), "cannot read file")
         with path.open("rb") as stream:
             raw = stream.read(JSON_LIMIT_BYTES + 1)
     except JSON_FAILURES as exc:
-        raise bindings_error("cannot read file") from exc
+        raise bindings_error("cannot read file", path) from exc
+    try:
+        committed = delegated_read("model bindings", hierarchy_runtime_source.git, setup["source"],
+                                   "show", setup["source_commit"] + ":" + BINDINGS_FILE)
+        require(raw == committed, "binding bytes changed after source verification")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise bindings_error("source pin verification failed; restore the pinned source or reprovision", path) from exc
+    return path, raw
+
+
+def load_model_bindings(setup, base):
+    """Read once per planned resolution; the hash describes the exact validated bytes, not a reserialization."""
+    path, raw = read_pinned_bindings(setup, base)
     try:
         data = parse_json_bytes(raw)
         binding_keys(data, ("schema", "roles", "hosts"), "top-level")
@@ -539,6 +594,7 @@ def load_model_bindings():
                                   if (host, model_class) not in hosts)
         require(not missing_bindings, "missing host/class rows: " + ", ".join(missing_bindings))
         for kind, policy in roles.items():
+            check_role_model_class(kind, policy["model_class"])
             for host in hierarchy_hosts.TEAM_HOSTS:
                 binding = hosts[host, policy["model_class"]]
                 for edge in ("default", "ceiling"):
@@ -548,34 +604,42 @@ def load_model_bindings():
                     require(binding["admission"][intent] != "rejected",
                             "binding %s/%s has rejected band %s %s for %s" %
                             (host, policy["model_class"], edge, intent, kind))
-        return roles, hosts, hashlib.sha256(raw).hexdigest()
+        return roles, hosts, hashlib.sha256(raw).hexdigest(), path
     except JSON_FAILURES as exc:
-        raise bindings_error(str(exc)) from exc
+        raise bindings_error(str(exc), path) from exc
 
 
-def planned_model_settings(bindings, host, kind, options, record):
+def planned_model_settings(bindings, host, kind, options, record, fixed=None):
     if kind in MODEL_POLICY_EXEMPT_ROLES:
         return options, record
-    roles, hosts, sha256 = bindings
+    roles, hosts, sha256, path = bindings
     row = roles.get(kind)
     if row is None and kind not in UNBANDED_MODEL_ROLES:
-        raise bindings_error("no role policy for " + safe_value(kind))
-    model_class = row["model_class"] if row is not None else "coding"
+        raise bindings_error("no role policy for " + safe_value(kind), path)
+    if row is not None:
+        check_role_model_class(kind, row["model_class"])
+    model_class = PRODUCT_MODEL_CLASS
     binding = hosts.get((host, model_class)) if model_class is not None else None
     if model_class is not None and binding is None:
-        raise bindings_error("no %s binding for host %s" % (model_class, safe_value(host)))
+        raise bindings_error("no %s binding for host %s" % (model_class, safe_value(host)), path)
     model = options.get("model")
-    if model is None and kind in UNBANDED_MODEL_ROLES:
-        # There is no model on argv to check. The caller has still validated the complete bindings file;
-        # unlike MR-1b this does not bypass that validation or invent a default for an unbanded seat.
-        return options, record
+    if model is None:
+        require(binding is not None, "no bound model can be determined; configure the governing model bindings")
+        model = binding["model"]
+        options = dict(options, model=model)
+        record = dict(record or {"effort": options.get("effort"), "reasoning": options.get("effort"),
+                                 "effort_from": "request", "reasoning_from": "request"})
+        record.update(model=model, model_from="model-bindings.json")
     require(model is not None,
             "no model: set the request model or team.json model (%s binding for %s: %s)" %
             (model_class, host, binding["model"] if binding is not None else "choose a bound model"))
     band, effort = row["band"] if row is not None else None, options.get("effort")
-    if effort is None and band is not None:
-        raise ValueError("%s has no effort; set %s (intent %s, band default) in request effort or team.json reasoning" %
-                         (kind, binding["levels"][band["default"]], band["default"]))
+    if effort is None:
+        if band is not None:
+            raise ValueError("%s has no effort; set %s (intent %s, band default) in request effort or team.json reasoning" %
+                             (kind, binding["levels"][band["default"]], band["default"]))
+        raise ValueError("%s has no effort; provide request effort or team.json reasoning; "
+                         "host defaults are not allowed for an unbanded role" % kind)
     bound = [item for item in hosts.values() if item["model"] == model]
     model_binding = next((item for item in bound if item["host"] == host), None)
     if model_binding is None:
@@ -595,10 +659,10 @@ def planned_model_settings(bindings, host, kind, options, record):
     else:
         binding = model_binding
     reverse = {level: intent for intent, level in binding["levels"].items()}
-    require((effort is None and band is None) or (isinstance(effort, str) and effort in reverse),
+    require(isinstance(effort, str) and effort in reverse,
             "%s effort %s has no supported intent; supported intents: %s; choose a supported effort" %
             (kind, diagnostic_name(effort), ", ".join(intent for intent in EFFORT_INTENTS if intent in binding["levels"])))
-    intent = reverse[effort] if effort is not None else None
+    intent = reverse[effort]
     repair = ("; set team.json reasoning_by_kind.%s to an in-band effort" % kind
               if record is not None and record["effort_from"] == "team.json" and
               record["reasoning_from"] == "default" else "")
@@ -606,7 +670,7 @@ def planned_model_settings(bindings, host, kind, options, record):
         require(EFFORT_INTENTS.index(band["floor"]) <= EFFORT_INTENTS.index(intent) <= EFFORT_INTENTS.index(band["ceiling"]),
                 "%s effort %s maps to intent %s outside band %s..%s; choose an effort within the band" %
                 (kind, effort, intent, band["floor"], band["ceiling"]) + repair)
-    admission = binding["admission"][intent] if intent is not None else None
+    admission = binding["admission"][intent]
     require(admission != "rejected", "%s intent %s (effort %s) is rejected for %s; choose a different supported level" %
             (binding["model"], intent, effort, host))
     record = dict(record or {"model": model, "effort": effort, "reasoning": effort, "model_from": "request",
@@ -616,6 +680,8 @@ def planned_model_settings(bindings, host, kind, options, record):
                   bindings_sha256=sha256, admission=admission)
     if record["reasoning"] == "ultra":
         record["deprecated"] = "ultra"
+    if fixed is not None:
+        record.update(effort_from="registry", reasoning_from="registry")
     return options, dict(sorted(record.items()))
 
 
@@ -645,6 +711,20 @@ def team_config_values(team):
     return model, by_kind
 
 
+def governing_setup(mailbox_root, plan):
+    home = safe_path(Path(mailbox_root).parent)
+    governing = read_json(home / "provision.json")
+    require(isinstance(governing, dict) and governing.get("schema") == SCHEMA and
+            governing.get("initiative") == plan["hierarchy"] and
+            governing.get("mailbox_root") == str(mailbox_root),
+            "governing provision record does not match this run; reprovision the base")
+    require(isinstance(governing.get("source"), str) and bool(governing["source"]) and
+            all(isinstance(governing.get(key), str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", governing[key])
+                for key in ("source_commit", "source_tree")),
+            "governing provision record has an invalid source pin; reprovision the base")
+    return governing, home
+
+
 def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=None):
     """Resolve argv options and provenance; planned settings belong to the governing mailbox, not a copied base."""
     # Direct callers (including team up's preflight) must get the same checks as actual starts. Entry points
@@ -652,15 +732,45 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
     check_model_request(request)
     if plan is PLAN_UNSET:
         setup = read_json(base / "provision.json")
+        check_governing_pin(setup, base)
         require(isinstance(setup, dict) and {"mailbox_root", "initiative"} <= setup.keys(),
                 "invalid provision.json: missing mailbox_root or initiative")
         mailbox_root = setup["mailbox_root"]
         plan = delegated_read("host-plan.json", hierarchy_hosts.governing_plan,
                               base, mailbox_root, setup["initiative"])
+    elif plan is not None:
+        check_governing_pin(read_json(base / "provision.json"), base)
+    if plan is not None:
+        endpoint = request.get("endpoint")
+        if endpoint is None and kind == "front-door":
+            endpoint = plan["hierarchy"] + "/front-door"
+        if endpoint is not None:
+            expected, stand_in = hierarchy_hosts.plan_host(plan, endpoint)
+            require(expected is not None, "endpoint is not covered by the governing host plan")
+            label = endpoint
+        else:
+            expected = plan["root"] if kind == "root" else plan["team"]
+            stand_in = False
+            label = diagnostic_name(kind) if kind is not None else "role"
+        require(host == expected, "%s runs on %s in this run's host plan, not %s" %
+                (label, expected, diagnostic_name(host)))
+        require(not stand_in, "%s is a stand-in binding that never runs a host; use add-role to register it" % label)
+        host = expected
+    fixed = None
+    if plan is not None:
+        entry = hierarchy_roles.registry()["roles"].get(kind) if isinstance(kind, str) else None
+        if entry is not None and entry["endpoint"] is not None:
+            request, fixed = apply_fixed_profile(request, hierarchy_roles.fixed_model_profile(entry),
+                                                 host, entry["endpoint"]["role"])
     full_request = "model" in request and "effort" in request
     if plan is None and full_request:
         return request, None
+    if plan is not None:
+        if mailbox_root is None:
+            mailbox_root = read_json(base / "provision.json")["mailbox_root"]
+        governing, home = governing_setup(mailbox_root, plan)
     if plan is not None and kind == "root":
+        read_pinned_bindings(governing, home)
         # ROOT is owner-chosen, recorded rather than resolved from the team's settings. Keep complete explicit
         # requests' existing return shape; otherwise name the host defaults for dimensions the owner left out.
         if full_request:
@@ -687,14 +797,16 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
             model, by_kind = team_config_values(team)
     except JSON_FAILURES as exc:
         raise ValueError(str(exc)) from exc
+    # No bindings read or parse without a plan; planned team files have already been strictly validated.
+    bindings = None
+    if plan is not None and kind not in MODEL_POLICY_EXEMPT_ROLES:
+        bindings = load_model_bindings(governing, home)
     if (plan is not None and raw is None and kind in TEAM_KINDS and
             "model" not in request and "effort" not in request):
-        # Host-default case left for the coordinator: closing it requires updating other lanes' fixtures.
+        # MR-1b waives band enforcement for banded defaults, never canonical source/policy verification.
         return request, None
-    # No bindings read or parse without a plan; planned team files have already been strictly validated.
-    bindings = load_model_bindings() if plan is not None and kind not in MODEL_POLICY_EXEMPT_ROLES else None
     if full_request or (plan is not None and raw is None):
-        return planned_model_settings(bindings, host, kind, request, None) if bindings is not None else (request, None)
+        return planned_model_settings(bindings, host, kind, request, None, fixed) if bindings is not None else (request, None)
     reasoning = by_kind.get(kind, team["reasoning"])
     if "model" not in request and plan is None:
         # A mismatch means team.json and the role hosts disagree, which the owner resolves; never start the role
@@ -717,7 +829,7 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
             record["downgrade"] = "ultra ran as max: Codex has no ultracode"
     record.update(model=options["model"], effort=options["effort"], reasoning=reasoning)
     if bindings is not None:
-        return planned_model_settings(bindings, host, kind, options, record)
+        return planned_model_settings(bindings, host, kind, options, record, fixed)
     return options, dict(sorted(record.items()))
 
 
@@ -760,11 +872,16 @@ def fixed_profile(request, mailbox, endpoint, host):
     applied. Whether a host serves the tier is a separate probe.
     """
     profile = hierarchy_roles.fixed_model_profile(registry_role(mailbox, endpoint))
+    return apply_fixed_profile(request, profile, host, endpoint_parts(endpoint)[1])
+
+
+def apply_fixed_profile(request, profile, host, label):
+    """One fixed-effort rule for actual starts and direct planned resolver calls."""
     if profile is None:
         return request, None
     effort = profile["effort"]
     require(request.get("effort", effort) == effort,
-            "the %s role runs at effort %s from the role registry" % (endpoint_parts(endpoint)[1], effort))
+            "the %s role runs at effort %s from the role registry" % (label, effort))
     tier = profile.get("tier")
     return {**request, "effort": effort}, {"source": "registry", "effort": effort, "tier": tier,
                                            "tier_applied": host == CODEX and tier is not None}
@@ -954,9 +1071,45 @@ def session_folder(base):
     require(folder.is_dir() and not folder.is_symlink(), "session records need a real folder: " + str(folder))
 
 
+def write_role_file(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def generation_model_profile(request, team, configuration):
+    """ADR session metadata plus the complete effective configuration that the generation freezes."""
+    team = team or {}
+    model, effort = request.get("model"), request.get("effort")
+    return {"model_class": team.get("model_class"), "model": model, "intent": team.get("intent"),
+            "native_effort": effort, "band": team.get("band"),
+            "model_from": team.get("model_from", "request" if model is not None else "host-default"),
+            "effort_from": team.get("effort_from", "request" if effort is not None else "host-default"),
+            "reasoning_from": team.get("reasoning_from", "request" if effort is not None else "host-default"),
+            "bindings_sha256": team.get("bindings_sha256"), "signals": [],
+            "ultracode": bool(request.get("ultracode", False)), "launch_config": configuration}
+
+
+def first_selection_provenance(profile, path):
+    """Equivalent settings keep the original generation's provenance; they never rewrite history."""
+    if not path.exists() and not path.is_symlink():
+        return profile
+    previous = delegated_read("session record", hierarchy_hosts.read_json, path)
+    previous = previous.get("model_profile") if isinstance(previous, dict) else None
+    sources = {"model_from": {"request", "team.json", "model-bindings.json", "host-default"},
+               "effort_from": {"request", "team.json", "registry", "host-default"},
+               "reasoning_from": {"request", "kind", "default", "registry", "host-default"}}
+    if (not isinstance(previous, dict) or set(previous) != set(profile) or
+            any(previous[key] != value for key, value in profile.items() if key not in sources) or
+            any(not isinstance(previous[key], str) or previous[key] not in allowed
+                for key, allowed in sources.items())):
+        return profile
+    return {**profile, **{key: previous[key] for key in sources}}
+
+
 def add_role(request):
     base = safe_path(text(request.get("base"), "base"))
     setup = read_json(base / "provision.json")
+    check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request.get("endpoint")
@@ -965,15 +1118,22 @@ def add_role(request):
     host = request["host"]
     plan = delegated_read("host-plan.json", hierarchy_hosts.governing_plan, base, setup["mailbox_root"], setup["initiative"])
     scope, stand_in = check_host_plan(plan, request, mailbox, endpoint, cwd) if plan is not None else (None, False)
+    if plan is not None and (stand_in or endpoint_parts(endpoint)[1] == "root"):
+        governing, home = governing_setup(setup["mailbox_root"], plan)
+        read_pinned_bindings(governing, home)
     team = None
     fixed = None
-    if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root":
+    if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root" and not stand_in:
         request, fixed = fixed_profile(request, mailbox, endpoint, host)
         # Before binding, so a bad team.json leaves the endpoint unbound.
         request, team = team_settings(base, host, request, role_kind(mailbox, endpoint), plan=plan,
                                      mailbox_root=setup["mailbox_root"])
     session = request.get("session") or str(uuid.uuid4())
     tools, writer = role_tools(endpoint, mailbox, request.get("tools"))
+    profile_options = dict(setup=setup, base=base, mailbox=mailbox, endpoint=endpoint, host=host, session=session,
+                           request=request, cwd=cwd, timeout=timeout, assistants=assistants, tools=tools,
+                           writer=writer, fixed=fixed, stand_in=stand_in)
+    prepared = None
     root = Path(setup["mailbox_root"])
     with writer_lock(root):
         # Also checked inside bind; here as well, so re-running add-role on an existing binding is checked too.
@@ -995,7 +1155,25 @@ def add_role(request):
                 endpoint, hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")), host,
                 hierarchy_hosts.team_start_mode(host, stand_in, request.get("background", False)), session,
                 history[-1]["generation"] if history else 1, stand_in, scope)
+            if not stand_in and ("model" in request or "effort" in request):
+                # Freeze the same rendering that will be published, not request spelling or provenance.
+                # MR-1b keeps its all-default record shape; plan-less calls create no session record.
+                files = {}
+
+                def collect(output, value):
+                    files[output] = value
+
+                profile_answer = render_role_profile(generation=record["generation"], emit=collect, **profile_options)
+                prepared = profile_answer, files
+                locations = ("connection", "codex_profile", "wake_profile", "board_connection")
+                configuration = {
+                    "runtime_pin": {key: setup[key] for key in ("source_commit", "source_tree")},
+                    "launch": {key: value for key, value in profile_answer.items() if key not in locations},
+                    "files": {str(output.relative_to(base)): value for output, value in files.items()}}
+                record["model_profile"] = generation_model_profile(request, team, configuration)
             record_path = hierarchy_hosts.session_record_path(home, endpoint, record["generation"])
+            if "model_profile" in record:
+                record["model_profile"] = first_selection_provenance(record["model_profile"], record_path)
             if not delegated_read("session record", hierarchy_hosts.session_recorded, record_path, record):
                 staged = record_path.with_name(".staged-%s-%s" % (uuid.uuid4().hex, record_path.name))
                 publish_file(staged, encoded(record) + b"\n")
@@ -1018,10 +1196,26 @@ def add_role(request):
         answer["team"] = team
     if fixed is not None:
         answer["model_profile"] = fixed
+    if prepared is None:
+        answer.update(render_role_profile(generation=generation, emit=write_role_file, **profile_options))
+    else:
+        profile_answer, files = prepared
+        for output, value in files.items():
+            write_role_file(output, value)
+        answer.update(profile_answer)
+    return answer
+
+
+def render_role_profile(setup, base, mailbox, endpoint, host, session, generation, request, cwd,
+                        timeout, assistants, tools, writer, fixed, stand_in, emit):
+    """Render every output through emit, so selected planned settings can be compared without writing."""
+    answer = {"endpoint": endpoint, "host": host, "session": session, "generation": generation}
     stem = endpoint.replace("/", "%2F") + "-g%d" % generation
     connection = base / "connections" / (stem + ".json")
     if endpoint_parts(endpoint)[1] == "root":
-        return root_connection(setup, connection, answer, request) if "lifecycle" in request else answer
+        return root_connection(setup, connection, answer, request, emit=emit) if "lifecycle" in request else answer
+    if stand_in:
+        answer["stand_in"] = True
     role_extra = role_workspace_tools(mailbox, endpoint)
     source_repo = request.get("source_repo")
     entry = registry_role(mailbox, endpoint)
@@ -1030,21 +1224,24 @@ def add_role(request):
     journal = lifecycle_args(request)
     arguments = adapter_args(setup, endpoint, host, session, generation, source_repo, journal)
     board = takes_board(setup, mailbox, endpoint)
-    connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if host == NATIVE:
         # The flat form a native thread's own script reads, as in the live connection files.
-        connection.write_text(json.dumps({"command": setup["python"], "args": arguments}, indent=2) + "\n", encoding="utf-8")
+        emit(connection, {"command": setup["python"], "args": arguments})
         answer.update(connection=str(connection), wake="native")
         if board:
             board_connection = base / "connections" / (stem + ".board.json")
-            board_connection.write_text(json.dumps({"command": setup["python"], "args": board_args(setup, endpoint, host, session, generation)},
-                                                   indent=2) + "\n", encoding="utf-8")
+            emit(board_connection, {"command": setup["python"],
+                                    "args": board_args(setup, endpoint, host, session, generation)})
             answer["board_connection"] = str(board_connection)
         return answer
     servers = {"aegis_mailbox": {"command": setup["python"], "args": arguments}}
     if board:
         servers["aegis_board"] = {"command": setup["python"], "args": board_args(setup, endpoint, host, session, generation)}
-    connection.write_text(json.dumps({"mcpServers": servers}, indent=2) + "\n", encoding="utf-8")
+    emit(connection, {"mcpServers": servers})
+    if stand_in:
+        # Keep the registered session's connection, but never create host argv or executable profiles.
+        return {**answer, "connection": str(connection), "cwd": str(cwd),
+                "prompt_via": "stdin" if host == CLAUDE else "argv"}
     if host == CLAUDE:
         catalog = assistant_catalog(setup, endpoint, mailbox) if assistants else None
         names = tools + (["Agent"] if assistants else [])
@@ -1066,32 +1263,29 @@ def add_role(request):
                                 role=hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")),
                                 session=session, generation=generation, tier=applied_tier(fixed))
         codex_record = base / "profiles" / (stem + ".codex.json")
-        codex_record.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        codex_record.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        emit(codex_record, profile)
         answer["codex_profile"] = str(codex_record)
         wake_argv = codex_argv(profile, ["resume", session])
         prompt_via = "argv"
     wake_profile = base / "profiles" / (stem + ".wake.json")
-    wake_profile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     profile = {"schema": "aegis.hierarchy-wake-profile/v1", "endpoint": endpoint, "host": host, "session": session,
                "generation": generation, "argv": wake_argv, "cwd": str(cwd), "timeout_seconds": timeout,
                "prompt_via": prompt_via}
     if host == CLAUDE and request.get("background"):
         profile.update(mode="background", control=["claude"])
-    wake_profile.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    emit(wake_profile, profile)
     return {**answer, "connection": str(connection), "wake_profile": str(wake_profile), "cwd": str(cwd),
             "prompt_via": prompt_via}
 
 
-def root_connection(setup, connection, answer, request):
+def root_connection(setup, connection, answer, request, emit=write_role_file):
     """The supervisor never wakes ROOT, so it gets a connection and no wake profile."""
     host = answer["host"]
     arguments = decision_args(setup, answer["endpoint"], host, answer["session"], answer["generation"], request)
-    connection.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     server = {"command": setup["python"], "args": arguments}
     # A native thread's own script reads the flat form, as for every other role.
     written = server if host == NATIVE else {"mcpServers": {"aegis_decision": server}}
-    connection.write_text(json.dumps(written, indent=2) + "\n", encoding="utf-8")
+    emit(connection, written)
     answer = {**answer, "connection": str(connection)}
     if host == CODEX:
         enabled = [DECISION_TOOL, *hierarchy_roles.decision_tools(registry_role(delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"]),
@@ -1107,6 +1301,7 @@ def codex_start(request):
     fields(request, {"base", "endpoint"}, {"cwd", "reader_shell", "writable_roots", "tmpdir", "add_dirs", "model", "effort", "skip_git_repo_check"})
     base = safe_path(text(request["base"], "base"))
     setup = read_json(base / "provision.json")
+    check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     mailbox.endpoint(request["endpoint"])
@@ -1142,6 +1337,7 @@ def claude_start(request):
                                                       "skip_git_repo_check", "add_dirs"})
     base = safe_path(text(request["base"], "base"))
     setup = read_json(base / "provision.json")
+    check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request["endpoint"]
