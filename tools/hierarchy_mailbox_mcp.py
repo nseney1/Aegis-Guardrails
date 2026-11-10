@@ -815,11 +815,13 @@ class Connection:
             with writer_lock(self.root):
                 result = self.checked_mailbox().publish({**arguments, **self.sender})
             if compact:
+                receipt = {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
+                           "created_at": result["message"]["created_at"], "size": None}
                 try:
-                    return {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
-                            "created_at": result["message"]["created_at"], "size": os.stat(result["path"]).st_size}
-                except OSError as exc:
-                    raise ValueError("published message metadata unavailable; inspect the mailbox before retrying") from exc
+                    receipt["size"] = os.stat(result["path"]).st_size
+                except OSError:
+                    receipt["note"] = "message published; size metadata unavailable; do not retry publication"
+                return receipt
             return result
         if name == "mailbox_ack_handoff":
             fields(arguments, {"checkpoint_sha256"})
