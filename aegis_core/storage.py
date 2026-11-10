@@ -100,6 +100,7 @@ __all__ = [
     "atomic_write_bytes",
     "atomic_write_text",
     "create_private_file",
+    "file_generation",
     "file_lock",
     "fsync_dir",
     "ledger_locked",
@@ -646,9 +647,11 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
 
     Re-entrant per thread, bounded by ``timeout`` seconds: ``locked``'s primitive
     (``_hold``) on its own key and a 0o600 lock file, without participating in
-    workspace/shared lock ordering. With ``dir_fd``, open only the basename relative
-    to that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks
-    and nonregular files; the caller retains ownership of the descriptor.
+    workspace/shared lock ordering. With ``flock``, both acquisition modes identify
+    reentrancy by the device and inode of the opened file; other lock primitives
+    retain pathname identity. With ``dir_fd``, open only the basename relative to
+    that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks and
+    nonregular files; the caller retains ownership of the descriptor.
     """
     target = Path(os.fspath(lock_path))
     if dir_fd is not None:
@@ -658,9 +661,21 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
-    key = f"file:{os.path.normcase(real_path(target))}"
-    with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
-        yield
+    if fcntl is None:
+        # Byte-range locks belong to individual Windows streams, which can share
+        # a device/inode pair. Preserve their distinct pathname keys and opener.
+        key = f"file:{os.path.normcase(real_path(target))}"
+        with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
+            yield
+        return
+    fd = _open_regular(target, os.O_RDWR | os.O_CREAT, mode=_PRIVATE_FILE_MODE)
+    try:
+        info = os.fstat(fd)
+        key = f"file-at:{info.st_dev}:{info.st_ino}"
+        with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
+            yield
+    finally:
+        os.close(fd)
 
 
 @contextmanager
@@ -670,7 +685,6 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
         raise ValueError("dir_fd requires a POSIX directory descriptor")
     if not stat.S_ISDIR(os.fstat(directory).st_mode):
         raise ValueError("dir_fd requires a directory descriptor")
-    key = f"file:{os.path.normcase(real_path(target))}"
     flags = os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
     try:
         fd = os.open(target.name, flags, _PRIVATE_FILE_MODE, dir_fd=directory)
@@ -688,6 +702,9 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target))
+        # The pathname can be redirected after the caller anchors its directory.
+        # Reentrancy must identify the file actually opened through that descriptor.
+        key = f"file-at:{info.st_dev}:{info.st_ino}"
         _make_private(fd, _PRIVATE_FILE_MODE)
         with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
             yield
@@ -696,6 +713,19 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
 
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────
+
+# On Windows os.stat() reports st_ctime as the creation time while os.fstat()
+# reports the last-change time, so a path stat and an fd stat of the same
+# unchanged file disagree once it has ever been written (BUG-035). Creation
+# time never moves on a rewrite anyway; st_ino, st_size and st_mtime_ns still
+# catch replacement and modification there.
+_COMPARE_CTIME = os.name != "nt"
+
+
+def file_generation(size: int, mtime_ns: int, ctime_ns: int) -> Tuple[int, int, int]:
+    """Comparable size and generation stamps for path stats, fd stats and reports."""
+    return size, mtime_ns, ctime_ns if _COMPARE_CTIME else 0
+
 
 @dataclass(frozen=True)
 class FileReport:
@@ -706,6 +736,9 @@ class FileReport:
     tail: bytes
     added: int = 0
     head: bytes = b""
+    mtime_ns: int = 0
+    ctime_ns: int = 0
+    started_ns: Optional[int] = None
 
 
 class JsonlAppend(int):
@@ -725,23 +758,15 @@ class ReportedRows(list):
         self.report = report
 
 
-def _file_report(fd: int, data: bytes, *, appended: bool = False) -> Optional[FileReport]:
+def _file_report(fd: int, data: bytes, *, appended: bool = False,
+                 started_ns: Optional[int] = None) -> Optional[FileReport]:
     try:
         info = os.fstat(fd)
-        if appended:
-            count = min(info.st_size, 256)
-            if count <= 0:
-                return None
-            os.lseek(fd, 0, os.SEEK_SET)
-            head = os.read(fd, count)
-            if len(head) != count:
-                return None
-        else:
-            head = data[:256]
     except OSError:
         return None  # Evidence is optional; a completed I/O operation still succeeded.
     return FileReport((info.st_dev, info.st_ino), info.st_size if appended else len(data),
-                      data[-256:], len(data) if appended else 0, head)
+                      data[-256:], len(data) if appended else 0, b"" if appended else data[:256],
+                      info.st_mtime_ns, info.st_ctime_ns, started_ns)
 
 
 def _encode_rows(rows: Iterable[Dict[str, Any]]) -> bytes:
@@ -765,6 +790,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     the torn bytes stay as one unreadable line and the new rows stay intact. Callers that
     need ordering or deduplication hold ``locked()``. Returns the number of rows written,
     with optional ``report`` evidence captured from the descriptor after the write.
+    Generation stamps and the I/O start time are captured without extra reads.
     """
     rows = list(rows)
     payload = _encode_rows(rows)
@@ -773,6 +799,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     created = not os.path.lexists(target)
+    started_ns = time.time_ns()
     fd = _open_regular(target, os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=mode)
     try:
         size = os.fstat(fd).st_size
@@ -782,7 +809,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
                 payload = b"\n" + payload
         _write_all(fd, payload)
         os.fsync(fd)
-        report = _file_report(fd, payload, appended=True)
+        report = _file_report(fd, payload, appended=True, started_ns=started_ns)
     finally:
         os.close(fd)
     if created:
@@ -904,6 +931,7 @@ def read_jsonl(
     caller passes bytes every wanted row carries verbatim and re-checks the fields.
     """
     report = None
+    started_ns = time.time_ns()
     try:
         # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
         fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
@@ -924,7 +952,7 @@ def read_jsonl(
         try:
             with os.fdopen(fd, "rb") as fh:
                 data = fh.read()
-                report = _file_report(fh.fileno(), data)
+                report = _file_report(fh.fileno(), data, started_ns=started_ns)
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 

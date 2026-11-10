@@ -13,6 +13,8 @@ Changed dependencies re-read their dependent messages, then rerun pinned
 validation with before/after confirmation. Directory
 enumeration and credential observations always run; missing observations do not
 authorize partial reuse. Non-POSIX bytes are hashed before parsed reuse.
+Without checked descriptor reads, bytes come from pinned read_bytes and stored
+validation runs every call; POSIX metadata/access reuse is unavailable.
 Pathlib-ignored lstat outcomes share the constant None/not-a-symlink probe key;
 permission and other real I/O failures still propagate to the pinned oracle.
 Each fresh header receives one pinned stored validation per scan attempt.
@@ -113,6 +115,13 @@ EVIDENCE_SUMMARY_BYTES = 32768
 MAX_EVIDENCE_SAMPLE_PATHS = 8
 MAX_EVIDENCE_SAMPLE_PATH_BYTES = 1024
 MAX_EVIDENCE_COUNT = (1 << 63) - 1
+
+
+def _checked_reads_supported():
+    # Windows pathname stat and fstat do not supply interchangeable inode/device
+    # keys on all supported Python versions. Keep its pinned byte-read path;
+    # parsed reuse still requires a matching hash and live pinned validation.
+    return os.name == "posix" and bool(getattr(os, "O_NOFOLLOW", 0))
 
 
 class _Evidence:
@@ -369,7 +378,7 @@ class MailboxIndex:
 
     def _read_message(self, path, *, previous=None):
         try:
-            if previous is None:
+            if previous is None or not _checked_reads_supported():
                 raw = hm.read_bytes(path)
             else:
                 hm.safe_path(path)
@@ -414,6 +423,7 @@ class MailboxIndex:
         return message
 
     def _open_checked(self, path, key, device):
+        hm.require(_checked_reads_supported(), "checked mailbox reads unavailable")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(path, flags)
         try:
@@ -453,11 +463,14 @@ class MailboxIndex:
                     # No original byte witness: even a canonically equal
                     # re-read could contain a newer frontmatter encoding.
                     raise _ChangedDuringRead()
-                hm.safe_path(path)
-                metadata = os.lstat(path)
-                relative = Path(path).relative_to(self.mailbox.root).as_posix()
-                with self._open_checked(path, self._key(relative, metadata), metadata.st_dev) as stream:
-                    raw = stream.read(hm.MAX_BYTES + 1)
+                if not _checked_reads_supported():
+                    raw = hm.read_bytes(path)
+                else:
+                    hm.safe_path(path)
+                    metadata = os.lstat(path)
+                    relative = Path(path).relative_to(self.mailbox.root).as_posix()
+                    with self._open_checked(path, self._key(relative, metadata), metadata.st_dev) as stream:
+                        raw = stream.read(hm.MAX_BYTES + 1)
                 hm.require(len(raw) <= hm.MAX_BYTES, "input exceeds 262144 bytes")
                 sha = hashlib.sha256(raw).hexdigest()
                 self._remember_hash(path, sha)
@@ -526,7 +539,7 @@ class MailboxIndex:
         observed = _Observations(self._observations)
         identity = self._identity()
         context = (root, hm.digest(self.mailbox.manifest), hm.MAX_BYTES, identity)
-        reusable_context = identity is not None and context == self._context and os.name == "posix"
+        reusable_context = identity is not None and context == self._context and _checked_reads_supported()
         same_limit = self._context is not None and self._context[2] == hm.MAX_BYTES
         folder_checks, folder_paths_used = set(), {}
         layout_key = context[:2]
@@ -572,7 +585,7 @@ class MailboxIndex:
                 # The accepted POSIX key policy permits reuse before hashing.
                 # Other platforms must hash first; a changed header may no
                 # longer need its old dependencies.
-                stable = reuse and os.name == "posix" and observed.stable(previous["paths"])
+                stable = reuse and _checked_reads_supported() and observed.stable(previous["paths"])
                 if stable:
                     message, sha = previous["message"], previous["sha256"]
                 else:
