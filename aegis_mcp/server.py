@@ -300,6 +300,12 @@ def _message_refusal(req_id, code, *, detail=None):
     from aegis_core.message_codec_format import frontend_error
 
     value = frontend_error(CodecError(code, detail=detail), detail=detail)
+    if code == "E_AUTH" and detail == "hold":
+        value["error"]["message"] = (
+            "workspace binding on hold; set AEGIS_WORKSPACE to the intended project directory "
+            "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+            "then restart the MCP server"
+        )
     return _tool_result(req_id, json.dumps(value, separators=(",", ":")), True)
 
 
@@ -409,7 +415,7 @@ def _repository_call(req_id, params, name, args):
         args["_unbound"] = binding.reason
     else:
         if name in ("aegis_msg_read", "aegis_msg_write"):
-            detail = "workspace" if binding.status == "unbound" else "binding"
+            detail = {"unbound": "workspace", "hold": "hold"}.get(binding.status, "binding")
             return _message_refusal(req_id, "E_AUTH", detail=detail)
         return _tool_result(req_id, json.dumps(_unbound_result(binding)), True)
     args["_host"] = _client_platform
