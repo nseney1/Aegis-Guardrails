@@ -22,20 +22,23 @@ SESSION = "5daa90d5-59c3-4bc9-ac88-2bd3454167e8"
 LAUNCHER_TEXT = ("import hashlib, json, os, subprocess\n" + "x = 1\n" * 400)[:2308]
 
 
+STUB_DISPATCH = (
+    "if os.name == 'nt' and os.environ.get('HIERARCHY_STUB_SCRIPT'):\n"
+    " original_run = tool.subprocess.run\n"
+    " def run(argv, *args, **kwargs):\n"
+    "  if argv[0] == 'claude': argv = [sys.executable, '-I', os.environ['HIERARCHY_STUB_SCRIPT'], *argv[1:]]\n"
+    "  return original_run(argv, *args, **kwargs)\n"
+    " tool.subprocess = types.SimpleNamespace(**{**vars(tool.subprocess), 'run': run})\n")
+
+
 # D-P3-1: pytest's tmp_path is under /tmp, which launch refuses as a cwd. Tests replace
 # TMP_ROOT inside the tool's own process; the command line has no seam that turns it off.
-DRIVER = ("import importlib.util, os, sys\n"
+DRIVER = ("import importlib.util, os, sys, types\n"
           "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
           "tool = importlib.util.module_from_spec(spec)\n"
           "spec.loader.exec_module(tool)\n"
-          "if sys.argv[2]: tool.TMP_ROOT = sys.argv[2]\n"
-          "if os.name == 'nt' and os.environ.get('HIERARCHY_STUB_SCRIPT'):\n"
-          " original_run = tool.subprocess.run\n"
-          " def run(argv, *args, **kwargs):\n"
-          "  if argv[0] == 'claude': argv = [sys.executable, '-I', os.environ['HIERARCHY_STUB_SCRIPT'], *argv[1:]]\n"
-          "  return original_run(argv, *args, **kwargs)\n"
-          " tool.subprocess.run = run\n"
-          "sys.exit(tool.main(sys.argv[3:]))\n")
+          "if sys.argv[2]: tool.TMP_ROOT = sys.argv[2]\n" + STUB_DISPATCH
+          + "sys.exit(tool.main(sys.argv[3:]))\n")
 
 
 def run_tool(*args, stdin=b"", env=None, timeout=60, cwd=None, tmp_root=None):
@@ -57,7 +60,7 @@ def capability_cli(*args, before="", after="", env=None):
     driver = ("import importlib.util, os, shutil, sys, types\n" + before
               + "spec = importlib.util.spec_from_file_location('hierarchy_root', sys.argv[1])\n"
               "tool = importlib.util.module_from_spec(spec)\n"
-              "spec.loader.exec_module(tool)\n" + after
+              "spec.loader.exec_module(tool)\n" + STUB_DISPATCH + after
               + "sys.exit(tool.main(sys.argv[2:]))\n")
     return subprocess.run([sys.executable, "-B", "-I", "-c", driver, str(TOOL), *map(str, args)],
                           capture_output=True, text=True, timeout=30, env=env)
@@ -657,6 +660,17 @@ def stub(tmp_path):
     return Stub(tmp_path)
 
 
+@pytest.fixture(params=[False, True], ids=["native", "windows-dispatch"])
+def capability_host(request, stub):
+    env, before = stub.env(), ""
+    if request.param:
+        # Replace the driver's reference only; pathlib and subprocess keep the real OS.
+        before = "os = types.SimpleNamespace(**{**vars(os), 'name': 'nt'})\n"
+        # Without the dispatch shim, no executable host can be reached on this PATH.
+        env["PATH"] = str(stub.dir)
+    return {"env": env, "before": before}
+
+
 def agent_row(session, name, state="working", status="busy", **extra):
     """Shaped like the real rows recorded in requests/root-c6-*-launch.json: no id (review P2-2)."""
     return {"pid": 4242, "sessionId": session, "name": name, "status": status, "state": state, **extra}
@@ -1041,6 +1055,79 @@ def test_lanes_health_tolerates_a_torn_tail_and_counts_enqueued_notices(lanes):
     assert rows["norequest"]["stalled"] is False
 
 
+def test_lanes_health_streams_a_large_transcript_with_bounded_peak_memory(stub, capability_host):
+    path = stub.projects / "-large" / (SESSION + ".jsonl")
+    path.parent.mkdir(parents=True)
+    record = json.dumps(user_record("x" * 1024)) + "\n"
+    with path.open("w", encoding="utf-8") as stream:
+        for _ in range(10000):
+            stream.write(record)
+        stream.write(json.dumps(request("2026-11-02T16:35:00.000Z", "last-request")) + "\n")
+        stream.write(json.dumps(queue(NOW, "enqueue", "pending notice")) + "\n")
+    stub.serve("agents.json", [])
+    result = capability_cli("lanes-health", "--projects-dir", stub.projects, "--now", NOW,
+                            "--session", SESSION, **capability_host, after=(
+        "import atexit, tracemalloc\n"
+        "tracemalloc.start()\n"
+        "atexit.register(lambda: print(tracemalloc.get_traced_memory()[1], file=sys.stderr))\n"))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = stub.dir / "calls.jsonl"
+    assert calls.is_file(), result.stdout
+    assert [json.loads(line) for line in calls.read_text().splitlines()] == [["agents", "--json"]]
+    row = json.loads(result.stdout)["sessions"][0]
+    assert row["last_record_ts"] == NOW and row["open_request_id"] == "last-request"
+    assert row["stalled"] is True and row["silent"] is False
+    assert row["enqueued_notices"] == [{"timestamp": NOW, "head": "pending notice"}]
+    peak = int(result.stderr.strip())
+    assert path.stat().st_size > 10 * 1024 * 1024
+    assert peak < 2 * 1024 * 1024, peak
+
+
+@pytest.mark.parametrize("tail", [b"", b"\n \t\r\n"])
+def test_lanes_health_reports_a_torn_last_nonblank_line(lanes, tail):
+    path = lanes.projects / "-home-x-workspace" / (IDS["torn"] + ".jsonl")
+    with path.open("ab") as stream:
+        stream.write(tail)
+    row = health(lanes, "torn")["torn"]
+    assert row["torn_tail"] is True and "error" not in row
+    assert row["last_record_ts"] == "2026-11-02T16:58:30.000Z"
+
+
+@pytest.mark.parametrize("later", [b'{"type":"assistant"}', b"also invalid"])
+def test_lanes_health_reports_late_corruption_without_partial_activity(lanes, later):
+    path = lanes.projects / "-home-x-workspace" / (IDS["stalled"] + ".jsonl")
+    with path.open("ab") as stream:
+        stream.write(b'\n{"secret-input":\n \t\n' + later + b"\n")
+    row = health(lanes, "stalled")["stalled"]
+    assert row["error"] == "unparsable JSON at line 4 of %s" % path
+    assert row["torn_tail"] is False
+    assert row["last_record_ts"] is None and row["open_request_id"] is None
+    assert row["enqueued_notices"] == [] and row["stalled"] is False
+
+
+def test_lanes_health_reports_a_deferred_transcript_read_error(lanes, capability_host):
+    result = capability_cli("lanes-health", "--projects-dir", lanes.projects, "--now", NOW,
+                            "--session", IDS["stalled"], **capability_host, after=(
+        "original_open = open\n"
+        "class BrokenTranscript:\n"
+        " def __enter__(self): return self\n"
+        " def __exit__(self, *args): pass\n"
+        " def read(self, *args): raise OSError('transcript read failed')\n"
+        " def __iter__(self):\n"
+        "  yield b'{\"type\":\"api-request\",\"timestamp\":\"2026-11-02T16:35:00.000Z\"}\\n'\n"
+        "  raise OSError('transcript read failed')\n"
+        "tool.open = lambda path, *args, **kwargs: (BrokenTranscript() if str(path).endswith('.jsonl')\n"
+        "                                         else original_open(path, *args, **kwargs))\n"))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = lanes.dir / "calls.jsonl"
+    assert calls.is_file(), result.stdout
+    assert [json.loads(line) for line in calls.read_text().splitlines()] == [["agents", "--json"]]
+    row = json.loads(result.stdout)["sessions"][0]
+    assert row["error"] == "transcript read failed" and row["torn_tail"] is False
+    assert row["last_record_ts"] is None and row["open_request_id"] is None
+    assert row["enqueued_notices"] == [] and row["stalled"] is False
+
+
 def test_lanes_health_flags_a_session_waiting_on_a_human(lanes):
     rows = health(lanes, "blocked", "missing")
     blocked = rows["blocked"]
@@ -1098,6 +1185,85 @@ def test_read_jsonl_skips_only_a_torn_last_line(tool, tmp_path):
     assert failure_code(tool, lambda: tool.read_jsonl(path, tolerate_torn_tail=False)) == 2
     path.write_text('{"a": 1}\n{"b": \n{"c": 3}\n', encoding="utf-8")
     assert failure_code(tool, lambda: tool.read_jsonl(path)) == 2
+
+
+@pytest.mark.parametrize("body,expected,torn", [
+    (b" \n\t\r\n", [], False),
+    (b'\n{"a":1}\r\n\t\n[2]\nnull\ntrue',
+     [(2, {"a": 1}), (4, [2]), (5, None), (6, True)], False),
+    (b'{"a":1}\n\xff\n \r\n', [(1, {"a": 1})], True),
+])
+def test_read_jsonl_preserves_line_numbers_values_and_blank_tail(tool, tmp_path, body, expected, torn):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(body)
+    assert tool.read_jsonl(path) == (expected, torn)
+    if torn:
+        with pytest.raises(tool.Failure, match="^unparsable JSON at line 2 of ") as caught:
+            tool.read_jsonl(path, tolerate_torn_tail=False)
+        assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("middle,refused", [
+    ('{"type":"assistant"}\n'.encode("utf-16-be"), True),
+    (b"1\x00\n", False),
+], ids=["utf16-assistant", "utf16-scalar"])
+@pytest.mark.parametrize("consumer", ["list", "health"])
+def test_transcript_callers_parse_exactly_the_split_bytes(tool, lanes, middle, refused, consumer):
+    path = lanes.projects / "-home-x-workspace" / (IDS["stalled"] + ".jsonl")
+    first = request("2026-11-02T16:35:00.000Z", "r1")
+    path.write_bytes(json.dumps(first).encode() + b"\n" + middle + b'{"type":"user"}\n')
+    error = "unparsable JSON at line 2 of %s" % path
+    if consumer == "list":
+        if refused:
+            with pytest.raises(tool.Failure) as caught:
+                tool.read_jsonl(path)
+            assert caught.value.code == 2 and str(caught.value) == error
+        else:
+            assert tool.read_jsonl(path) == ([(1, first), (2, 1), (3, {"type": "user"})], False)
+    else:
+        row = health(lanes, "stalled")["stalled"]
+        if refused:
+            assert row["error"] == error and row["torn_tail"] is False
+            assert row["last_record_ts"] is None and row["open_request_id"] is None
+        else:
+            assert "error" not in row and row["torn_tail"] is False
+            assert row["open_request_id"] == "r1" and row["stalled"] is True
+
+
+@pytest.mark.parametrize("consumer", ["list", "health"])
+def test_transcript_callers_tolerate_a_live_unterminated_tail(tool, lanes, monkeypatch, consumer):
+    path = lanes.projects / "-home-x-workspace" / (IDS["stalled"] + ".jsonl")
+    first = request("2026-11-02T16:35:00.000Z", "r1")
+
+    class GrowingTranscript:
+        def __init__(self):
+            self.lines = iter((json.dumps(first).encode() + b"\n", b'{"type":"assist', b'ant"}\n'))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.lines)
+
+    monkeypatch.setattr(tool, "open", lambda *args, **kwargs: GrowingTranscript(), raising=False)
+    if consumer == "list":
+        assert tool.read_jsonl(path) == ([(1, first)], True)
+        with pytest.raises(tool.Failure) as caught:
+            tool.read_jsonl(path, tolerate_torn_tail=False)
+        assert caught.value.code == 2
+        assert str(caught.value) == "unparsable JSON at line 2 of %s" % path
+    else:
+        args = tool.build_parser().parse_args(["lanes-health", "--projects-dir", str(lanes.projects),
+                                               "--session", IDS["stalled"]])
+        row = tool.lane_health(IDS["stalled"], "stalled", [], args, tool.parse_utc(NOW))
+        assert row["torn_tail"] is True and "error" not in row
+        assert row["open_request_id"] == "r1" and row["stalled"] is True
 
 
 def test_atomic_write_is_idempotent_and_refuses_a_differing_target(tool, tmp_path):

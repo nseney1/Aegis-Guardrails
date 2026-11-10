@@ -24,10 +24,10 @@ from hierarchy_mailbox import read_json, require, safe_path, strict_json, text  
 
 
 from hierarchy_container_verify import (  # noqa: E402,F401 (public adapter facade)
+    BASE_ENV_ALLOWLIST,
     DEFAULT_PATH,
     DIGEST_IMAGE,
     ENGINE_ENV_KEYS,
-    ENV_ALLOWLIST,
     ENV_NAME,
     EXPECTED_ERROR_ORDER,
     EXPECTED_FIELDS,
