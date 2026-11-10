@@ -136,6 +136,7 @@ def create_default_registry() -> CommandRegistry:
     from aegis_cli.hooks import HookCommand
     from aegis_cli.init import InitCommand
     from aegis_cli.migrate import MigrateCommand
+    from aegis_cli.msg import MsgCommand
     from aegis_cli.package import PackageCommand
     from aegis_cli.rule import RuleCommand
     from aegis_cli.scan import ScanCommand
@@ -163,6 +164,7 @@ def create_default_registry() -> CommandRegistry:
         BenchmarkCommand,
         PackageCommand,
         WorkspaceCommand,
+        MsgCommand,
     ):
         reg.register(cmd_cls)
 
