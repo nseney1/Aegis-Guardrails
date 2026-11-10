@@ -64,6 +64,51 @@ def ref(path):
     return {"path": str(path), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
 
 
+def seed_messages(root, requests):
+    """One isolated interpreter per batch; public API validation stays in-process."""
+    driver = r'''
+import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from hierarchy_mailbox import Mailbox,writer_lock
+root=Path(sys.argv[2])
+with writer_lock(root):
+    mailbox=Mailbox(root)
+    for value in json.load(sys.stdin):
+        mailbox.publish(value)
+'''
+    subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(ROOT / "tools"), str(root)],
+                   input=json.dumps(list(requests)), text=True, check=True, timeout=180,
+                   env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+
+def seed_completed_requests(ledger, count):
+    """Build fixture envelopes here; the isolated recorder needs only tools/."""
+    events = []
+
+    class SetupLedger(Ledger):
+        def cli(self, *args, expect=0):
+            if args[0] != "record" or expect != 0:
+                raise ValueError("bulk lifecycle setup only collects successful record requests")
+            events.append(json.loads(Path(args[2]).read_text()))
+
+    setup = SetupLedger(ledger.tmp, initialize=False)
+    for index in range(count):
+        completed_request(setup, "done-%02d" % index)
+    driver = r'''
+import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from hierarchy_lifecycle import Lifecycle
+lifecycle=Lifecycle(Path(sys.argv[2]))
+for event in json.load(sys.stdin):
+    lifecycle.record(event)
+'''
+    subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(ROOT / "tools"), str(ledger.path)],
+                   input=json.dumps(events), text=True, check=True, timeout=180,
+                   env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+
 @pytest.fixture
 def records(pilot, tmp_path):  # noqa: F811
     root, old_brief = pilot
@@ -158,8 +203,7 @@ def test_exact_entry_bound_and_overflow_leave_no_partial_output(pilot):  # noqa:
     root, _ = pilot
     initial = compose(root)
     needed = 256 - initial["entries"]
-    for index in range(needed):
-        invoke(root, "publish", message(identifier="note-%03d" % index))
+    seed_messages(root, (message(identifier="note-%03d" % index) for index in range(needed)))
     at_bound = compose(root)
     assert at_bound["entries"] == 256
     assert len(sections(at_bound["brief"])["Unread work"]) == needed
@@ -183,8 +227,7 @@ def test_corruption_refuses_verify_and_mailbox_read(pilot):  # noqa: F811
 def test_handoff_carries_brief_and_successor_pages_inbox_losslessly(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     identifiers = ["note-%03d" % i for i in range(105)]
-    for identifier in identifiers:
-        invoke(root, "publish", message(identifier=identifier))
+    seed_messages(root, (message(identifier=identifier) for identifier in identifiers))
     brief = compose(root)["brief"]
     assert [row["message_id"] for row in sections(brief)["Unread work"]] == identifiers
     result = handoff(tmp_path, {"schema": "aegis.hierarchy-handoff/v1", "host": "host-two",
@@ -388,8 +431,7 @@ def completed_request(ledger, identifier):
 def test_forty_completed_requests_are_covered_by_one_head_without_consuming_the_bound(pilot, tmp_path):  # noqa: F811
     root, _ = pilot
     ledger = Ledger(tmp_path)
-    for index in range(40):
-        completed_request(ledger, "done-%02d" % index)
+    seed_completed_requests(ledger, 40)
     before = files(tmp_path)
     answer = compose(root)
     rows = sections(answer["brief"])
@@ -406,8 +448,7 @@ def test_forty_completed_requests_are_covered_by_one_head_without_consuming_the_
 @secure_publication
 def test_257_genuinely_unread_messages_refuse_without_writing(pilot):  # noqa: F811
     root, _ = pilot
-    for index in range(257):
-        invoke(root, "publish", message(identifier="open-%03d" % index))
+    seed_messages(root, (message(identifier="open-%03d" % index) for index in range(257)))
     before = files(root.parent)
     assert compose(root, expect=2)["error"] == "fresh brief exceeds 256 entries"
     assert files(root.parent) == before and not (root.parent / "briefs").exists()
@@ -813,8 +854,7 @@ def test_as_of_requires_rfc3339_utc_without_writes(pilot, value):  # noqa: F811
 @pytest.mark.parametrize("order", ["compose-then-bind", "bind-then-compose"])
 def test_successor_lifetime_reads_use_one_predecessor_aggregate(tmp_path, order):
     root, delivery, checkpoint = receipt_fixture(tmp_path, endpoint="a/root")
-    for index in range(248):
-        invoke(root, "publish", message(recipient="a/root", identifier="lifetime-%03d" % index))
+    seed_messages(root, (message(recipient="a/root", identifier="lifetime-%03d" % index) for index in range(248)))
     invoke(root, "publish", message(recipient="a/root", identifier="esc-7", kind="escalation"))
     cursor = None
     for _ in range(4):
