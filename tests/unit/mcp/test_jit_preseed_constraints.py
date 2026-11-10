@@ -20,14 +20,14 @@ class TestJitPreseedConstraints(unittest.TestCase):
         for sub in ("invariants", "traps"):
             os.makedirs(os.path.join(self.rules_dir, sub), exist_ok=True)
 
-        # Create a sample wall cell (security invariant)
-        wall_cell = (
+        # Create a sample invariant rule (security invariant)
+        invariant_rule = (
             "---\n"
             "name: auth-token-invariants\n"
             "type: invariant\n"
             "enforcement: gate\n"
             "target_paths:\n"
-            '  - "soma_core/*.py"\n'
+            '  - "aegis_core/*.py"\n'
             "hypothesis: Never store secrets in plain-text or bypass auth token validation\n"
             "prediction: Token validation bypass will allow unauthorized access\n"
             "---\n"
@@ -35,16 +35,16 @@ class TestJitPreseedConstraints(unittest.TestCase):
             "All authentication handlers must validate tokens before processing requests.\n"
         )
         with open(os.path.join(self.rules_dir, "invariants", "auth-token-invariants.md"), "w", encoding="utf-8") as f:
-            f.write(wall_cell)
+            f.write(invariant_rule)
 
-        # Create a sample vacuole cell (anti-pattern trap)
-        trap_cell = (
+        # Create a sample trap rule (anti-pattern trap)
+        trap_rule = (
             "---\n"
             "name: no-broad-exceptions\n"
             "type: trap\n"
             "enforcement: advisory\n"
             "target_paths:\n"
-            '  - "soma_core/*.py"\n'
+            '  - "aegis_core/*.py"\n'
             "hypothesis: Broad except Exception blocks swallow critical system faults\n"
             "prediction: Silent failure during runtime\n"
             "---\n"
@@ -52,7 +52,7 @@ class TestJitPreseedConstraints(unittest.TestCase):
             "Catch specific exceptions rather than broad Exception.\n"
         )
         with open(os.path.join(self.rules_dir, "traps", "no-broad-exceptions.md"), "w", encoding="utf-8") as f:
-            f.write(trap_cell)
+            f.write(trap_rule)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -61,7 +61,7 @@ class TestJitPreseedConstraints(unittest.TestCase):
         """express() should extract structured invariant_warnings for candidate files."""
         result = scan_service.scan(
             self.workspace,
-            changed_files=["soma_core/auth.py"],
+            changed_files=["aegis_core/auth.py"],
         )
         self.assertIn("invariant_warnings", result)
         constraints = result["invariant_warnings"]
@@ -69,31 +69,31 @@ class TestJitPreseedConstraints(unittest.TestCase):
         self.assertGreaterEqual(len(constraints), 1)
 
         # Check constraint fields
-        wall_constraints = [c for c in constraints if c.get("type") == "invariant"]
-        self.assertTrue(len(wall_constraints) >= 1)
-        wall = wall_constraints[0]
-        self.assertIn("name", wall)
-        self.assertIn("hypothesis", wall)
-        self.assertIn("Never store secrets", wall["hypothesis"])
+        invariant_constraints = [c for c in constraints if c.get("type") == "invariant"]
+        self.assertTrue(len(invariant_constraints) >= 1)
+        invariant = invariant_constraints[0]
+        self.assertIn("name", invariant)
+        self.assertIn("hypothesis", invariant)
+        self.assertIn("Never store secrets", invariant["hypothesis"])
 
     def test_early_warning_summary_at_top_of_guidance(self):
         """express() should format an early-warning constraint section at the top of guidance."""
         result = scan_service.scan(
             self.workspace,
-            changed_files=["soma_core/auth.py"],
+            changed_files=["aegis_core/auth.py"],
         )
         context = result.get("guidance", "")
         # Must contain an early-warning constraint header
         self.assertIn("## Pre-Edit Invariants & Constraints", context)
 
-        # Early-warning section must appear before general active cells
+        # Early-warning section must appear before general active rules
         early_warning_pos = context.find("## Pre-Edit Invariants & Constraints")
-        active_cells_pos = context.find("## Active Governance Rules")
-        if active_cells_pos != -1:
+        active_rules_pos = context.find("## Active Governance Rules")
+        if active_rules_pos != -1:
             self.assertLess(
                 early_warning_pos,
-                active_cells_pos,
-                "Early-warning constraints must appear before active cells to anchor LLM attention",
+                active_rules_pos,
+                "Early-warning constraints must appear before active rules to anchor LLM attention",
             )
 
         # The warning must cite the invariant
@@ -103,7 +103,7 @@ class TestJitPreseedConstraints(unittest.TestCase):
         """MCP handle_scan should return invariant_warnings in its result."""
         args = {
             "workspace": self.workspace,
-            "files": ["soma_core/auth.py"],
+            "files": ["aegis_core/auth.py"],
         }
         res = handle_scan(args)
         self.assertNotIn("error", res)
@@ -112,10 +112,10 @@ class TestJitPreseedConstraints(unittest.TestCase):
 
     def test_preseed_inspection_with_unmodified_target_file(self):
         """Agent should be able to inspect constraints for a target file before editing it."""
-        # Note: soma_core/auth.py does NOT need to exist or be dirty in git
+        # Note: aegis_core/auth.py does NOT need to exist or be dirty in git
         result = scan_service.scan(
             self.workspace,
-            changed_files=["soma_core/new_handler.py"],
+            changed_files=["aegis_core/new_handler.py"],
         )
         self.assertGreaterEqual(len(result["invariant_warnings"]), 1)
         self.assertIn("Never store secrets", result["guidance"])

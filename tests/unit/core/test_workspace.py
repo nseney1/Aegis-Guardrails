@@ -60,16 +60,6 @@ class TestWorkspaceCore:
         with pytest.raises(ValueError, match="missing .aegis/rules"):
             str(Workspace.confine(str(tmp_path)).root)
 
-    def test_legacy_soma_workspace_raises_upgrade_sentinel(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
-        legacy_ws = tmp_path / "legacy_project"
-        (legacy_ws / ".soma" / "cells").mkdir(parents=True)
-
-        with pytest.raises(WorkspaceError, match="aegis migrate"):
-            str(Workspace.confine(str(legacy_ws)).root)
-
-        with pytest.raises(WorkspaceError, match="aegis migrate"):
-            resolve_workspace(start=legacy_ws)
 
     def test_confine_path(self, tmp_path: Path):
         ws = tmp_path / "sandbox"

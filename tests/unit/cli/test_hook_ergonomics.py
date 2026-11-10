@@ -7,7 +7,7 @@ Validates:
 4. Dispatcher: install/status/uninstall plus the isolated `safety-gate` (lifecycle phases were cut in v4, D15).
 5. Hook generator: POSIX sh block that pins the installing interpreter (format 5).
 6. Genesis integration: `--install-hooks` and `--no-hooks` flags.
-7. Smart `soma init` attachment: attaching local repository without clobbering existing global rules.
+7. Smart `aegis init` attachment: attaching local repository without clobbering existing global rules.
 """
 from __future__ import annotations
 
@@ -24,11 +24,8 @@ import pytest
 from aegis_cli.hooks import (
     _AEGIS_HOOK_END,
     _AEGIS_HOOK_START,
-    _SOMA_HOOK_END,
-    _SOMA_HOOK_START,
     AEGIS_HOOK_FORMAT,
     CURRENT_HOOK_FORMAT_VERSION,
-    SOMA_HOOK_FORMAT,
     hook_status,
     install_hook,
     uninstall_hook,
@@ -49,7 +46,7 @@ def _setup_git_repo(tmp_path: Path) -> Path:
 
 
 class TestHookInstallPorcelain:
-    """Tests for soma hook install porcelain."""
+    """Tests for aegis hook install porcelain."""
 
     def test_install_creates_hook_with_current_format(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -60,8 +57,8 @@ class TestHookInstallPorcelain:
         assert hook.is_file()
         content = hook.read_text(encoding="utf-8")
         assert content.startswith("#!/bin/sh\n")
-        assert _AEGIS_HOOK_START in content or _SOMA_HOOK_START in content
-        assert _AEGIS_HOOK_END in content or _SOMA_HOOK_END in content
+        assert _AEGIS_HOOK_START in content or _AEGIS_HOOK_START in content
+        assert _AEGIS_HOOK_END in content or _AEGIS_HOOK_END in content
         assert f"aegis-hook-format: {CURRENT_HOOK_FORMAT_VERSION}" in content
         # The hook never resolves aegis from the environment or the repository.
         assert "VIRTUAL_ENV" not in content
@@ -77,7 +74,7 @@ class TestHookInstallPorcelain:
         assert install_hook(repo) is True
         second_content = (repo / ".git" / "hooks" / "pre-commit").read_text(encoding="utf-8")
         assert first_content == second_content
-        assert second_content.count(_AEGIS_HOOK_START) == 1 or second_content.count(_SOMA_HOOK_START) == 1
+        assert second_content.count(_AEGIS_HOOK_START) == 1 or second_content.count(_AEGIS_HOOK_START) == 1
 
     def test_install_preserves_user_hooks(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -87,17 +84,17 @@ class TestHookInstallPorcelain:
         assert install_hook(repo) is True
         content = hook.read_text(encoding="utf-8")
         assert "echo 'custom user linter'" in content
-        assert _AEGIS_HOOK_START in content or _SOMA_HOOK_START in content
-        assert _AEGIS_HOOK_END in content or _SOMA_HOOK_END in content
+        assert _AEGIS_HOOK_START in content or _AEGIS_HOOK_START in content
+        assert _AEGIS_HOOK_END in content or _AEGIS_HOOK_END in content
 
     def test_install_replaces_old_format_block_in_place(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
         hook = repo / ".git" / "hooks" / "pre-commit"
         old_block = (
-            f"{_SOMA_HOOK_START}\n"
-            "# soma-hook-format: 2\n"
-            "soma checkpoint --pre-commit\n"
-            f"{_SOMA_HOOK_END}\n"
+            f"{_AEGIS_HOOK_START}\n"
+            "# aegis-hook-format: 2\n"
+            "aegis checkpoint --pre-commit\n"
+            f"{_AEGIS_HOOK_END}\n"
         )
         hook.write_text(f"#!/bin/sh\necho pre\n{old_block}echo post\n", encoding="utf-8")
 
@@ -106,7 +103,7 @@ class TestHookInstallPorcelain:
         assert "echo pre" in content
         assert "echo post" in content
         assert f"aegis-hook-format: {CURRENT_HOOK_FORMAT_VERSION}" in content
-        assert "soma-hook-format: 2" not in content
+        assert "aegis-hook-format: 2" not in content
 
     def test_install_refuses_external_symlink_without_force(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -121,11 +118,11 @@ class TestHookInstallPorcelain:
 
         # Without force: should return False and not modify outside file
         assert install_hook(repo, force=False) is False
-        assert _AEGIS_HOOK_START not in outside_hook.read_text(encoding="utf-8") and _SOMA_HOOK_START not in outside_hook.read_text(encoding="utf-8")
+        assert _AEGIS_HOOK_START not in outside_hook.read_text(encoding="utf-8") and _AEGIS_HOOK_START not in outside_hook.read_text(encoding="utf-8")
 
         # With force: should succeed
         assert install_hook(repo, force=True) is True
-        assert _AEGIS_HOOK_START in outside_hook.read_text(encoding="utf-8") or _SOMA_HOOK_START in outside_hook.read_text(encoding="utf-8")
+        assert _AEGIS_HOOK_START in outside_hook.read_text(encoding="utf-8") or _AEGIS_HOOK_START in outside_hook.read_text(encoding="utf-8")
 
     def test_install_returns_false_when_no_git_dir(self, tmp_path: Path):
         non_repo = tmp_path / "plain_dir"
@@ -134,30 +131,30 @@ class TestHookInstallPorcelain:
 
 
 class TestHookUninstallPorcelain:
-    """Tests for soma hook uninstall porcelain."""
+    """Tests for aegis hook uninstall porcelain."""
 
-    def test_uninstall_removes_solitary_soma_hook(self, tmp_path: Path):
+    def test_uninstall_removes_solitary_aegis_hook(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
         install_hook(repo)
         hook = repo / ".git" / "hooks" / "pre-commit"
         assert hook.exists()
 
         assert uninstall_hook(repo) is True
-        assert not hook.exists(), "Hook file should be deleted when only Soma content was present"
+        assert not hook.exists(), "Hook file should be deleted when only Aegis content was present"
 
     def test_uninstall_preserves_user_hooks(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
         hook = repo / ".git" / "hooks" / "pre-commit"
         hook.write_text("#!/bin/sh\necho 'keep me'\n", encoding="utf-8")
         install_hook(repo)
-        assert _AEGIS_HOOK_START in hook.read_text(encoding="utf-8") or _SOMA_HOOK_START in hook.read_text(encoding="utf-8")
+        assert _AEGIS_HOOK_START in hook.read_text(encoding="utf-8") or _AEGIS_HOOK_START in hook.read_text(encoding="utf-8")
 
         assert uninstall_hook(repo) is True
         assert hook.exists(), "Hook file should remain if user hooks exist"
         content = hook.read_text(encoding="utf-8")
         assert "echo 'keep me'" in content
-        assert _AEGIS_HOOK_START not in content and _SOMA_HOOK_START not in content
-        assert _AEGIS_HOOK_END not in content and _SOMA_HOOK_END not in content
+        assert _AEGIS_HOOK_START not in content and _AEGIS_HOOK_START not in content
+        assert _AEGIS_HOOK_END not in content and _AEGIS_HOOK_END not in content
 
     def test_uninstall_returns_false_when_no_hook_found(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -165,7 +162,7 @@ class TestHookUninstallPorcelain:
 
 
 class TestHookStatusPorcelain:
-    """Tests for soma hook status porcelain."""
+    """Tests for aegis hook status porcelain."""
 
     def test_status_reports_not_installed(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -188,7 +185,7 @@ class TestHookStatusPorcelain:
         repo = _setup_git_repo(tmp_path)
         hook = repo / ".git" / "hooks" / "pre-commit"
         hook.write_text(
-            f"#!/bin/sh\n{_SOMA_HOOK_START}\n# soma-hook-format: 2\nsoma checkpoint\n{_SOMA_HOOK_END}\n",
+            f"#!/bin/sh\n{_AEGIS_HOOK_START}\n# aegis-hook-format: 2\naegis checkpoint\n{_AEGIS_HOOK_END}\n",
             encoding="utf-8",
         )
         st = hook_status(repo)
@@ -336,7 +333,7 @@ class TestHookSecurityAndSymlinkHardening:
         assert hook_link.is_symlink(), "In-repo symlink must not be destroyed by install"
         target_content = target_script.read_text(encoding="utf-8")
         assert "echo 'project hook'" in target_content
-        assert _AEGIS_HOOK_START in target_content or _SOMA_HOOK_START in target_content
+        assert _AEGIS_HOOK_START in target_content or _AEGIS_HOOK_START in target_content
 
     def test_dangling_symlink_handling(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
@@ -355,7 +352,7 @@ class TestHookSecurityAndSymlinkHardening:
     def test_uninstall_unterminated_block_preserves_content(self, tmp_path: Path):
         repo = _setup_git_repo(tmp_path)
         hook = repo / ".git" / "hooks" / "pre-commit"
-        original = f"#!/bin/sh\n{_SOMA_HOOK_START}\necho 'corrupt without end marker'\necho 'user hook'\n"
+        original = f"#!/bin/sh\n{_AEGIS_HOOK_START}\necho 'corrupt without end marker'\necho 'user hook'\n"
         hook.write_text(original, encoding="utf-8")
 
         assert uninstall_hook(repo) is False
@@ -365,7 +362,7 @@ class TestHookSecurityAndSymlinkHardening:
         repo = _setup_git_repo(tmp_path)
         outside_hook = tmp_path / "outside_script"
         outside_hook.write_text(
-            f"#!/bin/sh\n{_SOMA_HOOK_START}\n# soma-hook-format: 3\nsoma checkpoint\n{_SOMA_HOOK_END}\n",
+            f"#!/bin/sh\n{_AEGIS_HOOK_START}\n# aegis-hook-format: 3\naegis checkpoint\n{_AEGIS_HOOK_END}\n",
             encoding="utf-8",
         )
         hook_link = repo / ".git" / "hooks" / "pre-commit"
@@ -383,10 +380,9 @@ class TestHookSecurityAndSymlinkHardening:
         repo = _setup_git_repo(tmp_path)
         hook = repo / ".git" / "hooks" / "pre-commit"
         hook.write_text(
-            f"#!/bin/sh\n{_SOMA_HOOK_START}\nsoma checkpoint --pre-commit\n{_SOMA_HOOK_END}\n",
+            f"#!/bin/sh\n{_AEGIS_HOOK_START}\naegis checkpoint --pre-commit\n{_AEGIS_HOOK_END}\n",
             encoding="utf-8",
         )
         st = hook_status(repo)
         assert st["status"] == "outdated"
         assert st["format_version"] == 1
-

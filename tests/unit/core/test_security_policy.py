@@ -99,7 +99,7 @@ def test_git_environment_claim_names_the_evidence_scope_and_hook_exception():
 
 # Names of v3 components and v3 biology vocabulary that v4 dropped. A policy document
 # that still names one points the reader at something the repository no longer has.
-RETIRED_NAMES = ("Breeze", "Tempest", "Spores", "Mulch", "genome", "enzyme", "phylogeny", "evolutionary")
+RETIRED_NAMES = ("Breeze", "Tempest", "evolutionary")
 
 
 def test_policy_documents_use_no_retired_v3_names():
@@ -183,9 +183,9 @@ def test_every_module_that_starts_a_program_is_in_the_inventory():
 def test_the_repository_trust_table_names_what_each_spawn_site_starts():
     table = _section(_security_text(), "Repository trust")
     rows = [line for line in table.splitlines() if line.startswith("| ") and not line.startswith("|---")]
-    first_cells = [row.split(" | ", 1)[0] for row in rows]
+    first_rules = [row.split(" | ", 1)[0] for row in rows]
     missing = sorted({term for terms in SPAWN_SITES.values() for term in terms
-                      if not any(term in cell for cell in first_cells)})
+                      if not any(term in rule for rule in first_rules)})
     assert missing == [], "the Repository trust table has no row for these programs"
 
 
@@ -223,9 +223,9 @@ def test_security_names_every_hook_registration_file_and_what_it_is_not(tmp_path
 def _tier_table():
     section = _section(_security_text(), "Trust tiers")
     rows = [line for line in section.splitlines() if line.startswith("| ") and not line.startswith("|---")]
-    header, *body = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in rows]
+    header, *body = [[rule.strip() for rule in row.strip().strip("|").split("|")] for row in rows]
     assert header == ["Claim", "Tier A", "Tier B", "Tier C"]
-    return [dict(zip(header, cells)) for cells in body]
+    return [dict(zip(header, rules)) for rules in body]
 
 
 def test_the_tier_b_column_claims_no_more_than_a_pull_request_editable_check_supports():

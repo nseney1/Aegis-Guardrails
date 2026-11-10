@@ -318,6 +318,37 @@ def test_the_hook_and_the_record_take_a_binary_file_and_note_one_over_the_size_c
     assert (rc, row["passed"], row["layer1"]) == (0, True, {"findings": 0, "files": 2, "evidence": []})
 
 
+@pytest.mark.parametrize("size", [256, 257, 300])
+def test_the_hook_names_the_index_cap_when_uncovered_native_content_was_not_checked(repo, capsys, monkeypatch, size):
+    from aegis_core.verification import runner
+
+    monkeypatch.setattr(runner, "INDEX_BLOB_LIMIT_BYTES", 256)
+    token = _token()
+    _write(repo / "src" / "app.ts", f"// {token} ".ljust(size - 1, "x") + "\n")
+    _git(repo, "add", "src/app.ts")
+    code, payload, raw = _check(repo, capsys, "--hook")
+    assert token not in raw
+    if size == 256:
+        assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "src/app.ts")])
+        assert not any("not checked" in row["detail"] for row in payload["layer1"])
+        return
+
+    assert (code, _failed(payload)) == (0, [])
+    rows = [row for row in payload["layer1"] if row["target"] == "src/app.ts"]
+    assert len(rows) == 1
+    assert (rows[0]["tool"], rows[0]["verdict"]) == ("ast_unverified", True)
+    detail = (
+        f"unverified too_large: src/app.ts not read or checked: its staged content is {size} bytes, "
+        "over the 0.000244141 MiB the pre-commit hook reads from git; "
+        "use target_paths to exclude generated bundles (aegis doctor)"
+    )
+    assert rows[0]["detail"] == detail
+    assert "exceeds 2 MiB" not in raw
+    assert main(["check", "--workspace", str(repo), "--hook"]) == 0
+    output = capsys.readouterr().out
+    assert detail in output and token not in output
+
+
 def test_a_crlf_checkout_of_a_committed_change_is_judged_against_the_same_base_as_an_lf_one(repo, capsys):
     """Given a branch commit that adds pickle.loads, when the file is checked out with core.autocrlf=true
     (Git for Windows' default) instead of LF, then the delta still finds what the branch added."""

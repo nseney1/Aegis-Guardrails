@@ -1,27 +1,27 @@
 {
-  "about": "Occurrences of the Soma-era vocabulary that remain; each count may only fall (tests/contract/test_legacy_ratchet.py). Words count in identifiers and non-docstring string literals of aegis_core, aegis_cli, aegis_mcp and aegis_sdk; contract_snapshots counts them in cli_tree.json and mcp_tools.json. Lower a record with: PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write",
+  "about": "Whole-tree text and path-name counts. All active counts are zero. The record writer can only lower counts; explicit exclusions require owner review.",
   "counts": {
-    "soma": 65,
-    "cell": 22,
+    "soma": 0,
+    "cell": 0,
     "genome": 0,
     "enzyme": 0,
-    "wall": 2,
-    "membrane": 2,
-    "vacuole": 2,
+    "wall": 0,
+    "membrane": 0,
+    "vacuole": 0,
     "organ": 0,
     "organelle": 0,
-    "telomere": 2,
-    "chloroplast": 2,
-    "plasmodesmata": 1,
-    "immune": 1,
+    "telomere": 0,
+    "chloroplast": 0,
+    "plasmodesmata": 0,
+    "immune": 0,
     "phylogeny": 0,
     "mitosis": 0,
     "apoptosis": 0,
-    "spore": 1,
-    "mycelium": 1,
-    "thorn": 1,
-    "bedrock": 1,
-    "mulch": 1,
+    "spore": 0,
+    "mycelium": 0,
+    "thorn": 0,
+    "bedrock": 0,
+    "mulch": 0,
     "nucleus": 0,
     "cytoplasm": 0,
     "ribosome": 0,
@@ -32,9 +32,1892 @@
     "organism": 0,
     "metabolism": 0,
     "homeostasis": 0,
-    "contract_snapshots": 5,
     "soma_imports": 0,
     "soma_classes": 0,
-    "organelle_type_literals": 0
-  }
+    "organelle_type_literals": 0,
+    "contract_snapshots": 0
+  },
+  "exempt_files": {
+    "docs/hierarchy-dogfood.md": "Hash-pinned evidence; requires an owner successor pin.",
+    "tests/contract/legacy_ratchet.json": "The ratchet word keys and explicit exemption/deferred evidence records.",
+    "tests/contract/public_names_4_3_3.json": "Historical public API baseline and explicit removal ledger; preserve the original names."
+  },
+  "exempt_patterns": {
+    "tests/fixtures/**": "Immutable fixture evidence; requires an owner successor pin."
+  },
+  "word_list_exemption": "Only the REQUIRED_WORDS assignment in tests/contract/test_legacy_ratchet.py is excluded from its source text.",
+  "ordinary_english": [
+    {
+      "file": "aegis_cli/ui/table.py",
+      "text": "    def add_row(self, *cells: Any) -> \"Table\":",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "aegis_cli/ui/table.py",
+      "text": "        str_cells = [str(c) for c in cells]",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "aegis_cli/ui/table.py",
+      "text": "    def add_row(self, *cells: Any) -> \"Grid\":",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "aegis_cli/ui/table.py",
+      "text": "        str_cells = [str(c) for c in cells]",
+      "occurrence": 1,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "`tools.apply_patch(\"…\")` call in the cell, with `source: \"code_mode\"`. A `cmd`",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "other argument is listed under `code_mode_unparsed`, with the reason. The cell's",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "only when the whole cell is a known shape: plain `text(await CALL);` statements,",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "the call that threw, and it ends a plain cell: the calls after it never ran and get",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "paths, wins: the cell adds no entry for that call.",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "docs/hierarchy-restart.md",
+      "text": "A code-mode call counts only where its cell's output is tied to it. An `unpaired`,",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "rules/.oracles/documentation.md",
+      "text": "- **Diagrams over Text**: Default to generating `mermaid.js` diagrams for state machines, sequence flows, or system architectures instead of writing walls of text. It is faster to comprehend and easier to maintain.",
+      "occurrence": 0,
+      "counts": {
+        "wall": 1
+      },
+      "reason": "Ordinary prose about long text paragraphs; no project metaphor."
+    },
+    {
+      "file": "tests/integration/hierarchy_fake_claude.py",
+      "text": "PROVIDERS = ((\"CLAUDE_CODE_USE_BEDROCK\", \"bedrock\"), (\"CLAUDE_CODE_USE_VERTEX\", \"vertex\"),",
+      "occurrence": 0,
+      "counts": {
+        "bedrock": 1
+      },
+      "reason": "Actual cloud-provider product and host environment variable; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_fake_claude.py",
+      "text": "    ({\"CLAUDE_CODE_USE_BEDROCK\": \"1\"}, \"third_party\", \"bedrock\"),",
+      "occurrence": 0,
+      "counts": {
+        "bedrock": 1
+      },
+      "reason": "Actual cloud-provider product and host environment variable; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_fake_claude.py",
+      "text": "    ({\"CLAUDE_CODE_USE_BEDROCK\": \"1\", \"ANTHROPIC_API_KEY\": \"sk-fake\"}, \"third_party\", \"bedrock\"),",
+      "occurrence": 0,
+      "counts": {
+        "bedrock": 1
+      },
+      "reason": "Actual cloud-provider product and host environment variable; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_hosts.py",
+      "text": "    _, problems = hierarchy_hosts.claude_auth_check(0, status(tmp_path, apiProvider=\"bedrock\"), tmp_path)",
+      "occurrence": 0,
+      "counts": {
+        "bedrock": 1
+      },
+      "reason": "Actual cloud-provider product and host environment variable; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_hosts.py",
+      "text": "    assert problems == [\"api provider 'bedrock' is not firstParty\"]",
+      "occurrence": 0,
+      "counts": {
+        "bedrock": 1
+      },
+      "reason": "Actual cloud-provider product and host environment variable; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "def cell(call, script):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    \"\"\"The cell's output: its header, one part per text() call and, after an uncaught throw, the Script error.\"\"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c0\", \"text(ALL_TOOLS.filter(x => /exec_command/.test(x.name)));\\n\"), printed(\"c0\", \"[]\"),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "                     cell(\"c1\", shell_call(attempt_command(\"in\")) + shell_call(attempt_command(\"out\"))),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", shell_call(attempt_command(\"in\")) + shell_call(attempt_command(\"out\"))),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "                     cell(\"c2\", patch_call(\"in\") + patch_call(\"out\")), completed_item(\"t1\", typed_patch),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "def test_a_script_error_ends_a_plain_cell_so_its_later_calls_never_ran(tmp_path):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", \"\".join(patch_call(target) for target in (\"in\", \"out\", \"git\", \"home\"))),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", caught(patch_call(\"git\")) + caught(patch_call(\"home\"))),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "                     cell(\"c2\", loop),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "                     cell(\"c3\", caught(shell_call(attempt_command(\"in\")))), printed(\"c3\", NOT_A_FUNCTION))",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "@pytest.mark.parametrize(\"case\", [\"fewer-parts\", \"other-statement\", \"running-cell\", \"no-output\", \"header-disagrees\",",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "                                                    \"output\": \"Script running with cell ID 4\\nWall time 31.0 seconds\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "        \"running-cell\": (two, running),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", script), *([] if output is None else [output]))",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", \"text(await tools.exec_command(%s));\\n\" % argument), printed(\"c1\", chunk(0, \"\")))",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", shell_call(attempt_command(\"out\"), options)),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", shell_call(\"sleep 600\", \",yield_time_ms:1000,max_output_tokens:1000\")),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", source), printed(\"c1\", *[chunk(0, \"echo\")] * source.count(\"tools.exec_command\")))",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "def test_code_mode_expansion_is_bounded_across_the_entire_cell(tmp_path):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    result = invoke(rollout(tmp_path, code_rows(cell(\"c1\", script))), \"events\")",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", shell_call(attempt_command(\"out\"), ',workdir:\"/tmp\"')),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", source), completed_item(\"t1\", typed),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", shell_call(attempt_command(\"out\"))),",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native.py",
+      "text": "    rows = code_rows(cell(\"c1\", source), printed(\"c1\", chunk(0, \"echo\")))",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native_probe.py",
+      "text": "    # The cell's first patch threw before its gitdir and CODEX_HOME patches ran; the model's caught retry tried them.",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native_probe.py",
+      "text": "    # The worktree write has a typed record, which wins over the cell's own output.",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/integration/test_hierarchy_native_probe.py",
+      "text": "def test_run_1s_wake_cell_that_reran_the_old_hold_cannot_be_tied_to_its_output(tmp_path):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "    cells = {}",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "            cells[f\"base/{tp}/{fp}\"] = fitness.compute({\"tp\": tp, \"fp\": fp, \"triggers\": tp + fp})",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "            cells[f\"adj/{tp}/{fp}\"] = fitness.compute({}, adjudicated_tp=tp, adjudicated_fp=fp, sessions_count=3,",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "        cells[f\"near/{base_fp}\"] = fitness.compute({\"fp\": base_fp, \"triggers\": base_fp}, adjudicated_tp=41,",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "            cells[f\"decay/{sessions}/{tp}/{fp}/trap\"] = fitness.compute(",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "    return cells",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "    cells = _decision_grid()",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "    decisions = json.dumps([[name, cells[name].state, cells[name].suggestion] for name in sorted(cells)])",
+      "occurrence": 0,
+      "counts": {
+        "cell": 3
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "    assert len(cells) == 7479",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_f_b2_credit_model_acceptance.py",
+      "text": "        assert sum(getattr(fit, name) for fit in cells.values()) == pytest.approx(recorded, abs=1e-3), name",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "An entry in the mathematical decision grid; no project metaphor."
+    },
+    {
+      "file": "tests/unit/core/test_message_codec.py",
+      "text": "def test_tsv_opt_in_escapes_cells_and_view_is_bounded():",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_message_codec.py",
+      "text": "    cells = [line.split(\"\\t\")[1] for line in output.splitlines() if line.startswith(\"@row\\t\")]",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_message_codec.py",
+      "text": "    assert len(set(cells)) == len(rows)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_message_codec.py",
+      "text": "    assert cells[3] == \"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_message_codec.py",
+      "text": "    assert [json.loads(cell) for i, cell in enumerate(cells) if i != 3] == [row[\"x\"] for row in rows if \"x\" in row]",
+      "occurrence": 0,
+      "counts": {
+        "cell": 3
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_rule_lint.py",
+      "text": "    cells = [r.split(\"|\")[1].strip() for r in rows[1:]]  # rows[0] is the header row",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tests/unit/core/test_rule_lint.py",
+      "text": "    return {(re.search(r\"\\((\\w+)\\)\", c) or re.match(r\"`?([\\w-]+)\", c)).group(1).lower() for c in cells}",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "A table field or table-field rendering variable; ordinary technical English."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "# a JavaScript cell. The cell calls tools.exec_command({cmd}) and tools.apply_patch(\"…\") and prints each result",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "# Every alternative consumes what it starts, an unterminated literal or comment up to its line or the cell's end, so",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "# a cell full of stray quotes is read in linear time; an unterminated literal never decodes.",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "class CellLimit(Unrecognized):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"\"\"(kind, text) tokens of a cell; whitespace and comments are dropped. A single-quoted or template literal is",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        raise CellLimit(\"code-mode cell exceeds %d calls\" % CODE_MODE_MAX_CALLS)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "def js_cell(tokens):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"\"\"The cell's calls in run order, if the whole cell is the statements js_statement reads, string arrays",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"\"\"Every exec_command and apply_patch call of a cell js_cell cannot read: (calls, unparsed). Their output cannot",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        except CellLimit:",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"\"\"(calls, paired, unparsed) of one cell: paired says each call prints exactly one output part in order.\"\"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        return js_cell(tokens), True, []",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        except CellLimit as exc:",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"Script running\" cell, a header that disagrees with the error part).\"\"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    ends the cell), or None when the parts cannot be tied one-to-one to the calls.\"\"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "def cover(open_cells, typed, shell):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    \"\"\"A typed item_completed record wins over the code-mode parse: mark the first open cell call of its turn that",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    it records (same command, or same paths) as covered, so the cell adds no second entry for it.\"\"\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        options = {option for cell in open_cells.values() if cell[\"turn\"] == typed[\"turn_id\"]",
+      "occurrence": 0,
+      "counts": {
+        "cell": 3
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "                   for call in cell[\"calls\"] if call[\"tool\"] == \"exec_command\"",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    for cell in open_cells.values():",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        if cell[\"turn\"] != typed[\"turn_id\"]:",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        for index, call in enumerate(cell[\"calls\"]):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "            if index in cell[\"covered\"] or call[\"tool\"] != (\"exec_command\" if shell else \"apply_patch\"):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "                cell[\"covered\"].add(index)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "def code_mode_close(cell, payload, witness, executions, patches):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    if payload is not None and cell[\"paired\"]:",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        results = None if parts is None else code_mode_results(cell[\"calls\"], parts)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    for index, call in enumerate(cell[\"calls\"]):",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        if index in cell[\"covered\"] or result == \"not_run\":",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        entry = code_mode_entry(call, result, cell[\"turn\"], cell[\"call_id\"], {**witness, \"call_line\": cell[\"line\"]})",
+      "occurrence": 0,
+      "counts": {
+        "cell": 3
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    its cell, source \"code_mode\"), and response_item custom_tool_call / function_call named apply_patch paired with",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    cell is a known statement shape, otherwise each call is listed with status \"unpaired\" and no result. A call to a",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    calls, cells = {}, {}",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "                    cells[call] = {\"calls\": found, \"paired\": paired, \"turn\": started_turn, \"call_id\": call,",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "            elif payload.get(\"type\") == \"custom_tool_call_output\" and isinstance(call, str) and call in cells:",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "                code_mode_close(cells.pop(call), payload, witness_of(path, number, raw, record), executions, patches)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "            cover(cells, (executions if shell else patches)[-1], shell)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "    for cell in cells.values():",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        # A cell with no output yet (a cut or still running turn): its calls are listed, none tied to a result.",
+      "occurrence": 0,
+      "counts": {
+        "cell": 1
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native.py",
+      "text": "        code_mode_close(cell, None, cell[\"witness\"], executions, patches)",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    },
+    {
+      "file": "tools/hierarchy_native_probe.py",
+      "text": "refusal) is UNEXPECTED. Codex code mode records count only where its cell's printed output ties to the call; a cell",
+      "occurrence": 0,
+      "counts": {
+        "cell": 2
+      },
+      "reason": "Code-execution unit and literal execution-stream timing fields; no project metaphor."
+    }
+  ],
+  "deferred": {
+    ".aegis/rules/boundaries/boundary-enzymes.md": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 2,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    ".aegis/rules/contracts/contract-integrity-index-canonical-form.md": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 1,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    ".gitignore": {
+      "reason": "STRIP-LEGACY-2: retained historical ignore names await coordinated removal; round 4 added four private-state protections without changing these names.",
+      "counts": {
+        "soma": 19,
+        "cell": 3,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 1,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "MANIFEST.in": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "NOTICE": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_cli/cli.py": {
+      "reason": "STRIP-LEGACY-2 (f6 lease): remove retained layout constant and _migratable checks, then remove dead refuse_unmigrated_v3 and unconverted_rule_files calls, including their doctor_base.py setup/fix callers; keep the v4 maintenance command.",
+      "counts": {
+        "soma": 7,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_cli/commands_table.py": {
+      "reason": "STRIP-LEGACY-2: the command surface and its frozen cli_tree.json snapshot are outside the round-1 lease.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 1,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/rules.py": {
+      "reason": "STRIP-LEGACY-2: the remaining historical type example is deferred; round 5 restores fail-closed directory classification only.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 1,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/verification/import_guard.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 2,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/workspace/layout.py": {
+      "reason": "STRIP-LEGACY-2: aegis_cli/cli.py still imports the historical constant; remove that import before deleting the constant and its public-name pin.",
+      "counts": {
+        "soma": 3,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "docs/reference.md": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 3,
+        "cell": 1,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 1,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/conftest.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 3,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/contract/cli_tree.json": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 3,
+        "cell": 1,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 1,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/cli/test_hook_run.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 2,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/core/test_packs.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 5,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/core/test_supercell_cells.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 3,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/core/test_v3_zero_legacy_invariants.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 2,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 1,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/mcp/test_mcp_argument_values.py": {
+      "reason": "STRIP-LEGACY-2: outside the round-1 admitted path list; source unchanged.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 2,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "tests/unit/cli/test_cli_removed_commands.py": {
+      "reason": "STRIP-LEGACY-2: retain the immune-init removed-command guard while commands_table.py still serves it.",
+      "counts": {
+        "soma": 0,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 2,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/ast/detect.py": {
+      "reason": "STRIP-LEGACY-2: preserve the retained layout constant in discovery skip lists until its coordinated removal and Breaking line.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/metrics.py": {
+      "reason": "STRIP-LEGACY-2: preserve the retained layout constant in discovery skip lists until its coordinated removal and Breaking line.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/verification/checkpoint_checks.py": {
+      "reason": "STRIP-LEGACY-2: preserve the retained layout constant in discovery skip lists until its coordinated removal and Breaking line.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_core/verification/call_graph.py": {
+      "reason": "STRIP-LEGACY-2: preserve the retained layout constant in discovery skip lists until its coordinated removal and Breaking line.",
+      "counts": {
+        "soma": 1,
+        "cell": 0,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    },
+    "aegis_cli/migrate.py": {
+      "reason": "STRIP-LEGACY-2: round 5b preserves migrate help at tip bytes so cli_tree.json and docs/reference.md stay unchanged; remove aegis migrate after MC-2 owns both generated artifacts.",
+      "counts": {
+        "soma": 4,
+        "cell": 3,
+        "genome": 0,
+        "enzyme": 0,
+        "wall": 0,
+        "membrane": 0,
+        "vacuole": 0,
+        "organ": 0,
+        "organelle": 0,
+        "telomere": 0,
+        "chloroplast": 0,
+        "plasmodesmata": 0,
+        "immune": 0,
+        "phylogeny": 0,
+        "mitosis": 0,
+        "apoptosis": 0,
+        "spore": 0,
+        "mycelium": 0,
+        "thorn": 0,
+        "bedrock": 0,
+        "mulch": 0,
+        "nucleus": 0,
+        "cytoplasm": 0,
+        "ribosome": 0,
+        "symbiosis": 0,
+        "germline": 0,
+        "phenotype": 0,
+        "genotype": 0,
+        "organism": 0,
+        "metabolism": 0,
+        "homeostasis": 0
+      }
+    }
+  },
+  "historical_sections": [
+    {
+      "file": "docs/why-aegis.md",
+      "start": "## Appendix B: Re-deriving the numbers",
+      "end": "## Planned, not shipped",
+      "reason": "Historical experiment and reproduction section."
+    },
+    {
+      "file": "CHANGELOG.md",
+      "reason": "Only these existing historical release sections and pre-1.0 history; new release headings are counted.",
+      "release_headings": [
+        "## [4.5.0] - 2026-11-02",
+        "## [4.4.0] - 2026-10-29",
+        "## [4.3.4] - 2026-10-20",
+        "## [4.3.3] - 2026-10-17",
+        "## [4.3.2] - 2026-10-17",
+        "## [4.3.1] - 2026-10-17",
+        "## [4.3.0] - 2026-10-17",
+        "## [4.2.0] - 2026-10-17",
+        "## [4.1.1] - 2026-10-17",
+        "## [4.1.0] - 2026-10-16",
+        "## [4.0.0] - 2026-10-16",
+        "## [3.3.0] — 2026-10-14 — \"Cryptographic Provenance, Declarative AST Rules, Telemetry Compaction, SARIF 2.1.0 & Multi-Platform Claude Desktop Support\"",
+        "## [3.2.0] — 2026-10-14 — \"Fortress Perimeter Hardening, Horizontal Skill Graph Wiring, O(1) Telemetry Caching & Full Documentation Overhaul\"",
+        "## [3.1.0] — 2026-10-14 — \"Architecture Hardening, Cryptographic Receipt Burn-Before-Compare & Canonical Aegis Taxonomy\"",
+        "## [3.0.0] — 2026-10-14 — \"Pure Aegis Clean-Slate Architecture & Zero-Dependency CLI UX\"",
+        "## [2.1.0] — 2026-10-14 — \"Pure Aegis Unification, Migration Bridge & aegis-guardrails Cutover\"",
+        "## [2.0.0] — 2026-10-14 — \"Soma-to-Aegis Unification & Architecture Rebrand\"",
+        "## [1.5.1] — 2026-10-14 — \"Subagent Delegation Governance & CI Supply Chain Hardening\"",
+        "## [1.5.0] — 2026-10-09 — \"Lifecycle Parity & Diagnostic Transparency\"",
+        "## [1.4.0] — 2026-10-09 — \"Cross-Platform Execution & Safe Claude Lifecycle\"",
+        "## [1.3.0] — 2026-10-08 — \"Unified CLI Command Architecture & Discovery\"",
+        "## [1.2.1] — 2026-10-08 — \"Git-Aware Polyglot Call Graph & Doctor Display Hotfix\"",
+        "## [1.2.0] — 2026-10-08 — \"Zero-Touch Genesis Polyglot Provisioning & Rust AST Driver\"",
+        "## [1.1.0] — 2026-10-08 — \"Language-Agnostic AST Verification via Normalized AST Drivers\"",
+        "## [1.0.0] — 2026-10-08 — \"General Availability & Production Governance Framework\"",
+        "## Before 1.0.0"
+      ]
+    },
+    {
+      "file": "governance/debrief_queue.jsonl",
+      "record_ids": [
+        "DEBRIEF-001",
+        "DEBRIEF-002",
+        "DEBRIEF-003",
+        "DEBRIEF-004",
+        "DEBRIEF-005",
+        "DEBRIEF-006",
+        "DEBRIEF-007",
+        "DEBRIEF-008"
+      ],
+      "reason": "Existing historical audit ids only; new ids and duplicate records are counted."
+    }
+  ],
+  "documented_removals": [
+    {
+      "file": "CHANGELOG.md",
+      "lines": [
+        "- Breaking: `.soma/` workspaces are no longer recognized. Archive them or convert them with v4.x `aegis migrate` before upgrading. Supported `.aegis/` rule maintenance and worktree-ledger merging remain available; retired v3 state is never converted by this version.",
+        "- Breaking: Checkpoint test discovery no longer strips a `soma_` prefix when pairing source modules with tests.",
+        "- Breaking: `aegis doctor` no longer reports or fixes `soma` MCP registrations, legacy hooks or `SOMA` blocks.",
+        "- Breaking: `aegis uninstall` leaves `soma` registrations and hook blocks in place for manual removal.",
+        "- Breaking: Cell-keyed ledger rows (`cell`, `cell_id`, `cells_used`) are no longer read; supported rows must identify rules with the v4 keys.",
+        "- Breaking: aegis_cli.hooks.management.SOMA_HOOK_FORMAT was removed with retired workspace support.",
+        "- Breaking: aegis_cli.init.SOMA_HOOK_FORMAT was removed with retired workspace support.",
+        "- Breaking: aegis_core.verification.checkpoint_checks.LEGACY_SOMA_DIRNAME was removed with retired workspace support.",
+        "- Breaking: aegis_core.workspace.discovery.LEGACY_SOMA_UPGRADE_MSG was removed with retired workspace support."
+      ],
+      "reason": "Only owner-requested Unreleased Breaking lines containing the tracked vocabulary; unrelated Breaking lines need no exemption."
+    }
+  ],
+  "ordinary_patterns": [
+    "(?i:(?:javascript|code[ _-]mode|code|execution|exec)[ _-]+cells?)",
+    "(?i:(?:table|str|rendered|json|tsv)[ _-]+cells?)",
+    "(?i:known[ _-]+cell[ _-]+shapes?)",
+    "(?i:wall[ _-]+of[ _-]+(?:text|prose))",
+    "(?i:wall[ _-]?(?:clock|time))",
+    "CLAUDE_CODE_USE_BEDROCK"
+  ]
 }

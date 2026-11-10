@@ -2,8 +2,8 @@
 
 The 12 lifecycle and telemetry entry points spelled the same inline idiom,
 ``Workspace(root=Path(x).resolve())``. A literal path means exactly that directory:
-no AEGIS_WORKSPACE override, no walk-up to an ancestor workspace, no legacy .soma
-refusal, and a symlinked path is accepted (Workspace.for_init would refuse it).
+no AEGIS_WORKSPACE override, no walk-up to an ancestor workspace, and no requirement
+that rules already exist. A symlinked path is accepted and resolved.
 """
 from __future__ import annotations
 
@@ -36,9 +36,9 @@ def test_the_environment_pin_does_not_redirect_an_explicit_path(nested: Path, tm
     assert literal_workspace(nested).root == nested.resolve()
 
 
-def test_a_legacy_soma_directory_is_not_refused(tmp_path: Path):
-    (tmp_path / ".soma" / "cells").mkdir(parents=True)
+def test_an_uninitialized_literal_directory_does_not_create_state(tmp_path: Path):
     assert literal_workspace(tmp_path).root == tmp_path.resolve()
+    assert not (tmp_path / ".aegis").exists()
 
 
 def test_a_symlinked_path_is_accepted_and_resolved(tmp_path: Path):

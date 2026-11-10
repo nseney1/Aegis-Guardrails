@@ -1,4 +1,4 @@
-"""Tests for centralized test runner discovery in soma_core/verification/test_runner.py."""
+"""Tests for centralized test runner discovery in aegis_core/verification/test_runner.py."""
 from __future__ import annotations
 
 import os
@@ -170,6 +170,3 @@ class TestDiscoverTestEvidence:
                 mock_run.return_value = subprocess.CompletedProcess(["pytest"], 0, stdout="", stderr="")
                 names, results = discover_test_evidence([str(bad_file)], str(tmp_path))
                 assert names == []
-
-
-

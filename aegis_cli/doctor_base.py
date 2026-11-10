@@ -25,8 +25,6 @@ from aegis_core.primitives import real_key, strict_loads
 SCHEMA = "aegis.doctor/v1"
 SOURCE = "aegis doctor"
 SERVER = "aegis"
-# The v3 server name; v4 registers only "aegis" and doctor --fix removes this one.
-LEGACY_SERVER = "soma"
 # Hosts that silently keep only the start of an over-budget instruction file: Codex at
 # its 32 KiB project_doc_max_bytes, Antigravity at 24,000 bytes per file (host-matrix
 # §1-§2, verified 2026-10-15). A block that ends within the budget still arrives; for
@@ -38,7 +36,6 @@ _REGISTRY_BOUND = frozenset({"antigravity"})
 # Hosts that read AGENTS.override.md instead of AGENTS.md at the same level.
 _READS_AGENTS_OVERRIDE = frozenset({"codex-cli"})
 _FIX_HINT = "aegis doctor --fix"
-_LEGACY_ENTRY = f"stale v3 '{LEGACY_SERVER}' MCP server"
 
 # A registered command, as doctor compares it: (host id, argv as the host config holds it).
 Registered = Tuple[str, Sequence[str]]
@@ -679,7 +676,7 @@ def _location(keys: Tuple[str, ...]) -> str:
 
 # ── v3 leftovers: hook entries and rule blocks ──────────────────────────────
 
-# A token after which the shell starts a new command (a v3 entry may be `cd x && soma hook ...`).
+# A token after which the shell starts a new command (a v3 entry may be `cd x && aegis hook ...`).
 _COMMAND_STARTERS = frozenset({"&&", "||", "|", ";", "&", "!", "(", "{", "then", "do", "else", "exec"})
 
 
@@ -712,8 +709,6 @@ def _is_legacy_handler(handler: Any, phases: frozenset) -> bool:
     for index, token in enumerate(tokens[:-1]):
         if starts and tokens[index + 1] == "hook":
             program = _program_name(token)
-            if program == LEGACY_SERVER:
-                return True
             if program == "aegis" and index + 2 < len(tokens) and tokens[index + 2].rstrip(";&|") in phases:
                 return True
         starts = token in _COMMAND_STARTERS or token.endswith((";", "&", "|"))
@@ -759,11 +754,11 @@ def _list_location(path: Tuple[Any, ...], index: int) -> str:
     return f"{out}[{index}]"
 
 
-_LEGACY_MARKER = re.compile(r"^<!-- (SOMA|AEGIS):(START|END) -->[ \t]*$")
+_LEGACY_MARKER = re.compile(r"^<!-- (AEGIS):(START|END) -->[ \t]*$")
 
 
 def _legacy_ranges(text: str) -> Tuple[List[Tuple[int, int]], bool]:
-    """(line ranges of well-formed SOMA/AEGIS START..END blocks, markers are balanced).
+    """(line ranges of well-formed AEGIS START..END blocks, markers are balanced).
 
     Markers shown inside a fenced code block are text, not a block. Inside an open block
     the content is v3's own (rule text with its fences), so only its END marker counts.
