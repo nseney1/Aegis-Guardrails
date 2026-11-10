@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core.ast import policy
+from aegis_core.ast import policy, schema
 from aegis_core.ast.drivers import python as python_driver
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast, parse_allow_comments
@@ -196,6 +196,7 @@ def python_parse_calls(monkeypatch):
     local_ast.parse = parse
     monkeypatch.setattr(policy, "ast", local_ast)
     monkeypatch.setattr(python_driver, "ast", local_ast)
+    monkeypatch.setattr(schema, "ast", local_ast)
     return calls
 
 
@@ -300,3 +301,65 @@ def test_python_unsafe_encoding_is_refused_before_parsing(tmp_path, python_parse
     if entrypoint == "policy":
         assert error.value.code == "AST_UNVERIFIABLE"
         assert type(error.value.__cause__) is UnicodeError
+
+
+@pytest.mark.parametrize("working_tree", [
+    "def plain():\n    pass\n",
+    "@forbidden.deco\ndef plain():\n    pass\n",
+    "def (:\n",
+    None,
+], ids=["plain", "decorated", "broken", "missing"])
+@pytest.mark.parametrize("roundtrip", [False, True], ids=["parsed", "serialized"])
+def test_python_decorator_free_supplied_text_is_authoritative(
+    tmp_path, python_parse_calls, working_tree, roundtrip,
+):
+    target = tmp_path / "staged.py"
+    if working_tree is not None:
+        target.write_bytes(working_tree.encode("utf-8"))
+    staged = "def plain():\n    pass\n"
+    tree = extract_normalized_ast(target, code=staged)
+    if roundtrip:
+        tree = NormalizedAST.from_json(tree.to_json())
+
+    for forbidden in (["forbidden.deco"], ["another.deco"]):
+        assert evaluate_forbid_ast_structured(tree, {"decorators": forbidden}, source=staged) == []
+    assert tree.decorators == ()
+    assert python_parse_calls == [(staged, str(target))]
+    assert tree.to_dict()["metadata"]["decorators"] == []
+
+
+def test_python_decorator_free_file_evaluation_never_reparses(tmp_path, python_parse_calls):
+    target = tmp_path / "plain.py"
+    source = "def plain():\n    pass\n"
+    target.write_bytes(source.encode("utf-8"))
+    tree = extract_normalized_ast(target)
+
+    for forbidden in (["forbidden.deco"], ["another.deco"]):
+        assert evaluate_forbid_ast_structured(tree, {"decorators": forbidden}) == []
+    assert python_parse_calls == [(source, str(target))]
+
+
+@pytest.mark.parametrize("endings", [
+    ("\r", "\r", "\r", "\r"),
+    ("\r", "\r\n", "\n", "\r"),
+    ("\r\n", "\r", "\r", "\n"),
+], ids=["cr-only", "mixed-cr-first", "mixed-crlf-first"])
+def test_python_allow_comments_use_parser_line_numbers(endings):
+    lines = [
+        "# coding: utf-8",
+        "import subprocess",
+        'subprocess.run("ls", shell=True) # aegis: allow[rule] reviewed',
+        'subprocess.run("pwd", shell=True)',
+    ]
+    source = "".join(line + ending for line, ending in zip(lines, endings))
+    tree = extract_normalized_ast("cr.py", code=source)
+    assert parse_allow_comments(source) == {3: [{"rules": {"rule"}, "reason": "reviewed"}]}
+    assert tree.metadata["allow_comments"] == {3: [{"rules": ["rule"], "reason": "reviewed"}]}
+    for text in (None, source):
+        findings = evaluate_forbid_ast_structured(
+            tree, {"calls": ["subprocess.run"]}, rule_id="rule", source=text,
+        )
+        assert [(f["line"], f["override"]) for f in findings] == [(3, "reviewed"), (4, None)]
+        assert evaluate_forbid_ast_structured(
+            tree, {"calls": ["subprocess.run"]}, rule_id="other", source=text,
+        )[0]["override"] is None
