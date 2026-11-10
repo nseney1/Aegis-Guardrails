@@ -478,32 +478,6 @@ def test_an_unregistered_host_without_the_bootstrap_has_no_enforcement(env):
 
 # ── warnings (findings) ─────────────────────────────────────────────────────
 
-def test_stale_soma_and_misplaced_aegis_entries_are_reported_where_they_are(env):
-    env.all_ok()
-    env.claude_json({
-        "mcpServers": {"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
-                       "soma": {"command": "soma-mcp"}},
-        "projects": {"/elsewhere": {"mcpServers": {"soma": {"command": "soma-mcp"},
-                                                   "aegis": {"command": "aegis-mcp"}}}}})
-    (env.home / ".mcp.json").write_text(json.dumps({"mcpServers": {"soma": {}, "aegis": {}}}))
-    (env.ws / ".mcp.json").write_text(json.dumps({"mcpServers": {"soma": {}, "other": {}}}))
-    desktop = env.home / ".config" / "Claude" / "claude_desktop_config.json"
-    desktop.parent.mkdir(parents=True)
-    desktop.write_text(json.dumps({"mcpServers": {"aegis": {"command": "aegis-mcp"}, "soma": {}}}))
-    payload = env.doctor()
-    got = sorted((f["code"], Path(f["path"]).name, f["location"]) for f in payload["findings"])
-    assert got == sorted([
-        ("legacy_mcp_entry", ".claude.json", "mcpServers.soma"),
-        ("legacy_mcp_entry", ".claude.json", "projects[/elsewhere].mcpServers.soma"),
-        ("misplaced_mcp_entry", ".claude.json", "projects[/elsewhere].mcpServers.aegis"),
-        ("legacy_mcp_entry", ".mcp.json", "mcpServers.soma"),
-        ("misplaced_mcp_entry", ".mcp.json", "mcpServers.aegis"),
-        ("legacy_mcp_entry", ".mcp.json", "mcpServers.soma"),
-        ("desktop_mcp_entry", "claude_desktop_config.json", "mcpServers.aegis"),
-        ("legacy_mcp_entry", "claude_desktop_config.json", "mcpServers.soma"),
-    ])
-    assert all(f["fixable"] for f in payload["findings"])
-
 
 def test_a_misplaced_aegis_entry_is_not_fixable_while_no_user_registration_replaces_it(env):
     env.claude_registered()
@@ -526,13 +500,13 @@ def test_a_local_scope_registration_alone_is_a_registration_not_a_finding(env):
 def test_legacy_marker_blocks_are_reported_in_project_and_global_instruction_files(env):
     env.all_ok()
     (env.ws / "CLAUDE.md").write_text(
-        "@AGENTS.md\n\n<!-- SOMA:START -->\n# Soma Governance Rules\nold\n<!-- SOMA:END -->\n", encoding="utf-8")
+        "@AGENTS.md\n\n<!-- AEGIS:START -->\n# Aegis Governance Rules\nold\n<!-- AEGIS:END -->\n", encoding="utf-8")
     glob_claude = env.home / ".claude" / "CLAUDE.md"
     glob_claude.parent.mkdir()
     glob_claude.write_text("mine\n<!-- AEGIS:START -->\nrules\n<!-- AEGIS:END -->\n", encoding="utf-8")
     broken = env.home / ".codex" / "AGENTS.md"
     broken.parent.mkdir()
-    broken.write_text("<!-- SOMA:START -->\nno end\n", encoding="utf-8")
+    broken.write_text("<!-- AEGIS:START -->\nno end\n", encoding="utf-8")
     found = {(Path(f["path"]), f["code"], f["fixable"]) for f in env.doctor()["findings"]}
     assert (env.ws / "CLAUDE.md", "legacy_block", True) in found
     assert (glob_claude, "legacy_block", True) in found
@@ -914,12 +888,12 @@ def test_a_workspace_path_with_control_sequences_is_reported_without_them(env, t
     import shutil
     hostile = tmp_path / "repo\x1b[2J\x1b]0;pwn\x07"
     shutil.copytree(str(env.ws), str(hostile))
-    (hostile / "CLAUDE.md").write_text("@AGENTS.md\n<!-- SOMA:START -->\nold\n<!-- SOMA:END -->\nmine\n",
+    (hostile / "CLAUDE.md").write_text("@AGENTS.md\n<!-- AEGIS:START -->\nold\n<!-- AEGIS:END -->\nmine\n",
                                        encoding="utf-8")
     payload = json.loads(env.run(json=True, workspace=str(hostile))[1])
     (finding,) = [f for f in payload["findings"] if f["code"] == "legacy_block"]
     assert "\x1b" not in finding["message"] and "\x07" not in finding["message"]
-    assert "legacy Aegis/Soma rules block" in finding["message"]
+    assert "legacy Aegis rules block" in finding["message"]
     rc, out = env.run(workspace=str(hostile))
     warnings = out[out.index("Warnings:"):]
     assert "\x1b" not in warnings and "\x07" not in warnings
@@ -956,15 +930,15 @@ def test_a_byte_order_mark_before_the_bootstrap_block_is_not_a_broken_block(env)
 def test_legacy_markers_shown_inside_a_code_fence_are_not_a_block(env):
     env.all_ok()
     (env.ws / "CLAUDE.md").write_text(
-        "@AGENTS.md\n\nThe v3 block looked like this:\n\n```md\n<!-- SOMA:START -->\nrules\n"
-        "<!-- SOMA:END -->\n```\n", encoding="utf-8")
+        "@AGENTS.md\n\nThe v3 block looked like this:\n\n```md\n<!-- AEGIS:START -->\nrules\n"
+        "<!-- AEGIS:END -->\n```\n", encoding="utf-8")
     assert "legacy_block" not in finding_codes(env.doctor())
 
 
 def test_a_legacy_block_with_an_unclosed_fence_inside_is_still_one_block(env):
     env.all_ok()
     path = env.ws / "CLAUDE.md"
-    path.write_text("@AGENTS.md\n<!-- SOMA:START -->\n```python\nunclosed\n<!-- SOMA:END -->\nmine\n",
+    path.write_text("@AGENTS.md\n<!-- AEGIS:START -->\n```python\nunclosed\n<!-- AEGIS:END -->\nmine\n",
                     encoding="utf-8")
     (finding,) = [f for f in env.doctor()["findings"] if f["code"] == "legacy_block"]
     assert finding["fixable"] is True and finding["location"] == "lines 2-5"
@@ -973,7 +947,7 @@ def test_a_legacy_block_with_an_unclosed_fence_inside_is_still_one_block(env):
 def test_a_byte_order_mark_before_a_legacy_block_is_still_a_fixable_block(env):
     env.all_ok()
     path = env.ws / "GEMINI.md"
-    path.write_bytes(b"\xef\xbb\xbf<!-- SOMA:START -->\nrules\n<!-- SOMA:END -->\nmine\n")
+    path.write_bytes(b"\xef\xbb\xbf<!-- AEGIS:START -->\nrules\n<!-- AEGIS:END -->\nmine\n")
     (finding,) = [f for f in env.doctor()["findings"] if f["code"] == "legacy_block"]
     assert finding["fixable"] is True and finding["location"] == "lines 1-3"
 
@@ -1016,7 +990,7 @@ def test_a_hostile_workspace_path_is_never_printed_raw_even_by_fix(env, tmp_path
     env.claude_registered()
     hostile = tmp_path / "repo\x1b[2J\x1b]0;pwn\x07"
     shutil.copytree(str(env.ws), str(hostile))
-    (hostile / "GEMINI.md").write_text("<!-- SOMA:START -->\nold\n<!-- SOMA:END -->\nmine\n", encoding="utf-8")
+    (hostile / "GEMINI.md").write_text("<!-- AEGIS:START -->\nold\n<!-- AEGIS:END -->\nmine\n", encoding="utf-8")
     rc, out = env.run(workspace=str(hostile))
     assert "aegis doctor" in out and _control(out) == []
     rc, out = env.run(workspace=str(hostile), fix=True, yes=True)
@@ -1696,7 +1670,7 @@ def test_from_home_no_source_file_under_it_is_taken_for_a_project(env):
     assert not any(f.get("action", "").startswith("enable") for f in payload.get("fixes", []))
 
 
-# ── v4.0.0 release review: the floor must be reachable, a .soma workspace migrates ──
+# ── v4.0.0 release review: the floor must be reachable, a .aegis workspace migrates ──
 
 def _install_current_hook(env: Env) -> Path:
     from aegis_cli.hooks.management import generate_hook_block
@@ -1811,32 +1785,6 @@ def test_the_best_effort_tier_without_host_hooks_is_inactive_and_names_the_insta
                               "run aegis hook install --host <host>")
 
 
-def test_a_legacy_workspace_without_rules_is_told_to_migrate_never_to_init(env, tmp_path, monkeypatch, capsys):
-    """Release review (upgrade): `aegis init` in a .soma workspace leaves its rules unserved.
-    Run through the CLI, which lets doctor (and only doctor and uninstall) into one."""
-    from aegis_cli.cli import main
-
-    env.all_ok()
-    legacy = tmp_path / "legacy"
-    (legacy / ".soma" / "cells" / "traps").mkdir(parents=True)
-    (legacy / ".soma" / "cells" / "traps" / "trap-x.md").write_text("---\nid: trap-x\n---\n# x\n", encoding="utf-8")
-    (legacy / ".git" / "hooks").mkdir(parents=True)
-    monkeypatch.chdir(legacy)
-    main(["doctor"])
-    out = capsys.readouterr().out
-    assert "Fix: Run 'aegis migrate' to see how this v3 workspace converts, then 'aegis migrate --apply'." in out
-    assert f"{legacy.resolve()} has no .aegis/: run aegis migrate there" in out
-    assert "a pre-commit hook has nothing to enforce: run aegis migrate" in out
-    for setup_advice in ("Run 'aegis init'", "run aegis init there", "nothing to enforce: run aegis init"):
-        assert setup_advice not in out
-    plain = tmp_path / "plain"
-    (plain / ".git" / "hooks").mkdir(parents=True)
-    monkeypatch.chdir(plain)
-    main(["doctor"])
-    out = capsys.readouterr().out
-    assert "Fix: Run 'aegis init' to install starter rules." in out and "aegis migrate" not in out
-
-
 # ── unmigrated v3 state (discovery.unmigrated_state, from the gate/upgrade lane) ──
 
 V3_STATE = [".aegis/evidence/signals.jsonl", "aegis.conf"]
@@ -1856,7 +1804,7 @@ def test_pending_worktree_ledger_rows_are_a_warning_that_names_aegis_migrate(env
     assert "worktree_ledger_pending" not in finding_codes(env.doctor())
 
 
-def test_unmigrated_v3_state_is_a_warning_that_names_the_files_and_aegis_migrate(env, monkeypatch):
+def test_unmigrated_v3_state_names_the_files_and_manual_archive_action(env, monkeypatch):
     """status, scan and sync refuse a workspace with v3 state v4 never reads; doctor, which
     still runs there, says so instead of reporting a healthy workspace."""
     from aegis_core.workspace import discovery
@@ -1875,12 +1823,13 @@ def test_unmigrated_v3_state_is_a_warning_that_names_the_files_and_aegis_migrate
     assert finding["severity"] == "warning" and finding["fixable"] is False
     assert Path(finding["path"]) == env.ws.resolve() / ".aegis" / "evidence" / "signals.jsonl"
     assert finding["message"] == (
-        "unmigrated v3 state: .aegis/evidence/signals.jsonl, aegis.conf. Aegis v4 does not read it, and "
-        "aegis status, scan and sync refuse to run until it is converted: run aegis migrate to see the "
-        "conversion, then aegis migrate --apply")
+        f"Unsupported v3 state at {env.ws.resolve()}: .aegis/evidence/signals.jsonl, aegis.conf. "
+        "Archive these paths outside the workspace, preserving any settings or evidence you need. "
+        "Then configure .aegis/config.json with the supported settings before running Aegis again; "
+        "aegis migrate does not convert these paths.")
     assert payload["summary"]["warnings"] >= 1
     rc, out = env.run()
-    assert "unmigrated v3 state: .aegis/evidence/signals.jsonl, aegis.conf" in out.split("Warnings:")[1]
+    assert finding["message"] in out.split("Warnings:")[1]
 
 
 def test_no_unmigrated_state_means_no_upgrade_warning(env, monkeypatch):

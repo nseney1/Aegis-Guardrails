@@ -4,6 +4,27 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Breaking: `.soma/` workspaces are no longer recognized. Archive them or convert them with v4.x `aegis migrate` before upgrading. Supported `.aegis/` rule maintenance and worktree-ledger merging remain available; retired v3 state is never converted by this version.
+- Breaking: The newly refused retired v3 state paths are `.aegis/receipt_key`, `.aegis/evidence/fitness.jsonl`, `.aegis/evidence/sessions_processed.jsonl` and `.aegis/manifest.json`. Current v4 writers use protected `state/` paths instead.
+- Breaking: Checkpoint test discovery no longer strips a `soma_` prefix when pairing source modules with tests.
+- Breaking: Rule-type alias directories (such as `invariant/` or `Invariants/`) fail closed for any frontmatter; `aegis migrate` normalizes them. Other non-canonical rule directories fail closed for rule-like frontmatter (`id`, `enforcement`, `type`, `target_paths` or `forbid_ast`); title-only notes there remain ignored-file warnings.
+- Breaking: `aegis doctor` no longer reports or fixes `soma` MCP registrations, legacy hooks or `SOMA` blocks.
+- Breaking: `aegis uninstall` leaves `soma` registrations and hook blocks in place for manual removal.
+- Breaking: Cell-keyed ledger rows (`cell`, `cell_id`, `cells_used`) are no longer read; supported rows must identify rules with the v4 keys.
+- Breaking: `refuse_unmigrated_v3` and `unconverted_rule_files` are compatibility no-ops until STRIP-LEGACY-2 removes their remaining callers and public names.
+
+- Breaking: aegis_cli.hooks.management.SOMA_HOOK_FORMAT was removed with retired workspace support.
+- Breaking: aegis_cli.init.SOMA_HOOK_FORMAT was removed with retired workspace support.
+- Breaking: aegis_core.verification.checkpoint_checks.LEGACY_SOMA_DIRNAME was removed with retired workspace support.
+- Breaking: aegis_core.workspace.layout.LEGACY_PREDECESSOR_LEDGER was removed with retired workspace support.
+- Breaking: aegis_core.workspace.layout.LEGACY_RULE_DIRS was removed with retired workspace support.
+- Breaking: aegis_core.taxonomy.LEGACY_TYPE_NAMES was removed with retired workspace support.
+- Breaking: aegis_core.taxonomy.LEGACY_REVIEW_PRONG_ALIASES was removed with retired workspace support.
+- Breaking: aegis_cli.install_hosts.LEGACY_SERVER_NAME was removed with retired workspace support.
+- Breaking: aegis_core.workspace.discovery.LEGACY_SOMA_UPGRADE_MSG was removed with retired workspace support.
+
 ### Added
 
 - Isolated manager workspace audit prototype: explicit `aegis workspace` commands and a separately pinned manager MCP registration serve owner-approved management rules across Aegis worktrees. Signed activation, immutable decisions, confined audit replay and qualified evidence remain separate from repository fitness; every outcome earns zero credit. Native Teams enforcement and the 4.7 release gates remain open.
@@ -19,6 +40,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `tools/hierarchy_team.py` runs one team from setup to cleanup from one config (`team-run.json`, `aegis.team-run/v1`) with nine subcommands: `init`, `login`, `root`, `up`, `request`, `approve`, `turn`, `status` and `down`. `up` writes `<base>/team.json`, so roles run at its model and effort, and checks each role's rollout; `approve` is one ROOT turn that reads the hash through `team_pending`; `turn` gives a role one owner turn, for example to answer a `silent_role` hold; `down` collects the evidence with `SHA256SUMS` and releases what the run holds. See `docs/hierarchy-team.md`. The M1 runbook now uses it.
 
 - `aegis msg read / write / verify` exposes the `aegis.msg/1` codec through the CLI, with compact views, code-authored spans and metadata, and fixed JSON errors.
+- `aegis_msg_read` and `aegis_msg_write` expose the shared message codec over MCP, with workspace-bound stores, verbatim bounded views matching the CLI, code-authored metadata, and fixed JSON refusals.
 
 ### Fixed
 

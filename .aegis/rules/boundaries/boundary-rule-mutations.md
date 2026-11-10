@@ -1,5 +1,5 @@
 ---
-id: boundary-genome-mutations
+id: boundary-rule-mutations
 domain: governance
 type: boundary
 enforcement: advisory

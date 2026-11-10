@@ -1,6 +1,6 @@
 """R-checks-37: the step summary renders finding text from the pull request as inert data. Every
 value sits in a CommonMark code span (the one inline form in which nothing is parsed), one table
-row per finding with one cell per column, so no heading, link, image or HTML comes from the data."""
+row per finding with one rule per column, so no heading, link, image or HTML comes from the data."""
 from __future__ import annotations
 
 import re
@@ -43,7 +43,7 @@ def _outside_spans(text: str) -> str:
 
 
 def _columns(row: str, escapes: bool) -> list:
-    """The cells of a GFM table row: ``escapes`` honours a backslash before any character (cmark-gfm),
+    """The rules of a GFM table row: ``escapes`` honours a backslash before any character (cmark-gfm),
     otherwise only ``\\|`` is an escaped pipe (the naive reading)."""
     body = row.strip()[1:-1] if row.strip().startswith("|") and row.strip().endswith("|") else row
     cols, cur, i = [], "", 0

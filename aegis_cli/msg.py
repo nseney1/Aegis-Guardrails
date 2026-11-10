@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import datetime, timezone
 import json
 import sys
@@ -12,15 +13,6 @@ from aegis_core.errors import WorkspaceError
 __all__ = ["MsgCommand", "MsgArgumentError", "KINDS", "emit_error"]
 
 KINDS = ("text", "record", "log", "blob", "review.v1", "prereview.v1", "handoff.v1", "leadreport.v1")
-_MESSAGES = {
-    "arguments": "invalid arguments; see aegis msg ACTION --help",
-    "workspace": "workspace is not initialized; run aegis init",
-    "binding": "workspace binding refused; check --workspace / AEGIS_WORKSPACE",
-    "root": "workspace root refused; choose a project directory",
-    "attachment": "workspace attachment unavailable; check permissions",
-    "input": "input file unreadable",
-    "write_ref": "write reference must be a full 64-hex id present in the target store",
-}
 
 
 class MsgArgumentError(ValueError):
@@ -28,10 +20,10 @@ class MsgArgumentError(ValueError):
 
 
 def emit_error(error, *, detail=None) -> int:
-    """Errors contain only fixed text; front-end guidance stays outside the core."""
-    value = error.as_dict()
-    if detail in _MESSAGES:
-        value["error"]["message"] = _MESSAGES[detail]
+    """Errors contain only the shared core's fixed next-action guidance."""
+    from aegis_core.message_codec_format import frontend_error
+
+    value = frontend_error(error, detail=detail)
     print(json.dumps(value, separators=(",", ":")))
     return 2
 
@@ -46,54 +38,12 @@ def _content(filename, maximum):
         return source.read(maximum + 1)
 
 
-def _selectors(groups):
-    """Bound selector ranges before slicing; projection commas stay literal."""
-    from aegis_core.message_codec_format import MAX_SELECTORS, require
-
-    parts = []
-    for expression in groups:
-        depth, start = 0, 0
-        for index, char in enumerate(expression):
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-            elif char == "," and depth == 0:
-                require(len(parts) < MAX_SELECTORS and index - start <= 1024, "E_SELECTOR")
-                parts.append((expression, start, index))
-                start = index + 1
-        require(len(parts) < MAX_SELECTORS and len(expression) - start <= 1024, "E_SELECTOR")
-        parts.append((expression, start, len(expression)))
-    return [expression[start:stop] for expression, start, stop in parts]
-
-
-def _read_integer(value, limit, code):
-    from aegis_core.message_codec_format import INDEX, require
-
-    require(type(value) is str and 0 < len(value) <= len(str(limit)) and INDEX.fullmatch(value), code)
-    parsed = int(value)
-    require(parsed <= limit, code)
-    return parsed
-
-
 def _open_store(args):
     from aegis_core import message_codec as codec, storage
-    from aegis_core.primitives import is_within
 
     if args.store is not None:
-        return codec.Store(args.store)
-    layout = args.ws.layout
-    if args.msg_action == "write":
-        directory = storage.state_dir(args.ws) / "messages"
-        directory.mkdir(mode=0o700, exist_ok=True)
-    else:
-        if (layout.aegis_dir.is_symlink() or layout.state_dir.is_symlink()
-                or not is_within(layout.state_dir, layout.root, unresolvable=False)):
-            raise codec.CodecError("E_AUTH")
-        directory = layout.state_dir / "messages"
-        if not directory.exists() and not directory.is_symlink():
-            raise codec.CodecError("E_REF", detail="resolution")
-    return codec.Store(directory)
+        return closing(codec.Store(args.store))
+    return storage.message_store(args.ws, write=args.msg_action == "write")
 
 
 class MsgCommand(AegisCommand):
@@ -169,7 +119,9 @@ class MsgCommand(AegisCommand):
             if not is_aegis_workspace(args.ws.root):
                 return emit_error(codec.CodecError("E_AUTH"), detail="workspace")
             if args.msg_action == "read":
-                selectors = _selectors(args.fields)
+                options = codec.preflight_read(True, selectors=args.fields, spans=args.spans, outline=args.outline,
+                                               since=args.since, expand=args.expand, format=args.format,
+                                               max_chars=args.max_chars).options
             # Validate caller content before creating even the default store.
             if args.msg_action == "write":
                 try:
@@ -181,8 +133,7 @@ class MsgCommand(AegisCommand):
                 value = codec.compose(args.kind, payload,
                                       {"from": "cli", "host": "cli", "session": "",
                                        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
-            store = _open_store(args)
-            try:
+            with _open_store(args) as store:
                 if args.msg_action == "write":
                     for rid in value["refs"].values():
                         store.resolve(rid)
@@ -194,22 +145,11 @@ class MsgCommand(AegisCommand):
                         rid = codec.record_id(value)
                         print(json.dumps({"id": rid, "ref": rid[:16], "verified": True}, separators=(",", ":")))
                     else:
-                        from aegis_core.message_codec_format import MAX_NODES, MAX_OUTPUT_CHARS, MAX_SPANS, require
-
-                        require(len(args.spans) <= MAX_SPANS, "E_SPAN")
-                        spans = [_read_integer(n, MAX_NODES - 1, "E_SPAN") for n in args.spans]
-                        max_chars = _read_integer(args.max_chars, MAX_OUTPUT_CHARS, "E_LIMIT")
-                        rendered = codec.read_view(value, selectors=selectors,
-                                                   spans=spans,
-                                                   outline=args.outline, since=args.since,
-                                                   expand=args.expand, store=store, format=args.format,
-                                                   max_chars=max_chars)
+                        rendered = codec.read_view(value, store=store, **options)
                         sys.stdout.write(rendered)
-            finally:
-                store.close()
             return 0
         except codec.CodecError as error:
-            detail = "write_ref" if args.msg_action == "write" and error.code == "E_REF" else None
+            detail = "write_ref" if args.msg_action == "write" and error.code == "E_REF" else error.detail
             return emit_error(error, detail=detail)
         except WorkspaceError:
             return emit_error(codec.CodecError("E_AUTH"))

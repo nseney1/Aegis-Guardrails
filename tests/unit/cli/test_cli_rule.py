@@ -281,16 +281,16 @@ def test_rule_list_long_id_not_truncated_and_colored(tmp_path, capsys):
     assert "\x1b[" not in out_plain
 
 
-def test_rule_parser_rejects_legacy_cell_flag():
-    """v3.0.0: --cell flag is removed from aegis rule subcommands."""
+@pytest.mark.parametrize("action", ["promote", "demote"])
+def test_rule_transitions_accept_one_positional_id(action):
     cmd = RuleCommand()
     parser = argparse.ArgumentParser()
     cmd.configure_parser(parser)
-    with pytest.raises(SystemExit):
-        parser.parse_args(["promote", "--cell", "old-id"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["demote", "--cell", "old-id"])
-
+    args = parser.parse_args([action, "trap-x"])
+    assert args.rule_id == "trap-x" and args.rule_action == action
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args([action, "trap-x", "another-id"])
+    assert error.value.code == 2
 
 
 def test_an_unknown_action_is_reported_on_stderr_and_exits_1(tmp_path, capsys):

@@ -50,17 +50,17 @@ def test_rule_edited_after_creation_is_inventoried(tmp_path):
     created was rejected as 'changed before it was opened'."""
     from aegis_core.rule_inventory import inventory_rules
 
-    cell = tmp_path / ".aegis" / "rules" / "invariants" / "edited.md"
-    _write_rule(cell, "edited")
+    rule = tmp_path / ".aegis" / "rules" / "invariants" / "edited.md"
+    _write_rule(rule, "edited")
     time.sleep(0.05)
-    with open(cell, "a", encoding="utf-8") as f:
+    with open(rule, "a", encoding="utf-8") as f:
         f.write("Edited after creation.\n")
 
     inventory = inventory_rules(str(tmp_path))
     assert [entry.relative_path for entry in inventory.entries] == [
         ".aegis/rules/invariants/edited.md"
     ]
-    assert inventory.entries[0].content == cell.read_bytes()
+    assert inventory.entries[0].content == rule.read_bytes()
     assert b"Edited after creation." in inventory.entries[0].content
 
 
@@ -116,10 +116,10 @@ def test_symlinked_directory_that_would_feed_the_scan_fails_it_closed(tmp_path):
 def test_rules_are_matched_to_changed_files(tmp_path):
     from aegis_core.outcomes.engine import match_rules_to_changes
 
-    _write_rule(tmp_path / ".aegis" / "rules" / "invariants" / "test-wall.md", "test-wall")
+    _write_rule(tmp_path / ".aegis" / "rules" / "invariants" / "test-invariant.md", "test-invariant")
 
     matches = match_rules_to_changes(tmp_path, ["src/index.py"])
-    assert [(m["_name"], m["_matched_files"]) for m in matches] == [("test-wall", ["src/index.py"])]
+    assert [(m["_name"], m["_matched_files"]) for m in matches] == [("test-invariant", ["src/index.py"])]
     assert match_rules_to_changes(tmp_path, ["other/file.txt"]) == []
     assert match_rules_to_changes(tmp_path, []) == []
     assert match_rules_to_changes(tmp_path / "nonexistent", ["src/index.py"]) == []

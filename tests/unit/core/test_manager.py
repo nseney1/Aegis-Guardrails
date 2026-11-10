@@ -14,6 +14,108 @@ def env(tmp_path):
     return prepare(tmp_path)
 
 
+@pytest.mark.parametrize("operation", ["report", "status"])
+@pytest.mark.parametrize("observation", ["clean", "dirty", "unavailable", "git_error", "missing", "mismatched"])
+def test_repeated_evidence_observes_worktree_once_per_request(env, monkeypatch, operation, observation):
+    import subprocess
+    from types import SimpleNamespace
+    from aegis_core import manager
+
+    service = active(env)
+    scan = service.scan("handoff", env["context"])
+    rule = scan["rules"][0]
+    tree = git(env["member"], "rev-parse", "HEAD^{tree}")
+    evidence = [{"member_id": "aegis", "worktree_id": "main", "source_tree": tree if index % 2 else "0" * 40,
+                 "check": "pytest", "rule_id": rule["id"],
+                 "rule_revision": rule["revision"] if index % 3 else "0" * 64,
+                 "reference": "log:" + str(index)} for index in range(20)]
+    if operation == "status":
+        service.report(scan["decision_ref"], [rule["id"]], "success", evidence, "seed")
+    if observation == "dirty":
+        (env["member"] / "source.txt").write_text("changed\n")
+    elif observation == "missing":
+        env["member"].rename(env["member"].with_name("missing-member"))
+    elif observation == "mismatched":
+        (env["member"] / ".git").rename(env["member"] / ".git-saved")
+        git(env["member"], "init", "-q")
+
+    calls = []
+    real_run = manager.gitsafe.run
+    def observed_run(args, cwd, **kwargs):
+        if str(cwd) == str(env["member"]):
+            calls.append(tuple(args))
+            if observation == "unavailable" and args == ["rev-parse", "HEAD^{tree}"]:
+                return subprocess.CompletedProcess(args, 128, b"", b"unavailable")
+            if observation == "git_error" and args == ["rev-parse", "HEAD^{tree}"]:
+                raise manager.gitsafe.GitError("test Git timeout")
+        return real_run(args, cwd, **kwargs)
+    # Replace this module's reference, leaving shared Git/OS helpers untouched.
+    monkeypatch.setattr(manager, "gitsafe", SimpleNamespace(**{**vars(manager.gitsafe), "run": observed_run}))
+
+    for request in range(2):
+        calls.clear()
+        result = (service.status() if operation == "status" else
+                  service.report(scan["decision_ref"], [rule["id"]], "success", evidence, "once-" + str(request)))
+        expected = (["stale", "source_match"] * 10 if observation == "clean" else
+                    ["unavailable" if observation == "git_error" else observation] * 20)
+        assert [entry["source_status"] for entry in result["evidence"]] == expected
+        assert [entry["reference"] for entry in result["evidence"]] == [entry["reference"] for entry in evidence]
+        assert [entry["rule_status"] for entry in result["evidence"]] == [
+            "match" if index % 3 else "unavailable" for index in range(20)]
+        assert all(entry["check_execution"] == "unverified"
+                   and entry["reference_status"] == "not_retrieved" for entry in result["evidence"])
+        assert calls.count(("rev-parse", "--absolute-git-dir")) == (0 if observation == "missing" else 1)
+        assert calls.count(("rev-parse", "HEAD^{tree}")) == (1 if observation in {"clean", "dirty", "unavailable", "git_error"} else 0)
+        assert sum("diff-index" in args for args in calls) == (1 if observation in {"clean", "dirty", "unavailable"} else 0)
+        if operation == "status":
+            expected_identity = "available" if observation in {"clean", "dirty", "unavailable", "git_error"} else observation
+            assert result["membership"][0]["state"] == expected_identity
+
+
+def test_published_request_vocabulary_matches_manager_wire_contract():
+    from aegis_core import manager_policy as policy
+    from aegis_mcp.manager import TOOL_DEFINITIONS
+
+    schemas = {tool["name"]: tool["inputSchema"]["properties"] for tool in TOOL_DEFINITIONS}
+    scan, report = schemas["aegis_scan"], schemas["aegis_report_outcome"]
+    assert set(scan["action"]["enum"]) == set(policy.ACTIONS)
+    assert set(report["outcome"]["enum"]) == set(policy.OUTCOMES)
+    assert {key: value["maxLength"] for key, value in scan["context"]["properties"].items()} == policy.CONTEXT_LIMITS
+    assert set(scan["context"]["required"]) == policy.REQUIRED_CONTEXT_FIELDS
+    evidence = report["evidence"]
+    assert {key: value["maxLength"] for key, value in evidence["items"]["properties"].items()} == policy.EVIDENCE_LIMITS
+    assert set(evidence["items"]["required"]) == set(policy.EVIDENCE_LIMITS)
+    assert evidence["maxItems"] == policy.MAX_EVIDENCE
+    assert report["rules_used"]["maxItems"] == policy.MAX_RULES
+    assert report["rules_used"]["items"]["maxLength"] == policy.MAX_RULE_ID_LENGTH
+    assert report["idempotency_key"]["maxLength"] == policy.MAX_IDEMPOTENCY_KEY_LENGTH
+    assert report["decision_ref"]["minLength"] == report["decision_ref"]["maxLength"] == policy.DECISION_REF_LENGTH
+
+
+def test_status_observations_keep_different_approved_bindings_separate(env):
+    service = active(env)
+    scan = service.scan("handoff", env["context"])
+    rule = scan["rules"][0]
+    evidence = {"member_id": "aegis", "worktree_id": "main",
+                "source_tree": git(env["member"], "rev-parse", "HEAD^{tree}"),
+                "check": "pytest", "rule_id": rule["id"], "rule_revision": rule["revision"],
+                "reference": "log:previous-binding"}
+    service.report(scan["decision_ref"], [rule["id"]], "success", [evidence], "previous")
+    (env["member"] / ".git").rename(env["member"].parent / "previous-git")
+    git(env["member"], "init", "-q")
+    git(env["member"], "add", "source.txt")
+    git(env["member"], "commit", "-qm", "replacement")
+    previous = service.status()["active_revision"]
+    candidate = service.candidate(env["revision"])
+    service.activate(env["revision"], previous, approve(env, candidate))
+    scan = service.scan("handoff", env["context"])
+    service.report(scan["decision_ref"], [rule["id"]], "success",
+                   [{**evidence, "reference": "log:current-binding"}], "current")
+    status = service.status()
+    assert [entry["source_status"] for entry in status["evidence"]] == ["mismatched", "source_match"]
+    assert status["membership"][0]["state"] == "available"
+
+
 def test_unapproved_policy_stays_draft_and_scan_refuses(env):
     service = ManagerService(env["config"])
     assert service.status()["policy_approval"] == "draft"

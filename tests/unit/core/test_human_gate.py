@@ -1103,6 +1103,223 @@ def _counted_find(repo, monkeypatch, **kw):
     return found, seen
 
 
+@needs_git
+def test_exemption_discovery_does_not_verify_unrelated_commits(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    for i in range(8):
+        repo.commit(f"chore: unrelated {i}", allow_empty=True)
+    calls = []
+    real = gitsafe.run
+
+    def spy(args, *a, **kw):
+        calls.append(list(args))
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", spy)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    expected = repo.git("rev-list", "main..HEAD").splitlines()
+    assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == expected
+    assert sum(c[0] == "rev-list" for c in calls) == 1
+
+
+@needs_signing
+def test_shared_exemption_discovery_keeps_candidate_order_and_refusal_precedence(tmp_path):
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, pub)
+    fixes = [repo.commit(f"fix: {i}", allow_empty=True) for i in range(3)]
+    valid = repo.commit(human_gate.exemption_message(fixes[0], "reviewed"), sign_key=key, allow_empty=True)
+    repo.commit(human_gate.exemption_message(fixes[0], "newer unsigned"), allow_empty=True)
+    duplicate = repo.commit(human_gate.exemption_message(fixes[1], "one") +
+                            human_gate.exemption_message(fixes[1], "two"), allow_empty=True)
+    reserved = repo.commit(human_gate.exemption_message(fixes[2], "one") +
+                           human_gate.exemption_message(fixes[2], "two") + "\nAegis-Accept: reserved\n",
+                           sign_key=key, allow_empty=True)
+
+    find = human_gate.exemption_finder(repo.root, "HEAD", "main")
+    outcomes = [find(fix) for fix in fixes]
+    assert [(v.valid, v.code, v.commit) for v in outcomes] == [
+        (True, "ok", valid), (False, "multiple_trailers", duplicate), (False, "accept_reserved", reserved)]
+
+
+@needs_git
+def test_exemption_discovery_honors_the_scan_limit_and_newest_rejection(tmp_path, monkeypatch):
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    repo.commit(human_gate.exemption_message(fix, "outside the limit"), allow_empty=True)
+    repo.commit("chore: unrelated", allow_empty=True)
+    monkeypatch.setattr(human_gate, "MAX_SCANNED_COMMITS", 1)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    newest = repo.commit(human_gate.exemption_message(fix.upper(), "in range") + "\nAegis-Accept: reserved\n",
+                         allow_empty=True)
+    verdict = human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
+    assert (verdict.code, verdict.commit) == ("accept_reserved", newest)
+
+
+@needs_git
+def test_large_commit_headers_are_read_one_at_a_time_and_released(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fixes = [repo.commit(f"fix: {i}", allow_empty=True) for i in range(9)]
+    tree, parent = repo.git("rev-parse", "HEAD^{tree}"), fixes[-1]
+    approvals = []
+    for fix in fixes:
+        raw = (f"tree {tree}\nparent {parent}\nauthor Test <t@example.com> 1 +0000\n"
+               "committer Test <t@example.com> 1 +0000\ngpgsig ").encode() + b"x" * (4 * 1024 * 1024)
+        raw += ("\n\n" + human_gate.exemption_message(fix, "reviewed") + "\nAegis-Accept: reserved\n").encode()
+        parent = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo.root,
+                                input=raw, capture_output=True, check=True).stdout.decode().strip()
+        approvals.append(parent)
+    repo.git("update-ref", "HEAD", parent)
+    held, captures = [0], []
+    real = gitsafe.run
+
+    class Capture(bytes):
+        def __new__(cls, data):
+            result = super().__new__(cls, data)
+            held[0] += len(result)
+            return result
+
+        def __del__(self):
+            held[0] -= len(self)
+
+    def counted(args, *a, **kw):
+        if args[0] == "cat-file":
+            assert args[:2] == ["cat-file", "commit"] and len(args) == 3, "discovery must read individual commit objects"
+            assert held[0] == 0, "previous commit object still retained at the next capture"
+        result = real(args, *a, **kw)
+        if args[:2] == ["cat-file", "commit"]:
+            captures.append((args[2], len(result.stdout)))
+            result.stdout = Capture(result.stdout)
+        return result
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    find = human_gate.exemption_finder(repo.root, "HEAD", "main")
+    assert [oid for oid, _size in captures] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert sum(size > 4 * 1024 * 1024 for _oid, size in captures) == len(approvals)
+    assert held[0] == 0
+    outcomes = [find(fix) for fix in fixes]
+    assert [(verdict.code, verdict.commit) for verdict in outcomes] == [
+        ("accept_reserved", approval) for approval in approvals]
+    assert held[0] == 0
+
+
+@needs_signing
+def test_oversized_exemption_is_read_alone_and_still_verifies(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    large_message_bytes = 16 * 1024 * 1024 + 1
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo = hg.make_repo(tmp_path, pub)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    message = "chore: approval\n\n" + "x" * large_message_bytes + "\n\n" + human_gate.exemption_message(fix, "reviewed")
+    approval = subprocess.run(["git", "-c", "user.name=Human", "-c", f"user.email={hg.PRINCIPAL}",
+                               "-c", "gpg.format=ssh", "-c", f"user.signingkey={key}",
+                               "commit-tree", "-S", repo.git("rev-parse", "HEAD^{tree}"), "-p", fix],
+                              cwd=repo.root, input=message.encode(), capture_output=True, check=True).stdout.decode().strip()
+    repo.git("update-ref", "HEAD", approval)
+    captures = []
+    discovering = True
+    real = gitsafe.run
+
+    def counted(args, *a, **kw):
+        if discovering and args[0] == "cat-file":
+            assert args[:2] == ["cat-file", "commit"] and len(args) == 3
+        result = real(args, *a, **kw)
+        if args[:2] == ["cat-file", "commit"]:
+            captures.append((args[2], len(result.stdout)))
+        return result
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    find = human_gate.exemption_finder(repo.root, "HEAD", "main")
+    discovering = False  # Signature verification uses gitsafe's central blob reader.
+    verdict = find(fix)
+    assert (verdict.valid, verdict.code, verdict.commit) == (True, "ok", approval)
+    assert sum(oid == approval and size > large_message_bytes for oid, size in captures) == 3
+    assert sum(oid == fix for oid, _size in captures) == 1
+
+
+@needs_git
+def test_failed_exemption_object_read_returns_no_candidate(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    real = gitsafe.run
+
+    def failed(args, *a, **kw):
+        if args[:2] == ["cat-file", "commit"]:
+            return subprocess.CompletedProcess(args, 1, b"", b"unreadable")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", failed)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+
+
+@needs_git
+@pytest.mark.parametrize("failed_read", [1, 2], ids=["first-object", "later-object"])
+def test_failed_object_read_discards_partial_exemption_candidates(tmp_path, monkeypatch, failed_read):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    for i in range(8):
+        repo.commit(human_gate.exemption_message(fix, f"reviewed {i}") + "\nAegis-Accept: reserved\n", allow_empty=True)
+    calls = []
+    real = gitsafe.run
+
+    def failed(args, *a, **kw):
+        if args[:2] == ["cat-file", "commit"]:
+            calls.append(args)
+            if len(calls) == failed_read:
+                return subprocess.CompletedProcess(args, 1, b"", b"untrusted diagnostics")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", failed)
+    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    assert len(calls) == failed_read
+
+
+@needs_git
+def test_exemption_prefilter_uses_the_verifiers_raw_message_encoding(tmp_path):
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    tree = repo.git("rev-parse", "HEAD^{tree}")
+    message = human_gate.exemption_message(fix, "reviewed") + "\nAegis-Accept: reserved\n"
+    if len(message) % 2:
+        message += "\n"
+    raw = (f"tree {tree}\nparent {fix}\nauthor Test <t@example.com> 1 +0000\n"
+           f"committer Test <t@example.com> 1 +0000\nencoding UTF-16LE\n\n{message}")
+    approval = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo.root,
+                              input=raw.encode("utf-8"), capture_output=True, check=True).stdout.decode().strip()
+    repo.git("update-ref", "HEAD", approval)
+    repo.git("config", "i18n.logOutputEncoding", "UTF-16LE")
+    expected = human_gate.verify_test_exemption(repo.root, approval, fix, "main")
+    actual = human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
+    assert (expected.code, expected.commit) == ("accept_reserved", approval)
+    assert actual == expected
+
+
+@needs_git
+def test_exemption_discovery_keeps_refusal_after_nul_in_raw_commit(tmp_path):
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    tree = repo.git("rev-parse", "HEAD^{tree}")
+    body = f"chore: approval\0\nAegis-Exempt-Test: {fix} reviewed\nAegis-Accept: reserved\n"
+    raw = (f"tree {tree}\nparent {fix}\nauthor Test <t@example.com> 1 +0000\n"
+           f"committer Test <t@example.com> 1 +0000\n\n{body}").encode("utf-8")
+    approval = subprocess.run(["git", "hash-object", "--literally", "-t", "commit", "-w", "--stdin"],
+                              cwd=repo.root, input=raw, capture_output=True, check=True).stdout.decode().strip()
+    repo.git("update-ref", "HEAD", approval)
+    expected = human_gate.verify_test_exemption(repo.root, approval, fix, "main")
+    actual = human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
+    assert (expected.valid, expected.code, expected.commit) == (False, "accept_reserved", approval)
+    assert actual == expected
+
+
 def _range(tmp_path, n: int, signer_pub=None, approve_key=None, name="r"):
     repo = hg.make_repo(tmp_path / name, signer_pub)
     digest = human_gate.governance_tree_hash(repo.root, "HEAD", base="main")
