@@ -14,7 +14,7 @@ import pytest
 
 from conftest import REPO_ROOT, iter_source_files, read, run
 
-# ── SOMA-C03 / cross-OS: Bash 4 constructs break macOS Bash 3.2 ──────────
+# ── AEGIS-C03 / cross-OS: Bash 4 constructs break macOS Bash 3.2 ──────────
 
 BASH4_PATTERNS = {
     "${var^} / ${var^^} case conversion": re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*\^\^?\}'),
@@ -43,7 +43,7 @@ def _shell_sources():
 
 @pytest.mark.parametrize("label,pattern", sorted(BASH4_PATTERNS.items()))
 def test_no_bash4_only_constructs(label, pattern):
-    """SOMA-C03: macOS ships Bash 3.2; these constructs raise 'bad substitution'
+    """AEGIS-C03: macOS ships Bash 3.2; these constructs raise 'bad substitution'
     at expansion time, which `bash -n` cannot detect."""
     offenders = []
     for name, text in _shell_sources():
@@ -55,10 +55,10 @@ def test_no_bash4_only_constructs(label, pattern):
     assert not offenders, f"Bash 4+ construct ({label}) found:\n" + "\n".join(offenders)
 
 
-# ── SOMA-C02: escaped quotes inside command substitution ────────────────
+# ── AEGIS-C02: escaped quotes inside command substitution ────────────────
 
 def test_no_escaped_quotes_in_command_substitution():
-    """SOMA-C02: `cd \\"$(dirname ...)\\"` passes literal quote characters, so the
+    """AEGIS-C02: `cd \\"$(dirname ...)\\"` passes literal quote characters, so the
     script dies at line 4 before sourcing anything. Killed the PreToolUse gate."""
     offenders = []
     for name, text in _shell_sources():
@@ -72,19 +72,17 @@ def test_no_escaped_quotes_in_command_substitution():
     )
 
 
-
-
-# ── SOMA-H04: unencoded file I/O corrupts on non-UTF-8 locales ──────────
+# ── AEGIS-H04: unencoded file I/O corrupts on non-UTF-8 locales ──────────
 
 OPEN_CALL = re.compile(r'(?<!\.)\bopen\s*\(')
 BINARY_MODE = re.compile(r'''['"][rwxa+t]*b[rwxa+t]*['"]''')
 
 
 def test_all_text_open_calls_specify_encoding():
-    """SOMA-H04: requires-python >=3.9 means PEP 686 does not apply, so Windows
+    """AEGIS-H04: requires-python >=3.9 means PEP 686 does not apply, so Windows
     uses the locale codepage. Rule files contain characters cp1252 cannot encode."""
     offenders = []
-    for sub in ("soma_mcp", "soma_sdk", "aegis_mcp", "aegis_sdk"):
+    for sub in ("aegis_mcp", "aegis_sdk", "aegis_mcp", "aegis_sdk"):
         root = os.path.join(REPO_ROOT, sub)
         if not os.path.isdir(root):
             continue
@@ -103,13 +101,13 @@ def test_all_text_open_calls_specify_encoding():
     )
 
 
-# ── SOMA-M01: JSON must not contain Infinity ────────────────────────────
+# ── AEGIS-M01: JSON must not contain Infinity ────────────────────────────
 
 def test_no_infinity_emitted_in_json_payloads():
-    """SOMA-M01: json.dumps(float('inf')) emits bare `Infinity`, which RFC 8259
+    """AEGIS-M01: json.dumps(float('inf')) emits bare `Infinity`, which RFC 8259
     forbids; strict non-Python MCP clients reject the frame."""
     offenders = []
-    for sub in ("soma_mcp", "soma_sdk", "aegis_mcp", "aegis_sdk"):
+    for sub in ("aegis_mcp", "aegis_sdk", "aegis_mcp", "aegis_sdk"):
         root = os.path.join(REPO_ROOT, sub)
         if not os.path.isdir(root):
             continue
@@ -125,11 +123,11 @@ def test_no_infinity_emitted_in_json_payloads():
     )
 
 
-# ── SOMA-C01: the MCP server must start without third-party packages ─────
+# ── AEGIS-C01: the MCP server must start without third-party packages ─────
 # (no runtime import outside the standard library: tests/contract/test_import_boundary.py)
 
 def test_mcp_server_answers_jsonrpc_without_pyyaml(tmp_path):
-    """SOMA-C01 end to end: initialize + tools/list must return valid JSON on a
+    """AEGIS-C01 end to end: initialize + tools/list must return valid JSON on a
     bare interpreter. Regression: ModuleNotFoundError, exit 1, 0 bytes stdout."""
     (tmp_path / ".aegis" / "rules").mkdir(parents=True)
     requests = (
@@ -137,7 +135,7 @@ def test_mcp_server_answers_jsonrpc_without_pyyaml(tmp_path):
         + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n"
     )
     env = {"PYTHONPATH": REPO_ROOT}
-    mcp_pkg = "aegis_mcp" if os.path.exists(os.path.join(REPO_ROOT, "aegis_mcp")) else "soma_mcp"
+    mcp_pkg = "aegis_mcp" if os.path.exists(os.path.join(REPO_ROOT, "aegis_mcp")) else "aegis_mcp"
     proc = subprocess.run(
         [sys.executable, "-m", mcp_pkg],
         cwd=str(tmp_path), input=requests, capture_output=True, text=True,
@@ -149,15 +147,15 @@ def test_mcp_server_answers_jsonrpc_without_pyyaml(tmp_path):
     for ln in lines:
         json.loads(ln)  # every framed response must be valid JSON
     first = json.loads(lines[0])
-    assert first["result"]["serverInfo"]["name"] in ("aegis-mcp", "soma-mcp")
+    assert first["result"]["serverInfo"]["name"] in ("aegis-mcp", "aegis-mcp")
     tools = json.loads(lines[1])["result"]["tools"]
     assert len(tools) >= 1
 
 
-# ── SOMA-M03: failure paths must exit nonzero ───────────────────────────
+# ── AEGIS-M03: failure paths must exit nonzero ───────────────────────────
 
 def test_cli_exits_nonzero_on_unknown_command():
-    """SOMA-M03: main() returned None on the unknown-command path, so the
+    """AEGIS-M03: main() returned None on the unknown-command path, so the
     console script produced exit 0 while printing an error."""
     proc = run([sys.executable, '-m', 'aegis_cli.cli',
                 'definitely-not-a-command'])
@@ -169,13 +167,13 @@ def test_cli_exits_nonzero_on_unknown_command():
 # ── Static Import & Documentation Integrity ─────────────────────────────
 
 def test_no_undefined_names_in_python_code():
-    """Verify zero F821 undefined names across soma_core, soma_cli, aegis_sdk."""
+    """Verify zero F821 undefined names across aegis_core, aegis_cli, aegis_sdk."""
     import shutil
     ruff_bin = shutil.which("ruff") or os.path.expanduser("~/.local/bin/ruff")
     if not os.path.exists(ruff_bin):
         pytest.skip("ruff binary not found")
     targets = [
-        d for d in ("soma_core", "soma_cli", "soma_sdk", "soma_mcp", "aegis_core", "aegis_cli", "aegis_sdk", "aegis_mcp")
+        d for d in ("aegis_core", "aegis_cli", "aegis_sdk", "aegis_mcp", "aegis_core", "aegis_cli", "aegis_sdk", "aegis_mcp")
         if os.path.isdir(os.path.join(REPO_ROOT, d))
     ]
     proc = subprocess.run(

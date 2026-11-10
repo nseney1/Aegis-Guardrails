@@ -395,25 +395,26 @@ def _parse(entry: RuleInventoryEntry, rule_type: Optional[str], directory: str) 
     )
 
 
-def _looks_like_rule(rule: Rule, any_frontmatter: bool = False) -> bool:
+def _looks_like_rule(rule: Rule, any_frontmatter: bool = False, include_identity: bool = False) -> bool:
     # A file with no frontmatter at all is a note. Frontmatter that cannot be read may
-    # hold any key, so it counts as a rule; so does any frontmatter in a v3 type
-    # directory, where v3 served every file as a rule of that directory's type.
+    # hold any key, so it counts as a rule. Type-name directories reject any metadata;
+    # generic directories recognize identity keys while title-only notes stay ignored.
     if rule.error == _NO_FRONTMATTER:
         return False
     if any_frontmatter or not rule.ok:
         return True
-    return any(key in rule.meta for key in _RULE_SIGNAL_KEYS)
+    keys = _RULE_SIGNAL_KEYS + (("id", "enforcement") if include_identity else ())
+    return any(key in rule.meta for key in keys)
 
 
 def _unserved(
     entry: RuleInventoryEntry, directory: str, why: str, fix: str, ignored: bool = True,
-    any_frontmatter: bool = False,
+    any_frontmatter: bool = False, include_identity: bool = False,
 ) -> Tuple[Optional[Rule], Optional[Ignored]]:
     """A markdown file the loader never serves: an error record when it looks like a rule;
     otherwise an ``Ignored`` record, or nothing when ``ignored`` is False (a README)."""
     rule = _parse(entry, None, directory)
-    if _looks_like_rule(rule, any_frontmatter):
+    if _looks_like_rule(rule, any_frontmatter, include_identity):
         message = f"not served: {why} ({fix})"
         if not rule.ok:
             message = f"{message}; {rule.error}"
@@ -448,7 +449,8 @@ def _classify(entry: RuleInventoryEntry, parts: List[str]) -> Tuple[Optional[Rul
         fix = f"a v3 type directory: aegis migrate moves its rules to {RULES_RELDIR}/{RULE_TYPES[legacy].directory}/"
         return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", fix,
                          any_frontmatter=True) + (None,)
-    return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", expected) + (None,)
+    return _unserved(entry, parts[0], f"{parts[0]}/ is not a rule type directory", expected,
+                     include_identity=True) + (None,)
 
 
 def load_rules(workspace: Any, inventory: Optional[RuleInventory] = None) -> RuleSet:

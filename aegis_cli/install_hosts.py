@@ -35,7 +35,7 @@ there, not the file a link there points to: version managers (Volta, mise, asdf)
 it as a link to one dispatcher that picks the tool from the name it is run under.
 The server is always registered as ``aegis``, with an absolute command and the env
 ``AEGIS_CLIENT=<host id>`` (plus ``AEGIS_WORKSPACE`` only for an explicit pin).
-Unregistering removes ``aegis`` and the legacy ``soma`` entry and nothing else.
+Unregistering removes the ``aegis`` entry and nothing else.
 
 **The workspace registry**, ``~/.aegis/workspaces.json`` (ADR 0005 AD-4)::
 
@@ -87,7 +87,6 @@ __all__ = [
     "BLOCK_VERSION",
     "HostAction",
     "InstallError",
-    "LEGACY_SERVER_NAME",
     "REGISTRY_LABEL",
     "REGISTRY_VERSION",
     "backup_dir",
@@ -124,7 +123,6 @@ __all__ = [
 SERVER_NAME = "aegis"
 # How output names the registry file (the path itself comes from UserLayout).
 REGISTRY_LABEL = f"~/{AEGIS_DIRNAME}/workspaces.json"
-LEGACY_SERVER_NAME = "soma"
 BLOCK_VERSION = 1
 CLI_TIMEOUT_SECONDS = 60
 
@@ -1013,25 +1011,24 @@ def register_host(host_id: str, *, home: Union[str, Path], command: Sequence[str
 
 def unregister_host(host_id: str, *, home: Union[str, Path], path: Optional[str] = None,
                     dry_run: bool = False) -> HostAction:
-    """Remove the ``aegis`` and legacy ``soma`` registrations from one host."""
+    """Remove the ``aegis`` registration from one host."""
     host = host_table.get(host_id)
     reg = host.registration
     if reg is None or host.retired:
         raise InstallError(_never_registered(host))
     if reg.kind == "json_file":
         target = _json_path(host, Path(home))
-        status = remove_mcp_json(target, (SERVER_NAME, LEGACY_SERVER_NAME), key=reg.key, dry_run=dry_run,
+        status = remove_mcp_json(target, (SERVER_NAME,), key=reg.key, dry_run=dry_run,
                                  backup_dir=backup_dir(home))
         result = "absent" if status == "absent" else ("would_run" if dry_run else "removed")
         return HostAction(host_id, result, None, str(target))
-    steps = [unregister_argv(host, SERVER_NAME), unregister_argv(host, LEGACY_SERVER_NAME)]
+    steps = [unregister_argv(host, SERVER_NAME)]
     binary = which(steps[0][0], path)
     if binary is None:
         return HostAction(host_id, "manual", steps[0], f"{steps[0][0]} is not on PATH")
     if dry_run:
         return HostAction(host_id, "would_run", steps[0])
     code, detail = _call([binary, *steps[0][1:]])
-    _call([binary, *steps[1][1:]])  # the legacy name is usually absent; its failure is expected
     # A host CLI exits non-zero for a name it does not hold, so a failure is reported, not fatal.
     return HostAction(host_id, "removed" if code == 0 else "absent", steps[0],
                       "" if code == 0 else f"exit {code}: {detail}".rstrip(": "))

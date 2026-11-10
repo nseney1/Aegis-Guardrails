@@ -12,8 +12,8 @@ class TestFrontmatterParser:
 
     def test_flat_scalars(self):
         text = """
-id: cell-123
-name: 'Special Cell'
+id: rule-123
+name: 'Special Rule'
 count: 42
 pi: 3.14159
 is_active: true
@@ -21,8 +21,8 @@ is_dormant: false
 extra: null
 """
         data = parse_yaml_subset(text)
-        assert data["id"] == "cell-123"
-        assert data["name"] == "Special Cell"
+        assert data["id"] == "rule-123"
+        assert data["name"] == "Special Rule"
         assert data["count"] == 42
         assert data["pi"] == 3.14159
         assert data["is_active"] is True
@@ -51,26 +51,26 @@ falsification: Shell scripts are deprecated and no longer used.
     def test_same_indent_sequences(self):
         text = """
 target_paths:
-- enzymes/*.sh
+- verifiers/*.sh
 - install/*.sh
-- enzymes/safety_gate.sh
+- verifiers/safety_gate.sh
 """
         data = parse_yaml_subset(text)
         assert data["target_paths"] == [
-            "enzymes/*.sh",
+            "verifiers/*.sh",
             "install/*.sh",
-            "enzymes/safety_gate.sh",
+            "verifiers/safety_gate.sh",
         ]
 
     def test_indented_sequences(self):
         text = """
 tags:
-  - cell
+  - rule
   - governance
   - zero-deps
 """
         data = parse_yaml_subset(text)
-        assert data["tags"] == ["cell", "governance", "zero-deps"]
+        assert data["tags"] == ["rule", "governance", "zero-deps"]
 
     def test_literal_block_scalar_pipe(self):
         text = """
@@ -156,7 +156,7 @@ options: {enabled: true, max_depth: 3}
     def test_comments_and_blank_lines(self):
         text = """
 # Header comment
-id: test-cell # inline comment
+id: test-rule # inline comment
 
 # Another comment
 tags: # comment on tag
@@ -164,7 +164,7 @@ tags: # comment on tag
   - tag2
 """
         data = parse_yaml_subset(text)
-        assert data["id"] == "test-cell"
+        assert data["id"] == "test-rule"
         assert data["tags"] == ["tag1", "tag2"]
 
     def test_parse_frontmatter_wrapper(self):
@@ -173,7 +173,7 @@ id: test
 enforcement: advisory
 ---
 
-# Cell Body
+# Rule Body
 This is markdown content.
 """
         meta = parse_frontmatter(content)
@@ -193,14 +193,14 @@ This is markdown content.
         with pytest.raises(ValueError, match="^No frontmatter delimiter$"):
             parse_rule_frontmatter(str(tmp_path))
 
-    def test_parse_cell_frontmatter_body_separation(self, tmp_path):
-        cell_file = tmp_path / "cell.md"
-        cell_file.write_text(
-            "---\nid: cell-file\ntype: wall\n---\n\n# Body Heading\nBody content\n",
+    def test_parse_rule_frontmatter_body_separation(self, tmp_path):
+        rule_file = tmp_path / "rule.md"
+        rule_file.write_text(
+            "---\nid: rule-file\ntype: invariant\n---\n\n# Body Heading\nBody content\n",
             encoding="utf-8",
         )
-        meta, body = parse_rule_frontmatter(str(cell_file))
-        assert meta == {"id": "cell-file", "type": "wall"}
+        meta, body = parse_rule_frontmatter(str(rule_file))
+        assert meta == {"id": "rule-file", "type": "invariant"}
         assert body == "# Body Heading\nBody content\n"
 
     def test_anchored_delimiter_with_inline_dashes(self):
@@ -327,12 +327,12 @@ class TestFrontmatterDumper:
 
     def test_dump_roundtrip_simple(self):
         data = {
-            "id": "my-cell",
-            "type": "wall",
+            "id": "my-rule",
+            "type": "invariant",
             "weight": 1.5,
             "count": 10,
             "active": True,
-            "tags": ["wall", "security"],
+            "tags": ["invariant", "security"],
         }
         dumped = dump_frontmatter(data)
         parsed = parse_frontmatter(f"---\n{dumped}---\n")
@@ -340,7 +340,7 @@ class TestFrontmatterDumper:
 
     def test_dump_roundtrip_nested(self):
         data = {
-            "id": "nested-cell",
+            "id": "nested-rule",
             "fitness": {
                 "score": 0.85,
                 "history": [1, 2, 3],

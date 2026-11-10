@@ -2,7 +2,7 @@
 
 Removes the git pre-commit hook block, the Aegis managed blocks (the AGENTS.md
 bootstrap, the CLAUDE.md ``@AGENTS.md`` import), this workspace's entry in
-``~/.aegis/workspaces.json`` and the hosts' ``aegis`` and legacy ``soma`` MCP
+``~/.aegis/workspaces.json`` and the hosts' ``aegis`` MCP
 registrations. It never deletes ``.aegis/`` (rules, config, ledger): those are the
 repository's. Hosts default to the ones this workspace was registered with; a host
 another registered workspace still lists keeps its registration unless named with

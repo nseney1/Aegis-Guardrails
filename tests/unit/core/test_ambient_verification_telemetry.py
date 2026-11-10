@@ -15,19 +15,19 @@ import pytest
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 
 
-def _create_cell(workspace: Path, cell_id: str, target_paths: list[str]) -> Path:
-    cells_dir = workspace / ".aegis" / "rules" / "traps"
-    cells_dir.mkdir(parents=True, exist_ok=True)
-    cell_path = cells_dir / f"{cell_id}.md"
+def _create_rule(workspace: Path, rule_id: str, target_paths: list[str]) -> Path:
+    rules_dir = workspace / ".aegis" / "rules" / "traps"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    rule_path = rules_dir / f"{rule_id}.md"
     fm = {
-        "id": cell_id,
+        "id": rule_id,
         "type": "trap",
         "enforcement": "advisory",
         "target_paths": target_paths,
-        "hypothesis": f"Hypothesis for {cell_id}",
+        "hypothesis": f"Hypothesis for {rule_id}",
     }
-    cell_path.write_text(dump_frontmatter(fm, body=f"# {cell_id}\n"), encoding="utf-8")
-    return cell_path
+    rule_path.write_text(dump_frontmatter(fm, body=f"# {rule_id}\n"), encoding="utf-8")
+    return rule_path
 
 
 @pytest.fixture
@@ -43,10 +43,10 @@ def test_record_verification_telemetry_appends_signals(test_workspace: Path):
     from aegis_core.outcomes.telemetry import Recorded, record_verification_telemetry
     from aegis_core.telemetry_engine import ledger
 
-    _create_cell(test_workspace, "cell-math", ["math_*.py", "calc.py"])
-    _create_cell(test_workspace, "cell-ui", ["ui_*.py"])
+    _create_rule(test_workspace, "rule-math", ["math_*.py", "calc.py"])
+    _create_rule(test_workspace, "rule-ui", ["ui_*.py"])
 
-    # Target file matches cell-math only
+    # Target file matches rule-math only
     recorded = record_verification_telemetry(
         workspace=str(test_workspace),
         target_files=["math_utils.py"],
@@ -57,9 +57,9 @@ def test_record_verification_telemetry_appends_signals(test_workspace: Path):
 
     assert recorded == Recorded(1)
     rows = ledger.read(test_workspace).rows
-    assert [(r["rule"], r["outcome"], r["meta"]["passed"]) for r in rows] == [("cell-math", "trigger", True)]
-    assert ledger.aggregate(test_workspace, "cell-math")["triggers"] == 1
-    assert ledger.aggregate(test_workspace, "cell-math")["tp"] == 0
+    assert [(r["rule"], r["outcome"], r["meta"]["passed"]) for r in rows] == [("rule-math", "trigger", True)]
+    assert ledger.aggregate(test_workspace, "rule-math")["triggers"] == 1
+    assert ledger.aggregate(test_workspace, "rule-math")["tp"] == 0
 
 
 def test_record_verification_telemetry_handles_failure(test_workspace: Path):
@@ -67,7 +67,7 @@ def test_record_verification_telemetry_handles_failure(test_workspace: Path):
     from aegis_core.outcomes.telemetry import Recorded, record_verification_telemetry
     from aegis_core.telemetry_engine import ledger
 
-    _create_cell(test_workspace, "cell-auth", ["auth.py"])
+    _create_rule(test_workspace, "rule-auth", ["auth.py"])
 
     recorded = record_verification_telemetry(
         workspace=str(test_workspace),
@@ -78,17 +78,17 @@ def test_record_verification_telemetry_handles_failure(test_workspace: Path):
     )
 
     assert recorded == Recorded(1)
-    totals = ledger.aggregate(test_workspace, "cell-auth")
+    totals = ledger.aggregate(test_workspace, "rule-auth")
     assert totals["triggers"] == 1
     assert totals["fp"] == 0
     assert ledger.read(test_workspace).rows[-1]["meta"]["verdict"] == "BLOCK"
 
 
 def test_cli_verify_emits_telemetry_ambiently(test_workspace: Path, monkeypatch):
-    """Running soma verify via CLI must emit ambient telemetry for verified files."""
+    """Running aegis verify via CLI must emit ambient telemetry for verified files."""
     from aegis_cli.verify import run_verify
 
-    _create_cell(test_workspace, "cell-core", ["core.py"])
+    _create_rule(test_workspace, "rule-core", ["core.py"])
     test_file = test_workspace / "core.py"
     test_file.write_text("x = 1\n", encoding="utf-8")
 
@@ -108,4 +108,4 @@ def test_cli_verify_emits_telemetry_ambiently(test_workspace: Path, monkeypatch)
 
     from aegis_core.telemetry_engine import ledger
 
-    assert any(r["rule"] == "cell-core" for r in ledger.read(test_workspace).rows)
+    assert any(r["rule"] == "rule-core" for r in ledger.read(test_workspace).rows)

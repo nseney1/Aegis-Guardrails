@@ -37,10 +37,10 @@ class TestArbiterSetLogic:
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
                   "Epoch persisted via frontmatter writer",
-                  "cell_promote.py", 217, ["test_idempotent"])
+                  "rule_promote.py", 217, ["test_idempotent"])
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          True, "All keys serialized")
         ]
 
@@ -69,10 +69,10 @@ class TestArbiterSetLogic:
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
                   "All fitness keys are persisted",
-                  "cell_promote.py", 215, [])
+                  "rule_promote.py", 215, [])
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          False, "last_decay_epoch mutated but never serialized",
                          [42, 56])
         ]
@@ -92,10 +92,10 @@ class TestArbiterSetLogic:
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
                   "Epoch persisted via last_decay_epoch field",
-                  "cell_promote.py", 35, ["test_consecutive_decay_is_noop"])
+                  "rule_promote.py", 35, ["test_consecutive_decay_is_noop"])
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          False, "last_decay_epoch mutated at L42,56 but not serialized",
                          [42, 56])
         ]
@@ -111,7 +111,7 @@ class TestArbiterSetLogic:
         predictions = []
         claims = []
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          False, "last_decay_epoch gap", [42])
         ]
 
@@ -141,12 +141,12 @@ class TestArbiterSetLogic:
         ]
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
-                  "Epoch persisted", "cell_promote.py", 217, []),
+                  "Epoch persisted", "rule_promote.py", 217, []),
             Claim(RiskCategory.UNGUARDED_TRANSITION,
-                  "Triggers > 0 guard", "cell_fitness.py", 278, []),
+                  "Triggers > 0 guard", "rule_fitness.py", 278, []),
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          True, "All keys serialized"),
         ]
 
@@ -175,12 +175,12 @@ class TestArbiterV030GroundTruth:
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
                   "Decay is idempotent via last_decay_epoch check at L31-35",
-                  "enzymes/cell_promote.py", 35,
+                  "verifiers/rule_promote.py", 35,
                   ["test_consecutive_decay_is_noop", "test_decay_applies_after_gap"]),
         ]
         # What the persistence_checker would produce (pre-fix)
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          False,
                          "PERSISTENCE GAP: last_decay_epoch assigned at L42,56 "
                          "but no startswith('last_decay_epoch:') in serializer",
@@ -198,11 +198,11 @@ class TestArbiterV030GroundTruth:
         predictions = [
             Prediction(RiskCategory.DEAD_CODE, Severity.HIGH,
                        "NEW/DORMANT status might be unreachable",
-                       "If dec_score is always not-None for zero-trigger cells, "
+                       "If dec_score is always not-None for zero-trigger rules, "
                        "the else branch at L189 is dead code",
                        "classify_status"),
         ]
-        result = arbitrate(predictions, [], [ToolEvidence("call_graph", "cell_fitness.py", True, "wired")])
+        result = arbitrate(predictions, [], [ToolEvidence("call_graph", "rule_fitness.py", True, "wired")])
         assert result.verdict == Verdict.REVISE
         assert [d.divergence_type for d in result.divergences] == ["unmatched_prediction"]
         assert result.divergences[0].tool_evidence is None
@@ -219,14 +219,14 @@ class TestArbiterV030GroundTruth:
         ]
         claims = [
             Claim(RiskCategory.PERSISTENCE_GAP,
-                  "Epoch persisted at L217", "cell_promote.py", 217, ["test_idempotent"]),
+                  "Epoch persisted at L217", "rule_promote.py", 217, ["test_idempotent"]),
             Claim(RiskCategory.DEAD_CODE,
-                  "is_unobserved guard at L182", "cell_fitness.py", 182, ["test_new_status"]),
+                  "is_unobserved guard at L182", "rule_fitness.py", 182, ["test_new_status"]),
             Claim(RiskCategory.UNGUARDED_TRANSITION,
-                  "triggers > 0 guard at L278", "cell_fitness.py", 278, ["test_promote"]),
+                  "triggers > 0 guard at L278", "rule_fitness.py", 278, ["test_promote"]),
         ]
         evidence = [
-            ToolEvidence("persistence_checker", "cell_promote.py:fitness",
+            ToolEvidence("persistence_checker", "rule_promote.py:fitness",
                          True, "All 5 keys serialized"),
         ]
 
@@ -275,7 +275,6 @@ class TestArbiterFailClosed:
             spec_agent_failed=False,
         )
         assert result.verdict == Verdict.SHIP
-
 
 
 # ── Arbiter: a review that did not happen never reads as clean (R-checks-44) ──
@@ -346,7 +345,7 @@ class TestVendorProvenance:
         ("openai", "codex-cli", ("custom-codex", "gpt-like-1"), ("openai", "gpt-like-2"), ""),
         ("claude", "claude-code", ("lab-a", "model"), ("lab-b", "model-variant"), ""),
         ("openai", "codex-cli", ("lab-a", "model"), ("lab-a-variant", "other"), ""),
-        ("bedrock", "openrouter", ("anthropic", "claude-x"), ("anthropic", "claude-y"), SAME),
+        ("vertex", "openrouter", ("anthropic", "claude-x"), ("anthropic", "claude-y"), SAME),
         ("openrouter", "openrouter", ("anthropic", "claude-x"), ("openai", "gpt-y"), ""),
         ("claude", "claude-code", ("first", "model-a"), ("first", "model-b"), SAME),
         ("claude", "claude-code", ("first", "model-a"), ("second", "model-b"), ""),

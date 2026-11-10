@@ -20,15 +20,15 @@ Aegis's own history has all three. At one point `aegis_scan` returned zero rules
 
 ## 2. How I got here
 
-I started Aegis for a small reason: I wanted one set of steering files that worked across Gemini, Claude and the other agents. That was Prism, rules plus hooks. The deeper I dug, the more I wondered whether an agent's behavior is shaped more by its guidance than by its training: the model as DNA, the rules as upbringing. People aren't forced to be good; they're raised that way. That became Soma, where I experimented with rules that adapt over time. It was the wrong theory. Training is where behavior forms, and I couldn't fit it in. I dropped the theory and kept what Soma taught me about guardrails.
+I started Aegis for a small reason: I wanted one set of steering files that worked across Gemini, Claude and the other agents. That was Prism, rules plus hooks. The deeper I dug, the more I wondered whether an agent's behavior is shaped more by its guidance than by its training: the model as DNA, the rules as upbringing. People aren't forced to be good; they're raised that way. I then experimented with rules that adapt over time. It was the wrong theory. Training is where behavior forms, and I couldn't fit it in. I dropped the theory and kept what those experiments taught me about guardrails.
 
 The timeline, all in 2026:
 
 - **26 September.** First commit, "Gemini Steering Rules": nine rules for Gemini and Antigravity. Within ten minutes it had installers for Copilot and Kiro and a new name, "AI Steering Rules". The same day I turned the TAB AI post-mortem (section 3) into rules.
 - **27 September.** Prism, and the first tag, v0.15.0.
-- **28 September.** Soma. Everything got a biology name (rules became `genome/`, scripts became `enzymes/`), and the MCP server started. The fitness idea came straight from TAB AI: I was learning reinforcement learning, so scoring rules by reward felt natural.
+- **28 September.** The first adaptive-rule experiment and the MCP server started. The fitness idea came straight from TAB AI: I was learning reinforcement learning, so scoring rules by reward felt natural.
 - **8 October.** v1.0.
-- **14 October.** At 2:50 a.m. I renamed Soma to Aegis. That's when I let go of the theory. Later that day I tagged v2.0, v2.1, v3.0, v3.1, v3.2 and v3.3. Sixteen minutes after v3.3 came the first commit of a v4 rewrite, with a failing test and no commit-message body. Counting the rename, v2.0, v2.1, v3.0 and that rewrite, that's five foundational resets in under 21 hours. By that night, 19 days after the first commit, the repository had 850 commits and 94 tags.
+- **14 October.** At 2:50 a.m. I renamed the project to Aegis. That's when I let go of the theory. Later that day I tagged v2.0, v2.1, v3.0, v3.1, v3.2 and v3.3. Sixteen minutes after v3.3 came the first commit of a v4 rewrite, with a failing test and no commit-message body. Counting the rename, v2.0, v2.1, v3.0 and that rewrite, that's five foundational resets in under 21 hours. By that night, 19 days after the first commit, the repository had 850 commits and 94 tags.
 - **15 October.** AI reviewers audited the code, and one scored its design 4/10 (section 4). That review pushed me to v4.
 - **16 October.** v4.0, 4.1 and 4.2. 4.1.0 was never tagged: its release review found problems, and 4.1.1 shipped the fixes that afternoon.
 - **17 October.** 4.3, trust and evidence (section 6).
@@ -98,7 +98,7 @@ On 15 October I had AI reviewers, each in a separate context, audit v3.3 plus th
 
 **Then:** see 14 October above. The v4 rewrite began as one commit of about 4,000 added lines, with a failing test and no message body.
 
-**Now:** the on-disk formats carry a version, and `aegis migrate` converts an old v3 or Soma workspace in place, dry run first and with backups, instead of a clean-slate purge. A tag needs a review and green CI on its commit. Rule files don't carry a schema version yet.
+**Now:** the on-disk formats carry a version. Retired workspace layouts are unsupported; `aegis migrate` currently merges v4 per-worktree ledgers into the shared repository ledger. A tag needs a review and green CI on its commit. Rule files don't carry a schema version yet.
 
 ### Repository files could run commands
 

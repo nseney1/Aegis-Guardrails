@@ -81,9 +81,9 @@ def ws(tmp_path: Path) -> Path:
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "init")
     rows = [
-        {"cell": "trap-src-drift", "signal": "trigger", "source": "ci"},
-        {"cell": "trap-src-drift", "signal": "tp", "source": "ci"},
-        {"cell": "invariant-app-pure", "signal": "trigger", "source": "mcp"},
+        {"rule_id": "trap-src-drift", "signal": "trigger", "source": "ci"},
+        {"rule_id": "trap-src-drift", "signal": "tp", "source": "ci"},
+        {"rule_id": "invariant-app-pure", "signal": "trigger", "source": "mcp"},
     ]
     # In a git repository the ledger is the one every worktree shares (in the common dir).
     ledger = ledger_path(root)
@@ -157,9 +157,7 @@ def test_grade_reports_every_component_with_a_letter(ws: Path) -> None:
     assert report["tiers"] == {"advisory": 1, "gate": 1}
     assert report["details"]["total_rules"] == 2
     assert (report["details"]["invariants"], report["details"]["healthy_invariants"]) == (1, 0)
-    # One name per field: the v3 "wall"/"cell" aliases are gone (citadel reads invariant_* first).
-    assert "wall_integrity" not in report
-    assert not {"walls", "healthy_walls", "total_cells", "stale_cells"} & set(report["details"])
+    assert set(report["details"]) == {"invariants", "healthy_invariants", "total_rules", "stale_rules"}
 
 
 def test_grade_of_a_workspace_without_rules_is_the_documented_fallback(tmp_path: Path) -> None:
