@@ -18,13 +18,13 @@ from fractions import Fraction
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from hierarchy_mailbox import require, strict_json, text  # noqa: E402
+import hierarchy_hosts  # noqa: E402
 
 
 ISOLATION_FIELDS = {"mode", "engine", "image", "cpus", "memory", "pids", "allow_unqualified"}
 DIGEST_IMAGE = re.compile(r"[^\s@\x00-\x1f\x7f-][^\s@\x00-\x1f\x7f]*@sha256:[0-9a-fA-F]{64}")
 MEMORY = re.compile(r"[1-9][0-9]*[kmg]")
-ENV_ALLOWLIST = frozenset(("PATH", "LANG", "LC_ALL", "TERM", "TZ", "PYTHONDONTWRITEBYTECODE",
-                           "HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"))
+BASE_ENV_ALLOWLIST = frozenset(("PATH", "LANG", "LC_ALL", "TERM", "TZ", "PYTHONDONTWRITEBYTECODE", "HOME"))
 DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin"
 SECRET_PATHS = (".claude", ".codex", ".ssh", ".gnupg", ".config", ".aws", ".kube", ".docker",
                 ".netrc", ".git-credentials")
@@ -316,14 +316,41 @@ def container_name(run):
     return "aegis-team-" + hashlib.sha256(run.encode("utf-8")).hexdigest()[:12]
 
 
+def _home_folders():
+    """Team-host homes only; native owner sessions deliberately have no run folder."""
+    error = "invalid container host registry"
+    kinds = hierarchy_hosts.TEAM_HOSTS
+    require(isinstance(kinds, (tuple, list)) and 0 < len(kinds) <= 64, error)
+    folders, seen = {"HOME": "home"}, set()
+    for kind in kinds:
+        require(isinstance(kind, str) and 0 < len(kind) <= 128 and kind not in seen, error)
+        seen.add(kind)
+        try:
+            host = hierarchy_hosts.entry(kind)
+        except (ValueError, TypeError, RecursionError):
+            raise ValueError(error) from None
+        require(isinstance(host, dict) and host.get("kind") == kind, error)
+        home = host.get("home")
+        require(isinstance(home, dict), error)
+        variable, folder = home.get("variable"), home.get("run_folder")
+        require(isinstance(variable, str) and 0 < len(variable) <= 128
+                and ENV_NAME.fullmatch(variable) is not None
+                and variable not in BASE_ENV_ALLOWLIST | ENGINE_ENV_KEYS and variable not in folders, error)
+        # One portable component, bounded before parsing or joining; no paths escape the run on either OS.
+        require(isinstance(folder, str) and 0 < len(folder) <= 128
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", folder) is not None
+                and folder not in folders.values(), error)
+        folders[variable] = folder
+    return folders
+
+
 def container_env(run, env=None):
     """Explicit values only: never forward ambient credentials, agent sockets or engine override variables."""
     run = _absolute(run, "run")
-    fixed = {"HOME": str(run / "home"), "CODEX_HOME": str(run / "codex-home"),
-             "CLAUDE_CONFIG_DIR": str(run / "claude-home")}
+    fixed = {variable: str(run / folder) for variable, folder in _home_folders().items()}
     require(env is None or isinstance(env, dict), "environment must be an object")
     env = {} if env is None else env
-    unknown = env.keys() - ENV_ALLOWLIST
+    unknown = env.keys() - (BASE_ENV_ALLOWLIST | fixed.keys())
     require(not unknown, "environment variables not allowlisted: " + ", ".join(sorted(unknown)))
     result = {"PATH": DEFAULT_PATH, "PYTHONDONTWRITEBYTECODE": "1", **fixed}
     for key, value in env.items():
@@ -505,9 +532,13 @@ def _validated_expected(expected):
     if not _fingerprint_record(create):
         bad.add("environment")
     elif "label" not in bad:
-        baseline = _env_fingerprints(container_env(checked["run"]))
-        if (not baseline.keys() <= create.keys() or create.keys() - ENV_ALLOWLIST
-                or any(create[key] != baseline[key] for key in ("HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"))):
+        try:
+            folders = _home_folders()
+            baseline = _env_fingerprints(container_env(checked["run"]))
+            if (not baseline.keys() <= create.keys() or create.keys() - (BASE_ENV_ALLOWLIST | folders.keys())
+                    or any(create[key] != baseline[key] for key in folders)):
+                bad.add("environment")
+        except ValueError:
             bad.add("environment")
     errors = [field for field in EXPECTED_ERROR_ORDER if field in bad]
     return (None, errors) if errors else (checked, [])
