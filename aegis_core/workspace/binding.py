@@ -569,7 +569,7 @@ def resolve_cli_root(
     ``--workspace X`` (or the cwd) walks up no further than its git toplevel and never
     to ``$HOME`` or the filesystem root; an uninitialized directory resolves to itself
     so a command can say so. ``accept`` widens what the walk stops at (as in
-    ``bounded_walk_up``; ``aegis migrate`` also stops at a legacy ``.soma/``). An
+    ``bounded_walk_up``). An
     ``AEGIS_WORKSPACE`` pin must be a workspace (``.aegis/``, or what ``accept`` takes,
     as the server's resolver requires) and must agree with an explicit target, or
     without one with the cwd: the cwd's walk-up result, else its repository, must be the
@@ -584,7 +584,7 @@ def resolve_cli_root(
         pin_root = _cli_path(raw_pin, base, "AEGIS_WORKSPACE ")
         problem = _pin_problem(pin_root)
         if problem and problem[0] == "pin_not_a_workspace" and accept is not None and accept(pin_root):
-            problem = None  # accept may also raise, e.g. the upgrade message at a legacy .soma/
+            problem = None  # an explicit accept policy may also raise its own refusal
         if problem:
             raise WorkspaceNotFoundError(problem[1].replace(str(pin_root), raw_pin))
         if explicit:

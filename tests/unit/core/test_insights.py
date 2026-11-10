@@ -1075,7 +1075,9 @@ S0 = {
     "cue": _S0_IMPORT | {"aegis_core.config", "aegis_core.verification", "aegis_core.verification.scanners",
                          "aegis_core.verification.test_runner"},
 }
-NEW_MODULES = frozenset({"aegis_core.redaction", *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
+# The storage split accompanies storage at all three hook stages.
+NEW_MODULES = frozenset({"aegis_core.redaction", "aegis_core.storage_shared",
+                         *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
 REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
                          "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})
 _HOOK_PATH = r"""

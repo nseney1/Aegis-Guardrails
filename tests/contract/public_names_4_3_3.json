@@ -1292,6 +1292,15 @@
   "aegis_mcp.registry.read_derived",
   "aegis_mcp.registry.resolve_workspace",
   "aegis_mcp.registry.stale_rules",
-  "aegis_mcp.server.defaultdict"
+  "aegis_mcp.server.defaultdict",
+  "aegis_cli.hooks.management.SOMA_HOOK_FORMAT",
+  "aegis_cli.init.SOMA_HOOK_FORMAT",
+  "aegis_core.verification.checkpoint_checks.LEGACY_SOMA_DIRNAME",
+  "aegis_core.workspace.layout.LEGACY_PREDECESSOR_LEDGER",
+  "aegis_core.workspace.layout.LEGACY_RULE_DIRS",
+  "aegis_core.taxonomy.LEGACY_TYPE_NAMES",
+  "aegis_core.taxonomy.LEGACY_REVIEW_PRONG_ALIASES",
+  "aegis_cli.install_hosts.LEGACY_SERVER_NAME",
+  "aegis_core.workspace.discovery.LEGACY_SOMA_UPGRADE_MSG"
  ]
 }

@@ -36,10 +36,6 @@
       "lines": 134,
       "stmts": 57
     },
-    "aegis_core/migrate.py:_plan_config": {
-      "lines": 112,
-      "stmts": 95
-    },
     "aegis_core/sync.py:sync": {
       "lines": 102,
       "stmts": 72
@@ -83,8 +79,8 @@
   },
   "modules": {
     "aegis_cli/install_hosts.py": {
-      "lines": 1037,
-      "stmts": 632
+      "lines": 1034,
+      "stmts": 630
     },
     "aegis_core/gitsafe.py": {
       "lines": 1250,
@@ -95,8 +91,8 @@
       "stmts": 751
     },
     "aegis_core/migrate.py": {
-      "lines": 1151,
-      "stmts": 770
+      "lines": 273,
+      "stmts": 213
     },
     "aegis_core/verification/runner.py": {
       "lines": 986,

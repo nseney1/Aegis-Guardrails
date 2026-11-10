@@ -1,7 +1,7 @@
 from pathlib import Path
 """Integration tests for the Layer 1 runner + persistence checker.
 
-Validates against the actual Soma codebase (post-fix) and against
+Validates against the actual Aegis codebase (post-fix) and against
 synthetic pre-fix scenarios.
 """
 import sys

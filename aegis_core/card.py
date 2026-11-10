@@ -2,7 +2,7 @@
 
 What a repository looks like to Aegis before anything is set up: its languages, the AST
 drivers that can read them, the rules by type and how many are active, the share of its
-files that pass Layer 1 and the five files with the most findings.
+files without blocking Layer 1 findings and the five files with the most findings.
 
 It reads and changes nothing: no state directory, no event, and ``baseline.json`` is
 neither read nor written, so a card never changes what a later ``aegis check`` decides.
@@ -114,12 +114,13 @@ def _rules(root: str, files: Sequence[str]) -> Dict[str, Any]:
             "errors": len(ruleset.errors), "active": active, "error": None}
 
 
-def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
+def _layer1(root: str, targets: Sequence[str]) -> Tuple[Dict[str, Any], int, int]:
     try:
         pairs, sources = baseline.run_fast(root, targets, allow_build=False)
     except Exception as exc:
         return {"checked": len(targets), "passed": 0, "failed": 0, "pass_rate": None, "findings": 0,
-                "checks_that_could_not_run": [f"Layer 1 could not run: {type(exc).__name__}: {exc}"], "top": []}
+                "checks_that_could_not_run": [f"Layer 1 could not run: {type(exc).__name__}: {exc}"], "top": [],
+                "not_analyzed": [{"path": path, "reason": "Layer 1 unavailable"} for path in sorted(set(targets))]}, 0, 0
     collected = baseline.collect(pairs, sources)
     per_file: Dict[str, int] = {}
     for finding in collected.findings:
@@ -129,9 +130,19 @@ def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
         if path is not None and not evidence.verdict and found is None:
             per_file[path] = per_file.get(path, 0) + 1  # a check that failed without a line is one finding
     from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL
+    from aegis_core.ast.runner import SOURCE_LIMIT_BYTES
 
+    blocking_checks = {f"{e.tool}: {e.detail}" for path, e in pairs if path is None and not e.verdict}
+    size_advisories = {f"{e.tool}: {e.detail}" for _path, e in pairs if e.tool == AST_SIZE_NOTE_TOOL and e.verdict}
+    # Retain the combined JSON list's original ordering, text and deduplication.
     loose = list(dict.fromkeys(f"{e.tool}: {e.detail}" for path, e in pairs
                               if (path is None and not e.verdict) or e.tool == AST_SIZE_NOTE_TOOL))
+    # Several checks can emit the same size advisory. Coverage counts files,
+    # independently of the compatible gate counts below.
+    size_reason = f"size limit (too_large; exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB)"
+    not_analyzed = [{"path": path, "reason": size_reason}
+                    for path in sorted({path for path, e in pairs
+                                        if path is not None and e.tool == AST_SIZE_NOTE_TOOL and e.verdict})]
     checked = len(targets)
     top = sorted(per_file.items(), key=lambda item: (-item[1], item[0]))[:TOP_FILES]
     return {
@@ -141,8 +152,9 @@ def _layer1(root: str, targets: Sequence[str]) -> Dict[str, Any]:
         "pass_rate": round((checked - len(failing)) / checked, 4) if checked else None,
         "findings": sum(per_file.values()),
         "checks_that_could_not_run": loose,
+        "not_analyzed": not_analyzed,
         "top": [{"path": path, "findings": count} for path, count in top],
-    }
+    }, len(blocking_checks), len(size_advisories)
 
 
 @dataclass(frozen=True)
@@ -160,6 +172,8 @@ class Card:
     rules: Dict[str, Any]
     layer1: Dict[str, Any]
     checked_at: Optional[float] = None
+    blocking_checks: int = 0
+    size_advisories: int = 0
 
     @property
     def sampled(self) -> bool:
@@ -180,9 +194,14 @@ class Card:
         if self.sampled:
             notes.append(f"Sampled {self.files_analyzed} of {self.files} files (every file in an even spread of the "
                          "sorted listing) for Layer 1; the languages and the rules cover all of them.")
-        if self.layer1["checks_that_could_not_run"]:
-            notes.append(f"{len(self.layer1['checks_that_could_not_run'])} check(s) could not run, so the pass rate "
-                         "does not count them (aegis check shows why).")
+        if self.blocking_checks:
+            notes.append(f"{self.blocking_checks} check(s) failed outside any file and fail aegis check "
+                         "(aegis check shows why).")
+        if self.size_advisories:
+            notes.append(f"{self.size_advisories} size advisory check(s): AST coverage is incomplete "
+                         "(aegis check shows why).")
+        if self.layer1["pass_rate"] is None and self.layer1["checks_that_could_not_run"]:
+            notes.append("Layer 1 could not run; no verification coverage is available (aegis check shows why).")
         return notes
 
     def as_dict(self) -> Dict[str, Any]:
@@ -213,6 +232,7 @@ def build(root: Any, now: Optional[float] = None, sample_limit: int = SAMPLE_LIM
     files, listing = baseline.list_files(base)
     picked = sample(files, sample_limit)
     languages = _languages(files)
+    layer1, blocking_checks, size_advisories = _layer1(base, baseline.checkable(base, picked))
     return Card(
         workspace=base,
         listing=listing,
@@ -222,6 +242,8 @@ def build(root: Any, now: Optional[float] = None, sample_limit: int = SAMPLE_LIM
         languages=tuple(languages),
         drivers=tuple(_drivers(base, languages)),
         rules=_rules(base, files),
-        layer1=_layer1(base, baseline.checkable(base, picked)),
+        layer1=layer1,
         checked_at=now,
+        blocking_checks=blocking_checks,
+        size_advisories=size_advisories,
     )

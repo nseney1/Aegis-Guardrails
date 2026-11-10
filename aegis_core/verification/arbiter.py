@@ -195,7 +195,7 @@ class ModelProvenance:
     """Caller-recorded family and model IDs, normalized without host inference.
 
     Family uses MR-3's choice.family vocabulary (aegis_core.model_select), describing
-    the model's family, never the serving endpoint (bedrock, openrouter or a proxy).
+    the model's family, never the serving endpoint (vertex, openrouter or a proxy).
     Each ID must be a nonblank string of at most 256 characters before and after
     normalization (strip and casefold); otherwise construction
     raises ValueError('invalid_model_provenance'). These are attribution, not authentication.

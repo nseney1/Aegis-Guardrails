@@ -1,4 +1,4 @@
-"""Path confinement and security boundaries for Soma workspaces (Layer 0 Core).
+"""Path confinement and security boundaries for Aegis workspaces (Layer 0 Core).
 
 Enforces cross-platform confinement, blocks directory traversal escapes, null bytes,
 extended device namespace paths, alternate data streams, and Windows reserved device names.
@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from pathlib import Path
 
 from aegis_core.errors import PathTraversalError, WorkspaceError, WorkspaceNotFoundError
+from aegis_core.primitives import is_within
 from aegis_core.workspace.layout import has_rules_dir
 
 _WINDOWS_DEVICE_NAMES = frozenset(
@@ -84,8 +86,6 @@ def validate_workspace_path(
     Returns the resolved Path object.
     Raises WorkspaceError / WorkspaceNotFoundError on invalid or malicious input.
     """
-    from aegis_core.workspace.discovery import refuse_unmigrated_v3
-
     if not untrusted_workspace or not str(untrusted_workspace).strip():
         raise WorkspaceError("workspace path must not be empty")
 
@@ -93,16 +93,83 @@ def validate_workspace_path(
     if not os.path.isdir(resolved):
         raise WorkspaceNotFoundError(f"workspace does not exist or is not a directory: {resolved}")
 
-    refuse_unmigrated_v3(resolved)
-
     if not has_rules_dir(resolved):
         raise WorkspaceError(f"not a valid Aegis workspace (missing .aegis/rules): {resolved}")
 
     return Path(resolved)
 
 
+def read_confined_bytes(root: Path, path: Path, error_type=PathTraversalError, missing_ok: bool = True,
+                        max_bytes: int | None = None):
+    """Read a regular confined file, optionally capped, or None when absent."""
+    if not is_within(path, root, unresolvable=False) or any(
+        parent.is_symlink() for parent in (path, *path.parents) if root in parent.parents
+    ):
+        raise error_type(f"{path.relative_to(root)} is a symlink or outside the workspace; no rule, config.json or .aegis/.gitignore was changed")
+    if not os.path.lexists(path):
+        if missing_ok:
+            return None
+        raise FileNotFoundError(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise error_type(f"{path.relative_to(root)} is not a regular file; no rule, config.json or .aegis/.gitignore was changed")
+        if max_bytes is not None:
+            data = stream.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise error_type(f"{path.relative_to(root)} exceeds {max_bytes} bytes; no rule, config.json or .aegis/.gitignore was changed")
+            return data
+        return stream.read()
+
+
+def iter_confined_files(root: Path, directory: Path, suffix: str = ".md"):
+    """Yield (path, problem) without descending links or paths outside root.
+
+    Unsafe entries and listing failures are yielded for the caller to report; they
+    are never read. Missing directories contain no files.
+    """
+    if directory.is_symlink() or not is_within(directory, root, unresolvable=False):
+        yield directory, "a symlink or outside the workspace; not followed"
+        return
+    if not directory.exists():
+        return
+    failures = []
+    for folder, dirs, files in os.walk(directory, followlinks=False, onerror=failures.append):
+        dirs.sort()
+        for name in list(dirs):
+            path = Path(folder, name)
+            if path.is_symlink() or not is_within(path, root, unresolvable=False):
+                dirs.remove(name)
+                yield path, "a symlink or outside the workspace; not followed"
+        for name in sorted(files):
+            if name.lower().endswith(suffix):
+                path = Path(folder, name)
+                problem = "a symlink or outside the workspace; not followed" if path.is_symlink() or not is_within(path, root, unresolvable=False) else None
+                yield path, problem
+    for error in failures:
+        yield Path(error.filename or directory), str(error)
+
+
+def finish_file_move(source: Path, target: Path) -> None:
+    """Remove the old same-named entry; normalize directory case only for aliases.
+
+    Distinct directories are never renamed over one another. A source directory
+    holding notes or other files stays; an empty one is removed.
+    """
+    if os.path.samefile(source.parent, target.parent):
+        if str(source.parent) != str(target.parent):
+            source.parent.rename(target.parent)
+    else:
+        source.unlink()
+        if not any(source.parent.iterdir()):
+            source.parent.rmdir()
+
+
 __all__ = [
     "_WINDOWS_DEVICE_NAMES",
     "confine_path_internal",
     "validate_workspace_path",
+    "iter_confined_files",
+    "finish_file_move",
+    "read_confined_bytes",
 ]

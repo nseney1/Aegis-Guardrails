@@ -40,11 +40,11 @@ def test_the_card_renders_its_counts_and_the_files_with_most_findings():
     assert text.render_card(_card().as_dict()) == [
         "Aegis day-0 card",
         "  workspace: /ws",
-        "  files: 3 (git), all analyzed",
+        "  files: 3 (git), all considered for Layer 1",
         "  languages: python 2, rust 1",
         "  AST drivers: python: built-in; rust: not enabled",
         "  rules: 2 (invariant 1, trap 1), 1 active (served and targeting a file)",
-        "  Layer 1: 50% of 2 files pass (1 of 2); 3 finding(s) in 1 file(s)",
+        "  Layer 1: 50% of 2 files without blocking findings (1 of 2); 3 finding(s) in 1 file(s)",
         "  files with the most findings:",
         "        3  src/bad.py",
     ]
@@ -69,7 +69,7 @@ def test_a_sampled_walked_card_whose_rules_cannot_be_read_says_each_note():
         "directories.",
         "  note: Sampled 4 of 9 files (every file in an even spread of the sorted listing) for Layer 1; the languages "
         "and the rules cover all of them.",
-        "  note: 1 check(s) could not run, so the pass rate does not count them (aegis check shows why).",
+        "  note: Layer 1 could not run; no verification coverage is available (aegis check shows why).",
         "  Next: add a rule for your own code with aegis rule create (aegis rule create --help)",
     ]
 
@@ -84,11 +84,11 @@ def test_a_card_with_no_active_rule_names_the_next_step():
     assert text.render_card(built.as_dict()) == [
         "Aegis day-0 card",
         "  workspace: /ws",
-        "  files: 1 (git), all analyzed",
+        "  files: 1 (git), all considered for Layer 1",
         "  languages: python 1",
         "  AST drivers: python: built-in",
         "  rules: 1 (trap 1), 0 active (served and targeting a file)",
-        "  Layer 1: 100% of 1 files pass (1 of 1); 0 finding(s) in 0 file(s)",
+        "  Layer 1: 100% of 1 files without blocking findings (1 of 1); 0 finding(s) in 0 file(s)",
         "  note: No active rule targets any file: aegis check enforces no rule until one names files.",
         "  note: 1 rule file(s) cannot be served (aegis status lists them).",
         "  Next: add a rule for your own code with aegis rule create (aegis rule create --help)",
@@ -100,7 +100,7 @@ def test_a_directory_that_is_no_aegis_workspace_renders_the_card_it_always_did(t
     assert text.render_card(card.build(tmp_path, now=0).as_dict()) == [
         "Aegis day-0 card",
         f"  workspace: {tmp_path}",
-        "  files: 0 (walked), all analyzed",
+        "  files: 0 (walked), all considered for Layer 1",
         "  languages: none recognized (rules are language-agnostic)",
         "  rules: 0, 0 active (served and targeting a file)",
         "  Layer 1: no file to check",
@@ -109,6 +109,37 @@ def test_a_directory_that_is_no_aegis_workspace_renders_the_card_it_always_did(t
         "directories.",
         "  Next: add a rule for your own code with aegis rule create (aegis rule create --help)",
     ]
+
+
+def test_card_coverage_lists_at_most_twenty_files_and_keeps_the_total():
+    built = _card(size_advisories=22, layer1={
+        'checked': 22, 'passed': 22, 'failed': 0, 'pass_rate': 1.0, 'findings': 0,
+        'checks_that_could_not_run': ['size advisory'], 'top': [],
+        'not_analyzed': [{'path': f'bundle{i}.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'}
+                         for i in range(22)],
+    })
+    lines = text.render_card(built.as_dict())
+    start = lines.index('  AST coverage: 22 file(s) not analyzed:')
+    assert lines[start + 1:start + 21] == [
+        f'    bundle{i}.ts: size limit (too_large; exceeds 2 MiB)' for i in range(20)
+    ]
+    assert lines[start + 21] == '    ... and 2 more'
+    assert not any('does not count them' in line for line in lines)
+
+
+def test_a_card_with_unavailable_layer1_does_not_report_a_zero_percent_pass_rate():
+    built = _card(layer1={
+        'checked': 2, 'passed': 0, 'failed': 0, 'pass_rate': None, 'findings': 0,
+        'checks_that_could_not_run': ['Layer 1 could not run: OSError: boom'], 'top': [],
+        'not_analyzed': [{'path': path, 'reason': 'Layer 1 unavailable'} for path in ['a.py', 'b.py']],
+    })
+    lines = text.render_card(built.as_dict())
+    assert '  Layer 1: unavailable; 2 file(s) selected' in lines
+    assert '  Layer 1 coverage: 2 file(s) not analyzed:' in lines
+    assert '    a.py: Layer 1 unavailable' in lines
+    assert '    b.py: Layer 1 unavailable' in lines
+    assert not any('AST coverage' in line for line in lines)
+    assert not any('%' in line for line in lines)
 
 
 def test_the_partition_report_groups_edges_and_caps_the_files_not_analyzed():

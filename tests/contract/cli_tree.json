@@ -455,7 +455,7 @@
             "flags": [
               "--tests"
             ],
-            "help": "With --record: also run the test command from the user-scope config (tests.command in ~/.aegis/config.json, default python -m pytest, never the repository's) in the snapshot with a fixed environment; exit 5 or zero passed tests is never evidence",
+            "help": "With --record: run automatically selected languages in a fixed snapshot environment; user-scope tests.command takes precedence and runs once, never the repository's. Python defaults to pytest; native runners: user-scope tests.languages.{go,rust,ts}.command (required for TS/JS). See docs/languages.md; exit 5 or zero passed is never evidence",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -650,7 +650,7 @@
             "flags": [
               "--coverage"
             ],
-            "help": "With --ci only: report-only diff coverage, the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
+            "help": "With --ci only: report-only diff coverage by language. Python uses pytest-based tests.command; Go defaults to go test -coverprofile; configure native coverage with coverage.languages.ts.command or coverage.languages.rust.command (LCOV), in user scope only. See docs/languages.md. Exit unchanged; unavailable: UNVERIFIED",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,

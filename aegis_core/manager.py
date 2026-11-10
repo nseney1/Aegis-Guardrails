@@ -13,13 +13,14 @@ from pathlib import Path
 
 from aegis_core import gitsafe
 from aegis_core.manager_config import initialize, load_config, verify_owner
-from aegis_core.manager_policy import ACTIONS, ManagerError, digest, parse_membership, parse_policy, read_candidate
+from aegis_core.manager_policy import (
+    ACTIONS, CONTEXT_LIMITS, DECISION_REF_LENGTH, EVIDENCE_LIMITS, MAX_EVIDENCE, MAX_IDEMPOTENCY_KEY_LENGTH,
+    MAX_RULE_ID_LENGTH, MAX_RULES, OUTCOMES, REQUIRED_CONTEXT_FIELDS,
+    ManagerError, digest, parse_membership, parse_policy, read_candidate,
+)
 from aegis_core.manager_store import ManagerStore
 
 __all__ = ["ManagerService", "initialize"]
-_OUTCOMES = frozenset(("success", "partial", "failure", "pass", "fail", "tp", "fp"))
-_CONTEXT = {"member_id", "worktree_id", "role", "phase", "risk", "summary"}
-_EVIDENCE = {"member_id", "worktree_id", "source_tree", "check", "rule_id", "rule_revision", "reference"}
 _HEX = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
@@ -48,9 +49,9 @@ def _statement(config, fingerprint, candidate, rows):
 
 
 def _context(value):
-    if type(value) is not dict or set(value) - _CONTEXT or not {"member_id", "worktree_id"} <= set(value):
+    if type(value) is not dict or set(value) - CONTEXT_LIMITS.keys() or not REQUIRED_CONTEXT_FIELDS <= set(value):
         raise ManagerError("invalid_context")
-    if any(not _bounded(item, 4096 if key == "summary" else 128) for key, item in value.items()):
+    if any(not _bounded(item, CONTEXT_LIMITS[key]) for key, item in value.items()):
         raise ManagerError("invalid_context")
     return copy.deepcopy(value)
 
@@ -118,12 +119,12 @@ def _identity(member, worktree, bindings=None):
 
 
 def _evidence_input(value):
-    if type(value) is not list or len(value) > 20:
+    if type(value) is not list or len(value) > MAX_EVIDENCE:
         raise ManagerError("invalid_evidence")
     for entry in value:
-        if type(entry) is not dict or set(entry) != _EVIDENCE:
+        if type(entry) is not dict or set(entry) != EVIDENCE_LIMITS.keys():
             raise ManagerError("invalid_evidence")
-        if any(not _bounded(item, 1024 if key == "reference" else 256) for key, item in entry.items()):
+        if any(not _bounded(item, EVIDENCE_LIMITS[key]) for key, item in entry.items()):
             raise ManagerError("invalid_evidence")
         if not _HEX.fullmatch(entry["source_tree"]) or not re.fullmatch(r"[0-9a-f]{64}", entry["rule_revision"]):
             raise ManagerError("invalid_evidence")
@@ -147,8 +148,47 @@ def _worktree_state(path):
     return "dirty" if changed.returncode == 1 or untracked else "clean"
 
 
+class _WorktreeObservations:
+    """Lazy observations shared only within one report or status request."""
+
+    def __init__(self):
+        self._identities = {}
+        self._sources = {}
+
+    def _key(self, candidate, member, worktree):
+        binding = candidate["bindings"].get(member["id"] + "/" + worktree["id"])
+        return (member["id"], worktree["id"], member["common_dir"], worktree["path"], digest(binding))
+
+    def identity(self, candidate, member, worktree):
+        key = self._key(candidate, member, worktree)
+        if key not in self._identities:
+            self._identities[key] = _identity(member, worktree, candidate["bindings"])
+        return self._identities[key]
+
+    @gitsafe.scrubbed()
+    def source(self, candidate, member, worktree):
+        key = self._key(candidate, member, worktree)
+        if key not in self._sources:
+            status, tree = self.identity(candidate, member, worktree), None
+            if status == "available":
+                try:
+                    result = gitsafe.run(["rev-parse", "HEAD^{tree}"], worktree["path"], timeout=5)
+                    tree = result.stdout.decode("ascii", "replace").strip() if not result.returncode else None
+                    dirty = _worktree_state(worktree["path"])
+                    if result.returncode or not tree or not _HEX.fullmatch(tree) or dirty == "unavailable":
+                        status = "unavailable"
+                    elif dirty == "dirty":
+                        status = "dirty"
+                except gitsafe.GitError:
+                    status = "unavailable"
+            self._sources[key] = status, tree
+        return self._sources[key]
+
+
 @gitsafe.scrubbed()
-def _evidence_state(candidate, evidence):
+def _evidence_state(candidate, evidence, observations=None):
+    if observations is None:
+        observations = _WorktreeObservations()
     result = []
     rules = {rule["id"]: rule["revision"] for rule in candidate["policy"]["rules"]}
     for entry in evidence:
@@ -156,17 +196,9 @@ def _evidence_state(candidate, evidence):
         state["rule_status"] = "match" if rules.get(entry["rule_id"]) == entry["rule_revision"] else "unavailable"
         try:
             member, worktree = _member(candidate, entry["member_id"], entry["worktree_id"])
-            status = _identity(member, worktree, candidate["bindings"])
+            status, tree = observations.source(candidate, member, worktree)
             if status == "available":
-                tree_result = gitsafe.run(["rev-parse", "HEAD^{tree}"], worktree["path"], timeout=5)
-                tree = tree_result.stdout.decode("ascii", "replace").strip() if not tree_result.returncode else None
-                dirty = _worktree_state(worktree["path"])
-                if tree_result.returncode or not tree or not _HEX.fullmatch(tree) or dirty == "unavailable":
-                    status = "unavailable"
-                elif dirty == "dirty":
-                    status = "dirty"
-                else:
-                    status = "source_match" if tree == entry["source_tree"] else "stale"
+                status = "source_match" if tree == entry["source_tree"] else "stale"
             state["source_status"] = status
         except ManagerError:
             state["source_status"] = "unauthorized_membership"
@@ -218,7 +250,7 @@ def _outcome_valid(row, decision, activation):
     rules = decision["result"]["rules"]
     if type(request["rules_used"]) is not list or any(type(rule) is not str for rule in request["rules_used"]) \
             or type(request["outcome"]) is not str or type(request["idempotency_key"]) is not str \
-            or not set(request["rules_used"]) <= {rule["id"] for rule in rules} or request["outcome"] not in _OUTCOMES:
+            or not set(request["rules_used"]) <= {rule["id"] for rule in rules} or request["outcome"] not in OUTCOMES:
         raise ManagerError("audit_corrupt")
     expected = {"schema": "aegis.manager-outcome/v1", "scope": "manager", "workspace_id": row["workspace_id"],
                 "decision_ref": decision["decision_ref"], "activation_ref": activation["activation_ref"],
@@ -234,7 +266,7 @@ def _outcome_valid(row, decision, activation):
     if type(result["evidence"]) is not list or len(result["evidence"]) != len(request["evidence"]):
         raise ManagerError("audit_corrupt")
     for original, observed in zip(request["evidence"], result["evidence"]):
-        if type(observed) is not dict or set(observed) != _EVIDENCE | {"source_status", "rule_status", "check_execution", "reference_status"}:
+        if type(observed) is not dict or set(observed) != EVIDENCE_LIMITS.keys() | {"source_status", "rule_status", "check_execution", "reference_status"}:
             raise ManagerError("audit_corrupt")
         if any(observed[key] != value for key, value in original.items()) \
                 or observed["check_execution"] != "unverified" or observed["reference_status"] != "not_retrieved" \
@@ -278,7 +310,7 @@ class ManagerService:
                         raise ManagerError("audit_corrupt")
                     activations[row["activation_ref"]] = row
                 elif kind == "decision":
-                    if not _bounded(row["decision_ref"], 64) or not _bounded(row["activation_ref"], 64) \
+                    if not _bounded(row["decision_ref"], DECISION_REF_LENGTH) or not _bounded(row["activation_ref"], 64) \
                             or row["decision_ref"] in decisions or type(row["action"]) is not str:
                         raise ManagerError("audit_corrupt")
                     _decision_valid(row, activations[row["activation_ref"]])
@@ -368,17 +400,18 @@ class ManagerService:
         outcomes = [row for row in rows if row["kind"] == "outcome"]
         references = [(row, entry) for row in outcomes for entry in row["request"]["evidence"]]
         states, memberships = [], []
+        observations = _WorktreeObservations()
         if current:
-            for row, entry in references[-20:]:
+            for row, entry in references[-MAX_EVIDENCE:]:
                 decision = next(item for item in rows if item.get("decision_ref") == row["request"]["decision_ref"]
                                 and item["kind"] == "decision")
                 origin = next(item for item in rows if item.get("activation_ref") == decision["activation_ref"]
                               and item["kind"] == "activation")
-                states.extend(_evidence_state(origin["candidate"], [entry]))
+                states.extend(_evidence_state(origin["candidate"], [entry], observations))
             for member in current["candidate"]["membership"]["repositories"]:
                 for worktree in member["worktrees"]:
                     memberships.append({"member_id": member["id"], "worktree_id": worktree["id"],
-                                        "state": _identity(member, worktree, current["candidate"]["bindings"])})
+                                        "state": observations.identity(current["candidate"], member, worktree)})
         return {"schema": "aegis.manager-status/v1", "workspace_id": self.config["workspace_id"],
                 "manager_audit_available": True, "policy_approval": "approved" if current else "draft",
                 "active_revision": current["activation_ref"] if current else None,
@@ -386,7 +419,7 @@ class ManagerService:
                 "policy_digest": current["candidate"]["policy_digest"] if current else None,
                 "membership_digest": current["candidate"]["membership_digest"] if current else None,
                 "pending_decisions": _pending(rows), "outcomes": len(outcomes), "evidence": states,
-                "evidence_total": len(references), "evidence_omitted": max(0, len(references) - 20),
+                "evidence_total": len(references), "evidence_omitted": max(0, len(references) - MAX_EVIDENCE),
                 "omitted_evidence_state": "unverified", "membership": memberships,
                 "fitness_credit": 0, "native_enforcement_ready": False, "teams_mutations_enabled": False,
                 "delegation_authority": False, "native_identity": None, "audit_head": rows[-1]["hash"]}
@@ -424,12 +457,12 @@ class ManagerService:
         return self.store.transaction(scan)
 
     def report(self, decision_ref, rules_used, outcome, evidence, idempotency_key, tests_passed=None):
-        if not _bounded(decision_ref, 64) or not re.fullmatch(r"[0-9a-f]{64}", decision_ref):
+        if not _bounded(decision_ref, DECISION_REF_LENGTH) or not re.fullmatch(r"[0-9a-f]{64}", decision_ref):
             raise ManagerError("unknown_decision")
-        if type(rules_used) is not list or len(rules_used) > 128 \
-                or any(not _bounded(rule, 64) for rule in rules_used) or len(set(rules_used)) != len(rules_used):
+        if type(rules_used) is not list or len(rules_used) > MAX_RULES \
+                or any(not _bounded(rule, MAX_RULE_ID_LENGTH) for rule in rules_used) or len(set(rules_used)) != len(rules_used):
             raise ManagerError("unserved_rules")
-        if type(outcome) is not str or outcome not in _OUTCOMES or not _bounded(idempotency_key, 128):
+        if type(outcome) is not str or outcome not in OUTCOMES or not _bounded(idempotency_key, MAX_IDEMPOTENCY_KEY_LENGTH):
             raise ManagerError("invalid_outcome")
         if tests_passed is not None and type(tests_passed) is not bool:
             raise ManagerError("invalid_outcome")

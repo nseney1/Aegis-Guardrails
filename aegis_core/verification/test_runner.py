@@ -1,4 +1,4 @@
-"""Centralized test runner discovery for Soma verification subsystem."""
+"""Centralized test runner discovery for Aegis verification subsystem."""
 from __future__ import annotations
 
 import importlib.util
@@ -98,7 +98,7 @@ def discover_test_evidence(target_files: list[str], repo_root: str) -> tuple[lis
 
         stem = os.path.splitext(basename)[0]
         parent = os.path.basename(os.path.dirname(tf))
-        clean_parent = parent[6:] if parent.startswith("aegis_") else (parent[5:] if parent.startswith("soma_") else parent)
+        clean_parent = parent[6:] if parent.startswith("aegis_") else parent
 
         # Candidate test file locations
         candidates = [
@@ -260,4 +260,3 @@ __all__ = [
     "discover_test_evidence",
     "run_external_cmd",
 ]
-

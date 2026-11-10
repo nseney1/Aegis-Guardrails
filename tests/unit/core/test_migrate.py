@@ -1,282 +1,277 @@
-"""`aegis migrate` (D13, D21, D10; v4.3 §10.2 and §10.4) on real-shaped legacy workspaces.
-
-Fixtures mirror real artifacts:
-- a citadel-shaped .aegis/evidence/signals.jsonl (v3 `aegis check` wrote a trigger row and
-  a tp row per rule and run, carrying both ``cell`` and ``rule_id``; later rows ``cell``
-  only) plus a telemetry/ compaction copy that repeats some of it;
-- a .soma/cells tree with wall, vacuole, chloroplast, membrane and plasmodesmata cells
-  (frontmatter ``type`` plus a ``fitness`` block) and one type nothing maps;
-- an aegis.conf with MAX_JIT_TOKENS, AEGIS_INFERENCE_PROVIDER, TEAM_REPO,
-  TEAM_MEMBER_ID and METRICS_REPO, and a citadel-shaped .aegis/slots.yaml;
-- the v3 runtime state (receipts, keys, locks, cursor, handoffs, jobs, arbitration files).
-"""
-from __future__ import annotations
-
-import hashlib
+"""Supported migration plans preserve modern files and refuse retired state."""
 import json
 import os
 from pathlib import Path
-import re
 import stat
-import subprocess
 
 import pytest
 
 from aegis_core import migrate
-from aegis_core.telemetry_engine import ledger
-from aegis_core.yaml_engine.frontmatter import parse_frontmatter
-
-TS1, TS2, TS3 = "2026-10-15T05:15:22Z", "2026-10-15T12:54:00Z", "2026-10-15T16:54:19Z"
 
 
-def _v1(cell, signal, ts, event_id, weight=1.0, with_rule_id=True, **meta):
-    row = {"timestamp": ts}
-    if with_rule_id:
-        row["rule_id"] = cell
-    row.update({
-        "cell": cell, "signal": signal, "source": "session", "event_id": event_id,
-        "payload_digest": hashlib.sha256(event_id.encode()).hexdigest(), "generation": 1,
-        "metadata": {"credit_weight": weight, "verdict": "PASS", **meta},
-    })
-    return row
+def test_a_modern_workspace_needs_no_conversion(tmp_path):
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    rule = rules / "trap-x.md"
+    rule.write_text("---\nid: trap-x\ntype: trap\n---\nBody\n", encoding="utf-8")
+    before = rule.read_bytes()
+    planned = migrate.plan(tmp_path)
+    assert planned.to_dict()["status"] == "up_to_date"
+    assert migrate.apply(planned).written == []
+    assert rule.read_bytes() == before
 
 
-def _packaged_template(name: str) -> bytes:
-    from aegis_core.ast.drivers import templates
-
-    return _v3_3_template(name) if name == "rust_ast.py" else (Path(templates.__file__).resolve().parent / name).read_bytes()
-
-
-def _write_jsonl(path: Path, rows) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-
-
-CITADEL_ROWS = [
-    _v1("contract-snapshot-schema", "trigger", TS1, "e1", target_files=["Cargo.toml"]),
-    _v1("contract-snapshot-schema", "tp", TS1, "e2", weight=0.3333333333333333, passed=True, evidence_checks=19),
-    _v1("trap-atomic-write", "trigger", TS2, "e3", target_files=["citadel/ipc.py"]),
-    _v1("trap-atomic-write", "tp", TS2, "e4", weight=0.6666666666666666, passed=True),
-    _v1("trap-atomic-write", "trigger", TS3, "e5", with_rule_id=False),
-    _v1("trap-atomic-write", "tp", TS3, "e6", with_rule_id=False),
-]
+@pytest.mark.parametrize("marker", ["manifest.json", "evidence/signals.jsonl", "slots.yaml", "keys/key", "receipt_key", "evidence/fitness.jsonl", "evidence/sessions_processed.jsonl"])
+def test_retired_state_is_refused_without_conversion(tmp_path, marker):
+    path = tmp_path / ".aegis" / marker
+    path.parent.mkdir(parents=True)
+    path.write_text("retained", encoding="utf-8")
+    planned = migrate.plan(tmp_path)
+    assert ".aegis/" + (marker if marker != "keys/key" else "keys") in planned.refusal
+    assert "Archive these paths outside the workspace" in planned.refusal
+    with pytest.raises(migrate.MigrationRefused, match="Archive these paths outside the workspace"):
+        migrate.apply(planned)
+    assert path.read_text(encoding="utf-8") == "retained"
 
 
-def _cell(path: Path, cell_type: str, extra: str = "") -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "---\n"
-        f"type: {cell_type}\n"
-        "enforcement: advisory\n"
-        f'hypothesis: "{path.stem} hypothesis"\n'
-        "target_paths:\n"
-        '  - "install/*.sh"\n'
-        "expiry_days: 60\n"
-        'created: "2026-09-28"\n'
-        f"{extra}"
-        "fitness:\n"
-        "  triggers: 2\n"
-        "  true_positives: 1\n"
-        "  false_positives: 1\n"
-        "tags: [install, parity]\n"
-        "---\n"
-        "\n"
-        f"Body of {path.stem}.\n",
-        encoding="utf-8",
+def test_a_symlinked_workspace_is_refused_without_reading_it(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".aegis").symlink_to(outside, target_is_directory=True)
+    planned = migrate.plan(root)
+    assert planned.refusal == ".aegis is a symlink; aegis migrate reads and writes only inside the workspace"
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("folder,declared", [("invariants", "Invariant"), ("Invariants", "invariant")])
+def test_v4_rule_names_are_normalized_and_become_servable(tmp_path, folder, declared):
+    from aegis_core.rules import load_rules
+
+    source = tmp_path / ".aegis" / "rules" / folder / "no-eval.md"
+    source.parent.mkdir(parents=True)
+    source.write_text(f"---\nid: no-eval\ntype: {declared}\nenforcement: gate\n---\nBody\n")
+    assert load_rules(tmp_path).errors
+    planned = migrate.plan(tmp_path)
+    assert planned.pending
+    migrate.apply(planned)
+    assert load_rules(tmp_path).errors == ()
+    assert (tmp_path / ".aegis/rules/invariants/no-eval.md").read_text() == (
+        "---\nid: no-eval\ntype: invariant\nenforcement: gate\n---\nBody\n"
     )
-    return path
+    assert not migrate.plan(tmp_path).pending
 
 
-@pytest.fixture
-def legacy(tmp_path: Path) -> Path:
-    root = tmp_path / "proj"
-    aegis = root / ".aegis"
-    _write_jsonl(aegis / "evidence" / "signals.jsonl", CITADEL_ROWS + [{"not": "a row"}])
-    with open(aegis / "evidence" / "signals.jsonl", "ab") as fh:
-        fh.write(b"{torn")
-    # the compaction copy repeats the first four rows
-    _write_jsonl(aegis / "telemetry" / "signals.jsonl", CITADEL_ROWS[:4])
-    (aegis / "evidence" / ".signals.lock").write_text("", encoding="utf-8")
-    (aegis / "evidence" / "arbitration_cycle_1.json").write_text('{"verdict": "SHIP"}', encoding="utf-8")
-    (aegis / "keys").mkdir()
-    (aegis / "keys" / "receipt.key").write_text("ab" * 32, encoding="utf-8")
-    (aegis / "locks").mkdir()
-    (aegis / "locks" / "signals.lock").write_text("", encoding="utf-8")
-    (aegis / "receipts.jsonl").write_text('{"hmac": "x"}\n', encoding="utf-8")
-    (aegis / "insight_cursor").write_text("12", encoding="utf-8")
-    (aegis / "handoffs").mkdir()
-    (aegis / "handoffs" / "t1.json").write_text("{}", encoding="utf-8")
-    (aegis / "jobs_state.json").write_text("{}", encoding="utf-8")
-    (aegis / "epoch_generation").write_text("1", encoding="utf-8")
-    (aegis / "drivers").mkdir()
-    # what v3 `aegis init` staged there: shutil.copy2 of the packaged template
-    (aegis / "drivers" / "rust_ast.py").write_bytes(_packaged_template("rust_ast.py"))
-    (aegis / "skills" / "genesis").mkdir(parents=True)  # not ours to remove
-    (aegis / "slots.yaml").write_text(
-        "# .aegis/slots.yaml — Repository skill & driver slot bindings\n"
-        "# Auto-generated by Aegis Init\n\n"
-        "slots:\n"
-        '  ast_driver_rs: "{python} .aegis/drivers/rust_ast.py"\n'
-        '  ast_driver_md: "touch /tmp/PWNED"\n'
-        '  TOOL_RUN: "Bash"\n'
-        '  TEST_RUNNER: "cargo test"\n',
-        encoding="utf-8",
+def test_a_rule_edited_after_planning_is_not_overwritten(tmp_path):
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n")
+    planned = migrate.plan(tmp_path)
+    source.write_text(source.read_text() + "An editor saved this.\n")
+    before = source.read_bytes()
+    assert not (tmp_path / ".aegis/state").exists()
+    with pytest.raises(migrate.MigrationRefused) as refusal:
+        migrate.apply(planned)
+    assert str(refusal.value) == (
+        ".aegis/rules/traps/t.md changed since the plan was made; "
+        "no rule, config.json or .aegis/.gitignore was changed. Run aegis migrate again."
     )
-    (aegis / "config.yaml").write_text("insight_signal_weight: 0.8\n", encoding="utf-8")
-    (root / "aegis.conf").write_text(
-        "# Aegis configuration\n"
-        "MAX_JIT_TOKENS=1500\n"
-        'AEGIS_INFERENCE_PROVIDER="gemini"\n'
-        "TEAM_REPO=git@github.com:acme/governance.git\n"
-        "TEAM_MEMBER_ID=alice\n"
-        "METRICS_REPO=https://example.invalid/metrics.git\n",
-        encoding="utf-8",
+    assert source.read_bytes() == before
+    assert not (tmp_path / ".aegis/config.json").exists()
+    assert not (tmp_path / ".aegis/.gitignore").exists()
+    assert (tmp_path / ".aegis/state/.gitignore").read_text() == "# Aegis machine-local state; never committed.\n*\n"
+    assert (tmp_path / ".aegis/state/lock").is_file()
+    assert not list((tmp_path / ".aegis/state").glob("migrate-backup-*"))
+
+
+def test_customized_drivers_left_by_v4_are_supported(tmp_path):
+    from aegis_core.workspace.discovery import unmigrated_state
+
+    driver = tmp_path / ".aegis/drivers/custom.py"
+    driver.parent.mkdir(parents=True)
+    driver.write_text("# User changes retained by v4\n", encoding="utf-8")
+    assert unmigrated_state(tmp_path) == []
+    assert migrate.plan(tmp_path).to_dict()["status"] == "up_to_date"
+
+
+def test_retired_markers_do_not_report_both_a_file_and_its_parent(tmp_path):
+    from aegis_core.workspace.discovery import unmigrated_state
+
+    marker = tmp_path / ".aegis/evidence/signals.jsonl"
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"")
+    assert unmigrated_state(tmp_path) == [".aegis/evidence/signals.jsonl"]
+
+
+@pytest.mark.parametrize("when", ["before_plan", "after_plan"])
+def test_oversized_config_refuses_apply_before_allocating_its_contents(tmp_path, when):
+    import tracemalloc
+    from aegis_core.config import MAX_CONFIG_BYTES
+
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"
+    source.write_bytes(original)
+    config = tmp_path / ".aegis/config.json"
+    if when == "after_plan":
+        planned = migrate.plan(tmp_path)
+    with config.open("wb") as stream:
+        stream.truncate(16 * 1024 * 1024)
+    if when == "before_plan":
+        planned = migrate.plan(tmp_path)
+        assert planned.unreadable == [".aegis/config.json"]
+    tracemalloc.start()
+    try:
+        with pytest.raises(migrate.MigrationRefused) as refusal:
+            migrate.apply(planned)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert str(refusal.value) == (
+        f".aegis/config.json exceeds {MAX_CONFIG_BYTES} bytes; "
+        "no rule, config.json or .aegis/.gitignore was changed"
     )
-    _cell(aegis / "rules" / "traps" / "trap-existing.md", "trap", extra="impact_weight: 1.4\n")
-    cells = root / ".soma" / "cells"
-    _cell(cells / "walls" / "wall-install-uninstall-parity.md", "wall")
-    _cell(cells / "vacuoles" / "trap-hardcoded-paths.md", "vacuole")
-    _cell(cells / "chloroplasts" / "persona-cross-platform-qa.md", "chloroplast")
-    _cell(cells / "membranes" / "membrane-genome-mutations.md", "membrane")
-    _cell(cells / "plasmodesmata" / "contract-mcp-cli-parity.md", "plasmodesmata")
-    _cell(cells / "ribosomes" / "ribosome-mystery.md", "ribosome")
-    (cells / "walls" / ".gitkeep").write_text("", encoding="utf-8")
-    (cells / "README.md").write_text("# Governance Cells\n", encoding="utf-8")
-    return root
+    assert peak < 2 * 1024 * 1024
+    assert source.read_bytes() == original
+    assert config.stat().st_size == 16 * 1024 * 1024
+    assert not (tmp_path / ".aegis/.gitignore").exists()
 
 
-def _only_the_unmapped_rule_blocks(report: dict) -> bool:
-    """After a full apply of the ``legacy`` fixture only its unmapped .soma rule is left. The
-    upgrade sentinel still refuses the workspace for it, so a rerun names it as the blocker
-    instead of reporting the workspace up to date."""
-    return report["status"] == "refused" and report["refusal"].startswith(
-        "1 rule file(s) in .soma/ cannot be converted: "
-        ".soma/cells/ribosomes/ribosome-mystery.md (unmapped type 'ribosome')."
-    )
+def test_a_normalization_destination_conflict_is_reported_and_skipped(tmp_path):
+    for folder in ("Invariant", "invariants"):
+        path = tmp_path / ".aegis/rules" / folder / "same.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\nid: same\ntype: invariant\n---\n{folder}\n")
+    planned = migrate.plan(tmp_path)
+    assert planned.refusal is None
+    assert planned.to_dict()["conflicts"] == [{"path": ".aegis/rules/Invariant/same.md", "to": ".aegis/rules/invariants/same.md"}]
+    migrate.apply(planned)
+    assert (tmp_path / ".aegis/rules/Invariant/same.md").is_file()
 
 
-def _snapshot(root: Path) -> dict:
-    return {
-        p.relative_to(root).as_posix(): p.read_bytes()
-        for p in sorted(root.rglob("*")) if p.is_file()
-    }
+def test_a_noncanonical_directory_moves_by_declared_type(tmp_path):
+    source = tmp_path / ".aegis/rules/trap/t.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nid: t\ntype: invariant\nenforcement: gate\n---\nBody\n", encoding="utf-8")
+    planned = migrate.plan(tmp_path)
+    assert planned.to_dict()["rules"] == [{"from": ".aegis/rules/trap/t.md", "to": ".aegis/rules/invariants/t.md", "type": "invariant"}]
+    migrate.apply(planned)
+    assert not source.exists()
+    assert (tmp_path / ".aegis/rules/invariants/t.md").is_file()
 
 
-# ── Dry run ──────────────────────────────────────────────────────────────────
+def test_a_linked_rule_is_reported_without_blocking_a_ledger_merge(tmp_path):
+    from tests import helpers_humangate as hg
+    from tests.conftest import symlink_or_skip
 
-def test_dry_run_reports_everything_and_writes_nothing(legacy: Path):
-    before = _snapshot(legacy)
-
-    plan = migrate.plan(legacy)
-
-    assert _snapshot(legacy) == before
-    report = plan.to_dict()
-    assert report["status"] == "pending"
-    # 6 v1 rows: each trigger row pairs with its run's tp row, which is itself a trigger in v2;
-    # the telemetry/ copy repeats 4 of them (same event ids) and adds nothing
-    assert report["ledger"] == {
-        "sources": [".aegis/evidence/signals.jsonl", ".aegis/telemetry/signals.jsonl"],
-        "rows": 3, "duplicates": 4, "unusable_rows": 1, "skipped_lines": 0, "torn_tail": True,
-    }
-    assert sorted(report["remove"]) == sorted([
-        ".aegis/config.yaml", ".aegis/drivers", ".aegis/epoch_generation", ".aegis/evidence",
-        ".aegis/handoffs", ".aegis/insight_cursor", ".aegis/jobs_state.json", ".aegis/keys",
-        ".aegis/locks", ".aegis/receipts.jsonl", ".aegis/slots.yaml", ".aegis/telemetry", "aegis.conf",
-    ])
-    assert report["config"] == {"v": 1, "jit": {"max_tokens": 1500}}
-    assert report["user_config"] == {
-        "drivers": {"md": "touch /tmp/PWNED"},
-        "slots": {"TOOL_RUN": "Bash", "TEST_RUNNER": "cargo test"},
-    }
-    dropped = "\n".join(report["dropped"])
-    for key in ("AEGIS_INFERENCE_PROVIDER", "TEAM_REPO", "TEAM_MEMBER_ID", "METRICS_REPO", "insight_signal_weight"):
-        assert key in dropped
-    assert {m["to"] for m in report["rules"]} == {
-        ".aegis/rules/invariants/wall-install-uninstall-parity.md",
-        ".aegis/rules/traps/trap-hardcoded-paths.md",
-        ".aegis/rules/personas/persona-cross-platform-qa.md",
-        ".aegis/rules/boundaries/membrane-genome-mutations.md",
-        ".aegis/rules/contracts/contract-mcp-cli-parity.md",
-    }
-    assert report["unmapped"] == [{"path": ".soma/cells/ribosomes/ribosome-mystery.md", "type": "ribosome"}]
-    assert {s["path"]: s["keys"] for s in report["strip"]} == {".aegis/rules/traps/trap-existing.md": ["fitness"]}
-    assert report["left_in_place"] == [".aegis/skills"]
+    repo = hg.make_repo(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("---\nid: t\ntype: trap\nscore: 1\n---\nBody\n", encoding="utf-8")
+    link = repo.root / ".aegis/rules/traps/t.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    symlink_or_skip(outside, link)
+    local = repo.root / ".aegis/state/ledger.jsonl"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(json.dumps({"v": 2, "seq": 1, "ts": "2026-10-01T00:00:00Z", "rule": "t", "outcome": "tp", "source": "ci", "key": "k1"}) + "\n")
+    planned = migrate.plan(repo.root)
+    assert planned.refusal is None
+    assert planned.to_dict()["skipped"][0]["path"] == ".aegis/rules/traps/t.md"
+    assert migrate.apply(planned).merged == 1
+    assert outside.read_text(encoding="utf-8").endswith("Body\n") and link.is_symlink()
 
 
-# ── Apply ────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("keep_note", [False, True])
+def test_hardlinked_case_variant_directories_converge_once(tmp_path, capsys, keep_note):
+    from aegis_cli.cli import main
+    from aegis_core.rules import load_rules
 
-def test_apply_converts_the_ledger_with_provenance_and_an_epoch(legacy: Path):
-    result = migrate.apply(migrate.plan(legacy))
-
-    rows = [json.loads(line) for line in (legacy / ".aegis" / "state" / "ledger.jsonl").read_text().splitlines()]
-    outcome_rows, epoch = rows[:-1], rows[-1]
-    assert [r["seq"] for r in rows] == [1, 2, 3, 4]
-    assert all(r["v"] == 2 and r["source"] == "session" for r in outcome_rows)
-    assert {(r["rule"], r["outcome"]) for r in outcome_rows} == {
-        ("contract-snapshot-schema", "tp"), ("trap-atomic-write", "tp"),
-    }
-    assert all(r["from"]["file"] == ".aegis/evidence/signals.jsonl" and r["from"]["v"] == 1 for r in outcome_rows)
-    assert epoch["epoch"]["migration"] == "v3-to-v4"
-    assert epoch["epoch"]["rows"] == 3
-    assert ledger.aggregate(legacy, "trap-atomic-write") == {
-        "triggers": 2, "tp": pytest.approx(0.6666666666666666 + 1), "fp": 0, "last_ts": TS3,
-    }
-    assert ledger.aggregate(legacy, "contract-snapshot-schema")["triggers"] == 1
-    assert result.backup is not None
-
-
-def test_apply_backs_up_and_removes_legacy_state(legacy: Path):
-    before = _snapshot(legacy)
-
-    result = migrate.apply(migrate.plan(legacy))
-
-    backup = result.backup
-    assert backup.parent == legacy / ".aegis" / "state" and backup.name.startswith("migrate-backup-")
-    for rel in (".aegis/evidence/signals.jsonl", ".aegis/keys/receipt.key", ".aegis/receipts.jsonl",
-                ".aegis/slots.yaml", "aegis.conf", ".aegis/rules/traps/trap-existing.md",
-                ".soma/cells/walls/wall-install-uninstall-parity.md"):
-        assert (backup / rel).read_bytes() == before[rel], rel
-    for gone in ("evidence", "telemetry", "keys", "locks", "receipts.jsonl", "insight_cursor", "handoffs",
-                 "jobs_state.json", "epoch_generation", "drivers", "slots.yaml", "config.yaml"):
-        assert not (legacy / ".aegis" / gone).exists(), gone
-    assert not (legacy / "aegis.conf").exists()
-    assert (legacy / ".aegis" / "skills" / "genesis").is_dir()
-    assert (legacy / ".aegis" / ".gitignore").read_text().splitlines()[-1] == "state/"
+    old_dir = tmp_path / ".aegis/rules/Invariants"
+    target_dir = tmp_path / ".aegis/rules/invariants"
+    old_dir.mkdir(parents=True)
+    target_dir.mkdir(exist_ok=True)
+    if os.path.samefile(old_dir, target_dir):
+        pytest.skip("requires distinct case-sensitive directories")
+    source, target = old_dir / "t.md", target_dir / "t.md"
+    if keep_note:
+        (old_dir / "notes.txt").write_text("Keep these notes", encoding="utf-8")
+    source.write_text("---\nid: t\ntype: invariant\nscore: 0.4\n---\nBody\n", encoding="utf-8")
+    os.link(source, target)
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "applied" and len(report["rules"]) == 1
+    assert not source.exists() and old_dir.exists() is keep_note
+    assert target.read_text(encoding="utf-8") == "---\nid: t\ntype: invariant\n---\nBody\n"
+    assert load_rules(tmp_path).errors == ()
+    assert not migrate.plan(tmp_path).pending
 
 
-def test_apply_writes_config_without_any_command(legacy: Path):
-    result = migrate.apply(migrate.plan(legacy))
+def test_a_cleanup_error_is_reported_in_json_with_a_nonzero_exit(tmp_path, capsys, monkeypatch):
+    from aegis_cli.cli import main
 
-    config = json.loads((legacy / ".aegis" / "config.json").read_text(encoding="utf-8"))
-    assert config == {"v": 1, "jit": {"max_tokens": 1500}}
-    assert "touch" not in (legacy / ".aegis" / "config.json").read_text(encoding="utf-8")
-    assert result.plan.user_config["drivers"] == {"md": "touch /tmp/PWNED"}
-    assert not (Path.home() / ".aegis" / "config.json").exists() or "touch" not in (
-        Path.home() / ".aegis" / "config.json"
-    ).read_text(encoding="utf-8")
+    source = tmp_path / ".aegis/rules/Invariant/t.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nid: t\ntype: invariant\n---\nBody\n", encoding="utf-8")
+    real_rmdir = Path.rmdir
+
+    def blocked_directory(path):
+        if path == source.parent:
+            raise OSError("directory cleanup denied")
+        return real_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", blocked_directory)
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["skipped"] == [{"path": ".aegis/rules/Invariant/t.md", "reason": "directory cleanup denied"}]
+    assert (tmp_path / ".aegis/rules/invariants/t.md").is_file()
 
 
-def test_apply_converts_soma_cells_and_strips_derived_counters(legacy: Path):
-    migrate.apply(migrate.plan(legacy))
+def test_a_concurrent_v4_config_is_preserved_when_applying(tmp_path):
+    from aegis_core.config import update_repo_config
 
-    rules = legacy / ".aegis" / "rules"
-    expected = {
-        "invariants/wall-install-uninstall-parity.md": "invariant",
-        "traps/trap-hardcoded-paths.md": "trap",
-        "personas/persona-cross-platform-qa.md": "persona",
-        "boundaries/membrane-genome-mutations.md": "boundary",
-        "contracts/contract-mcp-cli-parity.md": "contract",
-    }
-    for rel, rule_type in expected.items():
-        text = (rules / rel).read_text(encoding="utf-8")
-        meta = parse_frontmatter(text)
-        assert meta["type"] == rule_type, rel
-        assert "fitness" not in meta and "triggers" not in text
-        assert meta["tags"] == ["install", "parity"]
-        assert text.endswith(f"\nBody of {Path(rel).stem}.\n")
-        assert not (legacy / ".soma" / "cells" / rel.split("/")[0]).joinpath(Path(rel).name).exists()
-    # the unmapped type is reported and left where it was, never guessed
-    assert (legacy / ".soma" / "cells" / "ribosomes" / "ribosome-mystery.md").is_file()
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n", encoding="utf-8")
+    planned = migrate.plan(tmp_path)
+    update_repo_config(tmp_path, lambda data: data.update(hosts=["codex-cli"]))
+    before = (tmp_path / ".aegis/config.json").read_bytes()
+    migrate.apply(planned)
+    assert (tmp_path / ".aegis/config.json").read_bytes() == before
+    assert "score:" not in source.read_text(encoding="utf-8")
+
+
+def test_an_already_canonical_destination_is_not_rewritten(tmp_path):
+    source = tmp_path / ".aegis/rules/trap/t.md"
+    target = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir()
+    text = "---\nid: t\ntype: trap\n---\nBody\n"
+    source.write_text(text, encoding="utf-8")
+    target.write_text(text, encoding="utf-8")
+    target.chmod(0o600)
+    os.utime(target, (1000000000, 1000000000))
+    before = target.stat()
+    planned = migrate.plan(tmp_path)
+    assert planned.to_dict()["already_moved"] == [".aegis/rules/trap/t.md"]
+    assert planned.to_dict()["rules"] == []
+    migrate.apply(planned)
+    assert not source.exists() and target.read_text(encoding="utf-8") == text
+    assert target.stat().st_mtime_ns == before.st_mtime_ns
+    assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(before.st_mode)
+
+
+def test_a_new_normalization_destination_is_not_overwritten(tmp_path):
+    source = tmp_path / ".aegis/rules/Invariant/t.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nid: t\ntype: invariant\n---\nBody\n")
+    planned = migrate.plan(tmp_path)
+    target = tmp_path / ".aegis/rules/invariants/t.md"
+    target.parent.mkdir()
+    target.write_text("new content\n")
+    with pytest.raises(migrate.MigrationRefused, match="changed since the plan"):
+        migrate.apply(planned)
+    assert target.read_text() == "new content\n"
+    assert source.exists()
 
 
 def test_stripping_keeps_every_other_byte_and_hoists_impact_weight(tmp_path: Path):
@@ -303,7 +298,6 @@ def test_stripping_keeps_every_other_byte_and_hoists_impact_weight(tmp_path: Pat
     assert json.loads((root / ".aegis" / "config.json").read_text(encoding="utf-8")) == {"v": 1}
     assert (root / ".aegis" / ".gitignore").read_text(encoding="utf-8").splitlines()[-1] == "state/"
 
-
 def test_trigger_keyword_lists_are_rule_content_not_counters(tmp_path: Path):
     root = tmp_path / "ws"
     rule = root / ".aegis" / "rules" / "traps" / "trap-doc.md"
@@ -323,201 +317,6 @@ def test_trigger_keyword_lists_are_rule_content_not_counters(tmp_path: Path):
         "score: high\n---\nBody\n"
     )
 
-
-def test_a_second_apply_changes_nothing(legacy: Path):
-    migrate.apply(migrate.plan(legacy))
-    before = _snapshot(legacy)
-
-    plan = migrate.plan(legacy)
-    assert _only_the_unmapped_rule_blocks(plan.to_dict())
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-
-    assert _snapshot(legacy) == before
-
-
-def test_existing_v2_rows_are_never_rewritten(legacy: Path):
-    path = legacy / ".aegis" / "state" / "ledger.jsonl"
-    ledger.append(legacy, [{"rule": "trap-atomic-write", "outcome": "fp", "source": "mcp", "key": "k"}])
-    existing = path.read_bytes()
-
-    migrate.apply(migrate.plan(legacy))
-
-    data = path.read_bytes()
-    assert data.startswith(existing)
-    rows = [json.loads(line) for line in data.decode().splitlines()]
-    assert [r["seq"] for r in rows] == list(range(1, len(rows) + 1))
-
-
-def test_a_rule_already_at_the_destination_is_never_overwritten(legacy: Path):
-    taken = legacy / ".aegis" / "rules" / "invariants" / "wall-install-uninstall-parity.md"
-    taken.parent.mkdir(parents=True)
-    taken.write_text("---\nid: mine\ntype: invariant\n---\nmine\n", encoding="utf-8")
-
-    plan = migrate.plan(legacy)
-    assert plan.to_dict()["conflicts"] == [{
-        "path": ".soma/cells/walls/wall-install-uninstall-parity.md",
-        "to": ".aegis/rules/invariants/wall-install-uninstall-parity.md",
-    }]
-    migrate.apply(plan)
-
-    assert taken.read_text(encoding="utf-8") == "---\nid: mine\ntype: invariant\n---\nmine\n"
-    assert (legacy / ".soma" / "cells" / "walls" / "wall-install-uninstall-parity.md").is_file()
-
-
-def test_a_soma_only_workspace_gets_the_v4_layout(tmp_path: Path):
-    root = tmp_path / "old"
-    _cell(root / ".soma" / "cells" / "vacuoles" / "trap-x.md", "vacuole")
-
-    migrate.apply(migrate.plan(root))
-
-    assert (root / ".aegis" / "rules" / "traps" / "trap-x.md").is_file()
-    assert (root / ".aegis" / "state").is_dir()
-    assert json.loads((root / ".aegis" / "config.json").read_text(encoding="utf-8")) == {"v": 1}
-    assert (root / ".aegis" / ".gitignore").is_file()
-
-
-def test_nothing_to_migrate_in_a_v4_workspace(tmp_path: Path):
-    root = tmp_path / "v4"
-    (root / ".aegis" / "rules" / "traps").mkdir(parents=True)
-    (root / ".aegis" / "rules" / "traps" / "trap-ok.md").write_text("---\nid: trap-ok\ntype: trap\n---\nok\n")
-    before = _snapshot(root)
-
-    plan = migrate.plan(root)
-
-    assert plan.to_dict()["status"] == "up_to_date"
-    assert migrate.apply(plan).backup is None
-    assert _snapshot(root) == before
-
-
-def test_backup_is_written_before_anything_is_removed(legacy: Path, monkeypatch):
-    """A crash in the middle of apply leaves every touched file in the backup."""
-    import shutil as shutil_mod
-
-    real_rmtree = shutil_mod.rmtree
-    calls = []
-
-    def failing_rmtree(path, *args, **kwargs):
-        calls.append(path)
-        raise OSError("disk on fire")
-
-    monkeypatch.setattr(migrate.shutil, "rmtree", failing_rmtree)
-    with pytest.raises(OSError, match="disk on fire"):
-        migrate.apply(migrate.plan(legacy))
-    monkeypatch.setattr(migrate.shutil, "rmtree", real_rmtree)
-
-    backups = list((legacy / ".aegis" / "state").glob("migrate-backup-*"))
-    assert len(backups) == 1
-    assert (backups[0] / ".aegis" / "evidence" / "signals.jsonl").is_file()
-    assert calls
-
-
-# ── Crash windows and untrusted shapes ───────────────────────────────────────
-
-def _symlink_or_skip(link: Path, target: Path) -> None:
-    try:
-        link.symlink_to(target, target_is_directory=target.is_dir())
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
-
-
-def test_a_symlinked_aegis_dir_is_refused_and_nothing_is_written(tmp_path: Path):
-    root = tmp_path / "ws"
-    root.mkdir()
-    outside = tmp_path / "elsewhere"
-    (outside / "evidence").mkdir(parents=True)
-    (outside / "evidence" / "signals.jsonl").write_text(json.dumps(CITADEL_ROWS[0]) + "\n", encoding="utf-8")
-    _symlink_or_skip(root / ".aegis", outside)
-    before = _snapshot(outside)
-
-    plan = migrate.plan(root)
-    assert plan.to_dict()["status"] == "refused"
-    assert ".aegis is a symlink" in plan.to_dict()["refusal"]
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-    assert _snapshot(outside) == before
-
-
-def test_a_symlinked_aegis_dir_is_refused_even_when_it_points_inside_the_workspace(tmp_path: Path):
-    root = tmp_path / "ws"
-    (root / "real-aegis" / "rules" / "traps").mkdir(parents=True)
-    _symlink_or_skip(root / ".aegis", root / "real-aegis")
-
-    plan = migrate.plan(root)
-
-    assert plan.to_dict()["refusal"] == ".aegis is a symlink; aegis migrate reads and writes only inside the workspace"
-
-
-def test_an_existing_config_json_is_not_rewritten_when_no_legacy_setting_feeds_it(tmp_path: Path):
-    root = tmp_path / "ws"
-    rule = root / ".aegis" / "rules" / "invariants" / "w.md"
-    rule.parent.mkdir(parents=True)
-    rule.write_text("---\nid: w\ntype: wall\nenforcement: gate\nhypothesis: h\n---\nBody\n", encoding="utf-8")
-    config = root / ".aegis" / "config.json"
-    config.write_bytes(b'{"v": 1,   "expiry": {"default_days": 30}}')
-    plan = migrate.plan(root)
-    assert plan.to_dict()["status"] == "pending"
-
-    result = migrate.apply(plan)
-
-    assert ".aegis/config.json" not in result.written
-    assert config.read_bytes() == b'{"v": 1,   "expiry": {"default_days": 30}}'
-    assert "type: invariant" in rule.read_text(encoding="utf-8")
-
-
-def test_a_rerun_after_an_interrupted_apply_converges(legacy: Path, monkeypatch):
-    real_unlink = Path.unlink
-
-    def crash_on_soma(self, *args, **kwargs):
-        if ".soma" in self.parts:
-            raise OSError("power cut")
-        return real_unlink(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", crash_on_soma)
-    with pytest.raises(OSError, match="power cut"):
-        migrate.apply(migrate.plan(legacy))
-    monkeypatch.setattr(Path, "unlink", real_unlink)
-
-    plan = migrate.plan(legacy)
-    report = plan.to_dict()
-    assert report["conflicts"] == []
-    assert len(report["already_moved"]) == 5
-    migrate.apply(plan)
-
-    assert sorted(p.name for p in (legacy / ".soma" / "cells").rglob("*.md")) == ["README.md", "ribosome-mystery.md"]
-    rows = ledger.read(legacy).rows
-    assert len(rows) == 3  # the rerun re-read the v3 ledger and appended nothing twice
-    assert _only_the_unmapped_rule_blocks(migrate.plan(legacy).to_dict())
-
-
-def test_rule_paths_that_resolve_outside_the_workspace_are_not_written(tmp_path: Path):
-    root = tmp_path / "ws"
-    (root / ".aegis" / "rules").mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    victim = outside / "trap-victim.md"
-    victim.write_text("---\nid: v\nfitness:\n  triggers: 1\n---\nB\n", encoding="utf-8")
-    _symlink_or_skip(root / ".aegis" / "rules" / "traps", outside)
-    _cell(root / ".soma" / "cells" / "vacuoles" / "trap-new.md", "vacuole")
-
-    plan = migrate.plan(root)
-    report = plan.to_dict()
-    assert report["strip"] == [] and report["rules"] == []
-    skipped = {s["path"] for s in report["skipped"]}
-    assert ".soma/cells/vacuoles/trap-new.md" in skipped  # its destination dir leaves the workspace
-    # rglob may or may not descend a symlinked dir (it varies by Python version); either way
-    # the rule behind it is never rewritten
-    assert skipped <= {".soma/cells/vacuoles/trap-new.md", ".aegis/rules/traps/trap-victim.md"}
-    # Nothing else to apply, and the rule it cannot place is the blocker it names.
-    assert report["status"] == "refused"
-    assert ".soma/cells/vacuoles/trap-new.md (.aegis/rules/traps resolves outside the workspace)" in report["refusal"]
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-
-    assert victim.read_text(encoding="utf-8") == "---\nid: v\nfitness:\n  triggers: 1\n---\nB\n"
-    assert sorted(p.name for p in outside.iterdir()) == ["trap-victim.md"]
-
-
 def test_a_rule_with_a_bom_keeps_it(tmp_path: Path):
     root = tmp_path / "ws"
     rule = root / ".aegis" / "rules" / "traps" / "trap-bom.md"
@@ -529,578 +328,96 @@ def test_a_rule_with_a_bom_keeps_it(tmp_path: Path):
     assert rule.read_bytes() == "﻿---\nid: trap-bom\n---\nBody\n".encode("utf-8")
 
 
-# ── The v3 integrity manifest is v3 state (D3) ─────────────────────────────
+@pytest.mark.parametrize("entry", ["state", "config.json"])
+def test_v4_state_and_config_links_are_refused(tmp_path, entry):
+    from tests.conftest import symlink_or_skip
 
-def _served(root: Path) -> list:
-    from aegis_core.rules import load_rules
-
-    return sorted(rule.id for rule in load_rules(root).served)
-
-
-def _v3_manifest(root: Path) -> Path:
-    """What every v3 `aegis init` left behind: an HMAC key and a signed manifest of the rules.
-
-    The manifest lists only trap-existing, with a digest that matches nothing: v3 would
-    have refused every rule; v4 never reads it.
-    """
-    keys = root / ".aegis" / "keys"
-    keys.mkdir(parents=True, exist_ok=True)
-    (keys / "manifest.key").write_bytes(b"\x01" * 32)
-    manifest = root / ".aegis" / "rules" / "manifest.json"
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(
-        json.dumps({"version": 1, "cells": {"traps/trap-existing.md": "0" * 64}, "signature": "ab" * 32}),
-        encoding="utf-8",
-    )
-    return manifest
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    aegis = tmp_path / "repo/.aegis"
+    aegis.mkdir(parents=True)
+    symlink_or_skip(outside, aegis / entry, target_is_directory=True)
+    planned = migrate.plan(aegis.parent)
+    assert planned.refusal == f".aegis/{entry} is a symlink; aegis migrate reads and writes only inside the workspace"
+    with pytest.raises(migrate.MigrationRefused, match="is a symlink"):
+        migrate.apply(planned)
+    assert list(outside.iterdir()) == []
 
 
-def test_the_v3_manifest_and_its_key_are_backed_up_removed_and_never_exclude_a_rule(legacy: Path):
-    manifest = _v3_manifest(legacy)
-    before = manifest.read_bytes()
-
-    plan = migrate.plan(legacy)
-    report = plan.to_dict()
-    assert {".aegis/rules/manifest.json", ".aegis/keys"} <= set(report["remove"])
-    assert "manifest" not in report
-    result = migrate.apply(plan)
-
-    assert (result.backup / ".aegis" / "rules" / "manifest.json").read_bytes() == before
-    assert (result.backup / ".aegis" / "keys" / "manifest.key").read_bytes() == b"\x01" * 32
-    assert not manifest.exists() and not (legacy / ".aegis" / "keys").exists()
-    assert _served(legacy) == sorted([
-        "trap-existing", "wall-install-uninstall-parity", "trap-hardcoded-paths",
-        "persona-cross-platform-qa", "membrane-genome-mutations", "contract-mcp-cli-parity",
-    ])
-    assert _only_the_unmapped_rule_blocks(migrate.plan(legacy).to_dict())
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.parametrize("mode", [0o600, 0o640])
+def test_v4_backups_keep_modes_and_original_bytes(tmp_path, mode):
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"
+    source.write_bytes(original)
+    source.chmod(mode)
+    result = migrate.apply(migrate.plan(tmp_path))
+    assert stat.S_IMODE(result.backup.stat().st_mode) == 0o700
+    saved = result.backup / ".aegis/rules/traps/t.md"
+    assert saved.read_bytes() == original
+    assert stat.S_IMODE(saved.stat().st_mode) == mode
 
 
-def test_the_older_root_manifest_location_is_removed_too(tmp_path: Path):
-    root = tmp_path / "ws"
-    _cell(root / ".aegis" / "rules" / "traps" / "trap-a.md", "trap")
-    (root / ".aegis" / "manifest.json").write_text('{"cells": {}}', encoding="utf-8")
+def test_an_unreadable_rule_does_not_block_v4_worktree_merge(tmp_path):
+    from tests import helpers_humangate as hg
+    from aegis_core.telemetry_engine import ledger
 
-    plan = migrate.plan(root)
-    assert plan.to_dict()["remove"] == [".aegis/manifest.json"]
-    migrate.apply(plan)
-
-    assert not (root / ".aegis" / "manifest.json").exists()
-    assert _served(root) == ["trap-a"]
-
-
-def test_a_crash_mid_apply_converges_on_rerun(legacy: Path, monkeypatch):
-    _v3_manifest(legacy)
-    real_write = migrate.atomic_write_bytes
-
-    def crash_on_rule_write(path, data, *args, **kwargs):
-        posix = Path(path).as_posix()
-        if "/.aegis/rules/" in posix and "migrate-backup" not in posix and posix.endswith(".md"):
-            raise OSError("power cut")
-        return real_write(path, data, *args, **kwargs)
-
-    monkeypatch.setattr(migrate, "atomic_write_bytes", crash_on_rule_write)
-    with pytest.raises(OSError, match="power cut"):
-        migrate.apply(migrate.plan(legacy))
-    monkeypatch.setattr(migrate, "atomic_write_bytes", real_write)
-
-    migrate.apply(migrate.plan(legacy))
-
-    assert len(_served(legacy)) == 6
-    assert not (legacy / ".aegis" / "rules" / "manifest.json").exists()
-    assert "fitness" not in (legacy / ".aegis" / "rules" / "traps" / "trap-existing.md").read_text(encoding="utf-8")
-    assert _only_the_unmapped_rule_blocks(migrate.plan(legacy).to_dict())
+    repo = hg.make_repo(tmp_path)
+    bad = repo.root / ".aegis/rules/traps/cp1252.md"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    raw = b"---\nid: cp1252\ntype: trap\n---\ncaf\xe9\n"
+    bad.write_bytes(raw)
+    local = repo.root / ".aegis/state/ledger.jsonl"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(json.dumps({"v": 2, "seq": 1, "ts": "2026-10-01T00:00:00Z", "rule": "trap-x", "outcome": "tp", "source": "ci", "key": "k1"}) + "\n")
+    planned = migrate.plan(repo.root)
+    assert planned.refusal is None
+    assert planned.to_dict()["unreadable"] == [".aegis/rules/traps/cp1252.md"]
+    assert planned.worktree_pending == 1
+    assert migrate.apply(planned).merged == 1
+    assert [row["key"] for row in ledger.read(repo.root).rows] == ["k1"]
+    assert bad.read_bytes() == raw
 
 
-# ── Config written by someone else between plan and apply (review B2a-6) ─────
-
-def test_apply_merges_into_the_config_as_it_is_when_applying(legacy: Path):
-    from aegis_core.config import update_repo_config
-
-    plan = migrate.plan(legacy)
-
-    def concurrent(data):  # e.g. `aegis init` provisioning a driver after the plan was made
-        data["hosts"] = ["codex"]
-        data["jit"] = {"max_tokens": 900}
-        data["ast"] = {"packaged_drivers": ["go"]}
-
-    update_repo_config(legacy, concurrent)
-    migrate.apply(plan)
-
-    config = json.loads((legacy / ".aegis" / "config.json").read_text(encoding="utf-8"))
-    assert config == {"v": 1, "hosts": ["codex"], "jit": {"max_tokens": 900}, "ast": {"packaged_drivers": ["go"]}}
-
-
-# ── A ledger write torn at a row boundary (review B2a-2) ─────────────────────
-
-@pytest.mark.parametrize("rows_on_disk", [1, 2, 3])
-def test_a_ledger_write_torn_at_a_row_boundary_converges_without_duplicates(
-    legacy: Path, monkeypatch, tmp_path: Path, rows_on_disk: int,
-):
+def test_strip_only_apply_does_not_touch_the_shared_ledger(tmp_path):
+    from tests import helpers_humangate as hg
     from aegis_core import storage
 
-    def torn_append(path, rows):
-        scratch = tmp_path / "scratch.jsonl"
-        storage.append_jsonl(scratch, rows)
-        data = scratch.read_bytes()
-        cut = [i for i, byte in enumerate(data) if byte == ord("\n")][rows_on_disk - 1]
-        with open(path, "ab") as fh:  # the crash lands on the newline after a complete row
-            fh.write(data[:cut])
-        raise OSError("power cut")
-
-    monkeypatch.setattr(ledger, "append_jsonl", torn_append)
-    with pytest.raises(OSError, match="power cut"):
-        migrate.apply(migrate.plan(legacy))
-    monkeypatch.setattr(ledger, "append_jsonl", storage.append_jsonl)
-
-    migrate.apply(migrate.plan(legacy))
-
-    rows = [json.loads(line) for line in (legacy / ".aegis" / "state" / "ledger.jsonl").read_text().splitlines()]
-    assert [r["seq"] for r in rows] == [1, 2, 3, 4]
-    outcome_rows = rows[:-1]
-    assert len({(r["key"], r["rule"]) for r in outcome_rows}) == 3
-    assert "epoch" in rows[-1]
-    assert ledger.aggregate(legacy, "trap-atomic-write") == {
-        "triggers": 2, "tp": pytest.approx(0.6666666666666666 + 1), "fp": 0, "last_ts": TS3,
-    }
-    assert _only_the_unmapped_rule_blocks(migrate.plan(legacy).to_dict())
-
-
-# ── Confinement: a symlinked .aegis/state (review B2a-4) ─────────────────────
-
-def test_a_symlinked_state_dir_is_refused_and_nothing_is_written_outside(legacy: Path, tmp_path: Path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    _symlink_or_skip(legacy / ".aegis" / "state", outside)
-    before = _snapshot(legacy)
-
-    plan = migrate.plan(legacy)
-    assert plan.to_dict()["status"] == "refused"
-    assert ".aegis/state is a symlink" in plan.to_dict()["refusal"]
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-
-    assert list(outside.iterdir()) == []
-    assert _snapshot(legacy) == before
-
-
-# ── .aegis/drivers holds more than aegis's staged copies (review B2a-5) ──────
-
-def test_user_authored_drivers_are_left_in_place_and_reported(legacy: Path):
-    drivers = legacy / ".aegis" / "drivers"
-    (drivers / "my_md_driver.py").write_text("print('mine')\n", encoding="utf-8")
-    (drivers / "NOTES.txt").write_text("how our drivers work\n", encoding="utf-8")
-    slots = legacy / ".aegis" / "slots.yaml"
-    slots.write_text(
-        slots.read_text(encoding="utf-8").replace("touch /tmp/PWNED", "python3 .aegis/drivers/my_md_driver.py"),
-        encoding="utf-8",
-    )
-
-    plan = migrate.plan(legacy)
-    report = plan.to_dict()
-    assert ".aegis/drivers" not in report["remove"]
-    assert ".aegis/drivers/rust_ast.py" in report["remove"]  # the copy `aegis init` staged
-    assert {".aegis/drivers/my_md_driver.py", ".aegis/drivers/NOTES.txt"} <= set(report["left_in_place"])
-    assert report["user_config"]["drivers"] == {"md": "python3 .aegis/drivers/my_md_driver.py"}
-    result = migrate.apply(plan)
-
-    assert (drivers / "my_md_driver.py").read_text(encoding="utf-8") == "print('mine')\n"
-    assert (drivers / "NOTES.txt").is_file()
-    assert not (drivers / "rust_ast.py").exists()
-    assert (result.backup / ".aegis" / "drivers" / "rust_ast.py").is_file()
-    assert _only_the_unmapped_rule_blocks(migrate.plan(legacy).to_dict())
-
-
-def test_a_staged_copy_a_printed_driver_command_names_is_kept(legacy: Path):
-    slots = legacy / ".aegis" / "slots.yaml"
-    slots.write_text(
-        slots.read_text(encoding="utf-8").replace("touch /tmp/PWNED", "python3 -O .aegis/drivers/rust_ast.py"),
-        encoding="utf-8",
-    )
-
-    plan = migrate.plan(legacy)
-    report = plan.to_dict()
-    assert report["user_config"]["drivers"] == {"md": "python3 -O .aegis/drivers/rust_ast.py"}
-    assert ".aegis/drivers/rust_ast.py" in report["left_in_place"]
-    assert not any(path.startswith(".aegis/drivers") for path in report["remove"])
-    migrate.apply(plan)
-
-    assert (legacy / ".aegis" / "drivers" / "rust_ast.py").is_file()
-
-
-# ── Backups keep private files private (review B2a round 3, F2) ──────────────
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
-def test_backups_keep_each_file_mode_and_the_backup_dir_is_private(legacy: Path):
-    private = (".aegis/keys/receipt.key", ".aegis/receipts.jsonl", ".aegis/evidence/signals.jsonl")
-    for rel in private:
-        os.chmod(legacy / rel, 0o600)
-    os.chmod(legacy / "aegis.conf", 0o640)
-    saved = os.umask(0o022)
-    try:
-        result = migrate.apply(migrate.plan(legacy))
-    finally:
-        os.umask(saved)
-
-    def mode(path: Path) -> int:
-        return stat.S_IMODE(path.stat().st_mode)
-
-    assert mode(result.backup) == 0o700
-    for rel in private:
-        assert mode(result.backup / rel) == 0o600, rel
-    assert mode(result.backup / "aegis.conf") == 0o640
-
-
-# ── Nothing planned from stale bytes (review B2a round 3, F4) ────────────────
-
-def _without_state(snapshot: dict) -> dict:
-    return {rel: data for rel, data in snapshot.items() if not rel.startswith(".aegis/state/")}
-
-
-@pytest.mark.parametrize("rel, edit", [
-    (".aegis/rules/traps/trap-existing.md", b"EDITED AFTER PLAN\n"),
-    (".soma/cells/walls/wall-install-uninstall-parity.md", b"EDITED AFTER PLAN\n"),
-    ("aegis.conf", b"MAX_JIT_TOKENS=900\n"),
-    (".aegis/slots.yaml", b"  ast_driver_go: \"go run .aegis/drivers/go_ast.go\"\n"),
-    (".aegis/evidence/signals.jsonl", b"\n" + json.dumps(_v1("trap-late", "tp", TS3, "e7")).encode() + b"\n"),
-])
-def test_a_file_changed_after_planning_refuses_apply_and_changes_nothing(legacy: Path, rel: str, edit: bytes):
-    plan = migrate.plan(legacy)
-    with open(legacy / rel, "ab") as fh:
-        fh.write(edit)
-    before = _snapshot(legacy)
-
-    with pytest.raises(migrate.MigrationRefused, match=re.escape(rel) + " changed since the plan was made"):
-        migrate.apply(plan)
-
-    assert _without_state(_snapshot(legacy)) == before
-    assert not list((legacy / ".aegis" / "state").glob("migrate-backup-*"))
-    assert not (legacy / ".aegis" / "state" / "ledger.jsonl").exists()
-    result = migrate.apply(migrate.plan(legacy))  # a fresh plan works from the edited bytes
-    assert (result.backup / rel).read_bytes().endswith(edit)
-
-
-def test_a_rule_destination_created_after_planning_refuses_apply(legacy: Path):
-    plan = migrate.plan(legacy)
-    target = legacy / ".aegis" / "rules" / "invariants" / "wall-install-uninstall-parity.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("---\nid: someone-elses\n---\nTheirs\n", encoding="utf-8")
-    source = legacy / ".soma" / "cells" / "walls" / "wall-install-uninstall-parity.md"
-    source_bytes = source.read_bytes()
-
-    with pytest.raises(migrate.MigrationRefused, match="wall-install-uninstall-parity.md changed since the plan was made"):
-        migrate.apply(plan)
-
-    assert source.read_bytes() == source_bytes  # never removed while its content went nowhere
-    assert target.read_text(encoding="utf-8") == "---\nid: someone-elses\n---\nTheirs\n"
-
-
-def test_apply_backs_up_the_config_and_gitignore_it_changes(legacy: Path):
-    config = legacy / ".aegis" / "config.json"
-    config.write_bytes(b'{"v": 1, "hosts": ["codex"]}\n')
-    gitignore = legacy / ".aegis" / ".gitignore"
-    gitignore.write_bytes(b"evidence/\nlocks/\n")
-
-    result = migrate.apply(migrate.plan(legacy))
-
-    assert (result.backup / ".aegis" / "config.json").read_bytes() == b'{"v": 1, "hosts": ["codex"]}\n'
-    assert (result.backup / ".aegis" / ".gitignore").read_bytes() == b"evidence/\nlocks/\n"
-    assert json.loads(config.read_text(encoding="utf-8"))["jit"] == {"max_tokens": 1500}
-    assert gitignore.read_text(encoding="utf-8").splitlines()[-1] == "state/"
-
-
-# ── v3 rows written with surrogatepass (review B2a round 3, F5) ──────────────
-
-def test_a_v3_row_holding_a_lone_surrogate_is_migrated(tmp_path: Path):
-    root = tmp_path / "ws"
-    signals = root / ".aegis" / "evidence" / "signals.jsonl"
-    signals.parent.mkdir(parents=True)
-    row = _v1("trap-encoding", "tp", TS1, "s1", target_files=["caf\udce9.py"])
-    # exactly how v3 wrote the ledger: ensure_ascii=False, then surrogatepass
-    signals.write_bytes(json.dumps(row, ensure_ascii=False).encode("utf-8", "surrogatepass") + b"\n")
-
-    plan = migrate.plan(root)
-    assert plan.to_dict()["ledger"]["rows"] == 1
-    assert plan.to_dict()["ledger"]["skipped_lines"] == 0
-    migrate.apply(plan)
-
-    rows = ledger.read(root).rows
-    assert [(r["rule"], r["meta"]["target_files"]) for r in rows] == [("trap-encoding", ["caf\udce9.py"])]
-    (root / ".aegis" / "state" / "ledger.jsonl").read_bytes().decode("utf-8")  # still valid UTF-8
-
-
-# ── Staged drivers are removed only when they are what aegis shipped (F6) ────
-
-def test_a_customized_staged_driver_is_left_in_place_and_reported(legacy: Path):
-    driver = legacy / ".aegis" / "drivers" / "rust_ast.py"
-    custom = _packaged_template("rust_ast.py") + b"\n# our team's tweak\nEXTRA_KEYWORDS = ['unsafe']\n"
-    driver.write_bytes(custom)
-
-    plan = migrate.plan(legacy)
-    report = plan.to_dict()
-    assert not any(path.startswith(".aegis/drivers") for path in report["remove"])
-    reasons = {entry["path"]: entry["reason"] for entry in report["skipped"]}
-    assert "differs from every rust_ast.py aegis shipped" in reasons[".aegis/drivers/rust_ast.py"]
-    migrate.apply(plan)
-
-    assert driver.read_bytes() == custom
-
-
-@pytest.mark.parametrize("name", ["rust_ast.py", "go_ast.go"])
-@pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
-def test_an_unmodified_staged_driver_is_removed(tmp_path: Path, name: str, eol: bytes):
-    _assert_staged_copy_is_removed(tmp_path, name, _packaged_template(name), eol)
-
-
-@pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
-def test_an_unmodified_staged_ts_driver_is_removed_after_its_template_is_gone(tmp_path: Path, eol: bytes):
-    # v4.5 replaced ts_ast.js with the in-process parser; a v3 init may still have staged it.
-    from aegis_core.ast.drivers import templates
-
-    assert not (Path(templates.__file__).resolve().parent / "ts_ast.js").exists()
-    _assert_staged_copy_is_removed(tmp_path, "ts_ast.js", _v3_3_template("ts_ast.js"), eol)
-
-
-def _v3_3_template(name: str) -> bytes:
-    repo = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
-    try:
-        return subprocess.run(
-            ["git", "show", f"v3.3.0:aegis_core/ast/drivers/templates/{name}"],
-            cwd=str(repo), capture_output=True, check=True, timeout=30,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        pytest.skip("the v3.3.0 tag is not in this checkout")
-
-
-def _assert_staged_copy_is_removed(tmp_path: Path, name: str, shipped: bytes, eol: bytes) -> None:
-    root = tmp_path / "ws"
-    driver = root / ".aegis" / "drivers" / name
-    driver.parent.mkdir(parents=True)
-    lf = shipped.replace(b"\r\n", b"\n")
-    driver.write_bytes(lf.replace(b"\n", eol))  # what init copied from a Windows (CRLF) checkout
-
-    plan = migrate.plan(root)
-    assert plan.to_dict()["remove"] == [".aegis/drivers"]
-    migrate.apply(plan)
-
-    assert not driver.parent.exists()
-
-
-def test_a_driver_staged_by_v3_3_is_recognized(tmp_path: Path):
-    shipped = _v3_3_template("rust_ast.py")
-    from aegis_core.ast.drivers import templates
-    assert not (Path(templates.__file__).resolve().parent / "rust_ast.py").exists()
-    root = tmp_path / "ws"
-    driver = root / ".aegis" / "drivers" / "rust_ast.py"
-    driver.parent.mkdir(parents=True)
-    driver.write_bytes(shipped)
-
-    assert migrate.plan(root).to_dict()["remove"] == [".aegis/drivers"]
-
-
-# ── Refused before anything is written ───────────────────────────────────────
-
-@pytest.mark.parametrize("name", ["ledger.jsonl", "lock", "migrate-backup-20261015T120000Z"])
-def test_a_symlink_inside_the_state_dir_refuses_the_migration(legacy: Path, tmp_path: Path, name: str):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (legacy / ".aegis" / "state").mkdir()
-    _symlink_or_skip(legacy / ".aegis" / "state" / name, outside / name)
-    before = _snapshot(legacy)
-
-    plan = migrate.plan(legacy)
-    assert plan.to_dict()["status"] == "refused"
-    assert f".aegis/state/{name} is a symlink" in plan.to_dict()["refusal"]
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-
-    assert list(outside.iterdir()) == []
-    assert _snapshot(legacy) == before
-
-
-def test_a_state_dir_link_planted_after_planning_refuses_apply(legacy: Path, tmp_path: Path):
-    plan = migrate.plan(legacy)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (legacy / ".aegis" / "state").mkdir()
-    _symlink_or_skip(legacy / ".aegis" / "state" / "ledger.jsonl", outside / "victim")
-    before = _snapshot(legacy)
-
-    with pytest.raises(migrate.MigrationRefused, match=r"ledger\.jsonl: it is a symlink"):
-        migrate.apply(plan)
-
-    assert list(outside.iterdir()) == []
-    assert _snapshot(legacy) == before
-
-
-def test_a_symlinked_config_json_refuses_the_migration(legacy: Path, tmp_path: Path):
-    victim = tmp_path / "victim.json"
-    victim.write_text('{"v": 1}\n', encoding="utf-8")
-    _symlink_or_skip(legacy / ".aegis" / "config.json", victim)
-    before = _snapshot(legacy)
-
-    plan = migrate.plan(legacy)
-    assert plan.to_dict()["status"] == "refused"
-    assert ".aegis/config.json is a symlink" in plan.to_dict()["refusal"]
-    with pytest.raises(migrate.MigrationRefused):
-        migrate.apply(plan)
-
-    assert victim.read_text(encoding="utf-8") == '{"v": 1}\n'
-    assert _snapshot(legacy) == before
-
-
-# ── v3 rule layouts inside .aegis/rules ─────────────────────────────────────
-
-def test_rules_in_a_v3_type_directory_move_to_their_canonical_one_and_are_served(tmp_path: Path):
-    """v3.1-v3.3 `aegis insight` and the sentinels wrote invariants to .aegis/rules/walls/;
-    the v4 loader serves only the six type directories, so migrate moves them."""
-    from aegis_core.rules import load_rules
-    from aegis_core.scan import RULE_CACHE, scan
-
-    root = tmp_path / "ws"
-    rules = root / ".aegis" / "rules"
-    walls = rules / "walls"
-    walls.mkdir(parents=True)
-    # what v3.3 insights.py wrote: type wall, a context_files list, no hypothesis
-    (walls / "wall-insight-1.md").write_text(
-        "---\nid: wall-insight-1\ntype: wall\nenforcement: gate\ndomain: security\ndescription: d\n"
-        "context_files:\n  - src/a.py\ntarget_paths:\n  - 'src/*.py'\n---\n# wall-insight-1\n",
-        encoding="utf-8",
-    )
-    (walls / "wall-typed.md").write_text("---\nid: wall-typed\ntype: invariant\nenforcement: gate\n---\nB\n", encoding="utf-8")
-    (rules / "membranes").mkdir()
-    (rules / "membranes" / "m.md").write_text("---\nid: m\nhypothesis: h\nfitness:\n  triggers: 3\n---\nB\n", encoding="utf-8")
-    (walls / "notes.md").write_text("# Why these walls exist\n", encoding="utf-8")  # not a rule
-    (walls / "README.md").write_text("# Walls\n", encoding="utf-8")
-
-    plan = migrate.plan(root)
-
-    assert {m["from"]: (m["to"], m["type"]) for m in plan.to_dict()["rules"]} == {
-        ".aegis/rules/walls/wall-insight-1.md": (".aegis/rules/invariants/wall-insight-1.md", "invariant"),
-        ".aegis/rules/walls/wall-typed.md": (".aegis/rules/invariants/wall-typed.md", "invariant"),
-        ".aegis/rules/membranes/m.md": (".aegis/rules/boundaries/m.md", "boundary"),
-    }
-    assert plan.to_dict()["strip"] == []  # a moved rule is stripped on the way, not in place
-    migrate.apply(plan)
-
-    rs = load_rules(root)
-    assert sorted((r.path, r.type) for r in rs.served) == [
-        (".aegis/rules/boundaries/m.md", "boundary"),
-        (".aegis/rules/invariants/wall-insight-1.md", "invariant"),
-        (".aegis/rules/invariants/wall-typed.md", "invariant"),
-    ]
-    assert rs.errors == () and rs.needs_migrate == ()
-    moved = parse_frontmatter((rules / "invariants" / "wall-insight-1.md").read_text(encoding="utf-8"))
-    assert moved["type"] == "invariant" and moved["context_files"] == ["src/a.py"]
-    assert not (walls / "wall-insight-1.md").exists() and not (rules / "membranes" / "m.md").exists()
-    assert (walls / "notes.md").is_file() and (walls / "README.md").is_file()
-    RULE_CACHE.invalidate()
-    assert [r["name"] for r in scan(root, ["src/a.py"])["relevant_rules"]] == ["wall-insight-1"]
-    assert migrate.plan(root).to_dict()["status"] == "up_to_date"
-
-
-def test_a_v3_type_name_in_a_canonical_directory_is_rewritten(tmp_path: Path):
-    """v3.3 accepted `type: wall` in invariants/ and `type: membrane` in boundaries/."""
-    from aegis_core.rules import load_rules
-
-    root = tmp_path / "ws"
-    rules = root / ".aegis" / "rules"
-    for name in ("invariants", "boundaries", "traps"):
-        (rules / name).mkdir(parents=True)
-    (rules / "invariants" / "w.md").write_bytes(
-        b"---\r\nid: w\r\ntype: wall\r\nenforcement: gate\r\nhypothesis: h\r\n---\r\nBody\r\n"
-    )
-    (rules / "boundaries" / "m.md").write_text("---\nid: m\ntype: Membrane\n---\nB\n", encoding="utf-8")
-    (rules / "traps" / "odd.md").write_text("---\nid: odd\ntype: wall\n---\nB\n", encoding="utf-8")
-
-    plan = migrate.plan(root)
-
-    # a wall in traps/ names a type its directory contradicts: reported by the loader, not guessed
-    assert plan.to_dict()["retype"] == [
-        {"path": ".aegis/rules/boundaries/m.md", "from": "Membrane", "to": "boundary"},
-        {"path": ".aegis/rules/invariants/w.md", "from": "wall", "to": "invariant"},
-    ]
-    migrate.apply(plan)
-
-    assert (rules / "invariants" / "w.md").read_bytes() == (
-        b"---\r\nid: w\r\ntype: invariant\r\nenforcement: gate\r\nhypothesis: h\r\n---\r\nBody\r\n"
-    )
-    rs = load_rules(root)
-    assert {r.id for r in rs.served} == {"w", "m"}
-    assert [r.id for r in rs.errors] == ["odd"]
-    assert migrate.plan(root).to_dict()["status"] == "up_to_date"
-
-
-def test_the_v3_enforcement_artifact_key_is_stripped(tmp_path: Path):
-    """v3 tier escalation wrote enforcement_artifact into gate rules; v4 never reads it."""
-    from aegis_core.rules import load_rules
-
-    root = tmp_path / "ws"
-    rule = root / ".aegis" / "rules" / "gates" / "g.md"
-    rule.parent.mkdir(parents=True)
-    rule.write_text(
-        "---\nid: g\ntype: gate\nenforcement: gate\nenforcement_artifact: .aegis/enforcement/g.py\n"
-        "fitness:\n  triggers: 3\nhypothesis: h\n---\nB\n",
-        encoding="utf-8",
-    )
-
-    plan = migrate.plan(root)
-    assert {s["path"]: s["keys"] for s in plan.to_dict()["strip"]} == {
-        ".aegis/rules/gates/g.md": ["enforcement_artifact", "fitness"],
-    }
-    migrate.apply(plan)
-
-    assert rule.read_text(encoding="utf-8") == "---\nid: g\ntype: gate\nenforcement: gate\nhypothesis: h\n---\nB\n"
-    assert load_rules(root).needs_migrate == ()
-
-
-@pytest.mark.parametrize("extension", ["ts", "js", "rs"])
-@pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
-@pytest.mark.parametrize("selector_dir", [".aegis", ".soma"])
-def test_retired_native_selectors_are_removed_with_their_shipped_copies(tmp_path, extension, eol, selector_dir):
-    root = tmp_path / "ws"
-    filename, executable = ("rust_ast.py", "python3") if extension == "rs" else ("ts_ast.js", "node")
-    driver = root / ".aegis/drivers" / filename
-    driver.parent.mkdir(parents=True)
-    driver.write_bytes(_v3_3_template(filename).replace(b"\r\n", b"\n").replace(b"\n", eol))
-    slots = root / ".aegis/slots.yaml"
-    slots.write_bytes(f'slots:\n  ast_driver_{extension}: "{executable} {selector_dir}/drivers/{filename}"\n'.encode().replace(b"\n", eol))
-
-    plan = migrate.plan(root)
-    report = plan.to_dict()
-    assert report["user_config"] == {}
-    assert report["config"] == {"v": 1}
-    assert ".aegis/drivers" in report["remove"]
-    migrate.apply(plan)
-    assert not driver.parent.exists()
-    assert not slots.exists()
-
-
-@pytest.mark.parametrize("extension,command", [
-    ("ts", "node --trace-warnings .aegis/drivers/ts_ast.js"),
-    ("ts", "node .aegis/drivers/custom.js"),
-    ("external", "node .aegis/drivers/ts_ast.js"),
-    ("rs", "python3 -O .aegis/drivers/rust_ast.py"),
-    ("rs", "python3 .aegis/drivers/custom.py"),
-])
-def test_retired_native_selector_detection_preserves_custom_commands(tmp_path, extension, command):
-    root = tmp_path / "ws"
-    slots = root / ".aegis/slots.yaml"
-    slots.parent.mkdir(parents=True)
-    slots.write_text(f'slots:\n  ast_driver_{extension}: "{command}"\n', encoding="utf-8")
-
-    report = migrate.plan(root).to_dict()
-    assert report["user_config"] == {"drivers": {extension: command}}
-    assert report["config"] == {"v": 1}
-
-
-def test_retired_native_selector_does_not_remove_the_go_opt_in(tmp_path):
-    root = tmp_path / "ws"
-    slots = root / ".aegis/slots.yaml"
-    slots.parent.mkdir(parents=True)
-    slots.write_text('slots:\n  ast_driver_ts: "node .aegis/drivers/ts_ast.js"\n'
-                     '  ast_driver_go: "go run .aegis/drivers/go_ast.go"\n'
-                     '  ast_driver_.go: "go run .aegis/drivers/go_ast.go"\n', encoding="utf-8")
-
-    report = migrate.plan(root).to_dict()
-    assert report["config"] == {"v": 1, "ast": {"packaged_drivers": ["go"]}}
-    assert report["user_config"] == {}
+    repo = hg.make_repo(tmp_path)
+    path = repo.root / ".aegis/rules/traps/t.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n")
+    planned = migrate.plan(repo.root)
+    assert planned.pending and planned.worktree_pending == 0
+    shared = storage.ledger_site(repo.root, create=False).path
+    assert not shared.exists()
+    assert not shared.parent.exists()
+    migrate.apply(planned)
+    assert not shared.exists()
+    assert not shared.parent.exists()
+    assert "score:" not in path.read_text()
+
+
+def test_a_state_entry_link_refuses_a_nothing_pending_plan(tmp_path):
+    from tests.conftest import symlink_or_skip
+
+    state = tmp_path / "repo/.aegis/state"
+    state.mkdir(parents=True)
+    victim = tmp_path / "outside"
+    victim.write_text("unchanged")
+    symlink_or_skip(victim, state / "entry")
+    planned = migrate.plan(state.parent.parent)
+    assert planned.to_dict()["status"] == "refused"
+    assert ".aegis/state/entry is a symlink" in planned.refusal
+    assert victim.read_text() == "unchanged"
+
+
+def test_a_malformed_config_is_reported_as_unreadable(tmp_path):
+    config = tmp_path / ".aegis/config.json"
+    config.parent.mkdir()
+    config.write_text("{broken")
+    planned = migrate.plan(tmp_path)
+    assert planned.refusal is None
+    assert planned.to_dict()["unreadable"] == [".aegis/config.json"]
+    assert config.read_text() == "{broken"
