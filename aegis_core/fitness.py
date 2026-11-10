@@ -573,7 +573,7 @@ def _utc_stamp(iso: str) -> Optional[str]:
 
 # Raise whenever replay or forbid_ast evaluation semantics change: it is part of the digest stored with
 # replay.tip, so a tip recorded by another evaluator is never resumed from and history is walked again.
-REPLAY_FORMAT = 2
+REPLAY_FORMAT = 3
 
 
 def _rules_digest(rules: Sequence[Any]) -> str:
