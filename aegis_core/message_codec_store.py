@@ -37,33 +37,44 @@ class Store:
     def __init__(self, root):
         self.fd = None
         self._lock = Lock()
+        parent_fd = None
         try:
             capabilities = {function.__name__ for function in os.supports_dir_fd}
+            nofollow = {function.__name__ for function in os.supports_follow_symlinks}
             require({"open", "stat", "link", "unlink"} <= capabilities and
-                  hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"), "E_AUTH")
+                  "stat" in nofollow and
+                  hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and
+                  hasattr(os, "geteuid"), "E_AUTH")
             require(type(root) in (str, Path) or isinstance(root, Path), "E_AUTH")
             given = Path(root)
             if not given.is_absolute() or ".." in given.parts:
                 raise CodecError("E_AUTH", detail="path")
-            before = given.lstat()
-            require(stat.S_ISDIR(before.st_mode), "E_AUTH")
-            self.root = given.resolve(strict=True)
+            parent_path, leaf = given.parent.resolve(strict=True), given.name or "."
+            self.root = parent_path / leaf
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            self.fd = os.open(self.root.anchor, flags)
-            for component in self.root.parts[1:]:
+            self.fd = os.open(parent_path.anchor, flags)
+            for component in parent_path.parts[1:]:
                 child = os.open(component, flags, **_at(self.fd))
                 parent, self.fd = self.fd, child
                 os.close(parent)
+            child = os.open(leaf, flags, **_at(self.fd))
+            parent_fd, self.fd = self.fd, child
             info = os.fstat(self.fd)
             self._identity = (info.st_dev, info.st_ino)
             if info.st_uid != os.geteuid() or info.st_mode & 0o022:
                 raise CodecError("E_AUTH", detail="private")
-            require((info.st_dev, info.st_ino) == (before.st_dev, before.st_ino), "E_AUTH")
+            current = os.stat(leaf, follow_symlinks=False, **_at(parent_fd))
+            require(stat.S_ISDIR(current.st_mode) and
+                  (current.st_dev, current.st_ino) == self._identity, "E_AUTH")
+            parent, parent_fd = parent_fd, None
+            os.close(parent)
             self._finalizer = weakref.finalize(self, _release, self.fd)
         except (OSError, ValueError, RuntimeError) as error:
             fd, self.fd = self.fd, None
             if fd is not None:
                 _release(fd)
+            if parent_fd is not None:
+                _release(parent_fd)
             if isinstance(error, CodecError):
                 raise
             raise _store_error(error) from None
