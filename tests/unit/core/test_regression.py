@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tracemalloc
 from typing import Any, Dict
 
 import pytest
@@ -220,9 +221,13 @@ def test_a_failing_fix_with_a_signed_exemption_looks_it_up_once(tmp_path: Path, 
     fix = _fix(repo, "fix: hotfix without test\n\nAegis-No-Test: verified manually", {"src/app.py": APP.format(1)})
     repo.commit(human_gate.exemption_message(fix, "verified manually"), sign_key=human, allow_empty=True)
     looked_up: list = []
-    real_find = human_gate.find_test_exemption
-    monkeypatch.setattr(human_gate, "find_test_exemption",
-                        lambda root, head, base_ref, oid: looked_up.append(oid) or real_find(root, head, base_ref, oid))
+    real_finder = human_gate.exemption_finder
+
+    def finder(root, head, base_ref):
+        find = real_finder(root, head, base_ref)
+        return lambda oid: looked_up.append(oid) or find(oid)
+
+    monkeypatch.setattr(human_gate, "exemption_finder", finder)
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")
     assert [(c.commit, c.status) for c in report.commits] == [(fix, "exempted")]
@@ -705,6 +710,275 @@ def _fake_outcomes(monkeypatch: pytest.MonkeyPatch, head: Any, base: Any) -> lis
 
 
 @needs_git
+def test_failed_fixes_share_one_exemption_discovery(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    fixes = [_fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i)}) for i in range(1, 4)]
+    for i in range(8):
+        repo.commit(f"chore: unrelated {i}", allow_empty=True)
+    calls = _metadata_calls(monkeypatch)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert [(c.commit, c.status, c.exemption_code) for c in report.commits] == [
+        (oid, "failed", None) for oid in fixes]
+    assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert sum(c[0] == "rev-list" for c in calls) == 2
+
+
+@needs_git
+def test_exemption_discovery_timeout_is_not_retried_for_each_fix(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    for i in range(3):
+        _fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i + 1)})
+    calls = []
+    real = gitsafe.run
+
+    def timeout(args, *a, **kw):
+        if args[:2] == ["cat-file", "commit"]:
+            calls.append(args)
+            raise gitsafe.GitError("git cat-file timed out")
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", timeout)
+    report = regression.check_ci_regressions(repo.root, "main")
+    assert [(c.reason, c.exemption_code) for c in report.commits] == [("no_test_changes", None)] * 3
+    assert len(calls) == 1
+
+
+@needs_git
+def test_shared_snapshot_ids_are_indexed_once_for_many_fixes(tmp_path, monkeypatch):
+    class CountedId(str):
+        visits = 0
+
+        def partition(self, separator):
+            type(self).visits += 1
+            return super().partition(separator)
+
+    repo = make_repo(tmp_path)
+    modules = [f"tests/test_case{i}.py" for i in range(100)]
+    fixes = [_fix(repo, f"fix: group {group}", {"src/app.py": APP.format(1), f"src/group{group}.py": "value = 1\n", **{
+        path: "def test_case(): pass\n" for path in modules[group::4]}}) for group in range(4)]
+    ids = {CountedId(f"tests.test_case{i}.Case::test_{j}") for i in range(100) for j in range(200)}
+    _fake_outcomes(monkeypatch, (ids, set(), set()), (set(), ids, set()))
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert [c.commit for c in report.commits] == fixes
+    assert all(c.status == "passed" and len(c.fail_to_pass_tests) == 5000 for c in report.commits)
+    assert set().union(*(set(c.fail_to_pass_tests) for c in report.commits)) == ids
+    assert CountedId.visits <= 2 * len(ids)
+
+
+@needs_git
+@pytest.mark.parametrize("failed", [False, True], ids=["deep-passed", "deep-failed"])
+def test_deep_classname_index_work_is_bounded_by_wanted_modules(tmp_path, monkeypatch, failed):
+    class CountedClass(str):
+        copied = 0
+        searches = 0
+
+        def rpartition(self, separator):
+            type(self).copied += len(self)
+            assert type(self).copied <= 4 * len(classname), "unbounded ancestor materialization"
+            prefix, separator, suffix = super().rpartition(separator)
+            return type(self)(prefix), separator, suffix
+
+        def find(self, *args):
+            type(self).searches += 1
+            return super().find(*args)
+
+        def __getitem__(self, key):
+            value = super().__getitem__(key)
+            if isinstance(key, slice):
+                type(self).copied += len(value)
+            return value
+
+    class CountedId(str):
+        def partition(self, separator):
+            classname, separator, name = super().partition(separator)
+            return CountedClass(classname), separator, name
+
+    classname = "tests.test_app." + "x." * 100000 + "Case"
+    deep = CountedId(classname + "::test_deep")
+    plain = "tests.test_app::test_plain"
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: deep classname", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    head = ({plain}, {deep}, set()) if failed else ({deep}, set(), set())
+    # An ancestor beyond the wanted module's depth must still supply base collection evidence.
+    base = (set(), {plain}, {"tests.test_app." + "x." * 10 + "x"})
+    _fake_outcomes(monkeypatch, head, base)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    item, = report.commits
+    assert (item.status, item.reason) == (("failed", "failed_on_head") if failed else ("passed", "ok"))
+    assert item.fail_to_pass_tests == ((plain,) if failed else (deep,))
+    assert CountedClass.searches <= 2
+    assert CountedClass.copied <= 4 * len(classname)
+
+
+@needs_git
+def test_collection_error_attribution_work_is_linear_and_shared_by_classname(tmp_path, monkeypatch):
+    work = {"comparisons": 0, "error_splits": 0, "class_splits": 0, "wanted_searches": 0}
+    splits = {}
+    count = 2000
+
+    class CountedError(str):
+        __hash__ = str.__hash__
+
+        def __eq__(self, other):
+            work["comparisons"] += 1
+            assert work["comparisons"] <= 8 * count, "quadratic collection-error comparisons"
+            return super().__eq__(other)
+
+        def split(self, *args):
+            work["error_splits"] += 1
+            return super().split(*args)
+
+    class CountedClass(str):
+        def startswith(self, *args):
+            work["comparisons"] += 1
+            assert work["comparisons"] <= 8 * count, "quadratic collection-error comparisons"
+            return super().startswith(*args)
+
+        def find(self, *args):
+            work["wanted_searches"] += 1
+            return super().find(*args)
+
+        def split(self, *args):
+            splits[self] = splits.get(self, 0) + 1
+            assert splits[self] <= (2 if self.startswith("tests.test_app.") else 1), "classname attribution repeated"
+            work["class_splits"] += 1
+            return super().split(*args)
+
+    class CountedId(str):
+        def partition(self, separator):
+            classname, separator, name = super().partition(separator)
+            return CountedClass(classname), separator, name
+
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: shared collection attribution", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    relevant = {CountedId(f"tests.test_app.Case::test_{i}") for i in range(count)}
+    relevant.update(CountedId(f"tests.test_app.Class{i}::test_case") for i in range(count))
+    unrelated = {CountedId(f"other.test_{i}.Case::test_case") for i in range(count)}
+    errors = {CountedError(f"unrelated.module_{i}") for i in range(count)}
+    errors.update(CountedError(f"tests.test_app.Class{i}") for i in range(count))
+    errors.add(CountedError("tests.test_app.Case"))
+    _fake_outcomes(monkeypatch, (relevant | unrelated, set(), set()), (set(), set(), errors))
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    item, = report.commits
+    assert (item.status, item.reason, set(item.fail_to_pass_tests)) == ("passed", "ok", relevant)
+    assert work["error_splits"] <= len(errors)
+    assert work["class_splits"] <= 3 * count + 2
+    assert work["wanted_searches"] <= 2 * (count + 1)
+    assert work["comparisons"] <= 8 * count
+
+
+@needs_git
+@pytest.mark.parametrize("errors,expected", [
+    (set(), ("ok", "ok", "passed_on_base")),
+    ({"tests.test_app"}, ("failed_on_head", "ok", "passed_on_base")),
+    ({"tests.test_app.Child"}, ("ok", "failed_on_head", "passed_on_base")),
+    ({"<suite:pytest>"}, ("failed_on_head", "failed_on_head", "failed_on_head")),
+], ids=["base-ancestor", "exact-head-parent", "exact-head-child", "head-suite"])
+def test_indexed_attribution_preserves_overlapping_modules_and_collection_rules(tmp_path, monkeypatch, errors, expected):
+    repo = make_repo(tmp_path)
+    paths = ("tests/test_app.py", "tests/test_app/Child.py", "tests/test_app_extra.py")
+    for i, path in enumerate(paths):
+        _fix(repo, f"fix: module {i}", {"src/app.py": APP.format(1), f"src/module{i}.py": "x = 1\n",
+                                       path: "def test_case(): pass\n"})
+    parent = "tests.test_app::test_plain"
+    child = "tests.test_app.Child.Case::test_method"
+    extra = "tests.test_app_extra::test_case"
+    _fake_outcomes(monkeypatch, ({parent, child, extra}, set(), errors), (set(), set(), {"tests.test_app"}))
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert tuple(c.reason for c in report.commits) == expected
+    assert [c.fail_to_pass_tests for c in report.commits] == [tuple(sorted((parent, child))), (child,), ()]
+
+
+@needs_git
+@pytest.mark.parametrize("case", ["base-error", "unrelated-head-classname"])
+def test_dotted_report_input_has_bounded_peak_allocation(tmp_path, monkeypatch, case):
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: bounded attribution memory", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    plain = "tests.test_app::test_plain"
+    component = "a." if case == "base-error" else "ab."
+    dotted = component * ((8 * 1024 * 1024 - 4096) // len(component)) + "Case"
+    if case == "base-error":
+        head, base = ({plain}, set(), set()), (set(), set(), {"tests.test_app." + dotted})
+        expected = ("failed", "passed_on_base", ())
+    else:
+        identity = "other." + dotted + "::test_case"
+        head, base = ({plain, identity}, set(), set()), (set(), {plain}, set())
+        expected = ("passed", "ok", (plain,))
+    _fake_outcomes(monkeypatch, head, base)
+
+    tracemalloc.start()
+    try:
+        report = regression.check_ci_regressions(repo.root, "main")
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    item, = report.commits
+    assert (item.status, item.reason, item.fail_to_pass_tests) == expected
+    print(f"{case}: input={len(dotted)} peak={peak} limit={4 * len(dotted)}")
+    assert peak <= 4 * len(dotted), "attribution allocation grows with dotted components"
+
+
+@needs_git
+@pytest.mark.parametrize("head_ids", [set(), {"other.module.Case::test_case"}])
+def test_base_error_index_is_not_built_without_wanted_classnames(tmp_path, monkeypatch, head_ids):
+    class UnusedError(str):
+        def find(self, *_args):
+            pytest.fail("unused base collection error was indexed")
+
+        def split(self, *_args):
+            pytest.fail("unused base collection error was split")
+
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: no wanted result", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    _fake_outcomes(monkeypatch, (head_ids, set(), set()), (set(), set(), {UnusedError("tests.test_app.Case")}))
+
+    item, = regression.check_ci_regressions(repo.root, "main").commits
+    assert (item.status, item.reason, item.fail_to_pass_tests) == ("failed", "no_tests_collected", ())
+
+
+@needs_git
+@pytest.mark.parametrize("errors", [
+    {"tests.test_app.Case.Left", "tests.test_app.Case.Right"},
+    {"tests.test_app.Case", "tests.test_app.Case.Left"},
+    {"tests.test_app.Case", "tests.test_app.Case_extra"},
+    {"tests.test_app.", "tests.test_app..Child"},
+    {"tests.test_app..Child", "tests.test_app..Other"},
+    {"tests.test_app", "tests.test_app.Case.Left", "other"},
+    {"tests", "other", ""},
+    {"tests.test_app_extra", "tests.test_app.Case.Leftish"},
+])
+def test_compressed_collection_edges_preserve_exact_and_dotted_boundaries(tmp_path, monkeypatch, errors):
+    repo = make_repo(tmp_path)
+    _fix(repo, "fix: compressed collection boundaries", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
+    classes = ("tests.test_app", "tests.test_app.Case", "tests.test_app.Case.Left", "tests.test_app.Case.Right",
+               "tests.test_app.Case.Leftish", "tests.test_app.Case_extra", "tests.test_app.",
+               "tests.test_app..Child", "tests.test_app..Other", "tests.test_app_extra.Case", "other")
+    identities = {classname + "::test_case" for classname in classes}
+    _fake_outcomes(monkeypatch, (identities, set(), set()), (set(), set(), errors))
+    # The documented public rule is exact classname equality or a dotted descendant.
+    expected = tuple(sorted(classname + "::test_case" for classname in classes
+                            if (classname == "tests.test_app" or classname.startswith("tests.test_app."))
+                            and any(classname == error or classname.startswith(error + ".") for error in errors)))
+
+    item, = regression.check_ci_regressions(repo.root, "main").commits
+    assert item.fail_to_pass_tests == expected
+    assert item.reason == ("ok" if expected else "passed_on_base")
+
+
+@needs_git
 def test_ids_belong_to_their_own_module_and_a_suite_level_error_fails_every_fix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -731,8 +1005,8 @@ def test_ids_belong_to_their_own_module_and_a_suite_level_error_fails_every_fix(
 @needs_git
 def test_a_passing_fix_commit_looks_up_no_exemption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Review F3: Given three fix commits whose tests are fail-to-pass and one fix without a test, When
-    regressions are checked, Then only the failing commit looks up a test exemption, and git rev-list
-    runs once for the metadata plus once for that lookup (each lookup rescans the range)."""
+    regressions are checked, Then only the failing commit looks up a test exemption. Git rev-list
+    runs once for metadata and once for discovery; discovery reads each commit body once."""
 
     repo = make_repo(tmp_path)
     test_one = "def test_one():\n    pass\n"
@@ -745,13 +1019,13 @@ def test_a_passing_fix_commit_looks_up_no_exemption(tmp_path: Path, monkeypatch:
     ids = {"tests.test_one::test_one", "tests.test_two::test_one", "tests.test_three::test_one"}
     _fake_outcomes(monkeypatch, (ids, set(), set()), (set(), ids, set()))
     looked_up: list = []
-    real_find = human_gate.find_test_exemption
+    real_finder = human_gate.exemption_finder
 
-    def find_spy(root, head, base_ref, fix_commit):
-        looked_up.append(fix_commit)
-        return real_find(root, head, base_ref, fix_commit)
+    def finder(root, head, base_ref):
+        find = real_finder(root, head, base_ref)
+        return lambda oid: looked_up.append(oid) or find(oid)
 
-    monkeypatch.setattr(human_gate, "find_test_exemption", find_spy)
+    monkeypatch.setattr(human_gate, "exemption_finder", finder)
     calls = _metadata_calls(monkeypatch)
 
     report = regression.check_ci_regressions(repo.root, "main", "HEAD")

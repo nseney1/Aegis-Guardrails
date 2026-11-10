@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -9,11 +10,13 @@ from pathlib import Path
 import stat
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from aegis_core import redaction
 from aegis_core.verification import scanners
+from tests.conftest import symlink_or_skip
 
 
 def _tok(*parts: str) -> str:
@@ -575,6 +578,498 @@ def _sarif_for(uri: str, *, line: int = 1, snippet: str | None = None, message: 
         "ruleId": "S100", "level": "error", "message": {"text": message},
         "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri}, "region": region}}],
     }]}]}
+
+
+@pytest.fixture
+def sarif_disk_reads():
+    if (os.name == "nt" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd):
+        pytest.skip("SARIF disk snippets need anchored descriptor reads")
+
+
+@pytest.fixture
+def artifact_reads(monkeypatch):
+    """Observe the file boundary without patching pathlib or the shared os module."""
+    reads = []
+    original_fdopen = os.fdopen
+
+    class ObservedPath(type(Path())):
+        def read_text(self, *args, **kwargs):
+            reads.append(str(self))
+            return super().read_text(*args, **kwargs)
+
+    def observed_fdopen(fd, *args, **kwargs):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            reads.append(fd)
+        return original_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(scanners, "Path", ObservedPath)
+    monkeypatch.setattr(scanners, "os", SimpleNamespace(**dict(vars(os), fdopen=observed_fdopen)))
+    return reads
+
+
+class TestSarifLineCache:
+    @staticmethod
+    def document(*locations):
+        return {"runs": [{"results": [
+            _sarif_for(uri, line=line)["runs"][0]["results"][0] for uri, line in locations
+        ]}]}
+
+    def test_repeated_resolved_artifact_is_read_once_across_runs(self, tmp_path, artifact_reads):
+        token = _tier_a_samples()["github-pat"]
+        text = f"first\r\nTOKEN = '{token}'\rthird\vfourth\n"
+        path = tmp_path / "a.py"
+        path.write_bytes(text.encode())
+        uris = ["a.py", "./a.py", str(path), "file://" + str(path)]
+        doc = self.document(*[(uris[i % len(uris)], i % 4 + 1) for i in range(1000)])
+        results = doc["runs"][0]["results"]
+        doc["runs"] = [{"results": results[:500]}, {"results": results[500:]}]
+        report = scanners.ingest_sarif(doc, workspace_root=tmp_path)
+        explicit = self.document(*[("a.py", i % 4 + 1) for i in range(1000)])
+        for i, result in enumerate(explicit["runs"][0]["results"]):
+            result["locations"][0]["physicalLocation"]["region"]["snippet"] = {
+                "text": text.splitlines()[i % 4]}
+        assert report == scanners.ingest_sarif(explicit, workspace_root=tmp_path)
+        assert token not in json.dumps([f.as_dict() for f in report["findings"]])
+        assert len(artifact_reads) == 1
+
+    def test_cache_lifetime_is_one_ingestion_including_malformed_documents(self, tmp_path, artifact_reads):
+        path = tmp_path / "a.py"
+        path.write_text("before\n", encoding="utf-8")
+        doc = self.document(("a.py", 1), ("a.py", 1))
+        first = scanners.ingest_sarif(doc, workspace_root=tmp_path)
+        broken = self.document(("a.py", 1))
+        broken["runs"][0]["results"].append("malformed")
+        assert scanners.ingest_sarif(broken, workspace_root=tmp_path) == {
+            "status": "unverified", "reason": "SARIF is malformed: runs[0].results[1] must be an object",
+            "findings": []}
+        path.write_text("after\n", encoding="utf-8")
+        second = scanners.ingest_sarif(doc, workspace_root=tmp_path)
+        assert [f.snippet for f in first["findings"]] == ["before", "before"]
+        assert [f.snippet for f in second["findings"]] == ["after", "after"]
+        assert first["findings"][0].fingerprint != second["findings"][0].fingerprint
+        assert len(artifact_reads) == 2
+
+    def test_byte_budget_batches_interleaved_artifacts_without_rereading(self, tmp_path, artifact_reads, monkeypatch):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 2048, raising=False)
+        for name in ("a", "b"):
+            (tmp_path / name).write_bytes(name.encode() * 1000 + b"\n")
+        report = scanners.ingest_sarif(self.document(("a", 1), ("b", 1), ("b", 1), ("a", 1)),
+                                        workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == [name * 1000 for name in ("a", "b", "b", "a")]
+        assert len(artifact_reads) == 2
+
+    @pytest.mark.parametrize("text", ["x" * 4097 + "\r\nlast\vfinal", "\u2028" * 4097 + "last\u0085final",
+                                      "x" * 65535 + "\r\n" + "\u00e9" * 65537 + "\u2029final"],
+                             ids=["crlf-and-vertical-tab", "unicode-separators", "chunk-boundaries"])
+    def test_over_budget_sources_keep_splitlines_and_fingerprints(self, tmp_path, artifact_reads, monkeypatch, text):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 1024, raising=False)
+        (tmp_path / "a").write_bytes(text.encode())
+        lines = text.splitlines()
+        numbers = [1, len(lines) - 1, len(lines), len(lines) + 1]
+        doc = self.document(*[("a", n) for n in numbers])
+        report = scanners.ingest_sarif(doc, workspace_root=tmp_path)
+        expected = [lines[n - 1] if n <= len(lines) else "reported message" for n in numbers]
+        assert [f.snippet for f in report["findings"]] == expected
+        assert [f.fingerprint for f in report["findings"]] == [
+            scanners.sarif_fingerprint("S100", "a", line) for line in expected]
+        assert len(artifact_reads) == 1
+
+    def test_decoded_line_storage_over_budget_reads_once(self, tmp_path, artifact_reads, monkeypatch):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 1024)
+        # Small on disk, large as a list of decoded lines.
+        (tmp_path / "a").write_bytes(b"x\n" * 300)
+        report = scanners.ingest_sarif(self.document(("a", 1), ("a", 300)), workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == ["x", "x"]
+        assert len(artifact_reads) == 1
+
+    def test_empty_artifacts_are_read_once(self, tmp_path, artifact_reads, monkeypatch):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 768)
+        for name in ("a", "b"):
+            (tmp_path / name).touch()
+        report = scanners.ingest_sarif(self.document(("a", 1), ("b", 1), ("b", 1), ("a", 1)),
+                                       workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == ["reported message"] * 4
+        assert len(artifact_reads) == 2
+
+    def test_artifact_batching_preserves_finding_order(self, tmp_path, artifact_reads, monkeypatch):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 4096)
+        for name in ("a", "b", "c"):
+            (tmp_path / name).write_bytes(name.encode() * 1000)
+        names = ("a", "b", "a", "c", "a", "b")
+        report = scanners.ingest_sarif(self.document(*[(name, 1) for name in names]), workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == [name * 1000 for name in names]
+        assert len(artifact_reads) == 3
+
+    def test_growth_after_size_probe_is_read_in_one_pass(self, tmp_path, artifact_reads, monkeypatch):
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 1024)
+        path = tmp_path / "a"
+        path.write_bytes(b"first\n")
+
+        def grow(fd):
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size == 6:
+                path.write_bytes(b"first\n" + b"x" * 2048 + b"\nlast\n")
+            return info
+
+        monkeypatch.setattr(scanners.os, "fstat", grow)
+        report = scanners.ingest_sarif(self.document(("a", 3), ("a", 1)), workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == ["last", "first"]
+        assert len(artifact_reads) == 1
+
+    @pytest.mark.usefixtures("sarif_disk_reads")
+    def test_failed_artifact_open_uses_message_without_echoing_error(self, tmp_path, artifact_reads, monkeypatch):
+        (tmp_path / "a").write_bytes(b"disk text\n")
+
+        def denied(*args, **kwargs):
+            raise PermissionError("untrusted error text")
+
+        # Keep the capability probe accurate for this module-local OS adapter.
+        monkeypatch.setattr(scanners.os, "supports_dir_fd", {denied})
+        monkeypatch.setattr(scanners.os, "open", denied)
+        report = scanners.ingest_sarif(_sarif_for("a"), workspace_root=tmp_path)
+        assert report["status"] == "fail"
+        assert report["findings"][0].snippet == "reported message"
+        assert "untrusted error text" not in json.dumps([f.as_dict() for f in report["findings"]])
+        assert artifact_reads == []
+
+    def test_empty_missing_directory_and_out_of_range_use_message(self, tmp_path):
+        (tmp_path / "empty").touch()
+        (tmp_path / "dir").mkdir()
+        (tmp_path / "a").write_bytes(b"line\n")
+        report = scanners.ingest_sarif(self.document(
+            ("empty", 1), ("empty", 1), ("missing", 1), ("dir", 1), ("a", 2), ("a", 0)),
+            workspace_root=tmp_path)
+        assert report["status"] == "fail"
+        assert [f.snippet for f in report["findings"]] == ["reported message"] * 6
+
+    def test_supplied_snippets_never_read_the_artifact(self, tmp_path, artifact_reads):
+        (tmp_path / "a").write_bytes(b"disk text\n")
+        report = scanners.ingest_sarif(_sarif_for("a", snippet="supplied"), workspace_root=tmp_path)
+        assert report["findings"][0].snippet == "supplied"
+        assert artifact_reads == []
+
+    def test_unsupported_descriptor_reads_preserve_disk_snippets(self, tmp_path, monkeypatch, artifact_reads):
+        (tmp_path / "a").write_bytes(b"disk text\n")
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+        report = scanners.ingest_sarif(self.document(("a", 1), ("a", 1)), workspace_root=tmp_path)
+        assert [f.snippet for f in report["findings"]] == ["disk text", "disk text"]
+        assert [f.fingerprint for f in report["findings"]] == [
+            scanners.sarif_fingerprint("S100", "a", "disk text")] * 2
+        assert len(artifact_reads) == 1
+
+    def test_fallback_opener_refusals_use_message_without_echoing_error(self, tmp_path, monkeypatch):
+        from aegis_core.errors import PathTraversalError
+
+        (tmp_path / "a").write_bytes(b"disk text\n")
+
+        def refused(*args, **kwargs):
+            raise PathTraversalError("untrusted error text")
+
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+        monkeypatch.setattr(scanners, "atomicio", SimpleNamespace(open_regular=refused))
+        report = scanners.ingest_sarif(_sarif_for("a"), workspace_root=tmp_path)
+        assert report["status"] == "fail"
+        assert report["findings"][0].snippet == "reported message"
+        assert "untrusted error text" not in json.dumps([f.as_dict() for f in report["findings"]])
+
+    @pytest.mark.parametrize("descriptors", [False, True], ids=["fallback", "native"])
+    def test_changed_large_file_finding_is_not_subtracted(self, tmp_path, monkeypatch, descriptors):
+        import subprocess
+
+        if descriptors and not scanners._sarif_descriptor_reads_supported():
+            pytest.skip("descriptor-relative opens are unavailable")
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: descriptors)
+        root = _git_ws(tmp_path / "repo")
+        path = root / "app.py"
+        base = b"eval(old)\n" + b"# pad\n" * 200000
+        head = b"# pad\n" * 200000 + b"eval(user_input)\n"
+        assert min(len(base), len(head)) > 1 << 20
+        path.write_bytes(base)
+        for args in (["add", "app.py"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                        "commit", "-qm", "large base"]):
+            subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True)
+        path.write_bytes(head)
+
+        def runner(argv, cwd, timeout):
+            line = 200001 if Path(cwd).resolve() == root.resolve() else 1
+            doc = _sarif_for("app.py", line=line)
+            doc["runs"][0]["results"][0]["ruleId"] = "S307"
+            return {"returncode": 1, "stdout": json.dumps(doc), "stderr": ""}
+
+        report = scanners.run_preset("ruff", root, "HEAD", runner=runner)
+        assert report["status"] == "fail"
+        assert report["subtracted"] == 0
+        assert [(f.line, f.snippet) for f in report["findings"]] == [(200001, "eval(user_input)")]
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX directory search permissions")
+    @pytest.mark.parametrize("inside", [False, True], ids=["ancestor", "workspace-component"])
+    def test_searchable_unreadable_directory_preserves_disk_line(self, tmp_path, inside):
+        if not hasattr(os, "O_DIRECTORY"):
+            pytest.skip("cannot probe directory read permissions")
+        restricted = tmp_path / "search-only"
+        ws = tmp_path / "ws" if inside else restricted / "ws"
+        path = ws / "search-only" / "a" if inside else ws / "a"
+        path.parent.mkdir(parents=True)
+        restricted = path.parent if inside else restricted
+        path.write_bytes(b"disk text\n")
+        before = stat.S_IMODE(restricted.stat().st_mode)
+        try:
+            restricted.chmod(0o111)
+            try:
+                fd = os.open(restricted, os.O_RDONLY | os.O_DIRECTORY)
+            except PermissionError:
+                pass
+            else:
+                os.close(fd)
+                pytest.skip("host does not enforce directory read permissions for this user")
+            assert path.read_text(encoding="utf-8") == "disk text\n"
+            report = scanners.ingest_sarif(_sarif_for(path.relative_to(ws).as_posix()), workspace_root=ws)
+            assert report["findings"][0].snippet == "disk text"
+            assert report["findings"][0].fingerprint == scanners.sarif_fingerprint(
+                "S100", path.relative_to(ws).as_posix(), "disk text")
+        finally:
+            restricted.chmod(before)
+
+    @pytest.mark.usefixtures("sarif_disk_reads")
+    @pytest.mark.parametrize("component", ["root", "parent", "leaf"])
+    def test_eacces_on_descriptor_open_falls_back_to_disk_line(self, tmp_path, artifact_reads, monkeypatch, component):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a").write_bytes(b"disk text\n")
+
+        def denied(path, *args, **kwargs):
+            blocked = {"root": str(tmp_path), "parent": "sub", "leaf": "a"}[component]
+            if str(path) == blocked:
+                raise PermissionError(errno.EACCES, "permission denied")
+            return os.open(path, *args, **kwargs)
+
+        monkeypatch.setattr(scanners.os, "supports_dir_fd", {denied})
+        monkeypatch.setattr(scanners.os, "open", denied)
+        report = scanners.ingest_sarif(_sarif_for("sub/a"), workspace_root=tmp_path)
+        assert report["findings"][0].snippet == "disk text"
+        assert artifact_reads and len(artifact_reads) == 1
+
+    @pytest.mark.parametrize("swap", ["leaf", "ancestor"])
+    def test_fallback_rejects_identity_changes_and_closes_the_descriptor(self, tmp_path, monkeypatch, swap):
+        from aegis_core import atomicio
+
+        (tmp_path / "sub").mkdir()
+        path = tmp_path / "sub" / "a"
+        path.write_bytes(b"disk text\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "a").write_bytes(b"outside sentinel\n")
+        opened = []
+        original = atomicio.open_regular
+
+        def changed(target, flags):
+            if swap == "leaf":
+                path.rename(path.with_name("old"))
+                path.write_bytes(b"outside sentinel\n")
+            fd = original(target, flags)
+            opened.append(fd)
+            if swap == "ancestor":
+                try:
+                    try:
+                        path.parent.rename(tmp_path / "old-sub")
+                    except PermissionError:
+                        if os.name == "nt":
+                            pytest.skip("Windows cannot rename this directory with an open child descriptor")
+                        raise
+                    symlink_or_skip(outside, path.parent, target_is_directory=True)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            return fd
+
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+        monkeypatch.setattr(scanners, "atomicio", SimpleNamespace(open_regular=changed), raising=False)
+        report = scanners.ingest_sarif(_sarif_for("sub/a"), workspace_root=tmp_path)
+        assert report["findings"][0].snippet == "reported message"
+        assert len(opened) == 1
+        with pytest.raises(OSError) as caught:
+            os.fstat(opened[0])
+        assert caught.value.errno == errno.EBADF
+
+    @pytest.mark.parametrize("descriptors", [False, True], ids=["fallback", "native"])
+    @pytest.mark.parametrize("component", ["leaf", "parent", "root"])
+    def test_resolution_to_open_symlink_swap_cannot_read_outside(self, tmp_path, monkeypatch, component, descriptors):
+        if descriptors and not scanners._sarif_descriptor_reads_supported():
+            pytest.skip("descriptor-relative opens are unavailable")
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: descriptors)
+        ws = tmp_path / "ws"
+        (ws / "sub").mkdir(parents=True)
+        (ws / "sub" / "a").write_bytes(b"inside\n")
+        outside = tmp_path / "outside"
+        (outside / "sub").mkdir(parents=True)
+        (outside / "a").write_bytes(b"outside sentinel\n")
+        (outside / "sub" / "a").write_bytes(b"outside sentinel\n")
+        resolve = scanners._sarif_artifact
+
+        def swap(uri, root):
+            answer = resolve(uri, root)
+            path, target = {"leaf": (ws / "sub" / "a", outside / "a"),
+                            "parent": (ws / "sub", outside), "root": (ws, outside)}[component]
+            path.rename(path.with_name(path.name + "-old"))
+            symlink_or_skip(target, path, target_is_directory=component != "leaf")
+            return answer
+
+        monkeypatch.setattr(scanners, "_sarif_artifact", swap)
+        report = scanners.ingest_sarif(_sarif_for("sub/a"), workspace_root=ws)
+        assert report["findings"][0].snippet == "reported message"
+        assert "outside sentinel" not in json.dumps([f.as_dict() for f in report["findings"]])
+
+
+@pytest.fixture
+def descriptor_count(monkeypatch):
+    """Count real descriptors, with an opener-boundary fallback and owned leak cleanup."""
+    from aegis_core import atomicio
+
+    opened = {}
+
+    def remember(fd):
+        info = os.fstat(fd)
+        opened[fd] = (info.st_dev, info.st_ino)
+        return fd
+
+    def tracked_open(*args, **kwargs):
+        return remember(os.open(*args, **kwargs))
+
+    def tracked_dup(fd):
+        return remember(os.dup(fd))
+
+    capabilities = (os.supports_dir_fd - {os.open}) | ({tracked_open} if os.open in os.supports_dir_fd else set())
+    for module in (scanners, atomicio):
+        monkeypatch.setattr(module, "os", SimpleNamespace(**dict(vars(os), open=tracked_open,
+                                                                dup=tracked_dup, supports_dir_fd=capabilities)))
+
+    def live():
+        for fd, identity in opened.items():
+            try:
+                info = os.fstat(fd)
+            except OSError as error:
+                assert error.errno == errno.EBADF
+            else:
+                if (info.st_dev, info.st_ino) == identity:
+                    yield fd
+
+    def count(boundary_only=False):
+        if not boundary_only and Path("/proc/self/fd").is_dir():
+            return len(os.listdir("/proc/self/fd"))
+        return len(list(live()))
+
+    yield count
+    # Preserve the RED evidence without leaking the deliberately exposed descriptors into
+    # other tests. Both OS adapters belong to this fixture; the shared os module is untouched.
+    for fd in list(live()):
+        os.close(fd)
+
+
+class TestSarifDescriptorOwnership:
+    @pytest.mark.parametrize("boundary_only", [False, True], ids=["process-count", "opener-boundary"])
+    def test_directory_nonregular_and_identity_refusals_close_all_descriptors(
+            self, tmp_path, monkeypatch, descriptor_count, boundary_only):
+        before = descriptor_count(boundary_only)
+        for index in range(43):
+            name = f"directory-{index}"
+            (tmp_path / name).mkdir()
+            report = scanners.ingest_sarif(_sarif_for(name), workspace_root=tmp_path)
+            assert report["findings"][0].snippet == "reported message"
+        nonregular = tmp_path / "nonregular"
+        if os.name == "posix" and hasattr(os, "mkfifo"):
+            os.mkfifo(nonregular)
+        else:
+            nonregular.mkdir()
+        assert scanners.ingest_sarif(_sarif_for(nonregular.name), workspace_root=tmp_path)["findings"][0].snippet == "reported message"
+
+        path = tmp_path / "changed"
+        path.write_bytes(b"original\n")
+        original = scanners.atomicio.open_regular
+
+        def changed(target, flags):
+            path.rename(tmp_path / "old")
+            path.write_bytes(b"replacement\n")
+            return original(target, flags)
+
+        monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+        monkeypatch.setattr(scanners, "atomicio", SimpleNamespace(open_regular=changed))
+        assert scanners.ingest_sarif(_sarif_for(path.name), workspace_root=tmp_path)["findings"][0].snippet == "reported message"
+        assert descriptor_count(boundary_only) == before
+
+    @pytest.mark.parametrize("failure", ["fdopen", "fstat", "fallback-fstat", "fallback-opener-fstat", "parent-open"])
+    def test_descriptor_handoff_failures_close_every_owned_descriptor(self, tmp_path, monkeypatch, descriptor_count, failure):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a").write_bytes(b"disk text\n")
+        before = descriptor_count()
+
+        def refused(*args, **kwargs):
+            raise OSError(errno.EIO, "untrusted error text")
+
+        if failure == "fdopen":
+            monkeypatch.setattr(scanners.os, "fdopen", refused)
+        elif failure == "fallback-opener-fstat":
+            monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+            monkeypatch.setattr(scanners.atomicio.os, "fstat", refused)
+        elif failure in ("fstat", "fallback-fstat"):
+            if failure == "fallback-fstat":
+                monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
+            monkeypatch.setattr(scanners.os, "fstat", refused)
+        else:
+            if not scanners._sarif_descriptor_reads_supported():
+                pytest.skip("descriptor-relative directory traversal is unavailable")
+            original = scanners.os.open
+
+            def refused_parent(path, *args, **kwargs):
+                return refused() if path == "sub" else original(path, *args, **kwargs)
+
+            capabilities = (scanners.os.supports_dir_fd - {original}) | {refused_parent}
+            monkeypatch.setattr(scanners.os, "open", refused_parent)
+            monkeypatch.setattr(scanners.os, "supports_dir_fd", capabilities)
+        report = scanners.ingest_sarif(_sarif_for("sub/a"), workspace_root=tmp_path)
+        assert report["findings"][0].snippet == "reported message"
+        assert "untrusted error text" not in json.dumps([f.as_dict() for f in report["findings"]])
+        assert descriptor_count() == before
+
+    def test_low_descriptor_limit_preserves_later_source_snippet_and_fingerprint(self, tmp_path):
+        import subprocess
+        import textwrap
+
+        resource = pytest.importorskip("resource")
+        if not hasattr(resource, "RLIMIT_NOFILE"):
+            pytest.skip("file descriptor resource limits are unavailable")
+        _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 48:
+            pytest.skip("hard file descriptor limit cannot express the 48-descriptor scenario")
+        for index in range(43):
+            (tmp_path / f"directory-{index}").mkdir()
+        (tmp_path / "pyproject.toml").write_bytes(b"[build-system]\n")
+        script = textwrap.dedent('''
+            import json
+            from pathlib import Path
+            import resource
+            import sys
+            from aegis_core.verification import scanners
+            root = Path(sys.argv[1])
+            def document(uri):
+                return {"runs": [{"results": [{"ruleId": "S307", "message": {"text": "eval"},
+                    "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri},
+                        "region": {"startLine": 1}}}]}]}]}
+            _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (48, hard))
+            for index in range(43):
+                scanners.ingest_sarif(document(f"directory-{index}"), workspace_root=root)
+            report = scanners.ingest_sarif(document("pyproject.toml"), workspace_root=root)
+            finding = report["findings"][0]
+            print(json.dumps({"snippet": finding.snippet, "fingerprint": finding.fingerprint}))
+        ''')
+        completed = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
+                                   cwd=str(Path(scanners.__file__).resolve().parents[2]),
+                                   capture_output=True, text=True, timeout=20)
+        assert completed.returncode == 0, completed.stderr
+        assert json.loads(completed.stdout) == {
+            "snippet": "[build-system]",
+            "fingerprint": scanners.sarif_fingerprint("S307", "pyproject.toml", "[build-system]"),
+        }
 
 
 class TestSarifIngestStaysInsideWorkspace:
