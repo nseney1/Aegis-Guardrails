@@ -107,6 +107,7 @@ CORE_LAYERS: Dict[str, int] = {
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
+    "aegis_core.credit_memo": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
     # Standalone stdlib unittest reporting, launched by the L1 test execution service.
