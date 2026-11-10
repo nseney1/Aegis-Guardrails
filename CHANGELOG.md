@@ -18,6 +18,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `team_pending` and `team_status` mark an undecided merge that a live delegation still covers as `within_delegation`: it is the team Decider's to decide first, since a ROOT decision would pre-empt it.
 - `tools/hierarchy_team.py` runs one team from setup to cleanup from one config (`team-run.json`, `aegis.team-run/v1`) with nine subcommands: `init`, `login`, `root`, `up`, `request`, `approve`, `turn`, `status` and `down`. `up` writes `<base>/team.json`, so roles run at its model and effort, and checks each role's rollout; `approve` is one ROOT turn that reads the hash through `team_pending`; `turn` gives a role one owner turn, for example to answer a `silent_role` hold; `down` collects the evidence with `SHA256SUMS` and releases what the run holds. See `docs/hierarchy-team.md`. The M1 runbook now uses it.
 
+- `aegis msg read / write / verify` exposes the `aegis.msg/1` codec through the CLI, with compact views, code-authored spans and metadata, and fixed JSON errors.
+
 ### Fixed
 
 - The native probe reads Codex code mode: one attempt per `tools.exec_command` or `tools.apply_patch` call in a `custom_tool_call` named `exec`, tied to its printed output only for known cell shapes. An untied call is `INCONCLUSIVE`, a call to a tool the session lacks is no attempt, and a typed `item_completed` record wins. Re-judging native probe run 1's rollouts now gives the hand-verified verdicts instead of `NOT_ATTEMPTED`. The probe's hold is one-shot: a per-hold nonce, a read-only wait of at most 600 s, and `.done` and `.release` marks the probe writes after the stop, so a resumed session no longer re-runs it.
