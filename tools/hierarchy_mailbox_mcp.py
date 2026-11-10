@@ -8,6 +8,8 @@ cannot carry them.
 """
 import argparse
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,12 +40,35 @@ if "serve" in sys.argv[1:] and not getattr(sys, "_aegis_verified_runtime_entry",
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MESSAGE_TYPES, STAGES, Mailbox, _bounded_inbox, _cli_line,  # noqa: E402
+from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MAX_INBOX_RESPONSE_BYTES, MAX_RECORDS, MESSAGE_TYPES, STAGES, Mailbox, _cli_line,  # noqa: E402
                                cli_path, digest, endpoint_parts, fields, integer, matching, require, SHA256, SLUG,
-                               strict_json, text, writer_lock)
+                               _bounded_inbox as _legacy_bounded_inbox, read_bytes, strict_json, text, writer_lock)
 
 
 BOARD_LOCK_WAIT_SECONDS = 5.0
+# Conservative assumption tied to the smallest provisioned output limit (30,000
+# tokens): two bytes/token halves the usual four-byte estimate. This is not a
+# host-neutral fact or delivery guarantee; explicit full recovery is always available.
+BRIEF_DEDUPE_MAX_BYTES = 60000
+"""A stdout flush does not prove the agent saw checkpoint text: host truncation
+and context compaction can lose it. Above this bound, resend rather than suppress
+an unseen brief; briefs=full also provides explicit recovery.
+"""
+SINCE_CLOCK_SKEW_SECONDS = 5
+# Retain retries for all four order/filter combinations over a legal mailbox.
+# Adversarial ID/snapshot rewrites still have a fixed, non-evicting bound.
+MAX_INBOX_CURSOR_PAIRS = 4 * MAX_RECORDS
+INBOX_CURSOR_CAPACITY = "inbox walk capacity reached; finish an existing walk or restart the MCP connection"
+
+
+def _inbox_now():
+    """Clock seam; requests and environment variables cannot override the clock."""
+    return datetime.now(timezone.utc)
+
+
+def _parse_inbox_time(value):
+    from hierarchy_mailbox_pager import parse_inbox_time
+    return parse_inbox_time(value)
 
 
 @contextmanager
@@ -77,6 +102,23 @@ def _tool_result(result):
 def _error_text(exc):
     # Some errors repeat the input, and a response must stay within a page whatever was sent.
     return str(exc)[:1024]
+
+
+def _bounded_inbox(result, render):
+    from hierarchy_mailbox_pager import bounded_inbox
+    return bounded_inbox(result, render, max_response_bytes=MAX_INBOX_RESPONSE_BYTES)
+
+
+def _brief_status(mailbox, brief):
+    """Use pinned reference/path/read limits; classify changes by bytes, not error text."""
+    try:
+        mailbox.brief(brief, verify=False)
+        actual = hashlib.sha256(read_bytes(Path(brief["path"]))).hexdigest()
+    except (ValueError, OSError, UnicodeError):
+        return {**brief, "ok": False, "reason": "brief_unavailable"}
+    if actual != brief["sha256"]:
+        return {**brief, "ok": False, "reason": "brief_changed"}
+    return {**brief, "ok": True}
 
 
 MAX_OVERLAP_PATHS = 64
@@ -150,7 +192,7 @@ PUBLISH_DESCRIPTION = (
     "3. on a refusal, read its text and fix exactly the field it names; never re-send unchanged.")
 
 
-def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None):
+def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None, *, inbox_pager=False):
     """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
@@ -161,12 +203,31 @@ def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=N
         "acknowledgment": {"type": "string", "enum": sorted(STAGES)},
         "readiness": READINESS_SCHEMA, "result": RESULT_SCHEMA, "receipt": {"type": "object"},
     }
+    # Preserve these legacy bytes for standalone/no-plan hosts. Planned variants
+    # are static too; only the caller's shared validated-plan decision selects one.
+    inbox_description = ("Read only this endpoint's mailbox; optionally include its hash-verified briefs. "
+                         "binding_only returns just the binding, a hash check per checkpoint brief and the "
+                         "message count.")
+    inbox_properties = {
+        "include_briefs": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "after_message_id": {"type": "string", "maxLength": 80}, "binding_only": {"type": "boolean"}}
+    if inbox_pager:
+        inbox_description = (
+            "Read this endpoint's inbox; include_briefs adds verified texts. Per session, flushed pages <=60000 "
+            "bytes permit brief checks/slim binding later. Use briefs=full after compaction/truncation. "
+            "Receipts cover returned messages only; stopping early may end woken_unread.")
+        inbox_properties["after_message_id"]["description"] = (
+            "Exclusive; keep order/since fixed. On refusal, restart without this cursor.")
+        inbox_properties.update({
+            "order": {"type": "string", "enum": ["oldest", "newest"],
+                      "description": "Default oldest; newest reverses (created_at, message_id)."},
+            "since": {"type": "string", "enum": ["current_generation"],
+                      "description": "Frozen binding cutoff (>= plus pending IDs), with excluded count. Drift, future>5 seconds "
+                                     "or ambiguous times refuse: read oldest without since."},
+            "briefs": {"type": "string", "enum": ["full"],
+                       "description": "full forces texts/full binding and implies include_briefs=true."}})
     specs = [] if board_specs else [
-        ("mailbox_inbox", True, "Read only this endpoint's mailbox; optionally include its hash-verified briefs. "
-                                "binding_only returns just the binding, a hash check per checkpoint brief and the "
-                                "message count.",
-         {"include_briefs": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-          "after_message_id": {"type": "string", "maxLength": 80}, "binding_only": {"type": "boolean"}}, []),
+        ("mailbox_inbox", True, inbox_description, inbox_properties, []),
         ("mailbox_publish", False, PUBLISH_DESCRIPTION, properties, ["message_id", "to", "type", "body"]),
         ("mailbox_ack_handoff", False, "Acknowledge this configured successor's checkpoint; grants no owner approval.",
          {"checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, ["checkpoint_sha256"]),
@@ -422,6 +483,12 @@ class DecisionConnection:
     def record_position(self):
         pass
 
+    def record_inbox_page(self):
+        pass
+
+    def begin_response(self):
+        pass
+
 
 class Connection:
     instructions = MAILBOX_INSTRUCTIONS
@@ -441,6 +508,8 @@ class Connection:
         self.manifest_digest = digest(mailbox.manifest)
         self.delivery_dir = mailbox.delivery_directory(delivery_dir) if delivery_dir is not None else None
         self.returned = []
+        self.inbox_pager = False
+        self._pager = None
         self.checked_mailbox()
         self.initiative = initiative
         self.workspace_tools = ()
@@ -544,8 +613,12 @@ class Connection:
                 raise journal_busy(self.lifecycle, exc) from exc
         return {"receipt": receipt, "identity": "configured", "authenticated": False, "execution_enabled": False}
 
-    def definitions(self):
-        return definitions(self.workspace_tools, self.board_specs, self.source_specs, self.lifecycle_specs)
+    def definitions(self, *, inbox_pager=None):
+        pager = inbox_pager
+        if pager is None:
+            pager = self.slim_inbox_metadata() if not self.board_specs else False
+        return definitions(self.workspace_tools, self.board_specs, self.source_specs, self.lifecycle_specs,
+                           inbox_pager=pager)
 
     def board_call(self, name, arguments, render):
         if self.board_specs[name][0]:
@@ -599,8 +672,75 @@ class Connection:
             return self.workspace.capacity_view(ledger)
         return self.workspace.initiative_view(ledger, self.initiative)
 
-    def note_returned(self, page):
+    @property
+    def pager(self):
+        """Load planned state lazily, preserving the standalone legacy adapter."""
+        if self._pager is None:
+            from hierarchy_mailbox_pager import InboxPager
+            self._pager = InboxPager(clock=lambda: _inbox_now(), brief_dedupe_max_bytes=BRIEF_DEDUPE_MAX_BYTES,
+                                     since_clock_skew_seconds=SINCE_CLOCK_SKEW_SECONDS,
+                                     capacity_error=INBOX_CURSOR_CAPACITY)
+        return self._pager
+
+    def begin_response(self):
+        # Staging is response-local, including malformed requests and failed writes.
+        if self._pager is not None:
+            self._pager.begin_response()
+        if self.inbox_pager:
+            self.returned = []
+
+    def note_returned(self, page, rendered_bytes):
+        if self.inbox_pager:
+            self.pager.stage(page, rendered_bytes, max_cursor_pairs=MAX_INBOX_CURSOR_PAIRS)
         self.returned = [row["message"]["message_id"] for row in page["messages"]]
+
+    def record_inbox_page(self):
+        """Called by the transport only after stdout flush succeeds."""
+        if self._pager is not None:
+            self._pager.commit()
+
+    def binding_view(self):
+        """The pinned binding-only shape, using the same single fenced snapshot."""
+        mailbox, snapshot = self.checked_binding()
+        binding = {**snapshot, "ready": mailbox.ready(snapshot)}
+        endpoint = snapshot["endpoint"]
+        total = sum(1 for record in mailbox.messages().values() if record["message"]["to"] == endpoint)
+        briefs = []
+        for brief in (snapshot["checkpoint"] or {}).get("briefs", []):
+            status = _brief_status(mailbox, brief)
+            briefs.append({key: status[key] for key in ("path", "sha256", "ok")})
+        return {"endpoint": endpoint, "binding": binding, "checkpoint_briefs": briefs, "messages_total": total}
+
+    def slim_inbox_metadata(self):
+        """Use validated host plans for slim metadata; preserve standalone bytes when absent."""
+        path = Path(self.root).parent / "host-plan.json"
+        try:
+            if not path.exists() and not path.is_symlink():
+                return False
+            import hierarchy_hosts
+            return hierarchy_hosts.base_plan(path.parent, endpoint_parts(self.sender["from"])[0]) is not None
+        except ImportError as exc:
+            raise ValueError("host plan validation unavailable; restore the complete runtime") from exc
+        except (ValueError, OSError, UnicodeError, RecursionError) as exc:
+            raise ValueError("invalid host plan; repair the governing plan before retrying") from exc
+
+    def inbox(self, arguments, *, slimming=None):
+        """Authorize one snapshot, then delegate planned page selection and state."""
+        request = self.pager.prepare(arguments)
+        try:
+            mailbox, snapshot = self.checked_binding()
+        except ValueError as exc:
+            if request.since and str(exc).startswith("endpoint has no session binding:"):
+                raise ValueError("current_generation requires a binding; bind the endpoint and reconnect") from exc
+            raise
+        ready = mailbox.ready(snapshot)
+        if slimming is None:
+            slimming = self.slim_inbox_metadata()
+        limit = arguments.get("limit", 20)
+        integer(limit, "inbox limit", maximum=100)
+        return self.pager.page(request, snapshot=snapshot, ready=ready, records=mailbox.messages().values(),
+                               limit=limit, after=arguments.get("after_message_id"), read_brief=mailbox.brief,
+                               brief_status=lambda brief: _brief_status(mailbox, brief), slimming=slimming)
 
     def record_read(self):
         # Called only after the response is written and flushed. A failure or crash before then
@@ -617,44 +757,70 @@ class Connection:
     def checked_mailbox(self, *, ready=False):
         """Every call is refused unless this connection is the current binding. A write also needs the handoff
         acknowledged; a read does not, so a successor can read the checkpoint it must acknowledge."""
+        return self.checked_binding(ready=ready)[0]
+
+    def checked_binding(self, *, ready=False):
+        """A single validated snapshot, fenced exactly as the existing reader/writer."""
         mailbox = Mailbox(self.root)
         require(digest(mailbox.manifest) == self.manifest_digest, "mailbox manifest changed since server startup")
-        mailbox.fence(self.sender, ready=ready)
-        return mailbox
+        binding = mailbox.fence(self.sender, ready=ready)
+        return mailbox, binding
 
     def self_view(self, arguments):
         fields(arguments, set())
         import hierarchy_roles
-        mailbox = self.checked_mailbox()
+        pager = self.slim_inbox_metadata()
+        mailbox, binding = self.checked_binding()
         endpoint = self.sender["from"]
-        binding = mailbox.current_binding(endpoint)
+        if not pager:
+            binding = mailbox.current_binding(endpoint)
         return {"endpoint": endpoint, "role": hierarchy_roles.role_name(endpoint, mailbox.endpoint(endpoint).get("kind")),
                 "host": binding["host"], "session": binding["session"], "generation": binding["generation"],
                 "ready": mailbox.ready(binding), "current": True, "identity": "configured", "authenticated": False,
-                "tools": sorted(tool["name"] for tool in self.definitions())}
+                "tools": sorted(tool["name"] for tool in self.definitions(inbox_pager=pager))}
 
     def call(self, name, arguments, render=None):
+        self.begin_response()
         text(name, "tool name", 128)
         if self.board is not None:
             require(name in self.board_specs, "unknown mailbox tool: " + name)
             return self.board_call(name, arguments, render)
         if name == "mailbox_inbox":
-            fields(arguments, set(), {"include_briefs", "limit", "after_message_id", "binding_only"})
+            pager = self.slim_inbox_metadata()
+            self.inbox_pager = pager
+            allowed = {"include_briefs", "limit", "after_message_id", "binding_only"}
+            if pager:
+                allowed.update({"order", "since", "briefs"})
+            fields(arguments, set(), allowed)
             binding_only = arguments.get("binding_only", False)
             require(type(binding_only) is bool, "binding_only must be boolean")
             if binding_only:
+                require("briefs" not in arguments, "binding_only takes no briefs; omit briefs")
+                require(not {"order", "since"} & arguments.keys(),
+                        "binding_only takes no order or since; omit those options")
                 require(arguments.keys() == {"binding_only"},
                         "binding_only takes no include_briefs, limit or after_message_id")
-                return self.checked_mailbox().binding_view(self.sender["from"])
-            include_briefs = arguments.get("include_briefs", False)
-            require(type(include_briefs) is bool, "include_briefs must be boolean")
-            return self.checked_mailbox().inbox(self.sender["from"], include_briefs=include_briefs,
-                                               limit=arguments.get("limit", 20), after=arguments.get("after_message_id"))
+                return self.binding_view() if pager else self.checked_mailbox().binding_view(self.sender["from"])
+            if not pager:
+                include_briefs = arguments.get("include_briefs", False)
+                require(type(include_briefs) is bool, "include_briefs must be boolean")
+                return self.checked_mailbox().inbox(self.sender["from"], include_briefs=include_briefs,
+                                                   limit=arguments.get("limit", 20),
+                                                   after=arguments.get("after_message_id"))
+            return self.inbox(arguments, slimming=pager)
         if name == "mailbox_publish":
             fields(arguments, {"message_id", "to", "type", "body"},
                    {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"})
+            compact = self.slim_inbox_metadata()
             with writer_lock(self.root):
-                return self.checked_mailbox().publish({**arguments, **self.sender})
+                result = self.checked_mailbox().publish({**arguments, **self.sender})
+            if compact:
+                try:
+                    return {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
+                            "created_at": result["message"]["created_at"], "size": os.stat(result["path"]).st_size}
+                except OSError as exc:
+                    raise ValueError("published message metadata unavailable; inspect the mailbox before retrying") from exc
+            return result
         if name == "mailbox_ack_handoff":
             fields(arguments, {"checkpoint_sha256"})
             matching(arguments["checkpoint_sha256"], SHA256, "checkpoint sha256")
@@ -675,6 +841,7 @@ class Connection:
 
 
 def handle(connection, request):
+    connection.begin_response()
     fields(request, {"jsonrpc", "method"}, {"id", "params"})
     require(request["jsonrpc"] == "2.0", "unsupported JSON-RPC version")
     text(request["method"], "method", 128)
@@ -698,15 +865,22 @@ def handle(connection, request):
         return {"tools": connection.definitions()}
     if method == "tools/call":
         fields(params, {"name"}, {"arguments", "_meta"})
+        rendered_sizes = {}
         def render(page):
-            return _response_line({"jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)})
+            raw = _response_line({"jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)})
+            if params["name"] == "mailbox_inbox":
+                rendered_sizes[len(page["messages"])] = len(raw)
+            return raw
 
         try:
             result = connection.call(params["name"], params.get("arguments", {}), render)
             # A binding-only view has no messages to page and nothing to record as read.
             if params["name"] == "mailbox_inbox" and not params.get("arguments", {}).get("binding_only"):
-                result = _bounded_inbox(result, render)
-                connection.note_returned(result)
+                pager = _bounded_inbox if getattr(connection, "inbox_pager", True) else _legacy_bounded_inbox
+                result = pager(result, render)
+                # Every selected count was rendered by the pager, including zero
+                # and one. Reuse its size to retain the logarithmic render bound.
+                connection.note_returned(result, rendered_sizes[len(result["messages"])])
             return _tool_result(result)
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
             return {"content": [{"type": "text", "text": json.dumps({"error": _error_text(exc)})}], "isError": True}
@@ -730,6 +904,7 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
                                 workspace_store=workspace_store, initiative=initiative, board=board,
                                 source_repo=source_repo, lifecycle=lifecycle, actor=actor)
     while True:
+        connection.begin_response()
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
         if not raw:
             return 0
@@ -757,10 +932,12 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
         except OSError:
             # The connection is gone, so nothing was delivered. Point stdout at nothing so the
             # interpreter's own flush at exit cannot fail too.
+            connection.begin_response()
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
             return 0
         connection.record_read()
         connection.record_position()
+        connection.record_inbox_page()
         if oversized:
             return 0  # close the channel rather than interpret frame fragments as requests
 

@@ -70,7 +70,7 @@ for line in sys.stdin:
 '''
 
 
-def _driver(tmp_path: Path, mode: str = 'ok', timeout: float = 1.0):
+def _driver(tmp_path: Path, mode: str = 'ok', timeout: float = 3.0):
     from aegis_core.ast.batch import BatchDriver
 
     script = tmp_path / 'driver.py'
@@ -93,17 +93,24 @@ def test_one_process_serves_ordered_files_in_empty_cwd_without_path(tmp_path):
 
 
 @pytest.mark.parametrize('mode,reason', [
-    ('bad_hello', 'hello'), ('hello_timeout', 'timed out'), ('id', 'id'),
-    ('oversize', '8 MiB'), ('timeout', 'timed out'), ('crash', 'driver crashed'),
+    ('bad_hello', 'invalid protocol-v2 hello'),
+    pytest.param('hello_timeout', r'timed out after 1\.0s waiting for hello', marks=pytest.mark.timing),
+    ('id', 'id'), ('oversize', '8 MiB'),
+    pytest.param('timeout', r'timed out after 3\.0s waiting for parse', marks=pytest.mark.timing),
+    ('crash', 'driver crashed'),
     ('malformed', 'JSON'), ('bool_id', 'id'), ('language', 'language'),
 ])
 def test_protocol_failure_poisoned_session_fails_every_remaining_file(tmp_path, mode, reason):
-    from aegis_core.ast.runner import ASTDriverError
+    from aegis_core.ast.runner import ASTDriverError, ASTDriverTimeoutError
 
-    driver = _driver(tmp_path, mode, timeout=0.3)
-    with pytest.raises(ASTDriverError, match=reason) as first:
+    # Allow startup and the 8 MiB transfer to finish under load. Only the hello
+    # timeout has no earlier phase to protect; both timeouts precede the 5s sleep.
+    is_timeout = mode in ('hello_timeout', 'timeout')
+    error_type = ASTDriverTimeoutError if is_timeout else ASTDriverError
+    driver = _driver(tmp_path, mode, timeout=1.0 if mode == 'hello_timeout' else 3.0)
+    with pytest.raises(error_type, match=reason) as first:
         driver.parse(tmp_path / 'a.go')
-    with pytest.raises(ASTDriverError) as remaining:
+    with pytest.raises(error_type) as remaining:
         driver.parse(tmp_path / 'b.go')
     assert str(remaining.value) == str(first.value)
     driver.close()
@@ -126,12 +133,14 @@ def test_nonzero_shutdown_after_valid_response_fails_closed(tmp_path):
             assert driver.parse(tmp_path / 'a.go').language == 'go'
 
 
+@pytest.mark.timing
 def test_shutdown_deadline_kills_a_driver_that_ignores_eof(tmp_path):
     from aegis_core.ast.runner import ASTDriverTimeoutError
 
     with pytest.raises(ASTDriverTimeoutError, match='shutdown'):
-        with _driver(tmp_path, 'shutdown_timeout', timeout=0.3) as driver:
+        with _driver(tmp_path, 'shutdown_timeout', timeout=3.0) as driver:
             assert driver.parse(tmp_path / 'a.go').language == 'go'
+            driver.timeout = 1.0  # Shorten only the shutdown deadline after startup.
 
 
 def test_stderr_is_drained_and_diagnostics_are_bounded(tmp_path):
@@ -143,12 +152,14 @@ def test_stderr_is_drained_and_diagnostics_are_bounded(tmp_path):
     assert len(str(caught.value)) < 66 * 1024
 
 
+@pytest.mark.timing
 def test_group_termination_failure_still_reaps_and_cleans_scratch(tmp_path, monkeypatch):
     from aegis_core.ast import batch
     from aegis_core.ast.runner import ASTDriverError
 
-    driver = _driver(tmp_path, 'shutdown_timeout', timeout=0.1)
+    driver = _driver(tmp_path, 'shutdown_timeout', timeout=3.0)
     tree = driver.parse(tmp_path / 'a.go')
+    driver.timeout = 1.0  # Shorten only the shutdown deadline after startup.
     scratch = Path(tree.metadata['cwd'])
     if os.name == 'nt':
         kernel = driver._windows_job._kernel

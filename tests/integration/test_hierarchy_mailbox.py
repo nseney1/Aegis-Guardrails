@@ -3,9 +3,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
+import venv
 
 import pytest
 
@@ -19,6 +21,7 @@ ENDPOINTS = {
     "b/front-door": {}, "b/orchestrator": {},
     "b/lane/f6": {"kind": "implementer"},
 }
+_PILOT_SEED = pytest.StashKey[Path]()
 
 
 def invoke(root, command, request=None, *, ok=True, process_timeout=15, **flags):
@@ -41,17 +44,33 @@ def invoke(root, command, request=None, *, ok=True, process_timeout=15, **flags)
     return data
 
 
+def pilot_seed(request, tmp_path_factory):
+    """Build one immutable seed per requesting module/worker, without fixture dependencies."""
+    module = request.node.getparent(pytest.Module)
+    if _PILOT_SEED not in module.stash:
+        seed = tmp_path_factory.mktemp("pilot-seed") / "mailbox"
+        manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": ENDPOINTS,
+                    "counterparts": [["a/front-door", "b/front-door"],
+                                     ["a/orchestrator", "b/orchestrator"],
+                                     ["a/lane/f2", "b/lane/f6"]], "writer_limit": 3}
+        invoke(seed, "init", manifest)
+        for endpoint in ENDPOINTS:
+            invoke(seed, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
+                                  "expected_generation": 0})
+        module.stash[_PILOT_SEED] = seed
+
+        def release_seed():
+            del module.stash[_PILOT_SEED]
+
+        module.addfinalizer(release_seed)
+    return module.stash[_PILOT_SEED]
+
+
 @pytest.fixture
-def pilot(tmp_path):
+def pilot(tmp_path, tmp_path_factory, request):
     root = tmp_path / "mailbox"
-    manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": ENDPOINTS,
-                "counterparts": [["a/front-door", "b/front-door"],
-                                 ["a/orchestrator", "b/orchestrator"],
-                                 ["a/lane/f2", "b/lane/f6"]], "writer_limit": 3}
-    invoke(root, "init", manifest)
-    for endpoint in ENDPOINTS:
-        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
-                              "expected_generation": 0})
+    # Initial manifest/bindings contain no absolute paths; briefs stay test-local.
+    shutil.copytree(pilot_seed(request, tmp_path_factory), root)
     brief = tmp_path / "brief.md"
     brief.write_bytes(b"Goal: improve diagnostics.\nAcceptance: retain overlap evidence.\n")
     return root, {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}
@@ -61,6 +80,48 @@ def message(sender="a/orchestrator", recipient="a/lane/f2", *, identifier="dispa
     return {"message_id": identifier, "from": sender, "to": recipient,
             "host": "host-one", "session": sender, "binding_generation": 1,
             "type": kind, "body": "Information, never an approval.", **extra}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="durable lifecycle mutation requires POSIX directory fsync")
+@pytest.mark.parametrize("foreign_tests", [False, True], ids=["no-pytest", "foreign-tests-package"])
+def test_bulk_lifecycle_setup_needs_only_repository_tools(tmp_path, monkeypatch, foreign_tests):
+    from tests.integration.test_hierarchy_fresh_brief import seed_completed_requests
+    from tests.integration.test_hierarchy_lifecycle import Ledger
+
+    environment = tmp_path / "bare-python"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    interpreter = environment / "bin" / "python"
+    probe = subprocess.run([str(interpreter), "-I", "-B", "-c", "import pytest"],
+                           capture_output=True, text=True, timeout=15)
+    assert probe.returncode == 1 and not probe.stdout
+    assert probe.stderr.endswith("ModuleNotFoundError: No module named 'pytest'\n")
+    marker = tmp_path / "foreign-tests-imported"
+    if foreign_tests:
+        location = subprocess.run([str(interpreter), "-I", "-B", "-c",
+                                   "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                                  capture_output=True, text=True, check=True, timeout=15)
+        site = Path(location.stdout.strip())
+        site.relative_to(environment)  # Write only inside this disposable interpreter.
+        package = site / "tests"
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            "from pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('foreign tests imported')\n",
+            encoding="utf-8",
+        )
+        control = subprocess.run([str(interpreter), "-I", "-B", "-c", "import tests; print(tests.__file__)"],
+                                 capture_output=True, text=True, timeout=15)
+        assert control.returncode == 0 and not control.stderr
+        assert Path(control.stdout.strip()) == package / "__init__.py"
+        assert marker.read_text() == "foreign tests imported"
+        marker.unlink()
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    ledger = Ledger(tmp_path)
+    seed_completed_requests(ledger, 1)
+    state = ledger.status()
+    assert set(state["requests"]) == {"done-00"}
+    assert state["requests"]["done-00"]["resolution"]["kind"] == "complete"
+    assert state["obligations"] == []
+    assert not marker.exists()
 
 
 RECEIPT_FLUSH_DRIVER = r'''
