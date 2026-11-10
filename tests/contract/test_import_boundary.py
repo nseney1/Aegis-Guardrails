@@ -44,6 +44,9 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.taxonomy": 0,
     # Canonical message records and untrusted views (stdlib only).
     "aegis_core.message_codec": 0,
+    # Shared format primitives and anchored content-addressed storage.
+    "aegis_core.message_codec_format": 0,
+    "aegis_core.message_codec_store": 0,
     # Streaming message views and rendered-size preflight (stdlib only).
     "aegis_core.message_codec_views": 0,
     # Pure data, no aegis imports: the host table and the bootstrap text.
