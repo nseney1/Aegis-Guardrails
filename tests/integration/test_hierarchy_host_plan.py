@@ -356,7 +356,6 @@ def bound_files(setup):
 @pytest.mark.parametrize("endpoint,host,changes", [
     ("pilot/lane/f2", CLAUDE, {"session": "6f0e7c1a-1111-4222-8333-944455556666"}),
     ("pilot/orchestrator", CODEX, {"session": CODEX_SESSION, "source_cwd": True}),
-    ("pilot/front-door", CLAUDE, {"session": "6f0e7c1a-1111-4222-8333-944455556667"}),
 ])
 def test_without_a_plan_add_role_answers_and_writes_exactly_what_a_planned_match_does(tmp_path, endpoint, host,
                                                                                      changes):
@@ -374,6 +373,33 @@ def test_without_a_plan_add_role_answers_and_writes_exactly_what_a_planned_match
         answers.append(json.loads(json.dumps(answer).replace(str(built.tmp), "<tmp>")))
     assert answers[0] == answers[1]
     assert bound_files(plain) == bound_files(planned)
+    assert not (plain.base / "sessions").exists() and not (plain.base / "host-plan.json").exists()
+    assert (planned.base / "sessions").is_dir()
+
+
+@posix
+def test_front_door_stand_in_keeps_registration_without_executable_profiles(tmp_path):
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "plans").mkdir()
+    plain, planned = Setup(tmp_path / "plain"), Setup(tmp_path / "plans")
+    answers = []
+    for built in (plain, planned):
+        built.init()
+        if built is planned:
+            write_plan(built, team=CLAUDE)
+        answer = built.add_role("pilot/front-door", CLAUDE, cwd=str(built.tmp),
+                                session="6f0e7c1a-1111-4222-8333-944455556667")
+        answers.append(json.loads(json.dumps(answer).replace(str(built.tmp), "<tmp>")))
+    executable = {"start_argv", "wake_profile", "codex_profile"}
+    assert {"start_argv", "wake_profile"} <= answers[0].keys()
+    assert "stand_in" not in answers[0]
+    expected_answer = {key: value for key, value in answers[0].items() if key not in executable}
+    assert answers[1] == dict(expected_answer, stand_in=True)
+    assert not executable & answers[1].keys()
+    assert not any("argv" in key for key in answers[1])
+    expected_files = bound_files(plain)
+    del expected_files["profiles/pilot%2Ffront-door-g1.wake.json"]
+    assert bound_files(planned) == expected_files
     assert not (plain.base / "sessions").exists() and not (plain.base / "host-plan.json").exists()
     assert (planned.base / "sessions").is_dir()
 
