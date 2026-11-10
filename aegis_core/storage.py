@@ -92,6 +92,8 @@ try:
 except ImportError:  # POSIX
     msvcrt = None  # type: ignore[assignment]
 
+_DEPS = sys.modules[__name__]
+
 __all__ = [
     "FileReport",
     "JsonlAppend",
@@ -344,15 +346,15 @@ _SHARED_DIR_MODE = storage_shared.SHARED_DIR_MODE
 
 
 def _shared_link_error(path: Path, base: Path) -> PathTraversalError:
-    return storage_shared.shared_link_error(sys.modules[__name__], path, base)
+    return storage_shared.shared_link_error(_DEPS, path, base)
 
 
 def _shared_outside_error(path: Path, base: Path) -> PathTraversalError:
-    return storage_shared.shared_outside_error(sys.modules[__name__], path, base)
+    return storage_shared.shared_outside_error(_DEPS, path, base)
 
 
 def _confined(directory: Path, base: Path, link_error, outside_error, entries: bool = True) -> None:
-    return storage_shared.confined(sys.modules[__name__], directory, base, link_error, outside_error, entries)
+    return storage_shared.confined(_DEPS, directory, base, link_error, outside_error, entries)
 
 
 def shared_state_dir(workspace: Any, create: bool = True) -> Path:
@@ -382,7 +384,8 @@ def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
     ``supported`` is False. Symlinks are never followed or changed. Raises the
     confinement errors documented by ``shared_state_dir``.
     """
-    return storage_shared.state_modes(sys.modules[__name__], workspace, fix)
+    return storage_shared.state_modes(_DEPS, workspace, fix,
+                                     chmod_exact=lambda *args: _chmod_exact(*args))
 
 
 def _chmod_exact(path: Path, mode: int, is_dir: bool) -> bool:
@@ -402,15 +405,18 @@ def _chmod_exact(path: Path, mode: int, is_dir: bool) -> bool:
 
 def _local_state_dir(root: Path, create: bool) -> Path:
     """Route local state through the live preparation and refusal hooks."""
-    return storage_shared.local_state_dir(sys.modules[__name__], root, create)
+    return storage_shared.local_state_dir(_DEPS, root, create,
+                                         confined=lambda *args, **kwargs: _confined(*args, **kwargs))
 
 
 def _shared_errors(base: Path):
-    return storage_shared.shared_errors(sys.modules[__name__], base)
+    return storage_shared.shared_errors(_DEPS, base,
+                                       link_error=lambda *args: _shared_link_error(*args),
+                                       outside_error=lambda *args: _shared_outside_error(*args))
 
 
 def _confined_shared(directory: Path, base: Path, create: bool) -> None:
-    return storage_shared.confined_shared(sys.modules[__name__], directory, base, create)
+    return storage_shared.confined_shared(_DEPS, directory, base, create)
 
 
 def _shared_dir(base: Path, create: bool) -> Path:
@@ -420,7 +426,7 @@ def _shared_dir(base: Path, create: bool) -> Path:
 
 
 def _shared_lock_name(name: object) -> str:
-    return storage_shared.shared_lock_name(sys.modules[__name__], name)
+    return storage_shared.shared_lock_name(_DEPS, name)
 
 
 @contextmanager

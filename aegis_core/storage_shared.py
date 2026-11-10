@@ -3,6 +3,7 @@
 Every implementation receives ``deps`` from storage at call time. Collaborators,
 including calls between helpers, are resolved through that namespace; this module
 never imports storage. Patch aegis_core.storage.<name> to affect the moved code.
+Explicit callbacks expose private helper wiring to the call-graph checker.
 """
 from __future__ import annotations
 
@@ -75,7 +76,7 @@ class StateModes(NamedTuple):
         return {"checked": self.checked, "looser": self.looser, "fixed": self.fixed, "supported": self.supported}
 
 
-def state_modes(deps: Any, workspace: Any, fix: bool = False) -> StateModes:
+def state_modes(deps: Any, workspace: Any, fix: bool = False, *, chmod_exact) -> StateModes:
     """Count the entries of ``<git common dir>/aegis`` looser than 0o700 (directories) and
     0o600 (files); with ``fix`` set them to exactly that. Nothing is created.
 
@@ -100,7 +101,7 @@ def state_modes(deps: Any, workspace: Any, fix: bool = False) -> StateModes:
         checked += 1
         if deps.stat.S_IMODE(deps.os.lstat(path).st_mode) & 0o077:
             looser += 1
-            if fix and deps._chmod_exact(path, deps._SHARED_DIR_MODE if is_dir else deps._PRIVATE_FILE_MODE, is_dir):
+            if fix and chmod_exact(path, deps._SHARED_DIR_MODE if is_dir else deps._PRIVATE_FILE_MODE, is_dir):
                 fixed += 1
         if is_dir:
             with deps.os.scandir(path) as found:
@@ -108,24 +109,24 @@ def state_modes(deps: Any, workspace: Any, fix: bool = False) -> StateModes:
     return deps.StateModes(checked, looser, fixed, True)
 
 
-def local_state_dir(deps: Any, root: Path, create: bool) -> Path:
+def local_state_dir(deps: Any, root: Path, create: bool, *, confined) -> Path:
     """Local state with storage's refusals; ``create=False`` creates nothing."""
     if create:
         return deps.state_dir(root)
     layout = deps.WorkspaceLayout(root)
-    deps._confined(layout.aegis_dir, layout.root, deps._link_error, deps._outside_error, entries=False)
-    deps._confined(layout.state_dir, layout.root, deps._link_error, deps._outside_error)
+    confined(layout.aegis_dir, layout.root, deps._link_error, deps._outside_error, entries=False)
+    confined(layout.state_dir, layout.root, deps._link_error, deps._outside_error)
     return layout.state_dir
 
 
-def shared_errors(deps: Any, base: Path):
-    def link_error(path: Path) -> Exception:
-        return deps._shared_link_error(path, base)
+def shared_errors(deps: Any, base: Path, *, link_error, outside_error):
+    def confined_link_error(path: Path) -> Exception:
+        return link_error(path, base)
 
-    def outside_error(path: Path) -> Exception:
-        return deps._shared_outside_error(path, base)
+    def confined_outside_error(path: Path) -> Exception:
+        return outside_error(path, base)
 
-    return link_error, outside_error
+    return confined_link_error, confined_outside_error
 
 
 def confined_shared(deps: Any, directory: Path, base: Path, create: bool) -> None:
