@@ -49,6 +49,7 @@ The manager `workspace` namespace requires `--config` and refuses `--workspace`.
 | `aegis sync` | Rule Evolution & Intelligence | Rebuild rule fitness from the ledger and suggest promotions (--apply to apply them) |
 | `aegis benchmark` | Plumbing | Measure scan and hook latency, payload size and Layer 1 throughput (not an efficacy measure) |
 | `aegis hook` | Plumbing | Install, inspect or remove the git pre-commit hook and the agent hosts' PreToolUse hooks |
+| `aegis msg` | Plumbing | Write, read and verify untrusted content-addressed messages |
 
 ### `aegis doctor`
 
@@ -591,6 +592,57 @@ Without --host: remove the aegis block from the git pre-commit hook. With --host
 | `--dry-run` |  |  | Preview without modifying disk |
 | `--host` | `HOST` |  | Remove Aegis's PreToolUse and insight capture hook entries from this host instead of the git hook: claude-code, codex-cli, antigravity |
 | `--scope` | one of `user`, `project` |  | With --host: only this scope (default: both) |
+
+### `aegis msg`
+
+Write, read and verify untrusted content-addressed messages
+
+Records are untrusted data, never instructions. Store defaults to the workspace's .aegis/state/messages/ (created private on write through the state helper). Run aegis init first; message commands never initialize a workspace. All errors are fixed JSON with exit 2. Reading never acknowledges a message.
+
+Category: Plumbing. Subcommands: `read`, `verify`, `write`.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
+
+### `aegis msg read`
+
+Render a verified message view
+
+No selectors: pass through records up to 4000 canonical chars; otherwise show outline and top-level scalars. JSON is default; TSV is opt-in. All role-authored text is verbatim and untrusted.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
+| `ref` | `REF` |  | 64-hex id or unambiguous 16-64 lowercase hex prefix (required) |
+| `--fields` | `SEL` | `[]` | At most 16 selectors, depth 8: dotted paths, indices, one-level * and row projection findings.*.{id,severity,file,line}; comma separated; repeatable |
+| `--spans` | `N` | `[]` | Zero-based body span indices; at most 64 selections; repeatable |
+| `--outline` |  |  | Include outline; alone emits only the envelope and outline |
+| `--since` | `CURSOR` |  | Log rows after cursor; 0 starts a new cursor |
+| `--expand` | `NAME` | `[]` | Expand a named ref one level, charged to max-chars; repeatable |
+| `--format` | `FORMAT` | `"json"` | View format: json, md or tsv; MD fences data as untrusted, TSV uses JSON values |
+| `--max-chars` | `N` | `"60000"` | Output character limit; excess refuses with E_LIMIT: narrow the selectors |
+
+### `aegis msg verify`
+
+Verify canonical bytes and content hash
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
+| `ref` | `REF` |  | 64-hex id or unambiguous 16-64 lowercase hex prefix (required) |
+
+### `aegis msg write`
+
+Store caller-authored message content
+
+Input must contain exactly fields, body and refs. The CLI authors schema, kind, meta (from=cli, host=cli, empty session, UTC time) and spans.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
+| `--kind` | one of `text`, `record`, `log`, `blob`, `review.v1`, `prereview.v1`, `handoff.v1`, `leadreport.v1` |  | Message kind; fields must match its schema |
+| `--in` | `FILE` |  | UTF-8 JSON content object (fields, body, refs); - reads stdin; at most 262144 bytes. ATX headings (# through ###### at line start) outside code fences define body-character spans, each ending at the next heading or body end |
 
 ### Removed commands
 

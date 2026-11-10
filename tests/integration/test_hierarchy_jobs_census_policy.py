@@ -168,6 +168,93 @@ def manual_grant(shop, policy):
     return request
 
 
+def other_heavy_kind(kind):
+    return "heavy-tests" if kind == "heavy" else "heavy"
+
+
+def kind_request_id(shop, kind, holder="job:pilot/job-1"):
+    """job_request_id returns the holder's first request; this one names the kind as well."""
+    found = [event["data"]["request_id"] for event in shop.events()
+             if event["kind"] == "request" and event["data"]["holder"] == holder and event["data"]["kind"] == kind]
+    assert len(found) == 1, found
+    return found[0]
+
+
+@pytest.mark.parametrize("state", ["granted", "queued"])
+@pytest.mark.parametrize("other", ["writer", "other-heavy"])
+@pytest.mark.parametrize("kind", KINDS)
+def test_explicit_count_counts_outside_roots_for_a_job_holding_only_another_kind(policy_shop, kind, other, state):
+    shop = policy_shop
+    other = other_heavy_kind(kind) if other == "other-heavy" else other
+    request_heavy_jobs(shop, kind, "count")
+    other_request = shop.workspace.ask("pilot", other, "job:pilot/job-1")
+    if state == "granted":
+        assert shop.workspace.grant(other)["request_id"] == other_request
+    limit = shop.workspace.run("status")["capacity"][kind]["limit"]
+    pids = PIDS[:limit]
+    row = shop.run_open(census={"external_roots": {kind: pids}}, expect=3)["rows"][0]
+    if other in KINDS and state == "granted":
+        assert (row["state"], row["reason"], row["request_id"]) == ("waiting", "stale_grant", other_request)
+        assert shop.receipts("job-1") == []
+        assert not (shop.workspace.store / "jobs" / "pilot" / "job-1").exists()
+        assert not any(event["kind"] == "request" and event["data"]["kind"] == kind
+                       for event in shop.events()), "no second kind while the stale grant is held"
+        return
+    assert (row["state"], row["reason"]) == ("waiting", "capacity_full")
+    assert row["z_census"] == expected_summary("count", pids, limit=limit), "outside roots were counted"
+    assert not (shop.workspace.store / "jobs" / "pilot" / "job-1").exists()
+    assert shop.receipts("job-1") == [] and not (shop.workspace.store / "census").exists()
+    request_id = kind_request_id(shop, kind)
+    assert not any(event["kind"] == "grant" and event["data"]["request_id"] == request_id for event in shop.events())
+
+
+@pytest.mark.parametrize("other", ["writer", "heavy-tests"])
+def test_a_job_holding_another_kind_is_granted_with_census_and_audit_once_outside_load_leaves(policy_shop, other):
+    shop = policy_shop
+    request_heavy_jobs(shop, "heavy", "count")
+    other_request = shop.workspace.ask("pilot", other, "job:pilot/job-1")
+    assert shop.workspace.grant(other)["request_id"] == other_request
+    assert shop.run_open(census=PIDS, expect=3)["rows"][0]["reason"] == (
+        "stale_grant" if other == "heavy-tests" else "capacity_full")
+    if other == "heavy-tests":
+        shop.workspace.release(other_request)
+    row = shop.run_open(census=[101])["rows"][0]
+    assert row["state"] == "completed"
+    request_id = kind_request_id(shop, "heavy")
+    assert result_for(shop)["capacity"] == grant_view("count", [101])
+    assert row["z_census"] == expected_summary("count", [101], request_id=request_id)
+    record = json.loads((shop.workspace.store / "census" / (request_id + ".json")).read_bytes())
+    assert record == {"request_id": request_id, "holder": "job:pilot/job-1", "kind": "heavy",
+                      "capacity": grant_view("count", [101])}
+    assert not (shop.workspace.store / "census" / (other_request + ".json")).exists()
+
+
+@pytest.mark.parametrize("action", ["refuse", "execute"])
+@pytest.mark.parametrize("policy", POLICIES)
+def test_a_foreign_initiatives_grant_under_the_jobs_holder_never_supplies_its_audit(policy_shop, policy, action):
+    shop = policy_shop
+    request_heavy_jobs(shop, "heavy", policy)
+    shop.workspace.register("intruder")
+    foreign = shop.workspace.ask("intruder", "heavy", "job:pilot/job-1")
+    assert shop.workspace.grant("heavy")["request_id"] == foreign
+    # A well-formed record for the foreign grant, as its own runner would publish it.
+    folder = shop.workspace.store / "census"
+    folder.mkdir()
+    (folder / (foreign + ".json")).write_text(json.dumps({
+        "request_id": foreign, "holder": "job:pilot/job-1", "kind": "heavy", "capacity": grant_view("count")}))
+    if action == "refuse":
+        (shop.checkout / "src" / "app.py").write_text("changed = True\n")
+        row = shop.run_open()["rows"][0]
+        assert row["state"] == "refused" and "z_census" not in row
+        assert "capacity" not in result_for(shop), "another initiative's grant record is not this job's audit"
+    else:
+        row = shop.run_open(census=[101], expect=3)["rows"][0]
+        assert (row["state"], row["reason"], row["request_id"]) == ("waiting", "holder_conflict", foreign)
+        assert "z_census" not in row and not (shop.workspace.store / "jobs" / "pilot" / "job-1").exists()
+    assert sorted(path.name for path in folder.iterdir()) == [foreign + ".json"]
+    assert not any(event["kind"] in ("release", "withdraw") for event in shop.events())
+
+
 def crash_after_claim(shop):
     argv = shop.argv("run-open", census=[101])
     driver = ("import os, sys; sys.path.insert(0, sys.argv[1]); import hierarchy_jobs as jobs\n"
