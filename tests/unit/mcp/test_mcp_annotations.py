@@ -19,8 +19,10 @@ from aegis_mcp.server import handle_request
 
 _HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
-READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule"}
-WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight"}
+READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule",
+        "aegis_msg_read": "Read Message"}
+WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight",
+         "aegis_msg_write": "Write Message"}
 
 
 @pytest.fixture
@@ -61,6 +63,7 @@ def test_write_tools_claim_nothing_beyond_not_read_only(tools):
     assert writers == {
         "aegis_report_outcome": {"readOnlyHint": False, "title": "Report Outcome"},
         "aegis_capture_insight": {"readOnlyHint": False, "title": "Capture Insight"},
+        "aegis_msg_write": {"readOnlyHint": False, "title": "Write Message"},
     }
 
 
@@ -188,6 +191,8 @@ SIBLINGS = {
     "aegis_list_rules": ("aegis_scan",),
     "aegis_create_rule": ("aegis_list_rules",),
     "aegis_capture_insight": ("aegis_report_outcome",),
+    "aegis_msg_read": ("aegis_msg_write",),
+    "aegis_msg_write": ("aegis_msg_read",),
 }
 
 
@@ -216,7 +221,12 @@ def test_the_report_description_states_the_limits_the_code_enforces(tools):
 
 
 def test_tools_list_fits_the_handshake_budget(tools):
-    assert len(json.dumps(list(tools.values()))) <= 6_500
+    # MC-3: codec ADR D2 puts trust notices and grammar in the cached prefix.
+    # Round 2 requires kind fields too: their compact lists exceed 8,500;
+    # the ruling admits the measured total with a hard ceiling of 9,000.
+    budget = 8_880  # Measured with json.dumps(list(tools.values())).
+    assert budget <= 9_000
+    assert len(json.dumps(list(tools.values()))) <= budget
 
 
 @pytest.mark.parametrize("name,description,error", [
