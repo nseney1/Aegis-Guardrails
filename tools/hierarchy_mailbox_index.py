@@ -29,6 +29,14 @@ are always opened/read in the current call, hash-compared, and copied. Check-tim
 races retry once before reconciling to PIN; no routing entry is skipped.
 Fallback retains keyed candidates for re-observation on the next call, evicting
 headers contradicted by observed hashes even when PIN raises.
+Dependencies are observed only when a current routing entry needs the path;
+no deferred error objects, tracebacks or per-path error map are retained.
+Successful full PIN reconciliation retires deleted paths. Changed live records
+keep their old SHA baseline while header/dependency reuse is invalidated.
+Every completed scan binds reply dependencies to its resolved target. A retained
+reply with a different target loses parsed reuse but keeps its SHA baseline.
+Normal scans retry once to reread/revalidate it; PIN reconciliation uses the
+same invalidation helper before the next indexed read.
 Inbox expansion/bindings/ready
 remain live pinned code. Only its returned page is deep-copied.
 
@@ -262,8 +270,6 @@ class _Observations:
         self.previous = previous
         self.values, self.metadata = {}, {}
         self.changed, self.unknown, self.used = set(), set(), set()
-        for path in previous:
-            self.observe(path, used=False)
 
     @staticmethod
     def lstat(path):
@@ -292,10 +298,12 @@ class _Observations:
                 self.unknown.add(path)
         return self.metadata[path]
 
-    def stable(self, paths, *, known=False):
+    def stable(self, paths):
         self.used.update(paths)
-        if not known:
-            for path in paths:
+        # Listing/validation selects dependencies before any fallible probe.
+        # An obsolete dependency never needs an error placeholder or traceback.
+        for path in paths:
+            if path not in self.metadata:
                 self.observe(path, used=False)
         return ((not self.changed or self.changed.isdisjoint(paths))
                 and (not self.unknown or self.unknown.isdisjoint(paths)))
@@ -474,6 +482,29 @@ class MailboxIndex:
         return tuple(dict.fromkeys(value for item in inspected for part in (item, *item.parents)
                                    for value in (str(part),) if value not in self._above_root))
 
+    def _reconcile_reply_dependencies(self, entries, records, observed=None):
+        invalidated = False
+        for relpath, entry in list(entries.items()):
+            message = entry["message"]
+            if "in_reply_to" not in message:
+                continue
+            target = records[message["in_reply_to"]]["path"]
+            if entry.get("reply_target") == target:
+                continue
+            if observed is not None and entry is not self._entries.get(relpath):
+                # This header was read and validated in the current scan.
+                dependencies = tuple(dict.fromkeys(self._paths(entry["path"], message) + self._paths(target)))
+                observed.stable(dependencies)
+                observed.confirm(dependencies)
+                entry["paths"], entry["reply_target"] = dependencies, target
+            else:
+                # A reused header is not validated against a different binding.
+                # Retain _by_path's SHA baseline, but make the next read fresh.
+                entries.pop(relpath)
+                self._entries.pop(relpath, None)
+                invalidated = True
+        return invalidated
+
     @staticmethod
     def _identity():
         names = ("getuid", "geteuid", "getgid", "getegid", "getgroups")
@@ -513,7 +544,7 @@ class MailboxIndex:
             if folder_paths is None:
                 folder_paths = self._paths(folder)
             folder_paths_used[folder] = folder_paths
-            stable_folder = observed.stable(folder_paths, known=folder in self._folder_checks)
+            stable_folder = observed.stable(folder_paths)
             if folder not in self._folder_checks or not stable_folder:
                 hm.safe_path(folder)
                 observed.confirm(folder_paths)
@@ -538,8 +569,11 @@ class MailboxIndex:
                 previous = self._entries.get(relpath)
                 reuse = (not force and same_limit and previous is not None and previous["key"] == key
                          and previous["path"] == path and previous["device"] == metadata.st_dev)
-                stable = reuse and observed.stable(previous["paths"], known=True)
-                if reuse and stable and os.name == "posix":
+                # The accepted POSIX key policy permits reuse before hashing.
+                # Other platforms must hash first; a changed header may no
+                # longer need its old dependencies.
+                stable = reuse and os.name == "posix" and observed.stable(previous["paths"])
+                if stable:
                     message, sha = previous["message"], previous["sha256"]
                 else:
                     message, sha = self._read_message(path, previous=previous if reuse else None)
@@ -549,7 +583,7 @@ class MailboxIndex:
                 validated = False
                 if reuse and previous["sha256"] == sha:
                     dependencies = previous["paths"]
-                    stable = observed.stable(dependencies, known=True)
+                    stable = observed.stable(dependencies)
                 else:
                     destination = os.fspath(self.mailbox.validate_message(message, stored=True))
                     validated = True
@@ -593,14 +627,8 @@ class MailboxIndex:
         for record in records.values():
             if "in_reply_to" in record["message"]:
                 self.mailbox.reply(record["message"], records)
-                entry = by_path[record["path"]]
-                if entry is not self._entries.get(entry["relpath"]):
-                    target = records[record["message"]["in_reply_to"]]["path"]
-                    dependencies = tuple(dict.fromkeys(self._paths(entry["path"], entry["message"])
-                                                       + self._paths(target)))
-                    observed.stable(dependencies)
-                    observed.confirm(dependencies)
-                    entry["paths"] = dependencies
+        if self._reconcile_reply_dependencies(entries, records, observed):
+            raise _ChangedCheckObservation()
         self._evidence.prune(by_path)
         for path, entry in by_path.items():
             if path in fresh or path not in self._evidence.hashes:
@@ -637,9 +665,24 @@ class MailboxIndex:
         self.last_reconciliation = {"kind": "pinned_fallback", "attempts": attempt + 1,
                                     "error_type": type(error).__module__ + "." + type(error).__qualname__}
         records = self.mailbox.messages()
-        self._evidence.prune({record["path"]: record for record in records.values()})
+        live = {record["path"]: record for record in records.values()}
+        self._evidence.prune(live)
         self._admit_returned(records.values(), getattr(error, "candidate", None))
         self._evict_contradicted()
+        # Only a successful full canonical history establishes obsolescence.
+        # Delete only absent paths. A changed live record's last SHA may be its
+        # sole baseline when bounded history omitted it; invalidate its parsed
+        # header for reuse, but retain that SHA until current bytes are read.
+        for path, entry in list(self._by_path.items()):
+            if path not in live:
+                self._by_path.pop(path)
+                self._entries.pop(entry["relpath"], None)
+            elif entry["message"] != live[path]["message"]:
+                self._entries.pop(entry["relpath"], None)
+        self._reconcile_reply_dependencies(self._entries, records)
+        dependencies = {path for paths in self._folder_paths.values() for path in paths}
+        dependencies.update(path for entry in self._entries.values() for path in entry["paths"])
+        self._observations = {path: value for path, value in self._observations.items() if path in dependencies}
         return records
 
     def _materialize(self, selected):

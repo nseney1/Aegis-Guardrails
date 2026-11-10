@@ -42,6 +42,20 @@ def _positionals(argv: List[str]) -> List[str]:
     return out
 
 
+def _message_request(argv: List[str]) -> bool:
+    """Reserve fixed errors for a msg token anywhere, including after --."""
+    return "msg" in argv
+
+
+def _message_error_policy(parser: argparse.ArgumentParser) -> None:
+    """Apply the argv policy to every parser that can refuse this request."""
+    parser._message_argv_errors = True
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                _message_error_policy(child)
+
+
 def removed_command_pointer(argv: List[str]) -> Optional[str]:
     """The one-line pointer for a removed command in argv, or None.
 
@@ -69,11 +83,26 @@ class AegisParser(argparse.ArgumentParser):
             return get_default_registry().format_categorized_help(prog=self.prog) + "\n"
         return super().format_help()
 
+    def error(self, message: str) -> None:
+        if getattr(self, "_message_argv_errors", False) or getattr(self, "_message_errors", False):
+            from aegis_cli.msg import MsgArgumentError
+
+            raise MsgArgumentError()
+        super().error(message)
+
+    def parse_known_args(self, args=None, namespace=None):
+        ns, remaining = super().parse_known_args(args=args, namespace=namespace)
+        if hasattr(ns, "command"):
+            # parse_args reports trailing unknown flags after this returns. Use
+            # argparse's command, including when global flags are abbreviated.
+            self._message_errors = ns.command == "msg"
+        return ns, remaining
+
     def parse_args(self, args=None, namespace=None):
         ns = super().parse_args(args=args, namespace=namespace)
         if not hasattr(ns, "json"):
             ns.json = False
-        # Only `check` keeps --format; its json value must reach code (and the
+        # `check` and `msg read` have --format; its json value must reach code (and the
         # OutputContext below) that reads args.json alone.
         if getattr(ns, "format", None) == "json":
             ns.json = True
@@ -260,13 +289,26 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
         return run_hook_argv(argv[2:])
 
-    pointer = removed_command_pointer(argv)
+    # A workspace value may itself be a removed command name. For msg, let
+    # the parser decide arguments under its fixed JSON error policy.
+    message_request = _message_request(argv)
+    pointer = None if message_request else removed_command_pointer(argv)
     if pointer is not None:
         print(pointer, file=sys.stderr)
         return 2
 
     parser = _build_parser(prog=prog)
-    args = parser.parse_args(argv)
+    if message_request:
+        _message_error_policy(parser)
+    from aegis_cli.msg import MsgArgumentError
+
+    try:
+        args = parser.parse_args(argv)
+    except MsgArgumentError:
+        from aegis_cli.msg import emit_error
+        from aegis_core.message_codec import CodecError
+
+        return emit_error(CodecError("E_FORMAT"), detail="arguments")
     args.prog = prog
     if args.command is None:
         parser.print_help()
@@ -280,7 +322,17 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
         try:
             if args.command != "workspace":
                 _attach_workspace(args)
-        except WorkspaceError as exc:
+        except (WorkspaceError, OSError) as exc:
+            if args.command == "msg":
+                from aegis_cli.msg import emit_error
+                from aegis_core.message_codec import CodecError
+                from aegis_core.errors import WorkspaceNotFoundError
+
+                detail = ("attachment" if isinstance(exc, OSError) else
+                          "root" if isinstance(exc, WorkspaceNotFoundError) else "binding")
+                return emit_error(CodecError("E_AUTH"), detail=detail)
+            if not isinstance(exc, WorkspaceError):
+                raise
             if isinstance(exc, WorkspaceHold):
                 _print_hold(args, exc)
             else:

@@ -16,12 +16,12 @@ from .message_codec_format import (
     CodecError, KIND_SCHEMAS, MAX_BYTES, MAX_NODES, MAX_SELECTORS, MAX_REFS,
     MAX_SPANS, MAX_WORK_BYTES, MAX_REF_BYTES, MAX_OUTPUT_CHARS, REF_NAME, NAME,
     INDEX, KEYS, STRING, INTEGER, Budget, require, object_schema, array_schema, KEY_MARKER, CURSOR_PATTERN,
-    json_chunks, escape_char, neutral_text, canonical, parse, record_id,
+    json_chunks, escape_char, neutral_text, canonical, parse, compose, record_id,
 )
 from .message_codec_store import Store
 
 
-__all__ = ["CodecError", "Store", "canonical", "parse", "record_id", "read_view",
+__all__ = ["CodecError", "Store", "canonical", "parse", "compose", "record_id", "read_view",
            "KIND_SCHEMAS", "MAX_BYTES"]
 
 
