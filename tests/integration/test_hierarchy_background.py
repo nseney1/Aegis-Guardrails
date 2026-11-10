@@ -13,10 +13,37 @@ import sys
 
 import pytest
 
-from tests.integration.test_hierarchy_delivery import BODY_SENTINEL, HELPER, TARGET, Pilot, posix_only
+from tests.integration.test_hierarchy_delivery import BODY_SENTINEL, HELPER, TARGET, WAKE, Pilot, posix_only
 from tests.integration.test_hierarchy_provision import setup  # noqa: F401  (fixture)
 
 pytestmark = posix_only
+
+# Like WAKE_GROUP_FAULT, substitute only inside the wake subprocess. Give the
+# wake module its own clock reference so subprocess timeouts and the host stub
+# retain real time. Scale only stop confirmation, not launch/turn deadlines.
+WAKE_STOP_CLOCK = r'''
+import importlib.util, json, sys, time
+from pathlib import Path
+from types import SimpleNamespace
+wake_path, scale, record_path = sys.argv[1], float(sys.argv[2]), Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location("wake_stop_clock", wake_path)
+wake = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wake)
+assert wake.BACKGROUND_STOP_SECONDS == 15.0
+real_stop = wake.stop_background
+def stop_background(*args, **kwargs):
+    real_clock = wake.time
+    started = time.monotonic()
+    wake.time = SimpleNamespace(**{**vars(time), "monotonic": lambda: started + (time.monotonic() - started) * scale})
+    try:
+        return real_stop(*args, **kwargs)
+    finally:
+        elapsed = wake.time.monotonic() - started
+        wake.time = real_clock
+        record_path.write_text(json.dumps({"scale": scale, "elapsed_seconds": elapsed}), encoding="utf-8")
+wake.stop_background = stop_background
+sys.exit(wake.main(sys.argv[4:]))
+'''
 
 STUB = r'''
 import json, os, signal, subprocess, sys, time
@@ -157,12 +184,30 @@ class Background:
         path.write_text(json.dumps(document), encoding="utf-8")
         return path
 
-    def wake(self, profile, timeout=60):
-        return self.pilot.wake(profile, home=self.home, timeout=timeout)
+    def wake(self, profile, timeout=60, *, stop_clock_scale=None):
+        if stop_clock_scale is None:
+            return self.pilot.wake(profile, home=self.home, timeout=timeout)
+        boundary = self.pilot.tmp / "wake_stop_clock.py"
+        boundary.write_text(WAKE_STOP_CLOCK, encoding="utf-8")
+        record = self.pilot.tmp / "stop-clock.json"
+        record.unlink(missing_ok=True)
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", str(boundary), str(WAKE), str(stop_clock_scale), str(record),
+             "--root", str(self.pilot.root), "--delivery-dir", str(self.pilot.delivery),
+             "--endpoint", TARGET, "--profile", str(profile)],
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "HOME": str(self.home), "PYTHONDONTWRITEBYTECODE": "1"})
+        assert not result.stderr, result.stderr
+        return result.returncode, json.loads(result.stdout)
 
     def calls(self):
         log = self.state / "calls.log"
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def assert_stop_interval(self, scale):
+        interval = json.loads((self.pilot.tmp / "stop-clock.json").read_text(encoding="utf-8"))
+        assert interval["scale"] == scale
+        assert interval["elapsed_seconds"] >= 15.0
 
     def rows(self):
         return [json.loads(path.read_text()) for path in sorted(self.state.glob("*.row"))]
@@ -288,7 +333,8 @@ def test_a_failed_launch_whose_leftover_cannot_be_stopped_keeps_the_lock(backgro
     background.pilot.publish()
     (background.state / "hide-after-launch").write_text("")
     (background.state / "ignore-stop").write_text("")
-    code, result = background.wake(background.profile(stub_mode="orphan"))
+    code, result = background.wake(background.profile(stub_mode="orphan"), stop_clock_scale=8)
+    background.assert_stop_interval(8)
     assert code == 3 and result["state"] == "stop_unconfirmed", result
     assert result["background"]["stop_confirmed"] is False and wake_lock(background).exists()
 
@@ -380,10 +426,12 @@ def test_a_row_in_the_real_host_shape_drives_the_idle_stop_and_the_owner_wait(ba
         assert result["background"]["id"] == session[:8] and result["background"]["ended"] == "idle"
 
 
-def test_an_unconfirmed_stop_keeps_the_wake_lock(background):
+@pytest.mark.parametrize("stop_clock_scale", [1, 8], ids=["real-stop-deadline", "scaled-stop-deadline"])
+def test_an_unconfirmed_stop_keeps_the_wake_lock(background, stop_clock_scale):
     background.pilot.publish()
     (background.state / "ignore-stop").write_text("")
-    code, result = background.wake(background.profile())
+    code, result = background.wake(background.profile(), stop_clock_scale=stop_clock_scale)
+    background.assert_stop_interval(stop_clock_scale)
     assert code == 3 and result["state"] == "stop_unconfirmed", result
     assert result["background"]["stop_confirmed"] is False
     background.pilot.publish("note-2")
@@ -451,7 +499,8 @@ def test_one_missing_look_after_stop_does_not_confirm_the_stop(background):
     background.pilot.publish()
     (background.state / "ignore-stop").write_text("")
     (background.state / "hide-on-stop").write_text("")
-    code, result = background.wake(background.profile())
+    code, result = background.wake(background.profile(), stop_clock_scale=8)
+    background.assert_stop_interval(8)
     assert code == 3 and result["state"] == "stop_unconfirmed", result
     background.pilot.publish("note-2")
     again_code, again = background.wake(background.profile())

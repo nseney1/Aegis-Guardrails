@@ -41,7 +41,7 @@ concurrency guarantees live in one place:
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import errno
 import json
@@ -51,7 +51,7 @@ import stat
 import threading
 import time
 import uuid
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Union
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
 
 from aegis_core import gitsafe
 from aegis_core.atomicio import (
@@ -90,7 +90,10 @@ except ImportError:  # POSIX
     msvcrt = None  # type: ignore[assignment]
 
 __all__ = [
+    "FileReport",
+    "JsonlAppend",
     "JsonlRead",
+    "ReportedRows",
     "LedgerSite",
     "LockOrderError",
     "LockTimeoutError",
@@ -781,6 +784,53 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class FileReport:
+    """Descriptor evidence for one I/O operation, with at most 256 bytes at each end."""
+
+    identity: Tuple[int, int]
+    size: int
+    tail: bytes
+    added: int = 0
+    head: bytes = b""
+
+
+class JsonlAppend(int):
+    """The usual appended-row count, plus optional descriptor evidence."""
+
+    def __new__(cls, count: int, report: Optional[FileReport] = None):
+        result = super().__new__(cls, count)
+        result.report = report
+        return result
+
+
+class ReportedRows(list):
+    """Ordinary rows with optional evidence carried from their I/O descriptor."""
+
+    def __init__(self, rows: Iterable[Dict[str, Any]] = (), report: Optional[FileReport] = None):
+        super().__init__(rows)
+        self.report = report
+
+
+def _file_report(fd: int, data: bytes, *, appended: bool = False) -> Optional[FileReport]:
+    try:
+        info = os.fstat(fd)
+        if appended:
+            count = min(info.st_size, 256)
+            if count <= 0:
+                return None
+            os.lseek(fd, 0, os.SEEK_SET)
+            head = os.read(fd, count)
+            if len(head) != count:
+                return None
+        else:
+            head = data[:256]
+    except OSError:
+        return None  # Evidence is optional; a completed I/O operation still succeeded.
+    return FileReport((info.st_dev, info.st_ino), info.st_size if appended else len(data),
+                      data[-256:], len(data) if appended else 0, head)
+
+
 def _encode_rows(rows: Iterable[Dict[str, Any]]) -> bytes:
     lines = []
     for row in rows:
@@ -800,7 +850,8 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     or not, raises PathTraversalError and nothing is written. If the file ends in a torn line
     (no trailing newline, as a crash mid-write leaves it), a newline is written first:
     the torn bytes stay as one unreadable line and the new rows stay intact. Callers that
-    need ordering or deduplication hold ``locked()``. Returns the number of rows written.
+    need ordering or deduplication hold ``locked()``. Returns the number of rows written,
+    with optional ``report`` evidence captured from the descriptor after the write.
     """
     rows = list(rows)
     payload = _encode_rows(rows)
@@ -818,11 +869,12 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
                 payload = b"\n" + payload
         _write_all(fd, payload)
         os.fsync(fd)
+        report = _file_report(fd, payload, appended=True)
     finally:
         os.close(fd)
     if created:
         fsync_dir(target.parent)
-    return len(rows)
+    return JsonlAppend(len(rows), report)
 
 
 @dataclass(frozen=True)
@@ -839,6 +891,7 @@ class JsonlRead:
     skipped_lines: List[int]
     torn_tail: bool = False
     error: Optional[str] = None
+    report: Optional[FileReport] = field(default=None, compare=False, repr=False)
 
     @property
     def skipped(self) -> int:
@@ -937,6 +990,7 @@ def read_jsonl(
     (they are neither rows nor skipped lines; line numbers stay file line numbers). The
     caller passes bytes every wanted row carries verbatim and re-checks the fields.
     """
+    report = None
     try:
         # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
         fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
@@ -957,10 +1011,13 @@ def read_jsonl(
         try:
             with os.fdopen(fd, "rb") as fh:
                 data = fh.read()
+                report = _file_report(fh.fileno(), data)
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 
-    return parse_jsonl(data, errors, contains=contains)
+    result = parse_jsonl(data, errors, contains=contains)
+    return JsonlRead(result.rows, result.line_numbers, result.skipped_lines,
+                     result.torn_tail, result.error, report)
 
 
 def parse_jsonl(data: bytes, errors: str = "strict", *, contains: Optional[bytes] = None) -> JsonlRead:
