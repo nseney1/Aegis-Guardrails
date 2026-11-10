@@ -5,13 +5,172 @@ All tests use tmp_path to avoid touching the real filesystem.
 import argparse
 from datetime import date, timedelta
 import json
+import re
 
+import pytest
 
 from pathlib import Path
 
 from aegis_cli.status import run_status
 
 REPO_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
+_STATUS_TODAY = date(2026, 11, 10)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_status_today(monkeypatch):
+    """Freeze only the status clock, preserving the real date type."""
+    monkeypatch.setattr("aegis_cli.status._today", lambda: _STATUS_TODAY)
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "metadata,service_state,calendar_expiry,legacy_expiry",
+    [
+        ("created: 2020-01-01\nexpiry_days: 30\n", "served", "overdue (2475d)", "overdue (2475d)"),
+        ("created: 2026-11-10\nexpiry_days: 30\nexpired_at: 2026-01-01\n",
+         "retired", "30d", "expired"),
+        ("expiry_days: 30\n", "served", "—", "—"),
+        ("created: not-a-date\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: 20200101\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: 20200101.0\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: true\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: [2020-01-01]\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: {year: 2020}\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '20200101'\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '2020-W01-1'\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '2026-11-10T11:59:11Z'\nexpiry_days: 30\n", "served", "30d", "30d"),
+        ("created: 2026-11-10\nexpiry_days: '30'\n", "served", "30d", "30d"),
+        ("created: 2026-11-10\nexpiry_days: 0\n", "served", "0d", "0d"),
+        ("created: 2026-11-10\nexpiry_days: yes\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: false\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: 30.0\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: 30.5\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: [30]\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: {days: 30}\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: -1\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '-1'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '30days'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '3_0'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: ''\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '²'\n", "served", "—", "—"),
+        ("created: 2020-01-01\nexpiry_days: invalid\n", "served", "—", "—"),
+        ("created: 2020-01-01\nexpiry_days: 1.0e+999\nexpired_at: 2026-01-01\n",
+         "retired", "—", "expired"),
+        ("expiry_days: 30\n", "untargeted", "—", "—"),
+    ],
+    ids=["old-but-served", "retired", "missing-date", "malformed-date", "integer-date", "float-date", "bool-date",
+         "list-date", "mapping-date", "compact-date", "week-date", "timestamp-date", "string-days", "zero-days",
+         "bool-days", "false-days", "float-days", "fractional-days", "list-days", "mapping-days", "negative-days",
+         "negative-string-days", "non-digit-days", "underscore-days", "empty-days", "non-decimal-days",
+         "malformed-days", "retired-overflow",
+         "untargeted"],
+)
+def test_status_cli_service_state_is_independent_of_calendar(
+    tmp_path, capsys, json_output, metadata, service_state, calendar_expiry, legacy_expiry
+):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    targets = "" if service_state == "untargeted" else "target_paths: ['*.py']\n"
+    (rules / "example.md").write_text(
+        "---\nid: example\n" + targets + metadata + "---\n# Example\n",
+        encoding="utf-8",
+    )
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        (rule,) = json.loads(captured.out)["rules"]
+        assert rule["service_state"] == service_state
+        assert rule["calendar_expiry"] == calendar_expiry
+        assert rule["expiry"] == legacy_expiry  # Only retirement uses "expired".
+        assert rule["state"] == "insufficient"  # Fitness state remains separate.
+    else:
+        header = next(line for line in captured.out.splitlines() if line.lstrip().startswith("Rule "))
+        assert re.split(r" {2,}", header.strip())[-2:] == ["Service state", "Calendar (meta)"]
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("example "))
+        assert re.split(r" {2,}", row.strip())[-2:] == [service_state, calendar_expiry]
+        if service_state == "served":
+            assert "expired" not in row
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_packaged_guidance_is_not_loaded(tmp_path, monkeypatch, capsys, json_output):
+    from aegis_cli.cli import main
+    import aegis_cli.init as init_module
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    core = tmp_path / "rules"
+    core.mkdir()
+    (core / "guide.md").write_text("---\nid: guide\n---\n# Guidance\n", encoding="utf-8")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: core)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"guide": core / "guide.md"})
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        (rule,) = json.loads(captured.out)["rules"]
+        assert rule["service_state"] == "not_loaded"
+        assert rule["calendar_expiry"] == rule["expiry"] == "∞ (core)"
+    else:
+        assert "Core rules:     1 shipped (not_loaded: scan and check do not read them)" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("guide "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["not_loaded", "∞ (core)"]
+
+
+def test_status_cli_project_summary_explains_omitted_core_rules(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    import aegis_cli.init as init_module
+
+    workspace = tmp_path / "project"
+    (workspace / ".aegis" / "rules").mkdir(parents=True)
+    packaged = tmp_path / "package" / "rules"
+    packaged.mkdir(parents=True)
+    guide = packaged / "guide.md"
+    guide.write_text("---\nid: guide\n---\n# Guidance\n", encoding="utf-8")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: packaged)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"guide": guide})
+
+    assert main(["status", "--workspace", str(workspace), "--plain"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    summary = next(line for line in captured.out.splitlines() if "Core rules:" in line)
+    assert summary == "  Core rules:     listed only in the Aegis checkout (scan and check do not read them)"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_calendar_uses_current_clock_on_each_call(tmp_path, monkeypatch, capsys, json_output):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    (rules / "example.md").write_text(
+        "---\nid: example\ntarget_paths: ['*.py']\ncreated: 2030-01-31\nexpiry_days: 30\n---\n# Example\n",
+        encoding="utf-8",
+    )
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    for today, expected in [(date(2030, 2, 1), "29d"), (date(2030, 2, 2), "28d")]:
+        monkeypatch.setattr("aegis_cli.status._today", lambda: today)
+        assert main(argv) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        if json_output:
+            (rule,) = json.loads(captured.out)["rules"]
+            assert rule["calendar_expiry"] == rule["expiry"] == expected
+            assert rule["service_state"] == "served"
+        else:
+            row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("example "))
+            assert re.split(r" {2,}", row.strip())[-2:] == ["served", expected]
 
 
 class TestStatus:
@@ -31,14 +190,14 @@ class TestStatus:
         assert not any(_word_counts([out], REQUIRED_WORDS).values()), out
 
     def test_status_no_rules(self, tmp_path, capsys):
-        """Empty dirs → '0 active' and helpful message."""
+        """Empty projects explain where core rules are listed and give a helpful message."""
         (tmp_path / "rules").mkdir()
         (tmp_path / ".aegis" / "rules").mkdir(parents=True)
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "0 active" in captured.out
+        assert "Core rules:     listed only in the Aegis checkout (scan and check do not read them)" in captured.out
         assert "No rules found" in captured.out
 
     def test_status_counts_core_rules(self, capsys):
@@ -63,7 +222,8 @@ class TestStatus:
         (tmp_path / ".aegis" / "rules").mkdir(parents=True)
         assert run_status(argparse.Namespace(_root=tmp_path)) == 0
         out = capsys.readouterr().out
-        assert "Core rules:     0 active" in out and "pricing" not in out
+        assert "Core rules:     listed only in the Aegis checkout (scan and check do not read them)" in out
+        assert "pricing" not in out
         assert "~0 tokens" in out
         assert not marker.exists()
 
@@ -249,35 +409,40 @@ class TestStatus:
         assert "~100 tokens (pre-JIT max)" in captured.out
 
     def test_status_adaptive_rule_expiry_active(self, tmp_path, capsys):
-        """Active adaptive rules show remaining days."""
+        """Active adaptive rules show service state; JSON keeps calendar metadata."""
         rules = tmp_path / ".aegis" / "rules" / "traps"
         rules.mkdir(parents=True)
-        created = (date.today() - timedelta(days=10)).isoformat()
+        created = (_STATUS_TODAY - timedelta(days=10)).isoformat()
         (rules / "pattern.md").write_text(
-            f"---\ncreated: {created}\nexpiry_days: 30\n---\n# Pattern\n"
+            f"---\ncreated: {created}\nexpiry_days: 30\ntarget_paths: ['*.py']\n---\n# Pattern\n"
         )
 
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        # 30 - 10 = 20 days remaining
-        assert "20d" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("pattern "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["served", "20d"]
+        assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 0
+        (rule,) = json.loads(capsys.readouterr().out)["rules"]
+        assert rule["calendar_expiry"] == rule["expiry"] == "20d"
 
-    def test_status_adaptive_rule_expiry_expired(self, tmp_path, capsys):
-        """Expired adaptive rules show 'expired'."""
+    def test_status_adaptive_rule_past_calendar_expiry_is_still_served(self, tmp_path, capsys):
+        """A past calendar deadline does not retire an adaptive rule."""
         rules = tmp_path / ".aegis" / "rules" / "traps"
         rules.mkdir(parents=True)
-        created = (date.today() - timedelta(days=40)).isoformat()
+        created = (_STATUS_TODAY - timedelta(days=40)).isoformat()
         (rules / "stale.md").write_text(
-            f"---\ncreated: {created}\nexpiry_days: 30\n---\n# Stale\n"
+            f"---\ncreated: {created}\nexpiry_days: 30\ntarget_paths: ['*.py']\n---\n# Stale\n"
         )
 
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "expired" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("stale "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["served", "overdue (10d)"]
+        assert "expired" not in captured.out
 
     def test_status_command_contract(self):
         from unittest.mock import patch
@@ -418,7 +583,7 @@ class TestStatusComplianceCLI:
 
 
 def _pinned_workspace(tmp_path, monkeypatch):
-    """PIN-1's workspace: the expired traps t-one and t-two, the gate invariant i-one, the trap
+    """PIN-1's workspace: the old-but-served traps t-one and t-two, the gate invariant i-one, the trap
     legacy with derived counters, invariants/old.md, notes.md, blocked guard events for claude-code
     twice and codex-cli once plus one recorded event, ledger rows, a claimed report, an agent
     suggestion in the user's insights log and one core rule."""
@@ -465,18 +630,18 @@ def _pinned_workspace(tmp_path, monkeypatch):
     return ws
 
 
-def _adaptive(name: str, kind: str, triggers: int, expiry: str) -> dict:
+def _adaptive(name: str, kind: str, triggers: int, expiry: str, service_state: str) -> dict:
     """One adaptive rule of the pinned JSON, every key in the order run_status writes them."""
     return {"name": name, "type": kind, "score": None, "state": "insufficient",
             "status_label": f"insufficient (n={triggers})", "evidence_available": True, "evidence_error": None,
             "contested": 0, "override_rate": 0.0, "flagged_for_review": False, "triggers": triggers,
-            "expiry": expiry, "is_core": False}
+            "expiry": expiry, "is_core": False, "service_state": service_state, "calendar_expiry": expiry}
 
 
 PIN_TEXT = (
     "Aegis Workspace Status\n"
     "\n"
-    "  Core rules:     1 active\n"
+    "  Core rules:     1 shipped (not_loaded: scan and check do not read them)\n"
     "  Adaptive rules: 4 (traps/patterns)\n"
     "  Context load:   ~76 tokens (pre-JIT max)\n"
     "  Token budget:   [#-------------------] 76/2,000 (4%)\n"
@@ -499,15 +664,15 @@ PIN_TEXT = (
     "     legacy: .aegis/rules/traps/legacy.md\n"
     "     t-two: .aegis/rules/traps/t-two.md\n"
     "\n"
-    "  Rule      Triggers  Type       Fitness             Expiry  \n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  core-one  2         core       —                   ∞ (core)\n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  i-one     0         invariant  insufficient (n=0)  —       \n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  t-two     1         trap       insufficient (n=1)  expired \n"
-    "  legacy    0         trap       insufficient (n=0)  —       \n"
-    "  t-one     0         trap       insufficient (n=0)  expired \n"
+    "  Rule      Triggers  Type       Fitness             Service state  Calendar (meta)\n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  core-one  2         core       —                   not_loaded     ∞ (core)       \n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  i-one     0         invariant  insufficient (n=0)  served         —              \n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  t-two     1         trap       insufficient (n=1)  untargeted     overdue (2475d)\n"
+    "  legacy    0         trap       insufficient (n=0)  untargeted     —              \n"
+    "  t-one     0         trap       insufficient (n=0)  served         overdue (2475d)\n"
 )
 
 PIN_JSON = {
@@ -515,11 +680,12 @@ PIN_JSON = {
     "adaptive_rules": 4,
     "estimated_tokens": 76,
     "rules": [
-        {"name": "core-one", "type": "core", "score": None, "triggers": 2, "expiry": "∞ (core)", "is_core": True},
-        _adaptive("i-one", "invariant", 0, "—"),
-        _adaptive("t-two", "trap", 1, "expired"),
-        _adaptive("legacy", "trap", 0, "—"),
-        _adaptive("t-one", "trap", 0, "expired"),
+        {"name": "core-one", "type": "core", "score": None, "triggers": 2, "expiry": "∞ (core)", "is_core": True,
+         "service_state": "not_loaded", "calendar_expiry": "∞ (core)"},
+        _adaptive("i-one", "invariant", 0, "—", "served"),
+        _adaptive("t-two", "trap", 1, "overdue (2475d)", "untargeted"),
+        _adaptive("legacy", "trap", 0, "—", "untargeted"),
+        _adaptive("t-one", "trap", 0, "overdue (2475d)", "served"),
     ],
     "last_sync": None,
     "inventory_error": None,
@@ -542,7 +708,7 @@ PIN_JSON = {
 PIN_EMPTY_TEXT = (
     "Aegis Workspace Status\n"
     "\n"
-    "  Core rules:     0 active\n"
+    "  Core rules:     listed only in the Aegis checkout (scan and check do not read them)\n"
     "  Adaptive rules: 0 (traps/patterns)\n"
     "  Context load:   ~0 tokens (pre-JIT max)\n"
     "  Token budget:   [--------------------] 0/2,000 (0%)\n"
@@ -553,7 +719,7 @@ PIN_EMPTY_TEXT = (
 
 
 class TestStatusPins:
-    """Characterization pins: green before run_status was split into helpers, unchanged after."""
+    """Characterization pins, updated for RF-45's service-state column and additive JSON fields."""
 
     def test_the_text_view_prints_every_section_in_its_fixed_order(self, tmp_path, monkeypatch, capsys):
         ws = _pinned_workspace(tmp_path, monkeypatch)
@@ -660,7 +826,7 @@ class TestStatusPins:
             "  ⚠️  The ledger is incomplete (1 unreadable line(s)): fitness counts only the rows that could be read, "
             "so moves that rely on it (sync --apply, rule archive, tier changes) are refused",
             "",
-            "  Rule   Triggers  Type  Fitness               Expiry",
-            "  -----  --------  ----  --------------------  ------",
-            "  t-one  1         trap  evidence unavailable  —     ",
+            "  Rule   Triggers  Type  Fitness               Service state  Calendar (meta)",
+            "  -----  --------  ----  --------------------  -------------  ---------------",
+            "  t-one  1         trap  evidence unavailable  served         —              ",
         ]
