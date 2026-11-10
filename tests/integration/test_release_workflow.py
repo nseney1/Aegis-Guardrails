@@ -37,7 +37,7 @@ def _verify(*args):
 def _dist(tmp_path, extra=(), metadata=""):
     d = tmp_path / "dist"
     d.mkdir()
-    with zipfile.ZipFile(d / "soma_governance-0.0.0-py3-none-any.whl", "w") as wheel:
+    with zipfile.ZipFile(d / "aegis_governance-0.0.0-py3-none-any.whl", "w") as wheel:
         for name in ("__init__.py", "go_ast.go", "go.mod"):
             wheel.writestr("aegis_core/ast/drivers/templates/" + name, "")
         wheel.writestr("aegis_guardrails-0.0.0.dist-info/METADATA",
@@ -49,7 +49,7 @@ def _dist(tmp_path, extra=(), metadata=""):
             # backslashes on Windows and truncates names at NUL on every OS.
             member.filename = name
             wheel.writestr(member, "injected")
-    (d / "soma_governance-0.0.0.tar.gz").write_bytes(b"sdist bytes")
+    (d / "aegis_governance-0.0.0.tar.gz").write_bytes(b"sdist bytes")
     return d
 
 
@@ -123,7 +123,7 @@ def test_verify_dist_accepts_packaged_first_party_license_and_notice(tmp_path, p
 def test_verify_dist_rejects_tampered_artifact(tmp_path):
     d = _dist(tmp_path)
     assert _verify("record", str(d)).returncode == 0
-    with open(d / "soma_governance-0.0.0-py3-none-any.whl", "ab") as f:
+    with open(d / "aegis_governance-0.0.0-py3-none-any.whl", "ab") as f:
         f.write(b"tampered")
     proc = _verify("verify", str(d))
     assert proc.returncode == 1 and "sha256" in proc.stderr
@@ -132,7 +132,7 @@ def test_verify_dist_rejects_tampered_artifact(tmp_path):
 def test_verify_dist_rejects_unlisted_artifact(tmp_path):
     d = _dist(tmp_path)
     assert _verify("record", str(d)).returncode == 0
-    (d / "soma_governance-0.0.1-py3-none-any.whl").write_bytes(b"other")
+    (d / "aegis_governance-0.0.1-py3-none-any.whl").write_bytes(b"other")
     assert _verify("verify", str(d)).returncode == 1
 
 

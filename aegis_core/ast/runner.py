@@ -20,6 +20,7 @@ import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
+from aegis_core.ast.drivers import templates
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS, NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.schema import NormalizedAST
@@ -39,7 +40,7 @@ __all__ = [
 ]
 
 _PYTHON_NAMES = frozenset({"{python}", "python3", "python", "python.exe", "python3.exe"})
-_TEMPLATES_DIR = Path(__file__).resolve().parent / "drivers" / "templates"
+_TEMPLATES_DIR = Path(templates.__file__).resolve().parent
 # Packaged external template -> interpreter looked up on PATH.
 _PACKAGED_INTERPRETERS = {"go_ast.go": "go"}
 SOURCE_LIMIT_BYTES = 2 * 1024 * 1024

@@ -26,7 +26,7 @@ so the same report retried from another worktree is the same row.
   workspace lock outside git); nothing ever rewrites a row. A migration appends an epoch
   row instead. A caller that holds the worktree lock takes it first.
 
-Readers accept v1 rows (the ``cell``/``rule_id`` + ``signal`` shape of the v3
+Readers accept v1 rows (the ``rule_id`` + ``signal`` shape of the v3
 ``signals.jsonl``) and convert them in memory; see ``normalize_rows``.
 """
 from __future__ import annotations
@@ -42,11 +42,17 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from aegis_core import gitsafe
 from aegis_core.errors import PathTraversalError
-from aegis_core.primitives import utc_stamp
-from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl
+from aegis_core.primitives import is_within, utc_stamp
+from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label
+from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
+    "WorktreeMergePlan",
+    "plan_worktree_merge",
+    "pending_worktree_rows",
+    "merge_worktree_ledgers",
     "LEDGER_VERSION",
     "OUTCOMES",
     "SOURCES",
@@ -103,14 +109,8 @@ def _weight(row: Dict[str, Any]) -> Optional[Decimal]:
 # ── v1 compatibility ─────────────────────────────────────────────────────────
 
 def _v1_rule(row: Dict[str, Any]) -> Optional[str]:
-    for key in ("rule_id", "cell", "cell_id"):
-        value = row.get(key)
-        if isinstance(value, str) and value:
-            return value
-    used = row.get("cells_used")
-    if isinstance(used, list) and used and isinstance(used[0], str) and used[0]:
-        return used[0]
-    return None
+    value = row.get("rule_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _v1_to_v2(row: Dict[str, Any], origin: Any = "v1") -> Optional[Dict[str, Any]]:
@@ -683,3 +683,169 @@ def merge_rows_report(
         existing, _unusable = normalize_rows(read_jsonl(site.path).rows)
         added, duplicates, conflicts = plan_merge_report(existing, sources)
         return (append_rows(workspace, added) if added else []), duplicates, conflicts
+
+
+@dataclass
+class WorktreeMergePlan:
+    """Inputs, health and pending rows for a v4 shared-ledger merge."""
+
+    root: Path
+    worktree_sources: List[Tuple[str, Path]] = field(default_factory=list)
+    worktree_pending: int = 0
+    worktree_stats: Dict[str, Any] = field(default_factory=dict)
+    unreadable: List[str] = field(default_factory=list)
+    skipped: List[Dict[str, str]] = field(default_factory=list)
+    refusal: Optional[str] = None
+
+
+@dataclass
+class _WorktreeLedger:
+    """One worktree's own ledger as read for the merge: its usable rows (each with the
+    ``worktree`` it came from) and what could not be used, or why it was not read."""
+
+    label: str
+    workspace: Path
+    path: Path
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    skipped_lines: int = 0
+    unusable_rows: int = 0
+    problem: Optional[Tuple[str, str, str]] = None
+
+
+def _listed_worktrees(root: Path) -> List[Path]:
+    """The work trees ``git worktree list`` names (a bare repository has none)."""
+    for args, sep in ((["worktree", "list", "--porcelain", "-z"], b"\0"), (["worktree", "list", "--porcelain"], b"\n")):
+        try:
+            done = gitsafe.run(args, root)
+        except gitsafe.GitError:
+            return []
+        if done.returncode == 0:  # -z needs git 2.36; older git exits 129 and the second form answers
+            break
+    else:
+        return []
+    paths: List[Path] = []
+    for token in done.stdout.split(sep):
+        if token.startswith(b"worktree "):
+            paths.append(Path(os.fsdecode(token[len(b"worktree "):])))
+        elif token == b"bare" and paths:
+            paths.pop()
+    return paths
+
+
+def _worktree_roots(root: Path) -> List[Tuple[str, Path]]:
+    """(label, workspace root) of ``root`` in every worktree of its repository, this one
+    included, sorted by label; only worktrees whose directory exists. Empty outside git."""
+    top = gitsafe.toplevel(root)
+    relative = workspace_relative(root)
+    if top is None or relative is None:
+        return []
+    found: Dict[str, Path] = {}
+    for tree in [top, *_listed_worktrees(root)]:
+        resolved = Path(os.path.realpath(tree))
+        if not resolved.is_dir():
+            continue  # a worktree whose directory was removed (git calls it prunable)
+        found[worktree_label(resolved)] = resolved if relative == "." else resolved.joinpath(*relative.split("/"))
+    return sorted(found.items())
+
+
+def _read_worktree_ledger(label: str, workspace: Path) -> Optional[_WorktreeLedger]:
+    """The ledger ``workspace`` (the workspace root inside one worktree) keeps, or None when
+    it has none. Read only, and never through a link: another worktree's ``.aegis`` or
+    ``.aegis/state`` is whatever its commits put there."""
+    layout = WorkspaceLayout(workspace)
+    source = _WorktreeLedger(label, workspace, layout.ledger_file)
+    for directory in (layout.aegis_dir, layout.state_dir):
+        outside = os.path.lexists(directory) and not is_within(directory, workspace, unresolvable=False)
+        if directory.is_symlink() or outside:
+            why = "is a symlink" if directory.is_symlink() else "resolves outside the workspace"
+            source.problem = ("skipped", directory.as_posix(),
+                              f"{why}; its ledger was not read (aegis migrate reads and writes only inside the workspace)")
+            return source
+    if not os.path.lexists(layout.ledger_file):
+        return None
+    read = read_jsonl(layout.ledger_file)
+    if read.error:
+        source.problem = ("unreadable", layout.ledger_file.as_posix(), read.error)
+        return source
+    rows, unusable = normalize_rows(read.rows)
+    for row in rows:
+        stamp = row["worktree"] if isinstance(row.get("worktree"), str) and row["worktree"] else label
+        source.rows.append(dict(row, worktree=stamp))
+    source.skipped_lines = read.skipped
+    source.unusable_rows = unusable
+    return source
+
+
+def plan_worktree_merge(result: WorktreeMergePlan) -> None:
+    layout = WorkspaceLayout(result.root)
+    roots = _worktree_roots(layout.root)
+    if not roots:
+        return  # not in git: the ledger is .aegis/state/ledger.jsonl and nothing is shared
+    try:
+        ledger_site(layout.root, create=False)
+    except PathTraversalError as exc:
+        result.refusal = str(exc)
+        return
+    except OSError as exc:
+        result.refusal = f"cannot use the shared ledger directory: {exc.strerror or exc}"
+        return
+    sources: List[_WorktreeLedger] = []
+    for label, workspace in roots:
+        found = _read_worktree_ledger(label, workspace)
+        if found is None:
+            continue
+        if found.problem is not None:
+            kind, path, reason = found.problem
+            if kind == "unreadable":
+                result.unreadable.append(path)
+            else:
+                result.skipped.append({"path": path, "reason": reason})
+            continue
+        sources.append(found)
+    if not sources:
+        return
+    shared = read(layout.root)
+    if shared.error:
+        result.refusal = f"cannot merge into the shared ledger: {shared.error}"
+        return
+    added, duplicates, conflicts = plan_merge_report(shared.rows, [source.rows for source in sources])
+    result.worktree_sources = [(source.label, source.workspace) for source in sources]
+    result.worktree_pending = len(added)
+    result.worktree_stats = {
+        "sources": [source.path.as_posix() for source in sources],
+        "rows": len(added),
+        "duplicates": duplicates,
+        "conflicts": conflicts,
+        "unusable_rows": sum(source.unusable_rows for source in sources),
+        "skipped_lines": sum(source.skipped_lines for source in sources),
+    }
+
+
+def merge_worktree_ledgers(root: Path, sources: List[Tuple[str, Path]]) -> int:
+    """Merge the ledgers ``sources`` name into the shared ledger of ``root``, reading them
+    again now: a row appended since the plan is merged too. Returns the rows written."""
+    read: List[_WorktreeLedger] = []
+    for label, workspace in sources:
+        found = _read_worktree_ledger(label, workspace)
+        if found is not None and found.problem is None:
+            read.append(found)
+    written, duplicates, conflicts = merge_rows_report(root, [found.rows for found in read])
+    if written:
+        append_epoch(root, {
+            "migration": "worktree-ledgers",
+            "sources": sorted(found.label for found in read),
+            "rows": len(written),
+            "duplicates": duplicates,
+            **({"conflicts": conflicts} if conflicts else {}),
+        })
+    return len(written)
+
+
+def pending_worktree_rows(root: Any) -> int:
+    """Count pending v4 worktree rows without writing; unavailable repositories yield zero."""
+    result = WorktreeMergePlan(Path(os.fspath(root)).resolve())
+    try:
+        plan_worktree_merge(result)
+    except OSError:
+        return 0
+    return result.worktree_pending

@@ -98,18 +98,20 @@ def _snapshot(root: Path):
 
 
 def test_fix_on_a_non_terminal_without_yes_changes_nothing(env, monkeypatch):
-    stale = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {"command": "soma-mcp"}}})
+    env.claude_user_registration()
+    stale = env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {"command": "aegis-mcp"}}})
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     before = _snapshot(env.tmp)
     rc, out = env.run(fix=True)
     assert rc == 1
     assert "--yes" in out
     assert _snapshot(env.tmp) == before
-    assert json.loads(stale.read_text())["mcpServers"] == {"soma": {"command": "soma-mcp"}}
+    assert json.loads(stale.read_text())["mcpServers"] == {"aegis": {"command": "aegis-mcp"}}
 
 
 def test_fix_asks_first_and_a_no_changes_nothing(env, monkeypatch):
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.claude_user_registration()
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     before = _snapshot(env.tmp)
     rc, out = env.run(fix=True)
@@ -127,13 +129,13 @@ def test_usage_errors(argv, message, env, capsys):
     assert message in capsys.readouterr().err
 
 
-def test_fix_removes_reported_soma_entries_and_keeps_everything_else(env):
+def test_fix_removes_reported_aegis_entries_and_keeps_everything_else(env):
     claude = env.claude_user_registration(
         mcpServers={"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
-                    "soma": {"command": "soma-mcp"}, "github": {"command": "gh-mcp"}},
-        projects={"/p": {"allowedTools": ["Bash"], "mcpServers": {"soma": {}, "keep": {"command": "k"}}}})
-    home_mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}, "other": 1})
-    proj_mcp = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"soma": {}, "db": {"command": "db"}}})
+                    "foreign": {"command": "foreign-mcp"}, "github": {"command": "gh-mcp"}},
+        projects={"/p": {"allowedTools": ["Bash"], "mcpServers": {"aegis": {}, "keep": {"command": "k"}}}})
+    home_mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}, "other": 1})
+    proj_mcp = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"aegis": {}, "db": {"command": "db"}}})
     originals = {p: p.read_bytes() for p in (claude, home_mcp, proj_mcp)}
 
     payload = env.fix()
@@ -143,7 +145,7 @@ def test_fix_removes_reported_soma_entries_and_keeps_everything_else(env):
     data = json.loads(claude.read_text())
     assert data["numStartups"] == 7
     assert data["mcpServers"] == {"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
-                                  "github": {"command": "gh-mcp"}}
+                                  "foreign": {"command": "foreign-mcp"}, "github": {"command": "gh-mcp"}}
     assert data["projects"] == {"/p": {"allowedTools": ["Bash"], "mcpServers": {"keep": {"command": "k"}}}}
     assert json.loads(home_mcp.read_text()) == {"mcpServers": {}, "other": 1}
     assert json.loads(proj_mcp.read_text()) == {"mcpServers": {"db": {"command": "db"}}}
@@ -182,8 +184,8 @@ def test_fix_removes_a_misplaced_aegis_entry_only_when_the_user_registration_exi
 
 def test_fix_removes_legacy_blocks_exactly_and_keeps_crlf_and_user_text(env):
     claude_md = env.ws / "CLAUDE.md"
-    claude_md.write_bytes(b"@AGENTS.md\r\n\r\nMy notes.\r\n<!-- SOMA:START -->\r\n# Soma Governance Rules\r\n"
-                          b"rule\r\n<!-- SOMA:END -->\r\nMore notes.\r\n")
+    claude_md.write_bytes(b"@AGENTS.md\r\n\r\nMy notes.\r\n<!-- AEGIS:START -->\r\n# Aegis Governance Rules\r\n"
+                          b"rule\r\n<!-- AEGIS:END -->\r\nMore notes.\r\n")
     glob = env.home / ".claude" / "CLAUDE.md"
     glob.parent.mkdir()
     glob.write_bytes(b"mine\n<!-- AEGIS:START -->\nrules\n<!-- AEGIS:END -->\n")
@@ -195,7 +197,7 @@ def test_fix_removes_legacy_blocks_exactly_and_keeps_crlf_and_user_text(env):
 def test_fix_deletes_an_instruction_file_that_held_only_a_legacy_block(env):
     # An emptied CLAUDE.md would still stop Claude Code from reading AGENTS.md.
     claude_md = env.ws / "CLAUDE.md"
-    original = b"<!-- SOMA:START -->\n# Soma Governance Rules\nrule\n<!-- SOMA:END -->\n"
+    original = b"<!-- AEGIS:START -->\n# Aegis Governance Rules\nrule\n<!-- AEGIS:END -->\n"
     claude_md.write_bytes(original)
     payload = env.fix()
     assert not claude_md.exists()
@@ -207,9 +209,9 @@ def test_fix_deletes_an_instruction_file_that_held_only_a_legacy_block(env):
 def test_fix_never_touches_a_malformed_legacy_block(env):
     agents = env.home / ".codex" / "AGENTS.md"
     agents.parent.mkdir()
-    agents.write_text("<!-- SOMA:START -->\nno end marker\n", encoding="utf-8")
+    agents.write_text("<!-- AEGIS:START -->\nno end marker\n", encoding="utf-8")
     payload = env.fix()
-    assert agents.read_text() == "<!-- SOMA:START -->\nno end marker\n"
+    assert agents.read_text() == "<!-- AEGIS:START -->\nno end marker\n"
     assert payload["fixes"] == []
 
 
@@ -230,25 +232,27 @@ def test_fix_removes_v3_rule_copies_by_digest_and_keeps_edited_ones(env, monkeyp
 
 
 def test_fix_refuses_to_write_through_a_symlink(env, tmp_path):
+    env.claude_user_registration()
     from conftest import symlink_or_skip
-    target = env.write_json(tmp_path / "elsewhere.json", {"mcpServers": {"soma": {}}})
+    target = env.write_json(tmp_path / "elsewhere.json", {"mcpServers": {"aegis": {}}})
     symlink_or_skip(target, env.home / ".mcp.json")
     before = target.read_bytes()
     payload = env.fix()
     assert target.read_bytes() == before
     assert (env.home / ".mcp.json").is_symlink()
-    finding = next(f for f in payload["findings"] if f["code"] == "legacy_mcp_entry")
+    finding = next(f for f in payload["findings"] if f["code"] == "misplaced_mcp_entry")
     assert finding["fixable"] is False and "symlink" in finding["message"]
 
 
 def test_fix_replaces_a_file_swapped_for_a_symlink_after_the_check_and_spares_the_link_target(env, tmp_path, monkeypatch):
+    env.claude_user_registration()
     """R-cli-41: Given ~/.mcp.json checked as a regular file, When it is swapped for a symlink to
     another file just before the replacing write, Then the write replaces the link itself: the
     link's target keeps its bytes and no temporary file is left beside it."""
     from conftest import symlink_or_skip
     from aegis_core import storage
 
-    mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}, "other": 1})
+    mcp = env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}, "other": 1})
     victim = tmp_path / "victim.json"
     victim.write_bytes(b'{"keep": true}\n')
     real_write = storage.atomic_write_bytes
@@ -271,7 +275,8 @@ def test_fix_replaces_a_file_swapped_for_a_symlink_after_the_check_and_spares_th
 
 
 def test_fix_refuses_a_hard_linked_file(env, tmp_path):
-    target = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.claude_user_registration()
+    target = env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     try:
         os.link(target, tmp_path / "second-name.json")
     except OSError:
@@ -279,13 +284,14 @@ def test_fix_refuses_a_hard_linked_file(env, tmp_path):
     before = target.read_bytes()
     payload = env.fix()
     assert target.read_bytes() == before
-    finding = next(f for f in payload["findings"] if f["code"] == "legacy_mcp_entry")
+    finding = next(f for f in payload["findings"] if f["code"] == "misplaced_mcp_entry")
     assert finding["fixable"] is False and "hard link" in finding["message"]
 
 
 def test_fix_skips_a_file_that_changed_after_the_check(env, monkeypatch):
-    stale = env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
-    changed = json.dumps({"mcpServers": {"soma": {}, "new": {}}})
+    env.claude_user_registration()
+    stale = env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
+    changed = json.dumps({"mcpServers": {"aegis": {}, "new": {}}})
 
     def confirm_then_edit(prompt):
         stale.write_text(changed, encoding="utf-8")
@@ -300,7 +306,7 @@ def test_fix_skips_a_file_that_changed_after_the_check(env, monkeypatch):
 
 def test_fix_touches_only_what_it_reported(env):
     env.claude_user_registration()
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     unrelated = {
         env.home / ".gemini" / "config" / "rules" / "my-rule.md": b"# mine\n",
         env.ws / "CLAUDE.md": b"@AGENTS.md\nnotes\n",
@@ -319,7 +325,8 @@ def test_fix_touches_only_what_it_reported(env):
 
 
 def test_a_second_fix_finds_nothing_left_to_do(env):
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.claude_user_registration()
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     env.fix()
     payload = env.fix()
     assert payload["fixes"] == [] and payload["_rc"] == 0
@@ -327,8 +334,9 @@ def test_a_second_fix_finds_nothing_left_to_do(env):
 
 
 def test_fix_refuses_a_symlinked_user_plane(env, tmp_path):
+    env.claude_user_registration()
     from conftest import symlink_or_skip
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     outside = tmp_path / "outside-aegis"
     outside.mkdir()
     symlink_or_skip(outside, env.home / ".aegis", target_is_directory=True)
@@ -356,20 +364,22 @@ def test_the_ast_driver_fix_also_needs_yes_and_backs_up_the_config(env, monkeypa
 
 
 def test_text_fix_lists_the_plan_and_where_the_backup_went(env, monkeypatch):
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.claude_user_registration()
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: True)
     rc, out = env.run(fix=True)
     assert rc == 0
-    assert "remove mcpServers.soma" in out
+    assert "remove mcpServers.aegis" in out
     assert str(env.home / ".aegis" / "backups") in out
 
 
 @pytest.mark.parametrize("before, after", [
-    (b'{\n\t"mcpServers": {\n\t\t"soma": {},\n\t\t"x": 1\n\t}\n}\n', b'{\n\t"mcpServers": {\n\t\t"x": 1\n\t}\n}\n'),
-    (b'{\r\n    "mcpServers": {\r\n        "soma": {}\r\n    }\r\n}', b'{\r\n    "mcpServers": {}\r\n}'),
-    (b'{"mcpServers": {"soma": {}, "x": "\xc3\xa9"}}', b'{"mcpServers": {"x": "\xc3\xa9"}}'),
+    (b'{\n\t"mcpServers": {\n\t\t"aegis": {},\n\t\t"x": 1\n\t}\n}\n', b'{\n\t"mcpServers": {\n\t\t"x": 1\n\t}\n}\n'),
+    (b'{\r\n    "mcpServers": {\r\n        "aegis": {}\r\n    }\r\n}', b'{\r\n    "mcpServers": {}\r\n}'),
+    (b'{"mcpServers": {"aegis": {}, "x": "\xc3\xa9"}}', b'{"mcpServers": {"x": "\xc3\xa9"}}'),
 ])
 def test_fix_keeps_the_files_own_json_formatting(env, before, after):
+    env.claude_user_registration()
     path = env.home / ".mcp.json"
     path.write_bytes(before)
     env.fix()
@@ -380,7 +390,7 @@ def test_fix_keeps_the_files_own_json_formatting(env, before, after):
 
 def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypatch):
     claude_md = env.ws / "CLAUDE.md"
-    claude_md.write_bytes(b"<!-- SOMA:START -->\n# Soma Governance Rules\nrule\n<!-- SOMA:END -->\n")
+    claude_md.write_bytes(b"<!-- AEGIS:START -->\n# Aegis Governance Rules\nrule\n<!-- AEGIS:END -->\n")
     prompts = []
     monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: prompts.append(prompt) or False)
     rc, out = env.run(fix=True)
@@ -403,7 +413,7 @@ def test_the_plan_names_the_deletion_before_anything_is_confirmed(env, monkeypat
 
 def test_a_file_with_text_besides_the_legacy_block_is_edited_never_deleted(env, monkeypatch):
     path = env.ws / "GEMINI.md"
-    path.write_bytes(b"# mine\n\n<!-- SOMA:START -->\nrules\n<!-- SOMA:END -->\n")
+    path.write_bytes(b"# mine\n\n<!-- AEGIS:START -->\nrules\n<!-- AEGIS:END -->\n")
     monkeypatch.setattr(doctor_base, "_confirm", lambda prompt: False)
     rc, out = env.run(fix=True)
     assert f"{path}: remove the legacy block (lines 3-5)" in out
@@ -412,7 +422,7 @@ def test_a_file_with_text_besides_the_legacy_block_is_edited_never_deleted(env, 
 
 def test_a_byte_order_mark_survives_the_removal_of_a_legacy_block_on_line_one(env):
     path = env.ws / "GEMINI.md"
-    path.write_bytes(b"\xef\xbb\xbf<!-- SOMA:START -->\nrules\n<!-- SOMA:END -->\nmine\n")
+    path.write_bytes(b"\xef\xbb\xbf<!-- AEGIS:START -->\nrules\n<!-- AEGIS:END -->\nmine\n")
     payload = env.fix()
     assert [f["status"] for f in payload["fixes"]] == ["applied"]
     assert path.read_bytes() == b"\xef\xbb\xbfmine\n"
@@ -422,9 +432,10 @@ def test_a_byte_order_mark_survives_the_removal_of_a_legacy_block_on_line_one(en
 def test_backups_and_their_manifest_are_owner_only(env):
     claude = env.claude_user_registration(
         mcpServers={"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
-                    "soma": {"command": "soma-mcp"}})
+                    "foreign": {"command": "foreign-mcp"}},
+        projects={"/p": {"mcpServers": {"aegis": {}}}})
     claude.chmod(0o600)
-    env.write_json(env.home / ".mcp.json", {"mcpServers": {"soma": {}}})
+    env.write_json(env.home / ".mcp.json", {"mcpServers": {"aegis": {}}})
     payload = env.fix()
     assert {f["status"] for f in payload["fixes"]} == {"applied"}
     (backup,) = env.backups()
@@ -445,7 +456,8 @@ def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only
 
     claude = env.claude_user_registration(
         mcpServers={"aegis": {"command": str(env.mcp), "env": {"AEGIS_CLIENT": "claude-code"}},
-                    "soma": {"command": "soma-mcp"}})
+                    "foreign": {"command": "foreign-mcp"}},
+        projects={"/p": {"mcpServers": {"aegis": {}}}})
     claude.chmod(0o600)
     victim = tmp_path / "victim.json"
     victim.write_bytes(b'{"keep": true}\n')
@@ -468,7 +480,7 @@ def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only
         os.umask(saved)
     assert swapped, "the swap happened before the write"
     assert {f["status"] for f in payload["fixes"]} == {"applied"}
-    assert not claude.is_symlink() and "soma" not in json.loads(claude.read_text(encoding="utf-8"))["mcpServers"]
+    assert not claude.is_symlink() and json.loads(claude.read_text(encoding="utf-8"))["projects"]["/p"]["mcpServers"] == {}
     assert claude.stat().st_mode & 0o777 == 0o600
     assert victim.read_bytes() == b'{"keep": true}\n' and victim.stat().st_mode & 0o777 == 0o644
 
@@ -476,12 +488,13 @@ def test_a_private_config_swapped_for_a_symlink_after_the_check_stays_owner_only
 # ── Numbers JSON cannot hold (R-structure-21, R-cli-50) ─────────────────────────
 
 def test_fix_leaves_a_host_config_holding_an_overflowing_number_byte_identical(env):
+    env.claude_user_registration()
     """json reads 1e999 as infinity, which written back is the non-JSON literal Infinity: the file is
     reported as not valid JSON and nothing is planned for it; a control file is fixed as before."""
     overflow = env.home / ".mcp.json"
-    overflow.write_bytes(b'{\n  "mcpServers": {"soma": {}},\n  "n": 1e999\n}\n')
+    overflow.write_bytes(b'{\n  "mcpServers": {"aegis": {}},\n  "n": 1e999\n}\n')
     before = overflow.read_bytes()
-    control = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"soma": {}, "db": {"command": "db"}}})
+    control = env.write_json(env.ws / ".mcp.json", {"mcpServers": {"aegis": {}, "db": {"command": "db"}}})
     payload = env.fix()
     assert overflow.read_bytes() == before and b"Infinity" not in overflow.read_bytes()
     # By the path field, never a substring of json.dumps: it doubles every Windows backslash.

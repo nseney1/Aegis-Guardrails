@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from aegis_core import gitsafe
-from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME
+from aegis_core.workspace.layout import AEGIS_DIRNAME, LEGACY_SOMA_DIRNAME as _RETIRED_DIRNAME
 
 
 def _list_workspace_files(workspace: str) -> list[str]:
@@ -35,7 +35,7 @@ def _rules(workspace: str):
 def calculate_coverage(workspace: str, exclude: Optional[Union[List[str], str]] = None) -> dict:
     """Which workspace files the rules' target_paths cover, overall and per directory."""
     all_files = _list_workspace_files(workspace)
-    EXCLUDE_PATTERNS = [f'{AEGIS_DIRNAME}/', f'{LEGACY_SOMA_DIRNAME}/', 'vendor/', '.git/', 'node_modules/']
+    EXCLUDE_PATTERNS = [f'{AEGIS_DIRNAME}/', f'{_RETIRED_DIRNAME}/', 'vendor/', '.git/', 'node_modules/']
     if exclude:
         if isinstance(exclude, str):
             EXCLUDE_PATTERNS.append(exclude)
@@ -119,7 +119,7 @@ def calculate_governance_grade(workspace: str) -> Optional[dict]:
     fits = for_rules(workspace, rules)
 
     all_files = _list_workspace_files(workspace)
-    exclude = [f'{AEGIS_DIRNAME}/', f'{LEGACY_SOMA_DIRNAME}/', 'vendor/', '.git/', 'node_modules/']
+    exclude = [f'{AEGIS_DIRNAME}/', f'{_RETIRED_DIRNAME}/', 'vendor/', '.git/', 'node_modules/']
     all_files = [f for f in all_files if not any(p in f for p in exclude)]
 
     covered_files = {f for f in all_files if any(rule.applies_to(f) for rule in rules)}
@@ -194,4 +194,3 @@ __all__ = [
     "letter_grade",
     "calculate_governance_grade",
 ]
-

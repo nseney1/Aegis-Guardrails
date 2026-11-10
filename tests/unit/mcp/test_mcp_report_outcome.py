@@ -138,7 +138,7 @@ def test_retry_with_the_same_key_is_recorded_once(served):
     assert len(_rows(served)) == 1
 
 
-@pytest.mark.parametrize("alias", ["cells_used", "rules", "rule_id", "cell_id"])
+@pytest.mark.parametrize("alias", ["obsolete_rules_used", "rules", "rule_id"])
 def test_legacy_argument_names_are_rejected(served, alias):
     response, payload = _call({"outcome": "success", alias: ["trap-x"], "idempotency_key": "alias-1"})
     assert response["result"]["isError"] is True

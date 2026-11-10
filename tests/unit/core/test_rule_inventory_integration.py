@@ -5,35 +5,35 @@ import os
 import pytest
 
 
-CELL_TEMPLATE = (
+RULE_TEMPLATE = (
     "---\n"
-    "id: {cell_id}\n"
+    "id: {rule_id}\n"
     "type: invariant\n"
     "hypothesis: {hypothesis}\n"
     "target_paths:\n"
     "  - src/*.py\n"
     "---\n"
-    "Body for {cell_id}.\n"
+    "Body for {rule_id}.\n"
 )
 
 
-def _write_cell(workspace, cell_id="alpha", hypothesis="first"):
-    path = workspace / ".aegis" / "rules" / "invariants" / f"{cell_id}.md"
+def _write_rule(workspace, rule_id="alpha", hypothesis="first"):
+    path = workspace / ".aegis" / "rules" / "invariants" / f"{rule_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        CELL_TEMPLATE.format(cell_id=cell_id, hypothesis=hypothesis),
+        RULE_TEMPLATE.format(rule_id=rule_id, hypothesis=hypothesis),
         encoding="utf-8",
     )
     return path
 
 
-def _symlinked_cell_directory(tmp_path):
+def _symlinked_rule_directory(tmp_path):
     workspace = tmp_path / "workspace"
-    cells_dir = workspace / ".aegis" / "rules"
-    cells_dir.mkdir(parents=True)
+    rules_dir = workspace / ".aegis" / "rules"
+    rules_dir.mkdir(parents=True)
     outside = tmp_path / "outside"
-    _write_cell(outside, "outside", "must not escape")
-    link = cells_dir / "invariants"
+    _write_rule(outside, "outside", "must not escape")
+    link = rules_dir / "invariants"
     try:
         link.symlink_to(outside / ".aegis" / "rules" / "invariants", target_is_directory=True)
     except (OSError, NotImplementedError):
@@ -45,7 +45,7 @@ def test_sdk_and_mcp_direct_list_reject_symlinked_directory(tmp_path, monkeypatc
     from aegis_sdk.governance import Governance
     import aegis_mcp.tools as tools
 
-    workspace = _symlinked_cell_directory(tmp_path)
+    workspace = _symlinked_rule_directory(tmp_path)
 
     with pytest.raises(RuntimeError, match="rule inventory.*symlink"):
         Governance(project_root=workspace).list_rules()
@@ -59,7 +59,7 @@ def test_sdk_and_mcp_direct_list_reject_symlinked_directory(tmp_path, monkeypatc
 def test_mcp_transport_marks_inventory_failure_as_error(tmp_path, monkeypatch):
     import aegis_mcp.server as server
 
-    workspace = _symlinked_cell_directory(tmp_path)
+    workspace = _symlinked_rule_directory(tmp_path)
     monkeypatch.setattr(server, "_session_id", "inventory-test")
     monkeypatch.setattr(server, "_canonical_workspace", str(workspace))
 
@@ -80,19 +80,19 @@ def test_same_size_restored_mtime_edit_is_visible_to_sdk_and_mcp(tmp_path, monke
     from aegis_sdk.governance import Governance
     import aegis_mcp.tools as tools
 
-    cell_path = _write_cell(tmp_path, "alpha", "first")
+    rule_path = _write_rule(tmp_path, "alpha", "first")
     governance = Governance(project_root=tmp_path)
     assert governance.list_rules()[0]["id"] == "alpha"
 
     monkeypatch.chdir(tmp_path)
     assert tools.execute_tool("aegis_list_rules", {})["rules"][0]["id"] == "alpha"
 
-    original_stat = cell_path.stat()
-    original = cell_path.read_text(encoding="utf-8")
+    original_stat = rule_path.stat()
+    original = rule_path.read_text(encoding="utf-8")
     changed = original.replace("alpha", "bravo")
     assert len(changed.encode("utf-8")) == len(original.encode("utf-8"))
-    cell_path.write_text(changed, encoding="utf-8")
-    os.utime(cell_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    rule_path.write_text(changed, encoding="utf-8")
+    os.utime(rule_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     assert governance.list_rules()[0]["id"] == "bravo"
     assert tools.execute_tool("aegis_list_rules", {})["rules"][0]["id"] == "bravo"
@@ -125,10 +125,10 @@ def test_create_prompt_uses_inventory_bytes_without_reopen(tmp_path, monkeypatch
     import aegis_core.rules as rules
     import aegis_mcp.handlers.governance as governance
 
-    cell_path = _write_cell(tmp_path, "snapshot", "captured hypothesis")
+    rule_path = _write_rule(tmp_path, "snapshot", "captured hypothesis")
     snapshot = inventory_rules(str(tmp_path))
-    cell_path.write_text(
-        CELL_TEMPLATE.format(cell_id="mutatedx", hypothesis="changed hypothesis"),
+    rule_path.write_text(
+        RULE_TEMPLATE.format(rule_id="mutatedx", hypothesis="changed hypothesis"),
         encoding="utf-8",
     )
     monkeypatch.setattr(rules, "inventory_rules", lambda workspace: snapshot)
@@ -145,7 +145,7 @@ def test_create_prompt_rejects_outside_symlinked_example(tmp_path):
     from aegis_core.rule_inventory import RuleInventoryError
     from aegis_mcp.handlers.governance import build_rule_create_prompt
 
-    workspace = _symlinked_cell_directory(tmp_path)
+    workspace = _symlinked_rule_directory(tmp_path)
     with pytest.raises(RuleInventoryError, match="symlink"):
         build_rule_create_prompt("new concern", args={"workspace": str(workspace)})
 
@@ -153,7 +153,7 @@ def test_create_prompt_rejects_outside_symlinked_example(tmp_path):
 def test_mcp_list_parses_inventory_with_the_stdlib_parser(tmp_path, monkeypatch):
     import aegis_mcp.tools as tools
 
-    _write_cell(tmp_path, "fallback", "stdlib parser")
+    _write_rule(tmp_path, "fallback", "stdlib parser")
     monkeypatch.chdir(tmp_path)
 
     rules = tools.execute_tool("aegis_list_rules", {})["rules"]

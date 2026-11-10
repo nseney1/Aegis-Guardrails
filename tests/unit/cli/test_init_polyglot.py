@@ -1,4 +1,4 @@
-"""Tests for soma init zero-touch polyglot AST driver provisioning."""
+"""Tests for aegis init zero-touch polyglot AST driver provisioning."""
 import argparse
 from pathlib import Path
 import pytest

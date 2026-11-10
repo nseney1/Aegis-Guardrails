@@ -165,7 +165,7 @@ def test_every_t4_event_arm_reads_as_before(ws):
         _row(event="exposure", rule="unknown-rule", session="s9", host="h", paths=[], rev=None),
     ])
     with open(ledger.ledger_path(ws), "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps({"cell": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
+        fh.write(json.dumps({"rule_id": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
                              "event_id": "v1-alias"}) + "\n")
     now = parse_utc("2026-10-20T00:00:00Z")
     got = {rid: (f.triggers, f.tp, f.fp, f.caught, f.leaked, f.contested, f.eligible_sessions, f.adjudicated_n)

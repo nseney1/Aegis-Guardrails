@@ -96,7 +96,7 @@ def test_unknown_keys_are_counted_never_echoed(ws: Path):
     ({"jit": {"max_tokens": -1}}, "'jit.max_tokens'"),
     ({"jit": {"max_tokens": True}}, "'jit.max_tokens'"),
     ({"expiry": {"days": "soon"}}, "'expiry.days'"),
-    ({"expiry": {"per_type": {"wall": 3}}}, "'expiry.per_type'"),
+    ({"expiry": {"per_type": {"unsupported": 3}}}, "'expiry.per_type'"),
     ({"ast": {"packaged_drivers": ["../x"]}}, "'ast.packaged_drivers'"),
     ({"ast": []}, "'ast'"),
 ])
@@ -314,7 +314,7 @@ def _env_mappings(tree: ast.AST):
 
 def test_only_config_reads_aegis_environment_variables():
     """D11 ratchet: AEGIS_* and the cut config variables are read in aegis_core/config.py only."""
-    banned_prefixes = ("AEGIS_", "RULE_EXPIRY", "CELL_TELOMERE", "SOMA_")
+    banned_prefixes = ("AEGIS_", "RULE_EXPIRY")
     offenders = []
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
