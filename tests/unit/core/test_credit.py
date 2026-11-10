@@ -8,10 +8,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+from time import time_ns
+from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import credit, storage
+from aegis_core import credit, credit_memo, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.telemetry_engine import ledger
 from tests.conftest import symlink_or_skip
@@ -21,7 +24,274 @@ from tests.conftest import symlink_or_skip
 def snapshot_capabilities(request, monkeypatch):
     """Keep every exposure assertion on the native and portable memo paths."""
     if request.param == "portable":
-        monkeypatch.setattr(os, "supports_dir_fd", set())
+        monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), supports_dir_fd=set())))
+
+
+@contextmanager
+def _settle_ledger(root, monkeypatch):
+    """Settle only the enclosed I/O, retaining a distinguishable backdated mtime."""
+    path = ledger.ledger_path(root)
+    old = time_ns() - 10_000_000_000
+    os.utime(path, ns=(old, old))
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: time_ns() + 3_000_000_000)))
+        yield path
+
+
+def test_windows_creation_time_and_descriptor_change_time_share_generation(tmp_path, monkeypatch):
+    credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    monkeypatch.setattr(storage, "_COMPARE_CTIME", False)
+    path = ledger.ledger_path(tmp_path)
+    identity = path.stat()
+
+    def creation(info):
+        if (info.st_dev, info.st_ino) != (identity.st_dev, identity.st_ino):
+            return info
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields["st_ctime_ns"] = 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os),
+        stat=lambda *a, **kw: creation(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: creation(os.lstat(*a, **kw)))))
+    calls, real_read = [], credit.read_rows
+
+    def read(root):
+        calls.append(root)
+        return real_read(root)
+
+    monkeypatch.setattr(credit, "read_rows", read)
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
+    assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
+    assert calls == [tmp_path]
+
+
+def test_reset_before_append_report_under_clock_skew_never_fills(tmp_path, monkeypatch):
+    real_fsync = os.fsync
+    path = ledger.ledger_path(tmp_path)
+    resets = []
+
+    def fsync(fd):
+        real_fsync(fd)
+        if not resets and path.exists() and path.stat().st_size:
+            data = path.read_bytes()
+            replacement = data.replace(b'"rule":"rule-a"', b'"rule":"rule-b"')
+            assert data != replacement and len(data) == len(replacement)
+            path.write_bytes(replacement)
+            resets.append(True)
+
+    # Model process clocks ahead of the file clock: even apparently settled
+    # append evidence cannot certify a row erased before its report is captured.
+    monkeypatch.setattr(credit_memo, "time_ns", lambda: time_ns() + 10_000_000_000)
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: time_ns() + 3_000_000_000)))
+        patch.setattr(storage, "os", SimpleNamespace(**dict(vars(credit_memo.os), fsync=fsync)))
+        assert len(credit.record_exposure(tmp_path, "host", "session", ["rule-a"])) == 1
+    assert resets == [True]
+    assert [row["rule"] for row in credit.record_exposure(tmp_path, "host", "session", ["rule-a"])] == ["rule-a"]
+    assert [row["rule"] for row in credit.read_rows(tmp_path)] == ["rule-b", "rule-a"]
+
+
+@pytest.mark.parametrize("operation", ["read", "append"])
+def test_delayed_fill_with_coarse_unchanged_stamps_stays_ineligible(tmp_path, monkeypatch, operation):
+    credit.record_exposure(tmp_path, "host", "session", ["rule-c", "rule-a", "rule-d"])
+    credit_memo.reset()
+    path = ledger.ledger_path(tmp_path)
+    identity = path.stat()
+    tick = time_ns() - 500_000_000
+    real_read = credit.read_rows
+
+    def coarse(info):
+        if (info.st_dev, info.st_ino) != (identity.st_dev, identity.st_ino):
+            return info
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields.update(st_mtime_ns=tick, st_ctime_ns=tick)
+        return SimpleNamespace(**fields)
+
+    def read(root):
+        rows = real_read(root)
+        data = path.read_bytes()
+        replacement = data.replace(b'"rule":"rule-a"', b'"rule":"rule-b"')
+        assert data != replacement and len(data) == len(replacement)
+        path.write_bytes(replacement)
+        return rows
+
+    io = SimpleNamespace(**dict(vars(credit_memo.os),
+        stat=lambda *a, **kw: coarse(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: coarse(os.lstat(*a, **kw)),
+        fstat=lambda fd: coarse(os.fstat(fd))))
+    monkeypatch.setattr(storage, "os", io)
+    monkeypatch.setattr(credit_memo, "os", io)
+    monkeypatch.setattr(credit_memo, "time_ns", lambda: tick + 10_000_000_000)
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + 500_000_000)))
+        patch.setattr(credit, "read_rows", read)
+        rules = ["rule-a"] if operation == "read" else ["rule-a", "rule-e"]
+        credit.record_exposure(tmp_path, "other-host", "session", rules)
+    assert [row["rule"] for row in credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])] == ["rule-a"]
+
+
+@pytest.mark.parametrize("settled_read", [False, True], ids=["after-append", "after-settled-read"])
+def test_multirow_reset_preserving_both_samples_misses(tmp_path, monkeypatch, settled_read):
+    paths = ["src/package/module_%02d.py" % i for i in range(20)]
+    stamp = "2026-11-10T12:00:00Z"
+    credit.record_exposure(tmp_path, "host", "session", ["rule-c", "rule-a", "rule-d"], paths=paths, ts=stamp)
+    if settled_read:
+        credit_memo.reset()
+        with _settle_ledger(tmp_path, monkeypatch):
+            assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths, ts=stamp) == []
+    path = ledger.ledger_path(tmp_path)
+    original, info = path.read_bytes(), path.stat()
+    code = (
+        "import json, sys\n"
+        "from aegis_core import credit\n"
+        "from aegis_core.telemetry_engine import ledger\n"
+        "args = json.load(sys.stdin)\n"
+        "ledger.ledger_path(args['root']).write_bytes(b'')\n"
+        "rows = credit.record_exposure(args['root'], 'host', 'session', ['rule-c', 'rule-b', 'rule-d'], "
+        "paths=args['paths'], ts=args['stamp'])\n"
+        "assert [row['rule'] for row in rows] == ['rule-c', 'rule-b', 'rule-d']\n"
+    )
+    subprocess.run([sys.executable, "-c", code],
+                   input=json.dumps({"root": str(tmp_path), "paths": paths, "stamp": stamp}),
+                   cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, check=True, timeout=30)
+    replacement = path.read_bytes()
+    assert path.stat().st_ino == info.st_ino
+    assert len(original) == len(replacement)
+    assert original[:256] == replacement[:256]
+    assert original[-256:] == replacement[-256:]
+    assert original != replacement
+
+    written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths, ts=stamp)
+
+    assert [row["rule"] for row in written] == ["rule-a"]
+    assert [row["rule"] for row in credit.read_rows(tmp_path)] == ["rule-c", "rule-b", "rule-d", "rule-a"]
+
+
+@pytest.mark.parametrize("phase", ["read", "append", "read-before-append"])
+def test_multirow_reset_during_fill_cannot_certify_removed_rule(tmp_path, monkeypatch, phase):
+    paths = ["src/package/module_%02d.py" % i for i in range(20)]
+    stamp = "2026-11-10T12:00:00Z"
+    credit.record_exposure(tmp_path, "host", "session", ["rule-c", "rule-a", "rule-d"], paths=paths, ts=stamp)
+    real_read, real_append = credit.read_rows, ledger.append_rows
+
+    def reset():
+        path = ledger.ledger_path(tmp_path)
+        data = path.read_bytes()
+        replacement = data.replace(b'"rule":"rule-a"', b'"rule":"rule-b"')
+        assert data[:256] == replacement[:256] and data[-256:] == replacement[-256:]
+        assert len(data) == len(replacement) and data != replacement
+        path.write_bytes(replacement)
+
+    def read(root):
+        rows = real_read(root)
+        reset()
+        return rows
+
+    def append(root, rows):
+        written = real_append(root, rows)
+        reset()
+        return written
+
+    with monkeypatch.context() as patch:
+        patch.setattr(credit if phase != "append" else ledger,
+                      "read_rows" if phase != "append" else "append_rows",
+                      read if phase != "append" else append)
+        rules = ["rule-a"] if phase == "read" else ["rule-a", "rule-e"]
+        written = credit.record_exposure(tmp_path, "other-host", "session", rules, paths=paths, ts=stamp)
+        assert [row["rule"] for row in written] == ([] if phase == "read" else ["rule-e"])
+
+    assert [row["rule"] for row in credit.record_exposure(
+        tmp_path, "other-host", "session", ["rule-a"], paths=paths, ts=stamp)] == ["rule-a"]
+    assert [row["rule"] for row in real_read(tmp_path)] == (
+        ["rule-c", "rule-b", "rule-d"] + ([] if phase == "read" else ["rule-e"]) + ["rule-a"])
+
+
+@pytest.mark.parametrize("operation", ["read", "append"])
+@pytest.mark.parametrize("racy_field", ["mtime", "ctime"])
+@pytest.mark.parametrize("age_ns", [0, 1_999_999_999, 2_000_000_000, 2_000_000_001, -1])
+def test_racy_timestamp_refuses_memo_until_settled(tmp_path, monkeypatch, age_ns, operation, racy_field):
+    credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    credit_memo.reset()
+    path = ledger.ledger_path(tmp_path)
+    identity = path.stat()
+    tick = time_ns() - 10_000_000_000
+
+    def stamps(info):
+        if (info.st_dev, info.st_ino) != (identity.st_dev, identity.st_ino):
+            return info
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields.update(st_mtime_ns=tick if racy_field == "mtime" else tick - 10_000_000_000,
+                      st_ctime_ns=tick if racy_field == "ctime" else tick - 10_000_000_000)
+        return SimpleNamespace(**fields)
+
+    io = SimpleNamespace(**dict(vars(credit_memo.os),
+        stat=lambda *a, **kw: stamps(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: stamps(os.lstat(*a, **kw)),
+        fstat=lambda fd: stamps(os.fstat(fd))))
+    monkeypatch.setattr(storage, "os", io)
+    monkeypatch.setattr(credit_memo, "os", io)
+    # Boundary-only clock: the snapshot remains on the real clock, while the
+    # authoritative I/O starts at a precise offset from a controlled stat tick.
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + age_ns)))
+        rule = "rule-a" if operation == "read" else "rule-b"
+        written = credit.record_exposure(tmp_path, "host", "session", [rule])
+    assert [row["rule"] for row in written] == ([] if operation == "read" else [rule])
+    calls, real_read = [], credit.read_rows
+
+    def read(root):
+        calls.append(root)
+        return real_read(root)
+
+    monkeypatch.setattr(credit, "read_rows", read)
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + age_ns)))
+        assert credit.record_exposure(tmp_path, "host", "session", [rule]) == []
+    read_eligible = age_ns > 2_000_000_000 or (racy_field == "ctime" and not storage._COMPARE_CTIME)
+    eligible = operation == "read" and read_eligible
+    assert calls == ([] if eligible else [tmp_path])
+    # Appends never fill, even with old stamps under file-clock skew. Only the
+    # next settled authoritative read can establish the memo.
+    calls.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + 3_000_000_000)))
+        assert credit.record_exposure(tmp_path, "host", "session", [rule]) == []
+    assert calls == ([] if read_eligible else [tmp_path])
+    calls.clear()
+    assert credit.record_exposure(tmp_path, "host", "session", [rule]) == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("field", ["st_mtime_ns", "st_ctime_ns"])
+def test_either_generation_stamp_alone_invalidates_memo(tmp_path, monkeypatch, field):
+    if field == "st_ctime_ns" and not storage._COMPARE_CTIME:
+        pytest.skip("Windows creation time cannot be compared with descriptor change time")
+    credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
+    info = ledger.ledger_path(tmp_path).stat()
+    calls, real_lock = [], credit.ledger_locked
+
+    def changed(value):
+        if (value.st_dev, value.st_ino) == (info.st_dev, info.st_ino):
+            fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+            fields[field] += 1
+            return SimpleNamespace(**fields)
+        return value
+
+    def lock(root):
+        calls.append(root)
+        return real_lock(root)
+
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(
+        vars(credit_memo.os), stat=lambda *a, **kw: changed(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: changed(os.lstat(*a, **kw)),
+        fstat=lambda fd: changed(os.fstat(fd)))))
+    monkeypatch.setattr(credit, "ledger_locked", lock)
+    assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
+    assert calls == [tmp_path]
 
 
 @pytest.mark.parametrize("change", ["delete", "replace", "truncate"])
@@ -51,11 +321,12 @@ def test_exposure_is_written_again_after_ledger_changes(tmp_path, change):
 
 @pytest.mark.parametrize("append_other_row", [False, True], ids=["unchanged", "grown"])
 @pytest.mark.parametrize("file_count", [0, 20], ids=["short", "long"])
-def test_unchanged_ledger_rescan_checks_bounded_head_and_tail_without_lock_or_full_read(tmp_path, monkeypatch, append_other_row, file_count):
+def test_rescan_checks_generation_without_reads_and_any_append_misses(tmp_path, monkeypatch, append_other_row, file_count):
     paths = ["src/package/module_%02d.py" % i for i in range(file_count)]
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths)
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths) == []
     path = ledger.ledger_path(tmp_path)
-    cached_size = path.stat().st_size
     if append_other_row:
         ledger.append_rows(tmp_path, [{"v": ledger.LEDGER_VERSION, "event": "exposure", "rule": "rule-b"}])
     calls = []
@@ -91,18 +362,23 @@ def test_unchanged_ledger_rescan_checks_bounded_head_and_tail_without_lock_or_fu
 
     monkeypatch.setattr(credit, "ledger_locked", lock)
     monkeypatch.setattr(credit, "read_rows", read)
-    monkeypatch.setattr(os, "open", open_file)
-    monkeypatch.setattr(os, "read", fd_read)
-    monkeypatch.setattr(os, "lseek", seek)
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(
+        vars(credit_memo.os), open=open_file, read=fd_read, lseek=seek)))
+    monkeypatch.setattr(credit_memo.atomicio, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
+    if append_other_row:
+        with _settle_ledger(tmp_path, monkeypatch):
+            assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths) == []
+    else:
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths) == []
+    assert calls == (["lock", "read"] if append_other_row else [])
+    assert len(opened) == (3 if append_other_row else 1)
+    assert reads == seeks == []
+    calls.clear()
+    opened.clear()
     assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"], paths=paths) == []
     assert calls == []
-    expected_reads = 1 + int(cached_size > ledger._TAIL_CHECK_BYTES)
     assert len(opened) == 1
-    assert len(seeks) == len(reads) == expected_reads
-    assert reads == [min(cached_size, ledger._TAIL_CHECK_BYTES)] * expected_reads
-    assert seeks[0] == (max(0, cached_size - ledger._TAIL_CHECK_BYTES), os.SEEK_SET)
-    if expected_reads == 2:
-        assert seeks[1] == (0, os.SEEK_SET)
+    assert reads == seeks == []
     expected = ["rule-a", "rule-b"] if append_other_row else ["rule-a"]
     assert [row["rule"] for row in real_read(tmp_path)] == expected
 
@@ -244,6 +520,8 @@ def test_replacement_while_waiting_for_lock_drops_old_rules(tmp_path, monkeypatc
 @pytest.mark.parametrize("error", [PermissionError, NotADirectoryError])
 def test_fast_path_stat_error_falls_back_to_the_locked_read(tmp_path, monkeypatch, error):
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     path = ledger.ledger_path(tmp_path)
     real_stat, real_fstat, real_lock = os.stat, os.fstat, credit.ledger_locked
     identity = path.stat()
@@ -259,8 +537,9 @@ def test_fast_path_stat_error_falls_back_to_the_locked_read(tmp_path, monkeypatc
         locks.append(root)
         return real_lock(root)
 
-    monkeypatch.setattr(os, "stat", lambda *args, **kwargs: check(real_stat(*args, **kwargs)))
-    monkeypatch.setattr(os, "fstat", lambda fd: check(real_fstat(fd)))
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os),
+        stat=lambda *args, **kwargs: check(real_stat(*args, **kwargs)),
+        fstat=lambda fd: check(real_fstat(fd)))))
     monkeypatch.setattr(credit, "ledger_locked", lock)
     assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     assert errors == [error]
@@ -269,23 +548,24 @@ def test_fast_path_stat_error_falls_back_to_the_locked_read(tmp_path, monkeypatc
 
 
 def test_post_append_stat_error_does_not_hide_a_successful_write(tmp_path, monkeypatch):
-    real_append, real_stat, real_fstat = ledger.append_rows, os.stat, os.fstat
+    real_fsync, real_fstat = os.fsync, os.fstat
     appended, errors = [], []
 
-    def append(root, rows):
-        result = real_append(root, rows)
-        appended.append(ledger.ledger_path(root).stat())
+    def fsync(fd):
+        result = real_fsync(fd)
+        info = real_fstat(fd)
+        if info.st_size:
+            appended.append((info.st_dev, info.st_ino))
         return result
 
-    def check(info):
-        if appended and not errors and (info.st_dev, info.st_ino) == (appended[0].st_dev, appended[0].st_ino):
+    def fstat(fd):
+        info = real_fstat(fd)
+        if appended and not errors and (info.st_dev, info.st_ino) == appended[0]:
             errors.append("stat")
             raise PermissionError("injected post-append metadata failure")
         return info
 
-    monkeypatch.setattr(ledger, "append_rows", append)
-    monkeypatch.setattr(os, "stat", lambda *args, **kwargs: check(real_stat(*args, **kwargs)))
-    monkeypatch.setattr(os, "fstat", lambda fd: check(real_fstat(fd)))
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(credit_memo.os), fsync=fsync, fstat=fstat)))
     written = credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
     assert errors == ["stat"]
@@ -313,38 +593,42 @@ def test_a_changed_ledger_site_gets_its_own_exposure(tmp_path, monkeypatch):
     assert [row["rule"] for row in credit.read_rows(tmp_path)] == ["rule-a"]
 
 
-def test_tail_read_error_falls_back_without_duplicating_rows(tmp_path, monkeypatch):
+def test_snapshot_open_error_falls_back_without_duplicating_rows(tmp_path, monkeypatch):
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
-    identity = ledger.ledger_path(tmp_path).stat()
-    real_read, real_fstat, real_lock = os.read, os.fstat, credit.ledger_locked
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
+    path = ledger.ledger_path(tmp_path)
+    real_open, real_lock = os.open, credit.ledger_locked
     errors, locks = [], []
 
-    def read(fd, size):
-        info = real_fstat(fd)
-        if not errors and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
-            errors.append("read")
-            raise OSError("injected tail read failure")
-        return real_read(fd, size)
+    def open_file(file, *args, **kwargs):
+        if not errors and os.fspath(file) in (os.fspath(path), path.name):
+            errors.append("open")
+            raise OSError("injected snapshot open failure")
+        return real_open(file, *args, **kwargs)
 
     def lock(root):
         locks.append(root)
         return real_lock(root)
 
-    monkeypatch.setattr(os, "read", read)
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
+    monkeypatch.setattr(credit_memo.atomicio, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
     monkeypatch.setattr(credit, "ledger_locked", lock)
     assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
-    assert errors == ["read"]
+    assert errors == ["open"]
     assert locks == [tmp_path]
     assert [row["rule"] for row in credit.read_rows(tmp_path)] == ["rule-a"]
 
 
 @pytest.mark.parametrize("replacement", ["directory", "symlink"])
 def test_parent_swap_during_cache_open_cannot_validate_the_old_ledger(tmp_path, monkeypatch, replacement):
-    if (not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW")
-            or not {"open", "stat"} <= {f.__name__ for f in os.supports_dir_fd}
-            or "stat" not in {f.__name__ for f in os.supports_follow_symlinks}):
+    if (not hasattr(credit_memo.os, "O_DIRECTORY") or not hasattr(credit_memo.os, "O_NOFOLLOW")
+            or not {"open", "stat"} <= {f.__name__ for f in credit_memo.os.supports_dir_fd}
+            or "stat" not in {f.__name__ for f in credit_memo.os.supports_follow_symlinks}):
         pytest.skip("descriptor-relative no-follow operations unavailable")
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     path = ledger.ledger_path(tmp_path)
     backup = path.parent.with_name("old-state")
     outside = tmp_path / "outside"
@@ -365,7 +649,7 @@ def test_parent_swap_during_cache_open_cannot_validate_the_old_ledger(tmp_path, 
                 path.write_text("", encoding="utf-8")
         return real_open(file, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
     if replacement == "symlink":
         with pytest.raises(PathTraversalError) as refused:
             credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
@@ -412,6 +696,8 @@ def test_argon_two_root_spellings_share_the_memo_and_its_invalidation(tmp_path, 
     root, alternate = str(tmp_path), str(tmp_path) + "/."
     stamp = "2026-11-10T12:00:00Z"
     credit.record_exposure(root, "host", "session", ["rule-a"], ts=stamp)
+    with _settle_ledger(root, monkeypatch):
+        assert credit.record_exposure(root, "host", "session", ["rule-a"], ts=stamp) == []
     calls = []
     real_lock = credit.ledger_locked
 
@@ -605,8 +891,11 @@ def test_argon_0735_reset_traces_restore_exposure(tmp_path, monkeypatch, trace):
 def test_portable_ancestor_substitution_misses_and_reaches_typed_refusal(tmp_path, monkeypatch, ancestor, phase):
     if phase == "fill" and os.name == "nt":
         pytest.skip("Windows cannot rename the directory of the held ledger lock")
-    monkeypatch.setattr(os, "supports_dir_fd", set())
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), supports_dir_fd=set())))
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    if phase == "hit":
+        with _settle_ledger(tmp_path, monkeypatch):
+            assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     path = ledger.ledger_path(tmp_path)
     directory = path.parent if ancestor == "state" else path.parent.parent
     backup = directory.with_name("old-" + directory.name)
@@ -635,7 +924,8 @@ def test_portable_ancestor_substitution_misses_and_reaches_typed_refusal(tmp_pat
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(os, "open", open_file)
+        patch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
+        patch.setattr(credit_memo.atomicio, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
         if phase == "fill":
             patch.setattr(ledger, "append_rows", append)
             assert [row["rule"] for row in credit.record_exposure(tmp_path, "host", "session", ["rule-b"])] == ["rule-b"]
@@ -664,6 +954,8 @@ def test_portable_ancestor_substitution_misses_and_reaches_typed_refusal(tmp_pat
 
 def test_warm_exposure_resolves_the_ledger_site_once(tmp_path, monkeypatch):
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
+    with _settle_ledger(tmp_path, monkeypatch):
+        assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     real_site = storage.ledger_site
     calls = []
 
@@ -695,6 +987,8 @@ def test_linked_worktrees_share_one_persistence_memo(tmp_path, monkeypatch):
     git("worktree", "add", "--detach", str(linked), "HEAD")
     assert ledger.ledger_path(root) == ledger.ledger_path(linked)
     credit.record_exposure(root, "host", "session", ["rule-a"])
+    with _settle_ledger(root, monkeypatch):
+        assert credit.record_exposure(root, "host", "session", ["rule-a"]) == []
     calls = []
     real_lock = credit.ledger_locked
 
