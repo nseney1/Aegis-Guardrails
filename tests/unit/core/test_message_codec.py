@@ -41,6 +41,100 @@ def make_store(root):
     return codec.Store(root)
 
 
+@contextmanager
+def tracked_directory_fds(monkeypatch):
+    from contextlib import suppress
+    from threading import get_ident
+    real_open, real_close, caller = os.open, os.close, get_ident()
+    tracked = SimpleNamespace(opened=[], live=set())
+    with monkeypatch.context() as patch:
+        def opened(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if get_ident() == caller and flags & getattr(os, "O_DIRECTORY", 0):
+                tracked.opened.append(fd)
+                tracked.live.add(fd)
+            return fd
+
+        def closed(fd):
+            real_close(fd)
+            if get_ident() == caller:
+                tracked.live.discard(fd)
+
+        patch.setattr(os, "open", opened)
+        patch.setattr(os, "close", closed)
+        try:
+            yield tracked
+        finally:
+            for fd in tracked.live:
+                with suppress(OSError):
+                    real_close(fd)
+
+
+def use_readlink_only_pathlib(patch):
+    """Emulate CPython 3.9.13 (hosted macOS leg) for existing POSIX fixtures."""
+    real_lstat = os.lstat
+
+    def resolve(path, strict=False):
+        resolved = Path(path.anchor) if path.is_absolute() else Path.cwd()
+        pending = list(path.parts[1:] if path.is_absolute() else path.parts)
+        links = 0
+        while pending:
+            name = pending.pop(0)
+            if name == "..":
+                resolved = resolved.parent
+                continue
+            candidate = resolved / name
+            try:
+                target = Path(os.readlink(candidate))
+            except OSError as error:
+                if error.errno != errno.EINVAL:
+                    raise
+                resolved = candidate
+            else:
+                links += 1
+                if links > 40:
+                    raise OSError(errno.ELOOP, "fixture symlink loop")
+                if target.is_absolute():
+                    resolved = Path(target.anchor)
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+        return resolved
+
+    patch.setattr(Path, "lstat", lambda path: real_lstat(path))
+    patch.setattr(Path, "resolve", resolve)
+
+
+def test_readlink_only_pathlib_bypasses_stat_observers(tmp_path, monkeypatch):
+    if os.name != "posix":
+        pytest.skip("CPython 3.9.13 POSIX pathlib emulation")
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    symlink_or_skip(tmp_path, alias, target_is_directory=True)
+    given = alias / "root"
+    expected, identity = root.resolve(strict=True), root.stat()
+    observed, real_stat, real_lstat = [], os.stat, os.lstat
+    with monkeypatch.context() as patch:
+        use_readlink_only_pathlib(patch)
+
+        def stated(path, *args, **kwargs):
+            observed.append(("stat", path))
+            return real_stat(path, *args, **kwargs)
+
+        def lstated(path, *args, **kwargs):
+            observed.append(("lstat", path))
+            return real_lstat(path, *args, **kwargs)
+
+        patch.setattr(os, "stat", stated)
+        patch.setattr(os, "lstat", lstated)
+        info = Path(given).lstat()
+        resolved = Path(given).resolve(strict=True)
+    assert (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino)
+    assert resolved == expected
+    assert observed == []
+
+
 def raw(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True, allow_nan=False).encode("utf-8")
@@ -658,6 +752,89 @@ def test_r3_class_c_platform_refuses_unanchored_operations(tmp_path, monkeypatch
         assert_error("E_AUTH", lambda: codec.Store(tmp_path))
 
 
+@pytest.mark.parametrize("capability", ["supports_dir_fd", "supports_follow_symlinks"])
+def test_store_requires_anchored_leaf_stat_capabilities(tmp_path, monkeypatch, capability):
+    probe = make_store(tmp_path)
+    probe.close()
+    with monkeypatch.context() as patch:
+        supported = getattr(os, capability)
+        patch.setattr(os, capability, {function for function in supported if function.__name__ != "stat"})
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("unsupported leaf stat reached descriptor open")
+
+        patch.setattr(os, "open", forbidden)
+        assert_error("E_AUTH", lambda: codec.Store(tmp_path))
+
+
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+def test_store_leaf_observations_are_parent_anchored(tmp_path, monkeypatch, symlinked_ancestor):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    expected, parent_info = root.resolve(strict=True), tmp_path.stat()
+    if symlinked_ancestor:
+        alias = tmp_path / "alias"
+        symlink_or_skip(tmp_path, alias, target_is_directory=True)
+        root = alias / "root"
+    resolved, observed = [], []
+    with tracked_directory_fds(monkeypatch) as tracked, monkeypatch.context() as patch:
+        real_resolve, real_lstat, real_stat = Path.resolve, Path.lstat, os.stat
+
+        def resolving(path, *args, **kwargs):
+            resolved.append(path)
+            return real_resolve(path, *args, **kwargs)
+
+        def lstating(path, *args, **kwargs):
+            assert path != root, "caller leaf was observed through a path string"
+            return real_lstat(path, *args, **kwargs)
+
+        def stated(path, *args, **kwargs):
+            if path == "root":
+                assert kwargs.get("follow_symlinks") is False
+                info = os.fstat(kwargs["dir_fd"])
+                assert (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino)
+                observed.append(True)
+            return real_stat(path, *args, **kwargs)
+
+        patch.setattr(Path, "resolve", resolving)
+        patch.setattr(Path, "lstat", lstating)
+        patch.setattr(os, "stat", stated)
+        store = make_store(root)
+        try:
+            assert store.root == expected
+            assert store.read(store.write(record())) == record()
+        finally:
+            store.close()
+        assert resolved == [root.parent]
+        assert observed == [True]
+        assert tracked.live == set()
+
+
+@pytest.mark.parametrize("fault", ["owner", "mode", "stat_missing", "stat_io"])
+def test_store_leaf_refusal_releases_parent_and_leaf(tmp_path, monkeypatch, fault):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    uid = root.stat().st_uid
+    if fault == "mode":
+        root.chmod(0o777)
+    with tracked_directory_fds(monkeypatch) as tracked, monkeypatch.context() as patch:
+        real_stat = os.stat
+
+        def stated(path, *args, **kwargs):
+            if path == "root" and "dir_fd" in kwargs and fault.startswith("stat_"):
+                raise OSError(errno.ENOENT if fault == "stat_missing" else errno.EIO, MARKER)
+            return real_stat(path, *args, **kwargs)
+
+        patch.setattr(os, "stat", stated)
+        if fault == "owner":
+            patch.setattr(os, "geteuid", lambda: uid + 1, raising=False)
+        message = ("store access refused; use a private store directory" if fault in ("owner", "mode")
+                   else "store operation unavailable; check permissions, free space, write access and file descriptor limits"
+                   if fault == "stat_io" else None)
+        assert_error("E_AUTH", lambda: make_store(root), message)
+        assert tracked.live == set()
+
+
 @pytest.mark.parametrize("kind", [g["record"]["kind"] for g in goldens()])
 def test_class_c_every_outline_entry_is_selectable(kind):
     value = copy.deepcopy(next(g["record"] for g in goldens() if g["record"]["kind"] == kind))
@@ -1054,7 +1231,115 @@ def test_r4_class_b_expand_only_reads_requested_children(tmp_path, monkeypatch, 
             assert set(view["data"]["refs"]) == {"child"}
 
 
-def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch):
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+def test_real_leaf_replacement_before_open_binds_current_entry(tmp_path, monkeypatch,
+                                                              symlinked_ancestor, readlink_only_pathlib):
+    root, outside = tmp_path / "root", tmp_path / "outside"
+    root.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    expected, replacement = root.resolve(strict=True), outside.stat()
+    if symlinked_ancestor:
+        alias = tmp_path / "alias"
+        symlink_or_skip(tmp_path, alias, target_is_directory=True)
+        root = alias / "root"
+    swapped = []
+    with tracked_directory_fds(monkeypatch) as tracked, monkeypatch.context() as patch:
+        if readlink_only_pathlib:
+            use_readlink_only_pathlib(patch)
+        real_open = os.open
+
+        def opened(path, flags, *args, **kwargs):
+            if not swapped and path == "root" and "dir_fd" in kwargs:
+                root.rename(tmp_path / "original")
+                outside.rename(root)
+                swapped.append(True)
+            return real_open(path, flags, *args, **kwargs)
+
+        patch.setattr(os, "open", opened)
+        store = make_store(root)
+        try:
+            info = os.fstat(store.fd)
+            assert (info.st_dev, info.st_ino) == (replacement.st_dev, replacement.st_ino)
+            assert store.root == expected
+            value = record(body="current real entry at leaf open")
+            rid = store.write(value)
+            assert store.read(rid) == value
+            assert (root / (rid + ".json")).read_bytes() == raw(value)
+        finally:
+            store.close()
+        assert swapped
+        assert tracked.live == set()
+
+
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+def test_same_basename_resolution_swap_never_binds_stale_path(tmp_path, monkeypatch,
+                                                            symlinked_ancestor, readlink_only_pathlib):
+    base, saved = tmp_path, tmp_path / "saved"
+    root = base / "root"
+    root.mkdir(mode=0o700)
+    saved.mkdir(mode=0o700)
+    probe = base / "probe"
+    symlink_or_skip(saved, probe, target_is_directory=True)
+    probe.unlink()
+    expected = root.resolve(strict=True)
+    parent_info = saved.stat()
+    if symlinked_ancestor:
+        alias = base / "alias"
+        symlink_or_skip(base, alias, target_is_directory=True)
+        root = alias / "root"
+    swapped, restored = [], []
+    with tracked_directory_fds(monkeypatch) as tracked, monkeypatch.context() as patch:
+        if readlink_only_pathlib:
+            use_readlink_only_pathlib(patch)
+        real_resolve, real_open = Path.resolve, os.open
+
+        def resolving(path, *args, **kwargs):
+            if not swapped and path in (root, root.parent):
+                root.rename(saved / "root")
+                symlink_or_skip(saved / "root", root, target_is_directory=True)
+                swapped.append(True)
+            return real_resolve(path, *args, **kwargs)
+
+        def opened(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if swapped and not restored and path == "root" and "dir_fd" in kwargs:
+                info = os.fstat(kwargs["dir_fd"])
+                if (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino):
+                    root.unlink()
+                    (saved / "root").rename(root)
+                    restored.append(True)
+            return fd
+
+        patch.setattr(Path, "resolve", resolving)
+        patch.setattr(os, "open", opened)
+        bound = None
+        try:
+            try:
+                bound = make_store(root)
+            except codec.CodecError as error:
+                assert error.as_dict() == {"error": {"code": "E_AUTH", "message": MESSAGES["E_AUTH"]}}
+            else:
+                assert bound.root == expected
+                value = record(body="bound through caller parent")
+                assert bound.read(bound.write(value)) == value
+            finally:
+                if bound is not None:
+                    bound.close()
+            assert swapped
+            assert tracked.live == set()
+        finally:
+            if swapped and not restored:
+                root.unlink()
+                (saved / "root").rename(root)
+
+
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+@pytest.mark.parametrize("walk_target", ["outside", "original"])
+def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch,
+                                                  symlinked_ancestor, readlink_only_pathlib, walk_target):
     with monkeypatch.context() as monkeypatch:
         base = tmp_path_factory.mktemp("mc1-root-swap")
         root, outside = base / "root", base / "outside"
@@ -1064,24 +1349,129 @@ def test_r4_class_c_root_component_swap_is_refused(tmp_path_factory, monkeypatch
         probe = base / "probe"
         symlink_or_skip(outside, probe, target_is_directory=True)
         probe.unlink()
-        original, original_lstat, swapped = os.stat, os.lstat, []
+        if symlinked_ancestor:
+            alias = base / "alias"
+            symlink_or_skip(base, alias, target_is_directory=True)
+            root = alias / "root"
+        original, swapped = os.open, []
+        if readlink_only_pathlib:
+            # Older pathlib caches lstat and resolves through readlink only:
+            # neither product Path call reaches patched os.stat/os.lstat.
+            use_readlink_only_pathlib(monkeypatch)
 
-        def observed(path, *args, **kwargs):
-            result = original(path, *args, **kwargs)
-            return swapped_after_observation(path, result)
-
-        def observed_lstat(path, *args, **kwargs):
-            return swapped_after_observation(path, original_lstat(path, *args, **kwargs))
-
-        def swapped_after_observation(path, result):
-            if not swapped and (str(path) == str(root) or str(path) == "root"):
+        def observed(path, flags, *args, **kwargs):
+            # Inject at the product's anchored walk, independent of pathlib.
+            if not swapped and path == "root" and "dir_fd" in kwargs:
                 root.rename(base / "original")
-                symlink_or_skip(outside, root, target_is_directory=True)
+                symlink_or_skip(base / walk_target, root, target_is_directory=True)
                 swapped.append(True)
-            return result
+            return original(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr(os, "stat", observed)
-        monkeypatch.setattr(os, "lstat", observed_lstat)
+        monkeypatch.setattr(os, "open", observed)
+        assert_error("E_AUTH", lambda: make_store(root))
+        assert swapped
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory", "same_inode_symlink"])
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+def test_r4_class_c_root_swap_after_open_is_refused(tmp_path_factory, monkeypatch,
+                                                  replacement, symlinked_ancestor, readlink_only_pathlib):
+    from contextlib import suppress
+    from threading import get_ident
+    with monkeypatch.context() as patch:
+        base = tmp_path_factory.mktemp("mc1-observed-root-swap")
+        root, outside = base / "root", base / "outside"
+        root.mkdir(mode=0o700)
+        outside.mkdir(mode=0o700)
+        if replacement != "directory" or symlinked_ancestor:
+            probe = base / "probe"
+            symlink_or_skip(outside, probe, target_is_directory=True)
+            probe.unlink()
+        if symlinked_ancestor:
+            alias = base / "alias"
+            symlink_or_skip(base, alias, target_is_directory=True)
+            root = alias / "root"
+        if readlink_only_pathlib:
+            use_readlink_only_pathlib(patch)
+        swapped = []
+        real_open, real_close, caller = os.open, os.close, get_ident()
+        live = set()
+
+        def opened(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if get_ident() == caller:
+                live.add(fd)
+            if not swapped and path == "root" and "dir_fd" in kwargs:
+                root.rename(base / "original")
+                if replacement != "directory":
+                    target = base / "original" if replacement == "same_inode_symlink" else outside
+                    symlink_or_skip(target, root, target_is_directory=True)
+                else:
+                    outside.rename(root)
+                swapped.append(True)
+            return fd
+
+        def closed(fd):
+            real_close(fd)
+            if get_ident() == caller:
+                live.discard(fd)
+
+        patch.setattr(os, "open", opened)
+        patch.setattr(os, "close", closed)
+        try:
+            assert_error("E_AUTH", lambda: make_store(root))
+            assert swapped
+            assert live == set()
+        finally:
+            for fd in live:
+                with suppress(OSError):
+                    real_close(fd)
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+def test_r4_class_c_temporary_walk_swap_is_refused(tmp_path_factory, monkeypatch,
+                                                 replacement, symlinked_ancestor, readlink_only_pathlib):
+    with monkeypatch.context() as patch:
+        base = tmp_path_factory.mktemp("mc1-temporary-walk-swap")
+        root, outside = base / "root", base / "outside"
+        root.mkdir(mode=0o700)
+        outside.mkdir(mode=0o700)
+        if replacement == "symlink" or symlinked_ancestor:
+            probe = base / "probe"
+            symlink_or_skip(outside, probe, target_is_directory=True)
+            probe.unlink()
+        if symlinked_ancestor:
+            alias = base / "alias"
+            symlink_or_skip(base, alias, target_is_directory=True)
+            root = alias / "root"
+        if readlink_only_pathlib:
+            use_readlink_only_pathlib(patch)
+        real_open, swapped = os.open, []
+
+        def opened(path, flags, *args, **kwargs):
+            if swapped or path != "root" or "dir_fd" not in kwargs:
+                return real_open(path, flags, *args, **kwargs)
+            root.rename(base / "original")
+            if replacement == "symlink":
+                symlink_or_skip(base / "original", root, target_is_directory=True)
+            else:
+                outside.rename(root)
+            swapped.append(True)
+            try:
+                return real_open(path, flags, *args, **kwargs)
+            finally:
+                # Restore the entry before the anchored identity observation;
+                # only the leaf-open or descriptor-identity check can refuse.
+                if replacement == "symlink":
+                    root.unlink()
+                else:
+                    root.rename(outside)
+                (base / "original").rename(root)
+
+        patch.setattr(os, "open", opened)
         assert_error("E_AUTH", lambda: make_store(root))
         assert swapped
 
@@ -1230,7 +1620,8 @@ def test_r5_class_a_expand_is_rejected_before_store_io(tmp_path, monkeypatch, ex
             assert_error("E_REF", lambda: codec.read_view(parent, selectors=selectors, expand=expand, store=store))
 
 
-def test_r5_class_b_intermediate_ancestor_swap_is_refused(tmp_path_factory, monkeypatch):
+@pytest.mark.parametrize("readlink_only_pathlib", [False, True])
+def test_r5_class_b_intermediate_ancestor_swap_is_refused(tmp_path_factory, monkeypatch, readlink_only_pathlib):
     with monkeypatch.context() as monkeypatch:
         base = tmp_path_factory.mktemp("mc1-ancestor-swap")
         ancestor, outside = base / "ancestor", base / "outside"
@@ -1240,9 +1631,11 @@ def test_r5_class_b_intermediate_ancestor_swap_is_refused(tmp_path_factory, monk
         symlink_or_skip(outside, probe, target_is_directory=True)
         probe.unlink()
         original, swapped = os.open, []
+        if readlink_only_pathlib:
+            use_readlink_only_pathlib(monkeypatch)
 
         def observed(path, flags, *args, **kwargs):
-            if not swapped and (str(path).startswith(str(ancestor)) or str(path) == "ancestor"):
+            if not swapped and path == "ancestor" and "dir_fd" in kwargs:
                 ancestor.rename(base / "original")
                 symlink_or_skip(outside, ancestor, target_is_directory=True)
                 swapped.append(True)
@@ -1470,10 +1863,63 @@ def test_r7_class_f_writable_store_is_refused(tmp_path, mode):
     assert_error("E_AUTH", lambda: make_store(tmp_path), "store access refused; use a private store directory")
 
 
-def test_r7_class_f_store_owner_is_effective_uid(tmp_path, monkeypatch):
+@pytest.mark.parametrize("without_anchored_ops_and_uid", [False, True])
+def test_r7_class_f_store_owner_is_effective_uid(tmp_path, monkeypatch, without_anchored_ops_and_uid):
     with monkeypatch.context() as patch:
-        patch.setattr(os, "geteuid", lambda: tmp_path.stat().st_uid + 1)
-        assert_error("E_AUTH", lambda: make_store(tmp_path), "store access refused; use a private store directory")
+        if without_anchored_ops_and_uid:
+            # Reproduce Windows' missing primitives on Linux as well.
+            patch.setattr(os, "supports_dir_fd", set())
+            patch.delattr(os, "geteuid", raising=False)
+        uid, checked = tmp_path.stat().st_uid, []
+        def other_uid():
+            checked.append(True)
+            return uid + 1
+        if without_anchored_ops_and_uid:
+            assert not hasattr(os, "geteuid")
+        else:
+            patch.setattr(os, "geteuid", other_uid, raising=False)
+        if os.name == "nt" or without_anchored_ops_and_uid:
+            # Windows lacks anchored operations: refusal precedes any UID check.
+            assert_error("E_AUTH", lambda: codec.Store(tmp_path))
+            assert checked == []
+        else:
+            assert_error("E_AUTH", lambda: make_store(tmp_path), "store access refused; use a private store directory")
+            assert checked == [True]
+
+
+def test_r7_class_f_missing_effective_uid_refuses_before_open(tmp_path, monkeypatch):
+    from contextlib import suppress
+    from threading import get_ident
+    # Keep native anchored primitives; this is distinct from Windows emulation.
+    probe = make_store(tmp_path)
+    probe.close()
+    real_open, real_close, caller = os.open, os.close, get_ident()
+    opened, live = [], set()
+    try:
+        with monkeypatch.context() as patch:
+            def observed_open(*args, **kwargs):
+                fd = real_open(*args, **kwargs)
+                if get_ident() == caller:
+                    opened.append(fd)
+                    live.add(fd)
+                return fd
+
+            def observed_close(fd):
+                real_close(fd)
+                if get_ident() == caller:
+                    live.discard(fd)
+
+            patch.delattr(os, "geteuid", raising=False)
+            patch.setattr(os, "open", observed_open)
+            patch.setattr(os, "close", observed_close)
+            assert not hasattr(os, "geteuid")
+            assert_error("E_AUTH", lambda: codec.Store(tmp_path))
+            assert opened == []
+            assert live == set()
+    finally:
+        for fd in live:
+            with suppress(OSError):
+                real_close(fd)
 
 
 @pytest.mark.parametrize("selectors", [["verdict", "fields.verdict"], ["body", "body"]])
@@ -1927,27 +2373,58 @@ def test_r10_finalizer_release_error_never_raises_or_retries(tmp_path, monkeypat
     assert unraisable == []
 
 
-@pytest.mark.parametrize("failure_at", [1, 3])
+@pytest.mark.parametrize("failure_at", [1, 3, "leaf_parent"])
 @pytest.mark.parametrize("cleanup_error", [False, True])
-def test_r10_constructor_close_error_preserves_ownership_without_leak(tmp_path, monkeypatch, failure_at, cleanup_error):
+@pytest.mark.parametrize("unrelated_thread_close", [False, True])
+def test_r10_constructor_close_error_preserves_ownership_without_leak(
+        tmp_path, monkeypatch, failure_at, cleanup_error, unrelated_thread_close):
+    import gc
     from contextlib import suppress
+    from threading import Thread, get_ident
     outside = tmp_path / "outside"
     outside.mkdir(mode=0o700)
     real_open, real_close = os.open, os.close
     owned, borrowed, closed_unowned, attempts, failed = set(), [], [], [], []
+    leaf_parent, failed_at = [], []
+    unrelated = real_open(str(outside / "unrelated"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    noise_closed, noise_errors = [], []
+    caller, observing = get_ident(), False
     with monkeypatch.context() as patch:
         def observed_open(*args, **kwargs):
             fd = real_open(*args, **kwargs)
+            if not observing or get_ident() != caller:
+                return fd
             owned.add(fd)
+            if args[0] == tmp_path.name and "dir_fd" in kwargs:
+                leaf_parent.append(kwargs["dir_fd"])
+            if unrelated_thread_close and not noise_closed:
+                def close_unrelated():
+                    try:
+                        os.close(unrelated)
+                        noise_closed.append(unrelated)
+                    except BaseException as error:
+                        noise_errors.append(error)
+                worker = Thread(target=close_unrelated)
+                worker.start()
+                worker.join(timeout=5)
+                assert not worker.is_alive()
+                assert noise_errors == []
             return fd
         def observed_close(fd):
+            if not observing or get_ident() != caller:
+                return real_close(fd)
             attempts.append(fd)
             if fd not in owned:
+                # Report foreign closes and retries without touching the fd.
                 closed_unowned.append(fd)
-            owned.discard(fd)
+                return
+            owned.remove(fd)
             real_close(fd)
-            if not failed and len(attempts) == failure_at:
+            at_failure = (len(attempts) == failure_at if type(failure_at) is int
+                          else leaf_parent and fd == leaf_parent[0])
+            if not failed and at_failure:
                 failed.append(fd)
+                failed_at.append(len(attempts) - 1)
                 replacement = real_open(str(outside), os.O_RDONLY | os.O_DIRECTORY)
                 if replacement != fd:
                     os.dup2(replacement, fd)
@@ -1959,17 +2436,59 @@ def test_r10_constructor_close_error_preserves_ownership_without_leak(tmp_path, 
         patch.setattr(os, "open", observed_open)
         patch.setattr(os, "close", observed_close)
         try:
-            assert_error("E_AUTH", lambda: make_store(tmp_path),
-                "store operation unavailable; check permissions, free space, write access and file descriptor limits")
+            gc_was_enabled = gc.isenabled()
+            gc.collect()
+            gc.disable()
+            try:
+                observing = True
+                assert_error("E_AUTH", lambda: make_store(tmp_path),
+                    "store operation unavailable; check permissions, free space, write access and file descriptor limits")
+            finally:
+                observing = False
+                if gc_was_enabled:
+                    gc.enable()
             assert failed
             assert owned == set()
-            assert closed_unowned == []
-            assert attempts[failure_at - 1:].count(failed[0]) == 1
+            assert closed_unowned == [], "codec closed an unowned descriptor"
+            failed_index = failed_at[0]
+            assert attempts[failed_index:].count(failed[0]) == 1
+            if type(failure_at) is int:
+                assert failed_index == failure_at - 1
+            else:
+                assert failed[0] == leaf_parent[0]
             assert stat.S_ISDIR(os.fstat(borrowed[0]).st_mode)
+            assert noise_closed == ([unrelated] if unrelated_thread_close else [])
         finally:
+            if not noise_closed:
+                with suppress(OSError):
+                    real_close(unrelated)
             for fd in owned | set(borrowed):
                 with suppress(OSError):
                     real_close(fd)
+
+
+def test_r10_constructor_close_observer_rejects_foreign_cleanup_close(tmp_path, monkeypatch):
+    from contextlib import suppress
+    real_close, real_release = os.close, codec_store._release
+    foreign = os.open(str(tmp_path / "foreign"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    injected = []
+
+    def mutated_release(fd):
+        real_release(fd)
+        injected.append(foreign)
+        os.close(foreign)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(codec_store, "_release", mutated_release)
+            with pytest.raises(AssertionError, match="^codec closed an unowned descriptor"):
+                test_r10_constructor_close_error_preserves_ownership_without_leak(
+                    tmp_path, monkeypatch, failure_at=1, cleanup_error=False, unrelated_thread_close=False)
+        assert injected == [foreign]
+        assert stat.S_ISREG(os.fstat(foreign).st_mode)
+    finally:
+        with suppress(OSError):
+            real_close(foreign)
 
 
 @pytest.mark.parametrize("run", [100000, 200000])
