@@ -17,12 +17,12 @@ from aegis_sdk import Governance
 
 
 @pytest.fixture
-def mock_soma_workspace(tmp_path: Path) -> Path:
-    """Create a minimal valid Soma workspace directory structure."""
-    cells_dir = tmp_path / ".aegis" / "rules" / "invariants"
-    cells_dir.mkdir(parents=True)
-    sample_cell = cells_dir / "sample_rule.md"
-    sample_cell.write_text(
+def mock_aegis_workspace(tmp_path: Path) -> Path:
+    """Create a minimal valid Aegis workspace directory structure."""
+    rules_dir = tmp_path / ".aegis" / "rules" / "invariants"
+    rules_dir.mkdir(parents=True)
+    sample_rule = rules_dir / "sample_rule.md"
+    sample_rule.write_text(
         "---\nname: sample-rule\ntype: invariant\nenforcement: gate\n---\nRule content\n",
         encoding="utf-8",
     )
@@ -34,34 +34,34 @@ def mock_soma_workspace(tmp_path: Path) -> Path:
 class TestGovernanceWorkspacePorcelain:
     """Verifies aegis_sdk.Governance integration with Workspace."""
 
-    def test_governance_init_with_path_creates_workspace(self, mock_soma_workspace: Path):
-        gov = Governance(project_root=mock_soma_workspace)
+    def test_governance_init_with_path_creates_workspace(self, mock_aegis_workspace: Path):
+        gov = Governance(project_root=mock_aegis_workspace)
         assert hasattr(gov, "workspace")
         assert isinstance(gov.workspace, Workspace)
-        assert gov.workspace.root == mock_soma_workspace.resolve()
-        assert gov.root == mock_soma_workspace.resolve()
-        assert gov.rules_dir == mock_soma_workspace.resolve() / ".aegis" / "rules"
+        assert gov.workspace.root == mock_aegis_workspace.resolve()
+        assert gov.root == mock_aegis_workspace.resolve()
+        assert gov.rules_dir == mock_aegis_workspace.resolve() / ".aegis" / "rules"
 
-    def test_governance_init_with_workspace_object(self, mock_soma_workspace: Path):
-        ws = Workspace.confine(mock_soma_workspace)
+    def test_governance_init_with_workspace_object(self, mock_aegis_workspace: Path):
+        ws = Workspace.confine(mock_aegis_workspace)
         gov = Governance(project_root=ws)
         assert gov.workspace is ws
         assert gov.root == ws.root
         assert gov.rules_dir == ws.rules_dir
 
-    def test_governance_list_rules_with_workspace(self, mock_soma_workspace: Path):
-        ws = Workspace.confine(mock_soma_workspace)
+    def test_governance_list_rules_with_workspace(self, mock_aegis_workspace: Path):
+        ws = Workspace.confine(mock_aegis_workspace)
         gov = Governance(project_root=ws)
-        cells = gov.list_rules()
-        assert len(cells) == 1
-        assert cells[0]["_name"] == "sample_rule"
+        rules = gov.list_rules()
+        assert len(rules) == 1
+        assert rules[0]["_name"] == "sample_rule"
 
 
 class TestMCPToolsWorkspace:
     """Verifies MCP tool handlers with Workspace."""
 
-    def test_mcp_execute_tool_with_workspace_object(self, mock_soma_workspace: Path):
-        ws = Workspace.confine(mock_soma_workspace)
+    def test_mcp_execute_tool_with_workspace_object(self, mock_aegis_workspace: Path):
+        ws = Workspace.confine(mock_aegis_workspace)
         result = execute_tool("aegis_list_rules", {"workspace": ws})
         data = json.loads(result) if isinstance(result, str) else result
         assert [(r["_name"], r["name"]) for r in data["rules"]] == [("sample_rule", "sample-rule")]

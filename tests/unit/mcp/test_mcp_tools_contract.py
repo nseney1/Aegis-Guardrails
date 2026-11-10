@@ -1,7 +1,7 @@
 from pathlib import Path
 """Contract tests for MCP tool handlers.
 
-Tests untested tools in soma_mcp/tools.py through the execute_tool dispatcher.
+Tests untested tools in aegis_mcp/tools.py through the execute_tool dispatcher.
 """
 import os
 import sys
@@ -17,29 +17,29 @@ from aegis_mcp.tools import execute_tool
 
 
 def _setup_workspace(tmp_path):
-    """Create a minimal workspace with cells for MCP tools."""
+    """Create a minimal workspace with rules for MCP tools."""
     ws = str(tmp_path)
-    cells_dir = os.path.join(ws, '.aegis', "rules", 'traps')
-    os.makedirs(cells_dir, exist_ok=True)
-    # Create one cell
+    rules_dir = os.path.join(ws, '.aegis', "rules", 'traps')
+    os.makedirs(rules_dir, exist_ok=True)
+    # Create one rule
     fm = {
-        'id': 'test-cell',
+        'id': 'test-rule',
         'type': 'trap',
         'target_paths': ['src/*.py'],
         'hypothesis': 'Test hypothesis',
         'prediction': 'Test prediction',
     }
     content = dump_frontmatter(fm, body="Body\n")
-    with open(os.path.join(cells_dir, 'test-cell.md'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(rules_dir, 'test-rule.md'), 'w', encoding='utf-8') as f:
         f.write(content)
-    # Create genome dir
-    genome_dir = os.path.join(ws, 'genome')
-    os.makedirs(genome_dir, exist_ok=True)
+    # Create rules dir
+    rules_dir = os.path.join(ws, 'rules')
+    os.makedirs(rules_dir, exist_ok=True)
     return ws
 
 
-class TestSomaScan:
-    """Tests for soma_scan tool."""
+class TestAegisScan:
+    """Tests for aegis_scan tool."""
 
     def test_scan_returns_required_keys(self, tmp_path, monkeypatch):
         ws = _setup_workspace(tmp_path)
@@ -71,8 +71,7 @@ class TestSomaScan:
         assert "'files' must be a list" in result.get('error', '')
 
 
-
-class TestSomaListCells:
+class TestAegisListRules:
     """Tests for aegis_list_rules tool."""
 
     def test_list_returns_rules_stale_rules_and_ignored(self, tmp_path, monkeypatch):
@@ -80,32 +79,32 @@ class TestSomaListCells:
         monkeypatch.chdir(ws)
         result = execute_tool('aegis_list_rules', {})
         assert set(result) == {'rules', 'stale_rules', 'ignored'}
-        assert [r['_name'] for r in result['rules']] == ['test-cell']
+        assert [r['_name'] for r in result['rules']] == ['test-rule']
         assert result['stale_rules'] == [] and result['ignored'] == []
 
 
-class TestSomaCreateCell:
+class TestAegisCreateRule:
     """Tests for aegis_create_rule tool."""
 
-    def test_create_cell_returns_prompt(self, tmp_path, monkeypatch):
+    def test_create_rule_returns_prompt(self, tmp_path, monkeypatch):
         ws = _setup_workspace(tmp_path)
         monkeypatch.chdir(ws)
         result = execute_tool('aegis_create_rule', {
-            'description': 'Test cell for catching null dereferences'
+            'description': 'Test rule for catching null dereferences'
         })
         assert isinstance(result, dict)
         assert 'prompt' in result or 'instruction' in result
 
 
-class TestSomaReportOutcome:
-    """Tests for soma_report_outcome tool."""
+class TestAegisReportOutcome:
+    """Tests for aegis_report_outcome tool."""
 
     def test_valid_outcome_returns_recorded(self, tmp_path, monkeypatch):
         ws = _setup_workspace(tmp_path)
         monkeypatch.chdir(ws)
         result = execute_tool('aegis_report_outcome', {
             'outcome': 'success',
-            'rules_used': ['test-cell'],
+            'rules_used': ['test-rule'],
             'tests_passed': True,
             'idempotency_key': 'test-report-1',
         })
@@ -124,7 +123,7 @@ class TestSomaReportOutcome:
         assert result.get('status') == 'FAIL'
         assert "Invalid 'outcome'" in result.get('error', '')
 
-    def test_report_outcome_rejects_non_list_cells(self, tmp_path, monkeypatch):
+    def test_report_outcome_rejects_non_list_rules(self, tmp_path, monkeypatch):
         ws = _setup_workspace(tmp_path)
         monkeypatch.chdir(ws)
         result = execute_tool('aegis_report_outcome', {
@@ -144,7 +143,7 @@ class TestToolOutputSerializability:
         ('aegis_list_rules', {}),
         ('aegis_create_rule', {'description': 'test'}),
         ('aegis_scan', {'files': ['src/a.py']}),
-        ('aegis_report_outcome', {'outcome': 'tp', 'rules_used': ['test-cell'], 'idempotency_key': 'k'}),
+        ('aegis_report_outcome', {'outcome': 'tp', 'rules_used': ['test-rule'], 'idempotency_key': 'k'}),
     ])
     def test_output_is_json_serializable(self, tool_name, args, tmp_path, monkeypatch):
         ws = _setup_workspace(tmp_path)

@@ -392,11 +392,11 @@ class TestMergeMcpJson:
 
 
 class TestRemoveMcpJson:
-    def test_removes_aegis_and_legacy_soma_and_keeps_the_rest(self, tmp_path):
+    def test_removes_requested_entries_and_keeps_the_rest(self, tmp_path):
         target = tmp_path / "mcp_config.json"
-        target.write_text(json.dumps({"mcpServers": {"aegis": ENTRY, "soma": {"command": "s"},
+        target.write_text(json.dumps({"mcpServers": {"aegis": ENTRY, "foreign": {"command": "s"},
                                                      "github": {"command": "g"}}}), encoding="utf-8")
-        assert ih.remove_mcp_json(target, ("aegis", "soma")) == "removed"
+        assert ih.remove_mcp_json(target, ("aegis", "foreign")) == "removed"
         assert json.loads(target.read_text(encoding="utf-8")) == {"mcpServers": {"github": {"command": "g"}}}
 
     def test_missing_file_or_entry_is_absent_and_untouched(self, tmp_path):
@@ -742,7 +742,7 @@ class TestRegistrationCommands:
 
     @pytest.mark.parametrize("host, name, expected", [
         ("codex-cli", "aegis", ["codex", "mcp", "remove", "aegis"]),
-        ("claude-code", "soma", ["claude", "mcp", "remove", "--scope", "user", "soma"]),
+        ("claude-code", "aegis", ["claude", "mcp", "remove", "--scope", "user", "aegis"]),
     ])
     def test_unregister_argv(self, host, name, expected):
         assert ih.unregister_argv(hosts.get(host), name) == expected
@@ -881,21 +881,21 @@ class TestRegisterHost:
                                                  "env": {"AEGIS_CLIENT": "antigravity"}}}}
         assert ih.register_host("antigravity", home=tmp_path, command=["/x/aegis-mcp"]).result == "unchanged"
 
-    def test_unregister_native_removes_aegis_and_soma(self, tmp_path, monkeypatch):
+    def test_unregister_native_removes_aegis_once(self, tmp_path, monkeypatch):
         exe = _fake_bin(tmp_path / "bin", "codex")
         runner = _Runner()
         monkeypatch.setattr(ih, "_run_cli", runner)
         action = ih.unregister_host("codex-cli", home=tmp_path, path=str(tmp_path / "bin"))
         assert action.result == "removed"
         assert _paths(*{c[0] for c in runner.calls}) == _paths(exe)
-        assert [c[1:] for c in runner.calls] == [["mcp", "remove", "aegis"], ["mcp", "remove", "soma"]]
+        assert [c[1:] for c in runner.calls] == [["mcp", "remove", "aegis"]]
 
     def test_unregister_antigravity_edits_only_its_entries(self, tmp_path):
         cfg = tmp_path / ".gemini" / "config" / "mcp_config.json"
         cfg.parent.mkdir(parents=True)
-        cfg.write_text(json.dumps({"mcpServers": {"aegis": {}, "soma": {}, "x": {}}}), encoding="utf-8")
+        cfg.write_text(json.dumps({"mcpServers": {"aegis": {}, "foreign": {}, "x": {}}}), encoding="utf-8")
         assert ih.unregister_host("antigravity", home=tmp_path).result == "removed"
-        assert json.loads(cfg.read_text(encoding="utf-8")) == {"mcpServers": {"x": {}}}
+        assert json.loads(cfg.read_text(encoding="utf-8")) == {"mcpServers": {"foreign": {}, "x": {}}}
 
 
 class TestHostsAegisNeverRegisters:
@@ -1019,11 +1019,11 @@ class TestDryRunRefusesWhatTheWriteRefuses:
 
     @pytest.mark.parametrize("call", [
         lambda p: ih.merge_mcp_json(p, "aegis", ENTRY, dry_run=True),
-        lambda p: ih.remove_mcp_json(p, ("aegis", "soma"), dry_run=True),
+        lambda p: ih.remove_mcp_json(p, ("aegis", "foreign"), dry_run=True),
     ], ids=["merge", "remove"])
     def test_read_only_json_config(self, tmp_path, call):
         target = tmp_path / "mcp_config.json"
-        target.write_text(json.dumps({"mcpServers": {"soma": {"command": "s"}}}), encoding="utf-8")
+        target.write_text(json.dumps({"mcpServers": {"aegis": {"command": "s"}}}), encoding="utf-8")
         with _ReadOnly(target):
             with pytest.raises(ih.InstallError, match="read-only"):
                 call(target)

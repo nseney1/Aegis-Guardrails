@@ -13,6 +13,7 @@ import pytest
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import RuleCache, lf_digest, load_rules
 from tests.conftest import symlink_or_skip
+from tests.contract.test_legacy_ratchet import REQUIRED_WORDS
 
 
 def _rules(ws: Path) -> Path:
@@ -78,8 +79,8 @@ def test_readme_and_hidden_directories_are_skipped(tmp_path: Path) -> None:
 
 
 def test_a_rule_outside_a_type_directory_is_an_error_never_silently_dropped(tmp_path: Path) -> None:
-    """A v3 walls/ rule (or a rule dropped at the top level) would otherwise stop applying."""
-    _write(tmp_path, "walls/wall-x.md", _rule("wall-x", "invariant"))
+    """A v3 invariants/ rule (or a rule dropped at the top level) would otherwise stop applying."""
+    _write(tmp_path, "unsupported/invariant-x.md", _rule("invariant-x", "invariant"))
     _write(tmp_path, "loose.md", _rule("loose"))
     _write(tmp_path, "traps/nested/deep.md", _rule("deep"))
     _write(tmp_path, "_proposed/broken.md", "---\nid: [unterminated\n---\n")
@@ -88,12 +89,11 @@ def test_a_rule_outside_a_type_directory_is_an_error_never_silently_dropped(tmp_
 
     by_path = _by_path(rs)
     assert set(by_path) == {
-        ".aegis/rules/walls/wall-x.md", ".aegis/rules/loose.md",
+        ".aegis/rules/unsupported/invariant-x.md", ".aegis/rules/loose.md",
         ".aegis/rules/traps/nested/deep.md", ".aegis/rules/_proposed/broken.md",
     }
     assert all(not r.ok and not r.served for r in by_path.values())
-    assert "walls/ is not a rule type directory" in by_path[".aegis/rules/walls/wall-x.md"].error
-    assert "aegis migrate" in by_path[".aegis/rules/walls/wall-x.md"].error
+    assert "unsupported/ is not a rule type directory" in by_path[".aegis/rules/unsupported/invariant-x.md"].error
     assert "not in a rule type directory" in by_path[".aegis/rules/loose.md"].error
     assert "subdirectories of traps/" in by_path[".aegis/rules/traps/nested/deep.md"].error
     assert "malformed YAML frontmatter" in by_path[".aegis/rules/_proposed/broken.md"].error
@@ -113,6 +113,41 @@ def test_markdown_that_is_not_a_rule_is_reported_as_ignored(tmp_path: Path) -> N
         (".aegis/rules/notes/plan.md", "not a rule: notes/ is not a rule type directory"),
         (".aegis/rules/providence.md", "not a rule: it is not in a rule type directory"),
     ]
+
+
+def test_title_only_frontmatter_in_notes_is_ignored(tmp_path):
+    _write(tmp_path, "notes/design.md", "---\ntitle: Design\n---\nNotes\n")
+    rules = load_rules(tmp_path)
+    assert rules.errors == () and rules.rules == ()
+    assert [(item.path, item.reason) for item in rules.ignored] == [
+        (".aegis/rules/notes/design.md", "not a rule: notes/ is not a rule type directory"),
+    ]
+
+
+@pytest.mark.parametrize("folder", ["invariant", "Invariants"])
+@pytest.mark.parametrize("metadata", ["title: Design", "hypothesis: eval is unsafe"])
+def test_any_frontmatter_in_a_rule_type_alias_fails_scan_closed(tmp_path, folder, metadata):
+    from aegis_core.scan import scan
+
+    _write(tmp_path, folder + "/no-eval.md", "---\n" + metadata + "\n---\nBody\n")
+    rules = load_rules(tmp_path)
+    assert len(rules.errors) == 1
+    assert "aegis migrate" in rules.errors[0].error
+    assert rules.ignored == () and rules.served == ()
+    result = scan(tmp_path, ["app.py"])
+    assert result["status"] == "FAIL"
+    assert "aegis migrate" in result["rule_errors"][0]["error"]
+    assert "relevant_rules" not in result
+
+
+@pytest.mark.parametrize("metadata", ["id: no-eval", "enforcement: gate", "type: invariant", "target_paths: ['*.py']", "forbid_ast: eval"])
+def test_noncanonical_directories_refuse_rule_signals(tmp_path, metadata):
+    _write(tmp_path, "notes/no-eval.md", "---\n" + metadata + "\n---\nBody\n")
+    rules = load_rules(tmp_path)
+    assert len(rules.errors) == 1
+    assert rules.errors[0].path == ".aegis/rules/notes/no-eval.md"
+    assert rules.errors[0].error.startswith("not served: notes/ is not a rule type directory")
+    assert rules.ignored == () and rules.served == ()
 
 
 @pytest.mark.parametrize(
@@ -229,31 +264,29 @@ def test_a_key_v3_tooling_wrote_is_ignored_and_reported_for_migrate(tmp_path: Pa
     assert [r.id for r in rs.needs_migrate] == ["g"]
 
 
-def test_any_rule_file_in_a_v3_type_directory_is_an_error_naming_migrate(tmp_path: Path) -> None:
-    """v3 served every file with frontmatter in membranes/ as a boundary, type key or not."""
-    _write(tmp_path, "membranes/m.md", "---\nid: m\nhypothesis: h\n---\nB\n")
-    _write(tmp_path, "membranes/notes.md", "# notes, no frontmatter\n")
+@pytest.mark.parametrize("folder", [REQUIRED_WORDS[4] + "s", REQUIRED_WORDS[5] + "s", "patterns", "rules", "unsupported"])
+def test_an_unknown_type_directory_is_refused_generically(tmp_path: Path, folder) -> None:
+    from aegis_core.scan import scan
 
-    rs = load_rules(tmp_path)
-
-    (rule,) = rs.rules
-    assert rule.path == ".aegis/rules/membranes/m.md" and not rule.ok
+    _write(tmp_path, folder + "/m.md", "---\nid: m\nenforcement: gate\n---\nGate body.\n")
+    (rule,) = load_rules(tmp_path).rules
+    assert rule.path == f".aegis/rules/{folder}/m.md" and not rule.ok
     assert rule.error == (
-        "not served: membranes/ is not a rule type directory "
-        "(a v3 type directory: aegis migrate moves its rules to .aegis/rules/boundaries/)"
+        f"not served: {folder}/ is not a rule type directory "
+        "(expected .aegis/rules/<boundaries, contracts, gates, invariants, personas, traps>/<id>.md)"
     )
-    assert [i.path for i in rs.ignored] == [".aegis/rules/membranes/notes.md"]
+    assert scan(tmp_path, ["app.py"])["status"] == "FAIL"
 
 
-def test_a_v3_type_name_in_its_canonical_directory_points_at_migrate(tmp_path: Path) -> None:
-    """v3.3 accepted `type: wall` in invariants/; v4 knows only the six types."""
-    _write(tmp_path, "invariants/w.md", _rule("w", "wall"))
+def test_an_unknown_type_in_a_canonical_directory_is_refused_generically(tmp_path: Path) -> None:
+    """Only canonical types match their directories."""
+    _write(tmp_path, "invariants/w.md", _rule("w", "unsupported"))
 
     (rule,) = load_rules(tmp_path).rules
 
     assert not rule.ok
-    assert "type 'wall' does not match its directory 'invariants' (invariant)" in rule.error
-    assert "aegis migrate" in rule.error
+    assert "type 'unsupported' does not match its directory 'invariants' (invariant)" in rule.error
+    assert "aegis migrate" not in rule.error
 
 
 def test_a_forbid_ast_rule_without_target_paths_applies_to_every_file(tmp_path: Path) -> None:

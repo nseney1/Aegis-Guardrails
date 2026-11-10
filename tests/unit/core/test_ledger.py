@@ -336,9 +336,9 @@ def test_notes_with_surrogates_round_trip(tmp_path: Path):
 
 # ── v1 rows are read in memory, never rewritten ──────────────────────────────
 
-def _v1(cell, signal, ts, **extra):
-    row = {"timestamp": ts, "rule_id": cell, "cell": cell, "signal": signal, "source": "session",
-           "event_id": f"{cell}-{signal}-{ts}", "payload_digest": "d", "generation": 1}
+def _v1(rule, signal, ts, **extra):
+    row = {"timestamp": ts, "rule_id": rule, "signal": signal, "source": "session",
+           "event_id": f"{rule}-{signal}-{ts}", "payload_digest": "d", "generation": 1}
     row.update(extra)
     return row
 
@@ -352,12 +352,12 @@ def test_v1_rows_are_converted_in_memory_without_rewriting_the_file(tmp_path: Pa
         _v1("contract-x", "tp", "2026-10-15T05:15:22Z", metadata={"credit_weight": 0.3333333333333333, "passed": True}),
         _v1("contract-x", "trigger", "2026-10-15T06:00:00Z", metadata={"credit_weight": 1.0}),
         _v1("contract-x", "tp", "2026-10-15T06:00:00Z", metadata={"credit_weight": 1.0}),
-        # v3 MCP report: an outcome row without a trigger row, cell only
-        {"timestamp": "2026-10-15T07:00:00Z", "cell": "trap-y", "signal": "fp", "source": "mcp",
+        # v3 MCP report: an outcome row without a trigger row, rule only
+        {"timestamp": "2026-10-15T07:00:00Z", "rule_id": "trap-y", "signal": "fp", "source": "mcp",
          "metadata": {"host": "claude", "session": "s9"}},
         # v3 MCP "partial": a trigger row alone
-        {"timestamp": "2026-10-15T08:00:00Z", "cell": "trap-y", "signal": "trigger", "source": "mcp"},
-        {"timestamp": "2026-10-15T09:00:00Z", "cell": "trap-z", "signal": "success", "source": "ci"},
+        {"timestamp": "2026-10-15T08:00:00Z", "rule_id": "trap-y", "signal": "trigger", "source": "mcp"},
+        {"timestamp": "2026-10-15T09:00:00Z", "rule_id": "trap-z", "signal": "success", "source": "ci"},
         {"timestamp": "2026-10-15T09:00:00Z", "signal": "tp", "source": "ci"},  # no rule: unusable
     ]
     raw = "".join(json.dumps(r) + "\n" for r in rows).encode("utf-8")

@@ -35,7 +35,7 @@ RULES_RELDIR = f"{AEGIS_DIRNAME}/rules"
 # lives under state/, so one entry covers it.
 GITIGNORE_ENTRIES: tuple[str, ...] = ("state/",)
 
-# ── v3 layout, read only by `aegis migrate` and the upgrade checks ───────────
+# ── Retired v3 paths, retained for refusal checks and frozen CLI callers ────
 # Ledger copies, newest-wins order: evidence/ was the live ledger, telemetry/ held
 # compaction snapshots of it (a row can be in both).
 LEGACY_LEDGER_FILES: tuple[str, ...] = ("evidence/signals.jsonl", "telemetry/signals.jsonl")
@@ -44,9 +44,13 @@ LEGACY_LEDGER_FILES: tuple[str, ...] = ("evidence/signals.jsonl", "telemetry/sig
 LEGACY_LEDGER_ARCHIVE = "archive"
 LEGACY_LEDGER_ARCHIVE_GLOB = "*.jsonl.gz"
 LEGACY_LEDGER_ROLLUP = "checkpoint_rollup.json"
-# Runtime state v4 no longer reads. `aegis migrate --apply` backs these up and removes
-# them; entries are relative to .aegis/ (a trailing "/" marks a directory).
+LEGACY_CONFIG_ENTRIES: tuple[str, ...] = ("slots.yaml", "config.yaml")
+# Retired v3 state and configuration; archive these outside the workspace manually.
+# Entries are relative to .aegis/ (a trailing "/" marks a directory).
 LEGACY_STATE_ENTRIES: tuple[str, ...] = (
+    *LEGACY_LEDGER_FILES,
+    "evidence/fitness.jsonl",
+    "evidence/sessions_processed.jsonl",
     "evidence/",          # signals ledger, outcomes, rollups, lifecycle log, arbitration receipts, lock files
     "telemetry/",
     "metrics/",
@@ -66,19 +70,14 @@ LEGACY_STATE_ENTRIES: tuple[str, ...] = (
     "jobs_state.json",
     "epoch_generation",
     "migration.lock",
+    *LEGACY_CONFIG_ENTRIES,
 )
-# v3 config files that `aegis migrate` converts into config.json (relative to .aegis/,
+# Retired v3 config files (relative to .aegis/,
 # except aegis.conf, which lived at the repository root).
 LEGACY_REPO_CONF = "aegis.conf"
-LEGACY_REPO_CONFS: tuple[str, ...] = (LEGACY_REPO_CONF, "soma.conf")
-LEGACY_CONFIG_ENTRIES: tuple[str, ...] = ("slots.yaml", "config.yaml")
+LEGACY_REPO_CONFS: tuple[str, ...] = (LEGACY_REPO_CONF,)
 # A v3 setting file with no v4 equivalent, at the repository root; migrate reports it.
 LEGACY_STEERING_CONF = "steering.conf"
-# Where the v1/v2 layout kept rules, relative to its .soma/ directory: cells/<type>/
-# (v1, v2.2+) and rules/<type>/ (v2.0, v2.1). Both move to .aegis/rules/<type>/.
-LEGACY_RULE_DIRS: tuple[str, ...] = ("cells", "rules")
-# The v1/v2 ledger, relative to .soma/.
-LEGACY_PREDECESSOR_LEDGER = "evidence/signals.jsonl"
 # What only an unmigrated v3 workspace holds, relative to .aegis/: status, scan and sync
 # refuse while one exists, check warns (discovery.unmigrated_state).
 LEGACY_UPGRADE_MARKERS: tuple[str, ...] = (
@@ -89,6 +88,10 @@ LEGACY_UPGRADE_MARKERS: tuple[str, ...] = (
     "keys",
     "receipts.jsonl",
     "rules/manifest.json",
+    "manifest.json",
+    "receipt_key",
+    "evidence/fitness.jsonl",
+    "evidence/sessions_processed.jsonl",
 )
 
 
@@ -161,20 +164,6 @@ class WorkspaceLayout:
         """A v3 path under .aegis/ named by one of the LEGACY_* entries."""
         return self.aegis_dir / relative.rstrip("/")
 
-    @property
-    def legacy_soma_dir(self) -> Path:
-        return self.root / LEGACY_SOMA_DIRNAME
-
-    @property
-    def legacy_rule_dirs(self) -> tuple[Path, ...]:
-        """The v1/v2 rule directories (``.soma/cells``, ``.soma/rules``)."""
-        base = self.legacy_soma_dir
-        return tuple(base / name for name in LEGACY_RULE_DIRS)
-
-    @property
-    def legacy_predecessor_ledger(self) -> Path:
-        return self.legacy_soma_dir / LEGACY_PREDECESSOR_LEDGER
-
 
 @dataclass(frozen=True)
 class UserLayout:
@@ -234,10 +223,8 @@ __all__ = [
     "LEGACY_LEDGER_ARCHIVE_GLOB",
     "LEGACY_LEDGER_FILES",
     "LEGACY_LEDGER_ROLLUP",
-    "LEGACY_PREDECESSOR_LEDGER",
     "LEGACY_REPO_CONF",
     "LEGACY_REPO_CONFS",
-    "LEGACY_RULE_DIRS",
     "LEGACY_SOMA_DIRNAME",
     "LEGACY_STATE_ENTRIES",
     "LEGACY_STEERING_CONF",

@@ -20,13 +20,13 @@ from aegis_core.yaml_engine.serializer import dump_frontmatter
 from aegis_core.workspace.base import Workspace
 
 
-class TestSomaYAMLCoreParsing:
+class TestAegisYAMLCoreParsing:
     """Test standard YAML subset parsing capabilities."""
 
     def test_flat_scalars(self):
         text = """
-id: cell-123
-name: 'Special Cell'
+id: rule-123
+name: 'Special Rule'
 count: 42
 pi: 3.14159
 is_active: true
@@ -34,8 +34,8 @@ is_dormant: false
 extra: null
 """
         data = parse_yaml_subset(text)
-        assert data["id"] == "cell-123"
-        assert data["name"] == "Special Cell"
+        assert data["id"] == "rule-123"
+        assert data["name"] == "Special Rule"
         assert data["count"] == 42
         assert data["pi"] == 3.14159
         assert data["is_active"] is True
@@ -77,30 +77,30 @@ folded: >
         text = """
 id: rule-complex
 target_paths:
-  - "soma_core/*.py"
-  - "soma_cli/*.py"
+  - "aegis_core/*.py"
+  - "aegis_cli/*.py"
 fitness:
   triggers: 10
   score: 0.95
 tags: [security, gates, v1]
 """
         data = parse_yaml_subset(text)
-        assert data["target_paths"] == ["soma_core/*.py", "soma_cli/*.py"]
+        assert data["target_paths"] == ["aegis_core/*.py", "aegis_cli/*.py"]
         assert data["fitness"]["triggers"] == 10
         assert data["fitness"]["score"] == 0.95
         assert data["tags"] == ["security", "gates", "v1"]
 
     def test_unquoted_apostrophes_and_ratios(self):
         text = """
-desc: organism's DNA
+desc: project's DNA
 ratio: 1:1
 """
         data = parse_yaml_subset(text)
-        assert data["desc"] == "organism's DNA"
+        assert data["desc"] == "project's DNA"
         assert data["ratio"] == "1:1"
 
 
-class TestSomaYAMLSafetyAndDoSGuards:
+class TestAegisYAMLSafetyAndDoSGuards:
     """Security, anti-poisoning, and denial-of-service controls."""
 
     def test_max_doc_bytes_limit(self):
@@ -133,7 +133,7 @@ class TestSomaYAMLSafetyAndDoSGuards:
 
     def test_duplicate_key_prohibition_block(self):
         text = """
-id: wall-1
+id: invariant-1
 enforcement: advisory
 enforcement: gate
 """
@@ -149,11 +149,11 @@ enforcement: gate
         # Review M5: stripping zero-width characters inside values silently changed data. Only a
         # leading document BOM is stripped; values keep them; a raw invisible character in a key
         # is rejected so it cannot spoof a visually identical key.
-        doc = AegisYAML.parse_text("\ufeffid: cell\u200b-x\ntier: \u200dmethod")
-        assert doc["id"] == "cell\u200b-x"
+        doc = AegisYAML.parse_text("\ufeffid: rule\u200b-x\ntier: \u200dmethod")
+        assert doc["id"] == "rule\u200b-x"
         assert doc["tier"] == "\u200dmethod"
         with pytest.raises(AegisYAMLError, match="invisible"):
-            AegisYAML.parse_text("id: cell\n\u200ctier: method")
+            AegisYAML.parse_text("id: rule\n\u200ctier: method")
 
     def test_control_character_rejection(self):
         text = "key: bad\x07bell"
@@ -166,27 +166,27 @@ enforcement: gate
             AegisYAML.parse_text(text)
 
 
-class TestSomaDocumentAndDomainModel:
+class TestAegisDocumentAndDomainModel:
     """Test polymorphic document models, schema inference, and mapping interface."""
 
     def test_rule_kind_auto_inference(self):
         text = """---
-id: wall-symlink
-type: wall
+id: invariant-symlink
+type: invariant
 enforcement: gate
 ---
-# Wall Symlink
+# Invariant Symlink
 """
         doc = AegisYAML.parse_text(text)
         assert isinstance(doc, AegisDocument)
         assert doc.kind == "rule"
-        assert doc.id == "wall-symlink"
+        assert doc.id == "invariant-symlink"
         assert doc.enforcement == "gate"
-        assert doc.type == "wall"
+        assert doc.type == "invariant"
         assert doc.decay is True
         assert doc.target_paths == []
-        assert doc["id"] == "wall-symlink"
-        assert "Wall Symlink" in doc.body
+        assert doc["id"] == "invariant-symlink"
+        assert "Invariant Symlink" in doc.body
 
     def test_a_skill_is_a_document_with_kind_skill_and_gets_no_injected_keys(self):
         text = """---
@@ -231,11 +231,11 @@ handoff_targets: [staff-review]
 
     def test_parse_file_confined_workspace(self, tmp_path: Path):
         ws = Workspace(tmp_path)
-        rule_file = tmp_path / "cell.md"
-        rule_file.write_text("---\nid: local-cell\n---\n# Body\n", encoding="utf-8")
+        rule_file = tmp_path / "rule.md"
+        rule_file.write_text("---\nid: local-rule\n---\n# Body\n", encoding="utf-8")
 
-        doc = AegisYAML.parse_file("cell.md", ws)
-        assert doc.id == "local-cell"
+        doc = AegisYAML.parse_file("rule.md", ws)
+        assert doc.id == "local-rule"
 
     def test_parse_file_rejects_symlinks(self, tmp_path: Path):
         ws = Workspace(tmp_path)
@@ -256,13 +256,13 @@ class TestBackwardCompatibilityParity:
     """Ensure exact drop-in parity with legacy frontmatter API."""
 
     def test_parse_frontmatter_and_get_body(self):
-        text = "---\nid: legacy-cell\nversion: 1.0\n---\n# Cell Content\nLine 2"
+        text = "---\nid: legacy-rule\nversion: 1.0\n---\n# Rule Content\nLine 2"
         meta = parse_frontmatter(text)
-        assert meta["id"] == "legacy-cell"
+        assert meta["id"] == "legacy-rule"
         assert meta["version"] == 1.0
-        assert _get_body(text) == "# Cell Content\nLine 2"
+        assert _get_body(text) == "# Rule Content\nLine 2"
 
-    def test_parse_cell_frontmatter_file_and_str(self, tmp_path: Path):
+    def test_parse_rule_frontmatter_file_and_str(self, tmp_path: Path):
         f = tmp_path / "rule.md"
         f.write_text("---\nid: from-file\n---\n# Body from file", encoding="utf-8")
 
@@ -276,7 +276,7 @@ class TestBackwardCompatibilityParity:
 
     def test_dump_frontmatter_roundtrip(self):
         data = {
-            "id": "roundtrip-cell",
+            "id": "roundtrip-rule",
             "active": True,
             "score": 0.88,
             "tags": ["alpha", "beta"],
@@ -334,18 +334,18 @@ class TestBackwardCompatibilityParity:
 import datetime
 
 
-class TestSomaYAMLBranchHardening:
+class TestAegisYAMLBranchHardening:
     """Systematic branch coverage hardening for aegis_core.yaml."""
 
-    def test_soma_document_comprehensive_properties(self, tmp_path: Path):
-        doc = AegisDocument(metadata={"kind": "skill", "id": "s1", "type": "wall"}, body="body text", source_path="/tmp/doc.md")
+    def test_aegis_document_comprehensive_properties(self, tmp_path: Path):
+        doc = AegisDocument(metadata={"kind": "skill", "id": "s1", "type": "invariant"}, body="body text", source_path="/tmp/doc.md")
         assert doc.kind == "skill"
         assert doc.id == "s1"
         assert doc.name == "s1"
-        assert doc.type == "wall"
+        assert doc.type == "invariant"
         assert doc.body == "body text"
         assert doc.source_path == "/tmp/doc.md"
-        assert doc.to_dict() == {"kind": "skill", "id": "s1", "type": "wall"}
+        assert doc.to_dict() == {"kind": "skill", "id": "s1", "type": "invariant"}
         assert list(iter(doc)) == ["kind", "id", "type"]
         assert ("AegisDocument" in repr(doc) or "AegisDocument" in repr(doc))
         assert doc["id"] == "s1"
@@ -358,7 +358,7 @@ class TestSomaYAMLBranchHardening:
         assert doc.decay is False
 
         # rule kind auto inference
-        doc_rule = AegisDocument(metadata={"id": "r1", "type": "wall", "enforcement": "strict", "target_paths": ["a.py"]})
+        doc_rule = AegisDocument(metadata={"id": "r1", "type": "invariant", "enforcement": "strict", "target_paths": ["a.py"]})
         assert doc_rule.kind == "rule"
         assert doc_rule.enforcement == "strict"
         assert doc_rule.target_paths == ["a.py"]
@@ -368,15 +368,15 @@ class TestSomaYAMLBranchHardening:
         doc_explicit = AegisDocument(metadata={"id": "e1"}, kind="custom_kind")
         assert doc_explicit.kind == "custom_kind"
 
-    def test_somayaml_parse_text(self):
+    def test_ruleyaml_parse_text(self):
         # parse_text with frontmatter and body
-        doc = AegisYAML.parse_text("---\nid: cell-abc\nkind: skill\n---\n# Markdown Body\nHello world")
-        assert doc.id == "cell-abc"
+        doc = AegisYAML.parse_text("---\nid: rule-abc\nkind: skill\n---\n# Markdown Body\nHello world")
+        assert doc.id == "rule-abc"
         assert doc.body == "# Markdown Body\nHello world"
 
         # parse_text with only yaml mapping
-        doc_raw = AegisYAML.parse_text("id: cell-raw\nscore: 1.0\n")
-        assert doc_raw.id == "cell-raw"
+        doc_raw = AegisYAML.parse_text("id: rule-raw\nscore: 1.0\n")
+        assert doc_raw.id == "rule-raw"
         assert doc_raw.body == ""
 
         # parse_text error branches
@@ -386,7 +386,7 @@ class TestSomaYAMLBranchHardening:
         with pytest.raises(FrontmatterError, match="Expected YAML mapping at document root"):
             AegisYAML.parse_text("- item 1\n- item 2\n")
 
-    def test_somayaml_parse_file_and_write_frontmatter(self, tmp_path: Path):
+    def test_ruleyaml_parse_file_and_write_frontmatter(self, tmp_path: Path):
         # workspace without confine_path raises AegisYAMLError
         class BadWS:
             pass
@@ -430,7 +430,7 @@ class TestSomaYAMLBranchHardening:
         with pytest.raises(AegisYAMLError, match="Symlink parsing prohibited"):
             AegisYAML.parse_file("link.md", SymlinkReturnWS())
 
-    def test_parse_cell_frontmatter_branches(self, tmp_path: Path):
+    def test_parse_rule_frontmatter_branches(self, tmp_path: Path):
         with pytest.raises(ValueError, match="No frontmatter delimiter"):
             parse_rule_frontmatter("not frontmatter content")
 
@@ -655,6 +655,3 @@ items:
             _parse_block_seq([], 0, 0, depth=35)
         with pytest.raises(AegisYAMLError, match="Escape sequence"):
             _unescape_double(r"\0")
-
-
-

@@ -1,5 +1,5 @@
 from pathlib import Path
-"""Security hardening tests for Soma MCP server.
+"""Security hardening tests for Aegis MCP server.
 
 Tests path confinement, rule-name validation and rate limiting. (The v3 HMAC rule
 manifest is gone: D3. Rules are protected by git review and CI; aegis sync keeps an
@@ -23,12 +23,12 @@ from aegis_core.workspace.base import Workspace
 
 
 @pytest.fixture
-def soma_workspace(tmp_path):
-    """Create a minimal valid Soma workspace."""
-    cells_dir = tmp_path / ".aegis" / "rules" / "invariants"
-    cells_dir.mkdir(parents=True)
-    (cells_dir / "wall-test.md").write_text(
-        "---\ntype: invariant\nenforcement: gate\nhypothesis: test\n---\nTest cell.\n"
+def aegis_workspace(tmp_path):
+    """Create a minimal valid Aegis workspace."""
+    rules_dir = tmp_path / ".aegis" / "rules" / "invariants"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "invariant-test.md").write_text(
+        "---\ntype: invariant\nenforcement: gate\nhypothesis: test\n---\nTest rule.\n"
     )
     evidence_dir = tmp_path / ".aegis" / "evidence"
     evidence_dir.mkdir(parents=True)
@@ -49,14 +49,14 @@ class TestConfineWorkspace:
         with pytest.raises(ValueError, match="does not exist"):
             str(Workspace.confine("/nonexistent/path/abc123").root)
 
-    def test_rejects_non_soma_dir(self, tmp_path):
+    def test_rejects_non_aegis_dir(self, tmp_path):
         """A directory without .aegis/rules/ is not a valid workspace."""
         with pytest.raises(ValueError, match="not a valid Aegis workspace"):
             str(Workspace.confine(str(tmp_path)).root)
 
-    def test_accepts_valid_workspace(self, soma_workspace):
+    def test_accepts_valid_workspace(self, aegis_workspace):
         """A directory with .aegis/rules/ is accepted."""
-        result = str(Workspace.confine(str(soma_workspace)).root)
+        result = str(Workspace.confine(str(aegis_workspace)).root)
         assert os.path.isabs(result)
         assert os.path.isdir(os.path.join(result, ".aegis", "rules"))
 
@@ -70,50 +70,50 @@ class TestConfinePath:
         with pytest.raises(ValueError, match="must not be empty"):
             confine_path("", "/any")
 
-    def test_rejects_traversal(self, soma_workspace):
+    def test_rejects_traversal(self, aegis_workspace):
         """Path traversal with ../ is blocked."""
         with pytest.raises(ValueError, match="path traversal blocked"):
-            confine_path("../../etc/passwd", str(soma_workspace))
+            confine_path("../../etc/passwd", str(aegis_workspace))
 
-    def test_rejects_absolute_escape(self, soma_workspace):
+    def test_rejects_absolute_escape(self, aegis_workspace):
         """Absolute path outside workspace is blocked."""
         with pytest.raises(ValueError, match="path traversal blocked"):
-            confine_path("/etc/passwd", str(soma_workspace))
+            confine_path("/etc/passwd", str(aegis_workspace))
 
-    def test_rejects_workspace_root(self, soma_workspace):
+    def test_rejects_workspace_root(self, aegis_workspace):
         """Pointing at the workspace root itself is rejected."""
         with pytest.raises(ValueError, match="refusing to treat the workspace root"):
-            confine_path(".", str(soma_workspace))
+            confine_path(".", str(aegis_workspace))
 
     @pytest.mark.skipif(
         not hasattr(os, "symlink"), reason="Symlinks not supported"
     )
-    def test_rejects_symlink_escape(self, soma_workspace):
+    def test_rejects_symlink_escape(self, aegis_workspace):
         """Symlink that resolves outside workspace is blocked."""
-        outside = soma_workspace.parent / "outside_target"
+        outside = aegis_workspace.parent / "outside_target"
         outside.mkdir()
-        link = soma_workspace / "sneaky_link"
+        link = aegis_workspace / "sneaky_link"
         try:
             os.symlink(str(outside), str(link))
         except OSError:
             pytest.skip("Cannot create symlink")
         with pytest.raises(ValueError, match="path traversal blocked"):
-            confine_path("sneaky_link/secret.txt", str(soma_workspace))
+            confine_path("sneaky_link/secret.txt", str(aegis_workspace))
 
-    def test_accepts_valid_relative(self, soma_workspace):
+    def test_accepts_valid_relative(self, aegis_workspace):
         """Valid relative path inside workspace is accepted."""
-        resolved, relative = confine_path("src/main.py", str(soma_workspace))
+        resolved, relative = confine_path("src/main.py", str(aegis_workspace))
         assert relative == os.path.join("src", "main.py")
         assert resolved.endswith(os.path.join("src", "main.py"))
 
-    def test_accepts_nested_path(self, soma_workspace):
+    def test_accepts_nested_path(self, aegis_workspace):
         """Deeply nested relative path is accepted."""
-        resolved, relative = confine_path("a/b/c/file.py", str(soma_workspace))
+        resolved, relative = confine_path("a/b/c/file.py", str(aegis_workspace))
         assert relative == os.path.join("a", "b", "c", "file.py")
 
-    def test_rejects_null_bytes(self, soma_workspace):
+    def test_rejects_null_bytes(self, aegis_workspace):
         with pytest.raises(ValueError, match="null bytes"):
-            confine_path("src/file\x00.py", str(soma_workspace))
+            confine_path("src/file\x00.py", str(aegis_workspace))
 
     @pytest.mark.parametrize(
         "dev_name",
@@ -123,52 +123,51 @@ class TestConfinePath:
             "CON.", "NUL ", "AUX.tar.gz",
         ],
     )
-    def test_rejects_windows_device_names(self, soma_workspace, dev_name):
+    def test_rejects_windows_device_names(self, aegis_workspace, dev_name):
         with pytest.raises(ValueError, match="reserved Windows device name"):
-            confine_path(dev_name, str(soma_workspace))
+            confine_path(dev_name, str(aegis_workspace))
 
-    def test_rejects_alternate_data_streams(self, soma_workspace):
+    def test_rejects_alternate_data_streams(self, aegis_workspace):
         with pytest.raises(ValueError, match="alternate data stream"):
-            confine_path("file.txt:stream", str(soma_workspace))
+            confine_path("file.txt:stream", str(aegis_workspace))
 
-    def test_rejects_extended_device_namespaces(self, soma_workspace):
+    def test_rejects_extended_device_namespaces(self, aegis_workspace):
         with pytest.raises(ValueError, match="device namespace"):
-            confine_path(r"\\?\C:\secret.txt", str(soma_workspace))
+            confine_path(r"\\?\C:\secret.txt", str(aegis_workspace))
 
     @pytest.mark.parametrize(
         "safe_name",
         ["connect.py", "pronto.md", "components.py", "concurrent.py", "auxiliary.py", "nullify.py"],
     )
-    def test_accepts_benign_names_with_device_substrings(self, soma_workspace, safe_name):
-        resolved, relative = confine_path(safe_name, str(soma_workspace))
+    def test_accepts_benign_names_with_device_substrings(self, aegis_workspace, safe_name):
+        resolved, relative = confine_path(safe_name, str(aegis_workspace))
         assert relative == safe_name
 
 
+# ── Rule Name Validation ──────────────────────────────────────────────
 
-# ── Cell Name Validation ──────────────────────────────────────────────
 
+class TestValidateRuleNames:
+    def test_empty_list_returns_empty(self, aegis_workspace):
+        """Empty rule list always validates."""
+        assert validate_rule_names([], str(aegis_workspace)) == []
 
-class TestValidateCellNames:
-    def test_empty_list_returns_empty(self, soma_workspace):
-        """Empty cell list always validates."""
-        assert validate_rule_names([], str(soma_workspace)) == []
-
-    def test_all_valid_returns_empty(self, soma_workspace):
-        """Known cell names return no invalid entries."""
-        result = validate_rule_names(["wall-test"], str(soma_workspace))
+    def test_all_valid_returns_empty(self, aegis_workspace):
+        """Known rule names return no invalid entries."""
+        result = validate_rule_names(["invariant-test"], str(aegis_workspace))
         assert result == []
 
-    def test_unknown_names_returned(self, soma_workspace):
-        """Unknown cell names are returned as invalid."""
+    def test_unknown_names_returned(self, aegis_workspace):
+        """Unknown rule names are returned as invalid."""
         result = validate_rule_names(
-            ["wall-test", "nonexistent-cell", "another-fake"],
-            str(soma_workspace),
+            ["invariant-test", "nonexistent-rule", "another-fake"],
+            str(aegis_workspace),
         )
-        assert "nonexistent-cell" in result
+        assert "nonexistent-rule" in result
         assert "another-fake" in result
-        assert "wall-test" not in result
+        assert "invariant-test" not in result
 
-    def test_no_cells_dir_all_invalid(self, tmp_path):
+    def test_no_rules_dir_all_invalid(self, tmp_path):
         """When .aegis/rules/ doesn't exist, all names are invalid."""
         result = validate_rule_names(["any-name"], str(tmp_path))
         assert result == ["any-name"]

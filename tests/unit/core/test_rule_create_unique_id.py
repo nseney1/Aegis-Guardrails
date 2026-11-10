@@ -112,5 +112,3 @@ def test_an_archived_rule_does_not_block_re_creation(ws: Path) -> None:
 
     assert path == _rules(ws) / "traps" / "revived.md"
     assert archived.read_text(encoding="utf-8") == "---\nid: revived\ntype: trap\n---\nOld.\n"
-
-
