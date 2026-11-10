@@ -57,10 +57,6 @@ def word_parts(text: str) -> List[str]:
     return [p.lower() for p in _PARTS.findall(text)]
 
 
-def _is(part: str, word: str) -> bool:
-    return part == word or part == word + "s"
-
-
 def _python_files(dirs) -> Iterator[Path]:
     for directory in dirs:
         for path in sorted((REPO / directory).rglob("*.py")):
@@ -120,38 +116,44 @@ def _json_texts(value) -> Iterator[str]:
 
 def _word_counts(texts: Iterator[str], words) -> Dict[str, int]:
     counts = {word: 0 for word in words}
+    matches = {}
+    for word in words:
+        # A record can contain both a word and its plural: retain both matches.
+        matches.setdefault(word, []).append(word)
+        matches.setdefault(word + "s", []).append(word)
     for text in texts:
         for part in word_parts(text):
-            for word in words:
-                if _is(part, word):
-                    counts[word] += 1
+            for word in matches.get(part, ()):
+                counts[word] += 1
     return counts
 
 
-def _soma_imports() -> List[str]:
-    found = []
+def _soma_findings() -> Dict[str, List[str]]:
+    found = {"soma_imports": [], "soma_classes": []}
     for path in _python_files((*PACKAGES, "rules", "skills", "tests")):
+        rel = path.relative_to(REPO).as_posix()
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             names = []
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names = [node.module]
-            found.extend(f"{path.relative_to(REPO).as_posix()}:{node.lineno} {n}" for n in names if n.startswith("soma_"))
-    return found
-
-
-def _soma_classes() -> List[str]:
-    found = []
-    for path in _python_files((*PACKAGES, "rules", "skills", "tests")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            found["soma_imports"].extend(f"{rel}:{node.lineno} {n}" for n in names if n.startswith("soma_"))
             names = []
             if isinstance(node, ast.ClassDef):
                 names = [node.name]
             elif isinstance(node, ast.Assign):
                 names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            found.extend(f"{path.relative_to(REPO).as_posix()}:{node.lineno} {n}" for n in names if n.startswith("Soma"))
+            found["soma_classes"].extend(f"{rel}:{node.lineno} {n}" for n in names if n.startswith("Soma"))
     return found
+
+
+def _soma_imports() -> List[str]:
+    return _soma_findings()["soma_imports"]
+
+
+def _soma_classes() -> List[str]:
+    return _soma_findings()["soma_classes"]
 
 
 def _organelle_type_literals() -> List[str]:
@@ -191,8 +193,8 @@ def current_counts(words) -> Dict[str, int]:
 
     counts = _word_counts(code_texts(), words)
     counts[SNAPSHOT_ROW] = sum(_word_counts(snapshot_texts(), words).values())
-    for row, finder in _ZERO_ROW_FINDERS.items():
-        counts[row] = len(finder())
+    counts.update({row: len(found) for row, found in _soma_findings().items()})
+    counts["organelle_type_literals"] = len(_organelle_type_literals())
     return counts
 
 
@@ -254,6 +256,41 @@ def test_counting_sees_identifiers_and_strings_but_not_docstrings():
     # soma: the import name; cell: alias, function, parameter twice, key; genome: keyword-only param;
     # wall: the f-string text (not "firewall").
     assert counts == {"soma": 1, "cell": 5, "genome": 1, "wall": 1}
+
+
+def test_counting_keeps_plural_overlap_and_ignores_substrings():
+    assert _word_counts(iter(["cell cells cellss firewall walls"]), ("cell", "cells", "wall")) == {
+        "cell": 2, "cells": 2, "wall": 1,
+    }
+
+
+def test_zero_rows_keep_import_class_and_alias_diagnostics(tmp_path, monkeypatch):
+    package = tmp_path / "sample"
+    package.mkdir()
+    (package / "example.py").write_text(
+        "import soma_one, os, soma_two as other\n"
+        "from soma_three import value\n"
+        "class SomaThing: pass\n"
+        "SomaAlias = Other = object\n"
+        "class Somatic: pass\n"
+        "from unrelated import soma_four\n",
+        encoding="utf-8",
+    )
+    for name in SNAPSHOTS:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "RECORD", tmp_path / "record.json")
+    monkeypatch.setattr(sys.modules[__name__], "PACKAGES", ("sample",))
+    counts = current_counts(REQUIRED_WORDS)
+    assert {row: counts[row] for row in ZERO_ROWS} == {
+        "soma_imports": 3, "soma_classes": 3, "organelle_type_literals": 0,
+    }
+    assert _ZERO_ROW_FINDERS["soma_imports"]() == [
+        "sample/example.py:1 soma_one", "sample/example.py:1 soma_two", "sample/example.py:2 soma_three",
+    ]
+    assert _ZERO_ROW_FINDERS["soma_classes"]() == [
+        "sample/example.py:3 SomaThing", "sample/example.py:4 SomaAlias", "sample/example.py:5 Somatic",
+    ]
 
 
 def write_record() -> int:
