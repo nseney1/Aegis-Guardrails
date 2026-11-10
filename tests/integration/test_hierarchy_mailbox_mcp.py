@@ -2309,10 +2309,12 @@ def test_mb6_publish_refuses_invalid_plan_before_writing(mb3_pilot, monkeypatch,
     assert mailbox_snapshot(root) == before
 
 
-@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
-def test_mb6_publish_stat_failure_is_a_sanitized_refusal(mb3_pilot, monkeypatch, error):
+@pytest.mark.parametrize("host", ["codex-cli", "claude-code"])
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError, OSError])
+def test_mb6_publish_stat_failure_returns_success_with_size_unavailable(mb3_pilot, monkeypatch, host, error):
     import hierarchy_mailbox_mcp as mcp
     root, _ = mb3_pilot
+    mb3_host_plan(root, host=host)
     connection = mb3_connection(root)
     def unavailable(path):
         raise error("private OS detail: " + str(path))
@@ -2320,8 +2322,34 @@ def test_mb6_publish_stat_failure_is_a_sanitized_refusal(mb3_pilot, monkeypatch,
     result = mcp.handle(connection, {"jsonrpc": "2.0", "id": "publish", "method": "tools/call", "params": {
         "name": "mailbox_publish", "arguments": {
             "message_id": "mb6-stat", "to": "a/orchestrator", "type": "info", "body": "private body"}}})
-    assert result["isError"] is True
-    assert json.loads(result["content"][0]["text"]) == {
-        "error": "published message metadata unavailable; inspect the mailbox before retrying"}
+    assert not result.get("isError", False), result
     row, = invoke(root, "inbox", endpoint="a/orchestrator")["messages"]
     assert row["message"]["message_id"] == "mb6-stat"
+    assert json.loads(result["content"][0]["text"]) == {
+        "id": "mb6-stat", "path": row["path"], "sha256": hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest(),
+        "created_at": row["message"]["created_at"], "size": None,
+        "note": "message published; size metadata unavailable; do not retry publication"}
+
+
+@pytest.mark.parametrize("failure", ["busy", "duplicate"])
+def test_mb6_publish_failure_remains_an_error_without_reading_receipt_metadata(mb3_pilot, monkeypatch, failure):
+    import hierarchy_mailbox_mcp as mcp
+    root, _ = mb3_pilot
+    connection = mb3_connection(root)
+    frame = {"jsonrpc": "2.0", "id": "publish", "method": "tools/call", "params": {
+        "name": "mailbox_publish", "arguments": {
+            "message_id": "mb6-refused", "to": "a/orchestrator", "type": "info", "body": "private body"}}}
+    if failure == "duplicate":
+        assert not mcp.handle(connection, frame).get("isError", False)
+        expected = "message_id already exists: mb6-refused"
+    else:
+        (root / ".write.lock").write_text("fixture active writer", encoding="utf-8")
+        expected = "mailbox writer is busy; inspect an abandoned lock before retrying"
+    before = mailbox_snapshot(root)
+    def unexpected_stat(path):
+        pytest.fail("failed publication must not read receipt metadata")
+    monkeypatch.setattr(mcp, "os", SimpleNamespace(stat=unexpected_stat))
+    result = mcp.handle(connection, frame)
+    assert result["isError"] is True
+    assert json.loads(result["content"][0]["text"]) == {"error": expected}
+    assert mailbox_snapshot(root) == before
