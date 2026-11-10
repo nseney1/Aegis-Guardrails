@@ -1,6 +1,7 @@
 """aegis_core.storage atomic writes and JSONL I/O (ADR 0005 AD-3 L0)."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -365,7 +366,7 @@ def test_append_jsonl_writes_one_object_per_line(tmp_path: Path):
 
 
 @pytest.mark.parametrize("prefix", [None, b'{"old":'])
-def test_jsonl_reports_the_descriptor_identity_end_offset_and_bounded_tail(tmp_path, monkeypatch, prefix):
+def test_jsonl_reports_the_descriptor_identity_and_end_offset(tmp_path, monkeypatch, prefix):
     path = tmp_path / "ledger.jsonl"
     if prefix is not None:
         path.write_bytes(prefix)
@@ -378,7 +379,7 @@ def test_jsonl_reports_the_descriptor_identity_end_offset_and_bounded_tail(tmp_p
             written_through.append(((info.st_dev, info.st_ino), info.st_size))
         return real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fsync=fsync)))
     row = {"note": "café", "padding": "x" * 512}
     written = append_jsonl(path, [row])
     data = path.read_bytes()
@@ -387,17 +388,17 @@ def test_jsonl_reports_the_descriptor_identity_end_offset_and_bounded_tail(tmp_p
     assert written.report.identity == written_through[0][0]
     assert written.report.size == written_through[0][1] == len(data)
     assert written.report.added == len(data) - len(prefix or b"")
-    assert written.report.tail == data[-256:]
-    assert written.report.head == b""
+    assert not hasattr(written.report, "tail")
+    assert not hasattr(written.report, "head")
     read = read_jsonl(path)
     assert read.rows == [row]
     assert read.report.identity == written.report.identity
     assert read.report.size == len(data)
-    assert read.report.tail == data[-256:]
-    assert read.report.head == data[:256]
+    assert not hasattr(read.report, "tail")
+    assert not hasattr(read.report, "head")
 
 
-def test_append_without_head_read_reports_generation_and_io_start(tmp_path, monkeypatch):
+def test_jsonl_reports_generation_without_process_clock_or_extra_append_reads(tmp_path, monkeypatch):
     from aegis_core import storage
 
     path = tmp_path / "ledger.jsonl"
@@ -406,7 +407,7 @@ def test_append_without_head_read_reports_generation_and_io_start(tmp_path, monk
     opens, real_open = [], storage._open_regular
 
     def open_file(*args, **kwargs):
-        opens.append(storage.time.time_ns())
+        opens.append(args[0])
         return real_open(*args, **kwargs)
 
     def read(fd, size):
@@ -416,17 +417,16 @@ def test_append_without_head_read_reports_generation_and_io_start(tmp_path, monk
     # Replace only storage's reference, leaving pytest's own OS operations alone.
     monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), read=read)))
     monkeypatch.setattr(storage, "_open_regular", open_file)
-    started = storage.time.time_ns()
     written = append_jsonl(path, [{"rule": "a"}])
     after = path.stat()
     assert reads == [1]
-    assert storage.file_generation(written.report.size, written.report.mtime_ns, written.report.ctime_ns) == storage.file_generation(after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-    assert written.report.head == b""
-    assert started <= written.report.started_ns <= opens[0]
-    started = storage.time.time_ns()
+    assert written.report.size == after.st_size
+    assert written.report.started_ns is None
+    assert (written.report.mtime_ns, written.report.ctime_ns) == (0, 0)
     report = read_jsonl(path).report
     assert storage.file_generation(report.size, report.mtime_ns, report.ctime_ns) == storage.file_generation(after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-    assert started <= report.started_ns <= opens[1]
+    assert report.started_ns is None
+    assert opens == [path, path]
 
 
 def test_append_jsonl_keeps_the_file_valid_utf8(tmp_path: Path):
@@ -542,6 +542,37 @@ def test_read_jsonl_reports_an_unreadable_file_without_raising(tmp_path: Path):
     result = read_jsonl(path)
     assert result.rows == []
     assert result.error is not None and str(path) in result.error
+
+
+def test_read_jsonl_closes_descriptor_when_fdopen_fails(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    path.write_bytes(b'{"a":1}\n')
+    descriptors, real_open = [], storage._open_regular
+
+    def opened(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        descriptors.append(fd)
+        return fd
+
+    def refused(*args, **kwargs):
+        raise OSError(errno.EIO, "injected fdopen failure")
+
+    monkeypatch.setattr(storage, "_open_regular", opened)
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fdopen=refused)))
+    try:
+        result = read_jsonl(path)
+        assert result.rows == [] and result.report is None
+        assert result.error == f"cannot read {path}: injected fdopen failure"
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptors[0])
+        assert caught.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
 
 
 # ── Never through a link (review B2a round 3, F1) ────────────────────────────
