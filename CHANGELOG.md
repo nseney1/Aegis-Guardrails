@@ -19,6 +19,7 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `tools/hierarchy_team.py` runs one team from setup to cleanup from one config (`team-run.json`, `aegis.team-run/v1`) with nine subcommands: `init`, `login`, `root`, `up`, `request`, `approve`, `turn`, `status` and `down`. `up` writes `<base>/team.json`, so roles run at its model and effort, and checks each role's rollout; `approve` is one ROOT turn that reads the hash through `team_pending`; `turn` gives a role one owner turn, for example to answer a `silent_role` hold; `down` collects the evidence with `SHA256SUMS` and releases what the run holds. See `docs/hierarchy-team.md`. The M1 runbook now uses it.
 
 - `aegis msg read / write / verify` exposes the `aegis.msg/1` codec through the CLI, with compact views, code-authored spans and metadata, and fixed JSON errors.
+- `aegis_msg_read` and `aegis_msg_write` expose the shared message codec over MCP, with workspace-bound stores, verbatim bounded views matching the CLI, code-authored metadata, and fixed JSON refusals.
 
 ### Fixed
 

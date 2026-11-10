@@ -39,7 +39,8 @@ from aegis_core.workspace.layout import UserLayout
 
 from .projection import is_error_result
 from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
-from .registry import TOOL_DEFINITIONS
+from aegis_mcp.handlers.msg import message_result
+from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 from .tools import SERVER_INJECTED, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
@@ -106,6 +107,7 @@ def fresh_state() -> Dict[str, Any]:
 _RATE_LIMITS = {
     "aegis_report_outcome": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
     "aegis_capture_insight": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
+    "aegis_msg_write": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
 }
 # One stdio loop per process and no thread in aegis_mcp, so the limiter needs no lock.
 _tool_call_times: Dict[str, list] = {}
@@ -293,6 +295,19 @@ def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     }
 
 
+def _message_refusal(req_id, code, *, detail=None):
+    from aegis_core.message_codec import CodecError
+    from aegis_core.message_codec_format import frontend_error
+
+    value = frontend_error(CodecError(code, detail=detail), detail=detail)
+    return _tool_result(req_id, json.dumps(value, separators=(",", ":")), True)
+
+
+def _message_failure(req_id, error):
+    print("Message tool failed: " + type(error).__name__, file=sys.stderr)
+    return _message_refusal(req_id, "E_AUTH", detail="operation")
+
+
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
@@ -349,7 +364,14 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _manager_config is not None:
         return _manager_call(req_id, params)
 
+    if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or
+                                     any(k not in TOOL_ARGUMENTS[params["name"]] for k in supplied)):
+            return _message_refusal(req_id, "E_FORMAT")
     if _workspace_error is not None:
+        if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_refusal(req_id, "E_AUTH", detail="binding")
         return _tool_result(req_id, json.dumps(_unbound_result(_workspace_error)), True)
     if not isinstance(params, dict):
         return _error(req_id, -32602, "Tool call params must be an object.")
@@ -359,6 +381,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if args is None:
         args = {}
     if not isinstance(args, dict):
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_refusal(req_id, "E_FORMAT")
         return _error(req_id, -32602, "Tool arguments must be an object.")
     if not is_known_tool(name):
         return _error(req_id, -32602, f"Unknown tool: {name}")
@@ -366,6 +390,11 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         max_calls, window = _RATE_LIMITS[name]
         return _error(req_id, -32000, f"Rate limit exceeded for '{name}': max {max_calls} calls per {window}s")
 
+    if name in ("aegis_msg_read", "aegis_msg_write"):
+        try:
+            return _repository_call(req_id, params, name, args)
+        except Exception as exc:
+            return _message_failure(req_id, exc)
     return _repository_call(req_id, params, name, args)
 
 
@@ -379,19 +408,27 @@ def _repository_call(req_id, params, name, args):
     elif binding.status == "unbound" and name == "aegis_scan":
         args["_unbound"] = binding.reason
     else:
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            detail = "workspace" if binding.status == "unbound" else "binding"
+            return _message_refusal(req_id, "E_AUTH", detail=detail)
         return _tool_result(req_id, json.dumps(_unbound_result(binding)), True)
     args["_host"] = _client_platform
     args["_session"] = _session_id
     args["_client_name"] = _client_name
     args["_client_version"] = _client_version
-
     try:
         # Handlers may print progress notes; stdout belongs to the JSON-RPC framing.
         with contextlib.redirect_stdout(sys.stderr):
             result = execute_tool(name, args)
     except Exception as exc:
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_failure(req_id, exc)
         traceback.print_exc(file=sys.stderr)
         return _tool_result(req_id, f"Tool execution failed: {exc}", True)
+    if name in ("aegis_msg_read", "aegis_msg_write"):
+        text, needs_json = message_result(result)
+        return _tool_result(req_id, json.dumps(text, separators=(",", ":")) if needs_json else text,
+                            needs_json and "error" in text)
     return _tool_result(req_id, json.dumps(result), is_error_result(result))
 
 

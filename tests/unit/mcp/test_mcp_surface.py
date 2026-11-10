@@ -1,22 +1,18 @@
-"""The v4 MCP surface: four tools, no receipts, no session token, no execution tier.
+"""The MCP surface: registered tools, no receipts, no session token, no execution tier.
 
 These drive ``handle_request`` end to end, the way a host does over stdio.
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 import aegis_mcp.server as server
 
-SURVIVING_TOOLS = {
-    "aegis_scan",
-    "aegis_report_outcome",
-    "aegis_create_rule",
-    "aegis_list_rules",
-    "aegis_capture_insight",
-}
+SURVIVING_TOOLS = {tool["name"] for tool in json.loads(
+    (Path(__file__).resolve().parents[2] / "contract" / "mcp_tools.json").read_text(encoding="utf-8"))["tools"]}
 
 REMOVED_TOOLS = [
     "aegis_request_receipt",

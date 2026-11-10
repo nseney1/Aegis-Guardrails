@@ -40,15 +40,17 @@ concurrency guarantees live in one place:
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
 import stat
 import threading
 import time
+import uuid
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Union
 
 from aegis_core import gitsafe
@@ -111,6 +113,7 @@ __all__ = [
     "shared_state_dir",
     "shared_state_modes",
     "state_dir",
+    "message_store",
     "workspace_id",
     "workspace_relative",
     "worktree_label",
@@ -216,7 +219,7 @@ def _outside_error(path: Path) -> PathTraversalError:
 _STATE_GITIGNORE = b"# Aegis machine-local state; never committed.\n*\n"
 
 
-def state_dir(workspace: Any) -> Path:
+def state_dir(workspace: Any, *, directory_fd: Optional[int] = None) -> Path:
     """The workspace's ``.aegis/state`` directory, created if missing.
 
     Raises PathTraversalError when ``.aegis`` or ``.aegis/state`` is a symlink or
@@ -224,7 +227,11 @@ def state_dir(workspace: Any) -> Path:
     directly inside ``.aegis/state`` is a symlink or resolves outside it (a Windows
     junction): the ledger, the lock, the logs and migration backups would be written
     wherever it points. Writes ``state/.gitignore`` ("*") when it is missing.
+    ``directory_fd`` is a caller-held, anchored state directory; message_store
+    supplies it so preparation never reopens the state path during a rename.
     """
+    if directory_fd is not None:
+        return _state_dir_at(WorkspaceLayout(Path(os.fspath(workspace))), directory_fd)
     layout = WorkspaceLayout(Path(os.fspath(workspace)).resolve())
     for path in (layout.aegis_dir, layout.state_dir):
         if path.is_symlink():
@@ -242,6 +249,86 @@ def state_dir(workspace: Any) -> Path:
     if not os.path.lexists(layout.state_gitignore):
         atomic_write_bytes(layout.state_gitignore, _STATE_GITIGNORE)
     return layout.state_dir
+
+
+def _state_dir_at(layout, directory):
+    """Prepare an already anchored state directory; publish its ignore file atomically."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise _link_error(layout.state_dir / entry.name)
+    name = layout.state_gitignore.name
+    prepared_ignore = False
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        temporary = ".state-ignore-" + uuid.uuid4().hex
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            if os.write(fd, _STATE_GITIGNORE) != len(_STATE_GITIGNORE):
+                raise OSError(errno.EIO, "state ignore write incomplete")
+            os.fsync(fd)
+            try:
+                os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            except FileExistsError:
+                pass  # A concurrent creator owns the entry; inspect it without following it.
+        finally:
+            os.close(fd)
+            os.unlink(temporary, dir_fd=directory)
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        prepared_ignore = True
+    if stat.S_ISLNK(info.st_mode):
+        raise _link_error(layout.state_gitignore)
+    if prepared_ignore:
+        os.fsync(directory)
+    return layout.state_dir
+
+
+@contextmanager
+def message_store(workspace: Any, *, write: bool = False):
+    """Default message store, admitted by anchored descriptors before any record I/O."""
+    from . import message_codec as codec
+
+    capabilities = {function.__name__ for function in os.supports_dir_fd}
+    nofollow = {function.__name__ for function in os.supports_follow_symlinks}
+    codec.require({"open", "mkdir", "stat", "link", "unlink"} <= capabilities and "stat" in nofollow
+                  and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"), "E_AUTH")
+    layout = workspace.layout
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    message_path = layout.state_dir / "messages"
+    try:
+        with ExitStack() as stack:
+            parent = None
+            for component in (layout.root.anchor, *layout.root.parts[1:], layout.aegis_dir.name):
+                try:
+                    fd = os.open(component, flags, **({"dir_fd": parent} if parent is not None else {}))
+                except FileNotFoundError:
+                    raise codec.CodecError("E_AUTH", detail="workspace") from None
+                stack.callback(os.close, fd)
+                parent = fd
+            for directory in (layout.state_dir, message_path):
+                if write:
+                    try:
+                        os.mkdir(directory.name, mode=0o700 if directory == message_path else 0o777, dir_fd=parent)
+                    except FileExistsError:
+                        pass  # The anchored no-follow open validates the existing directory.
+                try:
+                    fd = os.open(directory.name, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    raise codec.CodecError("E_REF", detail="resolution") from None
+                stack.callback(os.close, fd)
+                parent = fd
+                if write and directory == layout.state_dir:
+                    state_dir(workspace, directory_fd=fd)
+            store = codec.Store(message_path)
+            stack.callback(store.close)
+            expected, actual = os.fstat(parent), os.fstat(store.fd)
+            codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
+            yield store
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+            raise codec.CodecError("E_AUTH") from None
+        raise
 
 
 # ── Shared state: one directory for every worktree of a repository ───────────
