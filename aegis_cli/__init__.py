@@ -11,6 +11,7 @@ from aegis_core.primitives import aegis_import_root as aegis_import_root
 
 
 NO_HOME_MESSAGE = "no home directory can be resolved on this machine (set HOME, or USERPROFILE on Windows)"
+_DISPLAY_CONTROLS = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 
 
 def resolve_root(args, default=None):
@@ -25,13 +26,62 @@ def resolve_root(args, default=None):
 
 
 def sanitize_display(text: object, max_len: Optional[int] = 80) -> str:
-    """Strip ANSI escapes, C1 control chars, and DCS/OSC sequences for safe terminal display."""
+    """Strip supported ANSI escapes and controls in linear time, then truncate.
+
+    A newline or end-of-input abandons an unterminated OSC/DCS string, preserving
+    its printable text. Each span is inspected at most twice, even with nested
+    unterminated introducers. Plain text bypasses the character loop.
+    """
     text = str(text)
-    text = re.sub(r'\x1b(?:\[[0-9;?]*[a-zA-Z]|\].*?(?:\x07|\x1b\\)|P.*?(?:\x1b\\|\x07)|[=><NOM78c])', '', text)
-    text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', text)
-    text = re.sub(r'[\x80-\x9f]', '', text)
-    text = text.replace('\n', ' ').replace('\r', '')
-    text = text.replace('\t', ' ')
+    first_control = _DISPLAY_CONTROLS.search(text)
+    if first_control is None:
+        return text[:max_len - 3] + '...' if max_len is not None and len(text) > max_len else text
+    index = first_control.start()
+    shown = [text[:index]]
+    size = len(text)
+    literal_until = 0
+    while index < size:
+        char = text[index]
+        if char == '\x1b' and index + 1 < size:
+            kind = text[index + 1]
+            if kind in (']', 'P') and index >= literal_until:
+                end = index + 2
+                while end < size and text[end] != '\n':
+                    if text[end] == '\x07':
+                        index = end + 1
+                        break
+                    if text[end] == '\x1b' and end + 1 < size and text[end + 1] == '\\':
+                        index = end + 2
+                        break
+                    end += 1
+                else:
+                    # No string beginning before this boundary can terminate.
+                    # Render that span normally without rescanning its suffixes.
+                    literal_until = end
+                    shown.append(kind)
+                    index += 2
+                continue
+            if kind == '[':
+                end = index + 2
+                while end < size and text[end] in '0123456789;?':
+                    end += 1
+                if end < size and ('a' <= text[end] <= 'z' or 'A' <= text[end] <= 'Z'):
+                    index = end + 1
+                else:
+                    # Keep the legacy printable portion of an unsupported CSI,
+                    # consuming its parameter run once even when no final exists.
+                    shown.append(text[index + 1:end])
+                    index = end
+                continue
+            if kind in '=><NOM78c':
+                index += 2
+                continue
+        if char in ('\n', '\t'):
+            shown.append(' ')
+        elif ord(char) >= 32 and not 127 <= ord(char) <= 159:
+            shown.append(char)
+        index += 1
+    text = ''.join(shown)
     if max_len is not None and len(text) > max_len:
         text = text[:max_len - 3] + '...'
     return text
