@@ -6,6 +6,10 @@ from __future__ import annotations
 
 import os
 import stat
+import io
+import json
+import shlex
+import sys
 
 import pytest
 
@@ -52,6 +56,489 @@ def test_a_passing_check_of_the_staged_tree_adds_the_trailer(tmp_path):
 @needs_git
 def test_no_check_row_means_no_trailer(tmp_path):
     assert "Aegis-Check" not in _commit(_project(tmp_path))
+
+
+@needs_git
+@pytest.mark.skipif(not hg.signing_ok(), reason="needs git >= 2.34 and ssh-keygen")
+def test_installed_hook_keeps_insight_approval_message_verifiable(tmp_path):
+    from aegis_core import human_gate
+
+    repo = _project(tmp_path)
+    key, pub = hg.keygen(tmp_path / "keys", "human")
+    repo.write("allowed_signers", hg.allowed_signers_text(pub))
+    base = repo.commit("trust owner")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    text = "Reviewed insight"
+    message = "chore: approve insight\n\nAegis-Approve-Insight: " + human_gate.insight_text_hash(text) + "\n"
+    repo.home.sign_with(str(key))
+    repo.git("commit", "-q", "-S", "-s", "--allow-empty", "-m", message)
+    approval = repo.head()
+    body = repo.git("log", "-1", "--format=%B")
+    assert "Aegis-Check:" not in body and "Signed-off-by:" in body
+    assert human_gate.verify_insight_approval(repo.root, approval, text, base).valid
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+@pytest.mark.parametrize("original, authority", [
+    (b"work\n", False),
+    (b"caf\xe9\n", False),
+    (b"approve\n\nAegis-Approve: " + b"b" * 64 + b"\n", True),
+    (b"caf\xe9\n\nAegis-Approve-Insight: " + b"b" * 64 + b"\n", True),
+    (b"chore: pasted\n\n" + b"x" * 9000 + b"\n", False),
+    (b"chore: pasted\n\n" + b"x" * 9000 + b"\n\nAegis-Approve: " + b"b" * 64 + b"\n", True),
+    (b"work\n" + ("Я" * 6899 + "\n").encode("cp1251") * 4, False),
+    (b"work\n" + ("Я" * 6899 + "\n").encode("cp1251") * 4 + b"\nAegis-Approve: " + b"b" * 64 + b"\n", True),
+], ids=["plain", "latin1", "authority", "latin1-authority", "long-line", "long-line-authority", "cp1251", "cp1251-authority"])
+def test_hook_uses_the_portable_helper_and_preserves_authority_bytes(
+        tmp_path, monkeypatch, platform, original, authority):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "os", SimpleNamespace(**{**vars(os), "name": platform}))
+    line = "Aegis-Check: tree=" + "b" * 40 + " exit=0"
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
+    calls = []
+    add_trailer = gitsafe.add_trailer
+
+    def recorded_add_trailer(path, trailer):
+        calls.append((path, trailer))
+        return add_trailer(path, trailer)
+
+    monkeypatch.setattr(gitsafe, "add_trailer", recorded_add_trailer)
+    assert commitmsg.main([str(message)]) == 0
+    if authority:
+        assert message.read_bytes() == original and calls == []
+    else:
+        assert message.read_bytes().startswith(original)
+        assert message.read_bytes().splitlines()[-1] == line.encode("ascii")
+        assert calls == [(str(message), line)]
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("name", ["Aegis-Approve", "Aegis-Approve-Insight", "Aegis-Exempt-Test", "Aegis-Manager-Approve"])
+def test_hook_checks_the_row_then_preserves_each_authority(tmp_path, monkeypatch, capsys, name):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = "approve\n\n" + name + ": " + "b" * 64 + "\n"
+    message.write_text(original, encoding="utf-8")
+    calls = []
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: calls.append(root) or "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert calls == [repo.root] and message.read_text(encoding="utf-8") == original
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("kind", ["missing", "oversized"])
+def test_hook_missing_or_oversized_message_stays_unchanged(tmp_path, monkeypatch, capsys, kind):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"x" * 65537
+    if kind == "missing":
+        message.unlink()
+    else:
+        message.write_bytes(original)
+    calls = []
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: calls.append(root) or "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert calls == [repo.root]
+    assert message.read_bytes() == original if kind == "oversized" else not message.exists()
+    reason = "message too large" if kind == "oversized" else "unreadable"
+    assert capsys.readouterr().err == f"aegis prepare-commit-msg: Aegis-Check not added ({reason})\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_hook_closes_a_failed_bounded_read_without_echoing_input(tmp_path, monkeypatch, capsys):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"work\n"
+    message.write_bytes(original)
+    opened, counts = [], []
+
+    class FailedRead:
+        def __enter__(self):
+            self.stream = open(message, "rb")
+            opened.append(self.stream)
+            return self
+
+        def readline(self, count):
+            counts.append(count)
+            raise OSError("private untrusted detail")
+
+        read = readline
+
+        def __exit__(self, *_args):
+            self.stream.close()
+
+    monkeypatch.setattr(commitmsg, "open", lambda *_args: FailedRead(), raising=False)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert counts and all(0 < count <= 4096 for count in counts) and all(stream.closed for stream in opened)
+    assert message.read_bytes() == original
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (unreadable)\n"
+
+
+CUT_LINE = b"# ------------------------ >8 ------------------------"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("kind", ["status", "long-comment", "cut-diff", "diff-authority"])
+def test_hook_judges_only_the_candidate_message(tmp_path, monkeypatch, capsys, kind):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    if kind == "status":
+        repo.git("config", "core.commentChar", "#")
+        status = b"#\tstaged path\n" * 10000
+        assert len(status) > 65536
+        original = status + b"work\n\n"
+    elif kind == "long-comment":
+        original = b"#" + b"x" * 90000 + b"\nwork\n"
+    else:
+        original = b"work\n\n" + CUT_LINE + b"\n"
+        original += b"  Aegis-Approve: X\n" if kind == "diff-authority" else b"+diff\n" * 20000
+    message.write_bytes(original)
+    if kind != "diff-authority":
+        assert len(original) > 65536
+    monkeypatch.chdir(repo.root)
+    line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
+    assert commitmsg.main([str(message)]) == 0
+    result = message.read_bytes()
+    assert line.encode("ascii") in result.split(CUT_LINE)[0]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_hook_authority_above_the_cut_is_byte_identical_and_silent(tmp_path, monkeypatch, capsys):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"approve\n\nAegis-Approve: " + b"a" * 64 + b"\n" + CUT_LINE + b"\n" + b"+diff\n" * 20000
+    message.write_bytes(original)
+    calls = []
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: calls.append(root) or "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original and calls == [repo.root]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("value", [";", "auto", "##", " #", "#\n"])
+def test_hook_unsupported_comment_character_has_one_fixed_notice(tmp_path, monkeypatch, capsys, value):
+    repo = hg.make_repo(tmp_path)
+    repo.git("config", "core.commentChar", value)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"work\n"
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("failure", ["exit", "timeout"])
+def test_hook_comment_config_error_has_one_fixed_notice(tmp_path, monkeypatch, capsys, failure):
+    from aegis_core import gitsafe
+    from subprocess import CompletedProcess
+
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+    run = gitsafe.run
+
+    def config_error(args, *a, **kw):
+        if args[0] == "config":
+            if failure == "timeout":
+                raise gitsafe.GitError("private config detail")
+            return CompletedProcess(args, 128, b"", b"private config detail")
+        return run(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", config_error)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == b"work\n"
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_hook_scan_cap_stops_reads_and_closes_the_stream(tmp_path, monkeypatch, capsys):
+    repo = hg.make_repo(tmp_path)
+    limit = getattr(commitmsg, "MAX_MESSAGE_SCAN_BYTES", 4 * 1024 * 1024)
+    assert limit >= 4 * 1024 * 1024
+    sizes, positions = [], []
+
+    class CountedStream(io.BytesIO):
+        def readline(self, count=-1):
+            sizes.append(count)
+            result = super().readline(count)
+            positions.append(self.tell())
+            return result
+
+        def read(self, count=-1):
+            sizes.append(count)
+            result = super().read(count)
+            positions.append(self.tell())
+            return result
+
+    stream = CountedStream(b"#" + b"x" * (limit + 100) + b"\nwork\n")
+    monkeypatch.setattr(commitmsg, "open", lambda *_args: stream, raising=False)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(repo.root / ".git" / "COMMIT_EDITMSG")]) == 0
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (scan limit)\n"
+    assert sizes and all(0 < size <= 4096 for size in sizes)
+    assert positions[-1] == limit and max(positions) <= limit and stream.closed
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["LF", "CRLF"])
+def test_hook_stops_the_scan_at_the_cut_line(tmp_path, monkeypatch, capsys, ending):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    prefix = b"work\n\n" + CUT_LINE + ending
+    original = prefix + b"  Aegis-Manager-Approve: X\n" + b"+diff\n" * 20000
+    message.write_bytes(original)
+    positions = []
+
+    class CountedStream(io.BytesIO):
+        def readline(self, count=-1):
+            result = super().readline(count)
+            positions.append(self.tell())
+            return result
+
+        def read(self, count=-1):
+            result = super().read(count)
+            positions.append(self.tell())
+            return result
+
+    stream = CountedStream(original)
+    monkeypatch.setattr(commitmsg, "open", lambda *_args: stream, raising=False)
+    monkeypatch.chdir(repo.root)
+    line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
+    calls = []
+    # Real LF publication is covered above; Git's CRLF publication limitation is a handoff finding.
+    monkeypatch.setattr(gitsafe, "add_trailer", lambda path, trailer: calls.append((path, trailer)) or True)
+    assert commitmsg.main([str(message)]) == 0
+    assert calls == [(str(message), line)]
+    assert positions[-1] == len(prefix) and max(positions) <= len(prefix) and stream.closed
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("failure", ["false", "error"])
+def test_hook_publish_failure_has_one_fixed_notice(tmp_path, monkeypatch, capsys, failure):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+
+    def refused(*_args):
+        if failure == "error":
+            raise gitsafe.GitError("private publication detail")
+        return False
+
+    monkeypatch.setattr(gitsafe, "add_trailer", refused)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == b"work\n"
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (unreadable)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("source", [None, "merge", "squash"])
+def test_hook_without_a_passing_row_or_for_skipped_sources_is_silent(tmp_path, monkeypatch, capsys, source):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: None)
+    argv = [str(message)] + ([source] if source else [])
+    assert commitmsg.main(argv) == 0
+    assert message.read_bytes() == b"work\n"
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("settings", [
+    [("core.commentString", ";")],
+    [("core.commentChar", "#"), ("core.commentString", "//")],
+    [("core.commentString", "//"), ("core.commentChar", "#")],
+    [("core.commentString", "#\ncore.commentchar #")],
+    [("core.commentChar", "#\ncore.commentstring #")],
+], ids=["string-only", "char-then-string", "string-then-char", "multiline-string", "multiline-char"])
+def test_hook_requires_every_comment_key_to_be_hash(tmp_path, monkeypatch, capsys, settings):
+    repo = hg.make_repo(tmp_path)
+    for key, value in settings:
+        repo.git("config", "--add", key, value)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"work\n"
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_hook_accepts_only_hash_values_from_one_combined_query(tmp_path, monkeypatch, capsys):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    for key in ("core.commentChar", "core.commentString", "core.commentChar"):
+        repo.git("config", "--add", key, "#")
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+    calls, run = [], gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[0] == "config":
+            calls.append(tuple(args))
+        return run(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    monkeypatch.chdir(repo.root)
+    line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes().splitlines()[-1] == line.encode("ascii")
+    assert len(calls) == 1 and "--get-regexp" in calls[0]
+    assert r"^core\.comment(char|string)$" in calls[0]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("raw", [
+    b"", b"core.commentchar\n#", b"core.commentchar #\0",
+    b"core.commentstring\n#\ncore.commentchar #\0", b"core.commentchar\n#\0\0",
+    b"core.commentchar\n#\0" * 4000, b"core.other\n#\0",
+], ids=["empty", "unterminated", "no-key-separator", "multiline-value", "empty-record", "over-limit", "unexpected-key"])
+def test_hook_refuses_malformed_or_oversized_comment_query_output(tmp_path, monkeypatch, capsys, raw):
+    from aegis_core import gitsafe
+    from subprocess import CompletedProcess
+
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+    run, calls = gitsafe.run, []
+
+    def malformed(args, *a, **kw):
+        if args[0] == "config":
+            calls.append(tuple(args))
+            return CompletedProcess(args, 0, raw, b"")
+        return run(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", malformed)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == b"work\n" and len(calls) == 1
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("prefix", [b";", b"//", b"future", b"x" * 4090, b"x" * (4096 - len(CUT_LINE[1:]))],
+                         ids=["semicolon", "slash", "future", "split-tail", "full-fragment"])
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n", b""], ids=["LF", "CRLF", "EOF"])
+def test_hook_refuses_an_unproved_cut_marker(tmp_path, monkeypatch, capsys, prefix, ending):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"work\n\n" + prefix + CUT_LINE[1:] + ending
+    if ending:
+        original += b"  Aegis-Manager-Approve: X\n"
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("key, value", [("core.commentChar", ";"), ("core.commentString", "//"),
+                                      ("core.commentString", "#")])
+def test_hook_without_a_passing_row_never_reads_comment_config(tmp_path, monkeypatch, capsys, key, value):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    repo.git("config", key, value)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(b"work\n")
+    calls, run = [], gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[0] == "config":
+            calls.append(tuple(args))
+        return run(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    monkeypatch.chdir(repo.root)
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == b"work\n" and not calls
+    assert capsys.readouterr().err == ""
+
+
+@needs_git
+def test_real_git_c_comment_string_reaches_the_hook_and_refuses_publication(tmp_path):
+    repo = _project(tmp_path)
+    repo.git("add", "-A")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    editor = tmp_path / "editor.py"
+    editor.write_text("import sys\nfrom pathlib import Path\np=Path(sys.argv[1])\n"
+                      "p.write_bytes(b'ordinary work\\n\\n' + p.read_bytes())\n", encoding="utf-8")
+    result = hg.run_git(repo.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", "core.commentString=;", "commit", "-q", "-v",
+                        env={**repo.home.env, "GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))},
+                        check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+    body = repo.git("log", "-1", "--format=%B")
+    assert body.splitlines()[0] == "ordinary work" and "Aegis-Check:" not in body
+    assert repo.git("rev-parse", "HEAD^{tree}") == row["tree"]
+
+
+@needs_git
+def test_real_verbose_editor_commit_retains_the_trailer_before_a_large_diff(tmp_path):
+    repo = _project(tmp_path)
+    repo.write("docs/verbose.txt", "before\n Aegis-Manager-Approve: X\nstable\n")
+    repo.commit("base for verbose diff")
+    repo.write("docs/verbose.txt", "before\n Aegis-Manager-Approve: X\nstable\n" + "new line " * 10 + "\n" + "x" * 80 + "\n")
+    with (repo.root / "docs/verbose.txt").open("a", encoding="utf-8") as stream:
+        stream.write(("new line " * 10 + "\n") * 1000)
+    repo.git("add", "-A")
+    assert len(repo.git("diff", "--cached").encode("utf-8")) > 65536
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    seen, editor = tmp_path / "editor-seen.json", tmp_path / "editor.py"
+    editor.write_text(
+        "import json, sys\nfrom pathlib import Path\np = Path(sys.argv[1])\nraw = p.read_bytes()\n"
+        f"Path({str(seen)!r}).write_text(json.dumps({{'bytes': len(raw), 'before_cut': "
+        "b'Aegis-Check:' in raw.split(b'# ------------------------ >8 ------------------------')[0]}))\n"
+        "p.write_bytes(b'work from editor\\n\\n' + raw)\n", encoding="utf-8")
+    repo.git("commit", "-q", "-v", env={"GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))})
+    observed = json.loads(seen.read_text(encoding="utf-8"))
+    assert observed["bytes"] > 65536 and observed["before_cut"]
+    body = repo.git("log", "-1", "--format=%B")
+    assert body.startswith("work from editor\n")
+    assert f"Aegis-Check: tree={row['tree']} exit=0" in body
+    assert "Aegis-Manager-Approve:" not in body
 
 
 @needs_git
