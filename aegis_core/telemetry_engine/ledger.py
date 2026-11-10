@@ -45,7 +45,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from aegis_core import gitsafe
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import is_within, utc_stamp
-from aegis_core.storage import append_jsonl, ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label
+from aegis_core.storage import (
+    FileReport, ReportedRows, append_jsonl, ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label,
+)
 from aegis_core.workspace.layout import WorkspaceLayout
 
 __all__ = [
@@ -416,15 +418,16 @@ def _current_index(path: Path) -> _Index:
     return view
 
 
-def _write(path: Path, rows: List[Dict[str, Any]]) -> None:
+def _write(path: Path, rows: List[Dict[str, Any]]) -> Optional[FileReport]:
     """Append rows and absorb them into the index. Call with the workspace lock held."""
     try:
-        append_jsonl(path, rows)
+        written = append_jsonl(path, rows)
     except BaseException:
         with _INDEX_GUARD:
             _INDEXES.pop(str(path), None)  # the file may hold part of the write: re-read it next time
         raise
     _current_index(path)
+    return getattr(written, "report", None)
 
 
 def _validated(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -556,9 +559,8 @@ def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, An
             new_rows.append(written)
             if identity is not None:
                 seen.add(identity)
-        if new_rows:
-            _write(path, new_rows)
-        return new_rows
+        report = _write(path, new_rows) if new_rows else None
+        return ReportedRows(new_rows, report)
 
 
 # ── Merging the ledgers of several worktrees (v4.2 #7) ───────────────────────
