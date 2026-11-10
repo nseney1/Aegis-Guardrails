@@ -176,6 +176,38 @@ def test_container_identity_needs_no_orchestrator(module):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_team_import_loads_only_container_verification_leaf():
+    code = ("import sys; sys.path.insert(0, %r); " % str(SCRIPT.parent)
+            + "import hierarchy_team; "
+              "assert sorted(name for name in sys.modules if name.startswith('hierarchy_container')) "
+              "== ['hierarchy_container_verify']")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_team_absolute_delegates_to_verification_leaf(adapter, monkeypatch):
+    team = importlib.import_module("hierarchy_team")
+    verifier = importlib.import_module("hierarchy_container_verify")
+    calls = []
+    expected = Path("/fixture/run")
+
+    def absolute(value, label):
+        calls.append((value, label))
+        return expected
+
+    monkeypatch.setattr(verifier, "_absolute", absolute)
+    assert team.absolute("/fixture/run", "fixture path") is expected
+    assert calls == [("/fixture/run", "fixture path")]
+
+
+@pytest.mark.parametrize("value", [Path("/fixture/run"), b"/fixture/run"])
+def test_team_absolute_keeps_string_input_contract(adapter, value):
+    team = importlib.import_module("hierarchy_team")
+    with pytest.raises(ValueError, match="^invalid fixture path$"):
+        team.absolute(value, "fixture path")
+
+
 def test_verification_leaf_public_contract(adapter, layout):
     verifier = importlib.import_module("hierarchy_container_verify")
     expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
@@ -185,6 +217,14 @@ def test_verification_leaf_public_contract(adapter, layout):
     assert verifier.verify(value, expected) == ["user"]
     assert verifier.verify("[", expected) == ["inspect"]
     assert verifier.verify(value, None) == ["expected"]
+
+
+def test_container_facade_imports_only_consumed_verifier_names():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    imported = {alias.asname or alias.name for node in tree.body if isinstance(node, ast.ImportFrom)
+                and node.module == "hierarchy_container_verify" for alias in node.names}
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    assert imported - used - {"container_name", "verify"} == set()
 
 
 def test_facade_exposes_every_name_used_by_suite(adapter):
