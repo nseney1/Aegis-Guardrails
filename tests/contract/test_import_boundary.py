@@ -84,6 +84,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
     "aegis_core.team": 1,
+    "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,
     "aegis_core.manager_store": 1,
@@ -106,6 +107,7 @@ CORE_LAYERS: Dict[str, int] = {
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
+    "aegis_core.credit_memo": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
     # Standalone stdlib unittest reporting, launched by the L1 test execution service.

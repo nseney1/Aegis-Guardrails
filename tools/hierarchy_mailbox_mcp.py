@@ -682,30 +682,6 @@ class Connection:
                                      capacity_error=INBOX_CURSOR_CAPACITY)
         return self._pager
 
-    @property
-    def inbox_session(self):
-        return self._pager.session if self._pager is not None else None
-
-    @property
-    def inbox_briefs_session(self):
-        return self._pager.briefs_session if self._pager is not None else None
-
-    @property
-    def offered_inbox_page(self):
-        return self._pager.offered if self._pager is not None else None
-
-    @property
-    def pending_inbox_page(self):
-        return self._pager.pending if self._pager is not None else None
-
-    @property
-    def inbox_cutoffs(self):
-        return self._pager.cutoffs if self._pager is not None else {}
-
-    @property
-    def inbox_cursors(self):
-        return self._pager.cursors if self._pager is not None else {}
-
     def begin_response(self):
         # Staging is response-local, including malformed requests and failed writes.
         if self._pager is not None:
@@ -736,23 +712,17 @@ class Connection:
         return {"endpoint": endpoint, "binding": binding, "checkpoint_briefs": briefs, "messages_total": total}
 
     def slim_inbox_metadata(self):
-        """Only a validated host plan opts this endpoint into metadata slimming.
-
-        Absence preserves the standalone two-file adapter and legacy inbox bytes.
-        Import the existing plan validator only for a configured base; no host
-        kind is inspected, and this read-only choice grants no authority.
-        """
-        base = Path(self.root).parent
-        path = base / "host-plan.json"
+        """Use validated host plans for slim metadata; preserve standalone bytes when absent."""
+        path = Path(self.root).parent / "host-plan.json"
         try:
             if not path.exists() and not path.is_symlink():
                 return False
             import hierarchy_hosts
-            return hierarchy_hosts.base_plan(base, endpoint_parts(self.sender["from"])[0]) is not None
+            return hierarchy_hosts.base_plan(path.parent, endpoint_parts(self.sender["from"])[0]) is not None
         except ImportError as exc:
-            raise ValueError("inbox host plan validation unavailable; restore the complete runtime") from exc
+            raise ValueError("host plan validation unavailable; restore the complete runtime") from exc
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-            raise ValueError("invalid inbox host plan; repair the governing plan before retrying") from exc
+            raise ValueError("invalid host plan; repair the governing plan before retrying") from exc
 
     def inbox(self, arguments, *, slimming=None):
         """Authorize one snapshot, then delegate planned page selection and state."""
@@ -841,8 +811,16 @@ class Connection:
         if name == "mailbox_publish":
             fields(arguments, {"message_id", "to", "type", "body"},
                    {"brief", "in_reply_to", "acknowledgment", "readiness", "result", "receipt"})
+            compact = self.slim_inbox_metadata()
             with writer_lock(self.root):
-                return self.checked_mailbox().publish({**arguments, **self.sender})
+                result = self.checked_mailbox().publish({**arguments, **self.sender})
+            if compact:
+                try:
+                    return {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
+                            "created_at": result["message"]["created_at"], "size": os.stat(result["path"]).st_size}
+                except OSError as exc:
+                    raise ValueError("published message metadata unavailable; inspect the mailbox before retrying") from exc
+            return result
         if name == "mailbox_ack_handoff":
             fields(arguments, {"checkpoint_sha256"})
             matching(arguments["checkpoint_sha256"], SHA256, "checkpoint sha256")
@@ -863,9 +841,7 @@ class Connection:
 
 
 def handle(connection, request):
-    begin = getattr(connection, "begin_response", None)
-    if begin is not None:
-        begin()
+    connection.begin_response()
     fields(request, {"jsonrpc", "method"}, {"id", "params"})
     require(request["jsonrpc"] == "2.0", "unsupported JSON-RPC version")
     text(request["method"], "method", 128)
