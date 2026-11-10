@@ -44,6 +44,7 @@ __all__ = [
     "find_review_approval",
     "is_branch_name",
     "find_test_exemption",
+    "exemption_finder",
     "governance_tree_hash",
     "insight_text_hash",
     "signed_empty_commit",
@@ -710,13 +711,12 @@ def _verify_commit_sig(top: Path, oid: str, base: str, ok_reason: str) -> Approv
     status, fingerprint = _signature(top, oid, signers or b"")
     if status == "G":
         return Approval(True, "ok", ok_reason, oid, fingerprint)
-    if status == "N":
-        return _no("unsigned", "the commit is not signed", oid)
-    if status == "U":
-        return _no("untrusted_signature", "the signing key is not in the base allowed_signers", oid)
-    if status == "E":
-        return _no("unverifiable", "git could not check the signature", oid)
-    return _no("bad_signature", f"the signature does not verify (git reports {status!r})", oid)
+    refusals = {
+        "N": ("unsigned", "the commit is not signed"),
+        "U": ("untrusted_signature", "the signing key is not in the base allowed_signers"),
+        "E": ("unverifiable", "git could not check the signature"),
+    }
+    return _no(*refusals.get(status, ("bad_signature", f"the signature does not verify (git reports {status!r})")), oid)
 
 
 def _commit_message(top: Path, oid: str) -> Optional[str]:
@@ -726,11 +726,9 @@ def _commit_message(top: Path, oid: str) -> Optional[str]:
 
 def _read_message(top: Path, oid: str) -> Union[str, Approval]:
     message = _commit_message(top, oid)
-    if message is None:
-        return _no("unresolved", f"cannot read commit {oid}", oid)
-    if _ACCEPT_LINE.search(message):
-        return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
-    return message
+    return (_no("unresolved", f"cannot read commit {oid}", oid) if message is None else
+            _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
+            if _ACCEPT_LINE.search(message) else message)
 
 
 def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str, List[str]]]:
@@ -745,16 +743,8 @@ def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str,
     return tip, base, res.stdout.decode("ascii", "replace").split()
 
 
-def _verify_single_trailer(
-    root: Any,
-    commit: str,
-    base_ref: Optional[str],
-    rx: re.Pattern[str],
-    name: str,
-    expected: str,
-    mismatch_msg: str,
-    ok_msg: str,
-) -> Approval:
+def _verify_single_trailer(root: Any, commit: str, base_ref: Optional[str], rx: re.Pattern[str],
+                           name: str, expected: str, mismatch_msg: str, ok_msg: str) -> Approval:
     try:
         top = _top(root)
         base_target = base_ref or gitsafe.resolve_base_ref(top)
@@ -825,8 +815,7 @@ def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base
         top = _top(root)
         oid, fix_oid, base = (gitsafe.resolve_commit(top, rev) for rev in (approval_commit, fix_commit, base_ref))
         if not oid or not fix_oid or not base:
-            why = f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}"
-            return _no("unresolved", why, str(approval_commit))
+            return _no("unresolved", f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}", str(approval_commit))
         message = _read_message(top, oid)
         if isinstance(message, Approval):
             return message
@@ -997,27 +986,38 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
 
 
 @gitsafe.scrubbed()
-def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
-    """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
-    trailer names it (so a refusal can say why); else None."""
+def exemption_finder(root: Any, head: str, base_ref: str) -> Callable[[str], Optional[Approval]]:
+    """Index once, newest first: lookups return the first valid exemption, else first rejection, else None.
+    Read full commit messages individually; release each before reading the next object."""
     top = _top(root)
     scan = _commits_in(top, head, base_ref)
-    fix_oid = gitsafe.resolve_commit(top, fix_commit)
-    if scan is None or not fix_oid:
-        return None
-    rejected: Optional[Approval] = None
-    for oid in scan[2]:
-        if oid == fix_oid:  # a commit cannot carry its own full oid
-            continue
-        verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
-        if verdict.valid:
-            return verdict
-        # unresolved and accept_reserved come before the trailer is read: keep them only for a commit naming the fix
-        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch") and any(
-            t.lower() == fix_oid.lower() for t, _why in _EXEMPT_TEST_LINE.findall(_commit_message(top, oid) or "")
-        ):
-            rejected = verdict
-    return rejected
+    candidates: Dict[str, List[str]] = {}
+    if scan is not None:
+        for oid in scan[2]:
+            message = _commit_message(top, oid)
+            if message is None:
+                candidates.clear()
+                break
+            for target in dict.fromkeys(t.lower() for t, _why in _EXEMPT_TEST_LINE.findall(message) if t.lower() != oid):
+                candidates.setdefault(target, []).append(oid)
+            del message  # Release the full message before reading the next raw object.
+
+    @gitsafe.scrubbed()
+    def find(fix_commit: str) -> Optional[Approval]:
+        fix_oid = gitsafe.resolve_commit(top, fix_commit)
+        rejected: Optional[Approval] = None
+        for oid in candidates.get(fix_oid or "", []):
+            verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
+            if verdict.valid:
+                return verdict
+            if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch"):
+                rejected = verdict
+        return rejected
+    return find
+
+
+def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
+    return exemption_finder(root, head, base_ref)(fix_commit)
 
 
 def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:
