@@ -8,12 +8,11 @@ cannot carry them.
 """
 import argparse
 from contextlib import contextmanager, nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import time
 
@@ -68,16 +67,8 @@ def _inbox_now():
 
 
 def _parse_inbox_time(value):
-    """Parse the pinned UTC grammar without version-dependent fromisoformat fractions."""
-    match = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})"
-                         r"(?:\.([0-9]{1,6}))?Z", value) if type(value) is str else None
-    require(match is not None, "invalid UTC timestamp")
-    try:
-        parts = [int(part) for part in match.groups()[:6]]
-        microsecond = int((match.group(7) or "").ljust(6, "0"))
-        return datetime(*parts, microsecond=microsecond, tzinfo=timezone.utc)
-    except ValueError as exc:
-        raise ValueError("invalid UTC timestamp") from exc
+    from hierarchy_mailbox_pager import parse_inbox_time
+    return parse_inbox_time(value)
 
 
 @contextmanager
@@ -114,41 +105,8 @@ def _error_text(exc):
 
 
 def _bounded_inbox(result, render):
-    """Match the pinned linear pager with logarithmically many transport renders.
-
-    All selected records/briefs are validated before paging. Check metadata and
-    the first message separately: neither may be skipped to make another fit.
-    For validated mailbox records, each added message/path outweighs any shrink
-    in remaining/next_after, including the final cursor becoming null.
-    """
-    messages = result["messages"]
-    total = len(messages) + result["remaining"]
-
-    def page(count):
-        remaining = total - count
-        return {**result, "messages": messages[:count], "remaining": remaining,
-                "next_after": messages[count - 1]["message"]["message_id"] if count and remaining else None}
-
-    empty = page(0)
-    require(len(render(empty)) <= MAX_INBOX_RESPONSE_BYTES,
-            "inbox response metadata exceeds 4194304 bytes")
-    if not messages:
-        return empty
-    require(len(render(page(1))) <= MAX_INBOX_RESPONSE_BYTES,
-            "inbox first message cannot fit 4194304 byte response budget")
-    low, high = 1, len(messages)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(render(page(middle))) <= MAX_INBOX_RESPONSE_BYTES:
-            low = middle
-        else:
-            high = middle - 1
-    return page(low)
-
-
-def _binding_identity(binding):
-    """Binding identity excludes its editable cutoff and checkpoint contents."""
-    return tuple(binding[key] for key in ("endpoint", "host", "session", "generation"))
+    from hierarchy_mailbox_pager import bounded_inbox
+    return bounded_inbox(result, render, max_response_bytes=MAX_INBOX_RESPONSE_BYTES)
 
 
 def _brief_status(mailbox, brief):
@@ -551,12 +509,7 @@ class Connection:
         self.delivery_dir = mailbox.delivery_directory(delivery_dir) if delivery_dir is not None else None
         self.returned = []
         self.inbox_pager = False
-        self.inbox_session = None
-        self.inbox_briefs_session = None
-        self.offered_inbox_page = None
-        self.pending_inbox_page = None
-        self.inbox_cutoffs = {}
-        self.inbox_cursors = {}
+        self._pager = None
         self.checked_mailbox()
         self.initiative = initiative
         self.workspace_tools = ()
@@ -719,54 +672,56 @@ class Connection:
             return self.workspace.capacity_view(ledger)
         return self.workspace.initiative_view(ledger, self.initiative)
 
+    @property
+    def pager(self):
+        """Load planned state lazily, preserving the standalone legacy adapter."""
+        if self._pager is None:
+            from hierarchy_mailbox_pager import InboxPager
+            self._pager = InboxPager(clock=lambda: _inbox_now(), brief_dedupe_max_bytes=BRIEF_DEDUPE_MAX_BYTES,
+                                     since_clock_skew_seconds=SINCE_CLOCK_SKEW_SECONDS,
+                                     capacity_error=INBOX_CURSOR_CAPACITY)
+        return self._pager
+
+    @property
+    def inbox_session(self):
+        return self._pager.session if self._pager is not None else None
+
+    @property
+    def inbox_briefs_session(self):
+        return self._pager.briefs_session if self._pager is not None else None
+
+    @property
+    def offered_inbox_page(self):
+        return self._pager.offered if self._pager is not None else None
+
+    @property
+    def pending_inbox_page(self):
+        return self._pager.pending if self._pager is not None else None
+
+    @property
+    def inbox_cutoffs(self):
+        return self._pager.cutoffs if self._pager is not None else {}
+
+    @property
+    def inbox_cursors(self):
+        return self._pager.cursors if self._pager is not None else {}
+
     def begin_response(self):
         # Staging is response-local, including malformed requests and failed writes.
-        self.pending_inbox_page = None
-        self.offered_inbox_page = None
+        if self._pager is not None:
+            self._pager.begin_response()
         if self.inbox_pager:
             self.returned = []
 
     def note_returned(self, page, rendered_bytes):
-        if not self.inbox_pager:
-            # Legacy reads have no walk, cutoff or metadata-delivery state.
-            self.returned = [row["message"]["message_id"] for row in page["messages"]]
-            return
-        offered = self.offered_inbox_page
-        cursor = page["next_after"]
-        contexts = self.inbox_cursors.get(cursor, set())
-        retain_cursor = cursor is not None
-        if retain_cursor:
-            known = offered["walk"] in contexts
-            require(known or sum(map(len, self.inbox_cursors.values())) < MAX_INBOX_CURSOR_PAIRS,
-                    INBOX_CURSOR_CAPACITY)
+        if self.inbox_pager:
+            self.pager.stage(page, rendered_bytes, max_cursor_pairs=MAX_INBOX_CURSOR_PAIRS)
         self.returned = [row["message"]["message_id"] for row in page["messages"]]
-        self.pending_inbox_page = ({**offered, "retain_cursor": retain_cursor}, cursor, rendered_bytes)
 
     def record_inbox_page(self):
-        """Commit after stdout flush; only small responses can suppress later texts."""
-        pending, self.pending_inbox_page = self.pending_inbox_page, None
-        if pending is not None:
-            offered, cursor, rendered_bytes = pending
-            # Unfiltered recovery must not replace an earlier frozen cutoff.
-            self.inbox_cutoffs.setdefault(offered["binding"], offered["cutoff"])
-            walk = offered["walk"]
-            if offered["retain_cursor"]:
-                self.inbox_cursors.setdefault(cursor, set()).add(walk)
-            elif cursor is None:
-                # Every issued context remains valid until its own walk drains,
-                # regardless of which other walks issue the same message ID.
-                for identifier, contexts in list(self.inbox_cursors.items()):
-                    contexts.discard(walk)
-                    if not contexts:
-                        del self.inbox_cursors[identifier]
-            if offered["slimming"] and rendered_bytes <= BRIEF_DEDUPE_MAX_BYTES:
-                self.inbox_session = offered["session"]
-                if offered["include_briefs"]:
-                    self.inbox_briefs_session = offered["session"]
-            else:
-                # Even a recovery page can be truncated. Keep all full metadata owed.
-                self.inbox_session = None
-                self.inbox_briefs_session = None
+        """Called by the transport only after stdout flush succeeds."""
+        if self._pager is not None:
+            self._pager.commit()
 
     def binding_view(self):
         """The pinned binding-only shape, using the same single fenced snapshot."""
@@ -800,128 +755,22 @@ class Connection:
             raise ValueError("invalid inbox host plan; repair the governing plan before retrying") from exc
 
     def inbox(self, arguments, *, slimming=None):
-        """MCP D-U3/D3 contract, superseding the pinned pager's every-page texts.
-
-        A call uses one fenced binding snapshot throughout. A validated governing
-        host plan opts into this entire pager contract. Without one, call() uses
-        the pinned legacy inbox/binding readers and transport pager, without
-        provenance tracking or cutoff state. Metadata deduplication
-        is per process, binding identity, checkpoint hash and recorded timestamp;
-        only flushed responses <= BRIEF_DEDUPE_MAX_BYTES count. briefs=full forces
-        recovery regardless of that state. binding_only never advances it.
-
-        Every issued cursor, including defaults before any collision, is associated
-        with (order, since, snapshot, cutoff) after flush. All pairs share
-        MAX_INBOX_CURSOR_PAIRS with no live eviction. The cap supports all four
-        option combinations over MAX_RECORDS messages at one binding snapshot.
-        Retries remain valid until that walk drains and frees its contexts. Unknown
-        IDs are legacy-compatible only under oldest with no since. Nondefault
-        order/since are echoed; filtered pages disclose excluded before the cursor.
-
-        On the first successful inbox page, freeze created_at per endpoint/host/session/
-        generation, independently of its editable checkpoint hash. Subsequent drift,
-        times beyond SINCE_CLOCK_SKEW_SECONDS in the future, and UTC comparisons
-        disagreeing with the pinned string sort refuse. Include equal timestamps
-        and checkpoint pending IDs. Timestamp filtering is never proof of reading
-        all mail; recover from wake holds by reading oldest without since.
-        """
-        include_briefs = arguments.get("include_briefs", False)
-        require(type(include_briefs) is bool, "include_briefs must be boolean")
-        force_full = "briefs" in arguments
-        if force_full:
-            require(type(arguments["briefs"]) is str and arguments["briefs"] == "full",
-                    "briefs must be full; use that exact string or omit briefs")
-            require("include_briefs" not in arguments or include_briefs,
-                    "briefs full requires include_briefs; omit include_briefs or use true")
-            include_briefs = True
-        order = arguments.get("order", "oldest")
-        require(type(order) is str and order in ("oldest", "newest"),
-                "order must be oldest or newest; use an exact string")
-        since = "since" in arguments
-        if since:
-            require(type(arguments["since"]) is str and arguments["since"] == "current_generation",
-                    "since must be current_generation; use that exact string or omit since")
-        call_time = _inbox_now() if since else None
+        """Authorize one snapshot, then delegate planned page selection and state."""
+        request = self.pager.prepare(arguments)
         try:
             mailbox, snapshot = self.checked_binding()
         except ValueError as exc:
-            if since and str(exc).startswith("endpoint has no session binding:"):
+            if request.since and str(exc).startswith("endpoint has no session binding:"):
                 raise ValueError("current_generation requires a binding; bind the endpoint and reconnect") from exc
             raise
-        endpoint = self.sender["from"]
-        binding = {**snapshot, "ready": mailbox.ready(snapshot)}
+        ready = mailbox.ready(snapshot)
         if slimming is None:
             slimming = self.slim_inbox_metadata()
-        identity = _binding_identity(snapshot)
-        session = (*identity, snapshot["checkpoint_sha256"], snapshot["created_at"])
         limit = arguments.get("limit", 20)
         integer(limit, "inbox limit", maximum=100)
-        # Keep the pinned whole-history validation, including records outside this page.
-        records = sorted((r for r in mailbox.messages().values() if r["message"]["to"] == endpoint),
-                         key=lambda r: (r["message"]["created_at"], r["message"]["message_id"]),
-                         reverse=order == "newest")
-        cutoff = None
-        excluded = 0
-        if since:
-            cutoff = snapshot["created_at"]
-            previous = self.inbox_cutoffs.get(identity)
-            require(previous is None or previous == cutoff,
-                    "current_generation cutoff changed; omit since to read the full inbox")
-            boundary = _parse_inbox_time(cutoff)
-            require(boundary <= call_time + timedelta(seconds=SINCE_CLOCK_SKEW_SECONDS),
-                    "current_generation cutoff is in the future; omit since to read the full inbox")
-            pending = set((snapshot["checkpoint"] or {}).get("pending_message_ids", []))
-            eligible = []
-            for record in records:
-                stamp = record["message"]["created_at"]
-                included = _parse_inbox_time(stamp) >= boundary
-                require(included == (stamp >= cutoff),
-                        "current_generation timestamp order is ambiguous; omit since to read the full inbox")
-                if included or record["message"]["message_id"] in pending:
-                    eligible.append(record)
-            excluded = len(records) - len(eligible)
-        else:
-            eligible = records
-        walk = (order, "current_generation" if since else None, session, cutoff)
-        after = arguments.get("after_message_id")
-        if after is not None:
-            matching(after, SLUG, "after message id")
-            issued = self.inbox_cursors.get(after)
-            require((walk in issued) if issued is not None else (order == "oldest" and not since),
-                    "inbox cursor does not match this walk; restart the walk without after_message_id")
-            require(any(r["message"]["message_id"] == after for r in records),
-                    "inbox cursor does not name a received message")
-            positions = [i for i, r in enumerate(eligible) if r["message"]["message_id"] == after]
-            require(bool(positions), "inbox cursor is outside current_generation; omit after_message_id")
-            eligible = eligible[positions[0] + 1:]
-        selected = eligible[:limit]
-        if include_briefs:
-            for record in selected:
-                brief = record["message"].get("brief")
-                if brief is not None:
-                    record["brief_text"] = mailbox.brief(brief).decode("utf-8")
-        checkpoint_briefs = []
-        if include_briefs:
-            for brief in (snapshot["checkpoint"] or {}).get("briefs", []):
-                if force_full or not slimming or self.inbox_briefs_session != session:
-                    checkpoint_briefs.append({**brief, "text": mailbox.brief(brief).decode("utf-8")})
-                else:
-                    checkpoint_briefs.append(_brief_status(mailbox, brief))
-        if slimming and not force_full and self.inbox_session == session:
-            # Preserve current identity, checkpoint identity and current acknowledgment;
-            # omit the schema, timestamp and bulky checkpoint already delivered.
-            binding = {key: binding[key] for key in
-                       ("endpoint", "host", "session", "generation", "checkpoint_sha256", "ready")}
-        self.offered_inbox_page = {"session": session, "include_briefs": include_briefs, "walk": walk,
-                                   "binding": identity, "cutoff": snapshot["created_at"], "slimming": slimming}
-        result = {"endpoint": endpoint, "messages": selected, "remaining": max(0, len(eligible) - limit),
-                  "binding": binding, "checkpoint_briefs": checkpoint_briefs,
-                  "next_after": selected[-1]["message"]["message_id"] if len(eligible) > limit else None}
-        if order != "oldest":
-            result["order"] = order
-        if since:
-            result.update(since="current_generation", excluded=excluded)
-        return result
+        return self.pager.page(request, snapshot=snapshot, ready=ready, records=mailbox.messages().values(),
+                               limit=limit, after=arguments.get("after_message_id"), read_brief=mailbox.brief,
+                               brief_status=lambda brief: _brief_status(mailbox, brief), slimming=slimming)
 
     def record_read(self):
         # Called only after the response is written and flushed. A failure or crash before then
