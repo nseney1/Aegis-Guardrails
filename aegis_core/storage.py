@@ -100,6 +100,7 @@ __all__ = [
     "atomic_write_bytes",
     "atomic_write_text",
     "create_private_file",
+    "file_generation",
     "file_lock",
     "fsync_dir",
     "ledger_locked",
@@ -713,6 +714,19 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
 
 # ── JSONL ─────────────────────────────────────────────────────────────────────
 
+# On Windows os.stat() reports st_ctime as the creation time while os.fstat()
+# reports the last-change time, so a path stat and an fd stat of the same
+# unchanged file disagree once it has ever been written (BUG-035). Creation
+# time never moves on a rewrite anyway; st_ino, st_size and st_mtime_ns still
+# catch replacement and modification there.
+_COMPARE_CTIME = os.name != "nt"
+
+
+def file_generation(size: int, mtime_ns: int, ctime_ns: int) -> Tuple[int, int, int]:
+    """Comparable size and generation stamps for path stats, fd stats and reports."""
+    return size, mtime_ns, ctime_ns if _COMPARE_CTIME else 0
+
+
 @dataclass(frozen=True)
 class FileReport:
     """Descriptor evidence for one I/O operation, with at most 256 bytes at each end."""
@@ -722,6 +736,9 @@ class FileReport:
     tail: bytes
     added: int = 0
     head: bytes = b""
+    mtime_ns: int = 0
+    ctime_ns: int = 0
+    started_ns: Optional[int] = None
 
 
 class JsonlAppend(int):
@@ -741,23 +758,15 @@ class ReportedRows(list):
         self.report = report
 
 
-def _file_report(fd: int, data: bytes, *, appended: bool = False) -> Optional[FileReport]:
+def _file_report(fd: int, data: bytes, *, appended: bool = False,
+                 started_ns: Optional[int] = None) -> Optional[FileReport]:
     try:
         info = os.fstat(fd)
-        if appended:
-            count = min(info.st_size, 256)
-            if count <= 0:
-                return None
-            os.lseek(fd, 0, os.SEEK_SET)
-            head = os.read(fd, count)
-            if len(head) != count:
-                return None
-        else:
-            head = data[:256]
     except OSError:
         return None  # Evidence is optional; a completed I/O operation still succeeded.
     return FileReport((info.st_dev, info.st_ino), info.st_size if appended else len(data),
-                      data[-256:], len(data) if appended else 0, head)
+                      data[-256:], len(data) if appended else 0, b"" if appended else data[:256],
+                      info.st_mtime_ns, info.st_ctime_ns, started_ns)
 
 
 def _encode_rows(rows: Iterable[Dict[str, Any]]) -> bytes:
@@ -781,6 +790,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     the torn bytes stay as one unreadable line and the new rows stay intact. Callers that
     need ordering or deduplication hold ``locked()``. Returns the number of rows written,
     with optional ``report`` evidence captured from the descriptor after the write.
+    Generation stamps and the I/O start time are captured without extra reads.
     """
     rows = list(rows)
     payload = _encode_rows(rows)
@@ -789,6 +799,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     created = not os.path.lexists(target)
+    started_ns = time.time_ns()
     fd = _open_regular(target, os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=mode)
     try:
         size = os.fstat(fd).st_size
@@ -798,7 +809,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
                 payload = b"\n" + payload
         _write_all(fd, payload)
         os.fsync(fd)
-        report = _file_report(fd, payload, appended=True)
+        report = _file_report(fd, payload, appended=True, started_ns=started_ns)
     finally:
         os.close(fd)
     if created:
@@ -920,6 +931,7 @@ def read_jsonl(
     caller passes bytes every wanted row carries verbatim and re-checks the fields.
     """
     report = None
+    started_ns = time.time_ns()
     try:
         # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
         fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
@@ -940,7 +952,7 @@ def read_jsonl(
         try:
             with os.fdopen(fd, "rb") as fh:
                 data = fh.read()
-                report = _file_report(fh.fileno(), data)
+                report = _file_report(fh.fileno(), data, started_ns=started_ns)
         except OSError as exc:
             return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
 

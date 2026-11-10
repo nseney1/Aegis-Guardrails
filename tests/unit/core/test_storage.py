@@ -388,13 +388,45 @@ def test_jsonl_reports_the_descriptor_identity_end_offset_and_bounded_tail(tmp_p
     assert written.report.size == written_through[0][1] == len(data)
     assert written.report.added == len(data) - len(prefix or b"")
     assert written.report.tail == data[-256:]
-    assert written.report.head == data[:256]
+    assert written.report.head == b""
     read = read_jsonl(path)
     assert read.rows == [row]
     assert read.report.identity == written.report.identity
     assert read.report.size == len(data)
     assert read.report.tail == data[-256:]
     assert read.report.head == data[:256]
+
+
+def test_append_without_head_read_reports_generation_and_io_start(tmp_path, monkeypatch):
+    from aegis_core import storage
+
+    path = tmp_path / "ledger.jsonl"
+    append_jsonl(path, [{"padding": "x" * 512}])
+    reads, real_read = [], os.read
+    opens, real_open = [], storage._open_regular
+
+    def open_file(*args, **kwargs):
+        opens.append(storage.time.time_ns())
+        return real_open(*args, **kwargs)
+
+    def read(fd, size):
+        reads.append(size)
+        return real_read(fd, size)
+
+    # Replace only storage's reference, leaving pytest's own OS operations alone.
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), read=read)))
+    monkeypatch.setattr(storage, "_open_regular", open_file)
+    started = storage.time.time_ns()
+    written = append_jsonl(path, [{"rule": "a"}])
+    after = path.stat()
+    assert reads == [1]
+    assert storage.file_generation(written.report.size, written.report.mtime_ns, written.report.ctime_ns) == storage.file_generation(after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    assert written.report.head == b""
+    assert started <= written.report.started_ns <= opens[0]
+    started = storage.time.time_ns()
+    report = read_jsonl(path).report
+    assert storage.file_generation(report.size, report.mtime_ns, report.ctime_ns) == storage.file_generation(after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    assert started <= report.started_ns <= opens[1]
 
 
 def test_append_jsonl_keeps_the_file_valid_utf8(tmp_path: Path):
