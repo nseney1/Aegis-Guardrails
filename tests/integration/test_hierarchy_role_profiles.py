@@ -12,6 +12,7 @@ PR259's registry enforcement now refuses the front door's former Read override: 
 The archived golden remains unchanged; the expected successor explicitly names this capability correction.
 Runtime provenance adds an exact retained-bootstrap envelope around every old MCP command, including the inline
 Codex config. Only the expected snapshot gets that reviewed envelope; actual settings and argv remain exact.
+The MCP interpreter follows the provision record; the archived golden keeps its historical path.
 """
 import json
 import os
@@ -45,22 +46,27 @@ def normalized(value, tmp):
     return value
 
 
-def with_runtime_bootstrap(value):
+def with_runtime_bootstrap(value, python):
     """The reviewed successor of the historical expected commands; never transform actual output."""
     legacy = ["-I", "-B", "<tmp>/source/tools/hierarchy_mailbox.py"]
     successor = ["-I", "-B", "<tmp>/initiatives/pilot/runtime-source.py", "--provision",
                  "<tmp>/initiatives/pilot/provision.json", "--entry", legacy[2], "--"]
     if isinstance(value, dict):
-        return {key: with_runtime_bootstrap(item) for key, item in value.items()}
+        return {key: (python if key == "command" and item == "/usr/bin/python3" and
+                      value.get("args", [])[:3] == legacy else with_runtime_bootstrap(item, python))
+                for key, item in value.items()}
     if isinstance(value, list):
         if value[:3] == legacy:
             return successor + value[3:]
-        return [with_runtime_bootstrap(item) for item in value]
+        return [with_runtime_bootstrap(item, python) for item in value]
     if isinstance(value, str) and value.startswith("mcp_servers="):
         # The Codex wake argv embeds TOML. Replace only this exact legacy args prefix, keeping every suffix byte.
         before = "args=" + json.dumps(legacy)[:-1] + ", "
         after = "args=" + json.dumps(successor)[:-1] + ", "
-        return value.replace(before, after, 1)
+        value = value.replace(before, after, 1)
+        command = 'mcp_servers={aegis_mailbox={command="/usr/bin/python3",'
+        successor_command = "mcp_servers={aegis_mailbox={command=" + json.dumps(python) + ","
+        return value.replace(command, successor_command, 1)
     return value
 
 
@@ -94,6 +100,7 @@ def variants(host):
 
 def build(tmp_path):
     snapshot = {}
+    interpreters = {}
     for host in ("claude-code", "codex-cli", "codex"):
         for index, options in enumerate(variants(host)):
             # A fresh initiative per variant, so one role's binding never decides another variant's answer.
@@ -101,6 +108,7 @@ def build(tmp_path):
             folder.mkdir()
             setup = Setup(folder)
             setup.init()
+            python = normalized(json.loads((setup.base / "provision.json").read_text(encoding="utf-8"))["python"], folder)
             writable = folder / "writable"
             writable.mkdir()
             for endpoint in ENDPOINTS:
@@ -114,6 +122,7 @@ def build(tmp_path):
                     request[key] = value
                 key = "%s %s %s" % (host, endpoint, json.dumps(options, sort_keys=True))
                 snapshot[key] = normalized(answer(setup, "add-role", request), folder)
+                interpreters[key] = python
             if host == "codex-cli":
                 for endpoint in ENDPOINTS:
                     if endpoint.endswith("/root"):
@@ -124,7 +133,8 @@ def build(tmp_path):
                                     for key, value in options.items()})
                     key = "codex-start %s %s" % (endpoint, json.dumps(options, sort_keys=True))
                     snapshot[key] = normalized(answer(setup, "codex-start", request), folder)
-    return snapshot
+                    interpreters[key] = python
+    return snapshot, interpreters
 
 
 def team_kinds(tmp_path):
@@ -146,11 +156,12 @@ def team_kinds(tmp_path):
 
 
 def test_every_legacy_role_keeps_its_exact_profile(tmp_path):
-    expected = with_runtime_bootstrap(json.loads(GOLDEN.read_text(encoding="utf-8")))
+    expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
     expected["profiles"]['claude-code pilot/front-door {"tools": "Read"}'] = {
         "error": "the front-door role does not permit file tool: Read"}
-    actual = {"profiles": build(tmp_path), "team_kinds": team_kinds(tmp_path)}
+    profiles, interpreters = build(tmp_path)
+    actual = {"profiles": profiles, "team_kinds": team_kinds(tmp_path)}
     assert set(actual["profiles"]) == set(expected["profiles"])
     for key in sorted(expected["profiles"]):
-        assert actual["profiles"][key] == expected["profiles"][key], key
+        assert actual["profiles"][key] == with_runtime_bootstrap(expected["profiles"][key], interpreters[key]), key
     assert actual["team_kinds"] == expected["team_kinds"]

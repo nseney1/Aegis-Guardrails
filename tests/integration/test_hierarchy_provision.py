@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -26,6 +27,10 @@ WAKE = ROOT / "tools" / "hierarchy_wake.py"
 INITIATIVE = {"id": "pilot", "project": "aegis", "repository": "aegis", "priority": 5, "target_branch": "develop"}
 LANES = {"f2": "implementer", "integration": "integrator", "review": "reviewer"}
 MAILBOX_TOOLS = {"mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"}
+RB2_PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
+                          'pass an absolute, executable "python" in the init request')
+RB2_RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
+                                  'restore it, or remove the unregistered base and run init again')
 _SOURCE_SEED = pytest.StashKey[Path]()
 
 
@@ -167,6 +172,230 @@ def test_init_builds_the_mailbox_registers_the_initiative_and_pins_the_source(se
     assert pinned["source_tree"] == git(setup.source, "rev-parse", "HEAD^{tree}")
 
 
+def test_init_uses_the_bound_interpreter_for_a_working_mcp_connection(tmp_path):
+    built = Setup(tmp_path)
+    record = built.init()
+    assert record["python"] == sys.executable
+    assert json.loads((built.base / "provision.json").read_text())["python"] == sys.executable
+    role = built.add_role("pilot/orchestrator", cwd=str(tmp_path))
+    server = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]
+    assert server["command"] == sys.executable
+    assert "mailbox_inbox" in start_connection(role["connection"])
+
+
+def test_init_needs_no_system_python_path(tmp_path, mr1_cli, monkeypatch):
+    module, call = mr1_cli
+    built = Setup(tmp_path)
+    interpreter = str(tmp_path / "bound-python")
+    shutil.copy2(sys.executable, interpreter)
+    monkeypatch.setattr(module, "sys", SimpleNamespace(executable=interpreter))
+    # Replace only the provisioner's OS reference, leaving pytest's filesystem operations intact.
+    monkeypatch.setattr(module, "os", SimpleNamespace(
+        X_OK=os.X_OK, access=lambda path, mode: path != "/usr/bin/python3" and os.access(path, mode)))
+    record = call("init", built.init_request())
+    assert record["python"] == interpreter
+
+
+@pytest.mark.parametrize("interpreter", [None, "", "missing"])
+def test_init_refuses_an_unavailable_bound_interpreter_without_publication(tmp_path, mr1_cli, monkeypatch,
+                                                                         interpreter):
+    module, call = mr1_cli
+    built = Setup(tmp_path)
+    if interpreter == "missing":
+        interpreter = str(tmp_path / "missing-python")
+    monkeypatch.setattr(module, "sys", SimpleNamespace(executable=interpreter))
+    assert call("init", built.init_request(), expect=2) == {"error": RB2_PYTHON_UNAVAILABLE}
+    assert not built.base.exists()
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "not-executable"])
+def test_init_refuses_an_unavailable_explicit_interpreter(tmp_path, kind):
+    built = Setup(tmp_path)
+    interpreter = tmp_path / "unavailable-python"
+    if kind == "directory":
+        interpreter.mkdir()
+    elif kind == "not-executable":
+        interpreter.write_text("not executable", encoding="utf-8")
+        interpreter.chmod(0o600)
+    assert provision("init", built.init_request(python=str(interpreter)), expect=2) == {
+        "error": RB2_PYTHON_UNAVAILABLE}
+    assert not built.base.exists()
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+def test_init_preserves_an_explicit_interpreter_override(tmp_path):
+    built = Setup(tmp_path)
+    interpreter = str(Path(sys.executable).resolve())
+    assert provision("init", built.init_request(python=interpreter))["python"] == interpreter
+    role = built.add_role("pilot/orchestrator", cwd=str(tmp_path))
+    server = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_mailbox"]
+    assert server["command"] == interpreter
+    assert "mailbox_inbox" in start_connection(role["connection"])
+
+
+@pytest.mark.parametrize("python", [5, "", None, "\x00", "x" * 4097])
+def test_rb2_explicit_malformed_python_keeps_its_validation_error(tmp_path, python):
+    built = Setup(tmp_path)
+    assert provision("init", built.init_request(python=python), expect=2) == {"error": "invalid python"}
+    assert not built.base.exists()
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+@pytest.fixture
+def rb2_pending(tmp_path, mr1_cli, monkeypatch):
+    import hierarchy_workspace
+
+    _, call = mr1_cli
+    built = Setup(tmp_path)
+    built.python = tmp_path / "pending-python"
+    shutil.copy2(sys.executable, built.python)
+    publish = hierarchy_workspace.publish_file
+
+    def interrupted(path, raw, **kwargs):
+        if path.parent == built.workspace.store / "events":
+            raise OSError("registration interrupted")
+        return publish(path, raw, **kwargs)
+
+    # Fail only the workspace's file-publication boundary, after the real base was renamed into place.
+    with monkeypatch.context() as patch:
+        patch.setattr(hierarchy_workspace, "publish_file", interrupted)
+        assert call("init", built.init_request(python=str(built.python)), expect=2) == {
+            "error": "registration interrupted"}
+    assert json.loads((built.base / "provision.json").read_text())["python"] == str(built.python)
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+    return built
+
+
+@pytest.mark.parametrize("kind", ["removed", "relative", "directory", "not-executable", "missing-field", "invalid",
+                                 "oversized"])
+def test_rb2_pending_init_refuses_an_unavailable_recorded_interpreter(rb2_pending, kind):
+    built = rb2_pending
+    path = built.base / "provision.json"
+    record = json.loads(path.read_text())
+    if kind == "removed":
+        built.python.unlink()
+    elif kind == "not-executable":
+        built.python.chmod(0o600)
+    elif kind == "missing-field":
+        del record["python"]
+    else:
+        record["python"] = {"relative": "relative-python", "directory": str(built.tmp), "invalid": 5,
+                            "oversized": "x" * 4097}[kind]
+    path.write_text(json.dumps(record), encoding="utf-8")
+    before = path.read_bytes()
+    assert provision("init", built.init_request(), expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+    assert path.read_bytes() == before
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+def test_rb2_pending_init_keeps_the_runtime_source_refusal_for_a_non_object_record(rb2_pending):
+    built = rb2_pending
+    path = built.base / "provision.json"
+    path.write_text("[]", encoding="utf-8")
+    assert provision("init", built.init_request(), expect=2) == {
+        "error": ("runtime source verification failed: expected commit=None tree=None; "
+                  "observed commit=unavailable tree=unavailable; list indices must be integers or slices, not str; "
+                  "reprovision into a new base through the existing handoff flow")}
+    assert path.read_text() == "[]"
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+@pytest.mark.parametrize("recorded_available", [False, True])
+def test_rb2_init_reports_a_base_collision_before_interpreter_checks(rb2_pending, recorded_available):
+    built = rb2_pending
+    if not recorded_available:
+        built.python.unlink()
+    before = (built.base / "provision.json").read_bytes()
+    request = built.init_request(python=sys.executable)
+    request["initiative"]["id"] = "second"
+    assert provision("init", request, expect=2) == {
+        "error": "initiative base already exists: " + str(built.base)}
+    assert (built.base / "provision.json").read_bytes() == before
+    initiatives = built.workspace.run("status")["initiatives"]
+    assert "pilot" not in initiatives and "second" not in initiatives
+
+
+def test_rb2_pending_init_refuses_a_conflicting_explicit_python(rb2_pending):
+    built = rb2_pending
+    before = (built.base / "provision.json").read_bytes()
+    assert provision("init", built.init_request(python=sys.executable), expect=2) == {
+        "error": "python does not match provision.json"}
+    assert (built.base / "provision.json").read_bytes() == before
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_rb2_pending_init_reuses_the_available_recorded_interpreter(rb2_pending, explicit):
+    built = rb2_pending
+    options = {"python": str(built.python)} if explicit else {}
+    assert provision("init", built.init_request(**options))["python"] == str(built.python)
+    assert "pilot" in built.workspace.run("status")["initiatives"]
+
+
+@pytest.mark.parametrize("fault", [OSError, ValueError])
+def test_rb2_interpreter_probe_failure_has_a_fixed_refusal_and_hint(tmp_path, mr1_cli, monkeypatch, fault):
+    module, call = mr1_cli
+    built = Setup(tmp_path)
+
+    def unavailable(*args):
+        raise fault("probe detail must not be echoed")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(X_OK=os.X_OK, access=unavailable))
+    assert call("init", built.init_request(), expect=2) == {"error": RB2_PYTHON_UNAVAILABLE}
+    assert not built.base.exists()
+    assert "pilot" not in built.workspace.run("status")["initiatives"]
+
+
+def test_rb2_no_plan_codex_output_changes_only_the_legacy_interpreter(tmp_path):
+    built = Setup(tmp_path)
+    request = built.init_request()
+    assert "python" not in request
+    provision("init", request)
+    assert not (built.base / "host-plan.json").exists()
+    session = "01a19a29-d635-7411-8529-9efedafc0881"
+    role = built.add_role("pilot/lane/review", "codex-cli", session=session, cwd=str(built.source))
+    arguments = ["-I", "-B", str(built.base / "runtime-source.py"), "--provision", str(built.base / "provision.json"),
+                 "--entry", str(built.source / "tools/hierarchy_mailbox.py"), "--", "--root", str(built.root), "serve",
+                 "--endpoint", "pilot/lane/review", "--host", "codex-cli", "--session", session, "--generation", "1",
+                 "--delivery-dir", str(built.base / "delivery"), "--workspace-store", str(built.workspace.store),
+                 "--initiative", "pilot"]
+    features = ["apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2", "memories", "computer_use",
+                "browser_use", "browser_use_external", "browser_use_full_cdp_access", "goals", "shell_tool", "unified_exec"]
+    tools = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
+    # Literal pre-RB-2 expectations; no checkout history or product renderer supplies expected bytes.
+    legacy_profile = {
+        "schema": "aegis.hierarchy-codex-profile/v1", "endpoint": "pilot/lane/review", "role": "reviewer",
+        "host": "codex-cli", "session": session, "generation": 1, "sandbox": "read-only", "writable_roots": [],
+        "network_access": False, "approval_policy": "never", "ignore_user_config": True, "disabled_features": features,
+        "mcp_servers": {"aegis_mailbox": {"command": "/usr/bin/python3", "args": arguments, "required": True,
+            "enabled_tools": tools, "tools": {"mailbox_inbox": {"output_token_limit": 30000},
+                "mailbox_publish": {"approval_mode": "approve"}, "mailbox_ack_handoff": {"approval_mode": "approve"}}}},
+        "model": None, "effort": None, "service_tier": None, "tmpdir": None, "add_dirs": [],
+        "cwd": str(built.source), "skip_git_repo_check": False}
+    legacy_config = ('mcp_servers={aegis_mailbox={command="/usr/bin/python3",args=' + json.dumps(arguments) +
+                     ',required=true,enabled_tools=' + json.dumps(tools) +
+                     ',tools={mailbox_inbox={output_token_limit=30000},mailbox_publish={approval_mode="approve"},'
+                     'mailbox_ack_handoff={approval_mode="approve"}}}}')
+    legacy_argv = ["codex", *[word for feature in features for word in ("--disable", feature)], "exec",
+                   "--ignore-user-config", "--sandbox", "read-only", "-c", 'approval_policy="never"',
+                   "-c", legacy_config, "--json", "-C", str(built.source), "resume", session]
+
+    def substitute(value):
+        return value.replace(json.dumps("/usr/bin/python3"), json.dumps(sys.executable))
+
+    expected_profile = substitute(json.dumps(legacy_profile, indent=2)) + "\n"
+    expected_argv = [substitute(word) for word in legacy_argv]
+    assert Path(role["codex_profile"]).read_text() == expected_profile
+    wake = {"schema": "aegis.hierarchy-wake-profile/v1", "endpoint": "pilot/lane/review", "host": "codex-cli",
+            "session": session, "generation": 1, "argv": expected_argv, "cwd": str(built.source),
+            "timeout_seconds": 900, "prompt_via": "argv"}
+    assert Path(role["wake_profile"]).read_text() == json.dumps(wake, indent=2) + "\n"
+    assert json.loads(Path(role["connection"]).read_text()) == {
+        "mcpServers": {"aegis_mailbox": {"command": sys.executable, "args": arguments}}}
+    assert substitute(legacy_config) in json.loads(Path(role["wake_profile"]).read_text())["argv"]
+
+
 def test_init_refuses_an_existing_base(setup):
     request = setup.init_request()
     request["initiative"] = {**INITIATIVE, "id": "second"}
@@ -298,7 +527,7 @@ def test_a_native_thread_gets_a_flat_connection_and_no_wake_profile(setup):
     role = setup.add_role("pilot/orchestrator", "codex", session="01a19a9d-b1ad-7b22-bec1-5e465d490ae6")
     assert role["wake"] == "native" and "wake_profile" not in role and "start_argv" not in role
     definition = json.loads(Path(role["connection"]).read_text())
-    assert definition["command"] == "/usr/bin/python3" or Path(definition["command"]).is_absolute()
+    assert definition["command"] == sys.executable
     arguments = definition["args"]
     assert arguments[arguments.index("--host") + 1] == "codex"
     assert arguments[arguments.index("--session") + 1] == "01a19a9d-b1ad-7b22-bec1-5e465d490ae6"
@@ -383,7 +612,7 @@ def test_a_read_only_codex_role_matches_the_profile_that_worked_on_a_real_host(s
     config = codex_config(argv)
     assert config["approval_policy"] == "never"
     server = config["mcp_servers"]["aegis_mailbox"]
-    assert server["required"] is True and server["command"] == sys.executable or server["command"].endswith("python3")
+    assert server["required"] is True and server["command"] == sys.executable
     assert set(server["enabled_tools"]) == MAILBOX_TOOLS | {"workspace_capacity", "workspace_initiative"}
     assert "--endpoint" in server["args"] and "pilot/orchestrator" in server["args"]
     assert server["tools"]["mailbox_publish"]["approval_mode"] == "approve"
@@ -1803,7 +2032,7 @@ def test_root_with_a_journal_gets_a_decision_connection_that_records_root_decide
     assert "wake_profile" not in role and "start_argv" not in role and "mcp_config" not in role
     assert not (team.base / "profiles").exists() or not list((team.base / "profiles").glob("*root*"))
     definition = json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]
-    assert definition == {"command": "/usr/bin/python3", "args": root_args(team, "claude-code")}
+    assert definition == {"command": sys.executable, "args": root_args(team, "claude-code")}
     assert Path(role["connection"]).name == "pilot%2Froot-g1.json"
     assert start_connection(role["connection"], "aegis_decision") == set(ROOT_TOOLS)
     value = lifecycle_request("feature-1")
@@ -1821,7 +2050,7 @@ def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_f
     role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
     # ROOT runs with approval_policy "never", so each enabled tool, the read tools too, carries its approve entry.
     assert tomllib.loads(role["mcp_config"]) == {"mcp_servers": {"aegis_decision": {
-        "command": "/usr/bin/python3", "args": root_args(team, "codex-cli"), "required": True,
+        "command": sys.executable, "args": root_args(team, "codex-cli"), "required": True,
         "enabled_tools": ROOT_TOOLS, "tools": {name: {"approval_mode": "approve"} for name in ROOT_TOOLS}}}}
     assert json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]["args"] == root_args(team, "codex-cli")
     (tmp_path / "native").mkdir()
@@ -1829,7 +2058,7 @@ def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_f
     native.init()
     native.lifecycle = team.lifecycle
     flat = native.add_role("pilot/root", "codex", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
-    assert json.loads(Path(flat["connection"]).read_text()) == {"command": "/usr/bin/python3", "args": root_args(native, "codex")}
+    assert json.loads(Path(flat["connection"]).read_text()) == {"command": sys.executable, "args": root_args(native, "codex")}
     assert "mcp_config" not in flat
 
 
@@ -2066,7 +2295,7 @@ def test_a_codex_reviewer_profile_is_recorded_and_its_argv_is_built_from_it(setu
     server = profile["mcp_servers"]["aegis_mailbox"]
     # The reviewer's registry entry reads no workspace view, so it has the mailbox tools alone.
     assert server["enabled_tools"] == ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
-    assert server["required"] is True and server["command"] == "/usr/bin/python3"
+    assert server["required"] is True and server["command"] == sys.executable
     argv = json.loads(Path(role["wake_profile"]).read_text())["argv"]
     assert argv[-2:] == ["resume", REVIEW_SESSION]
     assert_argv_follows_profile(argv, profile)
