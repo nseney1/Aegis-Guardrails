@@ -27,7 +27,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import pytest
 
@@ -107,6 +107,7 @@ CORE_LAYERS: Dict[str, int] = {
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
+    "aegis_core.credit_memo": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
     # Standalone stdlib unittest reporting, launched by the L1 test execution service.
@@ -190,13 +191,19 @@ def _string_import(node: ast.Call) -> Optional[str]:
     return None
 
 
-def import_edges(root: Path = REPO) -> List[Edge]:
-    modules = _module_files(root)
+def module_inventory(root: Path = REPO) -> Dict[str, Tuple[Path, ast.Module]]:
+    """One scan-local inventory; consumers inspect the trees without modifying them."""
+    return {module: (path, ast.parse(path.read_text(encoding="utf-8"),
+                                    filename=path.relative_to(root).as_posix()))
+            for module, path in _module_files(root).items()}
+
+
+def import_edges(root: Path = REPO, *, inventory=None) -> List[Edge]:
+    modules = module_inventory(root) if inventory is None else inventory
     edges: List[Edge] = []
-    for module, path in modules.items():
+    for module, (path, tree) in modules.items():
         is_package = path.name == "__init__.py"
         rel = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         for node in import_nodes(tree):
             targets: List[str] = []
             if isinstance(node, ast.Import):

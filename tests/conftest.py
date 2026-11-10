@@ -181,12 +181,24 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def hermetic_environment_and_mcp_isolation():
-    """Restore os.environ and reset MCP server singletons between tests."""
+    """Restore os.environ and reset loaded MCP singletons and credit caches between tests."""
     old_env = dict(os.environ)
     yield
     # Restore os.environ
     os.environ.clear()
     os.environ.update(old_env)
+
+    credit = sys.modules.get("aegis_core.credit")
+    if credit is not None:
+        for name in ("_EXPOSED", "_VERIFIED_CI",
+                     "_UNAVAILABLE_CI", "_SIGNERS_CHANGED", "_DEFAULT_BRANCH"):
+            getattr(credit, name).clear()
+    memo = sys.modules.get("aegis_core.credit_memo")
+    if memo is not None:
+        memo.reset()
+    scan_handler = sys.modules.get("aegis_mcp.handlers.core")
+    if scan_handler is not None:
+        scan_handler._RECORDED.clear()
 
     # Reset MCP server singletons if aegis_mcp.server is loaded
     for mod_name in ("aegis_mcp.server", "aegis_mcp.server"):

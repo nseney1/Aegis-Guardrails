@@ -18,6 +18,7 @@ import os
 from pathlib import PurePosixPath
 import selectors
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -27,6 +28,7 @@ from hierarchy_git import object_read_argv, object_read_env
 
 GIT_TIMEOUT_SECONDS = 30
 MAX_BLOB_BYTES = 16777216
+MAX_CACHED_BYTES = 16777216
 # The answer as the adapter sends it, JSON-encoded twice, stays under one MCP frame.
 RESPONSE_BYTES = 196608
 MAX_SHOW_LINES = 2000
@@ -76,6 +78,7 @@ def rendered_size(value):
 class SourceViews:
     def __init__(self, repository):
         self.repository = repository
+        self._show_cache = None
         top = self.git("rev-parse", "--show-toplevel", check=False)
         require(top.returncode == 0, "--source-repo is not a git repository: " + str(repository))
         promisors = self.git("config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$",
@@ -141,16 +144,12 @@ class SourceViews:
         require(kind.returncode == 0 and kind.stdout.strip() == b"commit", "commit not found in the source repository")
         return value
 
-    def show(self, arguments):
-        fields(arguments, {"commit", "path"}, {"start_line", "max_lines"})
-        commit = self.commit(arguments["commit"])
-        path = relative_path(arguments["path"])
-        start = arguments.get("start_line", 1)
-        require(type(start) is int and start >= 1, "start line must be at least 1")
-        limit = arguments.get("max_lines", DEFAULT_SHOW_LINES)
-        require(type(limit) is int and 1 <= limit <= MAX_SHOW_LINES,
-                "max lines must be between 1 and %d" % MAX_SHOW_LINES)
-        spec = commit + ":" + path
+    def _show_lines(self, spec, path):
+        # One connection retains only its latest file, keyed by immutable commit/path.
+        # Keep commit and argument checks in show(), including on cache hits.
+        if self._show_cache is not None and self._show_cache[0] == spec:
+            return self._show_cache[1:]
+        self._show_cache = None
         kind = self.git("cat-file", "-t", spec, check=False)
         require(kind.returncode == 0 and kind.stdout.strip() == b"blob", "path not found at that commit: " + path)
         blob = self.git("rev-parse", "--verify", spec).stdout.decode("ascii").strip()
@@ -161,6 +160,23 @@ class SourceViews:
         lines = raw.decode("utf-8", errors="replace").split("\n")
         if lines and lines[-1] == "":
             lines.pop()
+        cached = (spec, blob, lines)
+        retained = (sys.getsizeof(cached) + sys.getsizeof(spec) + sys.getsizeof(blob)
+                    + sys.getsizeof(lines) + sum(sys.getsizeof(line) for line in lines))
+        if retained <= MAX_CACHED_BYTES:
+            self._show_cache = cached
+        return blob, lines
+
+    def show(self, arguments):
+        fields(arguments, {"commit", "path"}, {"start_line", "max_lines"})
+        commit = self.commit(arguments["commit"])
+        path = relative_path(arguments["path"])
+        start = arguments.get("start_line", 1)
+        require(type(start) is int and start >= 1, "start line must be at least 1")
+        limit = arguments.get("max_lines", DEFAULT_SHOW_LINES)
+        require(type(limit) is int and 1 <= limit <= MAX_SHOW_LINES,
+                "max lines must be between 1 and %d" % MAX_SHOW_LINES)
+        blob, lines = self._show_lines(commit + ":" + path, path)
         require(start <= max(len(lines), 1), "start line is past the end of the file")
         page, cut, used = [], [], rendered_size({"commit": commit, "path": path, "blob": blob})
         for number in range(start, min(len(lines), start + limit - 1) + 1):
