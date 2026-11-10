@@ -45,7 +45,14 @@ including fixture reads and the outside `/proc` walk, records
 `census: "none"`, and has no `outside` key. Observing policies label `census` as
 `"fixture"` or `"proc"` according to the source actually read. Each kind is
 separate: full outside observations for `heavy` have class `pytest`, and those for
-`heavy-tests` have class `cargo`. Each observation contains only integer `pid`
+`heavy-tests` have class `cargo`. Only grants of the observed kind exempt their
+job's recorded execution process and descendants from its outside census. The
+canonical job claim and step birth must match; the birth is checked again in the
+census snapshot. A retained claim never exempts later jobs of a reused runner.
+Missing or stale step identity provides no exemption. A job holding only a
+Heavy-Tests grant still counts as outside `heavy` load during a pytest step;
+that phase cannot bypass the heavy limit. A claim under another kind is not read
+to establish an exemption for this census. Each observation contains only integer `pid`
 and `class`, sorted by PID and capped at 64; `outside_truncated` records the
 omitted count when nonzero. Counting uses the full root list. Outside rows contain no
 argv, paths or environment. The fixture census obeys the same policy. Ledger-held
@@ -84,13 +91,15 @@ row's summary. The conflicting file stays untouched. In a later pass, a valid
 record planted before publication and never contradicted cannot be distinguished
 from a genuine record; the same-user store has no authentication.
 
-An audit publication I/O error cannot abort the pass or block execution. A
+An audit publication I/O error alone does not erase the grant or block execution. A
 `granted_elsewhere` summary or this pass's result-writing executor records
 `census: "publish_failed"`, `publish_failed: true`, and reason code
 `"publish_failed"`, with no raw exception text or paths. This in-memory failure
 marker is bound to that request ID. Another executor without this pass's marker
 sees `"unrecorded"` if no file exists. Inspect the census directory's permissions,
 available space and hard-link support before relying on later audit records.
+If ledger replay, reconciliation or access subsequently fails, the pass stops with exit 3,
+retaining the durable grant and its publication outcome, including `publish_failed`.
 
 The execution claimant reads only its own granted request's record. It checks
 the exact fields, grant identity, kind, types, policy, observation source, row
@@ -143,7 +152,9 @@ Without a record for the job, `resolve` cannot recover the historical policy and
 leaves capacity provenance absent. It does not invent a census.
 In the normal heavy-job loop, audit lookup uses the fresh grant answer or the
 already-loaded ledger snapshot. It does not replay the ledger for each job's
-audit lookup. Resolution and standalone refusals retain the replay fallback.
+audit lookup. Additional stale-grant details also use that locked snapshot without
+another replay; settlement still reads current reservations before releasing them.
+Resolution and standalone refusals retain the replay fallback.
 Records are retained after settlement for manual grants and later
 inspection. This tool creates at most one record per ledger request, bounded by
 the store's 10000-event limit and the per-file limit; retained records and any
@@ -212,6 +223,129 @@ If a later job command cannot launch, the result retains the completed `steps`,
 their logs and a `failed_launch` record naming the attempted step and arguments.
 An uncertain process stop still holds the job without a terminal result. Reading
 the failure report alone never permits release of resources.
+
+## Job admission blockers
+
+`run-open` returns 3 for `waiting`, `running`, `abandoned`, `settle_pending` and
+`granted_elsewhere`; these rows need attention or another authorized pass. Code 2 is a
+refusal before a durable grant, not a claim that an acknowledged grant never happened.
+Code 0 includes terminal failed jobs whose receipts were settled.
+
+Use this section for current job-state actions; `hierarchy-dogfood.md` is retained
+unchanged as foundation-pinned evidence.
+Additional `next_action` guidance on ordinary blocked-settlement, unknown-claim,
+foreign-dependency and `granted_elsewhere` rows is scoped to owning initiatives
+with a canonical `<base>/host-plan.json`. This metadata check selects reporting;
+admission separately validates a plan before derived work. Runs without a plan
+retain the original fields and serialized bytes for those legacy outcomes.
+Use this section and `recovery-status` for their recovery instructions. Existing
+stale-kind guidance and explicit post-grant fault recovery keep their contracts.
+
+| You see | Next action |
+| --- | --- |
+| `waiting` with `capacity_full` | Run again after capacity of the named kind is available, including counted outside work |
+| `waiting` with `low_disk` | Restore `min_free_gigabytes`; `clean --job <initiative>/<message-id>` removes a finished job's work folders |
+| `waiting` with `job_limit` | Run another authorized pass; the execution budget is exhausted |
+| `waiting` with `stale_grant` | Root reconciles the named wrong-kind reservation and settles it with evidence before the job requests its current kind |
+| `waiting` with `holder_conflict` | Root reconciles the other initiative's row, then re-admits this job |
+| `waiting` with `foreign_reservation` | Follow `next_action` to clear the predecessor blocker; dependent grants named there still charge capacity |
+| `running` | Another runner owns execution; preserve its claim |
+| `abandoned` | Inspect `process_alive` and `next_action`; preserve unknown custody. With a valid original stopped claim, stop any remaining group before `resolve --job <initiative>/<message-id> --reason "..."` |
+| `settle_pending` | Repair the reported per-job claim, mailbox, storage or settlement error and run `run-open` again; an existing claim is never executed twice |
+| `granted_elsewhere` with `stale_kind` | Follow the matching-grant rule below; this grant alone does not authorize this job's execution |
+| Other `granted_elsewhere` | Re-admit a job holder through its owning initiative and clear blockers. A manual holder may start its already authorized work |
+| `reason` or `failure_reason` starting `post_grant_` | Preserve the durable grant, prior rows and census marker; root repairs ledger/audit access and reconciles using correlated terminal evidence |
+
+All rows above make `run-open` exit 3, including `execution_custody_unknown`.
+
+- `stale_grant`: the job's own initiative holds a different heavy kind, without the
+  matching grant its current recipe needs. Its current-kind queue entry is withdrawn;
+  no command starts and no second slot is requested. Root must reconcile the named
+  stale reservation and settle with evidence. If a matching grant also exists, the job
+  can run on it and settle additional own grants with that job's terminal result.
+- `holder_conflict`: another initiative filed an open row of the needed kind under
+  this job's holder. It cannot supply this job's capacity, terminate the job or be
+  released by its settlement. Root must reconcile the owning initiative's queued
+  request or granted reservation, then re-admit the job.
+- `foreign_reservation`: another initiative's row under the predecessor's holder
+  keeps its dependent waiting with no terminal result, receipt or execution. In the
+  locked cleanup, all of the dependent's own queued rows are withdrawn with source
+  `job runner`, across all kinds. This prevents later grant passes charging capacity
+  for a blocked job. Its grants remain charged; planned rows name them and their
+  kinds in `next_action`, and legacy operators inspect the `recovery-status`
+  reservation inventory. Absence cannot release them. Root must repair the foreign
+  predecessor blocker so the dependent can run, or reconcile retained grants using
+  correlated terminal evidence. Withdraw a foreign queued row through its owner;
+  settle a foreign grant only with that owner's evidence. Once the blocker clears,
+  `run-open` files fresh dependent requests or reuses its matching grant.
+- `granted_elsewhere` with `stale_kind`: a newly granted request has another heavy
+  kind than its admitted job now needs. `stale_job` names that job. Follow the
+  matching-grant rule above; do not start a command solely because of this row.
+  Other job holders reported as `granted_elsewhere` must be re-admitted through
+  their owning initiative's `run-open`, with dependencies and reservations checked.
+  A manual holder may start only its already authorized work.
+- `post_grant_reconcile_failed`, `post_grant_ledger_unreadable`,
+  `post_grant_store_busy` and `post_grant_step_failed` are pass-level ledger or
+  audit-custody failures after an acknowledged durable grant. Earlier rows remain
+  in the report; unhandled grants retain their request IDs and one census
+  publication attempt or failure marker. Root must preserve those reservations,
+  repair ledger or audit access, and reconcile with terminal evidence. A stale-kind
+  row retains `reason: stale_kind` and carries the fault in `failure_reason`.
+  Ordinary store-lock contention after every acknowledged grant was handled keeps
+  the legacy `store_busy` waiting row and its last capacity observation, when one
+  exists. Completed grant history alone does not turn that contention into a
+  `post_grant_store_busy` fault, including on the later heavy-kind pass. Contention
+  while a new grant remains unhandled still requires post-grant recovery.
+  If a non-busy store-integrity fault follows completed work, its terminal row is
+  retained and a separate `settle_pending` row for the affected grant's job reports
+  the reconciliation obligation. Other jobs' rows and preservation instructions
+  remain unchanged. Empty kind passes construct no Store; after acknowledged
+  grants, a final path check still reports a store-root swap after completion.
+  The loop needs
+  that actionable state to raise a Root hold; exit 3 or a field on a completed row
+  alone does not raise one. This hold does not authorize repeating completed work.
+  An acknowledged grant observed as released in the post-grant locked snapshot is
+  retired from reservation recovery. Its census record remains historical evidence;
+  a later fault must not report that released request as a retained reservation.
+
+A mailbox-writer lock or claim error before the exclusive execution fence is a
+per-job `settle_pending` row with a retry instruction; unrelated jobs and other
+kinds still proceed. Before this attempt enters its claim boundary, another
+runner's newly created directory does not establish this attempt's custody. A
+mailbox lock at that point stays retryable, with the original claimant preserved.
+An admitted derivation's directory is separate from its later execution fence;
+starting `take_execution` clears the earlier in-memory admission marker. A busy
+disposition lock before execution publication likewise stays retryable.
+A non-derived job's fence is its exclusive job directory;
+an admitted derivation uses its exclusive `execution.json`. A failure after that
+fence exists but before execution custody is established reports `abandoned`,
+`reason: execution_custody_unknown` and `process_alive: null`, with exit 3. Later
+passes preserve an unreadable claim as unknown and never run through the existing
+fence. Root must inspect `recovery-status`, original claims and process scope;
+neither deleting a directory nor manufacturing a claim is a recovery procedure.
+`resolve` still requires a valid original claim and stopped-process evidence.
+The same fence rule applies when a reserved dependent must claim before writing
+a no-effect refusal: ENOSPC after directory creation is unknown custody even on
+that refusal path. A publication loser settling a completed claimant's retained
+result instead reports `settle_pending` if settlement fails. Observing that result
+does not make the loser its execution owner or authorize a second execution.
+
+When the job budget is exhausted, remaining ready jobs report `job_limit` before
+any further kind grant snapshots, replays or grants. Ready heavy jobs still enter
+the ledger queue, using the normal enqueue lock and replay, so a later manual
+request cannot take their earlier sequence. A busy store during enqueue does not
+replace `job_limit` at the grant gate. Admission checks, enqueueing and settlement
+of earlier work remain separate from the execution budget.
+
+## Validating retained recipes
+
+`validate_recipes(data)` in `hierarchy_jobs.py` accepts captured UTF-8 JSON bytes
+or an already parsed JSON object. It enforces the same schema as `load_recipes`,
+including `census_outside_policy`, without reopening an input path. Existing-folder
+checks still inspect the configured folders. Validation returns the object without
+adding defaults or `recipes_sha256`, and does not modify a supplied parsed object.
+Callers retaining input bytes can hash those exact bytes themselves. `load_recipes`
+reads once, calls this validator and adds the exact raw-byte SHA-256 as before.
 
 ## Crash and reconnect procedure
 
