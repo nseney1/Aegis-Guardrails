@@ -44,10 +44,8 @@ def invoke(root, command, request=None, *, ok=True, process_timeout=15, **flags)
     return data
 
 
-@pytest.fixture
-def pilot(tmp_path, tmp_path_factory, request):
-    # Imported by other test modules: keep the seed on the requesting module's
-    # node so no additional fixture imports are needed. Only copies are mutated.
+def pilot_seed(request, tmp_path_factory):
+    """Build one immutable seed per requesting module/worker, without fixture dependencies."""
     module = request.node.getparent(pytest.Module)
     if _PILOT_SEED not in module.stash:
         seed = tmp_path_factory.mktemp("pilot-seed") / "mailbox"
@@ -65,9 +63,14 @@ def pilot(tmp_path, tmp_path_factory, request):
             del module.stash[_PILOT_SEED]
 
         module.addfinalizer(release_seed)
+    return module.stash[_PILOT_SEED]
+
+
+@pytest.fixture
+def pilot(tmp_path, tmp_path_factory, request):
     root = tmp_path / "mailbox"
     # Initial manifest/bindings contain no absolute paths; briefs stay test-local.
-    shutil.copytree(module.stash[_PILOT_SEED], root)
+    shutil.copytree(pilot_seed(request, tmp_path_factory), root)
     brief = tmp_path / "brief.md"
     brief.write_bytes(b"Goal: improve diagnostics.\nAcceptance: retain overlap evidence.\n")
     return root, {"path": str(brief), "sha256": hashlib.sha256(brief.read_bytes()).hexdigest()}

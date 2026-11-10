@@ -11,13 +11,14 @@ import threading
 import copy
 import math
 import random
+import shutil
 import uuid
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import pytest
 
-from tests.integration.test_hierarchy_mailbox import ENDPOINTS, HELPER, invoke, message, pilot  # noqa: F401
+from tests.integration.test_hierarchy_mailbox import ENDPOINTS, HELPER, invoke, message, pilot, pilot_seed  # noqa: F401
 from tests.integration.test_hierarchy_mailbox import (
     INBOX_WIRE_BUDGET, WIRE_PAYLOADS, checkpoint_wire_binding, corrupt_wire_fixture,
     mailbox_snapshot, record_wire_process, seed_wire_inbox, wire_peer_mailbox,
@@ -33,7 +34,7 @@ MB3_FIXED_NOW = datetime(2026, 1, 10, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def mb3_fixed_clock(monkeypatch):
     import hierarchy_mailbox_mcp as mcp
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: MB3_FIXED_NOW, raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: MB3_FIXED_NOW)
 
 
 def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None,
@@ -722,17 +723,13 @@ def test_publish_requires_the_writers_advertised_lane_check(pilot, tmp_path):  #
 
 
 @pytest.fixture
-def mb3_pilot(tmp_path_factory):
+def mb3_pilot(request, tmp_path_factory):
     # Binding/session fixtures must never reuse a pytest per-test path across invocations.
     directory = tmp_path_factory.mktemp("mb3-" + uuid.uuid4().hex)
     root = directory / "mailbox"
-    manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": ENDPOINTS,
-                "counterparts": [["a/front-door", "b/front-door"], ["a/orchestrator", "b/orchestrator"],
-                                 ["a/lane/f2", "b/lane/f6"]], "writer_limit": 3}
-    invoke(root, "init", manifest)
+    # Copy the immutable seed directly; importing this fixture needs no pilot fixture.
+    shutil.copytree(pilot_seed(request, tmp_path_factory), root)
     for endpoint in ENDPOINTS:
-        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
-                              "expected_generation": 0})
         mb3_binding_time(root, 1, "2026-01-01T00:00:00.000000Z", endpoint)
     brief = directory / "brief.md"
     brief.write_bytes(b"Goal: improve diagnostics.\nAcceptance: retain overlap evidence.\n")
@@ -1351,7 +1348,7 @@ def test_mb3_2_class_d_future_skew_boundary(mb3_pilot, monkeypatch, stamp, allow
     import hierarchy_mailbox_mcp as mcp
     root, _ = mb3_pilot
     mb3_binding_time(root, 1, stamp)
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc), raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
     answer = mb3_call(mb3_connection(root), {"since": "current_generation"})
     if allowed:
         assert not answer["result"].get("isError", False)
@@ -1475,7 +1472,7 @@ def test_mb3_3_class2_growth_stops_at_cap(mb3_pilot, monkeypatch, rewrite):
     root, _ = mb3_pilot
     rows = mb3_seed(root)
     connection = mb3_connection(root)
-    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 3, raising=False)
+    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 3)
     live_cursors = []
     for number in range(3):
         if rewrite == "binding":
@@ -1522,7 +1519,7 @@ def test_mb3_3_class2_drain_frees_only_finished_context(mb3_pilot, monkeypatch):
     root, _ = mb3_pilot
     mb3_seed(root)
     connection = mb3_connection(root)
-    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 2, raising=False)
+    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 2)
     first = payload(mb3_call(connection, {"order": "newest", "limit": 3}))
     other = payload(mb3_call(connection, {"order": "newest", "since": "current_generation", "limit": 3}))
     assert first["next_after"] == other["next_after"] == "wire-002"
@@ -1569,7 +1566,7 @@ def test_mb3_3_class4_clock_seam(mb3_pilot, monkeypatch, now, allowed):
     import hierarchy_mailbox_mcp as mcp
     root, _ = mb3_pilot
     mb3_checkpoint(root)
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: now, raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: now)
     answer = mb3_call(mb3_connection(root, 2), {"since": "current_generation"})
     if allowed:
         assert not answer["result"].get("isError", False)
