@@ -230,6 +230,11 @@ def contract_base(tmp_path_factory):
     assert base_bytes(directory) == before, "discovery mutated the shared contract base"
 
 
+@pytest.fixture(scope="module")
+def legacy_tools_result(contract_base):
+    return live_tools_list(contract_base, "role_legacy")
+
+
 @pytest.mark.parametrize("case", CASES)
 def test_mailbox_tools_match_their_connection_contract(contract_base, case):
     actual = live_tools_list(contract_base, case)
@@ -242,18 +247,114 @@ def test_mailbox_tools_match_their_connection_contract(contract_base, case):
         assert properties.keys() & {"order", "since", "briefs"} == ({"order", "since", "briefs"} if planned else set())
     else:
         assert "mailbox_inbox" not in tools
-    assert SNAPSHOT.is_file(), "regenerate the mailbox MCP contract snapshot with --write"
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
-    assert set(expected) == set(CASES) | set(REFUSAL_CASES)
-    assert actual == expected[case]
+    assert_matches_snapshot(actual, case)
     if planned:
         assert live_tools_list(contract_base, case, plan_host="claude-code") == actual, "host plan changed tools/list"
 
 
+def assert_matches_snapshot(actual, case):
+    assert SNAPSHOT.is_file(), "regenerate the mailbox MCP contract snapshot with --write"
+    expected = read_snapshot()
+    assert set(expected) == set(CASES) | set(REFUSAL_CASES)
+    for tool, expected_tool in zip(actual["tools"], expected[case]["tools"]):
+        assert canonical_json(tool) == canonical_json(expected_tool), (
+            "MCP tool changed: " + tool["name"] + " (snapshot: " + expected_tool["name"] + ")")
+    assert actual == expected[case], "MCP surface changed: " + case + " live=" + repr([
+        tool["name"] for tool in actual["tools"]]) + " snapshot=" + repr([
+        tool["name"] for tool in expected[case]["tools"]])
+
+
+def read_snapshot():
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    return {case: {"tools": [snapshot["tools"][name][variant] for name, variant in surface]}
+            if isinstance(surface, list) else surface for case, surface in snapshot["cases"].items()}
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def compact_snapshot(surfaces):
+    tools, cases, variant_indices = {}, {}, {}
+    for case, surface in surfaces.items():
+        if "tools" not in surface:
+            cases[case] = surface
+            continue
+        assert set(surface) == {"tools"}, case
+        references = []
+        for tool in surface["tools"]:
+            name = tool["name"]
+            variants = tools.setdefault(name, [])
+            indices = variant_indices.setdefault(name, {})
+            key = canonical_json(tool)
+            if key not in indices:
+                indices[key] = len(variants)
+                variants.append(tool)
+            references.append([name, indices[key]])
+        cases[case] = references
+    return {"tools": tools, "cases": cases}
+
+
 def snapshot_tool_lists():
-    for surface in json.loads(SNAPSHOT.read_text(encoding="utf-8")).values():
+    for surface in read_snapshot().values():
         if "tools" in surface:
             yield surface["tools"]
+
+
+def test_snapshot_stores_each_tool_variant_once():
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    assert set(snapshot) == {"tools", "cases"}
+    assert set(snapshot["cases"]) == set(CASES) | set(REFUSAL_CASES)
+    referenced = set()
+    for case, surface in snapshot["cases"].items():
+        if case in REFUSAL_CASES:
+            assert surface == {"error": REFUSAL_CASES[case][2]}
+            continue
+        for name, variant in surface:
+            assert isinstance(variant, int) and 0 <= variant < len(snapshot["tools"][name]), name
+            assert snapshot["tools"][name][variant]["name"] == name
+            referenced.add((name, variant))
+    for name, variants in snapshot["tools"].items():
+        assert variants, name
+        assert len({json.dumps(tool, sort_keys=True) for tool in variants}) == len(variants), name
+        assert {(name, variant) for variant in range(len(variants))} <= referenced, name
+
+
+def test_compaction_preserves_json_types_and_ignores_key_order():
+    tools = [{"name": "typed", "inputSchema": {"default": value}} for value in (True, 1, 1.0)]
+    surfaces = {str(index): {"tools": [tool]} for index, tool in enumerate(tools)}
+    surfaces["reordered"] = {"tools": [{"inputSchema": {"default": True}, "name": "typed"}]}
+    snapshot = compact_snapshot(surfaces)
+    assert json.dumps(snapshot["tools"]["typed"], sort_keys=True) == json.dumps(tools, sort_keys=True)
+    assert snapshot["cases"] == {"0": [["typed", 0]], "1": [["typed", 1]],
+                                 "2": [["typed", 2]], "reordered": [["typed", 0]]}
+
+
+@pytest.mark.parametrize("change", ["description", "inputSchema", "annotations", "name", "extra", "order", "missing", "added"])
+def test_changed_tool_still_fails_with_its_name(legacy_tools_result, tmp_path, monkeypatch, change):
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    references = snapshot["cases"]["role_legacy"]
+    if change == "order":
+        references[1], references[2] = references[2], references[1]
+    elif change == "missing":
+        references.pop(1)
+    elif change == "added":
+        references.append(["source_show", 0])
+    else:
+        snapshot["tools"]["mailbox_publish"][0][change] = "changed"
+    path = tmp_path / "changed-snapshot.json"
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    monkeypatch.setitem(globals(), "SNAPSHOT", path)
+    with pytest.raises(AssertionError) as failure:
+        assert_matches_snapshot(legacy_tools_result, "role_legacy")
+    if change == "added":
+        live_names = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
+        message = "MCP surface changed: role_legacy live=" + repr(live_names) + " snapshot=" + repr(live_names + ["source_show"])
+    else:
+        expected_name = ("changed" if change == "name" else
+                         "mailbox_ack_handoff" if change in {"order", "missing"} else "mailbox_publish")
+        message = "MCP tool changed: mailbox_publish (snapshot: " + expected_name + ")"
+    assert str(failure.value).splitlines()[0] == message
 
 
 def test_snapshot_covers_optional_role_tools():
@@ -268,7 +369,7 @@ def test_snapshot_covers_planned_inbox_schema():
 
 def test_profiles_cover_every_registry_role():
     roles = json.loads((REPO / "tools/hierarchy_templates/role-registry.json").read_text(encoding="utf-8"))["roles"]
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    expected = read_snapshot()
     assert set(ROLE_PROFILES) == set(roles)
     for name, entry in roles.items():
         profile = ROLE_PROFILES[name]
@@ -300,12 +401,12 @@ def test_forbidden_option_cases_cover_the_registry_gates():
 @pytest.mark.parametrize("case", REFUSAL_CASES)
 def test_forbidden_options_match_their_refusal_contract(contract_base, case):
     actual = refused_tools_list(contract_base, case)
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    expected = read_snapshot()
     assert actual == expected[case]
 
 
 def test_snapshot_covers_forbidden_options():
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    expected = read_snapshot()
     assert REFUSAL_CASES.keys() <= expected.keys()
     for case, (_, _, error) in REFUSAL_CASES.items():
         assert expected[case] == {"error": error}
@@ -317,7 +418,7 @@ def test_snapshot_covers_forbidden_options():
     ("decider_provisioned", ["source_show", "source_grep", "decider_record"]),
 ])
 def test_snapshot_covers_provisioned_tool_order(profile, extras):
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    expected = read_snapshot()
     for suffix in ("_legacy", "_planned"):
         case = profile + suffix
         assert case in expected, "missing provisioned connection contract: " + case
@@ -345,7 +446,7 @@ def test_setup_preserves_the_callers_git_index(tmp_path, monkeypatch):
     directory.mkdir()
     base = build_base(directory)
     assert index.read_bytes() == before, "contract setup mutated the caller's Git index"
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    expected = read_snapshot()
     for case in ("orchestrator_provisioned_legacy", "orchestrator_provisioned_planned"):
         assert live_tools_list(base, case) == expected[case]
     assert index.read_bytes() == before, "contract discovery mutated the caller's Git index"
@@ -361,5 +462,5 @@ if __name__ == "__main__":
         surfaces = {case: live_tools_list(directory, case) for case in CASES}
         surfaces.update({case: refused_tools_list(directory, case) for case in REFUSAL_CASES})
         assert base_bytes(directory) == before, "discovery mutated the shared contract base"
-    SNAPSHOT.write_text(json.dumps(surfaces, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    SNAPSHOT.write_text(json.dumps(compact_snapshot(surfaces), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {SNAPSHOT} ({PYTHON_RUNS} interpreters: {setup_runs} setup, {len(surfaces)} serves)")
