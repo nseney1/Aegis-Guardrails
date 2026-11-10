@@ -290,17 +290,26 @@ def outline(value, keys):
             "selectors": Array(selectors, len(keys) + len(value["fields"]))}
 
 
-def _prefix(rows, n, chunks):
-    digest = hashlib.sha256()
-    for chunk in chunks(Rows(rows, 0, n)):
-        digest.update(chunk.encode("ascii"))
-    return digest.hexdigest()
+def _prefix(rows, start, stop, chunks, digest):
+    """Extend an open canonical array; close only a copy at this boundary."""
+    for index in range(start, stop):
+        if index:
+            digest.update(b",")
+        for chunk in chunks(rows[index]):
+            digest.update(chunk.encode("ascii"))
+    closed = digest.copy()
+    closed.update(b"]")
+    return closed.hexdigest()
 
 
 def page(value, cursor, row_limit, chunks, need):
     need(value["kind"] == "log", "E_SELECTOR")
     rows = value["fields"]["rows"]
     offset = 0 if cursor == "0" else int(cursor.partition(":")[0])
-    need(offset <= len(rows) and (cursor == "0" or _prefix(rows, offset, chunks) == cursor.partition(":")[2]), "E_SELECTOR")
+    need(offset <= len(rows), "E_SELECTOR")
     stop = min(len(rows), offset + row_limit) if row_limit is not None else len(rows)
-    return dict(value, fields=dict(value["fields"], rows=Rows(rows, offset, stop))), (offset, stop), Join((stop, _prefix(rows, stop, chunks)), ":")
+    digest = hashlib.sha256(b"[")
+    previous = _prefix(rows, 0, offset, chunks, digest)
+    need(cursor == "0" or previous == cursor.partition(":")[2], "E_SELECTOR")
+    current = previous if stop == offset else _prefix(rows, offset, stop, chunks, digest)
+    return dict(value, fields=dict(value["fields"], rows=Rows(rows, offset, stop))), (offset, stop), Join((stop, current), ":")

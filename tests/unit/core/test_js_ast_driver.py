@@ -3,7 +3,7 @@ import pytest
 
 from aegis_core.ast.driver_errors import ASTDriverError
 from aegis_core.ast.policy import evaluate_forbid_ast_structured
-from aegis_core.ast.schema import NormalizedAST
+from aegis_core.ast.schema import DefinitionNode, NormalizedAST
 
 
 def parse(source, path='fixture.ts'):
@@ -103,6 +103,86 @@ export default function finish() { new Worker; }
     assert {'sealed', 'ns.checked'} <= set(tree.decorators)
     assert sum(c.kind == 'new' for c in tree.call_sites) == 2
     assert not any(c.target in ('run', 'finish') for c in tree.call_sites)
+
+
+def test_decorator_associations_preserve_the_complete_normalized_ast():
+    source = '''@outer
+@ns.inner
+export class Worker {
+  @first
+  @second
+  run() {}
+  plain() {}
+}
+@task
+export default function finish() {}
+@arrow
+export const start = () => {};
+@orphan;
+function later() {}
+class Later { method() {} }
+'''
+    expected = NormalizedAST('fixture.ts', 'typescript', definitions=[
+        DefinitionNode('Worker', 'class', 3, True, decorators=('outer', 'ns.inner')),
+        DefinitionNode('Later', 'class', 15),
+        DefinitionNode('run', 'method', 6, False, 'Worker', ('first', 'second')),
+        DefinitionNode('plain', 'method', 7, False, 'Worker'),
+        DefinitionNode('finish', 'function', 10, True, decorators=('task',)),
+        DefinitionNode('later', 'function', 14),
+        DefinitionNode('method', 'method', 15, False, 'Later'),
+        DefinitionNode('start', 'function', 12, True, decorators=('arrow',)),
+    ], metadata={
+        'capabilities': ['allow_comments', 'args', 'decorators'],
+        'allow_comments': {},
+        'decorators': ['outer', 'ns.inner', 'first', 'second', 'task', 'arrow', 'orphan'],
+    })
+    assert parse(source).to_dict() == expected.to_dict()
+
+
+@pytest.mark.parametrize('count', [100, 200, 400])
+def test_decorated_parse_token_work_is_bounded_by_source_size(monkeypatch, count):
+    from aegis_core.ast.drivers.js import extractor
+
+    work = 0
+
+    class CountedTokens(list):
+        def __getitem__(self, key):
+            nonlocal work
+            work += len(range(*key.indices(len(self)))) if isinstance(key, slice) else 1
+            return super().__getitem__(key)
+
+    class CountedExtractor(extractor.Extractor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.tokens = CountedTokens(self.tokens)
+
+    # Instrument only this module's token storage; exercise the public parser.
+    monkeypatch.setattr(extractor, 'Extractor', CountedExtractor)
+    source = '@sealed class Base {}\n' + ''.join(
+        'function f%d() {}\n' % index for index in range(count))
+    expected = NormalizedAST('fixture.ts', 'typescript', definitions=[
+        DefinitionNode('Base', 'class', 1, decorators=('sealed',)),
+    ] + [DefinitionNode('f%d' % index, 'function', index + 2) for index in range(count)],
+        metadata={
+            'capabilities': ['allow_comments', 'args', 'decorators'],
+            'allow_comments': {},
+            'decorators': ['sealed'],
+        })
+    assert parse(source).to_dict() == expected.to_dict()
+    assert work <= 80 * count
+
+
+@pytest.mark.parametrize('source,reason', [
+    ('@sealed class Broken {', 'syntax:unclosed_delimiter'),
+    ('@checked function broken(', 'syntax:unclosed_delimiter'),
+    ('@sealed export class Broken { @checked run( }', 'syntax:unbalanced_delimiter'),
+])
+def test_decorated_syntax_refusals_are_preserved(source, reason):
+    from aegis_core.ast.drivers.js.tokenizer import JSLexError
+
+    with pytest.raises(JSLexError) as error:
+        parse(source)
+    assert error.value.reason == reason
 
 
 def test_import_unknown_and_nonexecuting_text():
