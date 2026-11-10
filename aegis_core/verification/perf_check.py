@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import importlib.util
-import os, shlex, shutil, statistics, sys, tempfile, time
+import os, shutil, statistics, sys, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from aegis_core import gitsafe, pathlookup
+from aegis_core.argv import split_command
 from aegis_core.config import read_user_config
 from aegis_core.verification import test_runner
 
@@ -55,7 +56,7 @@ def _perf_argv(workspace_root: Path, user_config_path: Path | str | None) -> tup
     cmd = perf.get("command") if isinstance(perf, Mapping) else None
     if isinstance(cmd, str) and cmd.strip():
         try:
-            return shlex.split(cmd, posix=os.name != "nt"), ""
+            return split_command(cmd), ""
         except ValueError:  # unbalanced quotes
             return None, "perf.command cannot be parsed"
     if isinstance(cmd, list) and cmd and all(isinstance(x, str) and x.strip() for x in cmd):

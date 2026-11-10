@@ -59,6 +59,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # Operator command-string grammar shared by planners and process consumers.
+    "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
