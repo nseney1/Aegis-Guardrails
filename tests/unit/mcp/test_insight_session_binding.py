@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from aegis_core import credit
+from aegis_core import credit, credit_memo
 from aegis_core.insights import (
     JOIN_WINDOW_S,
     insights_path,
@@ -52,7 +52,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_PROJECT_DIR", "AEGIS_CLIENT"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(credit, "_EXPOSED", {})
-    monkeypatch.setattr(credit, "_PERSISTED", set())
+    monkeypatch.setattr(credit_memo, "_PERSISTED", set())
     return h
 
 

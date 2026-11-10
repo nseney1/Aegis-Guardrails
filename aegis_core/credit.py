@@ -18,9 +18,10 @@ import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import ghcli, gitevidence, gitsafe, human_gate
+from aegis_core import credit_memo as _credit_memo
 from aegis_core.errors import AegisError, PathTraversalError
 from aegis_core.primitives import utc_stamp
-from aegis_core.storage import ledger_locked, read_jsonl
+from aegis_core.storage import ReportedRows, ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
 
 __all__ = [
@@ -87,7 +88,7 @@ def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any
     except (PathTraversalError, OSError) as exc:
         return [], str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
-    return _event_rows(res.rows), err
+    return ReportedRows(_event_rows(res.rows), res.report), err
 
 
 def read_rows(root: Any) -> List[Dict[str, Any]]:
@@ -270,10 +271,6 @@ def landed_lookup(
 
 _EXPOSED: Dict[Tuple[str, str, str], Set[str]] = {}
 _MAX_EXPOSED_SESSIONS = 256
-# (root, host, session, rule, scope_basis) this process wrote or found in the ledger: a rescan
-# of the same session then takes no lock and reads nothing. Rows are only ever appended.
-_PERSISTED: Set[Tuple[str, str, str, str, Optional[str]]] = set()
-_MAX_PERSISTED = 50_000
 
 
 def record_exposure(
@@ -292,12 +289,16 @@ def record_exposure(
     if not persist or not rule_list:
         return []
     stamp, s_id, h_id = ts or utc_stamp(), session or "", host or ""
-    kept = [(str(root), h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
-    if all(k in _PERSISTED for k in kept):
+    root_id, path = _credit_memo.root_key(root)
+    kept = [(root_id, h_id, s_id, rule_id, scope_basis) for rule_id in rule_list]
+    if _credit_memo.contains(root_id, kept, path):
         return []
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
-    with ledger_locked(root):
-        seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read_rows(root), "exposure")}
+    with ledger_locked(root) as site:
+        before = _credit_memo.before_read(root_id, site)
+        read = read_rows(root)
+        seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read, "exposure")}
+        _credit_memo.reconcile(root_id, seen)
         to_append: List[Dict[str, Any]] = []
         for rule_id in rule_list:
             if (s_id, rule_id, scope_basis) in seen:
@@ -318,11 +319,9 @@ def record_exposure(
             if heartbeat is not None:
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
-        written = [_normalize_event_row(r) for r in ledger.append_rows(root, to_append)] if to_append else []
-        if len(_PERSISTED) + len(kept) > _MAX_PERSISTED:
-            _PERSISTED.clear()
-        _PERSISTED.update(kept)
-        return written
+        appended = ledger.append_rows(root, to_append) if to_append else []
+        _credit_memo.remember(root_id, kept, site.path, before, appended, getattr(read, "report", None))
+        return [_normalize_event_row(r) for r in appended]
 
 
 def exposed_rules(root: Any, host: Optional[str], session: Optional[str] = None) -> Set[str]:
