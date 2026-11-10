@@ -138,6 +138,39 @@ def test_append_jsonl_writes_one_object_per_line(tmp_path: Path):
     ]
 
 
+@pytest.mark.parametrize("prefix", [None, b'{"old":'])
+def test_jsonl_reports_the_descriptor_identity_end_offset_and_bounded_tail(tmp_path, monkeypatch, prefix):
+    path = tmp_path / "ledger.jsonl"
+    if prefix is not None:
+        path.write_bytes(prefix)
+    real_fsync = os.fsync
+    written_through = []
+
+    def fsync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            written_through.append(((info.st_dev, info.st_ino), info.st_size))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    row = {"note": "café", "padding": "x" * 512}
+    written = append_jsonl(path, [row])
+    data = path.read_bytes()
+
+    assert isinstance(written, int) and written == 1
+    assert written.report.identity == written_through[0][0]
+    assert written.report.size == written_through[0][1] == len(data)
+    assert written.report.added == len(data) - len(prefix or b"")
+    assert written.report.tail == data[-256:]
+    assert written.report.head == data[:256]
+    read = read_jsonl(path)
+    assert read.rows == [row]
+    assert read.report.identity == written.report.identity
+    assert read.report.size == len(data)
+    assert read.report.tail == data[-256:]
+    assert read.report.head == data[:256]
+
+
 def test_append_jsonl_keeps_the_file_valid_utf8(tmp_path: Path):
     path = tmp_path / "ledger.jsonl"
     append_jsonl(path, [{"note": "café \ud800  "}])
