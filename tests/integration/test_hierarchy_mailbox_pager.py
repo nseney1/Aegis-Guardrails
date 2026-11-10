@@ -44,7 +44,7 @@ def test_retained_pairs_commit_retry_collision_and_drain(mb3_pilot, monkeypatch)
     assert pager.retained_cursor_pairs == 1
     assert payload(mb3_call(connection, {**finish, "since": "current_generation"}))["next_after"] is None
     assert pager.retained_cursor_pairs == 0
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
     assert payload(mb3_call(connection, options))["next_after"] == first["next_after"]
     assert pager.retained_cursor_pairs == 1
 
