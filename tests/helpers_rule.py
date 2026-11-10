@@ -13,11 +13,8 @@ from aegis_core.taxonomy import DIR_RULE_TYPES, RULE_TYPE_DIRS, RULE_TYPES
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 
 __all__ = [
-    "make_cell",
     "make_rule",
-    "write_cell_with_fitness",
     "write_rule_with_fitness",
-    "soma_workspace",
     "aegis_workspace",
     "write_evidence",
 ]
@@ -31,14 +28,14 @@ def _placement(rules_dir, rule_type):
     return base / RULE_TYPE_DIRS[rule_type], base.parent.parent
 
 
-def make_rule(cells_dir, name, cell_type="trap", created_days_ago=10,
+def make_rule(rules_dir, name, rule_type="trap", created_days_ago=10,
               expiry_days=365, expiry_sessions=100):
     """Create a minimal rule file in its type directory."""
     created = (datetime.now(timezone.utc) - timedelta(days=created_days_ago)).strftime("%Y-%m-%d")
     fm = {
         'id': name,
-        'type': cell_type,
-        'enforcement': 'gate' if RULE_TYPES[cell_type].mandatory else 'advisory',
+        'type': rule_type,
+        'enforcement': 'gate' if RULE_TYPES[rule_type].mandatory else 'advisory',
         'hypothesis': f'Test rule {name}',
         'prediction': 'test',
         'falsification': 'test',
@@ -47,27 +44,24 @@ def make_rule(cells_dir, name, cell_type="trap", created_days_ago=10,
         'expiry_days': expiry_days,
         'created': created,
     }
-    folder, _ = _placement(cells_dir, cell_type)
+    folder, _ = _placement(rules_dir, rule_type)
     folder.mkdir(parents=True, exist_ok=True)
     rule_file = folder / f"{name}.md"
     rule_file.write_text(dump_frontmatter(fm, body=f"# {name}\nTest rule.\n"), encoding="utf-8")
     return str(rule_file)
 
 
-make_cell = make_rule
-
-
-def write_rule_with_fitness(cells_dir, name, enforcement="advisory",
-                            triggers=0, tp=0, fp=0, cell_type="trap",
+def write_rule_with_fitness(rules_dir, name, enforcement="advisory",
+                            triggers=0, tp=0, fp=0, rule_type="trap",
                             hypothesis=None, created_days_ago=60):
     """Write a rule file and give it ledger evidence: ``tp`` + ``fp`` verdict rows and
     ``triggers - tp - fp`` bare trigger rows."""
-    folder, workspace = _placement(cells_dir, cell_type)
+    folder, workspace = _placement(rules_dir, rule_type)
     folder.mkdir(parents=True, exist_ok=True)
     created = (datetime.now(timezone.utc) - timedelta(days=created_days_ago)).strftime("%Y-%m-%d")
     fm = {
         "id": name,
-        "type": cell_type,
+        "type": rule_type,
         "hypothesis": hypothesis or f"Test rule {name}",
         "enforcement": enforcement,
         "created": created,
@@ -80,9 +74,6 @@ def write_rule_with_fitness(cells_dir, name, enforcement="advisory",
     return str(path)
 
 
-write_cell_with_fitness = write_rule_with_fitness
-
-
 @pytest.fixture
 def aegis_workspace(tmp_path):
     """Create a minimal Aegis workspace with a rules directory."""
@@ -92,16 +83,7 @@ def aegis_workspace(tmp_path):
     return workspace
 
 
-@pytest.fixture
-def soma_workspace(tmp_path):
-    """Create a minimal workspace with a rules directory."""
-    workspace = tmp_path / "project"
-    rules_dir = workspace / ".aegis" / "rules"
-    rules_dir.mkdir(parents=True)
-    return workspace
-
-
-def write_evidence(workspace, cell_id, triggers=0, tp=0, fp=0):
+def write_evidence(workspace, rule_id, triggers=0, tp=0, fp=0):
     """Append ledger rows giving one rule ``triggers`` triggers, ``tp`` tps and ``fp`` fps.
 
     Each v2 outcome row is also a trigger, so the rows are tp + fp outcome rows plus
@@ -115,5 +97,5 @@ def write_evidence(workspace, cell_id, triggers=0, tp=0, fp=0):
     with open(ledger, "a", encoding="utf-8") as f:
         for outcome in outcomes:
             f.write(json.dumps({
-                "v": 2, "ts": stamp, "rule": cell_id, "outcome": outcome, "source": "manual",
+                "v": 2, "ts": stamp, "rule": rule_id, "outcome": outcome, "source": "manual",
             }) + "\n")

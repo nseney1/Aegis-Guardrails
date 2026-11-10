@@ -4,6 +4,7 @@ The suite deliberately avoids requiring pyyaml: several invariants under test
 exist precisely because `soma_mcp/` must work on a bare interpreter.
 """
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,29 @@ def _no_real_gh_on_path(monkeypatch, tmp_path_factory):
 @pytest.fixture(scope="session")
 def repo_root():
     return REPO_ROOT
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tmp_path_git_ceiling(tmp_path_factory):
+    """Stop Git discovery above temporary workspaces before per-test env snapshots."""
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    # Per-test ceilings extend basetemp, so its name must also be representable.
+    if os.pathsep in str(basetemp):
+        raise pytest.UsageError(
+            "choose --basetemp outside paths containing the path separator " + repr(os.pathsep)
+        )
+    # A ceiling inside the source tree would also hide Git from sibling directories.
+    ceiling_path = basetemp if Path(REPO_ROOT).resolve() in basetemp.parents else basetemp.parent
+    ceiling = str(ceiling_path)
+    previous = os.environ.get("GIT_CEILING_DIRECTORIES")
+    os.environ["GIT_CEILING_DIRECTORIES"] = (
+        ceiling + os.pathsep + previous if previous else ceiling
+    )
+    yield
+    if previous is None:
+        os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+    else:
+        os.environ["GIT_CEILING_DIRECTORIES"] = previous
 
 
 def require_bash():

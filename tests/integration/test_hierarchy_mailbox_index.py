@@ -581,8 +581,12 @@ def test_deletion_drops_membership_without_reparsing(mailbox, monkeypatch, api):
     assert index_module().compare(mailbox, index) == []
 
 
-def test_inode_reuse_with_different_ctime_reparses(mailbox, tmp_path, monkeypatch):
-    index = index_module().MailboxIndex(mailbox, mode="indexed")
+@pytest.mark.parametrize("preserve_ctime", [False, True], ids=["native", "creation-time"])
+def test_inode_reuse_with_different_ctime_reparses(mailbox, tmp_path, monkeypatch, preserve_ctime):
+    module = index_module()
+    if preserve_ctime:
+        monkeypatch.setattr(module, "_checked_reads_supported", lambda: False)
+    index = module.MailboxIndex(mailbox, mode="indexed")
     seed = index.messages()["seed"]
     path = Path(seed["path"])
     old = path.stat()
@@ -591,9 +595,16 @@ def test_inode_reuse_with_different_ctime_reparses(mailbox, tmp_path, monkeypatc
     replacement.replace(path)
     os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
     current = path.stat()
-    assert current.st_ino != old.st_ino and current.st_ctime_ns != old.st_ctime_ns
+    if preserve_ctime:
+        current = SimpleNamespace(st_dev=current.st_dev, st_ino=current.st_ino,
+                                  st_size=current.st_size, st_ctime_ns=old.st_ctime_ns)
+    assert current.st_ino != old.st_ino
+    # Checked metadata reuse needs a changed ctime. Windows hashes the bytes;
+    # its creation time can survive replacement through file-name tunneling.
+    if module._checked_reads_supported():
+        assert current.st_ctime_ns != old.st_ctime_ns
     assert current.st_size == old.st_size
-    real_lstat, real_os_lstat, real_fstat = Path.lstat, os.lstat, os.fstat
+    real_os = module.os
     injected = []
 
     def reused(value):
@@ -602,20 +613,16 @@ def test_inode_reuse_with_different_ctime_reparses(mailbox, tmp_path, monkeypatc
         injected.append(True)
         return SimpleNamespace(st_mode=value.st_mode, st_dev=value.st_dev, st_ino=old.st_ino,
                                st_size=value.st_size, st_mtime_ns=value.st_mtime_ns,
-                               st_ctime_ns=value.st_ctime_ns)
-
-    def lstat(target, *args, **kwargs):
-        return reused(real_lstat(target, *args, **kwargs))
+                               st_ctime_ns=current.st_ctime_ns)
 
     def fstat(descriptor):
-        return reused(real_fstat(descriptor))
+        return reused(real_os.fstat(descriptor))
 
     def os_lstat(path, *args, **kwargs):
-        return reused(real_os_lstat(path, *args, **kwargs))
+        return reused(real_os.lstat(path, *args, **kwargs))
 
-    monkeypatch.setattr(Path, "lstat", lstat)
-    monkeypatch.setattr(os, "lstat", os_lstat)
-    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(module, "os", PlatformOS(real_os.name, base=real_os,
+                                                lstat=os_lstat, fstat=fstat))
     calls = spy_parses(monkeypatch)
     assert index.get("seed") == mailbox.messages()["seed"]
     assert len(calls) == 1 and injected

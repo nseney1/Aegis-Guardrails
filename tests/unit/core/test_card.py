@@ -17,8 +17,9 @@ from typing import Dict
 import pytest
 
 from aegis_cli.formatters.text import render_card
-from aegis_core import card, events
+from aegis_core import baseline, card, events
 from aegis_core._version import __version__
+from aegis_core.verification import ToolEvidence
 from tests.helpers_checkmodes import NO_EVAL, commit, init_repo, write
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -128,7 +129,64 @@ def test_a_check_that_could_not_run_is_said_and_makes_no_file_fail(repo: Path):
     layer1 = card.build(repo).as_dict()["layer1"]
     assert layer1["failed"] == 0 and layer1["pass_rate"] == 1.0
     assert len(layer1["checks_that_could_not_run"]) == 1
-    assert any("could not run" in note for note in card.build(repo).as_dict()["notes"])
+    notes = card.build(repo).as_dict()["notes"]
+    assert "1 check(s) failed outside any file and fail aegis check (aegis check shows why)." in notes
+    assert not any("coverage" in note for note in notes)
+
+
+@pytest.mark.parametrize("tool,target,detail", [
+    ("forbid_ast", ".aegis/rules", "forbid_ast: cannot load rules: OSError: unavailable"),
+    ("forbid_ast", ".aegis/rules/invariants/broken.md", "forbid_ast: cannot load rule broken.md: invalid"),
+    ("forbid_ast", ".aegis/rules", "forbid_ast: cannot verify .aegis/rules: OSError: unavailable"),
+    ("security_pack", "changed files", "security_pack: cannot verify changed files: OSError: unavailable"),
+], ids=["rules-load", "rule-load", "exempt-notes", "security-pack"])
+@pytest.mark.parametrize("with_size_advisory", [False, True])
+def test_pathless_blocking_evidence_is_distinct_from_size_coverage(
+        repo, monkeypatch, tool, target, detail, with_size_advisory):
+    write(repo, "bundle.ts", "export const x = 1;\n")
+    failure = ToolEvidence(tool, target, False, detail)
+    size = ToolEvidence("ast_unverified", "bundle.ts", True, "unverified too_large: bundle.ts exceeds 2 MiB")
+    pairs = [(None, failure)]
+    if with_size_advisory:
+        pairs.append(("bundle.ts", size))
+    pairs.append((None, failure))  # preserve deduplication and interleaved order
+    if with_size_advisory:
+        pairs.append(("bundle.ts", size))
+    monkeypatch.setattr(baseline, "run_fast", lambda *args, **kwargs: (pairs, baseline.Sources(str(repo))))
+    data = card.build(repo).as_dict()
+    layer1 = data["layer1"]
+    assert (layer1["checked"], layer1["passed"], layer1["failed"], layer1["pass_rate"]) == (2, 2, 0, 1.0)
+    expected = [f"{tool}: {detail}"]
+    if with_size_advisory:
+        expected.append(f"{size.tool}: {size.detail}")
+    assert layer1["checks_that_could_not_run"] == expected
+    assert set(layer1) == {"checked", "passed", "failed", "pass_rate", "findings",
+                           "checks_that_could_not_run", "not_analyzed"}
+    assert "1 check(s) failed outside any file and fail aegis check (aegis check shows why)." in data["notes"]
+    coverage = [note for note in data["notes"] if "coverage" in note]
+    assert coverage == (["1 size advisory check(s): AST coverage is incomplete (aegis check shows why)."]
+                        if with_size_advisory else [])
+    lines = render_card(data)
+    assert any("failed outside any file and fail aegis check" in line for line in lines)
+
+
+def test_a_wholly_unavailable_layer1_names_every_target_without_a_pass_rate(repo, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(baseline, "run_fast", unavailable)
+    data = card.build(repo).as_dict()
+    assert data["layer1"] == {
+        "checked": 1, "passed": 0, "failed": 0, "pass_rate": None, "findings": 0,
+        "checks_that_could_not_run": ["Layer 1 could not run: OSError: unavailable"],
+        "not_analyzed": [{"path": "app.py", "reason": "Layer 1 unavailable"}],
+    }
+    lines = render_card(data)
+    assert "  Layer 1: unavailable; 1 file(s) selected" in lines
+    assert "  Layer 1 coverage: 1 file(s) not analyzed:" in lines
+    assert "    app.py: Layer 1 unavailable" in lines
+    assert data["notes"] == ["Layer 1 could not run; no verification coverage is available (aegis check shows why)."]
+    assert not any("%" in line or "AST coverage" in line for line in lines)
 
 
 def test_an_empty_repository_has_no_pass_rate(tmp_path: Path):
@@ -277,6 +335,7 @@ def test_the_text_card_reads_top_to_bottom(repo: Path):
     write(repo, "bad.py", "x = eval('1')\n")
     text = "\n".join(render_card(card.build(repo).as_dict()))
     for fragment in ("Aegis day-0 card", f"workspace: {repo}", "languages: python 2", "AST drivers: python: built-in",
-                     "rules: 1 (invariant 1)", "1 active", "Layer 1: 50% of 2 files pass", "1 finding(s) in 1 file(s)",
+                     "rules: 1 (invariant 1)", "1 active", "Layer 1: 50% of 2 files without blocking findings",
+                     "1 finding(s) in 1 file(s)",
                      "files with the most findings:", "1  bad.py"):
         assert fragment in text, fragment

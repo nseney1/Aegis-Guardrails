@@ -43,7 +43,7 @@ def literal_workspace(workspace: str | Path | os.PathLike[str] | Workspace | Non
 
     A Workspace is returned as is. A path names exactly that directory (resolved, so a
     symlink is accepted): no AEGIS_WORKSPACE override, no walk-up to an enclosing
-    workspace, no legacy .soma refusal. Only a missing argument falls back to
+    workspace, or layout check. Only a missing argument falls back to
     discovery (``Workspace.resolve()``).
     """
     from aegis_core.workspace.base import Workspace

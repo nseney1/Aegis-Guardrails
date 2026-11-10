@@ -1,7 +1,7 @@
 """Behavioral contract and security tests for aegis_core.command_safety (AC-01 through AC-35).
 
 Verifies zero-dependency AST/token command safety analyzer across happy paths,
-edge cases, evasion attempts, Thorns adversarial vectors, and latency bounds.
+edge cases, evasion attempts, Gauntlets adversarial vectors, and latency bounds.
 """
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ class TestCommandAnalyzerBehavioral:
             ("del /s /q C:\\*", REASON_CMD_DELETE),
             ("del /f /s /q C:\\*", REASON_CMD_DELETE),
             ("rmdir /s /q C:\\dir", REASON_CMD_DELETE),
-            # Thorns adversarial vectors
+            # Gauntlets adversarial vectors
             ("{ rm -rf /; }", REASON_RM_RF),
             ("if true; then rm -rf /; fi", REASON_RM_RF),
             ("command rm -rf /", REASON_RM_RF),
@@ -219,7 +219,7 @@ class TestCommandAnalyzerBehavioral:
         commands = [
             "git status",
             "git commit -m 'fix: typo in documentation'",
-            "python -m pytest tests/soma_core/",
+            "python -m pytest tests/aegis_core/",
             "ls -la /tmp",
             "git branch -D old-feature",
             "rm -rf /tmp/scratch",
@@ -321,7 +321,6 @@ class TestCommandAnalyzerBehavioral:
         res_branch = CommandAnalyzer.evaluate("git --git-dir /custom/.git branch -D feat")
         assert res_branch.is_destructive is True
         assert res_branch.reason == REASON_GIT_BRANCH
-
 
 
 # ── R-checks-a1: delimiter runs ("\n\n", ";\n", "&&\n", ";;") ────────────────

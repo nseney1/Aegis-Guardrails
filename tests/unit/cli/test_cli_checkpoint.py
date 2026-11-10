@@ -38,7 +38,7 @@ def _clean_workspace(root: Path) -> Path:
     state.mkdir(parents=True, exist_ok=True)
     (state / "ledger.jsonl").write_text(
         "\n".join(
-            json.dumps({"cell": "math-rule", "signal": s, "timestamp": "2026-09-30T12:00:00Z"})
+            json.dumps({"rule_id": "math-rule", "signal": s, "timestamp": "2026-09-30T12:00:00Z"})
             for s in ("trigger", "tp")
         )
         + "\n",
@@ -50,8 +50,8 @@ def _clean_workspace(root: Path) -> Path:
 def _paper_gate(root: Path) -> None:
     invariants = root / ".aegis" / "rules" / "invariants"
     invariants.mkdir(parents=True, exist_ok=True)
-    (invariants / "wall-bad.md").write_text(
-        "---\nid: wall-bad\ntype: invariant\nenforcement: advisory\n---\n# Bad Wall\n", encoding="utf-8"
+    (invariants / "invariant-bad.md").write_text(
+        "---\nid: invariant-bad\ntype: invariant\nenforcement: advisory\n---\n# Bad Invariant\n", encoding="utf-8"
     )
 
 
@@ -125,7 +125,7 @@ class TestRunCheckpoint:
         _clean_workspace(tmp_path)
         (tmp_path / ".aegis" / "state" / "ledger.jsonl").write_text(
             "\n".join(
-                json.dumps({"cell": "noisy-rule", "signal": s, "timestamp": f"2026-09-30T10:{i:02d}:00Z"})
+                json.dumps({"rule_id": "noisy-rule", "signal": s, "timestamp": f"2026-09-30T10:{i:02d}:00Z"})
                 # MIN_N (25) false positives: no misfire flag below the one sample gate (R-evidence-8)
                 for i, s in enumerate(("trigger",) * 3 + ("fp",) * 25)
             )
@@ -136,7 +136,7 @@ class TestRunCheckpoint:
         evidence = tmp_path / ".aegis" / "evidence"
         evidence.mkdir(parents=True, exist_ok=True)
         (evidence / "outcomes.jsonl").write_text(
-            "\n".join(json.dumps({"cell_id": "noisy-rule", "outcome": "tp"}) for _ in range(25)) + "\n",
+            "\n".join(json.dumps({"rule_id": "noisy-rule", "outcome": "tp"}) for _ in range(25)) + "\n",
             encoding="utf-8",
         )
         issues, _ = run_checkpoint(tmp_path, strict=True)
@@ -163,19 +163,19 @@ class TestCheckpointThroughCheck:
         assert _exit_code(["check", "--workspace", str(tmp_path)]) == 1
         assert _exit_code(["check", "--workspace", str(tmp_path), "--hook"]) == 1
         out = capsys.readouterr().out
-        assert "[FAIL] Invariant rule 'wall-bad.md' enforcement is 'advisory'" in out
+        assert "[FAIL] Invariant rule 'invariant-bad.md' enforcement is 'advisory'" in out
 
     def test_a_rule_left_in_a_v3_directory_fails_check_without_strict(self, tmp_path, capsys):
         """It would silently stop applying; check blocks until it is migrated (#19)."""
         _clean_workspace(tmp_path)
-        walls = tmp_path / ".aegis" / "rules" / "walls"
-        walls.mkdir(parents=True)
-        (walls / "wall-bad.md").write_text(
-            "---\nid: wall-bad\ntype: wall\nenforcement: gate\n---\n# Old wall\n", encoding="utf-8"
+        invariants = tmp_path / ".aegis" / "rules" / "unsupported"
+        invariants.mkdir(parents=True)
+        (invariants / "invariant-bad.md").write_text(
+            "---\nid: invariant-bad\ntype: unsupported\nenforcement: gate\n---\n# Old invariant\n", encoding="utf-8"
         )
         assert _exit_code(["check", "--workspace", str(tmp_path)]) == 1
         out = capsys.readouterr().out
-        assert "[FAIL] .aegis/rules/walls/wall-bad.md: not served: walls/ is not a rule type directory" in out
+        assert "[FAIL] .aegis/rules/unsupported/invariant-bad.md: not served: unsupported/ is not a rule type directory" in out
 
     def test_json_reports_issues_in_one_document(self, tmp_path, capsys):
         (tmp_path / "src").mkdir()

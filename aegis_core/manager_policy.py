@@ -10,14 +10,27 @@ import json
 import os
 import re
 from pathlib import Path
+from types import MappingProxyType
 
 from aegis_core import gitsafe
 from aegis_core.primitives import strict_loads
 
-__all__ = ["ACTIONS", "ManagerError", "canonical", "digest", "parse_membership", "parse_policy", "read_candidate"]
+__all__ = ["ACTIONS", "OUTCOMES", "CONTEXT_LIMITS", "REQUIRED_CONTEXT_FIELDS", "EVIDENCE_LIMITS",
+           "DECISION_REF_LENGTH", "MAX_EVIDENCE", "MAX_RULES", "MAX_RULE_ID_LENGTH", "MAX_IDEMPOTENCY_KEY_LENGTH",
+           "ManagerError", "canonical", "digest", "parse_membership", "parse_policy", "read_candidate"]
 
 ACTIONS = frozenset(("delegation", "ownership", "hierarchy", "resource_budget", "checkpoint",
                      "handoff", "evidence_review", "escalation", "policy_change"))
+OUTCOMES = frozenset(("success", "partial", "failure", "pass", "fail", "tp", "fp"))
+CONTEXT_LIMITS = MappingProxyType({"member_id": 128, "worktree_id": 128, "role": 128,
+                                 "phase": 128, "risk": 128, "summary": 4096})
+REQUIRED_CONTEXT_FIELDS = frozenset(("member_id", "worktree_id"))
+EVIDENCE_LIMITS = MappingProxyType({"member_id": 256, "worktree_id": 256, "source_tree": 256,
+                                  "check": 256, "rule_id": 256, "rule_revision": 256, "reference": 1024})
+MAX_EVIDENCE = 20
+DECISION_REF_LENGTH = 64
+MAX_RULE_ID_LENGTH = 64
+MAX_IDEMPOTENCY_KEY_LENGTH = 128
 MAX_PAYLOAD_BYTES = 256 * 1024
 MAX_RULES = 128
 MAX_WORKTREES = 16

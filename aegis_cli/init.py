@@ -31,9 +31,7 @@ from aegis_cli import NO_HOME_MESSAGE
 from aegis_cli.base import AegisCommand, CommandCategory, host_option, unwritable
 from aegis_cli.hooks import (  # noqa: F401 — re-exported for tests/unit/core/test_worktree_hooks.py
     AEGIS_HOOK_FORMAT,
-    SOMA_HOOK_FORMAT,
     _AEGIS_HOOK_START,
-    _SOMA_HOOK_START,
     install_hook,
 )
 from aegis_cli.init_views import (
@@ -359,7 +357,7 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
         return f"{target} is not UTF-8 text; Aegis cannot edit it"
     except OSError as exc:
         return f"{target} cannot be read ({exc.strerror or exc})"
-    if _AEGIS_HOOK_START not in content and _SOMA_HOOK_START not in content:
+    if _AEGIS_HOOK_START not in content:
         reason = None if removing else unwritable(target.parent)
         return f"{reason}, so the hook cannot be {verb}" if reason else None
     if shared:
@@ -381,8 +379,9 @@ def hook_refusal(root: Path, *, removing: bool = False) -> Optional[str]:
 
 def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report) -> Step:
     """Add the selected hosts to ``.aegis/config.json`` (``{"v": 1}`` when none)."""
-    from aegis_core.config import ConfigError, RepoConfig, update_repo_config
+    from aegis_core.config import ConfigError, MAX_CONFIG_BYTES, RepoConfig, update_repo_config
     from aegis_core.errors import PathTraversalError
+    from aegis_core.workspace.confinement import read_confined_bytes
     from aegis_core.workspace.layout import WorkspaceLayout
 
     layout = WorkspaceLayout(root)
@@ -401,8 +400,8 @@ def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report
             return
         data["hosts"] = ordered_hosts(list(current or []) + selected)
 
-    before = layout.config_file.read_bytes() if layout.config_file.is_file() else None
     try:
+        before = read_confined_bytes(root, layout.config_file, error_type=InstallError, max_bytes=MAX_CONFIG_BYTES)
         if dry_run:
             current = RepoConfig.load(root)
             data: Dict[str, Any] = {"hosts": list(current.hosts)} if before is not None else {}
@@ -413,9 +412,13 @@ def _config_hosts(root: Path, selected: List[str], dry_run: bool, report: Report
         else:
             hosts = update_repo_config(root, change).get("hosts", [])
             result = "created" if before is None else (
-                "unchanged" if layout.config_file.read_bytes() == before else "updated")
+                "unchanged" if read_confined_bytes(root, layout.config_file, error_type=InstallError, max_bytes=MAX_CONFIG_BYTES) == before else "updated")
+    except InstallError as exc:
+        raise InstallError(str(exc).removesuffix("; no rule, config.json or .aegis/.gitignore was changed")) from exc
     except PathTraversalError as exc:
         raise InstallError(str(exc)) from exc
+    except OSError as exc:
+        raise InstallError("cannot read .aegis/config.json") from exc
     except ConfigError as exc:
         report.warn(f"{exc}; left unchanged. Fix it, then rerun aegis init.")
         return Step(CONFIG_LABEL, "kept", str(exc))

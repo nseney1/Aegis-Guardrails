@@ -232,7 +232,7 @@ class TestLayer2ArbitrationVerdicts:
                 meta['score'] = 1.0
                 return meta
         ''')
-        source_file = tmp_path / "cell.py"
+        source_file = tmp_path / "rule.py"
         source_file.write_text(code)
 
         def fake_llm(prompt: str) -> str:
@@ -243,7 +243,7 @@ class TestLayer2ArbitrationVerdicts:
                     {
                         "category": "persistence_gap",
                         "claim": "All fitness keys are fully serialized",
-                        "evidence_file": "cell.py",
+                        "evidence_file": "rule.py",
                         "evidence_line": 3,
                         "tests_covering": [],
                     }
@@ -253,7 +253,7 @@ class TestLayer2ArbitrationVerdicts:
         evidence = [
             ToolEvidence(
                 tool="persistence_checker",
-                target="cell.py:fitness",
+                target="rule.py:fitness",
                 verdict=False,
                 detail="PERSISTENCE GAP: score mutated but not serialized",
                 lines=[3],
@@ -261,9 +261,9 @@ class TestLayer2ArbitrationVerdicts:
         ]
 
         result = _layer2(
-            changed_files=["cell.py"],
+            changed_files=["rule.py"],
             repo_root=str(tmp_path),
-            task_plan="Update cell fitness calculation",
+            task_plan="Update rule fitness calculation",
             layer1_evidence=evidence,
             llm_backend=fake_llm,
         )

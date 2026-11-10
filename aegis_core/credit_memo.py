@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import stat
+from time import time_ns
 from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import atomicio, storage
@@ -17,9 +18,15 @@ _Key = Tuple[str, str, str, str, Optional[str]]
 _Ancestors = Tuple[Tuple[Path, Tuple[int, int]], ...]
 _PERSISTED: Set[_Key] = set()
 _MAX_PERSISTED = 50_000
-# Mirrors aegis_core.telemetry_engine.ledger._TAIL_CHECK_BYTES. RF-32-style
-# unification comes with a later refactor; do not couple to that module's private names.
-_TAIL_CHECK_BYTES = 256
+_RACY_WINDOW_NS = 2_000_000_000
+
+
+def _settled(evidence: storage.FileReport) -> bool:
+    """Racy I/O evidence cannot become eligible by aging before a later fill."""
+    _, mtime_ns, ctime_ns = storage.file_generation(evidence.size, evidence.mtime_ns, evidence.ctime_ns)
+    return (evidence.started_ns is not None
+            and evidence.started_ns - mtime_ns > _RACY_WINDOW_NS
+            and (ctime_ns == 0 or evidence.started_ns - ctime_ns > _RACY_WINDOW_NS))
 
 
 @dataclass(frozen=True)
@@ -27,8 +34,8 @@ class _PersistedLedger:
     path: Path
     identity: Tuple[int, int]
     size: int
-    tail: bytes
-    head: bytes
+    mtime_ns: int
+    ctime_ns: int
 
 
 _PERSISTED_IDENTITY: Dict[str, _PersistedLedger] = {}
@@ -39,6 +46,8 @@ class _ReadGeneration:
     identity: Optional[Tuple[int, int]]
     size: int
     ancestors: Optional[_Ancestors]
+    mtime_ns: int = 0
+    ctime_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,15 +108,15 @@ def _forget(root: str) -> None:
     _PERSISTED_IDENTITY.pop(root, None)
 
 
-def _snapshot(path: Path, size: Optional[int] = None,
-              ancestors: Optional[_Ancestors] = None) -> Optional[_PersistedLedger]:
-    """Optional bounded cache evidence, read from one anchored regular-file descriptor.
+def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_PersistedLedger]:
+    """Optional stat evidence from one anchored regular-file descriptor, without reads.
 
     Use the regular-file opener on platforms without descriptor-relative no-follow
     operations. Cache I/O failures are misses, never failures of an exposure write.
     """
     if not path.is_absolute():
         return None
+    captured_ns = time_ns()
     anchored = (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
                 and {"open", "stat"} <= {f.__name__ for f in os.supports_dir_fd}
                 and "stat" in {f.__name__ for f in os.supports_follow_symlinks})
@@ -136,20 +145,9 @@ def _snapshot(path: Path, size: Optional[int] = None,
                 return None
             if not anchored and not _same_ancestors(ancestors):
                 return None
-            offset = info.st_size if size is None else size
-            if not stat.S_ISREG(info.st_mode) or not 0 < offset <= info.st_size:
+            if (not stat.S_ISREG(info.st_mode) or info.st_size <= 0
+                    or captured_ns - info.st_mtime_ns <= _RACY_WINDOW_NS):
                 return None
-            count = min(offset, _TAIL_CHECK_BYTES)
-            os.lseek(fd, offset - count, os.SEEK_SET)
-            tail = os.read(fd, count)
-            if len(tail) != count:
-                return None
-            head = tail
-            if offset > count:
-                os.lseek(fd, 0, os.SEEK_SET)
-                head = os.read(fd, count)
-                if len(head) != count:
-                    return None
             # Descriptors pin every ancestor. Reject a rename or link substitution
             # as well, so a detached old ledger cannot validate the current site.
             for directory, part, identity in chain:
@@ -159,9 +157,11 @@ def _snapshot(path: Path, size: Optional[int] = None,
             current = os.stat(path.name, dir_fd=parent, follow_symlinks=False) if anchored else os.lstat(path)
             if not anchored and not _same_ancestors(ancestors):
                 return None
-            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino) or current.st_size < offset:
+            stamps = storage.file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            if ((current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or storage.file_generation(current.st_size, current.st_mtime_ns, current.st_ctime_ns) != stamps):
                 return None
-            return _PersistedLedger(path, (info.st_dev, info.st_ino), offset, tail, head)
+            return _PersistedLedger(path, (info.st_dev, info.st_ino), *stamps)
     except (OSError, PathTraversalError):
         return None
 
@@ -169,12 +169,12 @@ def _snapshot(path: Path, size: Optional[int] = None,
 def contains(root: str, keys: Sequence[_Key], site: Optional[_MemoSite]) -> bool:
     """Check persisted keys against the current site, without a lock or full read.
 
-    Validate identity, size and bounded head/tail continuity. Deliberate content
-    forgery preserving both sampled regions is outside the memo's threat model.
+    Validate identity, size and file generation stamps. Every write, including an
+    unrelated append, invalidates the memo and takes the authoritative locked read.
     """
     cached = _PERSISTED_IDENTITY.get(root)
     if cached is not None:
-        if site is None or site.path != cached.path or _snapshot(site.path, cached.size, site.ancestors) != cached:
+        if site is None or site.path != cached.path or _snapshot(site.path, site.ancestors) != cached:
             _forget(root)
     return all(key in _PERSISTED for key in keys)
 
@@ -192,12 +192,14 @@ def before_read(root: str, site: storage.LedgerSite) -> Optional[_ReadGeneration
         _forget(root)
         return None
     else:
+        stamps = storage.file_generation(current.st_size, current.st_mtime_ns, current.st_ctime_ns)
         cached = _PERSISTED_IDENTITY.get(root)
         if cached is not None and (path != cached.path
                                    or (current.st_dev, current.st_ino) != cached.identity
-                                   or current.st_size < cached.size):
+                                   or stamps
+                                   != (cached.size, cached.mtime_ns, cached.ctime_ns)):
             _forget(root)
-        return _ReadGeneration((current.st_dev, current.st_ino), current.st_size, ancestors)
+        return _ReadGeneration((current.st_dev, current.st_ino), stamps[0], ancestors, *stamps[1:])
 
 
 def reconcile(root: str, seen: Set[Tuple[str, str, Optional[str]]]) -> None:
@@ -207,23 +209,28 @@ def reconcile(root: str, seen: Set[Tuple[str, str, Optional[str]]]) -> None:
 
 def remember(root: str, keys: Sequence[_Key], path: Path, before: Optional[_ReadGeneration],
              appended: Sequence[Mapping[str, Any]], read: Optional[storage.FileReport]) -> None:
-    """Memoise after the caller's locked append, within the process-wide size bound."""
+    """Memoise only a settled locked read, within the process-wide size bound."""
+    if appended:
+        _forget(root)
+        return
     if len(_PERSISTED) + len(keys) > _MAX_PERSISTED:
         reset()
     if len(keys) <= _MAX_PERSISTED:
-        evidence = getattr(appended, "report", None) if appended else read
-        if (before is None or evidence is None or not evidence.tail or not evidence.head
-                or evidence.size < before.size + evidence.added
-                or (before.identity is not None and evidence.identity != before.identity)
-                or (read is not None and not evidence.head.startswith(read.head))
-                or (read is None and before.size > 0)):
+        evidence = read
+        if (before is None or evidence is None or not _settled(evidence)
+                or evidence.identity != before.identity):
             _forget(root)
             return
-        # Compare the exact bounded suffix of the bytes actually read/appended,
-        # at that operation's end offset. Later ordinary appends remain valid.
-        snapshot = _snapshot(path, evidence.size, before.ancestors)
+        # The read must describe the generation observed before it started.
+        # A reset in that gap cannot certify keys seen only in the old file.
+        prior = (before.size, before.mtime_ns, before.ctime_ns)
+        if storage.file_generation(evidence.size, evidence.mtime_ns, evidence.ctime_ns) != prior:
+            _forget(root)
+            return
+        snapshot = _snapshot(path, before.ancestors)
         if (snapshot is not None and snapshot.identity == evidence.identity
-                and snapshot.tail.endswith(evidence.tail) and snapshot.head == evidence.head):
+                and (snapshot.size, snapshot.mtime_ns, snapshot.ctime_ns)
+                == storage.file_generation(evidence.size, evidence.mtime_ns, evidence.ctime_ns)):
             _PERSISTED_IDENTITY[root] = snapshot
             _PERSISTED.update(keys)
         else:

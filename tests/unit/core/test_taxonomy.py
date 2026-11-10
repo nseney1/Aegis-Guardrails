@@ -12,7 +12,6 @@ from aegis_core.taxonomy import (
     GENESIS_STAGES,
     GenesisStage,
     LEGACY_REVIEW_MODE_ALIASES,
-    LEGACY_REVIEW_PRONG_ALIASES,
     MCP_DEFAULT_RATE_LIMITS,
     REVIEW_MODES,
     REVIEW_MODE_RANKS,
@@ -50,8 +49,6 @@ def test_normalize_review_mode_canonical_and_legacy():
 
 def test_review_prongs_and_genesis_stages():
     assert REVIEW_PRONGS == ("Sentry", "Trace", "Probe", "Gauntlet", "Bastion", "Debrief")
-    assert LEGACY_REVIEW_PRONG_ALIASES["spores"] == ReviewProng.SENTRY
-    assert LEGACY_REVIEW_PRONG_ALIASES["mulch"] == ReviewProng.DEBRIEF
     assert GENESIS_STAGES == (
         GenesisStage.PERIMETER,
         GenesisStage.CHRONOLOGY,
@@ -69,7 +66,7 @@ def test_one_rule_type_table_with_six_types_and_their_directories():
     }
     assert {d: t for t, d in RULE_TYPE_DIRS.items()} == DIR_RULE_TYPES
     # No legacy alias survives in the table: v3 names are migrate's business.
-    assert not {"wall", "membrane", "genome", "walls", "membranes"} & (set(RULE_TYPE_DIRS) | set(DIR_RULE_TYPES))
+    assert "unsupported" not in RULE_TYPE_DIRS and "unsupported" not in DIR_RULE_TYPES
 
 
 def test_the_lifecycle_ladder_is_trap_invariant_gate():
@@ -84,7 +81,7 @@ def test_the_lifecycle_ladder_is_trap_invariant_gate():
 
 _ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
 _TYPE_WORDS = set(CANONICAL_RULE_TYPES) | set(RULE_TYPE_DIRS.values()) | {
-    "wall", "walls", "membrane", "membranes", "genome", "vacuole", "safety-guard", "learned-trap",
+    "invariant", "invariants", "boundary", "boundaries", "rules", "trap", "safety-guard", "learned-trap",
 }
 # The table itself, which also holds the legacy-name table aegis migrate converts with.
 _TABLE_OWNERS = {"aegis_core/taxonomy.py"}
@@ -122,8 +119,6 @@ def test_statistical_and_operational_constants():
 def test_a_type_name_of_any_version_stands_for_its_v4_type():
     assert legacy_rule_type("invariant") == "invariant"
     assert legacy_rule_type(" Trap ") == "trap"  # any case and padding
-    assert legacy_rule_type("walls") == "invariant"  # a v3 type directory
-    assert legacy_rule_type("Vacuoles") == "trap"  # a v2 organelle
     assert legacy_rule_type("traps") == "trap"
 
 
@@ -132,3 +127,12 @@ def test_a_name_no_version_used_stands_for_no_type():
     assert legacy_rule_type("") is None
     assert legacy_rule_type(None) is None
     assert legacy_rule_type(3) is None
+
+
+def test_supercell_mode_is_written_as_citadel(tmp_path):
+    from aegis_core.lifecycle.creation import create_rule
+    from aegis_core.yaml_engine.frontmatter import parse_frontmatter
+
+    (tmp_path / ".aegis/rules").mkdir(parents=True)
+    path = create_rule("trap", "Keep canonical mode", workspace=tmp_path, minimum_mode="supercell")
+    assert parse_frontmatter(path.read_text())["minimum_mode"] == "citadel"

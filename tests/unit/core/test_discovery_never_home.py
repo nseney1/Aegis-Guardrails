@@ -110,11 +110,11 @@ def test_a_folder_under_the_real_home_never_resolves_to_it_when_home_is_overridd
     assert root == (real_home.parent if how == "caller_file" else start)
 
 
-def test_a_legacy_soma_in_the_real_home_is_not_read_as_a_workspace(real_home):
-    # A long-time user's real home: v2's ~/.soma, no ~/.aegis. Like $HOME, never walked into.
+def test_user_configuration_in_the_real_home_is_not_a_workspace(real_home):
     shutil.rmtree(real_home / ".aegis")
-    (real_home / ".soma").mkdir()
+    (real_home / ".aegis").mkdir()
+    (real_home / ".aegis/config.json").write_text('{"v": 1}\n', encoding="utf-8")
     start = real_home / "code"
     start.mkdir()
     assert resolve_workspace_root(start=start) == start
-    assert resolve_workspace_root(start=real_home) == real_home
+    assert not _is_workspace_dir(str(real_home))
