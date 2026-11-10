@@ -12,11 +12,14 @@ our agents would have produced, then verifies the Arbiter catches it.
 """
 import sys
 
+import pytest
+
 
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 sys.path.insert(0, REPO_ROOT)
 
 from aegis_core.verification import Claim, Prediction, RiskCategory, Severity, ToolEvidence, Verdict
+from aegis_core.verification import arbiter
 from aegis_core.verification.arbiter import arbitrate
 
 
@@ -327,3 +330,150 @@ class TestUnverifiedReasons:
         result = arbitrate([], [], failing, gaps=self._gaps(reviewed_files=()))
         assert result.verdict == Verdict.BLOCK
         assert result.unverified_reasons == ("no_predictions", "no_reviewed_files")
+
+
+class TestVendorProvenance:
+    SAME = "Same-vendor arbiter provides prompt isolation only, not model independence."
+    UNKNOWN = "Vendor independence unverified: generating host is unknown."
+    UNVERIFIED = "Vendor independence unverified: explicit family is not a canonical vendor."
+
+    @pytest.mark.parametrize("declared,host,reviewer,generator,want", [
+        ("claude", "codex-cli", ("lab-a", "model-1"), ("lab-a", "model-2"), SAME),
+        ("openai", "codex-cli", ("lab-a", "model-1"), ("lab-b", "model-2"), ""),
+        ("unlisted-lab", "cursor", ("lab-a", "model-1"), ("lab-a", "model-2"), SAME),
+        (None, None, ("lab-a", "model-1"), ("lab-a", "model-2"), SAME),
+        ("claude", "claude-code", ("lab-a", "shared-model"), ("lab-b", "shared-model"), SAME),
+        ("openai", "codex-cli", ("custom-codex", "gpt-like-1"), ("openai", "gpt-like-2"), ""),
+        ("claude", "claude-code", ("lab-a", "model"), ("lab-b", "model-variant"), ""),
+        ("openai", "codex-cli", ("lab-a", "model"), ("lab-a-variant", "other"), ""),
+        ("bedrock", "openrouter", ("anthropic", "claude-x"), ("anthropic", "claude-y"), SAME),
+        ("openrouter", "openrouter", ("anthropic", "claude-x"), ("openai", "gpt-y"), ""),
+        ("claude", "claude-code", ("first", "model-a"), ("first", "model-b"), SAME),
+        ("claude", "claude-code", ("first", "model-a"), ("second", "model-b"), ""),
+        ("claude", "claude-code", ("claude", "model-a"), ("anthropic", "model-b"), ""),
+    ])
+    def test_explicit_identity_overrides_labels(self, declared, host, reviewer, generator, want):
+        assert arbiter.vendor_warning(
+            declared, host, reviewer_provenance=arbiter.ModelProvenance(*reviewer),
+            generator_provenance=arbiter.ModelProvenance(*generator),
+        ) == want
+
+    @pytest.mark.parametrize("declared,host,want", [
+        ("claude", "claude-code", SAME),
+        ("anthropic", "claude-code", SAME),
+        ("google", "antigravity", SAME),
+        ("gemini", "gemini-cli", SAME),
+        ("openai", "codex-cli", SAME),
+        ("codex", "openai", SAME),
+        (" OPENAI ", " CODEX-CLI ", SAME),
+        ("google", "custom-gemini-proxy", SAME),
+        ("openai", "custom-codex-proxy", SAME),
+        ("gemini", "claude-code", ""),
+        ("unlisted-lab", "codex-cli", ""),
+        ("unlisted-lab", "cursor", UNKNOWN),
+        ("claude", "cursor", UNKNOWN),
+        ("claude", "copilot", UNKNOWN),
+        ("claude", "windsurf", UNKNOWN),
+        ("claude", "kiro", UNKNOWN),
+        ("claude", None, UNKNOWN),
+        (None, "claude-code", ""),
+        ("  ", "unknown-host", ""),
+    ])
+    def test_label_results_are_byte_identical_without_provenance(self, declared, host, want):
+        assert arbiter.vendor_warning(declared, host) == want
+        assert arbiter.vendor_warning(
+            declared, host, reviewer_provenance=None, generator_provenance=None,
+        ) == want
+
+    @pytest.mark.parametrize("declared,host,reviewer,generator,want", [
+        ("anthropic", "codex-cli", None, ("anthropic", "model-a"), SAME),
+        ("anthropic", "codex-cli", ("openai", "model-b"), None, SAME),
+        ("anthropic", "claude-code", ("openai", "model-b"), None, ""),
+        ("anthropic", "claude-code", None, ("openai", "model-a"), ""),
+        ("unlisted-lab", "claude-code", ("anthropic", "model-b"), None, SAME),
+        ("anthropic", "cursor", None, ("anthropic", "model-a"), SAME),
+        ("anthropic", None, None, ("anthropic", "model-a"), SAME),
+        (None, "codex-cli", ("openai", "model-b"), None, SAME),
+        ("unlisted-lab", "codex-cli", None, ("openai", "model-a"), ""),
+        ("anthropic", "cursor", ("anthropic", "model-a"), None, UNKNOWN),
+        (None, None, None, ("openai", "model-a"), ""),
+        ("anthropic", "codex-cli", ("unlisted-family", "model-a"), None, UNVERIFIED),
+        ("anthropic", "claude-code", None, ("unlisted-family", "model-a"), UNVERIFIED),
+        ("claude", "claude-code", None, ("claude", "m"), UNVERIFIED),
+        ("anthropic", "codex-cli", None, ("first", "m"), UNVERIFIED),
+        ("anthropic", "codex-cli", ("first", "m"), None, UNVERIFIED),
+        (None, "codex-cli", ("codex", "gpt-5"), None, UNVERIFIED),
+        (None, "codex-cli", None, ("first", "m"), ""),
+        ("  ", "codex-cli", None, ("first", "m"), ""),
+    ])
+    def test_each_side_uses_its_own_provenance_before_its_label(self, declared, host, reviewer, generator, want):
+        assert arbiter.vendor_warning(
+            declared, host,
+            reviewer_provenance=arbiter.ModelProvenance(*reviewer) if reviewer else None,
+            generator_provenance=arbiter.ModelProvenance(*generator) if generator else None,
+        ) == want
+
+    @pytest.mark.parametrize("side", ["reviewer", "generator"])
+    @pytest.mark.parametrize("family,label,want", [
+        ("openai", "codex-cli", SAME),
+        ("anthropic", "claude-code", SAME),
+        ("google", "gemini-cli", SAME),
+        ("codex", "codex-cli", UNVERIFIED),
+        ("claude", "claude-code", UNVERIFIED),
+        ("gemini", "gemini-cli", UNVERIFIED),
+        ("antigravity", "antigravity", UNVERIFIED),
+        ("first", "codex-cli", UNVERIFIED),
+        ("openai-proxy", "codex-cli", UNVERIFIED),
+        ("anthropic-proxy", "claude-code", UNVERIFIED),
+        ("google-proxy", "gemini-cli", UNVERIFIED),
+    ])
+    def test_mixed_provenance_requires_an_exact_canonical_vendor(self, side, family, label, want):
+        records = {side + "_provenance": arbiter.ModelProvenance(family, "m")}
+        assert arbiter.vendor_warning(label, label, **records) == want
+
+    @pytest.mark.parametrize("reviewer,generator", [
+        ((" OpenAI ", "o3"), ("openai", "gpt-5")),
+        (("openai", "o3"), (" OPENAI ", "gpt-5")),
+        (("lab-a", " GPT-5 "), ("lab-b", "gpt-5")),
+        (("lab-a", "gpt-5"), ("lab-b", " GPT-5 ")),
+        (("Straße", "model-a"), ("STRASSE", "model-b")),
+        (("lab-a", "Straße"), ("lab-b", "STRASSE")),
+    ])
+    def test_normalized_family_or_model_matches(self, reviewer, generator):
+        assert arbiter.vendor_warning(
+            "claude", "codex-cli", reviewer_provenance=arbiter.ModelProvenance(*reviewer),
+            generator_provenance=arbiter.ModelProvenance(*generator),
+        ) == self.SAME
+
+    def test_family_and_model_are_stored_in_normalized_form(self):
+        provenance = arbiter.ModelProvenance(" OpenAI ", " GPT-5 ")
+        assert provenance.family == "openai"
+        assert provenance.model == "gpt-5"
+
+    @pytest.mark.parametrize("value", [None, 1, True, [], {}, "", "   ", "x" * 257])
+    @pytest.mark.parametrize("name", ["family", "model"])
+    def test_malformed_provenance_has_a_fixed_refusal(self, name, value):
+        values = ["lab-a", "model-1"]
+        values[0 if name == "family" else 1] = value
+        with pytest.raises(ValueError, match="^invalid_model_provenance$"):
+            arbiter.ModelProvenance(*values)
+
+    @pytest.mark.parametrize("values", [("ß" * 129, "model-a"), ("lab-a", "ß" * 129)])
+    def test_normalized_ids_must_also_fit_the_limit(self, values):
+        with pytest.raises(ValueError, match="^invalid_model_provenance$"):
+            arbiter.ModelProvenance(*values)
+
+    def test_provenance_at_the_size_limit_is_compared(self):
+        reviewer = arbiter.ModelProvenance("p" * 256, "r" * 256)
+        generator = arbiter.ModelProvenance("p" * 256, "g" * 256)
+        assert arbiter.vendor_warning(
+            "claude", "codex-cli", reviewer_provenance=reviewer, generator_provenance=generator,
+        ) == self.SAME
+
+    @pytest.mark.parametrize("name", ["reviewer_provenance", "generator_provenance"])
+    @pytest.mark.parametrize("value", [{}, [], "untrusted", 1])
+    def test_invalid_record_type_has_a_fixed_refusal(self, name, value):
+        provenance = arbiter.ModelProvenance("lab-a", "model-1")
+        records = {"reviewer_provenance": provenance, "generator_provenance": provenance, name: value}
+        with pytest.raises(ValueError, match="^invalid_model_provenance$"):
+            arbiter.vendor_warning("claude", "claude-code", **records)
