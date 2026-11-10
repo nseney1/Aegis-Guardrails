@@ -26,7 +26,6 @@ import ntpath
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -35,6 +34,7 @@ import sys
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from aegis_core.argv import split_command
 from aegis_core.config import read_user_config
 from aegis_core.primitives import is_within
 from aegis_core.storage import read_tail_bytes
@@ -109,7 +109,7 @@ def user_test_command(workspace: Path) -> Optional[List[str]]:
     command = tests.get("command") if isinstance(tests, dict) else None
     if isinstance(command, str) and command.strip():
         try:
-            words = shlex.split(command, posix=os.name != "nt")
+            words = split_command(command)
         except ValueError:
             return None
         return words or None
