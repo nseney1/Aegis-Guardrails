@@ -48,6 +48,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 from hierarchy_mailbox import (GIT_ID, SLUG, Mailbox, endpoint_parts, fields, matching, read_json, require,  # noqa: E402
                                strict_json, text, timestamp)
+import hierarchy_container_verify  # noqa: E402
 import hierarchy_hosts  # noqa: E402
 import hierarchy_lifecycle  # noqa: E402
 import hierarchy_native  # noqa: E402
@@ -156,9 +157,7 @@ def placeholders(value, where=""):
 
 def absolute(value, label):
     text(value, label)
-    path = Path(value)
-    require(path.is_absolute() and ".." not in path.parts, "%s must be an absolute path without ..: %s" % (label, value))
-    return path
+    return hierarchy_container_verify._absolute(value, label)
 
 
 def part(where, check):
