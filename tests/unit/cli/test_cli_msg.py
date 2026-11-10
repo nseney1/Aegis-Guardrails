@@ -550,16 +550,13 @@ def test_msg_denied_workspace_has_distinct_fixed_error(target, workspace, tmp_pa
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
 def test_msg_unreadable_discovery_directory_is_fixed_json(workspace, capsys):
-    from aegis_core.workspace.layout import WorkspaceLayout
-
-    legacy = WorkspaceLayout(workspace).legacy_rule_dirs[0].parent
-    legacy.mkdir(mode=0o700)
-    legacy.chmod(0)
+    original_mode = workspace.stat().st_mode
+    workspace.chmod(0)
     try:
         assert main(["msg", "verify", "a" * 64]) == 2
         assert_error(capsys.readouterr(), "E_AUTH", "attachment")
     finally:
-        legacy.chmod(0o700)
+        workspace.chmod(original_mode)
 
 
 @pytest.mark.parametrize("reference", ["typo", "other-store", "prefix", "malformed"])
