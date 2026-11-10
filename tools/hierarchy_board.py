@@ -385,16 +385,35 @@ class Board:
         total = len(posts)
         views = []
         best = {**extra, "authority": "information_only", "posts": [], "remaining": total, "next_after": None}
-        require(len(render(best)) <= MAX_PAGE_BYTES, "board page metadata exceeds the page budget")
+        rendered = render(best)
+        require(len(rendered) <= MAX_PAGE_BYTES, "board page metadata exceeds the page budget")
+        # A renderer may declare (fragment byte size, list separator byte size).
+        # Undeclared callbacks retain legacy sizing regardless of their output format.
+        framing = getattr(render, "board_page_framing", None)
+        if framing is not None:
+            fragment_size, separator_size = framing
+            fixed_size = len(rendered) - fragment_size(total) - fragment_size(None)
+        posts_size = 0
+        best_size = len(rendered)
         for post in posts[:limit]:
             views.append(self.view(state, post, now))
             candidate = {**best, "posts": list(views), "remaining": total - len(views),
                          "next_after": views[-1]["post_id"] if total > len(views) else None}
-            if len(render(candidate)) > MAX_PAGE_BYTES:
+            if framing is None:
+                size = len(render(candidate))
+            else:
+                # Only the new post, commas, remaining digits and cursor change. Never
+                # serialize an already-sized prefix, and never read beyond the first overflow.
+                posts_size += fragment_size(views[-1]) + (separator_size if len(views) > 1 else 0)
+                size = fixed_size + posts_size + fragment_size(candidate["remaining"]) + fragment_size(candidate["next_after"])
+            if size > MAX_PAGE_BYTES:
                 require(len(views) > 1, "a post does not fit the page budget")
                 views.pop()
                 break
             best = candidate
+            best_size = size
+        if framing is not None and best["posts"]:
+            require(len(render(best)) == best_size, "board page rendering changed during sizing")
         return best
 
     def open_blockers(self, state, channel):
@@ -591,6 +610,14 @@ def digest_text(board, state, channel, now):
 
 def cli_line(value):
     return (json.dumps(value, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _cli_fragment_size(value):
+    # The CLI uses default JSON separators and ensure_ascii=True: characters equal bytes.
+    return len(json.dumps(value, sort_keys=True))
+
+
+cli_line.board_page_framing = (_cli_fragment_size, 2)
 
 
 def run(args):

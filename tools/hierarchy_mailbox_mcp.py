@@ -99,6 +99,12 @@ def _tool_result(result):
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
 
 
+def _board_fragment_size(value):
+    # _tool_result embeds ASCII JSON in a string; _response_line escapes that string.
+    # Exclude the outer string quotes. Default list separators remain two bytes.
+    return len(json.dumps(json.dumps(value, sort_keys=True))) - 2
+
+
 def _error_text(exc):
     # Some errors repeat the input, and a response must stay within a page whatever was sent.
     return str(exc)[:1024]
@@ -815,11 +821,13 @@ class Connection:
             with writer_lock(self.root):
                 result = self.checked_mailbox().publish({**arguments, **self.sender})
             if compact:
+                receipt = {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
+                           "created_at": result["message"]["created_at"], "size": None}
                 try:
-                    return {"id": result["message"]["message_id"], "path": result["path"], "sha256": result["sha256"],
-                            "created_at": result["message"]["created_at"], "size": os.stat(result["path"]).st_size}
-                except OSError as exc:
-                    raise ValueError("published message metadata unavailable; inspect the mailbox before retrying") from exc
+                    receipt["size"] = os.stat(result["path"]).st_size
+                except OSError:
+                    receipt["note"] = "message published; size metadata unavailable; do not retry publication"
+                return receipt
             return result
         if name == "mailbox_ack_handoff":
             fields(arguments, {"checkpoint_sha256"})
@@ -871,6 +879,8 @@ def handle(connection, request):
             if params["name"] == "mailbox_inbox":
                 rendered_sizes[len(page["messages"])] = len(raw)
             return raw
+
+        render.board_page_framing = (_board_fragment_size, 2)
 
         try:
             result = connection.call(params["name"], params.get("arguments", {}), render)

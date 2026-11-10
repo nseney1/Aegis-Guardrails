@@ -656,6 +656,101 @@ def test_environment_refuses_secrets_and_home_override(adapter, layout):
             adapter.create_argv(ISOLATION, run=layout.run, mounts=mounts(adapter, layout), env=env)
 
 
+def container_registry(monkeypatch, entries, kinds=None):
+    verifier = importlib.import_module("hierarchy_container_verify")
+    registry = importlib.import_module("hierarchy_hosts")
+
+    def entry(kind):
+        value = entries[kind] if kind in entries else registry.entry(kind)
+        if isinstance(value, Exception):
+            raise value
+        return copy.deepcopy(value)
+
+    # Replace only the consumer's module reference, never the shared registry.
+    monkeypatch.setattr(verifier, "hierarchy_hosts", SimpleNamespace(
+        TEAM_HOSTS=registry.TEAM_HOSTS if kinds is None else kinds, entry=entry), raising=False)
+
+
+def test_registry_host_environment_golden(adapter, layout):
+    assert json.dumps(adapter.container_env(layout.run), sort_keys=True) == json.dumps({
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": str(layout.run / "home"), "CODEX_HOME": str(layout.run / "codex-home"),
+        "CLAUDE_CONFIG_DIR": str(layout.run / "claude-home")}, sort_keys=True)
+
+
+def test_registry_new_host_needs_no_container_edit(adapter, layout, monkeypatch):
+    registry = importlib.import_module("hierarchy_hosts")
+    extra = {"kind": "fixture-host", "home": {"variable": "FIXTURE_HOST_HOME", "run_folder": "fixture-home"}}
+    container_registry(monkeypatch, {"fixture-host": extra}, (*registry.TEAM_HOSTS, "fixture-host"))
+    fixed = str(layout.run / "fixture-home")
+    assert adapter.container_env(layout.run)["FIXTURE_HOST_HOME"] == fixed
+    for argv in (adapter.create_argv(ISOLATION, run=layout.run, mounts=[], uid=1234, gid=5678),
+                 adapter.exec_argv("podman", layout.run, ["true"], workdir=layout.project)):
+        assert "FIXTURE_HOST_HOME=" + fixed in argv
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=[], uid=1234, gid=5678)
+    value = inspect_for(expected, {"FIXTURE_HOST_HOME": fixed})
+    assert adapter.verify(value, expected) == []
+    with pytest.raises(ValueError, match="^container FIXTURE_HOST_HOME is fixed inside the run$"):
+        adapter.container_env(layout.run, {"FIXTURE_HOST_HOME": "/outside"})
+    # Matching tampered expected/actual values cannot authorize a different host home.
+    fingerprint = json.dumps(["FIXTURE_HOST_HOME", "/outside"], separators=(",", ":")).encode("utf-8")
+    expected["environment"]["FIXTURE_HOST_HOME"] = hashlib.sha256(fingerprint).hexdigest()
+    value[0]["Config"]["Env"] = ["FIXTURE_HOST_HOME=/outside" if item.startswith("FIXTURE_HOST_HOME=")
+                                  else item for item in value[0]["Config"]["Env"]]
+    value[0]["Config"]["CreateCommand"] = ["FIXTURE_HOST_HOME=/outside" if item.startswith("FIXTURE_HOST_HOME=")
+                                            else item for item in value[0]["Config"]["CreateCommand"]]
+    assert adapter.verify(value, expected) == ["environment"]
+
+
+@pytest.mark.parametrize("case", ["unknown", "entry", "entry-type-error", "entry-recursion", "kind", "home",
+    "variable-missing", "variable-type",
+    "variable-invalid", "variable-long", "variable-reserved", "variable-duplicate", "folder-missing",
+    "folder-type", "folder-empty", "folder-parent", "folder-absolute", "folder-slash", "folder-backslash",
+    "folder-long", "folder-reserved", "folder-duplicate", "kinds-empty", "kinds-type", "kinds-long"])
+def test_registry_malformed_host_refuses(adapter, layout, monkeypatch, case):
+    registry = importlib.import_module("hierarchy_hosts")
+    kinds = registry.TEAM_HOSTS
+    kind = kinds[0]
+    entry = registry.entry(kind)
+    if case == "unknown":
+        kinds = (*kinds, "untrusted-registry-sentinel")
+    elif case == "entry":
+        entry = []
+    elif case == "entry-type-error":
+        entry = TypeError("untrusted-registry-sentinel")
+    elif case == "entry-recursion":
+        entry = RecursionError("untrusted-registry-sentinel")
+    elif case == "kind":
+        entry["kind"] = "untrusted-registry-sentinel"
+    elif case == "home":
+        entry["home"] = None
+    elif case.endswith("-missing"):
+        del entry["home"]["variable" if case.startswith("variable") else "run_folder"]
+    elif case.startswith("variable-"):
+        entry["home"]["variable"] = {"type": [], "invalid": "untrusted-registry-sentinel=bad",
+            "long": "X" * 129, "reserved": "PATH", "duplicate": registry.entry(kinds[1])["home"]["variable"]}[
+                case[len("variable-"):]]
+    elif case.startswith("folder-"):
+        entry["home"]["run_folder"] = {"type": None, "empty": "", "parent": "..", "absolute": "/outside",
+            "slash": "x/y", "backslash": "x\\y", "long": "x" * 129, "reserved": "home",
+            "duplicate": registry.entry(kinds[1])["home"]["run_folder"]}[case[len("folder-"):]]
+    elif case == "kinds-empty":
+        kinds = ()
+    elif case == "kinds-type":
+        kinds = "untrusted-registry-sentinel"
+    elif case == "kinds-long":
+        kinds = (kind,) * 65
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=[], uid=1234, gid=5678)
+    value = inspect_for(expected)
+    container_registry(monkeypatch, {kind: entry}, kinds)
+    with pytest.raises(ValueError, match="^invalid container host registry$"):
+        adapter.container_env(layout.run)
+    assert adapter.verify(value, expected) == ["environment"]
+    result = cli(layout, config_for(layout), "plan")
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {"error": "invalid container host registry"}
+
+
 def test_other_argv_builders(adapter, layout):
     run = layout.run
     name = "aegis-team-" + hashlib.sha256(str(run).encode()).hexdigest()[:12]

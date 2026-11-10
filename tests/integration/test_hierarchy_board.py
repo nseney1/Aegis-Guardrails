@@ -146,6 +146,251 @@ def worst_case_references(fill='"'):
     return [{"kind": "file", "value": fill * 256, "sha256": "a" * 64, "description": fill * 128} for _ in range(8)]
 
 
+@pytest.fixture
+def page_board(tmp_path, monkeypatch):
+    from tools import hierarchy_board as board_module
+
+    frozen = board_module.now_utc()
+    monkeypatch.setattr(board_module, "now_utc", lambda: frozen)
+
+    def build(count, rich=False):
+        board = board_module.Board(tmp_path / "board")
+        board.initialize()
+        board.append(board.load(), "channel", {"channel": "alpha", "orchestrator": "a/orchestrator", "source": "owner"})
+        board.append(board.load(), "grant", {"channel": "alpha", "endpoint": "a/lane/f2", "access": "post", "source": "owner"})
+        root = None
+        for number in range(count):
+            arguments = {"channel": "alpha", "key": "post-%d" % number, "kind": "note", "body": "Post %d." % number}
+            if root is not None:
+                arguments["thread"] = root
+            if rich:
+                arguments.update(body='quotes " slash \\ newline\n tab\t é € 😀 ' * (number + 1),
+                                 references=[{"kind": "file", "value": 'inert/"\\é😀', "description": "a\nb\tc", "sha256": "a" * 64}],
+                                 expires_at="2020-01-01T00:00:00.000000Z" if number % 2 else "2099-01-01T00:00:00.000000Z")
+                if number % 3 == 0:
+                    arguments["kind"] = "blocker"
+            author = "a/orchestrator" if number % 2 else "a/lane/f2"
+            posted = board.publish(author, arguments)
+            root = root or posted["post_id"]
+            if rich and number == 3:
+                board.disposition(author, {"post_id": posted["post_id"], "state": "resolved", "note": 'fixed "\\é😀'})
+            if rich and number == 5:
+                board.tombstone({"post_id": posted["post_id"], "reason": "removed", "source": "owner"})
+        return board_module, board, root
+
+    return build
+
+
+def legacy_board_page(board_module, board, posts, limit, render, extra):
+    """Frozen pre-RF-6 selection oracle; it needs no checkout history."""
+    views = []
+    best = {**extra, "authority": "information_only", "posts": [], "remaining": len(posts), "next_after": None}
+    if len(render(best)) > board_module.MAX_PAGE_BYTES:
+        raise ValueError("board page metadata exceeds the page budget")
+    for post in posts[:limit]:
+        views.append(board.view(None, post, board_module.now_utc()))
+        candidate = {**best, "posts": list(views), "remaining": len(posts) - len(views),
+                     "next_after": views[-1]["post_id"] if len(posts) > len(views) else None}
+        if len(render(candidate)) > board_module.MAX_PAGE_BYTES:
+            if len(views) == 1:
+                raise ValueError("a post does not fit the page budget")
+            break
+        best = candidate
+    return best
+
+
+def board_transport(kind):
+    from tools import hierarchy_board, hierarchy_mailbox_mcp
+
+    if kind == "cli":
+        return hierarchy_board.cli_line
+
+    class Connection:
+        def begin_response(self):
+            pass
+
+        def call(self, _name, _arguments, render):
+            self.render = render
+            return {}
+
+    connection = Connection()
+    identifier = 123 if kind == "mcp-number" else 'request-"\\é😀'
+    hierarchy_mailbox_mcp.handle(connection, {
+        "jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+        "params": {"name": "board_read_channel", "arguments": {"channel": "alpha"}}})
+    return connection.render
+
+
+@pytest.mark.parametrize("transport", ["cli", "mcp-number", "mcp-string"])
+@pytest.mark.parametrize("route", ["channel", "thread"])
+def test_board_pages_match_legacy_bytes_at_every_selected_boundary(page_board, monkeypatch, transport, route):
+    module, board, root = page_board(12, rich=True)
+    state = board.load()
+    posts = state.channel_posts("alpha")
+    extra = {"channel": "alpha", **board.open_blockers(state, "alpha")} if route == "channel" else {"channel": "alpha", "thread": root}
+    render = board_transport(transport)
+    full = legacy_board_page(module, board, posts, 50, render, extra)
+    assert len(full["posts"]) == len(posts)
+    for count in (1, 2, 3, 11, 12):
+        boundary = {**full, "posts": full["posts"][:count], "remaining": len(posts) - count,
+                    "next_after": posts[count - 1]["post_id"] if count < len(posts) else None}
+        for offset in (-1, 0, 1):
+            monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(boundary)) + offset)
+            for limit in (1, 3, 12, 50):
+                try:
+                    expected = legacy_board_page(module, board, posts, limit, render, extra)
+                except ValueError as exc:
+                    with pytest.raises(ValueError, match="^" + str(exc) + "$"):
+                        board.call("a/orchestrator", "board_read_" + route,
+                                   {"channel": "alpha", "limit": limit} if route == "channel" else {"post_id": root, "limit": limit}, render)
+                    continue
+                actual, moved = board.call("a/orchestrator", "board_read_" + route,
+                                           {"channel": "alpha", "limit": limit} if route == "channel" else {"post_id": root, "limit": limit}, render)
+                assert render(actual) == render(expected)
+                assert len(render(actual)) <= module.MAX_PAGE_BYTES
+                assert moved == (("alpha", actual["posts"][-1]["seq"]) if route == "channel" and actual["posts"] else None)
+
+
+@pytest.mark.parametrize("transport", ["cli", "mcp-number", "mcp-string"])
+@pytest.mark.parametrize("route", ["channel", "thread"])
+def test_board_renders_the_selected_page_once_instead_of_each_prefix(page_board, transport, route):
+    module, board, root = page_board(50)
+    render = board_transport(transport)
+    rendered_counts = []
+
+    def counted(page):
+        rendered_counts.append(len(page["posts"]))
+        return render(page)
+
+    counted.board_page_framing = getattr(render, "board_page_framing", None)
+    page, _ = board.call("a/orchestrator", "board_read_" + route,
+                         {"channel": "alpha", "limit": 50} if route == "channel" else {"post_id": root, "limit": 50}, counted)
+    assert len(page["posts"]) == 50
+    assert len(render(page)) <= module.MAX_PAGE_BYTES
+    assert rendered_counts == [0, 50]
+
+
+@pytest.mark.parametrize("transport", ["cli", "mcp-number"])
+def test_board_metadata_budget_and_empty_pages_match_legacy(page_board, monkeypatch, transport):
+    module, board, root = page_board(1)
+    render = board_transport(transport)
+    page, moved = board.read_channel("a/orchestrator", {"channel": "alpha", "after_post_id": root}, render)
+    assert page["posts"] == [] and page["remaining"] == 0 and page["next_after"] is None and moved is None
+    monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(page)))
+    assert board.read_channel("a/orchestrator", {"channel": "alpha", "after_post_id": root}, render) == (page, None)
+    monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(page)) - 1)
+    with pytest.raises(ValueError, match="^board page metadata exceeds the page budget$"):
+        board.read_channel("a/orchestrator", {"channel": "alpha", "after_post_id": root}, render)
+
+
+@pytest.mark.parametrize("damaged_index", [1, 2])
+def test_board_only_loads_content_through_the_first_overflow(page_board, monkeypatch, damaged_index):
+    module, board, _ = page_board(3)
+    render = board_transport("mcp-number")
+    first, _ = board.read_channel("a/orchestrator", {"channel": "alpha", "limit": 1}, render)
+    monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(first)))
+    posts = board.load().channel_posts("alpha")
+    victim = board.content / (posts[damaged_index]["post_id"] + ".json")
+    victim.chmod(0o600)
+    victim.write_bytes(b"damaged")
+    if damaged_index == 1:
+        with pytest.raises(ValueError, match="^board content changed: " + posts[1]["post_id"] + "$"):
+            board.read_channel("a/orchestrator", {"channel": "alpha"}, render)
+    else:
+        assert board.read_channel("a/orchestrator", {"channel": "alpha"}, render)[0] == first
+
+
+@pytest.mark.parametrize("transport", ["opaque", "array", "other-envelope"])
+def test_board_custom_renderers_keep_legacy_budget_selection(page_board, monkeypatch, transport):
+    module, board, _ = page_board(3)
+
+    def render(page):
+        if transport == "opaque":
+            return b"opaque:" + module.cli_line(page)
+        if transport == "array":
+            return module.cli_line([page])
+        return module.cli_line({"id": 1, "page": page})
+
+    state = board.load()
+    posts = state.channel_posts("alpha")
+    extra = {"channel": "alpha", **board.open_blockers(state, "alpha")}
+    first = legacy_board_page(module, board, posts, 1, render, extra)
+    for offset in (-1, 0, 1):
+        monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(first)) + offset)
+        if offset < 0:
+            with pytest.raises(ValueError, match="^a post does not fit the page budget$"):
+                board.read_channel("a/orchestrator", {"channel": "alpha"}, render)
+        else:
+            expected = legacy_board_page(module, board, posts, 50, render, extra)
+            assert render(board.read_channel("a/orchestrator", {"channel": "alpha"}, render)[0]) == render(expected)
+
+
+@pytest.mark.parametrize("transport", ["unicode", "compact", "mcp-unicode", "body-suffix", "byte-list"])
+@pytest.mark.parametrize("route", ["channel", "thread"])
+def test_board_undeclared_serializers_match_legacy_bytes(page_board, monkeypatch, transport, route):
+    module, board, root = page_board(3, rich=True)
+
+    def render(page):
+        if transport == "unicode":
+            return (json.dumps(page, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        if transport == "compact":
+            return (json.dumps(page, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if transport == "mcp-unicode":
+            envelope = {"jsonrpc": "2.0", "id": 123, "result": {"content": [
+                {"type": "text", "text": json.dumps(page, sort_keys=True, ensure_ascii=False)}]}}
+            return (json.dumps(envelope, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        if transport == "body-suffix":
+            return module.cli_line(page) + (b" " if page["posts"] else b"")
+        return list(module.cli_line(page))
+
+    state = board.load()
+    posts = state.channel_posts("alpha")
+    extra = {"channel": "alpha", **board.open_blockers(state, "alpha")} if route == "channel" else {"channel": "alpha", "thread": root}
+    full = legacy_board_page(module, board, posts, 50, render, extra)
+    assert len(full["posts"]) == 3
+    for count in (1, 2, 3):
+        boundary = {**full, "posts": full["posts"][:count], "remaining": len(posts) - count,
+                    "next_after": posts[count - 1]["post_id"] if count < len(posts) else None}
+        for offset in (-1, 0, 1):
+            monkeypatch.setattr(module, "MAX_PAGE_BYTES", len(render(boundary)) + offset)
+            try:
+                expected = legacy_board_page(module, board, posts, 50, render, extra)
+            except ValueError as exc:
+                with pytest.raises(ValueError, match="^" + str(exc) + "$"):
+                    board.call("a/orchestrator", "board_read_" + route,
+                               {"channel": "alpha", "limit": 50} if route == "channel" else {"post_id": root, "limit": 50}, render)
+                continue
+            actual, _ = board.call("a/orchestrator", "board_read_" + route,
+                                   {"channel": "alpha", "limit": 50} if route == "channel" else {"post_id": root, "limit": 50}, render)
+            assert render(actual) == render(expected)
+            assert len(render(actual)) <= module.MAX_PAGE_BYTES
+
+
+def test_board_refuses_if_a_declared_renderer_disagrees_with_its_framing(page_board):
+    module, board, _ = page_board(1)
+
+    def changing_render(page):
+        return module.cli_line(page) + (b" " if page["posts"] else b"")
+
+    changing_render.board_page_framing = module.cli_line.board_page_framing
+    with pytest.raises(ValueError, match="^board page rendering changed during sizing$"):
+        board.read_channel("a/orchestrator", {"channel": "alpha"}, changing_render)
+
+
+@pytest.mark.parametrize("limit", [0, 51, True, "50"])
+def test_board_rejects_invalid_limits_before_rendering(page_board, limit):
+    _, board, _ = page_board(1)
+    rendered = []
+
+    def render(page):
+        rendered.append(page)
+        return b""
+
+    with pytest.raises(ValueError, match="^invalid limit$"):
+        board.read_channel("a/orchestrator", {"channel": "alpha", "limit": limit}, render)
+    assert rendered == []
+
+
 @pytest.mark.parametrize("fill", ['"', "\\", "\n", "\t", "é", "€"])
 def test_the_largest_legal_post_fits_a_page_alone_even_with_blockers_listed(hall, fill):
     author = hall.client()
