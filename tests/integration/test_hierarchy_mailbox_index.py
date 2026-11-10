@@ -1,56 +1,36 @@
-"""Public mailbox/index equivalence, corruption, and filesystem boundary controls."""
+"""In-process mailbox memo: fail-closed parity, incremental reads and no writes."""
 import hashlib
-import errno
 import importlib
-import json
+import gc
+import io
+import errno
 import os
 from pathlib import Path
-import stat
+import statistics
+import shutil
 import subprocess
 import sys
 import time
+import tracemalloc
+from types import SimpleNamespace
 
 import pytest
 
 from tools import hierarchy_mailbox as hm
 
 
-POSIX = pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem semantics")
-NUMBER_LITERALS = [pytest.param(value, id=name) for value, name in
-                   [("1e999", "positive_overflow"), ("-1e999", "negative_overflow"),
-                    ("NaN", "nan"), ("Infinity", "infinity"), ("-Infinity", "negative_infinity")]]
-if hasattr(sys, "get_int_max_str_digits") and 0 < sys.get_int_max_str_digits() < 5000:
-    NUMBER_LITERALS.append(pytest.param("9" * 5000, id="huge_int"))
-
-
 def index_module():
     return importlib.import_module("tools.hierarchy_mailbox_index")
 
 
-def symlink_or_skip(link, target):
-    try:
-        os.symlink(str(target), str(link), target_is_directory=Path(target).is_dir())
-    except (OSError, NotImplementedError) as exc:
-        pytest.skip("symlinks unavailable here: %s" % exc)
+class PlatformOS:
+    """Override a platform boundary without replacing the rest of the OS API."""
+    def __init__(self, name, **overrides):
+        self.name = name
+        self.__dict__.update(overrides)
 
-
-def key_order(value):
-    if isinstance(value, dict):
-        return [(key, key_order(item)) for key, item in value.items()]
-    if isinstance(value, list):
-        return [key_order(item) for item in value]
-    return None
-
-
-def stub_messages(monkeypatch, index, value):
-    injected = []
-
-    def replacement():
-        injected.append(True)
-        return value
-
-    monkeypatch.setattr(index, "messages", replacement)
-    return injected
+    def __getattr__(self, name):
+        return getattr(os, name)
 
 
 def request(identifier, sender="a/orchestrator", recipient="a/lane/review", **extra):
@@ -74,11 +54,6 @@ def mailbox(tmp_path):
     return box
 
 
-def snapshot(root):
-    return {str(p.relative_to(root)): ("directory" if p.is_dir() else
-            hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(root.rglob("*"))}
-
-
 def caught(call):
     try:
         call()
@@ -87,21 +62,210 @@ def caught(call):
     pytest.fail("expected a fail-closed exception")
 
 
+def assert_fallback_verification(index, expected):
+    """Canonical returns preserve observed facts while disclaiming PIN bytes."""
+    first = index.verify()
+    facts = [item for item in first if item["kind"] == "content_changed"]
+    assert sorted(facts, key=lambda item: item["path"]) == sorted(expected, key=lambda item: item["path"])
+    markers = [item for item in first if item["kind"] == "verification_unavailable"]
+    assert len(markers) == 1 and markers[0]["reason"] == "baseline_unavailable"
+    assert markers[0]["scope"] == "all_returned_records"
+    assert len(first) == len(expected) + 1
+    # Unavailable verification cannot acknowledge even fully observed facts.
+    complete = index.verify()
+    assert sorted(complete, key=lambda item: item["path"]) == sorted(expected, key=lambda item: item["path"])
+    assert index.verify() == []
+
+
 def rewrite(path, message):
-    header = {k: v for k, v in message.items() if k != "body"}
+    header = {key: value for key, value in message.items() if key != "body"}
     path.write_bytes(b"---\n" + hm.encoded(header) + b"\n---\n\n" + message["body"].encode())
 
 
+def symlink(link, target):
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip("symlink capability unavailable: %s" % exc)
+
+
+def snapshot(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        key = str(path.relative_to(root))
+        result[key] = ("symlink", os.readlink(path)) if path.is_symlink() else (
+            "directory" if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest())
+    return result
+
+
+def invoke(index, api):
+    if api == "get":
+        return index.get("seed")
+    if api == "inbox":
+        return index.inbox("a/lane/review")
+    return getattr(index, api)()
+
+
+def intercept_source_opens(monkeypatch, action):
+    """Apply an OS access condition to both pinned and descriptor-based reads."""
+    real_path_open, real_os_open = Path.open, os.open
+
+    def path_open(path, *args, **kwargs):
+        action(path)
+        return real_path_open(path, *args, **kwargs)
+
+    def os_open(path, *args, **kwargs):
+        action(Path(path))
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", path_open)
+    monkeypatch.setattr(os, "open", os_open)
+
+
+class MemoTrace:
+    """Test-only memo diagnostics; no extra filesystem observations or writes."""
+    def __init__(self, monkeypatch, mailbox):
+        module = index_module()
+        self.events, self.validations, self.memo_validations, self.in_scan = [], 0, 0, 0
+        self.above_root = {str(path) for path in mailbox.root.parents}
+        real_clear, real_scan = module.MailboxIndex._clear, module.MailboxIndex._scan
+        real_observations = module._Observations.__init__
+        real_validate = mailbox.validate_message
+
+        def clear(index):
+            caller = sys._getframe(1)
+            error = caller.f_locals.get("error")
+            self.events.append({"kind": "clear", "caller": caller.f_code.co_name,
+                                "records": len(getattr(index, "_entries", {})),
+                                "reason": None if error is None else
+                                {"type": type(error).__name__, "message": str(error)}})
+            return real_clear(index)
+
+        def observations(observed, previous):
+            real_observations(observed, previous)
+            for path in sorted(observed.changed.intersection(previous)):
+                old, new = previous[path], observed.values[path]
+                current = new if new is not None else old
+                fields = (("device", "inode", "mode", "uid") if current is not None and len(current) == 4
+                          else ("inode", "mode", "uid", "size", "mtime_ns", "ctime_ns", "device"))
+                changed = list(fields) if old is None or new is None else [
+                    field for field, left, right in zip(fields, old, new) if left != right]
+                self.events.append({"kind": "observation_changed", "path": path,
+                                    "fields": changed, "old": old, "new": new})
+            if observed.unknown:
+                self.events.append({"kind": "unknown_observations", "paths": sorted(observed.unknown)})
+
+        def scan(index, force):
+            context, layout = index._context, index._folder_layout
+            self.in_scan += 1
+            try:
+                result = real_scan(index, force)
+                if context != result[5]:
+                    fields = ("root", "manifest", "max_bytes", "credentials")
+                    changed = list(fields) if context is None else [
+                        field for field, old, new in zip(fields, context, result[5]) if old != new]
+                    self.events.append({"kind": "context_changed", "fields": changed,
+                                        "old": context, "new": result[5]})
+                return result
+            except Exception as error:
+                self.events.append({"kind": "scan_error", "type": type(error).__name__,
+                                    "message": str(error)})
+                raise
+            finally:
+                self.in_scan -= 1
+                if layout is not index._folder_layout:
+                    self.events.append({"kind": "layout_refresh", "key":
+                                        None if index._folder_layout is None else index._folder_layout[0]})
+
+        def validate(message, **kwargs):
+            self.validations += 1
+            self.memo_validations += bool(self.in_scan)
+            return real_validate(message, **kwargs)
+
+        monkeypatch.setattr(module.MailboxIndex, "_clear", clear)
+        monkeypatch.setattr(module.MailboxIndex, "_scan", scan)
+        monkeypatch.setattr(module._Observations, "__init__", observations)
+        monkeypatch.setattr(mailbox, "validate_message", validate)
+
+    def reset(self):
+        self.events.clear()
+        self.validations = 0
+        self.memo_validations = 0
+
+
+class ReadCounts:
+    """Count actual lstat calls once, including Python 3.9's pathlib boundary."""
+    def __init__(self, monkeypatch, trace):
+        self.lstats, self.memo_lstats, self.opens, self.depth = {}, {}, [], 0
+        real_lstat, real_os_lstat, real_open, real_os_open = Path.lstat, os.lstat, io.open, os.open
+
+        def count(path):
+            path = os.fspath(path)
+            self.lstats[path] = self.lstats.get(path, 0) + 1
+            if trace.in_scan and path not in trace.above_root:
+                self.memo_lstats[path] = self.memo_lstats.get(path, 0) + 1
+
+        def lstat(path, *args, **kwargs):
+            count(path)
+            self.depth += 1
+            try:
+                return real_lstat(path, *args, **kwargs)
+            finally:
+                self.depth -= 1
+
+        def os_lstat(path, *args, **kwargs):
+            if not self.depth:
+                count(path)
+            return real_os_lstat(path, *args, **kwargs)
+
+        def opened(path, *args, **kwargs):
+            if not isinstance(path, int):
+                self.opens.append(os.fspath(path))
+            return real_open(path, *args, **kwargs)
+
+        def os_open(path, *args, **kwargs):
+            self.opens.append(os.fspath(path))
+            return real_os_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+        monkeypatch.setattr(os, "lstat", os_lstat)
+        monkeypatch.setattr(io, "open", opened)
+        monkeypatch.setattr(os, "open", os_open)
+
+    def reset(self):
+        self.lstats.clear()
+        self.memo_lstats.clear()
+        self.opens.clear()
+
+
+def prepare_ac1(mailbox, first="messages"):
+    records = mailbox.messages()
+    identifier = next(iter(records))
+    endpoint = records[identifier]["message"]["to"]
+    # Oracle preparation may outlast the memo's observations in a shared tree.
+    # Finish it before warming the API that the measurement will follow.
+    expected_inbox = mailbox.inbox(endpoint, limit=20)
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    if first == "get":
+        index.get(identifier)
+    elif first == "inbox":
+        index.inbox(endpoint, limit=20)
+    else:
+        index.messages()
+    return index, records, identifier, endpoint, expected_inbox
+
+
 DEFECTS = ["missing_header", "bad_json", "duplicate_key", "nonfinite", "utf8", "unknown_field",
-           "wrong_folder", "duplicate_id", "missing_reply", "reverse_reply", "non_md", "symlink",
-           "pending_symlink", "directory_entry", "oversized_message", "missing_folder", "folder_symlink"]
+           "invalid_type", "wrong_folder", "duplicate_id", "missing_reply", "reverse_reply",
+           "non_md", "symlink", "pending_symlink", "directory_entry", "oversized_message",
+           "missing_folder", "folder_symlink", "unencodable_brief_path"]
 
 
 def inject(box, defect):
     seed = box.messages()["seed"]
     original = Path(seed["path"])
     path = original.parent / "zz-bad.md"
-    msg = {**seed["message"], "message_id": "bad"}
+    message = {**seed["message"], "message_id": "bad"}
     raw = {"missing_header": b"hello", "bad_json": b"---\n{\n---\n\nbody",
            "duplicate_key": b'---\n{"x":1,"x":2}\n---\n\nbody',
            "nonfinite": b'---\n{"x":NaN}\n---\n\nbody', "utf8": b"\xff",
@@ -109,953 +273,2642 @@ def inject(box, defect):
     if defect in raw:
         path.write_bytes(raw[defect])
     elif defect == "unknown_field":
-        rewrite(path, {**msg, "surprise": True})
+        rewrite(path, {**message, "surprise": True})
+    elif defect == "invalid_type":
+        rewrite(original, {**seed["message"], "type": "invalid-type"})
+    elif defect == "unencodable_brief_path":
+        rewrite(path, {**message, "brief": {"path": str(box.root.parent / "x\ud800.md"), "sha256": "a" * 64}})
     elif defect == "wrong_folder":
-        rewrite(box.root / "a/orchestrator/zz-bad.md", msg)
+        rewrite(box.root / "a/orchestrator/zz-bad.md", message)
     elif defect == "duplicate_id":
         path.write_bytes(original.read_bytes())
-    elif defect == "missing_reply":
-        rewrite(path, {**msg, "in_reply_to": "absent"})
-    elif defect == "reverse_reply":
-        rewrite(path, {**msg, "in_reply_to": "seed"})
+    elif defect in {"missing_reply", "reverse_reply"}:
+        rewrite(path, {**message, "in_reply_to": "absent" if defect == "missing_reply" else "seed"})
     elif defect == "non_md":
         path.with_suffix(".txt").write_text("unexpected")
     elif defect in {"symlink", "pending_symlink"}:
-        target = path if defect == "symlink" else path.parent / ".pending-bad"
-        symlink_or_skip(target, original)
+        symlink(path if defect == "symlink" else path.parent / ".pending-bad", original)
     elif defect == "directory_entry":
         path.mkdir()
-    elif defect in {"missing_folder", "folder_symlink"}:
+    else:
         folder = box.root / "across/front-door"
         folder.rmdir()
         if defect == "folder_symlink":
-            symlink_or_skip(folder, original.parent)
+            symlink(folder, original.parent)
 
 
 @pytest.mark.parametrize("defect", DEFECTS)
 @pytest.mark.parametrize("warm", [False, True])
-def test_errors_equal_pinned_scan(mailbox, defect, warm):
-    cls = index_module().MailboxIndex
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "verify", "inbox"])
+def test_malformed_equivalence(mailbox, defect, warm, mode, api):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
     if warm:
-        cls(mailbox).messages()
+        index.messages()
     inject(mailbox, defect)
+    if defect == "unencodable_brief_path":
+        expected = mailbox.messages()
+        result = invoke(index, api)
+        expected_result = ([] if api == "verify" else expected if api == "messages" else expected["seed"]
+                           if api == "get" else mailbox.inbox("a/lane/review"))
+        assert result == expected_result
+        assert index.last_reconciliation is None
+        assert index_module().compare(mailbox, index) == []
+        return
     expected = caught(mailbox.messages)
-    assert caught(lambda: cls(mailbox).messages()) == expected
+    assert caught(lambda: invoke(index, api)) == expected
+    assert index_module().compare(mailbox, index) == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "verify", "inbox"])
+@pytest.mark.parametrize("warm", [False, True])
+def test_record_limit_rechecked(mailbox, monkeypatch, api, warm):
+    seed = mailbox.messages()["seed"]
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    if warm:
+        index.messages()
+    rewrite(Path(seed["path"]).parent / "zz-extra.md", {**seed["message"], "message_id": "extra"})
+    monkeypatch.setattr(hm, "MAX_RECORDS", 1)
+    assert caught(lambda: invoke(index, api)) == caught(mailbox.messages)
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "verify", "inbox"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_unchanged_file_made_unreadable_is_not_reused(mailbox, monkeypatch, api, mode):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    injected = []
+
+    def inaccessible(target):
+        if target == path:
+            injected.append(True)
+            raise PermissionError("injected unreadable message: " + str(target))
+
+    intercept_source_opens(monkeypatch, inaccessible)
+    assert caught(lambda: invoke(index, api)) == caught(mailbox.messages)
+    assert injected
+
+
+@pytest.mark.parametrize("lookup", ["seed", "dispatch", "absent"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_every_lookup_rechecks_unreturned_brief(mailbox, tmp_path, lookup, mode):
+    folder = tmp_path / "briefs"
+    folder.mkdir()
+    packet = folder / "packet.md"
+    packet.write_text("Pinned brief.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    mailbox.publish(request("dispatch", type="dispatch", brief=brief))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    index.messages()
+    moved = tmp_path / "old-briefs"
+    folder.rename(moved)
+    symlink(folder, moved)
+    assert caught(lambda: index.get(lookup)) == caught(mailbox.messages)
+    assert index_module().compare(mailbox, index) == []
+
+
+def legacy_cache(mailbox, seed, *, identifier="seed", valid=True):
+    source = Path(seed["path"])
+    metadata = source.stat()
+    return {"schema": "aegis.mailbox-index/v3", "mailbox_root": str(mailbox.root),
+            "manifest_sha256": hm.digest(mailbox.manifest),
+            "source_sha256": hashlib.sha256(Path(hm.__file__).read_bytes()).hexdigest(),
+            "entries": {str(source.relative_to(mailbox.root)): {
+                "key": [metadata.st_size, metadata.st_mtime_ns, metadata.st_ino, metadata.st_ctime_ns],
+                "metadata": {**{key: seed["message"][key] for key in
+                                ("from", "to", "created_at", "type")}, "message_id": identifier},
+                "destination": "a/lane", "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "valid": valid}}}
+
+
+@pytest.mark.parametrize("poison", ["membership", "validity"])
+def test_legacy_persisted_input_is_ignored(mailbox, tmp_path, poison):
+    expected = mailbox.messages()
+    seed = expected["seed"]
+    directory = tmp_path / "mailbox-index"
+    directory.mkdir(mode=0o700)
+    path = directory / ("index-" + hashlib.sha256(os.fsencode(mailbox.root)).hexdigest()[:16] + ".json")
+    fake = legacy_cache(mailbox, seed, identifier="hidden-seed", valid=poison != "validity")
+    path.write_bytes(hm.encoded(fake))
+    path.chmod(0o600)
+    before = snapshot(tmp_path)
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    assert index.get("seed") == seed
+    assert index.get("hidden-seed") is None
+    assert index.messages() == expected
+    assert snapshot(tmp_path) == before
+    fresh = index_module().MailboxIndex(mailbox, mode="indexed")
+    assert fresh.get("seed") == seed
 
 
 @pytest.mark.parametrize("warm", [False, True])
-def test_record_limit_on_every_read(mailbox, monkeypatch, warm):
-    cls = index_module().MailboxIndex
+def test_forged_type_and_matching_disk_attestation_never_bypass_validation(mailbox, tmp_path, warm):
+    module = index_module()
+    seed = mailbox.messages()["seed"]
+    index = module.MailboxIndex(mailbox, mode="indexed")
     if warm:
-        cls(mailbox).messages()
-    monkeypatch.setattr(hm, "MAX_RECORDS", 1)
-    # Publish the new record before lowering the scan limit below the count.
-    record = mailbox.messages()["seed"]
-    rewrite(Path(record["path"]).parent / "zz-extra.md", {**record["message"], "message_id": "extra"})
-    assert caught(lambda: cls(mailbox).messages()) == caught(mailbox.messages)
+        index.messages()
+    rewrite(Path(seed["path"]), {**seed["message"], "type": "invalid-type"})
+    directory = tmp_path / "mailbox-index"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / ("index-" + hashlib.sha256(os.fsencode(mailbox.root)).hexdigest()[:16] + ".json")
+    path.write_bytes(hm.encoded(legacy_cache(mailbox, seed)))
+    path.chmod(0o600)
+    before = snapshot(tmp_path)
+    assert caught(index.messages) == caught(mailbox.messages)
+    assert module.compare(mailbox, index) == []
+    assert snapshot(tmp_path) == before
 
 
-POISONS = ["truncated", "invalid_json", "duplicate_key", "nonfinite", "schema", "manifest_sha256",
-           "source_sha256", "oversized", "non_ascii_key", "odd_entry",
-           "unknown_key", "traversal", "invalid_stat", "invalid_validity"]
+def spy_parses(monkeypatch):
+    module = index_module()
+    real_parse = module.MailboxIndex._parse_message
+    calls = []
+
+    def parse(self, path, raw):
+        calls.append(str(path))
+        return real_parse(self, path, raw)
+
+    monkeypatch.setattr(module.MailboxIndex, "_parse_message", parse)
+    return calls
 
 
-@pytest.mark.parametrize("poison", POISONS)
-def test_poisoned_cache_never_changes_result(mailbox, poison, monkeypatch):
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_one_publish_parses_only_new_record(mailbox, monkeypatch, api):
+    for number in range(16):
+        mailbox.publish(request("note-%02d" % number))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    index.messages()
+    calls = spy_parses(monkeypatch)
+    mailbox.publish(request("one-new"))
+    result = invoke(index, api)
+    assert len(calls) == 1 and calls[0].endswith("-one-new.md")
+    assert result == (mailbox.messages() if api == "messages" else mailbox.messages()["seed"]
+                      if api == "get" else mailbox.inbox("a/lane/review"))
+    calls.clear()
+    invoke(index, api)
+    assert calls == []
+    fresh = index_module().MailboxIndex(mailbox, mode="indexed")
+    fresh.messages()
+    assert len(calls) == len(mailbox.messages())
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_deletion_drops_membership_without_reparsing(mailbox, monkeypatch, api):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    calls = spy_parses(monkeypatch)
+    Path(seed["path"]).unlink()
+    result = invoke(index, api)
+    assert calls == []
+    assert result == ({} if api == "messages" else None if api == "get"
+                      else mailbox.inbox("a/lane/review"))
+    assert index_module().compare(mailbox, index) == []
+
+
+def test_inode_reuse_with_different_ctime_reparses(mailbox, tmp_path, monkeypatch):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    old = path.stat()
+    replacement = tmp_path / "replacement"
+    rewrite(replacement, {**seed["message"], "body": "modified body"})
+    replacement.replace(path)
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    current = path.stat()
+    assert current.st_ino != old.st_ino and current.st_ctime_ns != old.st_ctime_ns
+    assert current.st_size == old.st_size
+    real_lstat, real_os_lstat, real_fstat = Path.lstat, os.lstat, os.fstat
+    injected = []
+
+    def reused(value):
+        if (value.st_dev, value.st_ino) != (current.st_dev, current.st_ino):
+            return value
+        injected.append(True)
+        return SimpleNamespace(st_mode=value.st_mode, st_dev=value.st_dev, st_ino=old.st_ino,
+                               st_size=value.st_size, st_mtime_ns=value.st_mtime_ns,
+                               st_ctime_ns=value.st_ctime_ns)
+
+    def lstat(target, *args, **kwargs):
+        return reused(real_lstat(target, *args, **kwargs))
+
+    def fstat(descriptor):
+        return reused(real_fstat(descriptor))
+
+    def os_lstat(path, *args, **kwargs):
+        return reused(real_os_lstat(path, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(os, "lstat", os_lstat)
+    monkeypatch.setattr(os, "fstat", fstat)
+    calls = spy_parses(monkeypatch)
+    assert index.get("seed") == mailbox.messages()["seed"]
+    assert len(calls) == 1 and injected
+    assert index_module().compare(mailbox, index) == []
+
+
+@pytest.mark.parametrize("verify_first", [False, True])
+def test_mtime_restore_and_verify_report_changed_bytes(mailbox, monkeypatch, verify_first):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    metadata = path.stat()
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    calls = spy_parses(monkeypatch)
+    changes = index.verify() if verify_first else (index.messages(), index.content_changed)[1]
+    assert changes == [{"kind": "content_changed", "path": str(path),
+                        "old_sha256": old_sha, "new_sha256": new_sha}]
+    assert len(calls) == 1
+    calls.clear()
+    assert index.verify() == []
+    assert len(calls) == 1  # Force rehash even when every stat key matches.
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_callers_cannot_mutate_memo(mailbox, api):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    result = invoke(index, api)
+    record = result["seed"] if api == "messages" else result if api == "get" else result["messages"][0]
+    record["message"]["body"] = "caller mutation"
+    record["message"]["message_id"] = "hidden-seed"
+    assert index.get("seed") == mailbox.messages()["seed"]
+    assert index.get("hidden-seed") is None
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_operations_never_write_root_or_parent(mailbox, tmp_path, monkeypatch, mode):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    cleanup = tmp_path / "cleanup-probe"
+    cleanup.mkdir()
+    (cleanup / "file").write_bytes(b"cleanup outside the index operation")
+    before = snapshot(tmp_path)
+    real_open = Path.open
+    attempted = []
+
+    def targeted(path):
+        if isinstance(path, int):
+            return False
+        try:
+            Path(path).relative_to(tmp_path)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def read_only(path, mode="r", *args, **kwargs):
+        if targeted(path) and any(flag in mode for flag in "wax+"):
+            attempted.append(str(path))
+            raise AssertionError("index attempted a write")
+        return real_open(path, mode, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        attempted.append(str(args))
+        raise AssertionError("index attempted a filesystem mutation")
+
+    with monkeypatch.context() as operation:
+        operation.setattr(Path, "open", read_only)
+        for owner, names in ((Path, ("mkdir", "unlink", "rename", "replace", "symlink_to", "hardlink_to")),
+                             (os, ("mkdir", "unlink", "rename", "replace", "link", "symlink"))):
+            for name in names:
+                if not hasattr(owner, name):
+                    continue
+                original = getattr(owner, name)
+
+                def guarded(*args, _call=original, **kwargs):
+                    if any(key.endswith("dir_fd") and value is not None for key, value in kwargs.items()):
+                        return _call(*args, **kwargs)
+                    if any(targeted(path) for path in args):
+                        return forbidden(*args, **kwargs)
+                    return _call(*args, **kwargs)
+
+                operation.setattr(owner, name, guarded)
+        assert index.messages() == mailbox.messages()
+        assert index.get("seed") == mailbox.messages()["seed"]
+        assert index.inbox("a/lane/review") == mailbox.inbox("a/lane/review")
+        assert index.verify() == []
+        assert index_module().compare(mailbox, index) == []
+        assert attempted == [] and snapshot(tmp_path) == before
+    shutil.rmtree(cleanup)  # Exercise fd-based container cleanup before fixture teardown.
+
+
+def test_shadow_and_oracle_keep_differences_in_memory(mailbox, tmp_path, monkeypatch):
     module = index_module()
     index = module.MailboxIndex(mailbox)
     expected = mailbox.messages()
-    assert index.messages() == expected
-    data = json.loads(index.cache_path.read_bytes())
-    entry = next(iter(data["entries"].values()))
-    if poison == "truncated":
-        raw = b'{"schema":'
-    elif poison == "invalid_json":
-        raw = b"not JSON"
-    elif poison == "duplicate_key":
-        raw = b'{"schema":1,"schema":2}'
-    elif poison == "nonfinite":
-        raw = b'{"schema":NaN}'
-    elif poison == "oversized":
-        monkeypatch.setattr(module, "MAX_CACHE_BYTES", 4096)
-        raw = b" " * (module.MAX_CACHE_BYTES + 1)
-    else:
-        if poison in {"schema", "manifest_sha256", "source_sha256"}:
-            data[poison] = "wrong"
-        elif poison == "non_ascii_key":
-            data["\u0435ntries"] = {}
-        elif poison == "odd_entry":
-            data["entries"] = []
-        elif poison == "unknown_key":
-            entry["surprise"] = True
-        elif poison == "traversal":
-            data["entries"]["../escape.md"] = data["entries"].pop(next(iter(data["entries"])))
-        elif poison == "invalid_stat":
-            entry["key"][0] = True
-        elif poison == "invalid_validity":
-            entry["valid"] = "true"
-        raw = hm.encoded(data)
-    index.cache_path.write_bytes(raw)
-    before = snapshot(mailbox.root)
-    assert index.messages() == expected
-    assert module.MailboxIndex(mailbox).messages() == expected
-    assert snapshot(mailbox.root) == before
-
-
-@pytest.mark.parametrize("forge_sha", [False, True])
-@pytest.mark.parametrize("invalid", [False, True])
-def test_valid_cache_forgery_detected_by_shadow_and_verify(mailbox, forge_sha, invalid):
-    """Same-user cache authenticity is outside Track U; the oracle detects it."""
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    data = hm.strict_json(index.cache_path.read_text())
-    entry = next(iter(data["entries"].values()))
-    original_sha = entry["sha256"]
-    entry["message"]["body"] = "attacker body"
-    if invalid:
-        entry["message"]["type"] = "invalid-type"
-    if forge_sha:
-        header = {k: v for k, v in entry["message"].items() if k != "body"}
-        entry["sha256"] = hashlib.sha256(b"---\n" + hm.encoded(header) + b"\n---\n\nattacker body").hexdigest()
-    index.cache_path.write_bytes(hm.encoded(data))
-    assert index.messages() != expected
-    assert module.compare(mailbox, index)
-    differences = index.verify()
-    assert differences
-    if forge_sha:
-        assert any(item["kind"] == "content_changed" and item["new_sha256"] == original_sha
-                   for item in differences)
-    else:
-        assert any(item["kind"] == "cache_header_changed" for item in differences)
-    assert index.messages() == expected
+    before = snapshot(tmp_path)
     assert module.compare(mailbox, index) == []
+    calls = []
 
+    def wrong():
+        calls.append(True)
+        return {}
 
-def test_cross_process_reuses_cache(mailbox):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    mailbox.publish(request("new-note"))
-    script = '''import json,sys
-from tools import hierarchy_mailbox as hm
-from tools.hierarchy_mailbox_index import MailboxIndex
-reads=[]
-real=MailboxIndex._read_message
-def spy(self,path):
-    reads.append(str(path))
-    return real(self,path)
-MailboxIndex._read_message=spy
-result=MailboxIndex(hm.Mailbox(sys.argv[1])).messages()
-print(json.dumps({"result":result,"reads":reads}))
-'''
-    result = subprocess.run([sys.executable, "-B", "-c", script, str(mailbox.root)],
-                            capture_output=True, text=True, timeout=15)
-    assert result.returncode == 0, result.stderr
-    observed = hm.strict_json(result.stdout)
-    assert observed["result"] == mailbox.messages()
-    assert len(observed["reads"]) == 1
-    assert len(observed["result"]) == len(expected) + 1
-
-
-@pytest.mark.parametrize("unsafe", ["directory_symlink", "file_symlink", "directory_writable",
-                                         "file_writable", "directory_owner", "file_owner"])
-@pytest.mark.parametrize("same_instance", [False, True])
-@POSIX
-def test_unsafe_cache_refused(mailbox, tmp_path, monkeypatch, unsafe, same_instance):
-    module = index_module()
-    directory = tmp_path / "cache"
-    index = module.MailboxIndex(mailbox, directory)
-    index.messages()
-    if unsafe == "directory_symlink":
-        moved = tmp_path / "moved"
-        directory.rename(moved)
-        symlink_or_skip(directory, moved)
-    elif unsafe == "file_symlink":
-        target = tmp_path / "target.json"
-        index.cache_path.rename(target)
-        symlink_or_skip(index.cache_path, target)
-    elif unsafe.endswith("writable"):
-        (directory if unsafe.startswith("directory") else index.cache_path).chmod(0o770)
-    else:
-        real_fstat, real_stat, real_lstat = os.fstat, os.stat, Path.lstat
-        target = directory if unsafe.startswith("directory") else index.cache_path
-        inode = target.stat().st_ino
-        injected = []
-
-        def foreign_uid(descriptor):
-            value = real_fstat(descriptor)
-            if value.st_ino == inode:
-                injected.append("fstat")
-                fields = list(value)
-                fields[4] = os.getuid() + 1
-                return os.stat_result(fields)
-            return value
-
-        monkeypatch.setattr(os, "fstat", foreign_uid)
-
-        def foreign_stat(*args, **kwargs):
-            value = real_stat(*args, **kwargs)
-            if value.st_ino == inode:
-                injected.append("stat")
-                fields = list(value)
-                fields[4] = os.getuid() + 1
-                return os.stat_result(fields)
-            return value
-
-        monkeypatch.setattr(os, "stat", foreign_stat)
-
-        def foreign_lstat(path, *args, **kwargs):
-            value = real_lstat(path, *args, **kwargs)
-            if value.st_ino == inode:
-                injected.append("Path.lstat")
-                fields = list(value)
-                fields[4] = os.getuid() + 1
-                return os.stat_result(fields)
-            return value
-
-        monkeypatch.setattr(Path, "lstat", foreign_lstat)
-    before = snapshot(mailbox.root)
-    error_type, error = caught(lambda: (index if same_instance else
-                                      module.MailboxIndex(mailbox, directory)).messages())
-    assert issubclass(error_type, ValueError)
-    assert any(word in error for word in ("symlink", "owner", "owned", "writable"))
-    assert "private directory" in error
-    if unsafe.endswith("owner"):
-        assert injected
-    assert snapshot(mailbox.root) == before
-
-
-@pytest.mark.parametrize("where", ["inside", "equal", "ancestor"])
-def test_overlapping_directory_refused(mailbox, where):
-    cls = index_module().MailboxIndex
-    directory = {"inside": mailbox.root / "cache", "equal": mailbox.root,
-                 "ancestor": mailbox.root.parent}[where]
-    before = snapshot(mailbox.root)
-    assert issubclass(caught(lambda: cls(mailbox, directory).messages())[0], ValueError)
-    assert snapshot(mailbox.root) == before
-
-
-def test_warm_open_parses_only_one_new_file(mailbox, monkeypatch):
-    module = index_module()
-    for i in range(12):
-        mailbox.publish(request("note-%02d" % i))
-    index = module.MailboxIndex(mailbox)
-    before = snapshot(mailbox.root)
-    assert index.messages() == mailbox.messages()
-    assert snapshot(mailbox.root) == before
-    real_read = module.MailboxIndex._read_message
-    reads = []
-
-    def spy(self, path):
-        reads.append(path)
-        return real_read(self, path)
-
-    monkeypatch.setattr(module.MailboxIndex, "_read_message", spy)
-    # A new instance exercises the persisted cache as well as same-instance reads.
-    mailbox.publish(request("new-note"))
-    newer = module.MailboxIndex(mailbox)
-    assert newer.messages() == mailbox.messages()
-    assert len(reads) == 1
-    reads.clear()
-    assert newer.get("seed") == mailbox.messages()["seed"]
-    assert newer.get("absent") is None
-    assert not reads
-    if os.name == "posix":
-        assert stat.S_IMODE(newer.directory.stat().st_mode) == 0o700
-        assert stat.S_IMODE(newer.cache_path.stat().st_mode) == 0o600
-
-
-@pytest.mark.parametrize("verify_first", [pytest.param(False, marks=POSIX), True])
-def test_preserved_mtime_content_change(mailbox, monkeypatch, verify_first):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    record = index.messages()["seed"]
-    path = Path(record["path"])
-    old_raw, old_stat = path.read_bytes(), path.stat()
-    new_raw = old_raw.replace(b"original body", b"modified body")
-    path.write_bytes(new_raw)
-    os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
-    expected = [{"path": str(path), "old_sha256": hashlib.sha256(old_raw).hexdigest(),
-                 "new_sha256": hashlib.sha256(new_raw).hexdigest(), "kind": "content_changed"}]
-    if verify_first:
-        # Even a stale stat-key observer cannot bypass the explicit rehash hook.
-        injected = []
-
-        def unchanged(value):
-            injected.append(True)
-            return module.MailboxIndex._key(old_stat)
-
-        monkeypatch.setattr(index, "_key", unchanged)
-        assert index.verify() == expected
-        assert injected
-    else:
-        assert path.stat().st_ctime_ns != old_stat.st_ctime_ns
-        assert index.messages() == mailbox.messages()
-        assert index.content_changed == expected
-    assert index.verify() == []
-
-
-def test_r3_cached_brief_path_requires_shadow_or_verify(mailbox, tmp_path):
-    module = index_module()
-    brief_dir = tmp_path / "briefs"
-    brief_dir.mkdir()
-    brief_path = brief_dir / "task.md"
-    brief_path.write_text("Review the task.\n")
-    brief = {"path": str(brief_path), "sha256": hashlib.sha256(brief_path.read_bytes()).hexdigest()}
-    mailbox.publish(request("dispatch", type="dispatch", brief=brief))
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    moved = tmp_path / "old-briefs"
-    brief_dir.rename(moved)
-    symlink_or_skip(brief_dir, moved)
+    monkeypatch.setattr(index, "_indexed_messages", wrong)
     assert index.messages() == expected
+    assert index.last_divergence
     assert module.compare(mailbox, index)
-    assert caught(index.verify) == caught(mailbox.messages)
+    assert calls and snapshot(tmp_path) == before
 
 
-def test_shadow_equivalence_and_divergence(mailbox, tmp_path, monkeypatch):
-    module = index_module()
-    brief_path = tmp_path / "task.md"
-    brief_path.write_text("Review and report.\n")
-    brief = {"path": str(brief_path), "sha256": hashlib.sha256(brief_path.read_bytes()).hexdigest()}
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_varied_mailbox_and_pinned_inbox(mailbox, tmp_path, mode):
+    packet = tmp_path / "packet.md"
+    packet.write_text("Task packet.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
     mailbox.publish(request("dispatch", type="dispatch", brief=brief))
-    mailbox.publish(request("ack", "a/lane/review", "a/orchestrator", type="ack",
-                            acknowledgment="received", in_reply_to="dispatch"))
+    mailbox.publish(request("received", "a/lane/review", "a/orchestrator", type="ack",
+                            in_reply_to="dispatch", acknowledgment="received"))
     mailbox.publish(request("job", recipient="a/root", type="job_request", brief=brief))
     mailbox.publish(request("receipt", "a/root", "a/orchestrator", type="job_receipt",
                             in_reply_to="job", receipt={"state": "started"}))
-    index = module.MailboxIndex(mailbox)
-    before = snapshot(mailbox.root)
-    actual = index.messages()
-    assert list(actual) == list(mailbox.messages())
-    assert hm.encoded(actual) == hm.encoded(mailbox.messages())
-    assert module.compare(mailbox, index) == []
-    injected = stub_messages(monkeypatch, index, {})
-    differences = module.compare(mailbox, index)
-    assert injected == [True]
-    assert differences
-    log = index.directory / "divergence.jsonl"
-    assert len(log.read_text().splitlines()) == 1
-    assert hm.strict_json(log.read_text())["differences"] == differences
-    assert snapshot(mailbox.root) == before
-
-
-def test_atomic_write_failure_keeps_previous_cache(mailbox, monkeypatch):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    index.messages()
-    previous = index.cache_path.read_bytes()
-    mailbox.publish(request("later"))
-
-    injected = []
-
-    def crash(*args, **kwargs):
-        injected.append(True)
-        raise OSError("injected replace failure")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(module.os, "replace", crash)
-        with pytest.warns(RuntimeWarning, match="mailbox cache write failed"):
-            assert index.messages() == mailbox.messages()
-        assert "injected replace failure" in index.last_write_error
-    assert injected
-    assert index.cache_path.read_bytes() == previous
-    assert sorted(p.name for p in index.directory.iterdir()) == [index.cache_path.name]
-    assert module.MailboxIndex(mailbox).messages() == mailbox.messages()
-
-
-def test_pending_file_ignored_and_mailbox_untouched(mailbox):
-    module = index_module()
-    (mailbox.root / "a/lane/.pending-orphan").write_bytes(b"partial")
-    before = snapshot(mailbox.root)
-    index = module.MailboxIndex(mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
     assert index.messages() == mailbox.messages()
-    assert index.verify() == []
-    assert module.compare(mailbox, index) == []
-    assert snapshot(mailbox.root) == before
+    assert hm.encoded(index.messages()) == hm.encoded(mailbox.messages())
+    assert index_module().compare(mailbox, index) == []
+    for endpoint in ("a/lane/review", "a/orchestrator", "a/root"):
+        for include_briefs in (False, True):
+            assert index.inbox(endpoint, limit=1, include_briefs=include_briefs) == mailbox.inbox(
+                endpoint, limit=1, include_briefs=include_briefs)
+    assert index.inbox("a/lane/review", after="seed") == mailbox.inbox("a/lane/review", after="seed")
 
 
-def test_validation_cost_measurement(mailbox, tmp_path, record_property):
-    module = index_module()
-    brief_path = tmp_path / "measure.md"
-    brief_path.write_text("Measurement brief.\n")
-    brief = {"path": str(brief_path), "sha256": hashlib.sha256(brief_path.read_bytes()).hexdigest()}
-    for i in range(60):
-        mailbox.publish(request("measure-%02d" % i, brief=brief))
-    index = module.MailboxIndex(mailbox)
-    records = index.messages()
-    start = time.perf_counter()
-    for _ in range(3):
-        for record in records.values():
-            mailbox.validate_message(record["message"], stored=True)
-    validation = (time.perf_counter() - start) / 3
-    start = time.perf_counter()
-    for _ in range(3):
-        assert mailbox.messages() == records
-    full = (time.perf_counter() - start) / 3
-    start = time.perf_counter()
-    for _ in range(3):
-        assert index.messages() == records
-    warm = (time.perf_counter() - start) / 3
-    measurement = {"records": len(records), "validation_seconds": validation,
-                   "full_scan_seconds": full, "warm_seconds": warm, "validation_fraction": validation / full}
-    record_property("mailbox_index_cost", json.dumps(measurement))
-    print("MB1_COST " + json.dumps(measurement))
-
-
-@pytest.mark.parametrize("api", ["get", "messages"])
-def test_r3_optimization_counted_operations(mailbox, monkeypatch, api, record_property):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
+def test_pending_can_vanish_during_symlink_check(mailbox, monkeypatch):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
     expected = index.messages()
-    counts = {"reads": 0, "validations": 0, "source_reads": 0, "parses": 0, "manifest_digests": 0}
-    real_read, real_validate = hm.read_bytes, mailbox.validate_message
-    real_source, real_parse, real_digest = Path.read_bytes, hm.strict_json, hm.digest
-
-    def read(path):
-        if mailbox.root in Path(path).parents:
-            counts["reads"] += 1
-        return real_read(path)
-
-    def validate(*args, **kwargs):
-        counts["validations"] += 1
-        return real_validate(*args, **kwargs)
-
-    def source(path):
-        if path == Path(hm.__file__):
-            counts["source_reads"] += 1
-        return real_source(path)
-
-    def parse(raw):
-        counts["parses"] += 1
-        return real_parse(raw)
-
-    def digest(value):
-        if value is mailbox.manifest:
-            counts["manifest_digests"] += 1
-        return real_digest(value)
-
-    monkeypatch.setattr(hm, "read_bytes", read)
-    monkeypatch.setattr(mailbox, "validate_message", validate)
-    monkeypatch.setattr(Path, "read_bytes", source)
-    monkeypatch.setattr(hm, "strict_json", parse)
-    monkeypatch.setattr(hm, "digest", digest)
-    call = (lambda: index.get("seed")) if api == "get" else index.messages
-    actual = call()
-    assert actual == (expected["seed"] if api == "get" else expected)
-    assert counts == dict.fromkeys(counts, 0)
-    mailbox.publish(request("one-more"))
-    counts.update(dict.fromkeys(counts, 0))
-    call()
-    assert counts == {"reads": 1, "validations": 1, "source_reads": 0, "parses": 1, "manifest_digests": 0}
-    counts.update(dict.fromkeys(counts, 0))
-    call()
-    assert counts == dict.fromkeys(counts, 0)
-    counts.update(dict.fromkeys(counts, 0))
-    module.MailboxIndex(mailbox).get("seed")
-    assert counts == {"reads": 0, "validations": 0, "source_reads": 1, "parses": 1, "manifest_digests": 1}
-    record_property("counted_operations_" + api, "warm=0; publish=1 read,1 validation,1 parse; source=0")
-
-
-@pytest.mark.parametrize("api", ["get", "messages"])
-def test_r3_caller_cannot_mutate_index_state(mailbox, api):
-    index = index_module().MailboxIndex(mailbox)
-    expected = mailbox.messages()["seed"]
-    actual = index.get("seed") if api == "get" else index.messages()["seed"]
-    actual["message"]["body"] = "changed by caller"
-    actual["message"]["verification"]["lease"] = "changed by caller"
-    assert index.get("seed") == expected
-
-
-@pytest.mark.parametrize("opening", ["cold", "same", "fresh"])
-def test_r3_recursive_key_order_preserved(mailbox, opening):
-    module = index_module()
-    seed = mailbox.messages()["seed"]
-    header = {key: value for key, value in reversed(list(seed["message"].items())) if key != "body"}
-    header["verification"] = dict(reversed(list(header["verification"].items())))
-    Path(seed["path"]).write_bytes(b"---\n" + json.dumps(header).encode() + b"\n---\n\noriginal body")
-    expected = mailbox.messages()
-    index = module.MailboxIndex(mailbox)
-    if opening != "cold":
-        index.messages()
-    if opening == "fresh":
-        index = module.MailboxIndex(mailbox)
-    actual = index.messages()
-    assert actual == expected
-    assert key_order(actual) == key_order(expected)
-
-
-def test_r3_compare_detects_order_only_difference(mailbox, monkeypatch):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    actual = index.messages()
-    actual["seed"]["message"] = dict(reversed(list(actual["seed"]["message"].items())))
-    injected = stub_messages(monkeypatch, index, actual)
-    assert hm.encoded(actual) == hm.encoded(mailbox.messages())
-    assert module.compare(mailbox, index)
-    assert injected == [True]
-    assert len((index.directory / "divergence.jsonl").read_text().splitlines()) == 1
-
-
-@pytest.mark.parametrize("literal", NUMBER_LITERALS)
-@pytest.mark.parametrize("api", ["messages", "verify"])
-def test_r3_unencodable_cache_is_discarded(mailbox, literal, api):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    data = json.loads(index.cache_path.read_bytes())
-    next(iter(data["entries"].values()))["message"]["body"] = "NUMBER"
-    raw = json.dumps(data).replace('"NUMBER"', literal).encode()
-    index.cache_path.write_bytes(raw)
-    if api == "verify":
-        assert index.verify() == []
-    assert index.messages() == expected
-    assert module.compare(mailbox, index) == []
-
-
-@POSIX
-@pytest.mark.parametrize("target", ["cache", "log"])
-def test_r3_hardlinked_cache_files_refused(mailbox, monkeypatch, target):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    seed = index.messages()["seed"]
-    path = index.cache_path if target == "cache" else index.directory / "divergence.jsonl"
-    if path.exists():
-        path.unlink()
-    os.link(seed["path"], path)
-    before = snapshot(mailbox.root)
-    if target == "log":
-        injected = stub_messages(monkeypatch, index, {})
-        def call():
-            return module.compare(mailbox, index)
-    else:
-        call = index.messages
-    error_type, error = caught(call)
-    assert error_type is ValueError or issubclass(error_type, ValueError)
-    assert "link" in error and "private directory" in error
-    assert snapshot(mailbox.root) == before
-    if target == "log":
-        assert injected == [True]
-
-
-@POSIX
-@pytest.mark.parametrize("target", ["cache", "log"])
-def test_r3_directory_swap_never_writes_mailbox(mailbox, tmp_path, monkeypatch, target):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    index.messages()
-    mailbox.publish(request("new-after-swap"))
-    before = snapshot(mailbox.root)
-    real_open = os.open
-    swapped, violations = [], []
-    moved = tmp_path / "moved-cache"
-
-    def intercept(path, flags, *args, **kwargs):
-        name = Path(path).name
-        selected = name.startswith(".index-") if target == "cache" else name == "divergence.jsonl"
-        if flags & os.O_CREAT and selected and not swapped:
-            index.directory.rename(moved)
-            symlink_or_skip(index.directory, mailbox.root)
-            swapped.append(True)
-        descriptor = real_open(path, flags, *args, **kwargs)
-        if selected and flags & os.O_CREAT:
-            violations.extend(p.name for p in mailbox.root.iterdir()
-                              if p.name.startswith(".index-") or p.name == "divergence.jsonl")
-        return descriptor
-
-    monkeypatch.setattr(os, "open", intercept)
-    if target == "log":
-        injected_messages = stub_messages(monkeypatch, index, {})
-        def call():
-            return module.compare(mailbox, index)
-    else:
-        call = index.messages
-    try:
-        call()
-    except ValueError:
-        pass  # Refusing the raced path is also safe.
-    assert swapped
-    assert violations == []
-    assert snapshot(mailbox.root) == before
-    if target == "log":
-        assert injected_messages == [True]
-
-
-def test_r3_divergence_log_cap_reported(mailbox, monkeypatch):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    index.messages()
-    log = index.directory / "divergence.jsonl"
-    log.write_bytes(b"x" * 256)
-    log.chmod(0o600)
-    monkeypatch.setattr(module, "MAX_DIVERGENCE_BYTES", 256, raising=False)
-    injected = stub_messages(monkeypatch, index, {})
-    differences = module.compare(mailbox, index)
-    assert log.stat().st_size == 256
-    assert any(item["kind"] == "divergence_log_full" for item in differences)
-    assert injected == [True]
-
-
-@pytest.mark.parametrize("boundary", ["create", "fsync", "replace", "mkdir"])
-@pytest.mark.parametrize("anchored", [pytest.param(True, marks=POSIX), False])
-def test_r3_cache_write_failure_returns_valid_read(mailbox, monkeypatch, boundary, anchored):
-    module = index_module()
-    monkeypatch.setattr(module, "DIR_FD", anchored)
-    index = module.MailboxIndex(mailbox)
-    if boundary != "mkdir":
-        index.messages()
-    mailbox.publish(request("after-build"))
-    expected = mailbox.messages()
-    real_open, real_mkdir, real_path_mkdir = os.open, os.mkdir, Path.mkdir
+    pending = mailbox.root / "a/lane/.pending-vanish"
+    pending.write_text("partial")
+    real_lstat = os.lstat
     injected = []
 
-    def fail(*args, **kwargs):
-        injected.append(boundary)
-        raise OSError(errno.ENOSPC, "injected " + boundary + " failure")
-
-    def fail_create(path, flags, *args, **kwargs):
-        if flags & os.O_CREAT and Path(path).name.startswith(".index-"):
-            return fail()
-        return real_open(path, flags, *args, **kwargs)
-
-    def fail_mkdir(path, *args, **kwargs):
-        if Path(path).name == index.directory.name:
-            return fail()
-        return real_mkdir(path, *args, **kwargs)
-
-    def fail_path_mkdir(path, *args, **kwargs):
-        if path.name == index.directory.name:
-            return fail()
-        return real_path_mkdir(path, *args, **kwargs)
-
-    if boundary == "create":
-        monkeypatch.setattr(os, "open", fail_create)
-    elif boundary == "mkdir":
-        monkeypatch.setattr(os, "mkdir", fail_mkdir)
-        monkeypatch.setattr(Path, "mkdir", fail_path_mkdir)
-    else:
-        monkeypatch.setattr(os, boundary, fail)
-    with pytest.warns(RuntimeWarning, match="mailbox cache write failed"):
-        assert index.messages() == expected
-    assert "injected " + boundary + " failure" in index.last_write_error
-    assert injected
-
-
-@pytest.mark.parametrize("unlink_fails", [False, True])
-def test_r3_old_temp_sweep_is_bounded_and_optional(mailbox, monkeypatch, unlink_fails):
-    index = index_module().MailboxIndex(mailbox)
-    index.messages()
-    old = index.directory / ".index-old.tmp"
-    recent = index.directory / ".index-recent.tmp"
-    unrelated = index.directory / "unrelated.tmp"
-    for path in (old, recent, unrelated):
-        path.write_bytes(b"not a cache")
-        path.chmod(0o600)
-    os.utime(old, (time.time() - 7200, time.time() - 7200))
-    if unlink_fails:
-        real_unlink = os.unlink
-        injected = []
-
-        def fail_old(path, *args, **kwargs):
-            if Path(path).name == old.name:
-                injected.append(True)
-                raise OSError(errno.EACCES, "injected cleanup refusal")
-            return real_unlink(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, "unlink", fail_old)
-    assert index.messages() == mailbox.messages()
-    assert old.exists() is unlink_fails
-    assert recent.exists() and unrelated.exists()
-    if unlink_fails:
-        assert injected
-
-
-def test_r3_vanished_entry_retries_once(mailbox, monkeypatch):
-    index = index_module().MailboxIndex(mailbox)
-    seed = index.messages()["seed"]
-    real_lstat = Path.lstat
-    injected = []
-
-    def vanished(path, *args, **kwargs):
-        if str(path) == seed["path"] and not injected:
+    def check(path, *args, **kwargs):
+        if os.fspath(path) == str(pending) and not injected:
+            pending.unlink()
             injected.append(True)
-            raise FileNotFoundError(errno.ENOENT, "injected vanishing entry", str(path))
         return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", vanished)
-    assert index.messages() == mailbox.messages()
-    assert injected == [True]
+    monkeypatch.setattr(os, "lstat", check)
+    assert index.messages() == expected
+    assert injected and index_module().compare(mailbox, index) == []
 
 
-def test_r3_folder_ancestors_checked_once(mailbox, monkeypatch):
-    index = index_module().MailboxIndex(mailbox)
+def test_unknown_mode_refused(mailbox):
+    error_type, message = caught(lambda: index_module().MailboxIndex(mailbox, mode="bad"))
+    assert issubclass(error_type, ValueError) and "indexed" in message and "shadow" in message
+
+
+def test_oracle_detects_order_only_difference(mailbox, monkeypatch):
+    module = index_module()
+    index = module.MailboxIndex(mailbox, mode="indexed")
+    expected = mailbox.messages()
+    changed = {key: dict(reversed(list(record.items()))) for key, record in expected.items()}
+    assert hm.encoded(changed) == hm.encoded(expected)
+    monkeypatch.setattr(index, "_indexed_messages", lambda: changed)
+    assert module.compare(mailbox, index) == [{"kind": "mailbox_index_key_order"}]
+
+
+@pytest.mark.parametrize("platform", ["nt", "unproven"])
+@pytest.mark.parametrize("change", ["type", "body"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "verify", "inbox"])
+def test_r12_unreliable_metadata_rehashes_before_reuse(mailbox, monkeypatch, platform, change, mode, api):
+    module = index_module()
+    index = module.MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    original = path.stat()
+    message = {**seed["message"], change: "evil" if change == "type" else "modified body"}
+    rewrite(path, message)
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert path.stat().st_size == original.st_size
+    real_lstat, real_os_lstat, real_fstat = Path.lstat, os.lstat, os.fstat
+    observed = []
+
+    def creation_time(value):
+        if (value.st_dev, value.st_ino) != (original.st_dev, original.st_ino):
+            return value
+        observed.append(True)
+        return SimpleNamespace(st_mode=value.st_mode, st_dev=value.st_dev, st_ino=value.st_ino,
+                               st_size=value.st_size, st_mtime_ns=value.st_mtime_ns,
+                               st_ctime_ns=original.st_ctime_ns)
+
+    def lstat(target, *args, **kwargs):
+        return creation_time(real_lstat(target, *args, **kwargs))
+
+    def fstat(descriptor):
+        return creation_time(real_fstat(descriptor))
+
+    def os_lstat(path, *args, **kwargs):
+        return creation_time(real_os_lstat(path, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(os, "lstat", os_lstat)
+    # Isolate the platform boundary; do not change global os.name/pathlib classes.
+    monkeypatch.setattr(module, "os", PlatformOS(platform, fstat=fstat))
+    if change == "type":
+        assert caught(lambda: invoke(index, api)) == caught(mailbox.messages)
+    else:
+        result = invoke(index, api)
+        expected = mailbox.messages()
+        if api == "verify":
+            assert any(item["kind"] == "content_changed" for item in result)
+        else:
+            assert result == (expected if api == "messages" else expected["seed"]
+                              if api == "get" else mailbox.inbox("a/lane/review"))
+    assert observed and module.compare(mailbox, index) == []
+
+
+@pytest.mark.parametrize("platform", ["posix", "nt", "unproven"])
+def test_r12_hash_policy_reuses_parsing_only_after_hash_match(mailbox, monkeypatch, platform):
+    module = index_module()
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode="indexed")
     index.messages()
+    monkeypatch.setattr(module, "os", PlatformOS(platform, fstat=os.fstat))
+    real_parse = module.MailboxIndex._parse_message
+    real_read = module.MailboxIndex._read_message
+    parses, reads = [], []
+
+    def parse(self, path, raw):
+        parses.append(str(path))
+        return real_parse(self, path, raw)
+
+    def read(self, path, **kwargs):
+        reads.append(str(path))
+        return real_read(self, path, **kwargs)
+
+    monkeypatch.setattr(module.MailboxIndex, "_parse_message", parse)
+    monkeypatch.setattr(module.MailboxIndex, "_read_message", read)
+    index.messages()
+    assert parses == [] and len(reads) == (0 if platform == "posix" else 2)
+    mailbox.publish(request("one-new"))
+    reads.clear()
+    index.messages()
+    assert len(parses) == 1 and parses[0].endswith("-one-new.md")
+    assert len(reads) == (1 if platform == "posix" else 3)
+
+
+@pytest.mark.parametrize("race", ["pending_unlink", "reply_between_listings"])
+@pytest.mark.parametrize("pinned_error", [False, True])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "verify", "inbox"])
+def test_r12_publication_races_return_pinned_result(mailbox, monkeypatch, race, pinned_error, mode, api):
+    module = index_module()
+    cleanup = mailbox.root.parent / "cleanup-probe"
+    cleanup.mkdir()
+    (cleanup / "file").write_bytes(b"cleanup outside the index operation")
+    index = module.MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    retained = dict(index._entries)
+    injected = []
+    with monkeypatch.context() as race_patch:
+        if race == "pending_unlink":
+            if os.name != "posix":
+                pytest.skip("hard-link unlink changes POSIX ctime")
+            pending, aliases = [], {}
+            real_unlink = Path.unlink
+
+            def defer(path, *args, **kwargs):
+                if path.name.startswith(".pending-"):
+                    pending.append(path)
+                    return None
+                return real_unlink(path, *args, **kwargs)
+
+            with monkeypatch.context() as publication:
+                publication.setattr(Path, "unlink", defer)
+                for identifier in ("race-1", "race-2"):
+                    mailbox.publish(request(identifier))
+                    final = Path(mailbox.messages()[identifier]["path"])
+                    assert pending[-1].stat().st_ino == final.stat().st_ino
+                    aliases[final] = pending[-1]
+            real_lstat, real_os_lstat = Path.lstat, os.lstat
+
+            def unlink_after_stat(call, path, *args, **kwargs):
+                value = call(path, *args, **kwargs)
+                if isinstance(path, int) or kwargs.get("dir_fd") is not None:
+                    return value
+                target = Path(path)
+                if target in aliases:
+                    alias = aliases.pop(target)
+                    real_unlink(alias)
+                    injected.append(str(target))
+                    assert real_lstat(target).st_ctime_ns != value.st_ctime_ns
+                    if pinned_error and len(injected) == 2:
+                        rewrite(Path(seed["path"]), {**seed["message"], "type": "evil"})
+                return value
+
+            def path_lstat(path, *args, **kwargs):
+                return unlink_after_stat(real_lstat, path, *args, **kwargs)
+
+            def os_lstat(path, *args, **kwargs):
+                return unlink_after_stat(real_os_lstat, path, *args, **kwargs)
+
+            race_patch.setattr(Path, "lstat", path_lstat)
+            race_patch.setattr(os, "lstat", os_lstat)
+        else:
+            real_iterdir, real_scandir = Path.iterdir, os.scandir
+
+            def publish_between(path):
+                if isinstance(path, int):
+                    return
+                if os.fspath(path) == str(mailbox.root / "a/orchestrator") and not injected:
+                    injected.append(True)
+                    mailbox.publish(request("parent-between-listings"))
+                    mailbox.publish(request("reply-between-listings", "a/lane/review", "a/orchestrator",
+                                            in_reply_to="parent-between-listings"))
+                    if pinned_error:
+                        rewrite(Path(seed["path"]), {**seed["message"], "type": "evil"})
+            def iterdir(path):
+                publish_between(path)
+                return real_iterdir(path)
+
+            def scandir(path):
+                publish_between(path)
+                return real_scandir(path)
+
+            race_patch.setattr(Path, "iterdir", iterdir)
+            race_patch.setattr(os, "scandir", scandir)
+        if pinned_error:
+            assert caught(lambda: invoke(index, api)) == caught(mailbox.messages)
+        else:
+            result = invoke(index, api)
+            expected = mailbox.messages()
+            if api == "verify":
+                assert any(item["kind"] == "verification_unavailable" for item in result)
+            else:
+                assert result == (expected if api == "messages" else expected["seed"]
+                                  if api == "get" else mailbox.inbox("a/lane/review"))
+        assert len(injected) == (2 if race == "pending_unlink" else 1)
+        assert index.last_reconciliation["kind"] == "pinned_fallback"
+        assert index.last_reconciliation["attempts"] == (2 if race == "pending_unlink" else 1)
+        assert index._entries == retained  # Candidates are re-keyed on the next call, never bound to PIN's snapshot.
+        assert module.compare(mailbox, index) == []
+    shutil.rmtree(cleanup)
+
+
+@pytest.mark.parametrize("loading", ["sibling", "isolated_path"])
+def test_r12_isolated_reader_import_uses_pinned_sibling(mailbox, loading):
+    source = Path(hm.__file__).with_name("hierarchy_mailbox_index.py")
+    if loading == "sibling":
+        driver = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                  "import hierarchy_mailbox_index as m; "
+                  "print(m.hm.encoded(m.MailboxIndex(m.hm.Mailbox(sys.argv[2]), mode='indexed').messages()).decode())")
+        target = source.parent
+    else:
+        driver = ("import runpy,sys; m=runpy.run_path(sys.argv[1]); "
+                  "print(m['hm'].encoded(m['MailboxIndex'](m['hm'].Mailbox(sys.argv[2]), "
+                  "mode='indexed').messages()).decode())")
+        target = source
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(target), str(mailbox.root)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert hm.strict_json(result.stdout) == mailbox.messages()
+
+
+def test_r13_pinned_inbox_raises_instead_of_refilling(mailbox, tmp_path):
+    folder = tmp_path / "packet-folder"
+    folder.mkdir()
+    packet = folder / "packet.md"
+    packet.write_text("Packet for the first candidate.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    mailbox.publish(request("bad-candidate", type="dispatch", brief=brief))
+    mailbox.publish(request("refill-candidate"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    records = index.messages()
+    keys = {record["path"]: (Path(record["path"]).stat().st_size,
+                             Path(record["path"]).stat().st_mtime_ns,
+                             Path(record["path"]).stat().st_ctime_ns,
+                             Path(record["path"]).stat().st_ino) for record in records.values()}
+    moved = tmp_path / "moved-packet-folder"
+    folder.rename(moved)
+    symlink(folder, moved)
+    assert keys == {path: (Path(path).stat().st_size, Path(path).stat().st_mtime_ns,
+                          Path(path).stat().st_ctime_ns, Path(path).stat().st_ino) for path in keys}
+    expected_error = caught(lambda: mailbox.inbox("a/lane/review", limit=2))
+    assert expected_error[0] is ValueError and "symlink paths" in expected_error[1]
+    assert "bad-candidate.md" in expected_error[1]
+    assert caught(lambda: index.inbox("a/lane/review", limit=2)) == expected_error
+    # A filled [seed, refill-candidate] page would contradict this pinned outcome.
+
+
+def measure_ac1(root, monkeypatch, record_property, first, delivery):
+    mailbox = hm.Mailbox(root)
+    trace = MemoTrace(monkeypatch, mailbox)
+    index, records, identifier, endpoint, expected_inbox = prepare_ac1(mailbox, first)
+    assert len(records) == 10000
+    binding = mailbox.current_binding(endpoint)
+    sender = {"from": endpoint, "host": binding["host"], "session": binding["session"],
+              "binding_generation": binding["generation"]}
+    record_property("warmup_trace", hm.encoded(trace.events).decode())
+    counts = ReadCounts(monkeypatch, trace)
+    samples = {}
+    sources = {record["path"] for record in records.values()}
+    for api in ("get", "inbox"):
+        before = mailbox.root.stat()
+        mailbox.record_read(delivery / api, sender, [identifier])
+        after = mailbox.root.stat()
+        record_property(api + "_pinned_write", "record_read")
+        record_property(api + "_root_times_before", (before.st_mtime_ns, before.st_ctime_ns))
+        record_property(api + "_root_times_after", (after.st_mtime_ns, after.st_ctime_ns))
+        assert (before.st_dev, before.st_ino, before.st_mode, before.st_uid) == (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid)
+        trace.reset()
+        counts.reset()
+        load = os.getloadavg() if hasattr(os, "getloadavg") else None
+        started = time.perf_counter()
+        if api == "get":
+            result = index.get(identifier)
+        else:
+            result = index.inbox(endpoint, limit=20)
+        elapsed = time.perf_counter() - started
+        expected = records[identifier] if api == "get" else expected_inbox
+        assert result == expected
+        returned = [result] if api == "get" else result["messages"]
+        source_opens = [path for path in counts.opens if path in sources]
+        warm = (trace.validations == 0 and not trace.events and index.last_reconciliation is None
+                and counts.memo_lstats == {path: 1 for path in index._observations}
+                and sorted(source_opens) == sorted(record["path"] for record in returned)
+                and len(counts.opens) == len(returned) + (1 if api == "inbox" else 0))
+        samples[api] = {"seconds": elapsed, "warm": warm}
+        for field, value in {"seconds": elapsed, "warm": warm, "load_1_5_15": load,
+                             "lstats": sum(counts.lstats.values()), "opens": len(counts.opens),
+                             "validations": trace.validations, "trace": hm.encoded(trace.events).decode(),
+                             "max_memo_lstats": max(counts.memo_lstats.values(), default=0)}.items():
+            record_property(api + "_" + field, value)
+    return samples
+
+
+@pytest.mark.timing
+@pytest.mark.skipif(not os.environ.get("AEGIS_MB1_AC1_ROOT"), reason="explicit existing 10k fixture required")
+def test_r13_ac1_existing_10k_fixture(record_property, monkeypatch, tmp_path):
+    root = Path(os.environ["AEGIS_MB1_AC1_ROOT"])
+    record_property("mailbox", str(root))
+    record_property("records", 10000)
+    record_property("cpu_count", os.cpu_count())
+    samples = []
+    # Three complete, sequential benchmark runs, each with a fresh memo.
+    for number, first in enumerate(("get", "inbox", "messages"), 1):
+        prefix = "sample_%d_" % number
+        record_property(prefix + "first", first)
+        with monkeypatch.context() as patches:
+            samples.append(measure_ac1(root, patches,
+                                       lambda key, value: record_property(prefix + key, value), first,
+                                       tmp_path / ("receipts-%d" % number)))
+    medians = {api: statistics.median(sample[api]["seconds"] for sample in samples)
+               for api in ("get", "inbox")}
+    for api, median in medians.items():
+        record_property(api + "_median_seconds", median)
+        record_property(api + "_wall_clock_below_0_2", median <= 0.2)
+    record_property("wall_clock_gate", "deferred_until_quiet_machine_owner_acceptance")
+    assert all(sample[api]["warm"] for sample in samples for api in medians), samples
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r14_warm_validation_is_reused_by_observation_key(mailbox, monkeypatch, api):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    index.messages()
+    real_validate = mailbox.validate_message
+    validations = []
+
+    def validate(message, **kwargs):
+        validations.append(message["message_id"])
+        return real_validate(message, **kwargs)
+
+    monkeypatch.setattr(mailbox, "validate_message", validate)
+    invoke(index, api)
+    assert validations == []
+
+
+def test_r14_warm_lstats_are_deduplicated(mailbox, monkeypatch):
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    index.messages()
+    real_lstat = os.lstat
     counts = {}
-    real_lstat = Path.lstat
 
     def lstat(path, *args, **kwargs):
         counts[path] = counts.get(path, 0) + 1
         return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", lstat)
-    index.get("seed")
-    assert counts[mailbox.root] == 1
+    monkeypatch.setattr(os, "lstat", lstat)
+    assert index.get("seed")["message"]["message_id"] == "seed"
+    assert counts and max(counts.values()) == 1
 
 
-@POSIX
-@pytest.mark.parametrize("mode", [0o500, 0o400])
-def test_r3_read_only_cache_directory_returns_valid_read(mailbox, mode):
-    index = index_module().MailboxIndex(mailbox)
+@pytest.mark.parametrize("change", ["brief_symlink", "rename_swap", "in_place"])
+def test_r14_changed_observation_and_restoration(mailbox, tmp_path, change):
+    folder = tmp_path / "brief-folder"
+    folder.mkdir()
+    packet = folder / "packet.md"
+    packet.write_text("Keyed brief.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    mailbox.publish(request("dispatch", type="dispatch", brief=brief))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    source = Path(seed["path"])
+    original = source.read_bytes()
+    if change == "brief_symlink":
+        moved = tmp_path / "old-brief-folder"
+        folder.rename(moved)
+        symlink(folder, moved)
+    elif change == "rename_swap":
+        replacement = tmp_path / "replacement.md"
+        rewrite(replacement, {**seed["message"], "type": "evil"})
+        replacement.replace(source)
+    else:
+        metadata = source.stat()
+        rewrite(source, {**seed["message"], "type": "evil"})
+        os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    assert caught(lambda: index.get("seed")) == caught(mailbox.messages)
+    if change == "brief_symlink":
+        folder.unlink()
+        moved.rename(folder)
+    else:
+        source.write_bytes(original)
+    assert index.get("seed") == mailbox.messages()["seed"]
+    assert index_module().compare(mailbox, index) == []
+
+
+def test_r14_reference_mode_change_rechecks_its_record(mailbox, tmp_path, monkeypatch):
+    packet = tmp_path / "packet.md"
+    packet.write_text("Referenced file mode.\n")
+    packet.chmod(0o644)
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    mailbox.publish(request("dispatch", type="dispatch", brief=brief))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
     index.messages()
-    mailbox.publish(request("new-with-readonly-cache"))
-    expected = mailbox.messages()
-    index.directory.chmod(mode)
-    try:
-        with pytest.warns(RuntimeWarning, match="mailbox cache write failed"):
-            assert index.messages() == expected
-        assert index.last_write_error
-    finally:
-        index.directory.chmod(0o700)
+    real_validate = mailbox.validate_message
+    validations = []
+
+    def validate(message, **kwargs):
+        validations.append(message["message_id"])
+        return real_validate(message, **kwargs)
+
+    monkeypatch.setattr(mailbox, "validate_message", validate)
+    packet.chmod(0o600)
+    assert index.get("seed")["message"]["message_id"] == "seed"
+    assert validations == ["dispatch"]
 
 
-@pytest.mark.skipif(os.environ.get("AEGIS_MB1_SLOW") != "1", reason="opt in with AEGIS_MB1_SLOW=1")
-def test_r3_ac1_10k_warm_get(mailbox, record_property):
-    """Fixture files use pinned validation and the pinned no-replace publisher."""
-    seed = mailbox.messages()["seed"]
-    for i in range(1, 10000):
-        message = {**seed["message"], "message_id": "scale-%05d" % i}
-        destination = mailbox.validate_message(message, stored=True)
-        header = {k: v for k, v in message.items() if k != "body"}
-        raw = b"---\n" + hm.encoded(header) + b"\n---\n\n" + message["body"].encode()
-        name = Path(seed["path"]).name.replace("-seed.md", "-" + message["message_id"] + ".md")
-        hm.publish_file(destination / name, raw)
-    expected_all = mailbox.messages()
-    expected = expected_all["seed"]
-    index = index_module().MailboxIndex(mailbox)
+def test_r14_process_identity_is_live(mailbox, monkeypatch):
+    if not hasattr(os, "getgroups"):
+        pytest.skip("POSIX group observation required")
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
     index.messages()
-    start = time.perf_counter()
-    actual = index.get("seed")
-    elapsed = time.perf_counter() - start
-    record_property("ac1_get_seconds", elapsed)
-    assert actual == expected and key_order(actual) == key_order(expected)
-    assert elapsed < 0.2
-    start = time.perf_counter()
-    actual_all = index.messages()
-    elapsed = time.perf_counter() - start
-    record_property("ac1_messages_seconds", elapsed)
-    assert actual_all == expected_all and key_order(actual_all) == key_order(expected_all)
-    assert elapsed < 0.2
+    groups = os.getgroups()
+    real_validate = mailbox.validate_message
+    validations = []
+
+    def validate(message, **kwargs):
+        validations.append(message["message_id"])
+        return real_validate(message, **kwargs)
+
+    monkeypatch.setattr(mailbox, "validate_message", validate)
+    monkeypatch.setattr(os, "getgroups", lambda: groups + [max(groups + [0]) + 1])
+    assert index.get("seed")["message"]["message_id"] == "seed"
+    assert validations == ["seed"]
 
 
-@pytest.mark.parametrize("removed, victims", [(True, 1), (False, 1), (True, 2)])
-def test_r4_vanish_between_stat_and_read(mailbox, monkeypatch, removed, victims):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r15_cached_access_opens_and_reads_only_returned_records(mailbox, monkeypatch, api):
+    mailbox.publish(request("second"))
+    mailbox.publish(request("third"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
     expected = index.messages()
-    paths = {Path(mailbox.publish(request("vanish-%d" % i))["path"]) for i in range(victims)}
+    sources = {record["path"] for record in expected.values()}
     real_open = Path.open
+    real_os_open, real_fdopen = os.open, os.fdopen
+    descriptors = {}
+    opened, read = [], []
+
+    class Stream:
+        def __init__(self, stream, path):
+            self.stream, self.path = stream, path
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, *args, **kwargs):
+            read.append(str(self.path))
+            return self.stream.read(*args, **kwargs)
+
+    def opening(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if str(path) in sources:
+            opened.append(str(path))
+            return Stream(stream, path)
+        return stream
+
+    def os_open(path, *args, **kwargs):
+        descriptor = real_os_open(path, *args, **kwargs)
+        if os.fspath(path) in sources:
+            opened.append(os.fspath(path))
+            descriptors[descriptor] = os.fspath(path)
+        return descriptor
+
+    def fdopen(descriptor, *args, **kwargs):
+        stream = real_fdopen(descriptor, *args, **kwargs)
+        path = descriptors.pop(descriptor, None)
+        return Stream(stream, path) if path is not None else stream
+
+    monkeypatch.setattr(Path, "open", opening)
+    monkeypatch.setattr(os, "open", os_open)
+    monkeypatch.setattr(os, "fdopen", fdopen)
+    if api == "inbox":
+        result = index.inbox("a/lane/review", limit=1)
+        assert result["messages"][0] == expected["seed"]
+    else:
+        assert invoke(index, api) == (expected if api == "messages" else expected["seed"])
+    assert len(opened) == len(read) == (3 if api == "messages" else 1)
+
+
+def test_r15_unreturned_access_policy_change_is_the_accepted_risk(mailbox, monkeypatch):
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    expected = index.messages()
+    blocked = Path(expected["second"]["path"])
+
+    def denied(path):
+        if path == blocked:
+            raise PermissionError("simulated mandatory policy reload")
+
+    intercept_source_opens(monkeypatch, denied)
+    assert index.get("seed") == expected["seed"]
+    assert caught(index.messages) == caught(mailbox.messages)
+
+
+def test_r15_changed_access_key_reprobes_unreturned_record(mailbox, monkeypatch):
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    expected = index.messages()
+    blocked = Path(expected["second"]["path"])
+
+    def denied(path):
+        if path == blocked:
+            raise PermissionError("simulated changed access")
+
+    blocked.chmod(0o400)
+    intercept_source_opens(monkeypatch, denied)
+    assert caught(lambda: index.get("seed")) == caught(mailbox.messages)
+
+
+def test_r15_hot_loop_does_not_hash_pathlib_objects(mailbox, monkeypatch):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    index.messages()
+    real_hash = Path.__hash__
+    calls = []
+
+    def hashed(path):
+        calls.append(True)
+        return real_hash(path)
+
+    monkeypatch.setattr(Path, "__hash__", hashed)
+    assert index.get("seed")["message"]["message_id"] == "seed"
+    assert calls == []
+
+
+@pytest.fixture
+def prefix_mailbox(tmp_path):
+    # These hierarchy slugs are accepted by the pinned endpoint grammar.
+    hierarchies = ("a-x", "a-1", "a")
+    endpoints = {}
+    for hierarchy in hierarchies:
+        endpoints.update({hierarchy + "/front-door": {}, hierarchy + "/orchestrator": {},
+                          hierarchy + "/lane/review": {"kind": "reviewer"}})
+    root = tmp_path / "prefix-mailbox"
+    hm.initialize(root, {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
+                         "endpoints": endpoints, "counterparts": []})
+    mailbox = hm.Mailbox(root)
+    for endpoint in endpoints:
+        mailbox.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint,
+                      "expected_generation": 0})
+    packet = tmp_path / "prefix-packet.md"
+    packet.write_text("Check component order.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    for number, hierarchy in enumerate(hierarchies):
+        sender, lane = hierarchy + "/orchestrator", hierarchy + "/lane/review"
+        mailbox.publish(request("note-%d" % number, sender, hierarchy + "/front-door"))
+        mailbox.publish(request("dispatch-%d" % number, sender, lane, type="dispatch", brief=brief))
+        mailbox.publish(request("accepted-%d" % number, lane, sender, type="ack",
+                                acknowledgment="accepted", in_reply_to="dispatch-%d" % number))
+    return mailbox
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox", "dispatch_history", "compare"])
+@pytest.mark.parametrize("warm", [False, True])
+def test_r16_component_order_parity(prefix_mailbox, api, warm):
+    module = index_module()
+    mailbox = prefix_mailbox
+    index = module.MailboxIndex(mailbox, mode="indexed")
+    if warm:
+        index.messages()
+    expected = mailbox.messages()
+    # Explicitly pin the independent oracle's hierarchy/component order.
+    assert list(expected) == ["note-2", "dispatch-2", "accepted-2", "note-1", "dispatch-1",
+                              "accepted-1", "note-0", "dispatch-0", "accepted-0"]
+    if api == "messages":
+        actual = index.messages()
+        assert actual == expected and list(actual) == list(expected)
+    elif api == "get":
+        for identifier, record in expected.items():
+            actual = index.get(identifier)
+            assert actual == record and list(actual) == list(record)
+    elif api == "inbox":
+        for endpoint in mailbox.manifest["endpoints"]:
+            actual = index.inbox(endpoint)
+            pinned = mailbox.inbox(endpoint)
+            assert actual == pinned and list(actual) == list(pinned)
+    elif api == "dispatch_history":
+        assert mailbox.dispatch_history(index.messages()) == mailbox.dispatch_history(expected)
+    else:
+        assert module.compare(mailbox, index) == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r16_shadow_component_order_has_no_divergence(prefix_mailbox, api):
+    index = index_module().MailboxIndex(prefix_mailbox)
+    if api == "messages":
+        assert index.messages() == prefix_mailbox.messages()
+    elif api == "get":
+        assert index.get("dispatch-2") == prefix_mailbox.messages()["dispatch-2"]
+    else:
+        assert index.inbox("a/lane/review") == prefix_mailbox.inbox("a/lane/review")
+    assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r16_shadow_component_order_does_not_repeat_reads(prefix_mailbox, monkeypatch, api):
+    index = index_module().MailboxIndex(prefix_mailbox)
+    index.messages()
+    calls = {"indexed": 0, "pinned": 0}
+    real_indexed, real_pinned = index._read_index, prefix_mailbox.messages
+
+    def indexed(*args, **kwargs):
+        calls["indexed"] += 1
+        return real_indexed(*args, **kwargs)
+
+    def pinned():
+        calls["pinned"] += 1
+        return real_pinned()
+
+    monkeypatch.setattr(index, "_read_index", indexed)
+    monkeypatch.setattr(prefix_mailbox, "messages", pinned)
+    if api == "messages":
+        index.messages()
+    elif api == "get":
+        index.get("dispatch-2")
+    else:
+        index.inbox("a/lane/review")
+    assert calls == {"indexed": 1, "pinned": 1}
+
+
+def assert_warm_call(index, records, identifier, endpoint, page, api, trace, counts, record_property):
+    trace.reset()
+    counts.reset()
+    if api == "messages":
+        result = index.messages()
+        assert result == records and list(result) == list(records)
+        returned = list(records.values())
+    elif api == "get":
+        result = index.get(identifier)
+        assert result == records[identifier]
+        returned = [result]
+    else:
+        result = index.inbox(endpoint, limit=20)
+        assert result == page
+        returned = result["messages"]
+    record_property("memo_trace", hm.encoded(trace.events).decode())
+    record_property("validations", trace.validations)
+    record_property("lstats", sum(counts.lstats.values()))
+    record_property("opens", len(counts.opens))
+    assert trace.validations == 0, trace.events
+    assert not any(event["kind"] in {"clear", "scan_error"} for event in trace.events), trace.events
+    assert index.last_reconciliation is None
+    assert counts.memo_lstats and max(counts.memo_lstats.values()) == 1
+    sources = {record["path"] for record in records.values()}
+    assert sorted(path for path in counts.opens if path in sources) == sorted(
+        record["path"] for record in returned)
+    # Live pinned inbox delegation also opens the binding record.
+    assert len(counts.opens) == len(returned) + (1 if api == "inbox" else 0)
+
+
+@pytest.mark.parametrize("first", ["get", "inbox", "messages"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("refresh_layout", [False, True])
+def test_r17_unchanged_warm_counts(prefix_mailbox, monkeypatch, record_property, first, api, refresh_layout):
+    trace = MemoTrace(monkeypatch, prefix_mailbox)
+    index, records, identifier, endpoint, page = prepare_ac1(prefix_mailbox, first)
+    if refresh_layout:
+        index._folder_layout = None  # A missing derived layout must not invalidate checked records.
+    counts = ReadCounts(monkeypatch, trace)
+    assert_warm_call(index, records, identifier, endpoint, page, api, trace, counts, record_property)
+    assert [event["kind"] for event in trace.events] == (["layout_refresh"] if refresh_layout else [])
+
+
+@pytest.mark.parametrize("first", ["get", "inbox", "messages"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r17_oracle_preparation_finishes_before_warmup(prefix_mailbox, monkeypatch, record_property, first, api):
+    mailbox = prefix_mailbox
+    trace = MemoTrace(monkeypatch, mailbox)
+    real_open = io.open
+    marker = mailbox.root.parent / "concurrent-evidence"
     injected = []
 
-    def vanish(path, *args, **kwargs):
-        if path in paths and path not in injected and args and args[0] == "rb":
-            injected.append(path)
-            if removed:
-                path.unlink()
-            raise FileNotFoundError(errno.ENOENT, "injected stat/read disappearance", str(path))
+    def opened(path, *args, **kwargs):
+        # Reproduce a sibling evidence publication during the oracle's binding read.
+        if isinstance(path, (str, os.PathLike)) and "/bindings/" in os.fspath(path) and not injected:
+            injected.append(True)
+            marker.write_bytes(b"independent evidence publication\n")
         return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", vanish)
-    if removed and victims == 1:
-        assert index.messages() == expected
+    before = snapshot(mailbox.root)
+    monkeypatch.setattr(io, "open", opened)
+    index, records, identifier, endpoint, page = prepare_ac1(mailbox, first)
+    assert injected == [True] and snapshot(mailbox.root) == before
+    counts = ReadCounts(monkeypatch, trace)
+    assert_warm_call(index, records, identifier, endpoint, page, api, trace, counts, record_property)
+
+
+@pytest.mark.parametrize("ancestor", ["parent", "grandparent"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r18_above_root_timestamps_do_not_invalidate(prefix_mailbox, monkeypatch, record_property, ancestor, api):
+    mailbox = prefix_mailbox
+    trace = MemoTrace(monkeypatch, mailbox)
+    index, records, identifier, endpoint, page = prepare_ac1(mailbox)
+    path = mailbox.root.parent if ancestor == "parent" else mailbox.root.parent.parent
+    metadata = path.stat()
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1000000))
+    counts = ReadCounts(monkeypatch, trace)
+    assert_warm_call(index, records, identifier, endpoint, page, api, trace, counts, record_property)
+    assert trace.events == []
+    assert trace.above_root.isdisjoint(index._observations)
+    assert all(trace.above_root.isdisjoint(entry["paths"]) for entry in index._entries.values())
+    assert all(trace.above_root.isdisjoint(paths) for paths in index._folder_paths.values())
+
+
+@pytest.mark.parametrize("relative,expected", [
+    (".", ["note-0", "dispatch-0", "accepted-0", "note-1", "dispatch-1", "accepted-1",
+           "note-2", "dispatch-2", "accepted-2"]),
+    ("a", ["note-2", "dispatch-2", "accepted-2"]),
+    ("a/lane", ["dispatch-2", "accepted-2"]),
+    ("a/orchestrator", ["accepted-2"]),
+    ("across/lane", []),
+])
+@pytest.mark.parametrize("change", ["timestamp", "chmod", "replace"])
+def test_r18_in_scope_directory_change_revalidates_its_records(prefix_mailbox, monkeypatch, relative, expected, change):
+    mailbox = prefix_mailbox
+    trace = MemoTrace(monkeypatch, mailbox)
+    index, records, identifier, _, _ = prepare_ac1(mailbox)
+    real_validate = mailbox.validate_message
+    validated = []
+
+    def validate(message, **kwargs):
+        validated.append(message["message_id"])
+        return real_validate(message, **kwargs)
+
+    monkeypatch.setattr(mailbox, "validate_message", validate)
+    path = mailbox.root / relative
+    metadata = path.stat()
+    if change == "timestamp":
+        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1000000))
+        expected = []  # ADR ~21:02Z: directory timestamps no longer bind outcomes.
+    elif change == "chmod":
+        path.chmod(metadata.st_mode ^ 0o040)
     else:
-        assert issubclass(caught(index.messages)[0], module.IndexDivergence)
-    assert len(injected) == victims
+        path = mailbox.root if relative == "." else path
+        moved = mailbox.root.parent / "moved-directory"
+        path.rename(moved)
+        path.mkdir(mode=metadata.st_mode & 0o777)
+        for child in moved.iterdir():
+            child.rename(path / child.name)
+    trace.reset()
+    assert index.get(identifier) == records[identifier]
+    if change == "replace":
+        # Moving leaf files also changes their ctime, requiring fresh parsing
+        # and fresh pinned validation. Unaffected records stay reused.
+        assert sorted(set(validated)) == sorted(expected)
+    else:
+        assert sorted(validated) == sorted(expected)
+    assert index.last_reconciliation is None
 
 
-def test_r4_fallback_write_reuses_memory_immediately(mailbox, monkeypatch):
-    module = index_module()
-    monkeypatch.setattr(module, "DIR_FD", False)
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    parsed = []
-    real_parse = hm.strict_json
-
-    def parse(raw):
-        parsed.append(True)
-        return real_parse(raw)
-
-    monkeypatch.setattr(hm, "strict_json", parse)
-    assert index.messages() == expected
-    assert parsed == []
-    mailbox.publish(request("fallback-new"))
-    parsed.clear()
-    index.get("seed")
-    assert len(parsed) == 1  # Only the new message, not the just-written cache.
-    parsed.clear()
-    index.get("seed")
-    assert parsed == []
+def test_r18_pending_sibling_keeps_full_internal_directory_observation(prefix_mailbox, monkeypatch):
+    mailbox = prefix_mailbox
+    trace = MemoTrace(monkeypatch, mailbox)
+    index, records, identifier, _, _ = prepare_ac1(mailbox)
+    (mailbox.root / "a/lane/.pending-sibling").write_bytes(b"unrelated publication")
+    trace.reset()
+    assert index.get(identifier) == records[identifier]
+    assert trace.validations == 0  # ADR ~21:02Z: the directory identity is unchanged.
+    assert index.messages() == mailbox.messages()
 
 
-@pytest.mark.parametrize("name", ["caf\u00e9.md", "space name.md"])
-def test_r4_unicode_filename_fresh_instance_reuses_entries(mailbox, monkeypatch, name):
-    module = index_module()
-    seed = Path(mailbox.messages()["seed"]["path"])
-    seed.rename(seed.with_name(name))
+def preserve_source_stat(monkeypatch, metadata):
+    """Simulate the same-stat mmap/privileged boundary without faking file bytes."""
+    real_lstat, real_os_lstat, real_fstat = Path.lstat, os.lstat, os.fstat
+
+    def original(value):
+        return metadata if (value.st_dev, value.st_ino) == (metadata.st_dev, metadata.st_ino) else value
+
+    monkeypatch.setattr(Path, "lstat", lambda path, *a, **kw: original(real_lstat(path, *a, **kw)))
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **kw: original(real_os_lstat(path, *a, **kw)))
+    monkeypatch.setattr(os, "fstat", lambda descriptor: original(real_fstat(descriptor)))
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("following", ["none", "read", "invalid_inbox"])
+def test_r18_returned_hash_evidence_survives_fallback(mailbox, monkeypatch, api, mode, following):
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    metadata = path.stat()
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    assert path.stat().st_size == metadata.st_size
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    preserve_source_stat(monkeypatch, metadata)
     expected = mailbox.messages()
-    module.MailboxIndex(mailbox).messages()
-    real_read = module.MailboxIndex._read_message
+    result = invoke(index, api)
+    assert result == (expected if api == "messages" else expected["seed"] if api == "get"
+                      else mailbox.inbox("a/lane/review"))
+    assert index.last_reconciliation["kind"] == "pinned_fallback"
+    if following == "read":
+        assert index.get("second") == expected["second"]
+    elif following == "invalid_inbox":
+        assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+            lambda: mailbox.inbox("a/lane/review", after="absent"))
+    assert_fallback_verification(index, [{"kind": "content_changed", "path": str(path),
+                                         "old_sha256": old_sha, "new_sha256": new_sha}])
+
+
+@pytest.mark.parametrize("defect", ["malformed", "missing_reply"])
+def test_r18_scan_hash_evidence_survives_later_failure(mailbox, defect):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    bad = path.parent / "zz-bad.md"
+    if defect == "malformed":
+        bad.write_bytes(b"missing header")
+    else:
+        rewrite(bad, {**seed["message"], "message_id": "bad", "in_reply_to": "absent"})
+    assert caught(index.messages) == caught(mailbox.messages)
+    bad.unlink()
+    assert index.verify() == [{"kind": "content_changed", "path": str(path),
+                               "old_sha256": old_sha, "new_sha256": new_sha}]
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox", "verify"])
+def test_r18_above_root_symlink_still_has_pinned_error(tmp_path, api):
+    parent = tmp_path / "above-root"
+    parent.mkdir()
+    root = parent / "mailbox"
+    endpoints = {"a/front-door": {}, "a/orchestrator": {}, "a/lane/review": {"kind": "reviewer"}}
+    hm.initialize(root, {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
+                         "endpoints": endpoints, "counterparts": []})
+    mailbox = hm.Mailbox(root)
+    for endpoint in endpoints:
+        mailbox.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint,
+                      "expected_generation": 0})
+    mailbox.publish(request("seed"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    index.messages()
+    moved = tmp_path / "moved-parent"
+    parent.rename(moved)
+    symlink(parent, moved)
+    assert caught(lambda: invoke(index, api)) == caught(mailbox.messages)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("fault", ["bad_cursor", "brief_missing", "other_return_mismatch"])
+def test_r18_evidence_after_successful_scan_then_failure(mailbox, tmp_path, monkeypatch, mode, fault):
+    packet = tmp_path / "failure-packet.md"
+    packet.write_bytes(b"Pinned brief.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    mailbox.publish(request("dispatch", type="dispatch", brief=brief))
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    path = Path(records["seed"]["path"])
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rewrite(path, {**records["seed"]["message"], "body": "modified body"})
+    expected = [{"kind": "content_changed", "path": str(path), "old_sha256": old_sha,
+                 "new_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}]
+    if fault == "bad_cursor":
+        assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+            lambda: mailbox.inbox("a/lane/review", after="absent"))
+    elif fault == "brief_missing":
+        packet.unlink()
+        assert caught(lambda: index.inbox("a/lane/review", include_briefs=True)) == caught(
+            lambda: mailbox.inbox("a/lane/review", include_briefs=True))
+        packet.write_bytes(b"Pinned brief.\n")
+    else:
+        other = Path(records["second"]["path"])
+        metadata = other.stat()
+        old_other = hashlib.sha256(other.read_bytes()).hexdigest()
+        rewrite(other, {**records["second"]["message"], "body": "modified body"})
+        assert other.stat().st_size == metadata.st_size
+        preserve_source_stat(monkeypatch, metadata)
+        expected.append({"kind": "content_changed", "path": str(other), "old_sha256": old_other,
+                         "new_sha256": hashlib.sha256(other.read_bytes()).hexdigest()})
+        assert index.get("second") == mailbox.messages()["second"]
+    if fault == "other_return_mismatch":
+        assert_fallback_verification(index, expected)
+    else:
+        assert sorted(index.verify(), key=lambda item: item["path"]) == sorted(expected, key=lambda item: item["path"])
+        assert index.verify() == []
+
+
+def test_r18_shadow_oracle_error_keeps_prior_hash_observation(mailbox, monkeypatch):
+    index = index_module().MailboxIndex(mailbox)
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    attempts = []
+    restored = False
+
+    def opened(target):
+        if target == path and not restored:
+            attempts.append(True)
+            if len(attempts) >= 2:  # Local read succeeds; the pinned oracle then sees access failure.
+                raise PermissionError("injected source access change after local scan")
+
+    intercept_source_opens(monkeypatch, opened)
+    assert caught(index.messages) == caught(mailbox.messages)
+    restored = True
+    assert index.verify() == [{"kind": "content_changed", "path": str(path),
+                               "old_sha256": old_sha, "new_sha256": new_sha}]
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("ceiling", ["normal", "entries", "bytes"])
+def test_r19_thousand_malformed_alternations_are_bounded(mailbox, monkeypatch, record_property, ceiling):
+    module = index_module()
+    if ceiling == "entries":
+        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1, raising=False)
+    elif ceiling == "bytes":
+        monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
+                            getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    try:
+        gc.collect()
+        before = tracemalloc.get_traced_memory()[0]
+        expected_error = None
+        for number in range(1000):
+            path.write_bytes(b"malformed A" if number % 2 == 0 else b"malformed B")
+            if expected_error is None:
+                expected_error = caught(mailbox.messages)
+            assert caught(lambda: index.get("seed")) == expected_error
+        gc.collect()
+        growth = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        if not tracing:
+            tracemalloc.stop()
+    record_property("retained_growth_bytes", growth)
+    assert growth <= 128 * 1024
+    stats = index.evidence_stats()
+    record_property("evidence_stats", hm.encoded(stats).decode())
+    assert stats["pending_entries"] == 1
+    assert stats["entries"] <= stats["max_entries"]
+    assert stats["summary_paths"] <= stats["max_summary_paths"]
+    assert stats["bytes"] <= stats["max_bytes"]
+    assert stats["overflow"] == (ceiling != "normal")
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    changes = index.verify()
+    assert [item for item in changes if item["kind"] == "content_changed"] == [
+        {"kind": "content_changed", "path": str(path), "old_sha256": old_sha, "new_sha256": new_sha}]
+    overflow = [item for item in changes if item["kind"] == "content_change_overflow"]
+    assert bool(overflow) == (ceiling != "normal")
+    if overflow:
+        assert overflow[0]["overflow"] is True
+        assert len(overflow[0]["paths"]) <= stats["max_summary_paths"]
+    assert len(hm.encoded(changes)) <= stats["max_bytes"]
+    assert index.evidence_stats()["pending_entries"] == 0
+
+
+@pytest.mark.parametrize("following", ["none", "read", "invalid_inbox"])
+def test_r19_first_old_and_latest_new_are_coalesced(mailbox, monkeypatch, following):
+    mailbox.publish(request("second"))
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    metadata = path.stat()
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    preserve_source_stat(monkeypatch, metadata)
+    for body in ("modified body", "altered! body", "modified body"):
+        rewrite(path, {**seed["message"], "body": body})
+        assert path.stat().st_size == metadata.st_size
+        assert index.get("seed") == mailbox.messages()["seed"]
+    if following == "read":
+        assert index.get("second") == mailbox.messages()["second"]
+    elif following == "invalid_inbox":
+        assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+            lambda: mailbox.inbox("a/lane/review", after="absent"))
+    new_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert_fallback_verification(index, [{"kind": "content_changed", "path": str(path),
+                                         "old_sha256": old_sha, "new_sha256": new_sha}])
+
+
+@pytest.mark.parametrize("defect", ["missing_header", "unknown_field", "wrong_folder", "missing_reply"])
+def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, defect, record_property):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    source = Path(seed["path"])
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    try:
+        gc.collect()
+        before = tracemalloc.get_traced_memory()[0]
+        for number in range(1000):
+            path = (mailbox.root / "a/orchestrator" if defect == "wrong_folder" else source.parent
+                    ) / ("zz-rejected-%04d.md" % number)
+            message = {**seed["message"], "message_id": "rejected-%04d" % number}
+            if defect == "missing_header":
+                path.write_bytes(b"malformed")
+            else:
+                if defect == "unknown_field":
+                    message["unknown"] = True
+                elif defect == "missing_reply":
+                    message["in_reply_to"] = "absent"
+                rewrite(path, message)
+            assert caught(index.messages) == caught(mailbox.messages)
+            path.unlink()
+        gc.collect()
+        growth = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        if not tracing:
+            tracemalloc.stop()
+    record_property("retained_growth_bytes", growth)
+    assert growth <= 128 * 1024
+    assert index.verify() == []
+    stats = index.evidence_stats()
+    assert stats["entries"] == 1 and stats["pending_entries"] == 0
+    assert stats["overflow"] is False
+
+
+@pytest.mark.parametrize("ceiling", ["entries", "bytes"])
+def test_r19_global_overflow_has_bounded_paths_hashes_and_counters(mailbox, monkeypatch, ceiling):
+    module = index_module()
+    if ceiling == "entries":
+        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1, raising=False)
+    else:
+        monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
+                            getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 2, raising=False)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_COUNT", 3, raising=False)
+    for number in range(5):
+        mailbox.publish(request("other-%d" % number))
+    index = module.MailboxIndex(mailbox, mode="indexed")
+    records = index.messages()
+    for record in records.values():
+        rewrite(Path(record["path"]), {**record["message"], "body": "modified body"})
+    assert index.messages() == mailbox.messages()
+    changes = index.verify()
+    overflow = [item for item in changes if item["kind"] == "content_change_overflow"]
+    assert len(overflow) == 1
+    summary = overflow[0]
+    assert summary["overflow"] is True and summary["counts_saturated"] is True
+    assert len(summary["paths"]) == 2
+    assert summary["omitted_changes"] <= 3 and summary["omitted_baseline_observations"] <= 3
+    assert all(item["old_sha256"] != item["new_sha256"] for item in summary["paths"])
+    stats = index.evidence_stats()
+    assert stats["bytes"] <= stats["max_bytes"]
+    assert len(hm.encoded(changes)) <= stats["max_bytes"]
+
+
+def test_r19_shadow_verify_retry_coalesces_latest_hash(mailbox, monkeypatch):
+    index = index_module().MailboxIndex(mailbox)
+    seed = index.messages()["seed"]
+    path = Path(seed["path"])
+    old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    preserve_source_stat(monkeypatch, path.stat())
+    rewrite(path, {**seed["message"], "body": "modified body"})
+    assert index.get("seed") == mailbox.messages()["seed"]
+    real_open = Path.open
     reads = []
 
-    def read(self, path):
-        reads.append(path)
-        return real_read(self, path)
+    def opened(target, *args, **kwargs):
+        if target == path and args and args[0] == "rb":
+            reads.append(True)
+            if len(reads) == 2:
+                rewrite(path, {**seed["message"], "body": "altered! body"})
+        return real_open(target, *args, **kwargs)
 
-    monkeypatch.setattr(module.MailboxIndex, "_read_message", read)
-    assert module.MailboxIndex(mailbox).messages() == expected
-    assert reads == []
-    new = mailbox.publish(request("unicode-new"))
-    assert module.MailboxIndex(mailbox).get("unicode-new") == {"path": new["path"], "message": new["message"]}
-    assert reads == [Path(new["path"])]
+    monkeypatch.setattr(Path, "open", opened)
+    expected_raw = b"---\n" + hm.encoded({k: v for k, v in seed["message"].items() if k != "body"})
+    expected_raw += b"\n---\n\naltered! body"
+    assert_fallback_verification(index, [{"kind": "content_changed", "path": str(path), "old_sha256": old_sha,
+                                         "new_sha256": hashlib.sha256(expected_raw).hexdigest()}])
+    assert len(reads) >= 4
 
 
-@POSIX
-@pytest.mark.parametrize("busy", [False, True])
-def test_r4_log_cap_checked_under_bounded_flock(mailbox, monkeypatch, busy):
-    import fcntl
+@pytest.mark.parametrize("name", ["renamed.md", "caf\u00e9-\U0001f4e91.md"])
+def test_r19_summary_path_is_byte_bounded_and_identifiable(mailbox, monkeypatch, name):
     module = index_module()
-    index = module.MailboxIndex(mailbox)
-    index.messages()
-    log = index.directory / "divergence.jsonl"
-    log.touch(mode=0o600)
-    monkeypatch.setattr(module, "MAX_DIVERGENCE_BYTES", 512)
-    monkeypatch.setattr(module, "LOG_LOCK_TIMEOUT_SECONDS", 0, raising=False)
-    stub = stub_messages(monkeypatch, index, {})
-    real_flock = fcntl.flock
-    locks = []
+    monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
+                        getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATH_BYTES", 24, raising=False)
+    source = Path(mailbox.messages()["seed"]["path"])
+    source = source.rename(source.with_name(name))
+    index = module.MailboxIndex(mailbox, mode="indexed")
+    seed = index.messages()["seed"]
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    source.write_bytes(b"malformed")
+    assert caught(index.messages) == caught(mailbox.messages)
+    rewrite(source, {**seed["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    changes = index.verify()
+    overflow = [item for item in changes if item["kind"] == "content_change_overflow"]
+    assert len(overflow) == 1
+    sample = overflow[0]["paths"][0]
+    assert sample["path_truncated"] is True
+    assert len(hm.encoded(sample["path"])) <= 24
+    assert str(source).startswith(sample["path"])
+    assert sample["path_sha256"] == hashlib.sha256(os.fsencode(source)).hexdigest()
+    assert sample["old_sha256"] == old_sha and sample["new_sha256"] == new_sha
+    assert len(hm.encoded(changes)) <= module.MAX_EVIDENCE_BYTES
+    assert not any(item["kind"] == "content_changed" for item in changes)
 
-    def interleave(descriptor, operation):
-        locks.append(operation)
-        if operation & fcntl.LOCK_EX:
-            assert operation & fcntl.LOCK_NB
-            if busy:
-                raise BlockingIOError(errno.EWOULDBLOCK, "injected log contention")
-            real_flock(descriptor, operation)
-            # A competing append completed before this lock was granted.
-            with log.open("ab") as other:
-                other.write(b"x" * 512)
-        else:
-            real_flock(descriptor, operation)
 
-    monkeypatch.setattr(fcntl, "flock", interleave)
-    differences = module.compare(mailbox, index)
-    assert locks and stub == [True]
-    if busy:
-        assert any(item["kind"] == "divergence_log_busy" for item in differences)
-        assert log.stat().st_size == 0
-        assert len(locks) == 1
+@pytest.mark.parametrize("write", ["publish", "record_read"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r20_pinned_write_keeps_existing_validation(mailbox, tmp_path, monkeypatch, write, api):
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    existing = set(index.messages())
+    if write == "publish":
+        mailbox.publish(request("new"))
     else:
-        assert locks[-1] == fcntl.LOCK_UN
-        assert any(item["kind"] == "divergence_log_full" for item in differences)
-        assert log.stat().st_size == 512
+        mailbox.record_read(tmp_path / "delivery", request("reader", "a/lane/review"), ["seed"])
+    validated = []
+    real_validate = mailbox.validate_message
+
+    def validate(message, **kwargs):
+        validated.append(message["message_id"])
+        return real_validate(message, **kwargs)
+
+    monkeypatch.setattr(mailbox, "validate_message", validate)
+    parses = spy_parses(monkeypatch)
+    invoke(index, api)
+    assert not existing.intersection(validated)
+    assert len(parses) == (1 if write == "publish" else 0)
+    assert index.last_reconciliation is None
 
 
-def test_r4_budget_failure_is_remembered_until_count_grows(mailbox, monkeypatch):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
-    expected = index.messages()
-    budget = index.cache_path.stat().st_size - 1
-    index.cache_path.unlink()
-    monkeypatch.setattr(module, "MAX_CACHE_BYTES", budget)
-    encoded = []
-    real_dumps = json.dumps
+@pytest.mark.parametrize("fault", ["cursor", "zero_limit", "large_limit", "endpoint", "brief_hash"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r20_caller_error_preserves_warm_memo(mailbox, tmp_path, monkeypatch, fault, mode):
+    packet = tmp_path / "caller-brief.md"
+    packet.write_bytes(b"Original brief.\n")
+    mailbox.publish(request("dispatch", type="dispatch",
+                            brief={"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}))
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()["seed"]
+    endpoint, kwargs = "a/lane/review", {}
+    if fault == "cursor":
+        kwargs["after"] = "absent"
+    elif fault in ("zero_limit", "large_limit"):
+        kwargs["limit"] = 0 if fault == "zero_limit" else 101
+    elif fault == "endpoint":
+        endpoint = "a/lane/unknown"
+    else:
+        packet.write_bytes(b"Different brief.\n")
+        kwargs["include_briefs"] = True
+    assert caught(lambda: index.inbox(endpoint, **kwargs)) == caught(lambda: mailbox.inbox(endpoint, **kwargs))
+    trace.reset()
+    assert index.get("seed") == expected
+    assert trace.memo_validations == 0
+    assert not any(event["kind"] == "clear" for event in trace.events)
+    assert index.last_reconciliation is None
 
-    def dumps(value, *args, **kwargs):
-        if isinstance(value, dict) and "message" in value and "key" in value:
-            encoded.append(True)
-        return real_dumps(value, *args, **kwargs)
 
-    monkeypatch.setattr(json, "dumps", dumps)
-    with pytest.warns(RuntimeWarning, match="cache disabled for this mailbox size"):
-        assert index.messages() == expected
-    assert encoded == [True]
-    assert "MAX_CACHE_BYTES in tools/hierarchy_mailbox_index.py" in index.last_write_error
-    encoded.clear()
-    assert index.messages() == expected
-    assert encoded == []
-    mailbox.publish(request("larger"))
-    with pytest.warns(RuntimeWarning, match="cache disabled for this mailbox size"):
-        assert index.messages() == mailbox.messages()
-    assert encoded == [True]
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r20_get_unhashable_caller_key_preserves_memo(mailbox, monkeypatch, mode):
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()["seed"]
+    assert caught(lambda: index.get([])) == caught(lambda: mailbox.messages().get([]))
+    trace.reset()
+    assert index.get("seed") == expected
+    assert trace.memo_validations == 0
+    assert not any(event["kind"] == "clear" for event in trace.events)
 
 
-def test_r4_messages_does_not_use_generic_deepcopy(mailbox, monkeypatch):
-    module = index_module()
-    index = module.MailboxIndex(mailbox)
+def test_r20_lost_directory_search_permission_fails_live(mailbox):
+    folder = mailbox.root / "a/lane"
+    mode = folder.stat().st_mode & 0o777
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
     index.messages()
-    copied = []
-    real_copy = module.copy.deepcopy
+    try:
+        folder.chmod(0)
+        if os.access(folder, os.X_OK):
+            pytest.skip("search permission is not enforced for this uid")
+        assert caught(lambda: index.get("seed")) == caught(mailbox.messages)
+    finally:
+        folder.chmod(mode)
 
-    def deepcopy(value, *args, **kwargs):
-        copied.append(True)
-        return real_copy(value, *args, **kwargs)
 
-    monkeypatch.setattr(module.copy, "deepcopy", deepcopy)
-    assert index.messages() == mailbox.messages()
-    assert copied == []
+@pytest.mark.parametrize("site", ["probe", "materialize"])
+@pytest.mark.parametrize("kind", ["fifo", "symlink_fifo"])
+def test_r20_replaced_fifo_cannot_block_reader(mailbox, site, kind):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO capability unavailable")
+    driver = '''import sys,os,json
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tools import hierarchy_mailbox as hm
+from tools.hierarchy_mailbox_index import MailboxIndex
+box=hm.Mailbox(sys.argv[2]); index=MailboxIndex(box,mode="indexed")
+record=index.messages()["seed"]; target=Path(record["path"])
+if sys.argv[3]=="probe": target.parent.chmod(target.parent.stat().st_mode ^ 0o040)
+real_path_open,real_os_open=Path.open,os.open
+swapped=False
+def swap(path):
+ global swapped
+ if os.fspath(path)==str(target) and not swapped:
+  swapped=True
+  fifo=box.root.parent/"replacement-fifo"
+  os.mkfifo(fifo)
+  if sys.argv[4]=="symlink_fifo":
+   link=box.root.parent/"replacement-link"; link.symlink_to(fifo); os.replace(link,target)
+  else: os.replace(fifo,target)
+def path_open(path,*a,**kw):
+ swap(path); return real_path_open(path,*a,**kw)
+def os_open(path,*a,**kw):
+ swap(path); return real_os_open(path,*a,**kw)
+Path.open,os.open=path_open,os_open
+def error(call):
+ try: call()
+ except Exception as exc: return [type(exc).__name__,str(exc)]
+ raise AssertionError("FIFO was returned")
+actual=error(lambda:index.get("seed")); expected=error(box.messages)
+assert swapped and actual==expected,(actual,expected)
+print(json.dumps(actual))
+'''
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", driver, str(Path(hm.__file__).parent.parent),
+                                 str(mailbox.root), site, kind], capture_output=True, text=True, timeout=2)
+    except subprocess.TimeoutExpired:
+        pytest.fail("reader blocked after a FIFO replacement (2 s guard)")
+    assert result.returncode == 0, result.stderr
+
+
+def change_confirmation_inode(monkeypatch, source, attempts=2):
+    """Force fallback by racing each of the two permitted scan attempts."""
+    real_open, real_lstat = Path.open, os.lstat
+    state = {"read": False, "injected": False, "injections": 0}
+
+    def opened(path, *args, **kwargs):
+        if path == source and args and args[0] == "rb":
+            state["read"] = True
+        return real_open(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        value = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(source.parent) and state["read"] and state["injections"] < attempts:
+            state.update(read=False, injected=True, injections=state["injections"] + 1)
+            return SimpleNamespace(st_dev=value.st_dev, st_ino=value.st_ino + 1, st_mode=value.st_mode,
+                                   st_uid=value.st_uid, st_size=value.st_size,
+                                   st_mtime_ns=value.st_mtime_ns, st_ctime_ns=value.st_ctime_ns)
+        return value
+
+    monkeypatch.setattr(Path, "open", opened)
+    monkeypatch.setattr(os, "lstat", lstat)
+    return state
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r20_cold_fallback_return_seeds_hash_baseline(mailbox, monkeypatch, api, mode):
+    seed = mailbox.messages()["seed"]
+    source = Path(seed["path"])
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    state = change_confirmation_inode(monkeypatch, source)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    result = invoke(index, api)
+    assert result == (mailbox.messages() if api == "messages" else seed if api == "get"
+                      else mailbox.inbox("a/lane/review"))
+    assert state["injected"] and index.last_reconciliation is not None
+    metadata = source.stat()
+    rewrite(source, {**seed["message"], "body": "modified body"})
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert_fallback_verification(index, [{"kind": "content_changed", "path": str(source),
+                                         "old_sha256": old_sha, "new_sha256": new_sha}])
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r20_unavailable_verify_keeps_overflow_and_pending(mailbox, monkeypatch, mode):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    source = Path(seed["path"])
+    metadata = source.stat()
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    preserve_source_stat(monkeypatch, metadata)
+    rewrite(source, {**seed["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
     assert index.get("seed") == mailbox.messages()["seed"]
-    assert copied == [True]
+    before = next(item for item in index.content_changed if item["kind"] == "content_change_overflow")
+    state = change_confirmation_inode(monkeypatch, source)
+    unavailable = index.verify()
+    assert state["injected"]
+    assert any(item["kind"] == "verification_unavailable" for item in unavailable)
+    assert index.evidence_stats()["overflow"] is True
+    assert index.evidence_stats()["pending_entries"] >= 1
+    reported = index.verify()
+    assert any(item["kind"] == "verification_unavailable" for item in reported)
+    assert index.evidence_stats()["overflow"] is True
+    assert index.evidence_stats()["pending_entries"] >= 1
+    completed = index.verify()
+    assert not any(item["kind"] == "verification_unavailable" for item in completed)
+    assert [item for item in completed if item["kind"] == "content_changed"] == [
+        {"kind": "content_changed", "path": str(source), "old_sha256": old_sha, "new_sha256": new_sha}]
+    after = next(item for item in completed if item["kind"] == "content_change_overflow")
+    assert after["paths"] == before["paths"]
+    assert after["omitted_baseline_observations"] >= before["omitted_baseline_observations"]
+    assert index.evidence_stats()["overflow"] is False
 
 
-@POSIX
-@pytest.mark.parametrize("target", ["cache", "log"])
-@pytest.mark.parametrize("mode", [0o640, 0o604])
-def test_r4_readable_cache_files_refused(mailbox, monkeypatch, target, mode):
+def test_r20_fallback_preserves_already_read_canonical_bytes(mailbox, monkeypatch):
+    seed = mailbox.messages()["seed"]
+    source = Path(seed["path"])
+    original = source.read_bytes()
+    old_sha = hashlib.sha256(original).hexdigest()
+    changed = b"---\n " + original[4:]  # Same parsed message; different frontmatter bytes.
+    metadata = source.stat()
+    state = change_confirmation_inode(monkeypatch, source)
+    real_open = Path.open
+    reads = []
+
+    class Stream:
+        def __init__(self, stream, number):
+            self.stream, self.number = stream, number
+
+        def __enter__(self):
+            return self.stream.__enter__()
+
+        def __exit__(self, *args):
+            result = self.stream.__exit__(*args)
+            if self.number == 3:  # Two raced scans, then PIN reads A before the file changes.
+                source.write_bytes(changed)
+                os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+            return result
+
+    def opened(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if path == source and args and args[0] == "rb":
+            reads.append(True)
+            return Stream(stream, len(reads))
+        return stream
+
+    monkeypatch.setattr(Path, "open", opened)
+    index = index_module().MailboxIndex(mailbox, mode="indexed")
+    assert index.get("seed") == seed
+    assert state["injections"] == 2 and len(reads) >= 3
+    changes = index.verify()
+    assert [item for item in changes if item["kind"] == "content_changed"] == [
+        {"kind": "content_changed", "path": str(source), "old_sha256": old_sha,
+         "new_sha256": hashlib.sha256(changed).hexdigest()}]
+    # A changed stat fence cannot distinguish an edit before PIN read from one
+    # after it. Keep the observed change and explicitly disclaim PIN-byte coverage.
+    assert any(item["kind"] == "verification_unavailable" for item in changes)
+
+
+def r21_fill_history(mailbox, count):
+    # Same fixture construction as the pinned full-history test: clone a pinned
+    # stored message, then let both public readers validate the complete history.
+    seed = mailbox.messages()["seed"]
+    folder = Path(seed["path"]).parent
+    for number in range(1, count):
+        rewrite(folder / ("dead-%05d.md" % number),
+                {**seed["message"], "message_id": "dead-%05d" % number})
+
+
+def r21_force_fallback(index, mailbox, monkeypatch):
+    records = mailbox.messages()
+    source = Path(next(iter(records.values()))["path"])
+    metadata = source.stat()
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+    with monkeypatch.context() as patches:
+        state = change_confirmation_inode(patches, source)
+        assert index.messages() == records
+        assert state["injected"] and index.last_reconciliation is not None
+
+
+def r21_assert_covered(changes, path, old_sha, new_sha):
+    expected = {"kind": "content_changed", "path": str(path),
+                "old_sha256": old_sha, "new_sha256": new_sha}
+    if expected not in changes:
+        unavailable = [item for item in changes if item["kind"] == "verification_unavailable"]
+        # A global scope explicitly disclaims coverage for every returned path,
+        # including paths omitted from the bounded diagnostic sample.
+        assert any(item.get("scope") == "all_returned_records" or
+                   any(sample["path"] == str(path) for sample in item.get("paths", []))
+                   for item in unavailable), changes
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("rejected_scan", [False, True])
+def test_r21_deleted_history_reclaims_live_capacity(mailbox, monkeypatch, mode, rejected_scan):
     module = index_module()
-    index = module.MailboxIndex(mailbox)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 2)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    for record in records.values():
+        Path(record["path"]).unlink()
+    if rejected_scan:
+        bad = mailbox.root / "a/lane/bad.md"
+        bad.write_bytes(b"malformed")
+        assert caught(index.messages) == caught(mailbox.messages)
+        assert index.evidence_stats()["entries"] == 2  # Failed scans prove no deletion.
+        bad.unlink()
+    assert index.messages() == {}
+    assert index.evidence_stats()["entries"] == 0
+    assert index.evidence_stats()["bytes"] == module.EVIDENCE_SUMMARY_BYTES
+    for number in range(2):
+        mailbox.publish(request("new-%d" % number))
+    assert index.messages() == mailbox.messages()
+    assert index.evidence_stats()["entries"] == 2
+    assert index.evidence_stats()["overflow"] is False
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("count", [12, pytest.param(10000, marks=pytest.mark.skipif(
+    not os.environ.get("AEGIS_MB1_R21_10K"), reason="explicit 10k retirement regression required"))])
+def test_r21_argon_deleted_full_history_then_unsampled_fallback(mailbox, monkeypatch, mode, count):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", count)
+    r21_fill_history(mailbox, count)
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    assert len(records) == count and records == mailbox.messages()
+    for record in records.values():
+        Path(record["path"]).unlink()
+    for number in range(1, 10):
+        mailbox.publish(request("m%d" % number))
+    records = index.messages()
+    assert records == mailbox.messages()
+    r21_force_fallback(index, mailbox, monkeypatch)
+    record = records["m9"]
+    source = Path(record["path"])
+    metadata = source.stat()
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    rewrite(source, {**record["message"], "body": "modified body"})
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    r21_assert_covered(index.verify(), source, old_sha, new_sha)
+    assert index.evidence_stats()["entries"] == 9
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_r21_unsampled_live_overflow_cannot_claim_coverage(mailbox, monkeypatch, mode, fallback):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    for number in range(1, 10):
+        mailbox.publish(request("m%d" % number))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    if fallback:
+        r21_force_fallback(index, mailbox, monkeypatch)
+    source = Path(records["m9"]["path"])
+    metadata = source.stat()
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    rewrite(source, {**records["m9"]["message"], "body": "modified body"})
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    changes = index.verify()
+    overflow = next(item for item in changes if item["kind"] == "content_change_overflow")
+    assert overflow["omitted_changes"] > 0, changes
+    assert len(overflow["paths"]) <= module.MAX_EVIDENCE_SAMPLE_PATHS
+    r21_assert_covered(changes, source, old_sha, new_sha)
+    marker = next(item for item in changes if item["kind"] == "verification_unavailable")
+    assert marker["unbaselined_paths"] == 1 and marker["paths_complete"] is True
+    assert [item["path"] for item in marker["paths"]] == [str(source)]
+    # Persistent capacity loss cannot become a clean verification after one report.
+    r21_assert_covered(index.verify(), source, old_sha, new_sha)
+    for identifier, record in records.items():
+        if identifier != "m9":
+            Path(record["path"]).unlink()
+    index.verify()  # Report the historical gap while establishing the remaining baseline.
+    assert index.evidence_stats()["entries"] == 1
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r21_canonical_full_scan_reclaims_deleted_history(mailbox, monkeypatch, mode):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    index = module.MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    Path(seed["path"]).unlink()
+    mailbox.publish(request("replacement"))
+    r21_force_fallback(index, mailbox, monkeypatch)
+    assert index.evidence_stats()["overflow"] is False
+    assert_fallback_verification(index, [])
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r21_gap_diagnostics_remain_bounded_and_global(mailbox, monkeypatch, mode):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 0)
+    for number in range(20):
+        mailbox.publish(request("m%02d" % number))
+    index = module.MailboxIndex(mailbox, mode=mode)
     index.messages()
-    path = index.cache_path if target == "cache" else index.directory / "divergence.jsonl"
-    if target == "log":
-        path.touch(mode=0o600)
-        injected = stub_messages(monkeypatch, index, {})
-    path.chmod(mode)
-    before = snapshot(mailbox.root)
-    call = index.messages if target == "cache" else lambda: module.compare(mailbox, index)
-    error_type, message = caught(call)
-    assert issubclass(error_type, ValueError)
-    assert "readable" in message and "private directory" in message
-    assert snapshot(mailbox.root) == before
-    if target == "log":
-        assert injected == [True]
+    # No bounded samples are available for these thirteen paths. Every verify must
+    # explicitly disclaim coverage, even after a previous unavailable report.
+    for _ in range(2):
+        result = index.verify()
+        marker = next(item for item in result if item["kind"] == "verification_unavailable")
+        assert marker["scope"] == "all_returned_records"
+        assert marker["unbaselined_paths"] == 13 and marker["paths_complete"] is False
+        assert len(marker["paths"]) == module.MAX_EVIDENCE_SAMPLE_PATHS
+        assert len(hm.encoded(result)) <= module.EVIDENCE_SUMMARY_BYTES
 
 
-def test_r4_readiness_paths_require_shadow_or_verify(tmp_path):
-    from tests.integration.test_hierarchy_mailbox import readiness
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r21_retiring_path_preserves_unreported_hash_change(mailbox, monkeypatch, mode):
     module = index_module()
-    root = tmp_path / "mailbox"
-    manifest = {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
-                "endpoints": {"a/front-door": {}, "a/orchestrator": {},
-                              "a/lane/write": {"kind": "implementer"}}, "counterparts": []}
-    hm.initialize(root, manifest)
-    box = hm.Mailbox(root)
-    for endpoint in manifest["endpoints"]:
-        box.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint, "expected_generation": 0})
-    folder = tmp_path / "worktrees"
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    index = module.MailboxIndex(mailbox, mode=mode)
+    record = index.messages()["seed"]
+    source = Path(record["path"])
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    rewrite(source, {**record["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+        lambda: mailbox.inbox("a/lane/review", after="absent"))
+    source.unlink()
+    assert index.messages() == {}
+    assert index.evidence_stats()["entries"] == 0
+    changes = index.verify()
+    assert {"kind": "content_changed", "path": str(source),
+            "old_sha256": old_sha, "new_sha256": new_sha} in changes
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("reported_change", [False, True])
+def test_r22_verify_retains_live_sample_baseline(mailbox, monkeypatch, mode, fallback, reported_change):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    source = Path(records["second"]["path"])
+    original_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    if reported_change:
+        rewrite(source, {**records["second"]["message"], "body": "modified body"})
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    initial = index.verify()
+    assert not any(item["kind"] == "verification_unavailable" for item in initial)
+    assert [item for item in initial if item["kind"] == "content_changed"] == ([
+        {"kind": "content_changed", "path": str(source), "old_sha256": original_sha,
+         "new_sha256": old_sha}] if reported_change else [])
+    # Repeated acknowledgements must keep the latest baseline while consuming
+    # already reported facts, including a previous A->B change in the sample.
+    assert not any(item["kind"] == "content_changed" for item in index.verify())
+    assert index.evidence_stats()["pending_entries"] == 0
+    metadata = source.stat()
+    rewrite(source, {**records["second"]["message"],
+                     "body": "altered! body" if reported_change else "modified body"})
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    if fallback:
+        r21_force_fallback(index, mailbox, monkeypatch)
+    changes = index.verify()
+    assert [item for item in changes if item["kind"] == "content_changed"] == [
+        {"kind": "content_changed", "path": str(source), "old_sha256": old_sha, "new_sha256": new_sha}]
+    if fallback:
+        assert any(item["kind"] == "verification_unavailable" for item in changes)
+        complete = index.verify()
+        assert [item for item in complete if item["kind"] == "content_changed"] == [
+            {"kind": "content_changed", "path": str(source), "old_sha256": old_sha, "new_sha256": new_sha}]
+        assert not any(item["kind"] == "verification_unavailable" for item in complete)
+    else:
+        assert not any(item["kind"] == "verification_unavailable" for item in changes)
+    assert not any(item["kind"] == "content_changed" for item in index.verify())
+    assert index.evidence_stats()["pending_entries"] == 0
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("rejected_scan", [False, True])
+def test_r22_live_sample_retires_only_after_successful_scan(mailbox, monkeypatch, mode, rejected_scan):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    index.verify()
+    assert index.evidence_stats()["summary_paths"] == 1
+    source = Path(records["second"]["path"])
+    source.unlink()
+    if rejected_scan:
+        bad = source.parent / "bad.md"
+        bad.write_bytes(b"malformed")
+        assert caught(index.messages) == caught(mailbox.messages)
+        assert index.evidence_stats()["summary_paths"] == 1
+        bad.unlink()
+    assert index.messages() == mailbox.messages()
+    assert index.evidence_stats()["summary_paths"] == 0
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r22_retired_sample_fact_is_acknowledged_without_retaining_dead_baseline(mailbox, monkeypatch, mode):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    record = index.messages()["second"]
+    source = Path(record["path"])
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    rewrite(source, {**record["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+        lambda: mailbox.inbox("a/lane/review", after="absent"))
+    source.unlink()
+    assert index.messages() == mailbox.messages()
+    changes = index.verify()
+    assert {"kind": "content_changed", "path": str(source),
+            "old_sha256": old_sha, "new_sha256": new_sha} in changes
+    assert index.evidence_stats()["summary_paths"] == 0
+    assert index.evidence_stats()["pending_entries"] == 0
+    assert index.verify() == []
+
+
+def r23_publish_during_pinned_listings(monkeypatch, mailbox, *, replace, count, mutation):
+    """Publish at PIN's Path.iterdir boundary; index listing uses os.scandir."""
+    folder = Path(mailbox.messages()["seed"]["path"]).parent
+    real_iterdir, real_open = Path.iterdir, Path.open
+    state = {"publications": 0, "busy": False, "target": None, "old": None, "new": None}
+
+    def listing(path):
+        if path == folder and not state["busy"] and state["publications"] < count:
+            state["busy"] = True
+            try:
+                if replace:
+                    Path(mailbox.messages()["seed"]["path"]).unlink()
+                number = state["publications"] + 1
+                record = mailbox.publish(request("seed" if replace else "published-%d" % number))
+                state.update(publications=number, target=Path(record["path"]))
+            finally:
+                state["busy"] = False
+        return real_iterdir(path)
+
+    class Stream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self.stream.__enter__()
+
+        def __exit__(self, *args):
+            result = self.stream.__exit__(*args)
+            target = state["target"]
+            if state["old"] is None:
+                state["old"] = "capturing"
+                raw = target.read_bytes()
+                state["old"] = hashlib.sha256(raw).hexdigest()
+                metadata = target.stat()
+                changed = b"---\n " + raw[4:] if mutation == "format" else raw.replace(
+                    b"original body", b"modified body")
+                target.write_bytes(changed)
+                os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                state["new"] = hashlib.sha256(changed).hexdigest()
+            return result
+
+    def opened(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if (mutation != "none" and path == state["target"] and args and args[0] == "rb"
+                and not state["busy"] and state["publications"] == count and state["old"] is None):
+            return Stream(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "iterdir", listing)
+    monkeypatch.setattr(Path, "open", opened)
+    return state
+
+
+def r23_finish_return_coverage(index, state):
+    source = state["target"]
+    if state["old"] is None:
+        raw = source.read_bytes()
+        metadata = source.stat()
+        state["old"] = hashlib.sha256(raw).hexdigest()
+        changed = raw.replace(b"original body", b"modified body")
+        source.write_bytes(changed)
+        os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        state["new"] = hashlib.sha256(changed).hexdigest()
+    r21_assert_covered(index.verify(), source, state["old"], state["new"])
+    assert not any(item["kind"] == "verification_unavailable" for item in index.verify())
+
+
+def r23_source_reads(monkeypatch, source):
+    """Count byte reads through both PIN's path IO and checked descriptor IO."""
+    real_open, real_io = os.open, io.open
+    descriptors, reads = set(), []
+
+    def opened(path, *args, **kwargs):
+        descriptor = real_open(path, *args, **kwargs)
+        if os.fspath(path) == str(source):
+            descriptors.add(descriptor)
+        else:
+            descriptors.discard(descriptor)
+        return descriptor
+
+    class Stream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, *args):
+            reads.append(True)
+            return self.stream.read(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+    def stream(file, mode="r", *args, **kwargs):
+        value = real_io(file, mode, *args, **kwargs)
+        target = file in descriptors if isinstance(file, int) else Path(file) == source
+        return Stream(value) if target and "r" in mode else value
+
+    monkeypatch.setattr(os, "open", opened)
+    monkeypatch.setattr(io, "open", stream)
+    return reads
+
+
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("mutation", ["none", "body", "format"])
+def test_r23_final_shadow_records_keep_coverage(mailbox, monkeypatch, api, mutation):
+    index = index_module().MailboxIndex(mailbox)
+    state = r23_publish_during_pinned_listings(monkeypatch, mailbox, replace=api == "get",
+                                              count=2, mutation=mutation)
+    result = invoke(index, api)
+    assert state["publications"] == 2 and index.last_divergence
+    returned = result.values() if api == "messages" else [result] if api == "get" else result["messages"]
+    assert str(state["target"]) in [record["path"] for record in returned]
+    r23_finish_return_coverage(index, state)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("branch", ["scan", "materialize"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("mutation", ["none", "body", "format"])
+def test_r23_pinned_fallback_return_coverage(mailbox, monkeypatch, mode, branch, api, mutation):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    source = Path(mailbox.messages()["seed"]["path"])
+    if branch == "materialize":
+        index.messages()
+    state = r23_publish_during_pinned_listings(monkeypatch, mailbox, replace=api == "get",
+                                              count=1, mutation=mutation)
+    if branch == "scan":
+        injected = change_confirmation_inode(monkeypatch, source)
+    else:
+        real_open = os.open
+        injected = {"injected": False}
+
+        def opened(path, *args, **kwargs):
+            if os.fspath(path) == str(source) and not injected["injected"]:
+                injected["injected"] = True
+                raise PermissionError("injected materialization access change")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", opened)
+    result = invoke(index, api)
+    assert injected["injected"] and state["publications"] == 1
+    returned = result.values() if api == "messages" else [result] if api == "get" else result["messages"]
+    assert str(state["target"]) in [record["path"] for record in returned]
+    r23_finish_return_coverage(index, state)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("dependency", ["packet", "packet_ancestor"])
+def test_r23_changed_packet_rereads_all_dependents(mailbox, tmp_path, monkeypatch, mode, dependency):
+    folder = tmp_path / "packets"
     folder.mkdir()
-    evidence = readiness(folder)
-    brief_path = tmp_path / "packet.md"
-    brief_path.write_text("Review the cache.\n")
-    brief = {"path": str(brief_path), "sha256": hashlib.sha256(brief_path.read_bytes()).hexdigest()}
-    box.publish(request("dispatch", recipient="a/lane/write", type="dispatch", brief=brief))
-    box.publish(request("accepted", "a/lane/write", "a/orchestrator", type="ack", acknowledgment="accepted",
-                        in_reply_to="dispatch", readiness=evidence))
-    index = module.MailboxIndex(box)
-    expected = index.messages()
-    moved = tmp_path / "old-worktrees"
-    folder.rename(moved)
-    symlink_or_skip(folder, moved)
-    assert evidence["worktree"] == evidence["scan_workspace"]
+    packet = folder / "packet.md"
+    packet.write_bytes(b"Packet A.\n")
+    brief = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    for identifier in ("dispatch-1", "dispatch-2"):
+        mailbox.publish(request(identifier, type="dispatch", brief=brief))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    for identifier in ("dispatch-1", "dispatch-2"):
+        preserve_source_stat(monkeypatch, Path(records[identifier]["path"]).stat())
+    if dependency == "packet_ancestor":
+        preserve_source_stat(monkeypatch, packet.stat())
+        folder.chmod(folder.stat().st_mode ^ 0o040)
+    packet.write_bytes(b"Packet B.\n")
+    changed = {"path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+    for identifier in ("dispatch-1", "dispatch-2"):
+        record = records[identifier]
+        rewrite(Path(record["path"]), {**record["message"], "brief": changed})
+    expected = mailbox.inbox("a/lane/review", include_briefs=True)
+    for _ in range(2):
+        assert index.inbox("a/lane/review", include_briefs=True) == expected
+        assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("dependency", ["worktree", "worktree_ancestor"])
+def test_r23_changed_readiness_dependency_rereads_unreturned_record(mailbox, tmp_path, monkeypatch, mode, dependency):
+    mailbox.publish(request("reverse", sender="a/lane/review", recipient="a/orchestrator"))
+    source = mailbox.messages()["seed"]
+    worktree = tmp_path / "ready" / "worktree"
+    worktree.mkdir(parents=True)
+    readiness = {"worktree": str(worktree), "scan_workspace": str(worktree), "branch": "feature/a",
+                 "base_revision": "a" * 40, "lease_oid": "b" * 40, "lease_ref": "refs/aegis/lanes/a",
+                 "lease_expires_at": "2099-01-01T00:00:00Z", "owned_paths": ["tools/x.py"],
+                 "scan_evidence": "scan", "hook_evidence": "hook", "enforcement_tier": "advisory"}
+    path = Path(source["path"])
+    message = {**source["message"], "type": "ack", "in_reply_to": "reverse", "acknowledgment": "accepted",
+               "readiness": readiness}
+    rewrite(path, message)
+    expected = mailbox.messages()
+    index = index_module().MailboxIndex(mailbox, mode=mode)
     assert index.messages() == expected
-    assert module.compare(box, index)
-    assert caught(index.verify) == caught(box.messages)
-    assert "readiness.worktree" in module.__doc__ and "scan_workspace" in module.__doc__
+    preserve_source_stat(monkeypatch, path.stat())
+    changed_path = worktree if dependency == "worktree" else worktree.parent
+    changed_path.chmod(changed_path.stat().st_mode ^ 0o040)
+    rewrite(path, {**message, "body": "modified body"})
+    reads = r23_source_reads(monkeypatch, path)
+    assert index.get("reverse") == expected["reverse"]
+    assert len(reads) == (1 if mode == "indexed" else 2)
+    assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("following", ["none", "read", "invalid_inbox"])
+def test_r23_overflow_promotion_waits_for_verify(mailbox, monkeypatch, mode, api, following):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    mailbox.publish(request("second"))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    source = Path(records["second"]["path"])
+    old_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    rewrite(source, {**records["second"]["message"], "body": "modified body"})
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+        lambda: mailbox.inbox("a/lane/review", after="absent"))
+    Path(records["seed"]["path"]).unlink()
+    result = index.get("second") if api == "get" else index.messages() if api == "messages" else index.inbox(
+        "a/lane/review")
+    assert result is not None
+    if following == "read":
+        index.get("second")
+    elif following == "invalid_inbox":
+        assert caught(lambda: index.inbox("a/lane/review", after="absent")) == caught(
+            lambda: mailbox.inbox("a/lane/review", after="absent"))
+    assert [item for item in index.verify() if item["kind"] == "content_changed"] == [
+        {"kind": "content_changed", "path": str(source), "old_sha256": old_sha, "new_sha256": new_sha}]
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r23_candidate_changed_before_pinned_read_disclaims_original_bytes(mailbox, monkeypatch, mode, api):
+    seed = mailbox.messages()["seed"]
+    source = Path(seed["path"])
+    raw = source.read_bytes()
+    confirmation = change_confirmation_inode(monkeypatch, source)
+    real_iterdir = Path.iterdir
+    injected = []
+
+    def listing(path):
+        if path == source.parent and confirmation["injected"] and not injected:
+            injected.append(True)
+            source.write_bytes(b"---\n " + raw[4:])
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", listing)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    assert invoke(index, api) == (mailbox.messages() if api == "messages" else seed if api == "get"
+                                 else mailbox.inbox("a/lane/review"))
+    assert injected and confirmation["injected"]
+    original_returned = source.read_bytes()
+    metadata = source.stat()
+    changed = original_returned.replace(b"original body", b"modified body")
+    source.write_bytes(changed)
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    r21_assert_covered(index.verify(), source, hashlib.sha256(original_returned).hexdigest(),
+                       hashlib.sha256(changed).hexdigest())
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_r23_changed_reply_target_rereads_dependent(mailbox, monkeypatch, mode):
+    mailbox.publish(request("reply", sender="a/lane/review", recipient="a/orchestrator", in_reply_to="seed"))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    reply = Path(records["reply"]["path"])
+    preserve_source_stat(monkeypatch, reply.stat())
+    rewrite(Path(records["seed"]["path"]), {**records["seed"]["message"], "body": "modified body"})
+    rewrite(reply, {**records["reply"]["message"], "body": "modified body"})
+    reads = r23_source_reads(monkeypatch, reply)
+    assert index.get("absent") is None
+    assert len(reads) == (1 if mode == "indexed" else 2)
+    assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r24_unencodable_brief_stays_warm_without_fallback(mailbox, monkeypatch, mode, warm, api):
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    if warm:
+        index.messages()
+    inject(mailbox, "unencodable_brief_path")
+    trace.reset()
+    expected = mailbox.messages()
+    assert invoke(index, api) == (expected if api == "messages" else expected["seed"] if api == "get"
+                                  else mailbox.inbox("a/lane/review"))
+    assert index.last_reconciliation is None
+    assert not any(item["kind"] == "clear" for item in trace.events)
+    trace.reset()
+    assert invoke(index, api) == (expected if api == "messages" else expected["seed"] if api == "get"
+                                  else mailbox.inbox("a/lane/review"))
+    assert trace.memo_validations == 0 and trace.events == []
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("error", [errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP, "value",
+                                   errno.EACCES, errno.EIO])
+def test_r24_pathlib_observation_error_parity(mailbox, monkeypatch, mode, error):
+    seed = mailbox.messages()["seed"]
+    packet = mailbox.root.parent / "probe.md"
+    rewrite(Path(seed["path"]), {**seed["message"], "brief": {"path": str(packet), "sha256": "a" * 64}})
+    real_lstat, real_path_lstat = os.lstat, Path.lstat
+
+    def observe(call, path, *args, **kwargs):
+        if os.fspath(path) == str(packet):
+            if error == "value":
+                raise ValueError("injected unencodable path")
+            raise OSError(error, "injected pathlib probe", str(packet))
+        return call(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **kw: observe(real_lstat, path, *a, **kw))
+    monkeypatch.setattr(Path, "lstat", lambda path, *a, **kw: observe(real_path_lstat, path, *a, **kw))
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    if error in (errno.EACCES, errno.EIO):
+        assert caught(index.messages) == caught(mailbox.messages)
+    else:
+        expected = mailbox.messages()
+        assert index.messages() == expected
+        assert index.last_reconciliation is None
+        assert index.messages() == expected and index.last_reconciliation is None
+        assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r24_pending_unlink_check_race_retries_without_clear(mailbox, monkeypatch, mode, api):
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    index.messages()
+    real_unlink = Path.unlink
+    pending = []
+
+    def defer(path, *args, **kwargs):
+        if path.name.startswith(".pending-"):
+            pending.append(path)
+            return None
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as publication:
+        publication.setattr(Path, "unlink", defer)
+        record = mailbox.publish(request("new-record"))
+    source = Path(record["path"])
+    assert len(pending) == 1 and source.stat().st_ino == pending[0].stat().st_ino
+    state = {"read": False, "injected": False}
+    real_open, real_lstat = Path.open, os.lstat
+
+    def opened(path, *args, **kwargs):
+        if path == source and args and args[0] == "rb":
+            state["read"] = True
+        return real_open(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        value = real_lstat(path, *args, **kwargs)
+        if os.fspath(path) == str(source) and state["read"] and not state["injected"]:
+            real_unlink(pending[0])
+            state["injected"] = True
+            assert source.stat().st_ctime_ns != value.st_ctime_ns
+        return value
+
+    monkeypatch.setattr(Path, "open", opened)
+    monkeypatch.setattr(os, "lstat", lstat)
+    trace.reset()
+    expected = mailbox.messages()
+    state["read"] = False
+    # Oracle preparation reads source; arm only the indexed call below.
+    assert not state["injected"]
+    result = invoke(index, api)
+    assert result == (expected if api == "messages" else expected["seed"] if api == "get"
+                      else mailbox.inbox("a/lane/review"))
+    assert state["injected"] and index.last_reconciliation is None
+    errors = [item for item in trace.events if item["kind"] == "scan_error"]
+    assert [item["type"] for item in errors] == ["_ChangedCheckObservation"]
+    assert not any(item["kind"] == "clear" for item in trace.events)
+    trace.reset()
+    index.get("seed")
+    assert trace.memo_validations == 0 and trace.events == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r24_fallback_retains_rekeyed_memo(mailbox, monkeypatch, mode, api):
+    mailbox.publish(request("second"))
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()
+    source = expected["seed"]["path"]
+    real_open = os.open
+    injected = []
+
+    def opened(path, *args, **kwargs):
+        if os.fspath(path) == source and not injected:
+            injected.append(True)
+            raise PermissionError("injected descriptor access failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", opened)
+    trace.reset()
+    assert invoke(index, api) == (expected if api == "messages" else expected["seed"] if api == "get"
+                                  else mailbox.inbox("a/lane/review"))
+    assert injected and index.last_reconciliation is not None
+    assert not any(item["kind"] == "clear" for item in trace.events)
+    trace.reset()
+    assert index.get("seed") == expected["seed"]
+    assert trace.memo_validations == 0 and trace.events == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+@pytest.mark.parametrize("change", ["cold", "publish", "edit", "dependency"])
+def test_r24_each_fresh_record_validated_once(mailbox, monkeypatch, tmp_path, mode, api, change):
+    packet = tmp_path / "fresh-packet.md"
+    packet.write_bytes(b"Packet A.\n")
+    mailbox.publish(request("second", brief={"path": str(packet), "sha256": hashlib.sha256(
+        packet.read_bytes()).hexdigest()}))
+    mailbox.publish(request("third"))
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    if change != "cold":
+        records = index.messages()
+        if change == "publish":
+            mailbox.publish(request("new-record"))
+        elif change == "edit":
+            rewrite(Path(records["seed"]["path"]), {**records["seed"]["message"], "body": "modified body"})
+        else:
+            packet.write_bytes(b"Packet B.\n")
+    trace.reset()
+    expected = mailbox.messages()
+    assert invoke(index, api) == (expected if api == "messages" else expected["seed"] if api == "get"
+                                  else mailbox.inbox("a/lane/review"))
+    assert trace.memo_validations == (3 if change == "cold" else 1)
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r24_fallback_evicts_observed_byte_contradictions(mailbox, monkeypatch, mode, api):
+    mailbox.publish(request("second"))
+    trace = MemoTrace(monkeypatch, mailbox)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    source = Path(seed["path"])
+    preserve_source_stat(monkeypatch, source.stat())
+    rewrite(source, {**seed["message"], "body": "modified body"})
+    invoke(index, api)
+    trace.reset()
+    assert index.get("seed") == mailbox.messages()["seed"]
+    assert index.last_reconciliation is None
+    assert trace.memo_validations == 1
+    assert not any(item["kind"] == "clear" for item in trace.events)
+    trace.reset()
+    index.get("seed")
+    assert trace.memo_validations == 0 and trace.events == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("malformed", ["type", "json"])
+@pytest.mark.parametrize("ceiling", ["normal", "entries", "bytes"])
+def test_r24_failed_reconciliation_cannot_reuse_contradicted_header(mailbox, monkeypatch, mode, malformed, ceiling):
+    mailbox.publish(request("second"))
+    if ceiling != "normal":
+        for number in range(8):
+            mailbox.publish(request("overflow-%d" % number))
+        module = index_module()
+        if ceiling == "entries":
+            monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+        else:
+            monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES", module.EVIDENCE_SUMMARY_BYTES)
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    identifier = "seed" if ceiling == "normal" else "overflow-7"
+    seed = records[identifier]
+    if ceiling != "normal":
+        stats = index.evidence_stats()
+        assert stats["summary_paths"] == stats["max_summary_paths"] == 8
+        assert len(records) > stats["entries"] + stats["summary_paths"]
+    source = Path(seed["path"])
+    preserve_source_stat(monkeypatch, source.stat())
+    if malformed == "type":
+        rewrite(source, {**seed["message"], "type": "evil"})
+    else:
+        source.write_bytes(b"---\n{\n---\n\nbody")
+    assert caught(lambda: index.get(identifier)) == caught(mailbox.messages)
+    assert caught(lambda: index.get("second")) == caught(mailbox.messages)
+    assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("defect", ["long_path", "relative_path"])
+def test_critical_validate_before_dependency_expansion(mailbox, monkeypatch, record_property, mode, warm, defect):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    seed = mailbox.messages()["seed"]
+    if warm:
+        index.messages()
+    source = Path(seed["path"])
+    reference = "/" + "a/" * 3000 + "x.md" if defect == "long_path" else "../../../outside/secret.md"
+    rewrite(source, {**seed["message"], "brief": {"path": reference, "sha256": "a" * 64}})
+    assert source.stat().st_size < hm.MAX_BYTES
+    expected = caught(mailbox.messages)
+    probes = []
+    real_lstat, real_path_lstat = os.lstat, Path.lstat
+
+    def observed(call, path, *args, **kwargs):
+        if not isinstance(path, int) and not os.path.isabs(os.fspath(path)):
+            probes.append(os.fspath(path))
+            raise FileNotFoundError("blocked relative probe")
+        return call(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **kw: observed(real_lstat, path, *a, **kw))
+    monkeypatch.setattr(Path, "lstat", lambda path, *a, **kw: observed(real_path_lstat, path, *a, **kw))
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        actual = caught(index.messages)
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        if not tracing:
+            tracemalloc.stop()
+    record_property("dependency_peak_bytes", peak)
+    assert actual == expected
+    assert probes == []
+    assert peak < 8 * 1024 * 1024
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("blocked", ["selected", "unreturned"])
+@pytest.mark.parametrize("later_error", ["brief_missing", "brief_hash", "cursor", "limit"])
+def test_r24_inbox_first_error_matches_pinned_read_order(mailbox, tmp_path, monkeypatch, mode, blocked, later_error):
+    packet = tmp_path / "ordering-packet.md"
+    packet.write_bytes(b"Packet A.\n")
+    dispatch = mailbox.publish(request("dispatch", type="dispatch", brief={
+        "path": str(packet), "sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}))
+    other = mailbox.publish(request("unreturned", recipient="a/root"))
+    if later_error == "brief_missing":
+        packet.unlink()
+    elif later_error == "brief_hash":
+        packet.write_bytes(b"Packet B.\n")
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    index.messages()  # Stored PIN validation permits the missing/mismatched brief.
+    source = Path((dispatch if blocked == "selected" else other)["path"])
+
+    def denied(path):
+        if path == source:
+            raise PermissionError("injected message read denial: " + str(source))
+
+    intercept_source_opens(monkeypatch, denied)
+    kwargs = {"include_briefs": True}
+    if later_error == "cursor":
+        kwargs["after"] = "absent"
+    elif later_error == "limit":
+        kwargs["limit"] = 0  # PIN rejects this before reading any messages.
+    expected = caught(lambda: mailbox.inbox("a/lane/review", **kwargs))
+    assert expected[0] is (ValueError if later_error == "limit" else PermissionError)
+    assert caught(lambda: index.inbox("a/lane/review", **kwargs)) == expected
+    assert index.last_divergence == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("api", ["messages", "get", "inbox"])
+def test_r24_canonical_fallback_aba_is_not_a_byte_witness(mailbox, monkeypatch, mode, api):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    seed = index.messages()["seed"]
+    source = Path(seed["path"])
+    original = source.read_bytes()
+    equivalent = b"---\n " + original[4:]
+    other = mailbox.publish(request("other-folder", sender="a/lane/review", recipient="a/orchestrator"))
+    confirmation = change_confirmation_inode(monkeypatch, Path(other["path"]))
+    real_open = Path.open
+    state = {"active": True, "reads": 0}
+
+    class Stream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self.stream.__enter__()
+
+        def __exit__(self, *args):
+            result = self.stream.__exit__(*args)
+            source.write_bytes(original)
+            return result
+
+    def opened(path, *args, **kwargs):
+        if (path == source and args and args[0] == "rb" and state["active"]
+                and confirmation["injections"] == 2):
+            state["reads"] += 1
+            source.write_bytes(equivalent)
+            return Stream(real_open(path, *args, **kwargs))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    result = invoke(index, api)
+    state["active"] = False
+    assert state["reads"] >= 1 and source.read_bytes() == original
+    assert result == (mailbox.messages() if api == "messages" else seed if api == "get"
+                      else mailbox.inbox("a/lane/review"))
+    assert any(item["kind"] == "verification_unavailable" for item in index.verify())
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("clear", [False, True])
+def test_r24_unsampled_coverage_survives_clear_and_failed_fallback(mailbox, monkeypatch, mode, clear):
+    module = index_module()
+    monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 1)
+    for number in range(1, 4):
+        mailbox.publish(request("m%d" % number))
+    index = module.MailboxIndex(mailbox, mode=mode)
+    records = index.messages()
+    assert any(item["kind"] == "verification_unavailable" for item in index.verify())
+    if clear:
+        index._clear()  # Explicitly test disposal; normal fallback now retains keyed candidates.
+    monkeypatch.setattr(hm, "MAX_RECORDS", 4)
+    extra = Path(records["seed"]["path"]).parent / "zz-overflow.md"
+    rewrite(extra, {**records["seed"]["message"], "message_id": "overflow"})
+    assert caught(lambda: index.get("absent")) == caught(mailbox.messages)
+    before = dict(index._evidence.counts)
+    extra.unlink()
+    source = Path(records["m3"]["path"])
+    metadata = source.stat()
+    rewrite(source, {**records["m3"]["message"], "body": "modified body"})
+    os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    assert index.get("absent") is None
+    overflow = next(item for item in index.content_changed if item["kind"] == "content_change_overflow")
+    assert overflow["omitted_changes"] > before["omitted_changes"]
+    if clear:
+        assert overflow["unbaselined_reads"] > before["unbaselined_reads"]
+    else:
+        assert overflow["unbaselined_reads"] == 0
