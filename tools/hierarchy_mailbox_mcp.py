@@ -99,6 +99,12 @@ def _tool_result(result):
     return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
 
 
+def _board_fragment_size(value):
+    # _tool_result embeds ASCII JSON in a string; _response_line escapes that string.
+    # Exclude the outer string quotes. Default list separators remain two bytes.
+    return len(json.dumps(json.dumps(value, sort_keys=True))) - 2
+
+
 def _error_text(exc):
     # Some errors repeat the input, and a response must stay within a page whatever was sent.
     return str(exc)[:1024]
@@ -873,6 +879,8 @@ def handle(connection, request):
             if params["name"] == "mailbox_inbox":
                 rendered_sizes[len(page["messages"])] = len(raw)
             return raw
+
+        render.board_page_framing = (_board_fragment_size, 2)
 
         try:
             result = connection.call(params["name"], params.get("arguments", {}), render)
