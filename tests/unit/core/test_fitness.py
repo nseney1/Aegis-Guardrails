@@ -170,7 +170,7 @@ def test_for_rules_counts_weighted_and_v1_rows(tmp_path: Path) -> None:
     rows = [
         {"v": 2, "seq": 1, "ts": _iso(NOW), "rule": "t", "outcome": "tp", "source": "manual", "weight": 0.5},
         {"v": 2, "seq": 2, "ts": _iso(NOW), "rule": "t", "outcome": "fp", "source": "manual"},
-        {"cell": "t", "signal": "success", "source": "mcp", "timestamp": _iso(NOW)},  # v1
+        {"rule_id": "t", "signal": "success", "source": "mcp", "timestamp": _iso(NOW)},  # v1
         # a native session verdict is a local `aegis check` run: a trigger only (R-evidence-1)
         {"v": 2, "seq": 3, "ts": _iso(NOW), "rule": "t", "outcome": "fp", "source": "session"},
     ]

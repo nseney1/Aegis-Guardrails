@@ -8,7 +8,7 @@ from aegis_core.errors import AegisError, AegisValidationError, LockTimeoutError
 class TestDomainErrors:
     """Test suite for typed exception hierarchy and backwards compatibility."""
 
-    def test_soma_error_base(self):
+    def test_aegis_error_base(self):
         """All domain exceptions inherit from AegisError."""
         err = AegisError("Base error", code="ERR_BASE")
         assert str(err) == "Base error"

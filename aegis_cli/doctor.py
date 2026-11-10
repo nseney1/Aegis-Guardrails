@@ -83,8 +83,7 @@ the best-effort tier is ``unknown`` while any is registered, since doctor cannot
 run it (nor Codex's /hooks approval). An entry that is not the one ``aegis hook install``
 writes (matcher, type, command form with its host, or timeout) is ``modified`` and claims no
 tier. Duplicates, modified entries, host files that do not parse, entries
-whose ``aegis`` is gone and v3 leftovers (``soma hook ...`` or a removed ``aegis hook``
-phase, in any hook file or the stale v3 Antigravity plugin) are findings; ``--fix`` removes
+whose ``aegis`` is gone and v3 leftovers (a removed ``aegis hook`` phase, in any hook file or the stale v3 Antigravity plugin) are findings; ``--fix`` removes
 the leftovers with the ``remove_list_items`` action (or deletes a plugin file that holds
 nothing else).
 Strings taken from files or host output are printed without control sequences, and

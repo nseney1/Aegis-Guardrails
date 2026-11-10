@@ -13,46 +13,46 @@ from aegis_core.yaml_engine.frontmatter import parse_frontmatter
 from aegis_core.lifecycle.creation import create_rule
 
 
-class TestCellCreationEnforcement:
+class TestRuleCreationEnforcement:
     """Tests for enforcement frontmatter in create_rule."""
 
-    def test_create_vacuole_defaults_to_advisory_enforcement(self, tmp_path: Path):
+    def test_create_trap_defaults_to_advisory_enforcement(self, tmp_path: Path):
         """create_rule for trap defaults to enforcement: advisory."""
-        cell_path = create_rule(
+        rule_path = create_rule(
             rule_type="trap",
             hypothesis="When coordinates invert, render pipelines fail silently",
             workspace=tmp_path,
         )
-        assert cell_path.is_file()
-        content = cell_path.read_text(encoding="utf-8")
+        assert rule_path.is_file()
+        content = rule_path.read_text(encoding="utf-8")
         meta = parse_frontmatter(content)
         assert meta is not None
         assert meta.get("enforcement") == "advisory"
         assert meta.get("type") == "trap"
 
-    def test_create_wall_defaults_to_gate_enforcement(self, tmp_path: Path):
+    def test_create_invariant_defaults_to_gate_enforcement(self, tmp_path: Path):
         """create_rule for invariant defaults to enforcement: gate."""
-        cell_path = create_rule(
+        rule_path = create_rule(
             rule_type="invariant",
             hypothesis="Direct network calls outside sandbox are forbidden",
             workspace=tmp_path,
         )
-        assert cell_path.is_file()
-        content = cell_path.read_text(encoding="utf-8")
+        assert rule_path.is_file()
+        content = rule_path.read_text(encoding="utf-8")
         meta = parse_frontmatter(content)
         assert meta is not None
         assert meta.get("enforcement") == "gate"
         assert meta.get("type") == "invariant"
 
-    def test_create_cell_honors_explicit_enforcement(self, tmp_path: Path):
+    def test_create_rule_honors_explicit_enforcement(self, tmp_path: Path):
         """Explicit enforcement argument is honored."""
-        cell_path = create_rule(
+        rule_path = create_rule(
             rule_type="trap",
             hypothesis="Custom enforced trap",
             enforcement="gate",
             workspace=tmp_path,
         )
-        content = cell_path.read_text(encoding="utf-8")
+        content = rule_path.read_text(encoding="utf-8")
         meta = parse_frontmatter(content)
         assert meta is not None
         assert meta.get("enforcement") == "gate"

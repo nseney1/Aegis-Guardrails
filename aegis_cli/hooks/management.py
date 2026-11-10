@@ -16,14 +16,11 @@ from aegis_core.storage import atomic_write_bytes
 
 _AEGIS_HOOK_START = "# >>> aegis pre-commit >>>"
 _AEGIS_HOOK_END = "# <<< aegis pre-commit <<<"
-_SOMA_HOOK_START = "# >>> soma pre-commit >>>"
-_SOMA_HOOK_END = "# <<< soma pre-commit <<<"
 AEGIS_HOOK_FORMAT = "# aegis-hook-format:"
-SOMA_HOOK_FORMAT = "# soma-hook-format:"
 # 6: the block runs first (right after the shebang) and no longer ends in exec.
 CURRENT_HOOK_FORMAT_VERSION = 6
-# The marked blocks install and uninstall manage: today's and the pre-v3 one.
-_MARKERS = ((_AEGIS_HOOK_START, _AEGIS_HOOK_END), (_SOMA_HOOK_START, _SOMA_HOOK_END))
+# The marked blocks install and uninstall manage: the current Aegis format.
+_MARKERS = ((_AEGIS_HOOK_START, _AEGIS_HOOK_END),)
 
 # The block is POSIX sh; a hook any of these runs can carry it.
 _SHELLS = frozenset({"sh", "bash", "dash", "zsh"})
@@ -109,7 +106,7 @@ def _hook_interpreter(text: str) -> str | None:
 
 
 def _without_hook_block(text: str) -> str | None:
-    """``text`` with every marked aegis (or soma) block removed; None when one is unterminated."""
+    """``text`` with every marked aegis block removed; None when one is unterminated."""
     for start_m, end_m in _MARKERS:
         while True:
             start = text.find(start_m)
@@ -565,7 +562,7 @@ def hook_status(project_root: str | Path | Any | None = None) -> dict[str, Any]:
                 text = hook_file.read_text(encoding="utf-8", errors="replace")
                 if any(start_m in text for start_m, _end_m in _MARKERS):
                     managed = True
-                    match = re.search(r"(?:aegis|soma)-hook-format:\s*(\d+)", text)
+                    match = re.search(r"aegis-hook-format:\s*(\d+)", text)
                     if match:
                         format_version = int(match.group(1))
                     else:

@@ -96,6 +96,90 @@ class TestImportExtraction:
         yaml_import = [i for i in imports if i.module == "yaml"][0]
         assert yaml_import.guarded is False
 
+    @pytest.mark.parametrize("statement", ["import pkg{n}", "from pkg{n} import value"],
+                             ids=["import", "from"])
+    def test_membership_work_is_linear(self, tmp_path, monkeypatch, statement):
+        """Counting record reads catches a growing scan without timing assertions."""
+        import aegis_core.verification.import_guard as ig
+
+        inspections = 0
+
+        class CountedImportInfo(ig.ImportInfo):
+            def __getattribute__(self, name):
+                nonlocal inspections
+                if name == "module":
+                    inspections += 1
+                return super().__getattribute__(name)
+
+        monkeypatch.setattr(ig, "ImportInfo", CountedImportInfo)
+        count = 256
+        src = tmp_path / "many_imports.py"
+        src.write_text("\n".join(statement.format(n=n) for n in range(count)),
+                       encoding="utf-8")
+
+        imports = ig.extract_imports(str(src))
+
+        assert inspections <= count
+        assert [(i.module, i.lineno, i.guarded) for i in imports] == [
+            (f"pkg{n}", n + 1, False) for n in range(count)
+        ]
+
+    @pytest.mark.parametrize(("source", "expected"), [
+        pytest.param(
+            "try:\n    import nested\nexcept ImportError:\n    pass\n"
+            "import first, second.child\nfrom third.child import value\n",
+            [("first", 5, False), ("second", 5, False), ("third", 6, False),
+             ("nested", 2, True)],
+            id="breadth-first-order",
+        ),
+        pytest.param(
+            'import pkg\nfrom pkg.child import value\n'
+            'pytest.importorskip("pkg")\npytest.importorskip("pkg")\n',
+            [("pkg", 3, True), ("pkg", 4, True)],
+            id="importorskip-prepass-retains-duplicates",
+        ),
+        pytest.param(
+            "import pkg.one\nfrom pkg.two import value\n"
+            "try:\n    import pkg\n    from pkg import other\n"
+            "except ImportError:\n    pass\n",
+            [("pkg", 1, False), ("pkg", 2, False), ("pkg", 4, True)],
+            id="unguarded-duplicates-before-guard",
+        ),
+        pytest.param(
+            "try:\n    import pkg.child\nexcept ImportError:\n    pass\n"
+            "def later():\n    import pkg\n    from pkg import value\n",
+            [("pkg", 2, True)],
+            id="guarded-import-suppresses-later-both-forms",
+        ),
+        pytest.param(
+            "try:\n    from pkg.child import value\nexcept ImportError:\n    pass\n"
+            "def later():\n    from pkg import other\n    import pkg\n",
+            [("pkg", 2, True)],
+            id="guarded-from-suppresses-later-both-forms",
+        ),
+        pytest.param(
+            'pytest.importorskip("pkg")\ndef broken(\n',
+            [("pkg", 1, True)],
+            id="malformed-source-retains-prepass",
+        ),
+        pytest.param("def broken(\n", [], id="malformed-source-without-prepass"),
+    ])
+    def test_preserves_order_and_guard_suppression(self, tmp_path, source, expected):
+        from aegis_core.verification.import_guard import extract_imports
+
+        src = tmp_path / "mod.py"
+        src.write_text(source, encoding="utf-8")
+
+        assert [(i.module, i.lineno, i.guarded) for i in extract_imports(str(src))] == expected
+
+    def test_missing_file_raises(self, tmp_path):
+        from aegis_core.verification.import_guard import extract_imports
+
+        missing = tmp_path / "missing.py"
+        with pytest.raises(FileNotFoundError) as exc:
+            extract_imports(str(missing))
+        assert exc.value.filename == str(missing)
+
 
 class TestStdlibClassification:
     """Contract: correctly classify stdlib vs third-party modules."""

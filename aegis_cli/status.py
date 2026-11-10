@@ -37,7 +37,7 @@ def _project_root(args: argparse.Namespace) -> Path:
 
 
 def _parse_frontmatter(filepath: str) -> dict:
-    """Extract YAML frontmatter from a cell file using the canonical parser.
+    """Extract YAML frontmatter from a rule file using the canonical parser.
 
     Falls back to empty dict on any error.
     """
@@ -489,4 +489,3 @@ class StatusCommand(AegisCommand):
         if getattr(args, "compliance", False):
             return run_compliance(args)
         return run_status(args)
-

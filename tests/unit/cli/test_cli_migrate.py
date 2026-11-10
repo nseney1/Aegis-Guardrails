@@ -1,4 +1,4 @@
-"""`aegis migrate` from the command line: dry run by default, --apply, --json, exit codes."""
+"""The supported migration CLI preserves its state-mode reporting."""
 from __future__ import annotations
 
 import json
@@ -10,141 +10,178 @@ import stat
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core.workspace.discovery import LEGACY_SOMA_UPGRADE_MSG
 
 
-def _soma_workspace(root: Path) -> Path:
-    cell = root / ".soma" / "cells" / "vacuoles" / "trap-x.md"
-    cell.parent.mkdir(parents=True)
-    cell.write_text("---\ntype: vacuole\nfitness:\n  triggers: 2\n---\nBody\n", encoding="utf-8")
-    odd = root / ".soma" / "cells" / "ribosomes" / "ribosome-y.md"
-    odd.parent.mkdir(parents=True)
-    odd.write_text("---\ntype: ribosome\n---\nBody\n", encoding="utf-8")
-    return root
+def test_migrate_help_preserves_the_deferred_cli_contract(capsys):
+    snapshot = Path(__file__).resolve().parents[2] / "contract/cli_tree.json"
+    description = json.loads(snapshot.read_text())["parser"]["commands"]["migrate"]["description"]
+    with pytest.raises(SystemExit) as status:
+        main(["migrate", "--help"])
+    assert status.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert " ".join(description.split()) in text
 
 
-def _tree(root: Path) -> dict:
-    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+def test_refusal_documentation_allows_state_lock_bookkeeping():
+    from aegis_cli import migrate
+
+    assert "1 refused (no rule, config.json or .aegis/.gitignore was changed:" in migrate.__doc__
+    assert "state directory and its lock may be created" in migrate.__doc__
 
 
-def test_dry_run_is_the_default_and_writes_nothing(tmp_path: Path, capsys):
-    root = _soma_workspace(tmp_path)
-    before = _tree(root)
-
-    assert main(["migrate", "--workspace", str(root)]) == 0
-
-    out = capsys.readouterr().out
-    assert "dry run: nothing written; rerun with --apply" in out
-    assert "rule: .soma/cells/vacuoles/trap-x.md -> .aegis/rules/traps/trap-x.md (type trap)" in out
-    assert "unmapped type 'ribosome': .soma/cells/ribosomes/ribosome-y.md left in place" in out
-    assert _tree(root) == before
-    assert main(["migrate", "--workspace", str(root), "--dry-run"]) == 0
-
-
-def test_apply_converts_and_exits_1_when_something_was_left_behind(tmp_path: Path, capsys):
-    root = _soma_workspace(tmp_path)
-
-    assert main(["migrate", "--workspace", str(root), "--apply"]) == 1
-
-    out = capsys.readouterr().out
-    assert "migrated" in out and "backup:" in out
-    assert (root / ".aegis" / "rules" / "traps" / "trap-x.md").read_text(encoding="utf-8") == "---\ntype: trap\n---\nBody\n"
-    assert (root / ".soma" / "cells" / "ribosomes" / "ribosome-y.md").is_file()
-
-
-def test_json_report_and_idempotent_second_apply(tmp_path: Path, capsys):
-    root = tmp_path / "ws"
-    cell = root / ".soma" / "cells" / "walls" / "wall-a.md"
-    cell.parent.mkdir(parents=True)
-    cell.write_text("---\ntype: wall\n---\nBody\n", encoding="utf-8")
-
-    assert main(["--json", "migrate", "--workspace", str(root), "--apply"]) == 0
-    first = json.loads(capsys.readouterr().out)
-    assert first["status"] == "applied"
-    assert first["rules"] == [{"from": ".soma/cells/walls/wall-a.md", "to": ".aegis/rules/invariants/wall-a.md",
-                               "type": "invariant"}]
-    assert "migrate-backup-" in first["backup"]
-    assert first["config"] == {"v": 1}  # the report describes what the apply wrote
-
-    assert main(["--json", "migrate", "--workspace", str(root), "--apply"]) == 0
-    second = json.loads(capsys.readouterr().out)
-    assert second["status"] == "up_to_date" and second["backup"] is None
-
-
-def test_apply_and_dry_run_together_is_a_usage_error(tmp_path: Path, capsys):
-    assert main(["migrate", "--workspace", str(tmp_path), "--apply", "--dry-run"]) == 2
-    assert "mutually exclusive" in capsys.readouterr().err
-
-
-def test_the_legacy_sentinel_points_at_migrate(tmp_path: Path):
-    assert "aegis migrate --apply" in LEGACY_SOMA_UPGRADE_MSG
-
-
-def test_the_report_lists_the_v3_manifest_for_removal(tmp_path: Path, capsys):
-    """The signed v3 manifest is v3 state (D3): backed up and removed, never re-attested."""
-    root = tmp_path / "ws"
-    rules = root / ".aegis" / "rules" / "traps"
-    rules.mkdir(parents=True)
-    for name in ("trap-a", "trap-b"):
-        (rules / f"{name}.md").write_text(f"---\nid: {name}\nfitness:\n  triggers: 2\n---\nBody\n", encoding="utf-8")
-    (root / ".aegis" / "rules" / "manifest.json").write_text('{"cells": {}}', encoding="utf-8")
-
-    assert main(["migrate", "--workspace", str(root)]) == 0
-
-    out = capsys.readouterr().out
-    assert "  remove (backed up first): .aegis/rules/manifest.json" in out
-    assert "  strip: fitness from .aegis/rules/traps/trap-a.md" in out
-    assert "manifest: " not in out and "re-attest" not in out
-
-
-def test_a_rule_edited_between_plan_and_apply_is_reported_and_nothing_changes(tmp_path: Path, capsys, monkeypatch):
+def test_config_that_grows_before_apply_refuses_with_exit_1(tmp_path, monkeypatch, capsys):
     from aegis_core import migrate
+    from aegis_core.config import MAX_CONFIG_BYTES
 
-    root = _soma_workspace(tmp_path)
-    cell = root / ".soma" / "cells" / "vacuoles" / "trap-x.md"
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"
+    source.write_bytes(original)
     real_plan = migrate.plan
 
-    def plan_then_someone_saves(workspace):
-        planned = real_plan(workspace)
-        cell.write_text(cell.read_text(encoding="utf-8") + "Saved by an editor meanwhile.\n", encoding="utf-8")
+    def grow_after_planning(root):
+        planned = real_plan(root)
+        (tmp_path / ".aegis/config.json").write_bytes(b"x" * (MAX_CONFIG_BYTES + 1))
         return planned
 
-    monkeypatch.setattr(migrate, "plan", plan_then_someone_saves)
-
-    assert main(["--json", "migrate", "--workspace", str(root), "--apply"]) == 1
-
+    monkeypatch.setattr(migrate, "plan", grow_after_planning)
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused"
-    assert ".soma/cells/vacuoles/trap-x.md changed since the plan was made" in report["refusal"]
-    assert report["backup"] is None
-    assert cell.read_text(encoding="utf-8").endswith("Saved by an editor meanwhile.\n")
-    assert not (root / ".aegis" / "rules").exists()
+    assert report["refusal"] == (
+        f".aegis/config.json exceeds {MAX_CONFIG_BYTES} bytes; "
+        "no rule, config.json or .aegis/.gitignore was changed"
+    )
+    assert source.read_bytes() == original
 
 
-def test_a_refusal_found_only_when_applying_is_a_json_report_and_exit_1(tmp_path: Path, capsys, monkeypatch):
+def test_config_read_failure_during_apply_is_a_refusal_without_echo(tmp_path, monkeypatch, capsys):
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"
+    source.write_bytes(original)
+    config = tmp_path / ".aegis/config.json"
+    config.write_text('{"v": 1}', encoding="utf-8")
+    real_open = os.open
+
+    def deny_config(path, *args, **kwargs):
+        if Path(path) == config:
+            raise PermissionError("HOSTILE_MARKER")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_config)
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 1
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert "HOSTILE_MARKER" not in output
+    assert report["status"] == "refused"
+    assert report["refusal"] == (
+        "workspace inputs could not be read; no rule, config.json or .aegis/.gitignore was changed"
+    )
+    assert source.read_bytes() == original
+
+
+def test_default_pending_dry_run_writes_nothing_then_apply_is_idempotent(tmp_path, capsys):
+    source = tmp_path / ".aegis/rules/traps/t.md"
+    source.parent.mkdir(parents=True)
+    original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"
+    source.write_bytes(original)
+    before = {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert main(["migrate", "--workspace", str(tmp_path)]) == 0
+    assert "dry run: nothing written" in capsys.readouterr().out
+    assert {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "applied" and report["config"] == {"v": 1}
+    assert json.loads((tmp_path / ".aegis/config.json").read_text()) == {"v": 1}
+    assert source.read_bytes() == original.replace(b"score: 0.4\n", b"")
+    backups = list((tmp_path / ".aegis/state").glob("migrate-backup-*"))
+    assert len(backups) == 1
+    assert main(["migrate", "--json", "--workspace", str(tmp_path), "--apply"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "up_to_date"
+    assert list((tmp_path / ".aegis/state").glob("migrate-backup-*")) == backups
+
+
+def test_state_entry_link_refuses_both_cli_modes_with_nothing_pending(tmp_path, capsys):
+    from tests.conftest import symlink_or_skip
+
+    state = tmp_path / ".aegis/state"
+    state.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.write_text("unchanged")
+    symlink_or_skip(outside, state / "entry")
+    for flags in ([], ["--apply"]):
+        assert main(["migrate", "--json", "--workspace", str(tmp_path), *flags]) == 1
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "refused" and ".aegis/state/entry is a symlink" in report["refusal"]
+
+
+def test_apply_and_dry_run_together_is_a_usage_error(tmp_path, capsys):
+    (tmp_path / ".aegis/rules").mkdir(parents=True)
+    assert main(["migrate", "--workspace", str(tmp_path), "--apply", "--dry-run"]) == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+    assert not (tmp_path / ".aegis/state").exists()
+
+
+def test_a_refusal_found_only_when_applying_is_a_json_report_and_exit_1(tmp_path, capsys, monkeypatch):
     from aegis_core import migrate
+    from tests.conftest import symlink_or_skip
 
-    root = _soma_workspace(tmp_path)
+    root = tmp_path / "repo"
+    rule = root / ".aegis/rules/traps/t.md"
+    rule.parent.mkdir(parents=True)
+    rule.write_text("---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n")
+    before = rule.read_bytes()
     outside = tmp_path / "outside"
     outside.mkdir()
     real_plan = migrate.plan
 
     def plan_then_a_link_is_planted(workspace):
         planned = real_plan(workspace)
-        (root / ".aegis" / "state").mkdir(parents=True)
-        try:
-            (root / ".aegis" / "state" / "lock").symlink_to(outside / "lock")
-        except (OSError, NotImplementedError):
-            pytest.skip("symlinks unavailable")
+        state = root / ".aegis/state"
+        state.mkdir()
+        symlink_or_skip(outside / "lock", state / "lock")
         return planned
 
     monkeypatch.setattr(migrate, "plan", plan_then_a_link_is_planted)
-
     assert main(["--json", "migrate", "--workspace", str(root), "--apply"]) == 1
-
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "refused" and "lock: it is a symlink" in report["refusal"]
     assert list(outside.iterdir()) == []
+    assert rule.read_bytes() == before
+
+
+def test_modern_workspace_dry_run_is_idempotent(tmp_path, capsys):
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    for flags in ([], ["--dry-run"], ["--apply"]):
+        assert main(["migrate", "--json", "--workspace", str(tmp_path), *flags]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "up_to_date"
+        assert report["backup"] is None
+        assert report["rules"] == []
+
+
+def test_applied_worktree_merge_reports_its_backup_and_preserves_the_ignore_file(tmp_path, capsys):
+    from tests import helpers_humangate as hg
+    from aegis_core.telemetry_engine import ledger
+
+    repo = hg.make_repo(tmp_path)
+    source = repo.root / ".aegis" / "state" / "ledger.jsonl"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(json.dumps({"v": 2, "ts": "2026-10-01T00:00:00Z", "seq": 1,
+                                  "rule": "trap-x", "outcome": "tp", "source": "ci", "key": "k1"}) + "\n")
+    ignore = repo.root / ".aegis" / ".gitignore"
+    before = b"# user notes\n"
+    ignore.write_bytes(before)
+
+    assert main(["migrate", "--workspace", str(repo.root), "--apply"]) == 0
+
+    out = capsys.readouterr().out
+    assert "migrated" in out and "backup:" in out and "dry run" not in out
+    (backup,) = source.parent.glob("migrate-backup-*")
+    assert (backup / ".aegis" / ".gitignore").read_bytes() == before
+    assert "state/" in ignore.read_text()
+    assert [(row["rule"], row["key"]) for row in ledger.read(repo.root).rows] == [("trap-x", "k1")]
 
 
 # ── R-cli-38: --apply reports the modes it tightened ─────────────────────────

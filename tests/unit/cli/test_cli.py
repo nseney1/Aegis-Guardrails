@@ -127,7 +127,7 @@ class TestCLIEntryPoint:
 
 
 class TestNonUtf8Console:
-    """BUG-012: a cp1252 stdout (Windows, redirected output) made `soma
+    """BUG-012: a cp1252 stdout (Windows, redirected output) made `aegis
     status` exit 1 with UnicodeEncodeError on its emoji."""
 
     def test_status_survives_cp1252_stdout(self, tmp_path):
@@ -302,10 +302,10 @@ def _hook_stdin(monkeypatch, payload: dict) -> None:
 
 def test_hook_run_decides_from_the_payload_where_no_workspace_attaches(tmp_path, monkeypatch, capsys):
     """The registered form runs from any cwd: a directory the CLI cannot attach (here an
-    unmigrated .soma/) must not stop the handler, which reads the workspace from stdin."""
+    unmigrated .aegis/) must not stop the handler, which reads the workspace from stdin."""
     ws = _governed(tmp_path)
     legacy = tmp_path / "legacy"
-    (legacy / ".soma").mkdir(parents=True)
+    (legacy / ".aegis").mkdir(parents=True)
     monkeypatch.chdir(legacy)
     monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)

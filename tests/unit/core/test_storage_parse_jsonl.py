@@ -1,9 +1,7 @@
-"""File and archive JSONL readers have identical content semantics."""
-import gzip
-
+"""The public byte and file JSONL readers have identical content semantics."""
 import pytest
 
-from aegis_core import migrate, storage
+from aegis_core import storage
 
 
 @pytest.fixture(autouse=True)
@@ -27,16 +25,12 @@ def isolated(tmp_path, monkeypatch):
     (b'{"a":"\xed\xa0\x80"}\n', "strict", [], [], [1], False),
     (b'{"a":"\xed\xa0\x80"}\n', "surrogatepass", [{"a": "\ud800"}], [1], [], False),
 ], ids=["clean", "torn", "skipped", "bom", "crlf", "bad-utf8", "surrogate"])
-def test_one_parser_for_bytes_files_and_archives(tmp_path, data, errors, rows, numbers, skipped, torn):
+def test_one_parser_for_bytes_and_files(tmp_path, data, errors, rows, numbers, skipped, torn):
     path = tmp_path / "rows.jsonl"
     path.write_bytes(data)
     parsed = storage.parse_jsonl(data, errors)
     assert (parsed.rows, parsed.line_numbers, parsed.skipped_lines, parsed.torn_tail) == (rows, numbers, skipped, torn)
     assert storage.read_jsonl(path, errors) == parsed
-    if errors == "surrogatepass" or b"\xed" not in data:
-        archive = tmp_path / "rows.gz"
-        archive.write_bytes(gzip.compress(data))
-        assert migrate._read_archive(archive)[1] == parsed
 
 
 def test_contains_filter_keeps_original_line_numbers_and_tail(tmp_path):

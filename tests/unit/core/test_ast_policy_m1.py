@@ -1,10 +1,15 @@
 """M1 contracts exercised through schema serialization and policy evaluation."""
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
+
 import pytest
 
+from aegis_core.ast import policy
+from aegis_core.ast.drivers import python as python_driver
 from aegis_core.ast.drivers.python import parse_python_ast
-from aegis_core.ast.policy import evaluate_forbid_ast_structured, extract_normalized_ast, parse_allow_comments
+from aegis_core.ast.policy import ASTExtractionError, evaluate_forbid_ast_structured, extract_normalized_ast, parse_allow_comments
 from aegis_core.ast.schema import CallSiteNode, ImportNode, NormalizedAST
 
 
@@ -176,3 +181,122 @@ def test_malformed_comment_rule_string_cannot_override_by_substring():
     tree = _tree(metadata={"allow_comments": {1: [{"rules": "other-rule", "reason": "invalid"}]}})
     finding, = evaluate_forbid_ast_structured(tree, {"calls": ["danger"]}, rule_id="rule", source="danger()")
     assert finding["override"] is None
+
+
+@pytest.fixture
+def python_parse_calls(monkeypatch):
+    calls = []
+
+    def parse(source, filename="<unknown>", **kwargs):
+        calls.append((source, filename))
+        return ast.parse(source, filename=filename, **kwargs)
+
+    # Replace only these modules' references; pytest and other AST users keep the real module.
+    local_ast = SimpleNamespace(**vars(ast))
+    local_ast.parse = parse
+    monkeypatch.setattr(policy, "ast", local_ast)
+    monkeypatch.setattr(python_driver, "ast", local_ast)
+    return calls
+
+
+@pytest.mark.parametrize("input_kind", ["code", "utf8-file", "bom-file", "latin1-file", "crlf-file"])
+def test_python_policy_parses_once_and_preserves_normalized_output(tmp_path, python_parse_calls, input_kind):
+    source = (
+        "# coding: utf-8\n"
+        "import subprocess as sp\n"
+        "from functools import lru_cache as cache\n"
+        "__all__ = ['Worker']\n"
+        "@decorate\n"
+        "class Worker:\n"
+        "    @cache(maxsize=16)\n"
+        "    async def run(self, value):\n"
+        "        sp.run('café', shell=True)  # aegis: allow[z-rule, a-rule] reviewed\n"
+        "        return value + 1 if value < 16 else 0\n"
+    )
+    target = tmp_path / "fixture.py"
+    if input_kind == "bom-file":
+        target.write_bytes(b"\xef\xbb\xbf" + source.encode("utf-8"))
+    elif input_kind == "latin1-file":
+        source = source.replace("utf-8", "latin-1")
+        target.write_bytes(source.encode("latin-1"))
+    elif input_kind == "crlf-file":
+        source = source.replace("\n", "\r\n")
+        target.write_bytes(source.encode("utf-8"))
+    elif input_kind == "utf8-file":
+        target.write_bytes(source.encode("utf-8"))
+
+    result = extract_normalized_ast(target, code=source if input_kind == "code" else None)
+
+    assert python_parse_calls == [(source, str(target))]
+    expected = parse_python_ast(source, file_path=str(target)).to_dict()
+    expected["metadata"].update({
+        "decorators": ["decorate", "cache"],
+        "allow_comments": {9: [{"rules": ["a-rule", "z-rule"], "reason": "reviewed"}]},
+    })
+    assert result.to_dict() == expected
+    findings = evaluate_forbid_ast_structured(
+        result, {"calls": ["subprocess.run"], "decorators": ["functools.lru_cache"]},
+        rule_id="a-rule", source=source,
+    )
+    assert [(f["kind"], f["override"], f["unknown"]) for f in findings] == [
+        ("calls", "reviewed", False), ("decorators", None, False),
+    ]
+
+
+@pytest.mark.parametrize("from_file", [False, True], ids=["source", "path"])
+def test_python_parsing_wrapper_still_parses_once(tmp_path, python_parse_calls, from_file):
+    target = tmp_path / "wrapper.py"
+    source = "import os\nos.getcwd()\n"
+    target.write_bytes(source.encode("utf-8"))
+
+    result = parse_python_ast(target) if from_file else parse_python_ast(source, file_path=str(target))
+
+    assert python_parse_calls == [(source, str(target))]
+    assert result.file_path == str(target)
+    assert [site.target for site in result.call_sites] == ["os.getcwd"]
+
+
+@pytest.mark.parametrize("entrypoint", ["driver", "policy"])
+@pytest.mark.parametrize("source", ["def (:\n", "  unexpected()\n"], ids=["syntax", "indentation"])
+def test_python_parse_errors_keep_exact_wrapping(entrypoint, source, python_parse_calls):
+    path = "broken.py"
+    with pytest.raises(SyntaxError) as syntax:
+        ast.parse(source, filename=path)
+
+    if entrypoint == "driver":
+        error_type = ValueError
+        message = f"Failed to parse Python AST for {path}: {syntax.value}"
+        extract = lambda: parse_python_ast(source, file_path=path)
+    else:
+        error_type = ASTExtractionError
+        message = f"cannot verify {path}: {type(syntax.value).__name__}: {syntax.value}"
+        extract = lambda: extract_normalized_ast(path, code=source)
+
+    with pytest.raises(error_type) as error:
+        extract()
+
+    assert str(error.value) == message
+    assert type(error.value.__cause__) is type(syntax.value)
+    assert str(error.value.__cause__) == str(syntax.value)
+    assert python_parse_calls == [(source, path)]
+    if entrypoint == "policy":
+        assert error.value.code == "AST_UNVERIFIABLE"
+
+
+@pytest.mark.parametrize("entrypoint", ["driver", "policy"])
+def test_python_unsafe_encoding_is_refused_before_parsing(tmp_path, python_parse_calls, entrypoint):
+    target = tmp_path / "unsafe.py"
+    target.write_bytes(b"# coding: utf-7\nimport os\n")
+    reason = "source encoding 'utf-7' does not decode ASCII to itself"
+
+    with pytest.raises(UnicodeError if entrypoint == "driver" else ASTExtractionError) as error:
+        if entrypoint == "driver":
+            parse_python_ast(target)
+        else:
+            extract_normalized_ast(target)
+
+    assert str(error.value) == (reason if entrypoint == "driver" else f"cannot verify {target}: UnicodeError: {reason}")
+    assert python_parse_calls == []
+    if entrypoint == "policy":
+        assert error.value.code == "AST_UNVERIFIABLE"
+        assert type(error.value.__cause__) is UnicodeError

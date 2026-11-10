@@ -511,9 +511,6 @@ def _mcp_findings(ctx: _Ctx, claude_user: bool) -> List[_Finding]:
             continue
         data = entry.data or {}
         servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
-        if _base.LEGACY_SERVER in servers:
-            found.append(_key_finding(ctx, entry, "legacy_mcp_entry", ("mcpServers", _base.LEGACY_SERVER),
-                                      _base._LEGACY_ENTRY))
         if _base.SERVER in servers and kind == "dot_mcp":
             found.append(_key_finding(ctx, entry, "misplaced_mcp_entry", ("mcpServers", _base.SERVER),
                                       "Aegis v4 registers 'aegis' per user, never in a .mcp.json file",
@@ -526,10 +523,6 @@ def _mcp_findings(ctx: _Ctx, claude_user: bool) -> List[_Finding]:
                 psrv = project.get("mcpServers") if isinstance(project, dict) else None
                 if not isinstance(psrv, dict):
                     continue
-                if _base.LEGACY_SERVER in psrv:
-                    found.append(_key_finding(ctx, entry, "legacy_mcp_entry",
-                                              ("projects", name, "mcpServers", _base.LEGACY_SERVER),
-                                              _base._LEGACY_ENTRY))
                 if _base.SERVER in psrv and claude_user:
                     found.append(_key_finding(ctx, entry, "misplaced_mcp_entry",
                                               ("projects", name, "mcpServers", _base.SERVER),
@@ -638,9 +631,7 @@ def _upgrade_findings(ctx: _Ctx) -> List[_Finding]:
     if not found:
         return []
     return [_Finding("unmigrated_v3_state", ctx.root / found[0],
-                     f"unmigrated v3 state: {', '.join(found)}. Aegis v4 does not read it, and aegis status, "
-                     "scan and sync refuse to run until it is converted: run aegis migrate to see the "
-                     "conversion, then aegis migrate --apply")]
+                     discovery.UPGRADE_STATE_MSG.format(path=ctx.root, found=", ".join(found)))]
 
 
 def _home_rules_finding(ctx: _Ctx) -> List[_Finding]:
@@ -736,7 +727,7 @@ def _legacy_hook_findings(ctx: _Ctx) -> List[_Finding]:
         if not items:
             continue
         where = ", ".join(_list_location(p, i) for p, i in items)
-        calls = f"call {_base.LEGACY_SERVER} hook or a removed aegis hook phase"
+        calls = "call a removed aegis hook phase"
         if is_plugin:
             code, message = "legacy_hook_plugin", f"{ctx.label(path)}: the stale v3 Antigravity plugin's hooks {calls}"
         else:
@@ -772,10 +763,10 @@ def _legacy_block_findings(ctx: _Ctx) -> List[_Finding]:
         label = ctx.label(path)
         where = ", ".join(f"lines {a + 1}-{b + 1}" for a, b in ranges) or None
         if not balanced:
-            found.append(_Finding("legacy_block", path, f"{label}: unbalanced SOMA/AEGIS START/END markers; "
+            found.append(_Finding("legacy_block", path, f"{label}: unbalanced AEGIS START/END markers; "
                                   "remove the old block by hand (--fix will not guess)", location=where))
             continue
-        message = f"{label}: legacy Aegis/Soma rules block ({where})"
+        message = f"{label}: legacy Aegis rules block ({where})"
         action = None
         if entry.refusal:
             message += f"; --fix will not change it: {entry.refusal}"
