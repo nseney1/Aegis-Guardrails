@@ -14,12 +14,12 @@ from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
+from aegis_core.argv import split_command
 from aegis_core.ast.drivers.python import parse_python_ast
 from aegis_core.ast.detect import NATIVE_JS_EXTENSIONS, NATIVE_SOURCE_EXTENSIONS
 from aegis_core.ast.schema import NormalizedAST
@@ -274,16 +274,15 @@ def _names_program(token: str) -> bool:
 
 def _split_command(cmd: str) -> list[str]:
     """Split a driver command line string into argv arguments, preserving Windows paths."""
+    parts = split_command(cmd)
     if os.name == "nt":
-        parts = [p.strip('"') for p in shlex.split(cmd, posix=False)]
         # Rejoin the words of an unquoted path with spaces (C:\Program Files\...).
         if parts and not _names_program(parts[0]):
             for i in range(1, len(parts)):
                 cand = " ".join(parts[: i + 1])
                 if _names_program(cand):
                     return [cand] + parts[i + 1 :]
-        return parts
-    return shlex.split(cmd)
+    return parts
 
 
 def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] = None) -> Optional[str]:

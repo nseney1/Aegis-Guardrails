@@ -236,6 +236,7 @@ def _vendor_warning(repo_root: str) -> str:
         declared = UserConfig.load(repo_root).arbiter_vendor
     except (AegisError, OSError):
         declared = None
+    # RF-26b follow-up: wire MR-3 provenance and tolerate invalid records; label rule until then.
     return vendor_warning(declared, env_client())
 
 
