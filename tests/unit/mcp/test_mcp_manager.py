@@ -77,8 +77,8 @@ def test_manager_rejects_conflicting_startup_scope(tmp_path):
 def test_repository_registration_keeps_original_surface_and_parent_refusal(tmp_path):
     responses = exchange(tmp_path, [("aegis_scan", {"files": ["unknown.py"]})])
     definitions = {item["name"]: item for item in responses[1]["result"]["tools"]}
-    assert set(definitions) == {"aegis_scan", "aegis_list_rules", "aegis_report_outcome",
-                               "aegis_create_rule", "aegis_capture_insight"}
+    contract = json.loads((REPO / "tests" / "contract" / "mcp_tools.json").read_text(encoding="utf-8"))
+    assert set(definitions) == {tool["name"] for tool in contract["tools"]}
     assert "files" in definitions["aegis_scan"]["inputSchema"]["properties"]
     payload = json.loads(responses[-1]["result"]["content"][0]["text"])
     assert payload["status"] == "not_governed"

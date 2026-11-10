@@ -40,18 +40,21 @@ concurrency guarantees live in one place:
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
 import stat
+import sys
 import threading
 import time
+import uuid
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, storage_shared
 from aegis_core.atomicio import (
     _O_CLOEXEC,
     _O_NOFOLLOW,
@@ -70,6 +73,8 @@ from aegis_core.atomicio import (
 )
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
 from aegis_core.primitives import is_within, real_path
+# Shared implementations use this module's live bindings; all original patch targets remain here.
+from aegis_core.storage_shared import StateModes
 from aegis_core.taxonomy import (
     LOCK_MAX_BACKOFF_SECONDS,
     LOCK_RETRY_INTERVAL_SECONDS,
@@ -115,6 +120,7 @@ __all__ = [
     "shared_state_dir",
     "shared_state_modes",
     "state_dir",
+    "message_store",
     "workspace_id",
     "workspace_relative",
     "worktree_label",
@@ -220,7 +226,7 @@ def _outside_error(path: Path) -> PathTraversalError:
 _STATE_GITIGNORE = b"# Aegis machine-local state; never committed.\n*\n"
 
 
-def state_dir(workspace: Any) -> Path:
+def state_dir(workspace: Any, *, directory_fd: Optional[int] = None) -> Path:
     """The workspace's ``.aegis/state`` directory, created if missing.
 
     Raises PathTraversalError when ``.aegis`` or ``.aegis/state`` is a symlink or
@@ -228,7 +234,11 @@ def state_dir(workspace: Any) -> Path:
     directly inside ``.aegis/state`` is a symlink or resolves outside it (a Windows
     junction): the ledger, the lock, the logs and migration backups would be written
     wherever it points. Writes ``state/.gitignore`` ("*") when it is missing.
+    ``directory_fd`` is a caller-held, anchored state directory; message_store
+    supplies it so preparation never reopens the state path during a rename.
     """
+    if directory_fd is not None:
+        return _state_dir_at(WorkspaceLayout(Path(os.fspath(workspace))), directory_fd)
     layout = WorkspaceLayout(Path(os.fspath(workspace)).resolve())
     for path in (layout.aegis_dir, layout.state_dir):
         if path.is_symlink():
@@ -248,45 +258,101 @@ def state_dir(workspace: Any) -> Path:
     return layout.state_dir
 
 
+def _state_dir_at(layout, directory):
+    """Prepare an already anchored state directory; publish its ignore file atomically."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise _link_error(layout.state_dir / entry.name)
+    name = layout.state_gitignore.name
+    prepared_ignore = False
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        temporary = ".state-ignore-" + uuid.uuid4().hex
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            if os.write(fd, _STATE_GITIGNORE) != len(_STATE_GITIGNORE):
+                raise OSError(errno.EIO, "state ignore write incomplete")
+            os.fsync(fd)
+            try:
+                os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            except FileExistsError:
+                pass  # A concurrent creator owns the entry; inspect it without following it.
+        finally:
+            os.close(fd)
+            os.unlink(temporary, dir_fd=directory)
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        prepared_ignore = True
+    if stat.S_ISLNK(info.st_mode):
+        raise _link_error(layout.state_gitignore)
+    if prepared_ignore:
+        os.fsync(directory)
+    return layout.state_dir
+
+
+@contextmanager
+def message_store(workspace: Any, *, write: bool = False):
+    """Default message store, admitted by anchored descriptors before any record I/O."""
+    from . import message_codec as codec
+
+    capabilities = {function.__name__ for function in os.supports_dir_fd}
+    nofollow = {function.__name__ for function in os.supports_follow_symlinks}
+    codec.require({"open", "mkdir", "stat", "link", "unlink"} <= capabilities and "stat" in nofollow
+                  and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and hasattr(os, "geteuid"), "E_AUTH")
+    layout = workspace.layout
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    message_path = layout.state_dir / "messages"
+    try:
+        with ExitStack() as stack:
+            parent = None
+            for component in (layout.root.anchor, *layout.root.parts[1:], layout.aegis_dir.name):
+                try:
+                    fd = os.open(component, flags, **({"dir_fd": parent} if parent is not None else {}))
+                except FileNotFoundError:
+                    raise codec.CodecError("E_AUTH", detail="workspace") from None
+                stack.callback(os.close, fd)
+                parent = fd
+            for directory in (layout.state_dir, message_path):
+                if write:
+                    try:
+                        os.mkdir(directory.name, mode=0o700 if directory == message_path else 0o777, dir_fd=parent)
+                    except FileExistsError:
+                        pass  # The anchored no-follow open validates the existing directory.
+                try:
+                    fd = os.open(directory.name, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    raise codec.CodecError("E_REF", detail="resolution") from None
+                stack.callback(os.close, fd)
+                parent = fd
+                if write and directory == layout.state_dir:
+                    state_dir(workspace, directory_fd=fd)
+            store = codec.Store(message_path)
+            stack.callback(store.close)
+            expected, actual = os.fstat(parent), os.fstat(store.fd)
+            codec.require((expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino), "E_AUTH")
+            yield store
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+            raise codec.CodecError("E_AUTH") from None
+        raise
+
+
 # ── Shared state: one directory for every worktree of a repository ───────────
 
-_SHARED_DIR_MODE = 0o700
+_SHARED_DIR_MODE = storage_shared.SHARED_DIR_MODE
 
 
 def _shared_link_error(path: Path, base: Path) -> PathTraversalError:
-    return PathTraversalError(
-        f"refusing to use {path}: it is a symlink; aegis keeps shared state only inside {base}",
-        path=str(path),
-    )
+    return storage_shared.shared_link_error(sys.modules[__name__], path, base)
 
 
 def _shared_outside_error(path: Path, base: Path) -> PathTraversalError:
-    return PathTraversalError(
-        f"refusing to use {path}: it resolves outside {base}; aegis keeps shared state only inside it",
-        path=str(path),
-    )
+    return storage_shared.shared_outside_error(sys.modules[__name__], path, base)
 
 
 def _confined(directory: Path, base: Path, link_error, outside_error, entries: bool = True) -> None:
-    """Refuse ``directory`` when it is a symlink, is not a directory, or resolves outside
-    ``base``, and (``entries``) when an entry directly inside it is a symlink or a
-    directory that resolves outside ``base``. A missing ``directory`` passes."""
-    if directory.is_symlink():
-        raise link_error(directory)
-    if not os.path.lexists(directory):
-        return
-    if not is_within(directory, base, unresolvable=False):  # a Windows junction is not a symlink
-        raise outside_error(directory)
-    if not directory.is_dir():
-        raise PathTraversalError(f"refusing to use {directory}: it is not a directory", path=str(directory))
-    if not entries:
-        return
-    with os.scandir(directory) as found:
-        for entry in found:
-            if entry.is_symlink():
-                raise link_error(Path(entry.path))
-            if entry.is_dir(follow_symlinks=False) and not is_within(Path(entry.path), base, unresolvable=False):
-                raise outside_error(Path(entry.path))
+    return storage_shared.confined(sys.modules[__name__], directory, base, link_error, outside_error, entries)
 
 
 def shared_state_dir(workspace: Any, create: bool = True) -> Path:
@@ -309,51 +375,14 @@ def shared_state_dir(workspace: Any, create: bool = True) -> Path:
     return _shared_dir(Path(real_path(common)), create)
 
 
-class StateModes(NamedTuple):
-    """What ``shared_state_modes`` found: ``checked`` entries (directories and files) in the
-    shared state, ``looser`` of them with any group or other permission bit, ``fixed`` of
-    those tightened. Counts only: a name in a report would leak what the state holds."""
-
-    checked: int
-    looser: int
-    fixed: int
-    supported: bool
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {"checked": self.checked, "looser": self.looser, "fixed": self.fixed, "supported": self.supported}
-
-
 def shared_state_modes(workspace: Any, fix: bool = False) -> StateModes:
-    """Count the entries of ``<git common dir>/aegis`` looser than 0o700 (directories) and
-    0o600 (files); with ``fix`` set them to exactly that. Nothing is created.
+    """Count shared-state entries looser than 0o700/0o600; optionally tighten them.
 
-    Outside a git repository (or when git cannot run) there is no shared state, so nothing
-    is checked: the workspace-local ``.aegis/state`` is not held to the shared standard.
-    A symlink is never followed or changed. Raises what ``shared_state_dir`` raises for an
-    unconfined directory. Without POSIX permission bits (Windows) nothing is checked and
-    ``supported`` is False.
+    Creates nothing. Outside Git no entries are checked or changed; on Windows
+    ``supported`` is False. Symlinks are never followed or changed. Raises the
+    confinement errors documented by ``shared_state_dir``.
     """
-    if os.name == "nt":
-        return StateModes(0, 0, 0, False)
-    common = gitsafe.common_dir(Path(os.fspath(workspace)).resolve())
-    if common is None:
-        return StateModes(0, 0, 0, True)
-    top = _shared_dir(Path(real_path(common)), create=False)
-    if not os.path.lexists(top):
-        return StateModes(0, 0, 0, True)
-    checked = looser = fixed = 0
-    pending = [(top, True)]
-    while pending:
-        path, is_dir = pending.pop()
-        checked += 1
-        if stat.S_IMODE(os.lstat(path).st_mode) & 0o077:
-            looser += 1
-            if fix and _chmod_exact(path, _SHARED_DIR_MODE if is_dir else _PRIVATE_FILE_MODE, is_dir):
-                fixed += 1
-        if is_dir:
-            with os.scandir(path) as found:
-                pending.extend((Path(e.path), e.is_dir(follow_symlinks=False)) for e in found if not e.is_symlink())
-    return StateModes(checked, looser, fixed, True)
+    return storage_shared.state_modes(sys.modules[__name__], workspace, fix)
 
 
 def _chmod_exact(path: Path, mode: int, is_dir: bool) -> bool:
@@ -372,38 +401,16 @@ def _chmod_exact(path: Path, mode: int, is_dir: bool) -> bool:
 
 
 def _local_state_dir(root: Path, create: bool) -> Path:
-    """The workspace's ``.aegis/state`` with ``state_dir``'s refusals; with ``create`` False
-    nothing is created."""
-    if create:
-        return state_dir(root)
-    layout = WorkspaceLayout(root)
-    _confined(layout.aegis_dir, layout.root, _link_error, _outside_error, entries=False)
-    _confined(layout.state_dir, layout.root, _link_error, _outside_error)
-    return layout.state_dir
+    """Route local state through the live preparation and refusal hooks."""
+    return storage_shared.local_state_dir(sys.modules[__name__], root, create)
 
 
 def _shared_errors(base: Path):
-    def link_error(path: Path) -> PathTraversalError:
-        return _shared_link_error(path, base)
-
-    def outside_error(path: Path) -> PathTraversalError:
-        return _shared_outside_error(path, base)
-
-    return link_error, outside_error
+    return storage_shared.shared_errors(sys.modules[__name__], base)
 
 
 def _confined_shared(directory: Path, base: Path, create: bool) -> None:
-    """``_confined`` for a directory of the shared state under ``base`` (the resolved common
-    dir); with ``create`` a missing one is made private and checked again."""
-    link_error, outside_error = _shared_errors(base)
-    _confined(directory, base, link_error, outside_error)
-    if create and not os.path.lexists(directory):
-        try:
-            directory.mkdir(mode=_SHARED_DIR_MODE)
-            os.chmod(directory, _SHARED_DIR_MODE)  # mkdir's mode passes through the umask; this is exact
-        except FileExistsError:
-            pass  # another worktree's process made it first; checked again below
-        _confined(directory, base, link_error, outside_error)
+    return storage_shared.confined_shared(sys.modules[__name__], directory, base, create)
 
 
 def _shared_dir(base: Path, create: bool) -> Path:
@@ -413,16 +420,7 @@ def _shared_dir(base: Path, create: bool) -> Path:
 
 
 def _shared_lock_name(name: object) -> str:
-    ok = (
-        isinstance(name, str)
-        and name.endswith(".lock")
-        and name != ".lock"
-        and not any(ch in name for ch in "/\\\0")
-        and name not in (".", "..")
-    )
-    if not ok:
-        raise ValueError(f"a shared lock is one file name ending in .lock, got {name!r}")
-    return name  # type: ignore[return-value]
+    return storage_shared.shared_lock_name(sys.modules[__name__], name)
 
 
 @contextmanager

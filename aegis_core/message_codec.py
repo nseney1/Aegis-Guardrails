@@ -10,6 +10,7 @@ JSON is default; MD fences that JSON; TSV marks data and uses JSON cells.
 JSON short escapes are preserved; outline alone emits only envelope and outline.
 """
 import hashlib
+from typing import NamedTuple
 
 from . import message_codec_views as _views
 from .message_codec_format import (
@@ -230,14 +231,58 @@ def _renderer(limit):
     return _views.Renderer(require, escape_char, neutral_text, limit)
 
 
-def _options(value, selectors, spans, expand, since, row_limit, outline, format, max_chars, store, unknown):
-    """Validate all caller values before content hashing, sets or I/O."""
+class _ReadOptions(NamedTuple):
+    options: dict
+    planned: dict
+
+
+def _read_selectors(groups, cli):
+    """Bound both representations before slicing CLI groups into selector entries."""
+    require(type(groups) in (list, tuple) and len(groups) <= MAX_SELECTORS, "E_SELECTOR")
+    if not cli:
+        require(all(type(n) is str and 0 < len(n) <= 1024 for n in groups), "E_SELECTOR")
+        return groups
+    parts = []
+    for expression in groups:
+        require(isinstance(expression, str) and len(expression) <= MAX_SELECTORS * 1025 - 1, "E_SELECTOR")
+        depth, start = 0, 0
+        for index, char in enumerate(expression):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                require(len(parts) < MAX_SELECTORS and 0 < index - start <= 1024, "E_SELECTOR")
+                parts.append((expression, start, index))
+                start = index + 1
+        require(len(parts) < MAX_SELECTORS and 0 < len(expression) - start <= 1024, "E_SELECTOR")
+        parts.append((expression, start, len(expression)))
+    return [expression[start:stop] for expression, start, stop in parts]
+
+
+def _read_integer(value, limit, code, cli):
+    if cli:
+        require(type(value) is str and 0 < len(value) <= len(str(limit)) and INDEX.fullmatch(value), code)
+        value = int(value)
+    require(type(value) is int and 0 <= value <= limit, code)
+    return value
+
+
+def preflight_read(cli=False, /, *, selectors=(), spans=(), expand=(), since=None, row_limit=None,
+                   outline=False, format="json", max_chars=60000, store=None, **unknown):
+    """Normalize in one refusal order; cli=True positionally selects raw argparse values.
+
+    Return normalized read_view options and their selector plan. The representation
+    switch is positional-only so a read_view unknown keyword cannot enable parsing.
+    Record-specific schema and reference checks follow record verification.
+    """
+    require(type(cli) is bool, "E_SELECTOR")
     require(type(expand) in (list, tuple) and len(expand) <= MAX_REFS, "E_REF")
     require(all(type(n) is str and REF_NAME.fullmatch(n) for n in expand), "E_REF")
     require(store is None or type(store) is Store, "E_REF")
-    require(type(selectors) in (list, tuple) and len(selectors) <= MAX_SELECTORS, "E_SELECTOR")
+    selectors = _read_selectors(selectors, cli)
     require(type(spans) in (list, tuple) and len(spans) <= MAX_SPANS, "E_SPAN")
-    require(all(type(n) is int and 0 <= n < MAX_NODES for n in spans), "E_SPAN")
+    spans = [_read_integer(n, MAX_NODES - 1, "E_SPAN", cli) for n in spans]
     require(since is None or (type(since) is str and len(since) <= 70 and
                            (since == "0" or CURSOR_PATTERN.fullmatch(since))), "E_SELECTOR")
     require(row_limit is None or (type(row_limit) is int and 1 <= row_limit <= MAX_NODES), "E_LIMIT")
@@ -245,15 +290,23 @@ def _options(value, selectors, spans, expand, since, row_limit, outline, format,
     require((since is not None or row_limit is None) and type(outline) is bool, "E_SELECTOR")
     if type(format) is not str or format not in ("json", "md", "tsv"):
         raise CodecError("E_FORMAT", detail="format")
-    require(type(max_chars) is int and 0 <= max_chars <= MAX_OUTPUT_CHARS, "E_LIMIT")
+    max_chars = _read_integer(max_chars, MAX_OUTPUT_CHARS, "E_LIMIT", cli)
     planned = {}
     for selector in selectors:
         parts = _selector(selector)
         parts = parts if parts[0] in KEYS else ["fields"] + parts
-        if type(value) is dict and type(value.get("kind")) is str and value["kind"] in KIND_SCHEMAS:
-            _schema_path(_record_schema(value["kind"]), parts)
         require(tuple(parts) not in planned, "E_SELECTOR")
         planned[tuple(parts)] = selector
+    return _ReadOptions(dict(selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
+                             outline=outline, format=format, max_chars=max_chars), planned)
+
+
+def _options(value, selectors, spans, expand, since, row_limit, outline, format, max_chars, store, unknown):
+    planned = preflight_read(selectors=selectors, spans=spans, expand=expand, since=since, row_limit=row_limit,
+                             outline=outline, format=format, max_chars=max_chars, store=store, **unknown).planned
+    if type(value) is dict and type(value.get("kind")) is str and value["kind"] in KIND_SCHEMAS:
+        for parts in planned:
+            _schema_path(_record_schema(value["kind"]), parts)
     require(not expand or (type(value) is dict and type(value.get("refs")) is dict and
                          all(name in value["refs"] for name in expand)), "E_REF")
     return planned
