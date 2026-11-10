@@ -106,6 +106,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.governance": 1,
     "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
+    "aegis_core.approval_shape": 0,
     # v4.3 verified checks: the tree identity (gitsafe, pathlookup), the credit state machine over the ledger
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
