@@ -1735,6 +1735,70 @@ def test_r7_class_a_cursor_follows_growth_and_refuses_changed_prefix():
     assert_error("E_SELECTOR", lambda: codec.read_view(old, since=log_cursor(grown["fields"]["rows"], 3)))
 
 
+@pytest.mark.parametrize("count", [0, 1, 3])
+@pytest.mark.parametrize("row_limit", [1, 2, None])
+def test_rf16_cursor_boundaries_match_canonical_arrays(count, row_limit):
+    rows = [
+        {"text": '[],{}"\\\n é😀', "data": {"z": [None, True, False, -0.0], "a": {"[,]": "]"}}},
+        {"text": "second", "data": [[], {}, 1.25]},
+        {"text": "last"},
+    ][:count]
+    value = record("log", {"rows": rows})
+    for offset in range(count + 1):
+        cursors = [log_cursor(rows, offset)] + (["0"] if offset == 0 else [])
+        stop = count if row_limit is None else min(count, offset + row_limit)
+        for cursor in cursors:
+            view = json.loads(codec.read_view(value, since=cursor, row_limit=row_limit))
+            assert view["data"]["rows"] == rows[offset:stop]
+            assert view["cursor"] == log_cursor(rows, stop)
+
+
+def test_rf16_paging_hashes_each_prefix_row_once(monkeypatch):
+    rows = [{"text": str(index)} for index in range(2000)]
+    value = record("log", {"rows": rows})
+    expected = [log_cursor(rows, stop) for stop in range(100, len(rows) + 1, 100)]
+    identities, visits = {id(row) for row in rows}, []
+    original = codec.json_chunks
+
+    def counted(value, *args, **kwargs):
+        if id(value) in identities:
+            visits.append(id(value))
+        yield from original(value, *args, **kwargs)
+
+    def hashing_chunks(value, *args, **kwargs):
+        if "ranges" in kwargs:  # Source coverage is separate from cursor hashing.
+            yield from original(value, *args, **kwargs)
+        else:
+            with monkeypatch.context() as patch:
+                patch.setattr(codec_format, "json_chunks", counted)
+                yield from counted(value, *args, **kwargs)
+
+    monkeypatch.setattr(codec, "json_chunks", hashing_chunks)
+    cursor = "0"
+    for start, wanted in zip(range(0, len(rows), 100), expected):
+        before = len(visits)
+        view = json.loads(codec.read_view(value, since=cursor, row_limit=100))
+        assert view["data"]["rows"] == rows[start:start + 100]
+        assert view["cursor"] == wanted
+        assert visits[before:] == [id(row) for row in rows[:start + 100]]
+        cursor = view["cursor"]
+    assert len(visits) == sum(range(100, len(rows) + 1, 100))
+
+
+@pytest.mark.parametrize("offset", [0, 1, 2])
+def test_rf16_cursor_rechecks_prefix_on_every_call(offset):
+    rows = [{"text": "first"}, {"text": "last"}]
+    value = record("log", {"rows": rows})
+    cursor = log_cursor(rows, offset)
+    first = codec.read_view(value, since=cursor, row_limit=1)
+    assert codec.read_view(value, since=cursor, row_limit=1) == first
+    if offset:
+        rows[offset - 1]["text"] = MARKER
+    else:
+        cursor = "0:" + hashlib.sha256(b"[").hexdigest()
+    assert_error("E_SELECTOR", lambda: codec.read_view(value, since=cursor, row_limit=1))
+
+
 @pytest.mark.parametrize("cursor", ["", ":" + "a" * 64, "01:" + "a" * 64, "-1:" + "a" * 64,
     "1:" + "A" * 64, "1:a", "100000:" + "a" * 64, "1:" + "a" * 65, True, {}, []])
 def test_r7_class_a_cursor_grammar(cursor):
