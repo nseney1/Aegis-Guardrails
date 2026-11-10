@@ -16,9 +16,17 @@ NO_DRIVER_NOTE_TOOL = 'forbid_ast_no_driver'
 AST_SIZE_NOTE_TOOL = 'ast_unverified'
 
 
-def too_large_note(path: str, language: str = 'unknown') -> ToolEvidence:
+def too_large_note(path: str, language: str = 'unknown', *, reason: str | None = None) -> ToolEvidence:
+    if reason is None:
+        from aegis_core.ast.runner import SOURCE_LIMIT_BYTES
+
+        detail = f'{path} exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB'
+    else:
+        detail = f'{path} not read or checked: {reason}'
+
     return ToolEvidence(AST_SIZE_NOTE_TOOL, path, True,
-        f'unverified too_large: {path} exceeds 2 MiB; use target_paths to exclude generated bundles (aegis doctor)',
+        f'unverified too_large: {detail}; '
+        'use target_paths to exclude generated bundles (aegis doctor)',
         language=language)
 
 
@@ -112,7 +120,7 @@ def run_checks(paths: list[tuple[str, str]], root: str, session: Any, *, discove
                                     f'forbid_ast: cannot verify {rel}: {why}',
                                     language=source_language(rel)) for rule in covering)
         if not covering and Path(rel).suffix.lower() in PACK_EXTENSIONS - {'.py'}:
-            results.append(too_large_note(rel, source_language(rel)))
+            results.append(too_large_note(rel, source_language(rel), reason=why))
     for rel, path in paths:
         applicable = [(rule, spec) for rule, spec in rules if rule.applies_to(rel)]
         if not applicable:

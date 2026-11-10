@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 from aegis_core.workspace.layout import WorkspaceLayout
+from aegis_core.storage import file_generation
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -45,22 +46,12 @@ class RuleInventoryError(RuntimeError):
         super().__init__(f"rule inventory {operation} failed for {self.path}: {message}")
 
 
-# On Windows os.stat() reports st_ctime as the creation time while os.fstat()
-# reports the last-change time, so a path stat and an fd stat of the same
-# unchanged file disagree once it has ever been written (BUG-035). Creation
-# time never moves on a rewrite anyway; st_ino, st_size and st_mtime_ns still
-# catch replacement and modification there.
-_COMPARE_CTIME = os.name != "nt"
-
-
 def _stat_signature(info: os.stat_result) -> Tuple[int, int, int, int, int, int]:
     return (
         info.st_dev,
         info.st_ino,
         info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns if _COMPARE_CTIME else 0,
+        *file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns),
     )
 
 

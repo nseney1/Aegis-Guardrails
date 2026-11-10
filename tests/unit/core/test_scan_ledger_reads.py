@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
+from types import SimpleNamespace
 from typing import Callable, Dict, List
 
 import pytest
@@ -102,6 +104,13 @@ def _mcp_scan(root: Path, session: str = "s1") -> Dict:
 
 def test_an_mcp_scan_reads_the_ledger_at_most_twice_and_once_when_its_exposures_are_kept(ws, monkeypatch):
     assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
+    assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
+    # Racy generations need locked reads; only a settled read can prime the exposure memo.
+    old = time.time_ns() - 10_000_000_000
+    os.utime(ledger.ledger_path(ws), ns=(old, old))
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: time.time_ns() + 3_000_000_000)))
+        assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) <= 2
     assert _reads(monkeypatch, ws, lambda: _mcp_scan(ws)) == 1
 
 
@@ -165,7 +174,7 @@ def test_every_t4_event_arm_reads_as_before(ws):
         _row(event="exposure", rule="unknown-rule", session="s9", host="h", paths=[], rev=None),
     ])
     with open(ledger.ledger_path(ws), "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps({"cell": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
+        fh.write(json.dumps({"rule_id": "trap-b", "signal": "success", "source": "mcp", "timestamp": "2026-10-08T00:00:00Z",
                              "event_id": "v1-alias"}) + "\n")
     now = parse_utc("2026-10-20T00:00:00Z")
     got = {rid: (f.triggers, f.tp, f.fp, f.caught, f.leaked, f.contested, f.eligible_sessions, f.adjudicated_n)

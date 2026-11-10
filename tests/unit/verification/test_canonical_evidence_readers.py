@@ -10,9 +10,9 @@ from pathlib import Path
 from aegis_core.yaml_engine.serializer import dump_frontmatter
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
-ENZYMES = ROOT / "enzymes"
-if str(ENZYMES) not in sys.path:
-    sys.path.insert(0, str(ENZYMES))
+VERIFIERS = ROOT / "verifiers"
+if str(VERIFIERS) not in sys.path:
+    sys.path.insert(0, str(VERIFIERS))
 
 
 def _ledger(root: Path) -> Path:
@@ -24,26 +24,26 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
 
-def _signal(cell: str, signal: str, timestamp: str = "2026-01-01T00:00:00Z", weight=None) -> dict:
-    record = {"cell": cell, "signal": signal, "timestamp": timestamp}
+def _signal(rule: str, signal: str, timestamp: str = "2026-01-01T00:00:00Z", weight=None) -> dict:
+    record = {"rule_id": rule, "signal": signal, "timestamp": timestamp}
     if weight is not None:
         record["metadata"] = {"credit_weight": weight}
     return record
 
 
-def _cell(path: Path, cell_id: str, cell_type: str = "trap", age_days: int = 45) -> None:
+def _rule(path: Path, rule_id: str, rule_type: str = "trap", age_days: int = 45) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     created = (datetime.now(timezone.utc) - timedelta(days=age_days)).strftime("%Y-%m-%d")
     metadata = {
-        "id": cell_id,
+        "id": rule_id,
         "domain": "testing",
-        "type": cell_type,
-        "enforcement": "gate" if cell_type in ("gate", "invariant") else "advisory",
+        "type": rule_type,
+        "enforcement": "gate" if rule_type in ("gate", "invariant") else "advisory",
         "created": created,
         "expiry_days": 365,
         "expiry_sessions": 365,
     }
-    path.write_text(dump_frontmatter(metadata, body=f"# {cell_id}\n"), encoding="utf-8")
+    path.write_text(dump_frontmatter(metadata, body=f"# {rule_id}\n"), encoding="utf-8")
 
 
 def test_ledger_reader_reports_bad_lines_and_keeps_weights(tmp_path):
@@ -59,7 +59,7 @@ def test_ledger_reader_reports_bad_lines_and_keeps_weights(tmp_path):
         encoding="utf-8",
     )
     legacy = tmp_path / ".aegis" / "evidence"
-    _write_jsonl(legacy / "fitness.jsonl", [{"cell_id": "legacy", "triggered_at": "x"}])
+    _write_jsonl(legacy / "fitness.jsonl", [{"rule_id": "legacy", "triggered_at": "x"}])
     _write_jsonl(legacy / "signals.jsonl", [_signal("legacy", "tp")])
 
     totals = ledger.aggregate(tmp_path)
@@ -97,8 +97,8 @@ def test_lifecycle_uses_weighted_ledger_rows(tmp_path, monkeypatch):
     from aegis_core.telemetry_engine import ledger
     from tests import helpers_adjudication as ha
 
-    cells = tmp_path / ".aegis" / "rules" / "traps"
-    _cell(cells / "canonical.md", "canonical")
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    _rule(rules / "canonical.md", "canonical")
     monkeypatch.setenv("HOME", str(tmp_path.parent / f"{tmp_path.name}-home"))
     ha.merge_to_base(tmp_path)
 
@@ -164,8 +164,8 @@ def test_owned_production_has_no_active_legacy_evidence_paths():
 def test_lifecycle_does_not_demote_a_rule_with_outcome_only_rows(tmp_path):
     from aegis_core.lifecycle.promotion import evaluate_demotions
 
-    cell = tmp_path / ".aegis" / "rules" / "invariants" / "outcome-only.md"
-    _cell(cell, "outcome-only", cell_type="invariant", age_days=120)
+    rule = tmp_path / ".aegis" / "rules" / "invariants" / "outcome-only.md"
+    _rule(rule, "outcome-only", rule_type="invariant", age_days=120)
     # A v1 outcome row with no trigger row is still a trigger and a verdict: not a misfire.
     recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_jsonl(_ledger(tmp_path), [_signal("outcome-only", "tp", recent, weight="0.5")])
@@ -179,8 +179,8 @@ def test_invalid_weights_make_a_row_unusable_and_the_checkpoint_says_so(tmp_path
 
     _write_jsonl(_ledger(tmp_path), [
         _signal("bad-weight", "tp", weight="NaN"),
-        _signal("cell-neg", "tp", weight=-1.5),
-        _signal("cell-huge", "tp", weight=50),
+        _signal("rule-neg", "tp", weight=-1.5),
+        _signal("rule-huge", "tp", weight=50),
         _signal("fine", "tp", weight=1),
     ])
 

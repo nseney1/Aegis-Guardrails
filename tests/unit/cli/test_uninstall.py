@@ -1,7 +1,7 @@
 """`aegis uninstall`: undo what `aegis init` did on this machine, and never touch .aegis/.
 
 It removes the git hook block, the Aegis managed blocks, this workspace's registry
-entry and the hosts' ``aegis`` (and legacy ``soma``) registrations. A host another
+entry and the hosts' ``aegis`` registrations. A host another
 registered workspace still uses keeps its registration unless named with ``--host``.
 """
 from __future__ import annotations
@@ -89,7 +89,7 @@ class TestUndoesInit:
         assert claude.read_bytes() == b"# Claude\r\nmine\r\n"
         assert registry(env) == {"v": 1, "workspaces": []}
         assert json.loads(cfg.read_text(encoding="utf-8")) == {"mcpServers": {"github": {"command": "gh"}}}
-        assert env.runner.calls == [["codex", "mcp", "remove", "aegis"], ["codex", "mcp", "remove", "soma"]]
+        assert env.runner.calls == [["codex", "mcp", "remove", "aegis"]]
         assert snapshot(env.project / ".aegis" / "rules") == rules_before
         assert (env.project / ".aegis" / "config.json").read_bytes() == config_before
 
@@ -240,7 +240,7 @@ class TestRecordedHostsAegisNeverRegisters:
 
         actions = self._actions(env, capsys)
 
-        assert env.runner.calls == [["codex", "mcp", "remove", "aegis"], ["codex", "mcp", "remove", "soma"]]
+        assert env.runner.calls == [["codex", "mcp", "remove", "aegis"]]
         assert actions["codex-cli"][0] == "removed"
         assert {h: actions[h] for h in self.SKIPPED} == {h: ("skipped", d) for h, d in self.SKIPPED.items()}
         assert registry(env) == {"v": 1, "workspaces": []}

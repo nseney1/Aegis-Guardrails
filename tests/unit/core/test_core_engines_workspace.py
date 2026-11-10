@@ -21,17 +21,17 @@ from aegis_core.workspace.base import Workspace
 
 
 @pytest.fixture
-def mock_soma_workspace(tmp_path: Path) -> Workspace:
-    """Create a temporary initialized Soma workspace structure."""
-    cells_dir = tmp_path / ".aegis" / "rules"
-    traps_dir = cells_dir / "traps"
-    walls_dir = cells_dir / "invariants"
-    for d in (traps_dir, walls_dir):
+def mock_aegis_workspace(tmp_path: Path) -> Workspace:
+    """Create a temporary initialized Aegis workspace structure."""
+    rules_dir = tmp_path / ".aegis" / "rules"
+    traps_dir = rules_dir / "traps"
+    invariants_dir = rules_dir / "invariants"
+    for d in (traps_dir, invariants_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # Add a sample cell
-    sample_cell = traps_dir / "test-rule.md"
-    sample_cell.write_text(
+    # Add a sample rule
+    sample_rule = traps_dir / "test-rule.md"
+    sample_rule.write_text(
         "---\n"
         "id: test-rule\n"
         "type: trap\n"
@@ -66,40 +66,38 @@ def mock_soma_workspace(tmp_path: Path) -> Workspace:
 class TestLifecycleWorkspaceInteroperability:
     """Verify lifecycle subsystem functions accept Workspace directly."""
 
-    def test_create_cell_with_workspace_instance(self, mock_soma_workspace: Workspace):
+    def test_create_rule_with_workspace_instance(self, mock_aegis_workspace: Workspace):
         created = create_rule(
             rule_type="trap",
             hypothesis="Always validate user inputs",
-            workspace=mock_soma_workspace,
+            workspace=mock_aegis_workspace,
         )
         assert isinstance(created, Path)
         assert created.is_file()
-        assert str(mock_soma_workspace.rules_dir) in str(created)
+        assert str(mock_aegis_workspace.rules_dir) in str(created)
 
-    def test_derived_view_with_workspace_instance(self, mock_soma_workspace: Workspace):
-        derived = build(mock_soma_workspace)
+    def test_derived_view_with_workspace_instance(self, mock_aegis_workspace: Workspace):
+        derived = build(mock_aegis_workspace)
         assert derived["rules"]["test-rule"]["triggers"] == 1  # the ledger row, not the frontmatter
 
-    def test_run_cell_selection_with_workspace_instance(self, mock_soma_workspace: Workspace):
-        res = run_rule_selection(workspace=mock_soma_workspace, execute=False)
+    def test_run_rule_selection_with_workspace_instance(self, mock_aegis_workspace: Workspace):
+        res = run_rule_selection(workspace=mock_aegis_workspace, execute=False)
         assert (res["status"], res["candidates"]) == ("nothing_to_archive", [])
 
-    def test_parsers_and_promotions_with_workspace_instance(self, mock_soma_workspace: Workspace):
-        rules = load_rules(mock_soma_workspace)
+    def test_parsers_and_promotions_with_workspace_instance(self, mock_aegis_workspace: Workspace):
+        rules = load_rules(mock_aegis_workspace)
         assert rules.get("test-rule") is not None
 
-        fits = for_rules(mock_soma_workspace, rules.rules)
+        fits = for_rules(mock_aegis_workspace, rules.rules)
         assert fits["test-rule"].tp == 1
 
-        cand_file, ctype = find_rule_file(mock_soma_workspace, "test-rule")
+        cand_file, ctype = find_rule_file(mock_aegis_workspace, "test-rule")
         assert cand_file is not None
         assert cand_file.is_file()
         assert ctype == "trap"
 
-        promotions = evaluate_promotions(mock_soma_workspace)
+        promotions = evaluate_promotions(mock_aegis_workspace)
         assert isinstance(promotions, list)
 
-        demotions = evaluate_demotions(mock_soma_workspace)
+        demotions = evaluate_demotions(mock_aegis_workspace)
         assert isinstance(demotions, list)
-
-

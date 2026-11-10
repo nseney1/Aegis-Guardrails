@@ -14,8 +14,8 @@
   aegis check --write-baseline        record the current findings (aegis_core.baseline)
   aegis check --prune-baseline        drop the baseline entries whose findings are fixed
   aegis check --record [--tests] [--base REF] [--json]
-                                      bind the work tree to a git tree, run Layer 1 (and the user-scope
-                                      tests.command) on a snapshot of it, write one ledger check row
+                                      bind the work tree to a git tree, run Layer 1 and optional language tests
+                                      (or the user-scope tests.command) on a snapshot, write one ledger check row
   aegis check --card [--json]         the day-0 card (aegis_core.card); changes nothing
   aegis check --calibration [--json]  the calibration of the logged Layer 2 predictions per backend and
                                       observable kind (.aegis/state/arbiter_predictions.jsonl); log-only
@@ -45,6 +45,11 @@ from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
 __all__ = ["CheckCommand", "run_check"]
+
+
+# Drift contract: tests/unit/cli/test_check_explain.py::test_record_language_hint_set_matches_testplans.
+_RECORD_TEST_LANGUAGES = frozenset(("ts", "go", "rust"))
+_RECORD_FIELD_MAX_CHARS = 8 * 1024
 
 
 # Every other mode and the options a --record run would silently ignore.
@@ -78,6 +83,115 @@ def _record_conflict(args: argparse.Namespace) -> str:
     return next(iter(_given(args, _NOT_WITH_RECORD)), "")
 
 
+def _test_refusal(tests: dict) -> str:
+    """Explain the TestsRun evidence predicate, including legacy/global receipts."""
+    if tests.get("timed_out"):
+        return "timeout"
+    if not tests.get("complete", True):
+        return "incomplete_report"
+    if tests.get("failed", 0):
+        return "failed_tests"
+    if not tests.get("passed", 0):
+        return "no_tests_passed"
+    return "nonzero_exit" if tests.get("exit", 0) else ""
+
+
+def _record_components(row: dict, *, failing: bool):
+    """Select failures before advisory notes without copying omitted entries."""
+    tests = row.get("tests")
+    if tests and failing:
+        languages = tests.get("languages")
+        if languages:
+            for language in languages:
+                if not language.get("evidence"):
+                    yield "tests", language
+        elif _test_refusal(tests):
+            yield "tests", tests
+    for evidence in row.get("layer1", {}).get("evidence", ()):
+        if (not evidence.get("verdict")) == failing and (failing or evidence.get("reason")):
+            yield "Layer 1", evidence
+
+
+def _receipt_text(value: str, limit: int = 120, *, identifier: bool = False) -> str:
+    # Omit the whole oversized field: controls could expose a token cut by a raw slice.
+    if len(value) > _RECORD_FIELD_MAX_CHARS:
+        return "[diagnostic omitted: too_large]"
+
+    from aegis_cli import sanitize_display
+    from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets, redact_insight_text
+
+    # Controls can split a secret; canonicalize the whole field before any redaction or cut.
+    canonical = sanitize_display(value, max_len=None)
+    if identifier:
+        # Keep repository names intact while still masking known credentials, keys and URLs.
+        for pattern, replacement in TOKEN_REDACTIONS:
+            canonical = pattern.sub(replacement, canonical)
+        redacted = redact_command_secrets(canonical)
+    else:
+        # A display-sized max_len would let the redactor discard input before masking it.
+        redacted = redact_insight_text(canonical, max_len=max(len(canonical), limit))
+    return redacted[:limit]
+
+
+def _record_config_hint(reason: str, language: str = "", *, detail: str = "", incomplete_errors=()) -> str:
+    if reason == "no_driver:.go" or (reason == "no_driver" and language == "go"):
+        return "; config: .aegis/config.json: ast.packaged_drivers"
+    if reason.startswith("no_driver:") and len(reason) <= 27:
+        extension = reason[len("no_driver:"):]
+        if re.fullmatch(r"\.[a-zA-Z0-9_+-]{1,16}", extension):
+            return f"; config: ~/.aegis/config.json: drivers.{extension[1:]}"
+    prefix = f"tests.languages.{language}" if language in _RECORD_TEST_LANGUAGES else "tests"
+    if reason == "tests_runner_not_configured" and language == "ts" and detail in (
+            "TS/JS requires a user-scoped runner", "tests_runner_not_configured: TS/JS requires a user-scoped runner"):
+        return f"; config: ~/.aegis/config.json: {prefix}.command"
+    if (reason == "timeout" and prefix != "tests" and not detail
+            and "deadline_exceeded" not in incomplete_errors):
+        return f"; config: ~/.aegis/config.json: {prefix}.timeout_s"
+    return ""
+
+
+def _record_component_text(kind: str, component: dict) -> str:
+    reason = component.get("reason", "")
+    if kind == "Layer 1":
+        tool = _receipt_text(component.get("tool", "unknown"), identifier=True)
+        target = _receipt_text(component.get("target", ""), identifier=True)
+        config = _record_config_hint(reason)
+        return f"Layer 1: {tool} ({target}): {_receipt_text(reason) or 'finding'}{config}"
+    language = component.get("language", "")
+    label = f"tests[{_receipt_text(language, 40)}]" if language else "tests"
+    if language == "python" or reason in ("", "ok", "failed_tests", "no_tests_passed"):
+        reason = _test_refusal(component) or "unavailable"
+    config = _record_config_hint(reason, language, detail=component.get("detail", ""),
+                                 incomplete_errors=component.get("incomplete_errors", ()))
+    detail = _receipt_text(component.get("detail", ""), 160)
+    return f"{label}: {_receipt_text(reason, 80)}{config}" + (f"; {detail}" if detail else "")
+
+
+def _print_record_receipt(row: dict) -> None:
+    """Keep successful receipts concise; bound failure detail to eight single-line rows."""
+    tests = row.get("tests")
+    detail = f", tests {tests['passed']} passed, {tests['failed']} failed" if tests else ", Layer 1 only"
+    print(f"recorded: tree {row['tree'][:12]} {'passed' if row['passed'] else 'FAILED'}{detail}"
+          + ("; protected paths changed: no credit until approved" if row["protected_changed"] else ""))
+    if row["passed"]:
+        return
+    layer1 = row.get("layer1", {})
+    if layer1.get("findings"):
+        print(f"  Layer 1: {layer1['findings']} finding(s)")
+    shown = 0
+    for failing in (True, False):
+        omitted = 0
+        for kind, component in _record_components(row, failing=failing):
+            if shown < 8:
+                # Each field is already canonical and redacted; only bound the assembled line.
+                print("  " + _record_component_text(kind, component)[:398])
+                shown += 1
+            else:
+                omitted += 1
+        if omitted:
+            print(f"  {omitted} {'failing' if failing else 'advisory'} diagnostic(s) omitted")
+
+
 def _run_record(args: argparse.Namespace) -> int:
     """`aegis check --record [--tests]`: 0 recorded and passed, 1 failed or could not run, 2 usage."""
     from aegis_cli import sanitize_display
@@ -103,10 +217,7 @@ def _run_record(args: argparse.Namespace) -> int:
                         tree=outcome.binding.as_dict() if outcome.binding else None)
         print(json.dumps(document, indent=2))
     elif outcome.status == "recorded":
-        tests = row.get("tests")
-        detail = f", tests {tests['passed']} passed, {tests['failed']} failed" if tests else ", Layer 1 only"
-        print(f"recorded: tree {row['tree'][:12]} {'passed' if row['passed'] else 'FAILED'}{detail}"
-              + ("; protected paths changed: no credit until approved" if row["protected_changed"] else ""))
+        _print_record_receipt(row)
         if outcome.hint:
             print(f"hint: {outcome.hint}")
     else:
@@ -512,9 +623,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--tests",
             action="store_true",
-            help="With --record: also run the test command from the user-scope config (tests.command in "
-            "~/.aegis/config.json, default python -m pytest, never the repository's) in the snapshot with a "
-            "fixed environment; exit 5 or zero passed tests is never evidence",
+            help="With --record: run automatically selected languages in a fixed snapshot environment; user-scope "
+            "tests.command takes precedence and runs once, never the repository's. Python defaults to pytest; "
+            "native runners: user-scope tests.languages.{go,rust,ts}.command (required for TS/JS). See docs/languages.md; exit 5 or zero passed is never evidence",
         )
         parser.add_argument("--format", choices=("text", "json", "github", "sarif"), default="text",
                             help="Output format. github|sarif: workflow-command annotations or SARIF 2.1.0 for --ci or "
@@ -635,9 +746,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--coverage",
             action="store_true",
-            help="With --ci only: report-only diff coverage, the share of the executable lines changed since "
-            "merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes "
-            "the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
+            help="With --ci only: report-only diff coverage by language. Python uses pytest-based tests.command; "
+            "Go defaults to go test -coverprofile; configure native coverage with coverage.languages.ts.command "
+            "or coverage.languages.rust.command (LCOV), in user scope only. See docs/languages.md. Exit unchanged; unavailable: UNVERIFIED",
         )
         parser.add_argument(
             "--perf",

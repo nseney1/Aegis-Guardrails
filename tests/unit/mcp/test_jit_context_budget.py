@@ -11,16 +11,16 @@ from aegis_core.scan import estimate_tokens, scan as express
 
 class TestJITContextBudgetClamping(unittest.TestCase):
     def setUp(self):
-        self.test_dir = tempfile.mkdtemp(prefix="soma_test_jit_budget_")
+        self.test_dir = tempfile.mkdtemp(prefix="aegis_test_jit_budget_")
         self.ws = Path(self.test_dir)
         self.rules_dir = self.ws / ".aegis" / "rules"
         (self.rules_dir / "traps").mkdir(parents=True, exist_ok=True)
         (self.rules_dir / "invariants").mkdir(parents=True, exist_ok=True)
 
-        # Helper to create a cell with custom length
-        self._create_cell(
+        # Helper to create a rule with custom length
+        self._create_rule(
             "invariants",
-            "wall-security.md",
+            "invariant-security.md",
             frontmatter={
                 "type": "invariant",
                 "enforcement": "gate",
@@ -30,9 +30,9 @@ class TestJITContextBudgetClamping(unittest.TestCase):
             },
             body="Security guidelines detailed instructions " * 15,  # ~60 words -> ~80 tokens
         )
-        self._create_cell(
+        self._create_rule(
             "traps",
-            "vacuole-style.md",
+            "trap-style.md",
             frontmatter={
                 "type": "trap",
                 "enforcement": "advisory",
@@ -42,9 +42,9 @@ class TestJITContextBudgetClamping(unittest.TestCase):
             },
             body="Code style conventions detailed instructions " * 30,  # ~120 words -> ~160 tokens
         )
-        self._create_cell(
+        self._create_rule(
             "traps",
-            "vacuole-perf.md",
+            "trap-perf.md",
             frontmatter={
                 "type": "trap",
                 "enforcement": "advisory",
@@ -58,7 +58,7 @@ class TestJITContextBudgetClamping(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _create_cell(self, subtype: str, filename: str, frontmatter: dict, body: str):
+    def _create_rule(self, subtype: str, filename: str, frontmatter: dict, body: str):
         path = self.rules_dir / subtype / filename
         fm_lines = ["---"]
         for k, v in frontmatter.items():
@@ -128,21 +128,21 @@ class TestJITContextBudgetClamping(unittest.TestCase):
             res = express(str(self.ws), changed_files=["main.py"])
             self.assertNotEqual(res["stats"].get("max_tokens_budget"), 180)
 
-    def test_mandatory_cells_prioritized_under_tight_budget(self):
-        """Mandatory wall/gate cells must be included first before advisory cells under a tight budget."""
-        wall_only = express(str(self.ws), changed_files=["main.py"], budget=1, max_tokens=10_000)
-        self.assertEqual([c["name"] for c in wall_only["relevant_rules"]], ["wall-security"])
+    def test_mandatory_rules_prioritized_under_tight_budget(self):
+        """Mandatory invariant/gate rules must be included first before advisory rules under a tight budget."""
+        invariant_only = express(str(self.ws), changed_files=["main.py"], budget=1, max_tokens=10_000)
+        self.assertEqual([c["name"] for c in invariant_only["relevant_rules"]], ["invariant-security"])
 
-        # Enough for the wall and the "2 more rules omitted" notice (~17 tokens as sent),
-        # far short of any advisory cell: every advisory cell is omitted, never swapped in.
-        res = express(str(self.ws), changed_files=["main.py"], max_tokens=wall_only["stats"]["estimated_tokens"] + 30)
+        # Enough for the invariant and the "2 more rules omitted" notice (~17 tokens as sent),
+        # far short of any advisory rule: every advisory rule is omitted, never swapped in.
+        res = express(str(self.ws), changed_files=["main.py"], max_tokens=invariant_only["stats"]["estimated_tokens"] + 30)
         relevant_names = [c["name"] for c in res["relevant_rules"]]
-        self.assertEqual(relevant_names, ["wall-security"])
+        self.assertEqual(relevant_names, ["invariant-security"])
         self.assertTrue(res["stats"]["clamped"])
         self.assertEqual(res["stats"]["omitted"], 2)
 
-    def test_a_gate_that_does_not_fit_is_never_displaced_by_an_advisory_cell(self):
-        """Under a budget too small for the wall, a smaller advisory cell is not staged in its place."""
+    def test_a_gate_that_does_not_fit_is_never_displaced_by_an_advisory_rule(self):
+        """Under a budget too small for the invariant, a smaller advisory rule is not staged in its place."""
         res = express(str(self.ws), changed_files=["main.py"], max_tokens=140)
         self.assertEqual(res["relevant_rules"], [])
         self.assertEqual(res["stats"]["omitted"], 3)

@@ -14,6 +14,7 @@ target or file namespaces; infrastructure errors never supply failed test identi
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import os
 from pathlib import Path
 import posixpath
@@ -315,10 +316,10 @@ def _commits_meta(cwd: str, merge_commit: str, head_commit: str) -> List[_Commit
     return metas
 
 
-def _resolve_commit_exemption(root: str, head_commit: str, base_commit: str, meta: _CommitMeta) -> Tuple[Optional[human_gate.Approval], Optional[str]]:
+def _resolve_commit_exemption(meta: _CommitMeta, find: Callable[[str], Optional[human_gate.Approval]]) -> Tuple[Optional[human_gate.Approval], Optional[str]]:
     """(the valid exemption, None), or (None, the code of a rejected one naming this commit)."""
     try:
-        found = human_gate.find_test_exemption(root, head_commit, base_commit, meta.oid)
+        found = find(meta.oid)
     except (human_gate.HumanGateError, gitsafe.GitError):
         return None, None
     return (found, None) if found is None or found.valid else (None, found.code)
@@ -366,23 +367,128 @@ _DETAILS = {
 }
 
 
-def _belongs(test_id: str, module: str) -> bool:
-    cls = test_id.partition("::")[0]
-    return cls == module or cls.startswith(module + ".")
+class _ModulePrefixes:
+    """A radix trie with O(modules) nodes and compressed substring edge labels."""
+
+    def __init__(self, modules: Iterable[str]):
+        self.root: Dict[str, Any] = {}
+        for module in modules:
+            self._add(module)
+        # Construction uses source spans so repeated edge splits never copy a long
+        # suffix repeatedly. Materialize each final label only once, without recursion.
+        pending = [self.root]
+        while pending:
+            for edge in pending.pop().values():
+                text, start, end, value, children = edge
+                edge[:] = [text[start:end], value, children]
+                if children:
+                    pending.append(children)
+
+    def _add(self, module: str) -> None:
+        children, start = self.root, 0
+        while True:
+            end = module.find(".", start)
+            end = len(module) if end < 0 else end
+            key = module[start:end]
+            edge = children.get(key)
+            if edge is None:
+                children[key] = [module, start, len(module), module, {}]
+                return
+            text, left, right, value, descendants = edge
+            here, there = end, left + end - start
+            while here < len(module) and there < right:
+                next_here = module.find(".", here + 1)
+                next_here = len(module) if next_here < 0 else next_here
+                next_there = text.find(".", there + 1, right)
+                next_there = right if next_there < 0 else next_there
+                if next_here - here != next_there - there or not module.startswith(text[there + 1:next_there], here + 1):
+                    break
+                here, there = next_here, next_there
+            if there == right:
+                if here == len(module):
+                    edge[3] = module
+                    return
+                children, start = descendants, here + 1
+                continue
+            split = there + 1
+            dot = text.find(".", split, right)
+            children = {text[split:right if dot < 0 else dot]: [text, split, right, value, descendants]}
+            edge[2:] = [there, module if here == len(module) else None, children]
+            if here == len(module):
+                return
+            start = here + 1
+
+    def matches(self, classname: str) -> Iterable[str]:
+        children, start = self.root, 0
+        while children:
+            if len(children) == 1:
+                label, value, children = next(iter(children.values()))
+            else:
+                end = classname.find(".", start)
+                edge = children.get(classname[start:len(classname) if end < 0 else end])
+                if edge is None:
+                    return
+                label, value, children = edge
+            if not classname.startswith(label, start):
+                return
+            start += len(label)
+            if start < len(classname) and classname[start] != ".":
+                return
+            if value is not None:
+                yield value
+            if start == len(classname):
+                return
+            start += 1
 
 
-def _judge(test_files: Sequence[str], head: Any, base: Any) -> Tuple[str, Tuple[str, ...]]:
+class _PythonResults:
+    """Attribute shared snapshot identities only to the wanted test modules."""
+
+    def __init__(self, head: Any, base: Any, wanted: Set[str]):
+        self.head, self.base = head, base
+        self.suite_error = any(error.startswith("<suite:") for error in head.collection_errors)
+        self.passed: Dict[str, Set[str]] = {}
+        self.failed: Dict[str, Set[str]] = {}
+        self.f2p: Dict[str, Set[str]] = {}
+        # Radix nodes are O(errors + wanted modules), with substring labels; the
+        # classname cache holds O(unique classnames + actual wanted associations).
+        modules, errors = _ModulePrefixes(wanted), None
+        attribution: Dict[str, Tuple[Set[str], bool]] = {}
+        for ids, index in ((head.passed_ids, self.passed), (head.failed_ids, self.failed)):
+            for identity in ids:
+                module = identity.partition("::")[0]
+                if module not in attribution:
+                    prefixes = set(modules.matches(module))
+                    if prefixes and errors is None:
+                        errors = _ModulePrefixes(base.collection_errors)
+                    collection_failed = bool(prefixes) and next(iter(errors.matches(module)), None) is not None
+                    attribution[module] = prefixes, collection_failed
+                prefixes, collection_failed = attribution[module]
+                if not prefixes:
+                    continue
+                f2p = index is self.passed and (identity in base.failed_ids or collection_failed)
+                for prefix in prefixes:
+                    index.setdefault(prefix, set()).add(identity)
+                    if f2p:
+                        self.f2p.setdefault(prefix, set()).add(identity)
+
+    @staticmethod
+    def select(index: Dict[str, Set[str]], modules: Set[str]) -> Set[str]:
+        return set().union(*(index.get(module, ()) for module in modules))
+
+
+def _judge(test_files: Sequence[str], results: _PythonResults) -> Tuple[str, Tuple[str, ...]]:
     """(reason, fail-to-pass ids) of one commit's Python test files in the head and base runs."""
+    head, base = results.head, results.base
     for run in (head, base):
         if getattr(run, "reason", None):
             return ("timeout" if head.timed_out or base.timed_out else run.reason), ()
     modules = {p[:-3].replace("/", ".") for p in test_files}
-    mine = lambda ids: {i for i in ids if any(_belongs(i, m) for m in modules)}  # noqa: E731
-    f2p = tuple(sorted(i for i in mine(head.passed_ids)
-                       if i in base.failed_ids or any(_belongs(i, e) for e in base.collection_errors)))
-    seen = mine(head.passed_ids) | mine(head.failed_ids) | (modules & head.collection_errors)
-    bad = bool(mine(head.failed_ids) or modules & head.collection_errors
-               or any(e.startswith("<suite:") for e in head.collection_errors))
+    passed = results.select(results.passed, modules)
+    failed = results.select(results.failed, modules)
+    f2p = tuple(sorted(results.select(results.f2p, modules)))
+    seen = passed | failed | (modules & head.collection_errors)
+    bad = bool(failed or modules & head.collection_errors or results.suite_error)
     if head.timed_out or base.timed_out:
         reason = "timeout"
     else:
@@ -390,8 +496,8 @@ def _judge(test_files: Sequence[str], head: Any, base: Any) -> Tuple[str, Tuple[
     return reason, f2p
 
 
-def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_commit: str,
-                         runs: Optional[Tuple[Any, Any]], native: Optional[Dict[str, Any]] = None,
+def _evaluate_fix_commit(meta: _CommitMeta, find: Callable[[str], Optional[human_gate.Approval]],
+                         runs: Optional[_PythonResults], native: Optional[Dict[str, Any]] = None,
                          configured: bool = False) -> Tuple[CommitRegression, Optional[RegressionFinding]]:
     source_files = tuple(p for p in meta.changed_files if is_source_file(p))
     test_files = tuple(p for p in meta.present_files if is_python_test_file(p))
@@ -404,10 +510,10 @@ def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_co
             if row["reason"] != "no_test_changes":
                 rows.append(row)
     reasons, f2p = [], ()
-    if configured and not test_files and runs and getattr(runs[0], "reason", None):
-        reasons.append(runs[0].reason)
+    if configured and not test_files and runs and getattr(runs.head, "reason", None):
+        reasons.append(runs.head.reason)
     if test_files:
-        py_reason, f2p = ("no_tests_collected", ()) if runs is None else _judge(test_files, *runs)
+        py_reason, f2p = ("no_tests_collected", ()) if runs is None else _judge(test_files, runs)
         reasons.append(py_reason)
     if configured and other_tests:
         reasons.append("tests_runner_unsupported")
@@ -415,8 +521,7 @@ def _evaluate_fix_commit(root: str, meta: _CommitMeta, head_commit: str, base_co
     reason = next((value for value in reasons if value != "ok"), "ok" if reasons else "no_test_changes")
     if reason == "ok":
         return CommitRegression(meta.oid, meta.subject, "passed", "ok", f2p, meta.no_test_reason, languages=tuple(rows)), None
-    # Only a commit that did not pass needs its exemption: each lookup rescans the whole range.
-    approval, rejected = _resolve_commit_exemption(root, head_commit, base_commit, meta)
+    approval, rejected = _resolve_commit_exemption(meta, find)
     nt_note = f" (its test exemption was rejected: {rejected})" if rejected else ""
     if meta.no_test_reason:
         nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
@@ -481,6 +586,16 @@ def check_ci_regressions(
             if selected else None)
     native = (run_native_regressions(root, workspace_path, merge_commit, head_commit, groups, say,
                                     timeout=timeout if timeout != DEFAULT_TIMEOUT_S else None) if groups and command is None else {})
-    results = [_evaluate_fix_commit(root, meta, head_commit, base_commit, runs, native, command is not None) for meta in fix_metas]
+    @functools.lru_cache(maxsize=1)
+    def exemption_finder() -> Callable[[str], Optional[human_gate.Approval]]:
+        try:
+            return human_gate.exemption_finder(root, head_commit, base_commit)
+        except (human_gate.HumanGateError, gitsafe.GitError):
+            return lambda _oid: None
+
+    wanted = {path[:-3].replace("/", ".") for path in judged}
+    indexed = _PythonResults(*runs, wanted) if runs is not None else None
+    results = [_evaluate_fix_commit(meta, lambda oid: exemption_finder()(oid), indexed, native, command is not None)
+               for meta in fix_metas]
     return RegressionReport(DEFAULT_TIER, tuple(res for res, _finding in results),
                             tuple(f for _res, f in results if f is not None), tuple(untested))

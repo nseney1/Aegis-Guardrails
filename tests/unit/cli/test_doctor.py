@@ -146,18 +146,18 @@ def test_cli_check_prints_zsh_remedy_when_unresolvable(tmp_path, monkeypatch, ca
     assert "-m aegis_cli" not in out
 
 
-def test_cli_check_never_says_aegis_is_where_only_a_v3_soma_script_is(tmp_path, monkeypatch, capsys,
+def test_cli_check_never_says_aegis_is_where_only_an_unrelated_script_is(tmp_path, monkeypatch, capsys,
                                                                       real_lookup):
     bindir = tmp_path / ".local" / "bin"
     bindir.mkdir(parents=True)
-    (bindir / "soma").write_text("#!/bin/sh\n")
+    (bindir / "foreign-tool").write_text("#!/bin/sh\n")
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.setattr("aegis_cli.pathcheck.default_candidates", lambda: [str(bindir)])
     assert _check_cli_resolvable(tmp_path / "ws") is False
     out = capsys.readouterr().out
     assert "The 'aegis' command is not installed" in out
     assert "pip install aegis-guardrails" in out
-    assert str(bindir) not in out and "soma" not in out
+    assert str(bindir) not in out and "foreign-tool" not in out
 
 
 def test_cli_check_silent_remedy_when_resolvable(tmp_path, monkeypatch, capsys, real_lookup):
@@ -352,7 +352,6 @@ def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, c
     assert "native JavaScript/TypeScript (in-process)" in out
 
 
-
 def test_run_doctor_drivers_flag(tmp_path):
     # The check only reports; provisioning goes through the backed-up --fix plan.
     with patch("aegis_cli.doctor._check_ast_drivers") as mock_check:
@@ -448,7 +447,7 @@ def test_check_precommit_hook_all_branches(tmp_path, capsys):
     assert "Pre-commit hook uses an old block" in capsys.readouterr().out
 
     # 3. Old hook format
-    hook_file.write_text("#!/bin/sh\n# >>> aegis pre-commit >>>\nsoma checkpoint --pre-commit\n# <<< aegis pre-commit <<<\n", encoding="utf-8")
+    hook_file.write_text("#!/bin/sh\n# >>> aegis pre-commit >>>\naegis checkpoint --pre-commit\n# <<< aegis pre-commit <<<\n", encoding="utf-8")
     assert _check_precommit_hook(tmp_path) is False
     assert "Pre-commit hook uses an old block" in capsys.readouterr().out
 
@@ -480,7 +479,6 @@ def test_doctor_json_mode_and_warning_counts(tmp_path, monkeypatch, capsys):
     assert "warnings" in payload["summary"]
     assert payload["summary"]["failed"] == 0
     assert {c["id"] for c in payload["checks"]} >= {"python_version", "rules", "cli_on_path"}
-
 
 
 def test_doctor_fix_refuses_a_symlinked_config_without_crashing(tmp_path, capsys):

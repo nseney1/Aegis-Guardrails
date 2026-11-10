@@ -92,7 +92,8 @@ def parse_allow_comments(source: str, language: str = "python") -> Dict[int, Lis
         return {}
     by_line: Dict[int, List[Dict[str, Any]]] = {}
     try:
-        for tok_type, tok_str, (srow, _), _, _ in tokenize.generate_tokens(io.StringIO(source).readline):
+        # Match the parser's universal newlines, including CR-only source.
+        for tok_type, tok_str, (srow, _), _, _ in tokenize.generate_tokens(io.StringIO(source, newline=None).readline):
             if tok_type == tokenize.COMMENT:
                 _add_allow(by_line, srow, tok_str)
     except (tokenize.TokenError, IndentationError, SyntaxError):
@@ -274,13 +275,14 @@ def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, impo
     except Exception as exc:
         raise ASTExtractionError(str(fp), f"{type(exc).__name__}: {exc}") from exc
     meta = getattr(normalized_ast, "metadata", None)
-    if isinstance(meta, dict) and isinstance(meta.get("decorators"), (list, tuple, set)):
+    collected = isinstance(meta, dict) and isinstance(meta.get("decorators"), (list, tuple, set))
+    if collected:
         raw_decs.extend(meta["decorators"])
     for defn in getattr(normalized_ast, "definitions", ()) or ():
         d_decs = getattr(defn, "decorators", None) if not isinstance(defn, dict) else defn.get("decorators")
         if isinstance(d_decs, (list, tuple, set)):
             raw_decs.extend(d_decs)
-    if not raw_decs and fp.endswith(".py") and os.path.isfile(fp):
+    if not raw_decs and not collected and fp.endswith(".py") and os.path.isfile(fp):
         try:
             raw_decs.extend(_extract_python_decorators_from_file(fp))
         except Exception as exc:
@@ -440,7 +442,7 @@ def evaluate_forbid_ast_delta(spec: Any, head_ast: Any, base_ast: Any = None, *,
 
 
 def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional[Union[str, Path]] = None, code: Optional[str] = None, ast_runner: Any = None, confine_root: Optional[Union[str, Path]] = None) -> Optional[NormalizedAST]:
-    from aegis_core.ast.drivers.python import parse_python_ast, read_python_source
+    from aegis_core.ast.drivers.python import normalize_python_ast, read_python_source
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
@@ -456,16 +458,16 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
         if ext == ".py":
             source_text = code if code is not None else read_python_source(path_str)
             tree = ast.parse(source_text, filename=path_str)
-            norm_ast = parse_python_ast(source_text, file_path=path_str)
+            norm_ast = normalize_python_ast(tree, path_str)
             decs = _extract_python_decorators_from_tree(tree)
             allows = {
                 line: [{**entry, "rules": sorted(entry["rules"]) if entry["rules"] is not None else None}
                        for entry in entries]
                 for line, entries in parse_allow_comments(source_text).items()
             }
-            if decs or allows:
-                meta = {**norm_ast.metadata, **({"decorators": list(decs)} if decs else {}), **({"allow_comments": allows} if allows else {})}
-                object.__setattr__(norm_ast, "metadata", meta)
+            # An empty collection is authoritative too: never substitute working-tree bytes.
+            meta = {**norm_ast.metadata, "decorators": list(decs), **({"allow_comments": allows} if allows else {})}
+            object.__setattr__(norm_ast, "metadata", meta)
             return norm_ast
         if ast_runner is None:
             from aegis_core.ast.runner import ASTDriverRunner

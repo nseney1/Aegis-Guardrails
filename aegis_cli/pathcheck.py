@@ -176,7 +176,7 @@ def default_candidates() -> list[str]:
 def scripts_dir(candidates: Iterable[str] | None = None, cmd_name: str = "aegis") -> str | None:
     """First candidate directory that contains the ``cmd_name`` console script.
 
-    Only that name counts: a leftover v3 ``soma`` script is not where aegis is.
+    Only that exact console-script name counts; unrelated executables are ignored.
     """
     for directory in (default_candidates() if candidates is None else candidates):
         for name in (cmd_name, cmd_name + ".exe"):

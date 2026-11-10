@@ -19,8 +19,8 @@ RETRACTED = (
     "ungameable",
     "deterministic set-algebra arbiter",
     "< 1.0% waste rate",
-    "require('soma-governance')",
-    'require("soma-governance")',
+    "require('aegis-governance')",
+    'require("aegis-governance")',
 )
 
 
