@@ -10,6 +10,7 @@ The Arbiter answers three questions:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 from aegis_core.stats import wilson_ci
@@ -189,15 +190,63 @@ def _vendor_of(label: Optional[str]) -> Optional[str]:
     return next((vendor for key, vendor in _VENDOR_KEYS if low and key in low), None)
 
 
-def vendor_warning(declared: Optional[str], generator_label: Optional[str]) -> str:
-    """The T6 cross-vendor advisory: the user's declared arbiter vendor against the generating
-    host's label. '' when nothing is declared or the two differ."""
-    if not (declared or "").strip():
+@dataclass(frozen=True)
+class ModelProvenance:
+    """Caller-recorded family and model IDs, normalized without host inference.
+
+    Family uses MR-3's choice.family vocabulary (aegis_core.model_select), describing
+    the model's family, never the serving endpoint (bedrock, openrouter or a proxy).
+    Each ID must be a nonblank string of at most 256 characters before and after
+    normalization (strip and casefold); otherwise construction
+    raises ValueError('invalid_model_provenance'). These are attribution, not authentication.
+    """
+
+    family: str
+    model: str
+
+    def __post_init__(self) -> None:
+        for name in ("family", "model"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not 0 < len(value) <= 256:
+                raise ValueError("invalid_model_provenance")
+            normalized = value.strip().casefold()
+            if not normalized or len(normalized) > 256:
+                raise ValueError("invalid_model_provenance")
+            object.__setattr__(self, name, normalized)
+
+
+def vendor_warning(
+    declared: Optional[str], generator_label: Optional[str], *,
+    reviewer_provenance: Optional[ModelProvenance] = None,
+    generator_provenance: Optional[ModelProvenance] = None,
+) -> str:
+    """The T6 advisory: resolve each side from its provenance, else its label.
+
+    A shared family or recorded model ID yields the same-vendor advisory. Explicit
+    families are never inferred from endpoints. A lone explicit family must exactly
+    match a canonical label-rule vendor; otherwise independence is unverified.
+    With no provenance, the declared-vendor/
+    host-label rule is unchanged, including its unknown-label asymmetry.
+    The result never affects the verdict.
+    A non-ModelProvenance record raises ValueError('invalid_model_provenance').
+    RF-26b owns CLI wiring and adapter tolerance of that refusal to preserve Layer 1 status.
+    """
+    for record in (reviewer_provenance, generator_provenance):
+        if record is not None and not isinstance(record, ModelProvenance):
+            raise ValueError("invalid_model_provenance")
+    if reviewer_provenance is None and not (declared or "").strip():
         return ""
-    generator = _vendor_of(generator_label)
+    if (reviewer_provenance is None) != (generator_provenance is None):
+        explicit = reviewer_provenance if reviewer_provenance is not None else generator_provenance
+        if explicit.family not in {vendor for _, vendor in _VENDOR_KEYS}:
+            return "Vendor independence unverified: explicit family is not a canonical vendor."
+    generator = generator_provenance.family if generator_provenance is not None else _vendor_of(generator_label)
     if generator is None:
         return "Vendor independence unverified: generating host is unknown."
-    if _vendor_of(declared) == generator:
+    reviewer = reviewer_provenance.family if reviewer_provenance is not None else _vendor_of(declared)
+    same_model = (reviewer_provenance is not None and generator_provenance is not None
+                  and reviewer_provenance.model == generator_provenance.model)
+    if reviewer == generator or same_model:
         return "Same-vendor arbiter provides prompt isolation only, not model independence."
     return ""
 

@@ -733,9 +733,11 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
 
     Re-entrant per thread, bounded by ``timeout`` seconds: ``locked``'s primitive
     (``_hold``) on its own key and a 0o600 lock file, without participating in
-    workspace/shared lock ordering. With ``dir_fd``, open only the basename relative
-    to that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks
-    and nonregular files; the caller retains ownership of the descriptor.
+    workspace/shared lock ordering. With ``flock``, both acquisition modes identify
+    reentrancy by the device and inode of the opened file; other lock primitives
+    retain pathname identity. With ``dir_fd``, open only the basename relative to
+    that caller-owned POSIX directory descriptor, refusing symlinks, hardlinks and
+    nonregular files; the caller retains ownership of the descriptor.
     """
     target = Path(os.fspath(lock_path))
     if dir_fd is not None:
@@ -745,9 +747,21 @@ def file_lock(lock_path: Path, timeout: float = 5.0, *, dir_fd: Optional[int] = 
     if target.parent.is_symlink():
         raise _link_error(target.parent)
     target.parent.mkdir(parents=True, exist_ok=True)
-    key = f"file:{os.path.normcase(real_path(target))}"
-    with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
-        yield
+    if fcntl is None:
+        # Byte-range locks belong to individual Windows streams, which can share
+        # a device/inode pair. Preserve their distinct pathname keys and opener.
+        key = f"file:{os.path.normcase(real_path(target))}"
+        with _hold(target, key, timeout, shared=False, ordered=False, mode=_PRIVATE_FILE_MODE):
+            yield
+        return
+    fd = _open_regular(target, os.O_RDWR | os.O_CREAT, mode=_PRIVATE_FILE_MODE)
+    try:
+        info = os.fstat(fd)
+        key = f"file-at:{info.st_dev}:{info.st_ino}"
+        with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
+            yield
+    finally:
+        os.close(fd)
 
 
 @contextmanager
@@ -757,7 +771,6 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
         raise ValueError("dir_fd requires a POSIX directory descriptor")
     if not stat.S_ISDIR(os.fstat(directory).st_mode):
         raise ValueError("dir_fd requires a directory descriptor")
-    key = f"file:{os.path.normcase(real_path(target))}"
     flags = os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC
     try:
         fd = os.open(target.name, flags, _PRIVATE_FILE_MODE, dir_fd=directory)
@@ -775,6 +788,9 @@ def _file_lock_at(target: Path, timeout: float, directory: int) -> Iterator[None
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise PathTraversalError(f"refusing to use {target}: not a private regular file", path=str(target))
+        # The pathname can be redirected after the caller anchors its directory.
+        # Reentrancy must identify the file actually opened through that descriptor.
+        key = f"file-at:{info.st_dev}:{info.st_ino}"
         _make_private(fd, _PRIVATE_FILE_MODE)
         with _hold(target, key, timeout, shared=False, ordered=False, opened_fd=fd):
             yield
