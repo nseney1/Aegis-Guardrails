@@ -187,9 +187,12 @@ def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
     assert _ledger_opens(git_ws, _count(monkeypatch, lambda: _scan(git_ws))) == 1
 
 
-def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
+@pytest.mark.parametrize("portable", [False, True], ids=["native", "portable"])
+def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portable):
     import aegis_mcp.server as server
 
+    if portable:
+        monkeypatch.setattr(os, "supports_dir_fd", set())
     _seed_ledger(git_ws)
     monkeypatch.setattr(server, "_canonical_workspace", str(git_ws))
     server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -201,8 +204,64 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch):
         assert response["result"]["isError"] is False
         assert json.loads(response["result"]["content"][0]["text"])["rules_staged"] > 0
 
-    counts = [_ledger_opens(git_ws, _count(monkeypatch, lambda i=i: call(i))) for i in (1, 2)]
-    # The first scan of a session also takes record_exposure's locked dedup read; the second reads once.
+    path = ledger.ledger_path(git_ws)
+    info = path.stat()
+    identity = (info.st_dev, info.st_ino)
+    real_open, real_read, real_seek = os.open, os.read, os.lseek
+
+    def full_reads(req_id: int) -> int:
+        opened, active = [], {}
+
+        def opener(file, *args, **kwargs):
+            fd = real_open(file, *args, **kwargs)
+            active.pop(fd, None)
+            flags = args[0] if args else kwargs.get("flags", os.O_RDONLY)
+            if Path(file).name == path.name and not flags & (os.O_WRONLY | os.O_RDWR):
+                event = ([], [])
+                opened.append(event)
+                active[fd] = event
+            return fd
+
+        def event_for(fd):
+            event = active.get(fd)
+            if event is not None:
+                current = os.fstat(fd)
+                # fdopen closes full-read descriptors in C; their numbers may
+                # subsequently belong to a subprocess pipe rather than the ledger.
+                if (current.st_dev, current.st_ino) == identity:
+                    return event
+            return None
+
+        def read(fd, size):
+            event = event_for(fd)
+            if event is not None:
+                event[0].append(size)
+            return real_read(fd, size)
+
+        def seek(fd, offset, whence):
+            event = event_for(fd)
+            if event is not None:
+                event[1].append((offset, whence))
+            return real_seek(fd, offset, whence)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "open", opener)
+            patch.setattr(os, "read", read)
+            patch.setattr(os, "lseek", seek)
+            seen = _count(patch, lambda: call(req_id))
+        tails = [(reads, seeks) for reads, seeks in opened if reads]
+        assert len(tails) == 1, tails
+        for reads, seeks in tails:
+            assert len(reads) == len(seeks) == 2, (reads, seeks)
+            assert all(0 < size <= ledger._TAIL_CHECK_BYTES for size in reads), reads
+            assert seeks[0][0] >= 0 and seeks[0][1] == os.SEEK_SET, seeks
+            assert seeks[1] == (0, os.SEEK_SET), seeks
+        return _ledger_opens(git_ws, seen) - len(tails)
+
+    counts = [full_reads(i) for i in (1, 2)]
+    # Keep full-read bounds: initial scans also read for locked exposure deduplication.
+    # RF-2 separately permits one open with two seek/reads of at most 256 bytes
+    # each for head/tail continuity; these bounded checks must not hide a full read.
     assert counts[0] <= 2 and counts[1] == 1, counts
 
 

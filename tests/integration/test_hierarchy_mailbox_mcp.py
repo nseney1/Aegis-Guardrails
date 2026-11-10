@@ -11,13 +11,14 @@ import threading
 import copy
 import math
 import random
+import shutil
 import uuid
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import pytest
 
-from tests.integration.test_hierarchy_mailbox import ENDPOINTS, HELPER, invoke, message, pilot  # noqa: F401
+from tests.integration.test_hierarchy_mailbox import ENDPOINTS, HELPER, invoke, message, pilot, pilot_seed  # noqa: F401
 from tests.integration.test_hierarchy_mailbox import (
     INBOX_WIRE_BUDGET, WIRE_PAYLOADS, checkpoint_wire_binding, corrupt_wire_fixture,
     mailbox_snapshot, record_wire_process, seed_wire_inbox, wire_peer_mailbox,
@@ -33,7 +34,7 @@ MB3_FIXED_NOW = datetime(2026, 1, 10, tzinfo=timezone.utc)
 @pytest.fixture(autouse=True)
 def mb3_fixed_clock(monkeypatch):
     import hierarchy_mailbox_mcp as mcp
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: MB3_FIXED_NOW, raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: MB3_FIXED_NOW)
 
 
 def exchange(root, calls=(), *, endpoint="a/lane/review", session=None, host="host-one", generation=1, raw=None,
@@ -387,8 +388,13 @@ def test_locked_mailbox_refuses_mutation_without_partial_files(pilot):  # noqa: 
     assert list(root.glob("**/*.md")) == []
 
 
-def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(pilot):  # noqa: F811
-    root, _ = pilot
+@pytest.mark.parametrize("host", [None, "codex-cli", "claude-code"])
+def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(mb3_pilot, host):
+    root, _ = mb3_pilot
+    if host is None:
+        (root.parent / "host-plan.json").unlink()
+    else:
+        mb3_host_plan(root, host=host)
     intent = {"message_id": "intent-file", "to": "a/orchestrator", "type": "info",
               "body": "Goal: improve diagnostics.\nAcceptance: retain conservative overlap evidence.\n"}
     created = payload(exchange(root, [("mailbox_publish", intent)], endpoint="a/front-door")[-1])
@@ -397,9 +403,10 @@ def test_front_door_authors_hash_bound_brief_using_only_scoped_tools(pilot):  # 
     handed_off = {"message_id": "intent-handoff", "to": "a/orchestrator", "type": "brief",
                   "body": "Use this immutable hierarchy brief.", "brief": reference}
     result = payload(exchange(root, [("mailbox_publish", handed_off)], endpoint="a/front-door")[-1])
-    assert result["message"]["brief"] == reference
+    assert result["path"].endswith(".md")
     inbox = payload(exchange(root, [("mailbox_inbox", {"include_briefs": True})], endpoint="a/orchestrator")[-1])
     delivered = next(r for r in inbox["messages"] if r["message"]["message_id"] == "intent-handoff")
+    assert delivered["message"]["brief"] == reference
     assert intent["body"] in delivered["brief_text"]
 
 
@@ -722,17 +729,13 @@ def test_publish_requires_the_writers_advertised_lane_check(pilot, tmp_path):  #
 
 
 @pytest.fixture
-def mb3_pilot(tmp_path_factory):
+def mb3_pilot(request, tmp_path_factory):
     # Binding/session fixtures must never reuse a pytest per-test path across invocations.
     directory = tmp_path_factory.mktemp("mb3-" + uuid.uuid4().hex)
     root = directory / "mailbox"
-    manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": ENDPOINTS,
-                "counterparts": [["a/front-door", "b/front-door"], ["a/orchestrator", "b/orchestrator"],
-                                 ["a/lane/f2", "b/lane/f6"]], "writer_limit": 3}
-    invoke(root, "init", manifest)
+    # Copy the immutable seed directly; importing this fixture needs no pilot fixture.
+    shutil.copytree(pilot_seed(request, tmp_path_factory), root)
     for endpoint in ENDPOINTS:
-        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
-                              "expected_generation": 0})
         mb3_binding_time(root, 1, "2026-01-01T00:00:00.000000Z", endpoint)
     brief = directory / "brief.md"
     brief.write_bytes(b"Goal: improve diagnostics.\nAcceptance: retain overlap evidence.\n")
@@ -799,7 +802,8 @@ def test_mb3_binding_only_refuses_view_options(mb3_pilot, key, value):
 
 def mb3_handler_page(result, monkeypatch=None, renderer=None):
     import hierarchy_mailbox_mcp as mcp
-    connection = SimpleNamespace(call=lambda *args: copy.deepcopy(result), note_returned=lambda *args: None)
+    connection = SimpleNamespace(begin_response=lambda: None, call=lambda *args: copy.deepcopy(result),
+                                 note_returned=lambda *args: None)
     if renderer is not None:
         monkeypatch.setattr(mcp, "_response_line", renderer)
     return {"jsonrpc": "2.0", "id": "é-edge", "result": mcp.handle(connection, inbox_frame({}, "é-edge"))}
@@ -1085,8 +1089,8 @@ def mb3_drain(connection, options, *, limit=2):
 
 
 def mb3_committed_state(connection):
-    return copy.deepcopy((connection.inbox_session, connection.inbox_briefs_session,
-                          getattr(connection, "inbox_cutoffs", {}), getattr(connection, "inbox_cursors", {})))
+    return copy.deepcopy((connection.pager.session, connection.pager.briefs_session,
+                          connection.pager.cutoffs, connection.pager.cursors))
 
 
 @pytest.mark.parametrize("tool,args", [("mailbox_inbox", {}), ("mailbox_inbox", {"since": "current_generation"}),
@@ -1351,7 +1355,7 @@ def test_mb3_2_class_d_future_skew_boundary(mb3_pilot, monkeypatch, stamp, allow
     import hierarchy_mailbox_mcp as mcp
     root, _ = mb3_pilot
     mb3_binding_time(root, 1, stamp)
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc), raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: datetime(2026, 1, 2, tzinfo=timezone.utc))
     answer = mb3_call(mb3_connection(root), {"since": "current_generation"})
     if allowed:
         assert not answer["result"].get("isError", False)
@@ -1475,7 +1479,7 @@ def test_mb3_3_class2_growth_stops_at_cap(mb3_pilot, monkeypatch, rewrite):
     root, _ = mb3_pilot
     rows = mb3_seed(root)
     connection = mb3_connection(root)
-    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 3, raising=False)
+    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 3)
     live_cursors = []
     for number in range(3):
         if rewrite == "binding":
@@ -1490,7 +1494,7 @@ def test_mb3_3_class2_growth_stops_at_cap(mb3_pilot, monkeypatch, rewrite):
         answer = mb3_call(connection, {"order": "newest", "limit": 2})
         assert not answer["result"].get("isError", False), payload(answer)
         live_cursors.append(payload(answer)["next_after"])
-        assert sum(map(len, connection.inbox_cursors.values())) == number + 1
+        assert sum(map(len, connection.pager.cursors.values())) == number + 1
     if rewrite == "binding":
         mb3_binding_time(root, 1, "2026-01-01T00:00:04.000000Z")
     else:
@@ -1501,10 +1505,10 @@ def test_mb3_3_class2_growth_stops_at_cap(mb3_pilot, monkeypatch, rewrite):
     before = mb3_committed_state(connection)
     assert payload(mb3_call(connection, {"order": "newest", "limit": 2})) == {"error": MB3_CAPACITY}
     assert mb3_committed_state(connection) == before
-    assert sum(map(len, connection.inbox_cursors.values())) == 3
+    assert sum(map(len, connection.pager.cursors.values())) == 3
     # A full default read works without evicting or reclassifying live associations.
     assert len(payload(mb3_call(connection, {"limit": 100}))["messages"]) == 5
-    assert sum(map(len, connection.inbox_cursors.values())) == 3
+    assert sum(map(len, connection.pager.cursors.values())) == 3
 
 
 def test_mb3_3_class2_default_provenance_is_freed_on_drain(mb3_pilot):
@@ -1512,9 +1516,9 @@ def test_mb3_3_class2_default_provenance_is_freed_on_drain(mb3_pilot):
     mb3_seed(root)
     connection = mb3_connection(root)
     mb3_call(connection, {"limit": 1})
-    assert sum(map(len, connection.inbox_cursors.values())) == 1
+    assert sum(map(len, connection.pager.cursors.values())) == 1
     assert mb3_drain(connection, {}, limit=2) == ["wire-000", "wire-001", "wire-002", "wire-003", "wire-004"]
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
 
 
 def test_mb3_3_class2_drain_frees_only_finished_context(mb3_pilot, monkeypatch):
@@ -1522,20 +1526,20 @@ def test_mb3_3_class2_drain_frees_only_finished_context(mb3_pilot, monkeypatch):
     root, _ = mb3_pilot
     mb3_seed(root)
     connection = mb3_connection(root)
-    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 2, raising=False)
+    monkeypatch.setattr(mcp, "MAX_INBOX_CURSOR_PAIRS", 2)
     first = payload(mb3_call(connection, {"order": "newest", "limit": 3}))
     other = payload(mb3_call(connection, {"order": "newest", "since": "current_generation", "limit": 3}))
     assert first["next_after"] == other["next_after"] == "wire-002"
-    assert sum(map(len, connection.inbox_cursors.values())) == 2
+    assert sum(map(len, connection.pager.cursors.values())) == 2
     done = payload(mb3_call(connection, {"order": "newest", "after_message_id": "wire-002", "limit": 3}))
     assert done["next_after"] is None
-    assert sum(map(len, connection.inbox_cursors.values())) == 1
+    assert sum(map(len, connection.pager.cursors.values())) == 1
     # The still-live since context must not regain the default/unknown fallback.
     assert payload(mb3_call(connection, {"after_message_id": "wire-002"})) == {"error": MB3_RESTART}
     remaining = payload(mb3_call(connection, {"order": "newest", "since": "current_generation",
                                              "after_message_id": "wire-002", "limit": 3}))
     assert remaining["next_after"] is None
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
     assert len(payload(mb3_call(connection, {"after_message_id": "wire-002"}))["messages"]) == 2
 
 
@@ -1569,7 +1573,7 @@ def test_mb3_3_class4_clock_seam(mb3_pilot, monkeypatch, now, allowed):
     import hierarchy_mailbox_mcp as mcp
     root, _ = mb3_pilot
     mb3_checkpoint(root)
-    monkeypatch.setattr(mcp, "_inbox_now", lambda: now, raising=False)
+    monkeypatch.setattr(mcp, "_inbox_now", lambda: now)
     answer = mb3_call(mb3_connection(root, 2), {"since": "current_generation"})
     if allowed:
         assert not answer["result"].get("isError", False)
@@ -1594,10 +1598,10 @@ def test_mb3_3b_immediate_default_restart_and_cleanup(mb3_pilot, options):
     connection = mb3_connection(root)
     first = payload(mb3_call(connection, {**options, "limit": 3}))
     assert first["next_after"] == "wire-002"
-    assert sum(map(len, connection.inbox_cursors.values())) == 1
+    assert sum(map(len, connection.pager.cursors.values())) == 1
     default = payload(mb3_call(connection, {"limit": 3}))
     assert default["next_after"] == "wire-002"
-    assert sum(map(len, connection.inbox_cursors.values())) == 2
+    assert sum(map(len, connection.pager.cursors.values())) == 2
     done_default = payload(mb3_call(connection, {"limit": 3, "after_message_id": "wire-002"}))
     assert [r["message"]["message_id"] for r in done_default["messages"]] == ["wire-003", "wire-004"]
     assert done_default["remaining"] == 0 and done_default["next_after"] is None
@@ -1608,7 +1612,7 @@ def test_mb3_3b_immediate_default_restart_and_cleanup(mb3_pilot, options):
         assert ids == (expected[::-1] if start.get("order") == "newest" else expected)
         assert len(ids) == len(set(ids))
         assert end["next_after"] is None and end["remaining"] == 0
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
 
 
 @pytest.mark.parametrize("options", [{"order": "newest"}, {"since": "current_generation"}])
@@ -1639,7 +1643,7 @@ def test_mb3_3b_collision_at_cap_refuses_before_staging(mb3_pilot, monkeypatch, 
     mb3_call(connection, {"order": "newest", "limit": 3})
     before = mb3_committed_state(connection)
     answer = mb3_call(connection, {"limit": limit})
-    assert connection.pending_inbox_page is None
+    assert connection.pager.pending is None
     assert mb3_committed_state(connection) == before
     if allowed:
         assert not answer["result"].get("isError", False)
@@ -1659,11 +1663,11 @@ def test_mb3_3b_collision_pair_reissue_at_exact_cap(mb3_pilot, monkeypatch):
     for _ in range(2):
         answer = mb3_call(connection, {"limit": 3})
         assert not answer["result"].get("isError", False)
-        assert sum(map(len, connection.inbox_cursors.values())) == 2
+        assert sum(map(len, connection.pager.cursors.values())) == 2
     assert payload(mb3_call(connection, {"order": "newest", "after_message_id": "wire-002"}))["next_after"] is None
-    assert sum(map(len, connection.inbox_cursors.values())) == 1  # The default walk is still live.
+    assert sum(map(len, connection.pager.cursors.values())) == 1  # The default walk is still live.
     assert payload(mb3_call(connection, {"after_message_id": "wire-002"}))["next_after"] is None
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
 
 
 def test_mb3_3b_cleanup_retains_default_until_last_nondefault_finishes(mb3_pilot):
@@ -1674,13 +1678,13 @@ def test_mb3_3b_cleanup_retains_default_until_last_nondefault_finishes(mb3_pilot
     for options in walks:
         mb3_call(connection, {**options, "limit": 3})
     mb3_call(connection, {"limit": 3})
-    assert len(connection.inbox_cursors["wire-002"]) == 3
+    assert len(connection.pager.cursors["wire-002"]) == 3
     mb3_call(connection, {**walks[0], "after_message_id": "wire-002"})
-    assert len(connection.inbox_cursors["wire-002"]) == 2
+    assert len(connection.pager.cursors["wire-002"]) == 2
     default = payload(mb3_call(connection, {"after_message_id": "wire-002"}))
     assert [r["message"]["message_id"] for r in default["messages"]] == ["wire-003", "wire-004"]
     mb3_call(connection, {**walks[1], "after_message_id": "wire-002"})
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
 
 
 @pytest.mark.parametrize("first,second", [({}, {"order": "newest"}), ({"order": "newest"}, {}),
@@ -1721,9 +1725,9 @@ def test_mb3_3b_colliding_default_commits_only_after_successful_flush(mb3_pilot,
         patch.setattr(os, "dup2", lambda *a: None)
         assert mcp.serve(root, "a/lane/f2", "host-one", "a/lane/f2", 1) == 0
     assert mb3_committed_state(connection) == before
-    assert connection.pending_inbox_page is None
+    assert connection.pager.pending is None
     mb3_call(connection, {"limit": 3})
-    assert sum(map(len, connection.inbox_cursors.values())) == 2
+    assert sum(map(len, connection.pager.cursors.values())) == 2
 
 
 @pytest.mark.parametrize("planned", [False, True])
@@ -1762,7 +1766,7 @@ def test_mb3_coord2_bad_plan_fails_closed(mb3_pilot, monkeypatch, damage):
             return original(target, *args, **kwargs)
         monkeypatch.setattr(Path, "open", denied)
     assert payload(mb3_call(mb3_connection(root), {})) == {
-        "error": "invalid inbox host plan; repair the governing plan before retrying"}
+        "error": "invalid host plan; repair the governing plan before retrying"}
 
 
 @pytest.mark.parametrize("options", [{"order": "newest"}, {"since": "current_generation"},
@@ -1783,7 +1787,7 @@ def test_mb3_coord2_prior_default_cursor_survives_other_walk(mb3_pilot, options,
         expected = ["wire-%03d" % n for n in range(5)]
         assert ids == (expected[::-1] if option.get("order") == "newest" else expected)
         assert final["remaining"] == 0 and final["next_after"] is None
-    assert connection.inbox_cursors == {}
+    assert connection.pager.cursors == {}
 
 
 def test_mb3_coord2_legal_mailbox_transport_walk_exceeds_old_capacity(mb3_pilot):
@@ -1811,16 +1815,16 @@ def test_mb3_coord2_legal_mailbox_transport_walk_exceeds_old_capacity(mb3_pilot)
         size = len(mcp._response_line({"jsonrpc": "2.0", "id": "page", "result": mcp._tool_result(page)}))
         connection.note_returned(page, size)
         connection.record_inbox_page()
-    count = sum(map(len, connection.inbox_cursors.values()))
+    count = sum(map(len, connection.pager.cursors.values()))
     assert count == MAX_RECORDS - 1
     retry = mb3_call(connection, {"order": "newest", "limit": 1,
                                 "after_message_id": rows[0]["message"]["message_id"]})
     assert payload(retry)["messages"] == rows[1:2]
-    assert sum(map(len, connection.inbox_cursors.values())) == count
+    assert sum(map(len, connection.pager.cursors.values())) == count
     last = mb3_call(connection, {"order": "newest", "limit": 1,
                                "after_message_id": rows[-2]["message"]["message_id"]})
     assert payload(last)["messages"] == rows[-1:]
-    assert payload(last)["next_after"] is None and connection.inbox_cursors == {}
+    assert payload(last)["next_after"] is None and connection.pager.cursors == {}
 
 
 def test_mb3_coord2_capacity_covers_all_option_combinations():
@@ -1866,10 +1870,10 @@ def test_mb3_coord2_preserves_gate_after_large_later_page(mb3_pilot):
     binding = mb3_checkpoint(root)
     connection = mb3_connection(root, 2)
     mb3_call(connection, {"include_briefs": True})
-    assert connection.inbox_briefs_session is not None
+    assert connection.pager.briefs_session is not None
     mb3_message_time(invoke(root, "publish", message(body="x" * 62000)), "2026-01-03T00:00:00.000000Z")
     mb3_call(connection, {})
-    assert connection.inbox_session is None and connection.inbox_briefs_session is None
+    assert connection.pager.session is None and connection.pager.briefs_session is None
     assert payload(mb3_call(connection, {"include_briefs": True}))["checkpoint_briefs"] == [
         {**binding["checkpoint"]["briefs"][0], "text": "checkpoint"}]
 
@@ -1996,7 +2000,7 @@ def test_mb3_coord3_discovery_uses_validated_plan(mb3_pilot, monkeypatch, damage
             return original(target, *args, **kwargs)
         monkeypatch.setattr(Path, "open", denied)
     request = {"jsonrpc": "2.0", "id": "list", "method": "tools/list"}
-    with pytest.raises(ValueError, match="^invalid inbox host plan; repair the governing plan before retrying$"):
+    with pytest.raises(ValueError, match="^invalid host plan; repair the governing plan before retrying$"):
         mcp.handle(mb3_connection(root), request)
 
 
@@ -2020,7 +2024,7 @@ def test_mb3_coord3_one_plan_decision_per_inbox_call(mb3_pilot, monkeypatch):
         answer = mb3_call(connection, {"briefs": "full"})
     assert not answer["result"].get("isError", False)
     assert opened == [path]
-    assert connection.inbox_session is not None  # The validated first snapshot, not a second absence check.
+    assert connection.pager.session is not None  # The validated first snapshot, not a second absence check.
     legacy = next(t for t in connection.definitions() if t["name"] == "mailbox_inbox")
     assert "order" not in legacy["inputSchema"]["properties"]
 
@@ -2243,3 +2247,81 @@ def test_mb3_coord5_no_plan_ignores_prior_planned_cursor_state(mb3_pilot):
     page = payload(mb3_call(connection, {"after_message_id": first["next_after"]}))
     assert [r["message"]["message_id"] for r in page["messages"]] == ["wire-003", "wire-004"]
     assert page["next_after"] is None and page["remaining"] == 0
+
+
+@pytest.mark.parametrize("host", [None, "codex-cli", "claude-code"])
+@pytest.mark.parametrize("body", ["x" * 60000, 'é😀"\\\n' * 1000], ids=["ascii", "utf8-escapes"])
+def test_mb6_publish_receipt_and_legacy_wire_bytes(mb3_pilot, host, body):
+    root, _ = mb3_pilot
+    if host is None:
+        (root.parent / "host-plan.json").unlink()
+    else:
+        mb3_host_plan(root, host=host)
+    arguments = {"message_id": "mb6-publish", "to": "a/orchestrator", "type": "info", "body": body}
+    frame = {"jsonrpc": "2.0", "id": "publish", "method": "tools/call",
+             "params": {"name": "mailbox_publish", "arguments": arguments}}
+    lines, answers = mcp_wire_exchange(root, [frame])
+    assert not answers[0]["result"].get("isError", False), payload(answers[0])
+    row, = invoke(root, "inbox", endpoint="a/orchestrator")["messages"]
+    raw = Path(row["path"]).read_bytes()
+    sha256 = hashlib.sha256(raw).hexdigest()
+    assert row["message"]["body"] == body
+    assert row["message"]["from"] == "a/lane/f2"
+    assert row["message"]["authority"] == "information_only"
+    print("MB6 publish wire bytes:", host, len(lines[0]))
+    if host is None:
+        expected = {**row, "sha256": sha256}
+    else:
+        expected = {"id": arguments["message_id"], "path": row["path"], "sha256": sha256,
+                    "created_at": row["message"]["created_at"], "size": len(raw)}
+    assert payload(answers[0]) == expected
+    expected_response = {"jsonrpc": "2.0", "id": "publish", "result": {
+        "content": [{"type": "text", "text": json.dumps(expected, sort_keys=True)}]}}
+    assert lines[0] == (json.dumps(expected_response, sort_keys=True) + "\n").encode("utf-8")
+
+
+@pytest.mark.parametrize("damage", ["malformed", "wrong_hierarchy", "unreadable"])
+def test_mb6_publish_refuses_invalid_plan_before_writing(mb3_pilot, monkeypatch, damage):
+    import hierarchy_hosts
+    import hierarchy_mailbox_mcp as mcp
+    root, _ = mb3_pilot
+    connection = mb3_connection(root)
+    path = root.parent / "host-plan.json"
+    if damage == "malformed":
+        path.write_bytes(b"{}")
+    elif damage == "wrong_hierarchy":
+        mb3_host_plan(root, hierarchy="b")
+    before = mailbox_snapshot(root)
+    with monkeypatch.context() as patch:
+        if damage == "unreadable":
+            original = hierarchy_hosts.read_json
+            def denied(target):
+                if target == path:
+                    raise PermissionError("private OS detail")
+                return original(target)
+            patch.setattr(hierarchy_hosts, "read_json", denied)
+        result = mcp.handle(connection, {"jsonrpc": "2.0", "id": "publish", "method": "tools/call", "params": {
+            "name": "mailbox_publish", "arguments": {
+                "message_id": "mb6-refused", "to": "a/orchestrator", "type": "info", "body": "private body"}}})
+    assert result["isError"] is True
+    assert json.loads(result["content"][0]["text"]) == {
+        "error": "invalid host plan; repair the governing plan before retrying"}
+    assert mailbox_snapshot(root) == before
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_mb6_publish_stat_failure_is_a_sanitized_refusal(mb3_pilot, monkeypatch, error):
+    import hierarchy_mailbox_mcp as mcp
+    root, _ = mb3_pilot
+    connection = mb3_connection(root)
+    def unavailable(path):
+        raise error("private OS detail: " + str(path))
+    monkeypatch.setattr(mcp, "os", SimpleNamespace(stat=unavailable))
+    result = mcp.handle(connection, {"jsonrpc": "2.0", "id": "publish", "method": "tools/call", "params": {
+        "name": "mailbox_publish", "arguments": {
+            "message_id": "mb6-stat", "to": "a/orchestrator", "type": "info", "body": "private body"}}})
+    assert result["isError"] is True
+    assert json.loads(result["content"][0]["text"]) == {
+        "error": "published message metadata unavailable; inspect the mailbox before retrying"}
+    row, = invoke(root, "inbox", endpoint="a/orchestrator")["messages"]
+    assert row["message"]["message_id"] == "mb6-stat"

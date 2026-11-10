@@ -1,8 +1,12 @@
 """C1 public adapter contract. No real owner homes or engines are used by default."""
+import ast
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import errno
 import hashlib
 import importlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -97,9 +101,34 @@ def config_for(layout):
             "live_checkouts": [str(layout.live)], "isolation": dict(ISOLATION)}
 
 
-def cli(layout, config, *args, bootstrap=""):
+def fake_engine_call(argv, *, uid=None, gid=None):
+    """Run the unchanged fake's public CLI in a fresh module with private OS/account references."""
+    spec = importlib.util.spec_from_file_location("container_test_fake", FAKE)
+    fake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    fake.sys = SimpleNamespace(argv=argv, stderr=stderr)
+    fake.os = SimpleNamespace(**{**vars(os),
+                                "getuid": os.getuid if uid is None else lambda: uid,
+                                "getgid": os.getgid if gid is None else lambda: gid})
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        code = fake.main(argv[1:])
+    return subprocess.CompletedProcess(argv, code, stdout.getvalue(), stderr.getvalue())
+
+
+def cli(layout, config, *args, bootstrap="", isolated=False):
     path = layout.run.parent / "team-run.json"
     path.write_text(json.dumps(config), encoding="utf-8")
+    argv = [*args, "--config", str(path)]
+    if not bootstrap and not isolated:
+        adapter = importlib.import_module("tools.hierarchy_container")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # The engine is the process boundary. Replace only the adapter's reference, never global run().
+        with pytest.MonkeyPatch.context() as patch, redirect_stdout(stdout), redirect_stderr(stderr):
+            patch.setattr(adapter, "subprocess", SimpleNamespace(**{
+                **vars(adapter.subprocess), "run": lambda command, **kwargs: fake_engine_call(command)}))
+            code = adapter.main(argv)
+        return subprocess.CompletedProcess(argv, code, stdout.getvalue(), stderr.getvalue())
     # Password database is an OS boundary. Patch it in the child too: changing HOME alone must never hide
     # the real password-database home from production checks, or aim a test at ~/.claude or ~/.codex.
     # Python 3.9's pathlib accessor must capture native OS functions before our lstat double; a captured
@@ -112,7 +141,7 @@ def cli(layout, config, *args, bootstrap=""):
             + bootstrap + "sys.argv = [%r] + sys.argv[1:]; runpy.run_path(%r, run_name='__main__')"
             % (str(SCRIPT), str(SCRIPT)))
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    return subprocess.run([sys.executable, "-I", "-B", "-c", code, *args, "--config", str(path)],
+    return subprocess.run([sys.executable, "-I", "-B", "-c", code, *argv],
                           env=env, capture_output=True, text=True, timeout=15)
 
 
@@ -133,6 +162,139 @@ def image_info(image=IMAGE):
 def expected_for(adapter, isolation, **kwargs):
     kwargs.setdefault("image_inspect", image_info(isolation["image"]))
     return adapter.expected_plan(isolation, **kwargs)
+
+
+@pytest.mark.parametrize("module", ["hierarchy_container", "hierarchy_container_verify"])
+def test_container_identity_needs_no_orchestrator(module):
+    code = ("import sys; sys.path.insert(0, %r); " % str(SCRIPT.parent)
+            + "import %s as adapter; " % module
+            + "assert adapter.container_name('/fixture/run').startswith('aegis-team-'); "
+              "assert 'hierarchy_team' not in sys.modules; "
+              "assert 'hierarchy_provision' not in sys.modules")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_verification_leaf_public_contract(adapter, layout):
+    verifier = importlib.import_module("hierarchy_container_verify")
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+    assert verifier.verify(value, expected) == []
+    value[0]["Config"]["User"] = "wrong"
+    assert verifier.verify(value, expected) == ["user"]
+    assert verifier.verify("[", expected) == ["inspect"]
+    assert verifier.verify(value, None) == ["expected"]
+
+
+def test_facade_exposes_every_name_used_by_suite(adapter):
+    # Read our tracked source directly: this guard also covers opt-in tests that CI normally skips.
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+             and isinstance(node.value, ast.Name) and node.value.id == "adapter"}
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        getters = [node.args[1] for node in ast.walk(function) if isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                   and len(node.args) >= 2 and isinstance(node.args[0], ast.Name)
+                   and node.args[0].id == "adapter"]
+        names.update(node.value for node in getters if isinstance(node, ast.Constant))
+        for decorator in function.decorator_list:
+            if (not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute)
+                    or decorator.func.attr != "parametrize" or len(decorator.args) < 2):
+                continue
+            parameters = [name.strip() for name in ast.literal_eval(decorator.args[0]).split(",")]
+            if "builder" in parameters and any(isinstance(node, ast.Name) and node.id == "builder"
+                                               for node in getters):
+                index = parameters.index("builder")
+                for row in decorator.args[1].elts:
+                    target = row if len(parameters) == 1 else row.elts[index]
+                    names.add(ast.literal_eval(target))
+        for loop in (node for node in ast.walk(function) if isinstance(node, ast.For)):
+            targets = loop.target.elts if isinstance(loop.target, ast.Tuple) else [loop.target]
+            for index, target in enumerate(targets):
+                if isinstance(target, ast.Name) and target.id == "builder":
+                    for row in loop.iter.elts:
+                        names.add(ast.literal_eval(row.elts[index] if isinstance(loop.target, ast.Tuple) else row))
+    assert sorted(name for name in names if not hasattr(adapter, name)) == []
+
+
+@pytest.mark.parametrize("value", ["/fixture/run", "relative", "/fixture/../run", "/fixture/\x00run", "",
+                                   "/" + "x" * 4096, Path("/fixture/run"), b"/fixture/run"],
+                         ids=["absolute", "relative", "parent", "nul", "empty", "too-long", "pathlike", "bytes"])
+def test_path_contract_matches_team(adapter, value):
+    team = importlib.import_module("hierarchy_team")
+    verifier = importlib.import_module("hierarchy_container_verify")
+
+    def result(check, argument):
+        try:
+            return check(argument, "fixture path")
+        except (ValueError, TypeError) as exc:
+            return type(exc), str(exc)
+
+    # This conversion was the adapter boundary before extraction; team.absolute itself takes strings.
+    original_argument = os.fspath(value) if isinstance(value, os.PathLike) else value
+    assert result(verifier._absolute, value) == result(team.absolute, original_argument)
+
+
+def test_owner_capture_missing_file_has_documented_diagnostic(adapter, layout, monkeypatch):
+    variable = "AEGIS_TEST_C1_HISTORICAL_CAPTURE_DIR"
+    root = layout.run.parent / "missing-capture"
+    root.mkdir()
+    monkeypatch.setenv(variable, str(root))
+    with pytest.raises(pytest.fail.Exception) as error:
+        test_owner_capture_replay(adapter, layout)
+    missing = FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(root / "container-inspect.json"))
+    assert str(error.value) == ("%s=%s: invalid container-inspect.json: %s; supply the historical "
+                                "real-podman-4.9.3 capture directory" % (variable, root, missing))
+
+
+@pytest.mark.parametrize("surface", ["plan", "verify", "created"])
+def test_matrix_surfaces_do_not_spawn(adapter, layout, monkeypatch, surface):
+    expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+    value = inspect_for(expected)
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("matrix helper spawned a child Python")
+
+    # Replace this test module's reference, leaving pytest and the product's subprocess module intact.
+    monkeypatch.setattr(sys.modules[__name__], "subprocess",
+                        SimpleNamespace(**{**vars(subprocess), "run": unexpected_child}))
+    monkeypatch.setattr(adapter, "subprocess",
+                        SimpleNamespace(**{**vars(adapter.subprocess), "run": unexpected_child}))
+    verifier = importlib.import_module("hierarchy_container_verify")
+    if hasattr(verifier, "subprocess"):
+        monkeypatch.setattr(verifier, "subprocess",
+                            SimpleNamespace(**{**vars(verifier.subprocess), "run": unexpected_child}))
+    if surface == "created":
+        expected, value = fake_created_inspect(adapter, layout, ISOLATION)
+        assert adapter.verify(value, expected) == []
+    elif surface == "verify":
+        assert verify_surface(adapter, layout, expected, value, "fake-cli") == []
+    else:
+        result = cli(layout, config_for(layout), "plan")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["mode"] == "container"
+
+
+@pytest.mark.parametrize("case", ["host", "plan", "refused", "verify", "mismatch"])
+def test_standalone_cli_parity(adapter, layout, case):
+    config, args = config_for(layout), ["plan"]
+    if case == "host":
+        config = {}
+    elif case == "refused":
+        config["isolation"]["cpus"] = 0
+    elif case in ("verify", "mismatch"):
+        expected = expected_for(adapter, ISOLATION, run=layout.run, mounts=mounts(adapter, layout))
+        value = inspect_for(expected)
+        if case == "mismatch":
+            value[0]["Config"]["User"] = "wrong"
+        path = layout.run.parent / "standalone-inspect.json"
+        path.write_text(json.dumps(value), encoding="utf-8")
+        args = ["verify", "--inspect", str(path)]
+    local = cli(layout, config, *args)
+    child = cli(layout, config, *args, isolated=True)
+    assert (child.returncode, child.stdout, child.stderr) == (local.returncode, local.stdout, local.stderr)
+    assert local.returncode == (2 if case in ("refused", "mismatch") else 0)
 
 
 @pytest.mark.parametrize("raw", [None, {"mode": "host"}])
@@ -1515,23 +1677,17 @@ def test_verify_unexpected_environment(adapter, layout):
 
 
 def fake_created_inspect(adapter, layout, isolation, *, env=None, uid=None, gid=None):
-    """Public engine CLI with explicit process env; high account IDs are modelled at the child OS boundary."""
+    """Public fake CLI in-process; high account IDs are modelled only in the fake's OS reference."""
     plan = mounts(adapter, layout)
 
     def call(argv):
-        p = subprocess.run(argv, env=dict(os.environ), capture_output=True, text=True, timeout=15)
+        p = fake_engine_call(argv, uid=uid, gid=gid)
         assert p.returncode == 0, p.stderr
         return p.stdout
 
     image = call(adapter.image_inspect_argv(isolation["engine"], isolation["image"]))
     argv = adapter.create_argv(isolation, run=layout.run, mounts=plan, env=env, uid=uid, gid=gid)
-    if uid is not None or gid is not None:
-        # Model the invoking account, not a fictional Podman option or actual high-ID native execution.
-        bootstrap = ("import os,runpy,sys; os.getuid=lambda:%r; os.getgid=lambda:%r; "
-                     "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')" % (uid, gid))
-        call([sys.executable, "-B", "-c", bootstrap, str(layout.run.parent / "bin" / isolation["engine"]), *argv[1:]])
-    else:
-        call(argv)
+    call(argv)
     value = json.loads(call(adapter.inspect_argv(isolation["engine"], layout.run)))
     kwargs = {"env": env} if env is not None else {}
     expected = expected_for(adapter, isolation, run=layout.run, mounts=plan, image_inspect=image,

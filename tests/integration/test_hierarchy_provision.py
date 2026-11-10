@@ -31,6 +31,7 @@ RB2_PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
                           'pass an absolute, executable "python" in the init request')
 RB2_RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
                                   'restore it, or remove the unregistered base and run init again')
+_SOURCE_SEED = pytest.StashKey[Path]()
 
 
 def provision(command, request, *, expect=0):
@@ -43,21 +44,53 @@ def provision(command, request, *, expect=0):
     return json.loads(result.stdout)
 
 
+def build_source(source):
+    (source / "tools").mkdir(parents=True)
+    for path in (ROOT / "tools").glob("hierarchy_*.py"):
+        shutil.copy(path, source / "tools" / path.name)
+    shutil.copytree(ROOT / "tools" / "hierarchy_templates", source / "tools" / "hierarchy_templates")
+    git(source, "init", "-q", "-b", "develop")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "pinned source")
+
+
+def worker_source_seed(tmp_path_factory, request):
+    # setup is also imported as a fixture by other modules. A session stash
+    # keeps one seed per worker without requiring those modules to import it.
+    session = request.session
+    if _SOURCE_SEED not in session.stash:
+        seed = tmp_path_factory.mktemp("provision-source-seed") / "source"
+        build_source(seed)
+        commit = git(seed, "rev-parse", "HEAD")
+
+        def check_seed():
+            assert git(seed, "status", "--porcelain") == ""
+            assert git(seed, "rev-parse", "HEAD") == commit
+
+        session.addfinalizer(check_seed)
+        session.stash[_SOURCE_SEED] = seed
+    return session.stash[_SOURCE_SEED]
+
+
+@pytest.fixture(scope="session")
+def source_seed(tmp_path_factory, request):
+    return worker_source_seed(tmp_path_factory, request)
+
+
 class Setup:
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, *, source_seed=None):
         self.tmp = tmp_path
         self.base = tmp_path / "initiatives" / "pilot"
         self.workspace = Workspace(tmp_path)
         self.workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
         self.source = tmp_path / "source"
-        (self.source / "tools").mkdir(parents=True)
-        for path in (ROOT / "tools").glob("hierarchy_*.py"):
-            shutil.copy(path, self.source / "tools" / path.name)
-        templates = self.source / "tools" / "hierarchy_templates"
-        shutil.copytree(ROOT / "tools" / "hierarchy_templates", templates)
-        git(self.source, "init", "-q", "-b", "develop")
-        git(self.source, "add", ".")
-        git(self.source, "commit", "-qm", "pinned source")
+        if source_seed is None:
+            # Preserve direct callers in other test modules.
+            build_source(self.source)
+        else:
+            # Only immutable objects are shared. Files, index and refs are local;
+            # the seed outlives every clone, including clones made by imports.
+            git(tmp_path, "clone", "-q", "--shared", str(source_seed), str(self.source))
 
     def request(self, **body):
         return {"_request_path": str(self.tmp / ("request-%s.json" % uuid.uuid4().hex)), **body}
@@ -78,10 +111,52 @@ class Setup:
 
 
 @pytest.fixture
-def setup(tmp_path):
-    built = Setup(tmp_path)
+def setup(tmp_path, tmp_path_factory, request):
+    built = Setup(tmp_path, source_seed=worker_source_seed(tmp_path_factory, request))
     built.init()
     return built
+
+
+def test_rf33_source_clones_keep_mutations_private(tmp_path, source_seed):
+    for name in ("first", "second", "third"):
+        (tmp_path / name).mkdir()
+    seed = source_seed
+    path = "tools/hierarchy_templates/model-bindings.json"
+    original = (seed / path).read_bytes()
+    commit = git(seed, "rev-parse", "HEAD")
+    first = Setup(tmp_path / "first", source_seed=seed)
+    second = Setup(tmp_path / "second", source_seed=seed)
+    first.init()
+    second.init()
+    first_record = (first.base / "provision.json").read_bytes()
+    second_record = (second.base / "provision.json").read_bytes()
+
+    # Overwrite a tracked file, stage it, commit it and change the local refs.
+    (first.source / path).write_text("{}", encoding="utf-8")
+    git(first.source, "add", "--", path)
+    for source in (seed, second.source):
+        assert (source / path).read_bytes() == original
+        assert git(source, "status", "--porcelain") == ""
+        assert git(source, "rev-parse", "HEAD") == commit
+    git(first.source, "commit", "-qm", "private fixture policy")
+    git(first.source, "branch", "private-fixture")
+    (first.source / "untracked.txt").write_text("private", encoding="utf-8")
+    (first.base / "provision.json").write_text("{}", encoding="utf-8")
+
+    third = Setup(tmp_path / "third", source_seed=seed)
+    third.init()
+    for source in (seed, second.source, third.source):
+        assert (source / path).read_bytes() == original
+        assert git(source, "status", "--porcelain") == ""
+        assert git(source, "rev-parse", "HEAD") == commit
+        assert git(source, "branch", "--list", "private-fixture") == ""
+    assert (second.base / "provision.json").read_bytes() == second_record
+    assert json.loads((third.base / "provision.json").read_text())["source_commit"] == commit
+    # Restore only this case's record so the public pin verifier sees its drift.
+    (first.base / "provision.json").write_bytes(first_record)
+    assert "checkout identity changed" in first.add_role("pilot/orchestrator", expect=2)["error"]
+    assert second.add_role("pilot/orchestrator")["generation"] == 1
+    assert third.add_role("pilot/orchestrator")["generation"] == 1
 
 
 def test_init_builds_the_mailbox_registers_the_initiative_and_pins_the_source(setup):
@@ -329,16 +404,16 @@ def test_init_refuses_an_existing_base(setup):
     assert "second" not in setup.workspace.run("status")["initiatives"]
 
 
-def test_a_dirty_source_is_refused_because_every_adapter_runs_from_it(tmp_path):
-    built = Setup(tmp_path)
+def test_a_dirty_source_is_refused_because_every_adapter_runs_from_it(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     (built.source / "uncommitted.txt").write_text("not pinned")
     refused = provision("init", built.init_request(), expect=2)
     assert refused["error"] == "source checkout must be clean so adapters run exact committed code"
     assert not built.base.exists()
 
 
-def test_a_source_that_is_not_a_checkout_is_refused(tmp_path):
-    built = Setup(tmp_path)
+def test_a_source_that_is_not_a_checkout_is_refused(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     source = tmp_path / "never-a-checkout"
     source.mkdir()
     request = built.init_request()
@@ -347,8 +422,8 @@ def test_a_source_that_is_not_a_checkout_is_refused(tmp_path):
     assert not built.base.exists()
 
 
-def test_a_duplicate_initiative_or_missing_store_creates_nothing(tmp_path):
-    built = Setup(tmp_path)
+def test_a_duplicate_initiative_or_missing_store_creates_nothing(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     built.workspace.register("pilot")
     assert provision("init", built.init_request(), expect=2)["error"] == "initiative already registered: pilot"
     assert not built.base.exists()
@@ -366,8 +441,8 @@ def test_a_duplicate_initiative_or_missing_store_creates_nothing(tmp_path):
     ({"initiative": {**INITIATIVE, "mailbox_root": "/set/by/the/tool"}}, "unexpected fields"),
     ({"run": "rm -rf /"}, "unexpected fields"),
 ])
-def test_malformed_init_requests_are_refused(tmp_path, change, error):
-    built = Setup(tmp_path)
+def test_malformed_init_requests_are_refused(tmp_path, change, error, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     assert error in provision("init", {**built.init_request(), **change}, expect=2)["error"]
     assert not built.base.exists()
 
@@ -817,10 +892,10 @@ ROUTER_ACTOR = "the router session takes no lifecycle actor; routing is the rout
 
 
 @pytest.fixture
-def team(tmp_path):
+def team(tmp_path, source_seed):
     """A provisioned initiative with a Router and a Decider, and a lifecycle journal whose policy has both."""
     from tests.integration.test_hierarchy_decider import Decider
-    built = Setup(tmp_path)
+    built = Setup(tmp_path, source_seed=source_seed)
     provision("init", built.init_request(roles=["router", "decider"]))
     (tmp_path / "journal").mkdir()
     built.ledger = Decider(tmp_path / "journal")
@@ -1196,8 +1271,8 @@ def test_mr1_malformed_team_keys_never_reach_errors_raw(setup, raw):
 
 
 @pytest.fixture
-def mr1_r2_setup(tmp_path):
-    built = Setup(tmp_path)
+def mr1_r2_setup(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     provision("init", built.init_request(roles=["decider", "router"]))
     return built
 
@@ -1833,11 +1908,11 @@ def test_mr1_r5_partial_binding_accepts_supported_levels_and_names_unsupported_o
 
 
 @pytest.mark.parametrize("which", ["team", "bindings"])
-def test_mr1_r5_unicode_paths_and_repair_text_survive_refusals(tmp_path_factory, mr1_cli, monkeypatch, which):
+def test_mr1_r5_unicode_paths_and_repair_text_survive_refusals(tmp_path_factory, mr1_cli, monkeypatch, which, source_seed):
     module, call = mr1_cli
     folder = tmp_path_factory.mktemp("mr1-unicode-" + uuid.uuid4().hex) / "José"
     folder.mkdir()
-    setup = Setup(folder)
+    setup = Setup(folder, source_seed=source_seed)
     setup.init()
     mr1_plan(setup)
     if which == "team":
@@ -1970,7 +2045,7 @@ def test_root_with_a_journal_gets_a_decision_connection_that_records_root_decide
         ("feature-1", "approve", "root-1")]
 
 
-def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_file(team, tmp_path):
+def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_file(team, tmp_path, source_seed):
     tomllib = pytest.importorskip("tomllib", reason="Codex settings are read with tomllib, Python 3.11+")
     role = team.add_role("pilot/root", "codex-cli", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
     # ROOT runs with approval_policy "never", so each enabled tool, the read tools too, carries its approve entry.
@@ -1979,7 +2054,7 @@ def test_a_codex_root_gets_the_decision_server_inline_and_a_native_root_a_flat_f
         "enabled_tools": ROOT_TOOLS, "tools": {name: {"approval_mode": "approve"} for name in ROOT_TOOLS}}}}
     assert json.loads(Path(role["connection"]).read_text())["mcpServers"]["aegis_decision"]["args"] == root_args(team, "codex-cli")
     (tmp_path / "native").mkdir()
-    native = Setup(tmp_path / "native")
+    native = Setup(tmp_path / "native", source_seed=source_seed)
     native.init()
     native.lifecycle = team.lifecycle
     flat = native.add_role("pilot/root", "codex", session=ROOT_SESSION, lifecycle=team.lifecycle, actor="root-1")
@@ -2067,12 +2142,12 @@ def test_a_router_with_the_journal_gets_router_status(team):
     assert "mcp__aegis_mailbox__router_status" in flag(argv, "--allowedTools").split(",")
 
 
-def test_a_codex_router_enables_router_status_and_without_the_journal_does_not(team, tmp_path):
+def test_a_codex_router_enables_router_status_and_without_the_journal_does_not(team, tmp_path, source_seed):
     role = team.add_role("pilot/router", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source), lifecycle=team.lifecycle)
     server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
     assert server["enabled_tools"][-1] == "router_status" and "router_status" not in server["tools"]
     (tmp_path / "plain").mkdir()
-    plain = Setup(tmp_path / "plain")
+    plain = Setup(tmp_path / "plain", source_seed=source_seed)
     provision("init", plain.init_request(roles=["router"]))
     without = plain.add_role("pilot/router", cwd=str(plain.tmp))
     assert "router_status" not in start_connection(without["connection"])
@@ -2086,7 +2161,7 @@ def test_the_router_session_is_refused_an_actor(team):
     assert unbound(team, "pilot/router")
 
 
-def test_a_decider_with_the_journal_and_its_actor_gets_decider_record(team):
+def test_a_decider_with_the_journal_and_its_actor_gets_decider_record(team, source_seed):
     role = team.add_role("pilot/decider", "codex-cli", session=REVIEW_SESSION, cwd=str(team.source), reader_shell=True,
                          lifecycle=team.lifecycle, actor="decider-1")
     server = codex_config(json.loads(Path(role["wake_profile"]).read_text())["argv"])["mcp_servers"]["aegis_mailbox"]
@@ -2094,7 +2169,7 @@ def test_a_decider_with_the_journal_and_its_actor_gets_decider_record(team):
     assert server["enabled_tools"][-1] == "decider_record"
     assert server["tools"]["decider_record"] == {"approval_mode": "approve"}
     (team.tmp / "claude").mkdir()
-    claude = Setup(team.tmp / "claude")
+    claude = Setup(team.tmp / "claude", source_seed=source_seed)
     provision("init", claude.init_request(roles=["decider"]))
     plain = claude.add_role("pilot/decider", cwd=str(claude.tmp), lifecycle=team.lifecycle, actor="decider-1")
     assert "decider_record" in start_connection(plain["connection"])
