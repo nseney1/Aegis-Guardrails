@@ -491,7 +491,7 @@ def test_shared_refusal_mapping_matches_cli_bytes(detail, capsys):
 
 
 @pytest.mark.parametrize("status,detail,pin_error", [
-    ("unbound", "workspace", False), ("hold", "binding", False),
+    ("unbound", "workspace", False),
     ("error", "binding", False), ("error", "binding", True),
 ])
 @pytest.mark.parametrize("action", ["read", "write"])
@@ -508,6 +508,70 @@ def test_binding_status_supplies_the_right_next_action(status, detail, pin_error
     expected = json.loads(capsys.readouterr().out)
     options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
     assert refuse(action, "E_AUTH", **options) == expected
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+def test_hold_guidance_is_fixed_and_does_not_echo_binding(action, workspace, monkeypatch):
+    from aegis_core.workspace.binding import WorkspaceBinding
+
+    denied = WorkspaceBinding(status="hold", reason="HOSTILE_MARKER", message="HOSTILE_MARKER",
+                              details={"candidates": ["HOSTILE_MARKER"]})
+    monkeypatch.setattr(server, "_bind", lambda *args: denied)
+    options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
+    assert refuse(action, "E_AUTH", **options) == {"error": {
+        "code": "E_AUTH",
+        "message": "workspace binding on hold; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server",
+    }}
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+def test_ambiguous_host_roots_dispatch_gives_launch_pin_guidance(action, tmp_path, monkeypatch):
+    roots = [tmp_path / "project-a", tmp_path / "project-b"]
+    for root in roots:
+        (root / ".aegis").mkdir(parents=True)
+    home = tmp_path / "user-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(server, "_server_cwd", str(tmp_path))
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                           "params": {"capabilities": {"roots": {}}}})
+    server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    request, = server.take_outbox()
+    assert server.handle_request({"jsonrpc": "2.0", "id": request["id"],
+                                  "result": {"roots": [{"uri": root.as_uri()} for root in roots]}}) is None
+    options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
+    held = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": "aegis_scan", "arguments": {}}})
+    assert held["result"]["isError"]
+    assert json.loads(held["result"]["content"][0]["text"])["reason"] == "ambiguous_host_roots"
+    error = refuse(action, "E_AUTH", **options)
+    assert error == {"error": {
+        "code": "E_AUTH",
+        "message": "workspace binding on hold; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server",
+    }}
+    for root in roots:
+        assert str(root) not in error["error"]["message"]
+        assert not (root / ".aegis" / "state").exists()
+
+    # The recovery writes a real store; keep the refusal checks portable above.
+    probe = make_store(tmp_path)
+    probe.close()
+    monkeypatch.setattr(server, "_canonical_workspace", str(roots[0]))
+    server.handle_request({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
+    request, = server.take_outbox()
+    assert server.handle_request({"jsonrpc": "2.0", "id": request["id"],
+                                  "result": {"roots": [{"uri": root.as_uri()} for root in roots]}}) is None
+    text, failed = call("write", kind="text", content=CONTENT)
+    assert not failed, text
+    record = json.loads(text)
+    assert (roots[0] / ".aegis" / "state" / "messages" / (record["id"] + ".json")).is_file()
+    assert not (roots[1] / ".aegis" / "state").exists()
 
 
 @pytest.mark.parametrize("action", ["read", "write"])

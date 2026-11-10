@@ -178,6 +178,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_hosts  # noqa: E402
+from hierarchy_hosts import SESSION  # noqa: E402
 import hierarchy_roles  # noqa: E402
 import hierarchy_runtime_source  # noqa: E402
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
@@ -205,7 +206,6 @@ PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
 RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
                               'restore it, or remove the unregistered base and run init again')
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 # multi_agent_v2 as well: the live M1 sessions ran with multi_agent disabled and were still offered the v2 sub-agent
 # tools. Whether codex honours either flag under an account's managed settings is unverified; the native probe checks.
 CODEX_DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2", "memories", "computer_use",
@@ -1131,6 +1131,7 @@ def add_role(request):
     setup = read_json(base / "provision.json")
     check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
+    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request.get("endpoint")
     mailbox.endpoint(endpoint)
@@ -1619,6 +1620,8 @@ def move(request):
             **({"roles": optional} if optional else {}),
             **{key: request[key] for key in ("board", "python") if key in request}})
     setup = read_json(base / "provision.json")
+    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
+    require("python" not in request or request["python"] == setup["python"], "python does not match provision.json")
     new = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     answers, needs_profile, tell = {}, [], {}
     for name in sorted(endpoints):

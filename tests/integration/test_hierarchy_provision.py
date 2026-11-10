@@ -347,6 +347,91 @@ def test_rb2_interpreter_probe_failure_has_a_fixed_refusal_and_hint(tmp_path, mr
     assert "pilot" not in built.workspace.run("status")["initiatives"]
 
 
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli", "codex"])
+@pytest.mark.parametrize("kind", ["removed", "relative", "directory", "not-executable", "missing-field", "invalid",
+                                 "empty", "nul", "oversized"])
+def test_rb2c_add_role_refuses_an_unavailable_recorded_interpreter(setup, host, kind):
+    path = setup.base / "provision.json"
+    record = json.loads(path.read_text())
+    interpreter = setup.tmp / "recorded-python"
+    if kind in ("removed", "not-executable"):
+        shutil.copy2(sys.executable, interpreter)
+        if kind == "removed":
+            interpreter.unlink()
+        else:
+            interpreter.chmod(0o600)
+        record["python"] = str(interpreter)
+    elif kind == "missing-field":
+        del record["python"]
+    else:
+        record["python"] = {"relative": "relative-python", "directory": str(setup.tmp), "invalid": 5,
+                            "empty": "", "nul": "\x00", "oversized": "x" * 4097}[kind]
+    path.write_text(json.dumps(record), encoding="utf-8")
+    before = {p.relative_to(setup.base): p.read_bytes() for p in setup.base.rglob("*") if p.is_file()}
+    assert setup.add_role("pilot/orchestrator", host, session="01a19a8e-3073-7af2-b5c0-d0c41fe82ada", cwd=str(setup.source),
+                          expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+    assert {p.relative_to(setup.base): p.read_bytes() for p in setup.base.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("fault", [OSError, ValueError])
+def test_rb2c_add_role_interpreter_probe_failure_is_a_fixed_refusal(setup, mr1_cli, monkeypatch, fault):
+    module, call = mr1_cli
+    before = invoke(setup.root, "status")["bindings"]
+
+    def unavailable(*args):
+        raise fault("probe detail must not be echoed")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(X_OK=os.X_OK, access=unavailable))
+    assert call("add-role", setup.request(base=str(setup.base), endpoint="pilot/orchestrator", host="claude-code"),
+                expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+    assert invoke(setup.root, "status")["bindings"] == before
+
+
+@pytest.fixture
+def rb2c_registered_move(setup):
+    old = setup.tmp / "old" / "mailbox"
+    old.parent.mkdir()
+    invoke(old, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {
+        "pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/root": {}}, "writer_limit": 3, "counterparts": []})
+    invoke(old, "bind", {"endpoint": "pilot/orchestrator", "host": "codex", "session": "native-orchestrator",
+                         "expected_generation": 0})
+    body = {"store": str(setup.workspace.store), "base": str(setup.base), "source": str(setup.source),
+            "old_root": str(old), "hierarchy": "pilot", "note": "The owner approved this move.",
+            "root": {"host": "codex", "session": "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"},
+            "initiative": {key: value for key, value in INITIATIVE.items() if key != "id"}}
+    return setup, body
+
+
+def test_rb2c_registered_move_refuses_a_conflicting_explicit_python(rb2c_registered_move):
+    built, body = rb2c_registered_move
+    interpreter = built.tmp / "other-python"
+    shutil.copy2(sys.executable, interpreter)
+    before = {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()}
+    assert provision("move", built.request(**body, python=str(interpreter)), expect=2) == {
+        "error": "python does not match provision.json"}
+    assert {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()} == before
+
+
+def test_rb2c_registered_move_refuses_an_unavailable_recorded_python(rb2c_registered_move):
+    built, body = rb2c_registered_move
+    path = built.base / "provision.json"
+    record = json.loads(path.read_text())
+    record["python"] = str(built.tmp / "deleted-python")
+    path.write_text(json.dumps(record), encoding="utf-8")
+    before = {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()}
+    assert provision("move", built.request(**body), expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+    assert {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_rb2c_registered_move_reuses_the_available_recorded_python(rb2c_registered_move, explicit):
+    built, body = rb2c_registered_move
+    options = {"python": sys.executable} if explicit else {}
+    assert provision("move", built.request(**body, **options))["hierarchy"] == "pilot"
+    path = built.base / "connections" / "pilot%2Forchestrator-g1.json"
+    assert json.loads(path.read_text())["command"] == sys.executable
+
+
 def test_rb2_no_plan_codex_output_changes_only_the_legacy_interpreter(tmp_path):
     built = Setup(tmp_path)
     request = built.init_request()

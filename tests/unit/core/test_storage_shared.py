@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import stat
 from types import SimpleNamespace
@@ -10,7 +11,42 @@ import pytest
 
 from aegis_core import storage
 from aegis_core.errors import PathTraversalError
+from aegis_core.verification import call_graph
+from aegis_cli.cli import main
 from tests import helpers_humangate as hg
+
+
+def test_storage_helpers_have_call_sites():
+    root = Path(__file__).resolve().parents[3]
+    result = call_graph.check(str(root / "aegis_core" / "storage.py"), str(root), fast_mode=False)
+    assert result.verdict is True, result.detail
+
+
+@pytest.mark.parametrize("path", ["aegis_core/storage.py", "aegis_core/storage_shared.py",
+                                 "tests/unit/core/test_storage_shared.py"])
+def test_public_scan_covers_storage_confinement(tmp_path, monkeypatch, capsys, path):
+    root = Path(__file__).resolve().parents[3]
+    workspace = tmp_path / "workspace"
+    for relative in ("contracts/contract-atomic-storage-boundaries.md",
+                     "invariants/invariant-single-canonical-ledger.md"):
+        source = root / ".aegis" / "rules" / relative
+        destination = workspace / ".aegis" / "rules" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    assert main(["scan", path, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {rule["name"] for rule in payload["relevant_rules"]} == {
+        "contract-atomic-storage-boundaries", "invariant-single-canonical-ledger"}
+
+
+def test_bound_storage_namespace_preserves_live_patch_targets(tmp_path, monkeypatch):
+    expected = tmp_path / "patched-state"
+    monkeypatch.setattr(storage, "sys", SimpleNamespace(modules={}))
+    monkeypatch.setattr(storage, "gitsafe", SimpleNamespace(common_dir=lambda root: None))
+    monkeypatch.setattr(storage, "state_dir", lambda root: expected)
+    assert storage.shared_state_dir(tmp_path) == expected
 
 
 @pytest.fixture
