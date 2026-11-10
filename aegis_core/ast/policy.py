@@ -440,7 +440,7 @@ def evaluate_forbid_ast_delta(spec: Any, head_ast: Any, base_ast: Any = None, *,
 
 
 def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional[Union[str, Path]] = None, code: Optional[str] = None, ast_runner: Any = None, confine_root: Optional[Union[str, Path]] = None) -> Optional[NormalizedAST]:
-    from aegis_core.ast.drivers.python import parse_python_ast, read_python_source
+    from aegis_core.ast.drivers.python import normalize_python_ast, read_python_source
     path_str = str(file_path)
     ext = os.path.splitext(path_str)[1].lower()
     try:
@@ -456,7 +456,7 @@ def extract_normalized_ast(file_path: Union[str, Path], workspace_root: Optional
         if ext == ".py":
             source_text = code if code is not None else read_python_source(path_str)
             tree = ast.parse(source_text, filename=path_str)
-            norm_ast = parse_python_ast(source_text, file_path=path_str)
+            norm_ast = normalize_python_ast(tree, path_str)
             decs = _extract_python_decorators_from_tree(tree)
             allows = {
                 line: [{**entry, "rules": sorted(entry["rules"]) if entry["rules"] is not None else None}
