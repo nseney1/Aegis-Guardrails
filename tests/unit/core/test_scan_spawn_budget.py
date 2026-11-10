@@ -189,13 +189,14 @@ def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
 
 @pytest.mark.parametrize("portable", [False, True], ids=["native", "portable"])
 @pytest.mark.parametrize("scan2_state", ["real", "settled", "unsettled"])
-def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portable, scan2_state):
+def test_an_mcp_scan_counts_index_reads_and_memo_validation(git_ws, monkeypatch, portable, scan2_state):
+    from dataclasses import replace
     from types import SimpleNamespace
     from aegis_core import atomicio, credit, credit_memo, storage
     import aegis_mcp.server as server
 
     if portable:
-        monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(os), supports_dir_fd=set())))
+        monkeypatch.setattr(credit_memo, "_anchored_snapshot_supported", lambda: False)
     _seed_ledger(git_ws)
     monkeypatch.setattr(server, "_canonical_workspace", str(git_ws))
     server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -208,8 +209,24 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portabl
         assert json.loads(response["result"]["content"][0]["text"])["rules_staged"] > 0
 
     path = ledger.ledger_path(git_ws)
-    real_open, real_snapshot = os.open, credit_memo._snapshot
-    reads, snapshots, sample_reads = [], [], []
+    clock_info = storage.ledger_site(git_ws).lock.stat()
+    real_open, real_snapshot, real_before = os.open, credit_memo._snapshot, credit_memo.before_read
+    reads, snapshots, sample_reads, starts = [], [], [], []
+    generation, clock = [], [None]
+
+    def reported(info):
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        if generation and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) == generation[0]:
+            fields["st_ctime_ns"] = info.st_mtime_ns
+        if clock[0] is not None and (info.st_dev, info.st_ino) == (clock_info.st_dev, clock_info.st_ino):
+            fields["st_mtime_ns"] = clock[0]
+        return SimpleNamespace(**fields)
+
+    def pin_old_generation(age):
+        old = time.time_ns() - age
+        os.utime(path, ns=(old, old))
+        info = path.stat()
+        generation[:] = [(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)]
 
     def opener(file, *args, **kwargs):
         flags = args[0] if args else kwargs.get("flags", os.O_RDONLY)
@@ -224,20 +241,27 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portabl
     def snapshot(*args, **kwargs):
         result = real_snapshot(*args, **kwargs)
         assert result is not None
-        info = path.stat()
+        info = io.stat(path)
         assert result.identity == (info.st_dev, info.st_ino)
         assert (result.size, result.mtime_ns, result.ctime_ns) == storage.file_generation(
             info.st_size, info.st_mtime_ns, info.st_ctime_ns)
         snapshots.append(result)
         return result
 
-    io = SimpleNamespace(**dict(vars(os), open=opener))
+    def before(*args, **kwargs):
+        result = real_before(*args, **kwargs)
+        starts.append(None if result is None else result.started_ns)
+        return result
+
+    io = SimpleNamespace(**dict(vars(os), open=opener,
+        stat=lambda *a, **kw: reported(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: reported(os.lstat(*a, **kw)), fstat=lambda fd: reported(os.fstat(fd))))
     for module in (atomicio, storage, ledger):
         monkeypatch.setattr(module, "os", io)
-    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=opener, read=sample_read)))
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(io), read=sample_read)))
     monkeypatch.setattr(credit_memo, "_snapshot", snapshot)
-    real_read = credit.read_rows
-    exposure_reports = []
+    monkeypatch.setattr(credit_memo, "before_read", before)
+    real_read, exposure_reports = credit.read_rows, []
 
     def exposure_read(*args, **kwargs):
         rows = real_read(*args, **kwargs)
@@ -245,68 +269,43 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portabl
         return rows
 
     monkeypatch.setattr(credit, "read_rows", exposure_read)
-
-    counts = []
+    supported = credit_memo.filesystem_clock_supported()
     for request in (1, 2):
         reads.clear()
         snapshots.clear()
         exposure_reports.clear()
-        if request == 2 and scan2_state != "real":
-            if scan2_state == "settled":
-                # Distinct from scan 3's backdate even on coarse file clocks.
-                old = time.time_ns() - 20_000_000_000
-                os.utime(path, ns=(old, old))
-                io_start = lambda: time.time_ns() + 3_000_000_000
-            else:
-                # Tie the I/O start to the unchanged generation so a scheduler
-                # pause cannot turn this deliberately recent evidence eligible.
-                tick = path.stat().st_mtime_ns
-                io_start = lambda: tick
-            with monkeypatch.context() as patch:
-                patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=io_start)))
-                call(request)
-        else:
-            call(request)
-        counts.append(len(exposure_reports))
-        assert len(exposure_reports) == 1
+        starts.clear()
+        if request == 2 and scan2_state == "settled":
+            pin_old_generation(20_000_000_000)
+        elif request == 2 and scan2_state == "unsettled":
+            clock[0] = path.stat().st_mtime_ns
+        call(request)
+        assert len(exposure_reports) == len(starts) == 1
         report = exposure_reports[0]
-        assert report is not None and report.started_ns is not None
-        _, mtime_ns, ctime_ns = storage.file_generation(report.size, report.mtime_ns, report.ctime_ns)
-        ages = (report.started_ns - mtime_ns, report.started_ns - ctime_ns)
-        settled = ages[0] > 2_000_000_000 and (ctime_ns == 0 or ages[1] > 2_000_000_000)
-        # Scan 1 appends and never fills. Scan 2 may settle during a scheduler
-        # pause: its actual I/O evidence decides whether a fill/open is correct.
+        assert report is not None and report.started_ns is None
+        settled = credit_memo.settled(replace(report, started_ns=starts[0]))
         fills = int(request == 2 and settled)
         if request == 2 and scan2_state != "real":
-            assert fills == int(scan2_state == "settled")
-        assert len(reads) == 2 + fills
+            assert fills == int(supported and scan2_state == "settled")
+        # The first exposure append also opens the keyed index; later duplicates do not.
+        assert len(reads) == 2 + fills + int(request == 1)
         assert len(snapshots) == fills
-        print("RF-2b scan evidence:", scan2_state, request, ages, "fills:", fills)
 
-    filled = fills  # Scan 2 may leave a memo for scan 3 to invalidate.
-    old = time.time_ns() - 10_000_000_000
-    os.utime(path, ns=(old, old))
-    for request, expected in ((3, 1), (4, 0)):
+    filled = fills
+    pin_old_generation(10_000_000_000)
+    clock[0] = None
+    for request in (3, 4):
         reads.clear()
         snapshots.clear()
         exposure_reports.clear()
-        if request == 3:
-            # Backdating distinguishes this generation; only its settling read
-            # gets a shifted I/O clock. The warm scan uses real clocks again.
-            with monkeypatch.context() as patch:
-                patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: time.time_ns() + 3_000_000_000)))
-                call(request)
-        else:
-            call(request)
-        counts.append(len(exposure_reports))
-        assert len(exposure_reports) == expected
+        starts.clear()
+        call(request)
         validation = filled if request == 3 else 0
-        assert len(reads) == 2 + expected + validation
-        assert len(snapshots) == 1 + validation
-        print("RF-2b ledger opens/snapshots:", scan2_state, request, len(reads), len(snapshots))
+        new_fill = int(supported)
+        assert len(exposure_reports) == (1 if request == 3 or not supported else 0)
+        assert len(reads) == (2 + validation + new_fill if request == 3 else 2)
+        assert len(snapshots) == validation + new_fill
     assert sample_reads == []
-    assert counts == [1, 1, 1, 0]
-    print("RF-2b exposure reads per scan:", scan2_state, counts)
 
 
 # ── (d): a scan that matches no rule does no fitness work (R-structure-7) ───
