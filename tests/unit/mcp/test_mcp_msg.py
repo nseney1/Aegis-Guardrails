@@ -223,17 +223,13 @@ def test_reference_contains_selector_grammar_and_examples():
         assert guidance in entry
 
 
-@pytest.mark.parametrize("pin_error", [False, True])
-def test_binding_failure_is_a_fixed_message_refusal(workspace, monkeypatch, pin_error, capsys):
-    from aegis_core.workspace.binding import WorkspaceBinding
-    denied = WorkspaceBinding(status="error", reason="HOSTILE_MARKER", message="HOSTILE_MARKER")
-    if pin_error:
-        monkeypatch.setattr(server, "_workspace_error", denied)
-    else:
-        monkeypatch.setattr(server, "_bind", lambda *args: denied)
-    assert emit_error(codec.CodecError("E_AUTH"), detail="binding") == 2
-    expected = json.loads(capsys.readouterr().out)
-    assert refuse("read", "E_AUTH", ref="a" * 64) == expected
+@pytest.mark.parametrize("detail,message", [
+    ("workspace", "workspace is not initialized; run aegis init"),
+    ("binding", "workspace binding refused; check --workspace / AEGIS_WORKSPACE"),
+])
+def test_cli_binding_refusal_keeps_its_own_next_action(detail, message, capsys):
+    assert emit_error(codec.CodecError("E_AUTH"), detail=detail) == 2
+    assert json.loads(capsys.readouterr().out) == {"error": {"code": "E_AUTH", "message": message}}
 
 
 @pytest.mark.parametrize("arguments", [[], "HOSTILE_MARKER", 7])
@@ -490,24 +486,151 @@ def test_shared_refusal_mapping_matches_cli_bytes(detail, capsys):
     assert frontend_error(codec.CodecError(code), detail=detail) == expected
 
 
-@pytest.mark.parametrize("status,detail,pin_error", [
-    ("unbound", "workspace", False), ("hold", "binding", False),
-    ("error", "binding", False), ("error", "binding", True),
+@pytest.mark.parametrize("status,pin_error,prefix", [
+    ("hold", False, "on hold"),
+    ("error", False, "refused"), ("error", True, "refused"),
 ])
 @pytest.mark.parametrize("action", ["read", "write"])
-def test_binding_status_supplies_the_right_next_action(status, detail, pin_error, action,
-                                                       workspace, monkeypatch, capsys):
+def test_binding_status_supplies_the_right_next_action(status, pin_error, prefix, action,
+                                                       workspace, monkeypatch):
     from aegis_core.workspace.binding import WorkspaceBinding
 
-    denied = WorkspaceBinding(status=status, reason="HOSTILE_MARKER", message="HOSTILE_MARKER")
+    denied = WorkspaceBinding(status=status, reason="HOSTILE_MARKER", message="HOSTILE_MARKER",
+                              details=(("candidates", ["HOSTILE_MARKER"]),))
     if pin_error:
         monkeypatch.setattr(server, "_workspace_error", denied)
     else:
         monkeypatch.setattr(server, "_bind", lambda *args: denied)
-    assert emit_error(codec.CodecError("E_AUTH"), detail=detail) == 2
-    expected = json.loads(capsys.readouterr().out)
+
+    def must_not_execute(*args):
+        pytest.fail("binding refusal reached a handler")
+    monkeypatch.setattr(server, "execute_tool", must_not_execute)
     options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
-    assert refuse(action, "E_AUTH", **options) == expected
+    assert refuse(action, "E_AUTH", **options) == {"error": {
+        "code": "E_AUTH",
+        "message": "workspace binding " + prefix + "; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server",
+    }}
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+@pytest.mark.parametrize("startup_error", [False, True], ids=["pin-disappeared", "invalid-startup-pin"])
+def test_real_pin_error_dispatch_gives_launch_configuration_guidance(action, startup_error,
+                                                                   tmp_path, monkeypatch):
+    root = tmp_path / "HOSTILE_MARKER"
+    if not startup_error:
+        (root / ".aegis").mkdir(parents=True)
+    server._start({"AEGIS_WORKSPACE": str(root)})
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+    if not startup_error:
+        assert server._workspace_error is None
+        root.rename(tmp_path / "moved-project")
+
+    def must_not_execute(*args):
+        pytest.fail("pin error reached a handler")
+    monkeypatch.setattr(server, "execute_tool", must_not_execute)
+    options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
+    assert refuse(action, "E_AUTH", **options) == {"error": {
+        "code": "E_AUTH",
+        "message": "workspace binding refused; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server",
+    }}
+    assert not root.exists()
+    assert not (tmp_path / "moved-project" / ".aegis" / "state").exists()
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+@pytest.mark.parametrize("case,reason", [
+    ("uninitialized-startup", "pin_not_a_workspace"),
+    ("metadata-removed", "pin_not_a_workspace"),
+    ("missing-startup", "pin_missing"),
+    ("denied-startup", "pin_denied"),
+])
+def test_real_pin_error_dispatch_selects_reason_specific_remedy(action, case, reason,
+                                                               tmp_path, monkeypatch):
+    home = tmp_path / "HOSTILE_MARKER-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    root = home if case == "denied-startup" else tmp_path / "HOSTILE_MARKER-project"
+    if case in ("uninitialized-startup", "metadata-removed"):
+        root.mkdir()
+    if case == "metadata-removed":
+        (root / ".aegis").mkdir()
+    server._start({"AEGIS_WORKSPACE": str(root)})
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+    if case == "metadata-removed":
+        assert server._workspace_error is None
+        (root / ".aegis").rmdir()
+
+    def must_not_execute(*args):
+        pytest.fail("pin error reached a handler")
+    monkeypatch.setattr(server, "execute_tool", must_not_execute)
+    diagnostic = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                        "params": {"name": "aegis_scan", "arguments": {}}})
+    assert diagnostic["result"]["isError"]
+    binding = json.loads(diagnostic["result"]["content"][0]["text"])["binding"]
+    assert (binding["status"], binding["reason"]) == ("error", reason)
+    if case in ("uninitialized-startup", "metadata-removed"):
+        message = ("pinned directory is not an Aegis workspace; run aegis init in that directory "
+                   "(aegis init --pin also pins the hosts), then restart the MCP server")
+    else:
+        message = ("workspace binding refused; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server")
+    options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
+    assert refuse(action, "E_AUTH", **options) == {"error": {"code": "E_AUTH", "message": message}}
+    assert not (root / ".aegis" / "state").exists()
+
+
+@pytest.mark.parametrize("action", ["read", "write"])
+def test_ambiguous_host_roots_dispatch_gives_launch_pin_guidance(action, tmp_path, monkeypatch):
+    roots = [tmp_path / "project-a", tmp_path / "project-b"]
+    for root in roots:
+        (root / ".aegis").mkdir(parents=True)
+    home = tmp_path / "user-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(server, "_server_cwd", str(tmp_path))
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                           "params": {"capabilities": {"roots": {}}}})
+    server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    request, = server.take_outbox()
+    assert server.handle_request({"jsonrpc": "2.0", "id": request["id"],
+                                  "result": {"roots": [{"uri": root.as_uri()} for root in roots]}}) is None
+    options = {"ref": "a" * 64} if action == "read" else {"kind": "text", "content": CONTENT}
+    held = server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": "aegis_scan", "arguments": {}}})
+    assert held["result"]["isError"]
+    assert json.loads(held["result"]["content"][0]["text"])["reason"] == "ambiguous_host_roots"
+    error = refuse(action, "E_AUTH", **options)
+    assert error == {"error": {
+        "code": "E_AUTH",
+        "message": "workspace binding on hold; set AEGIS_WORKSPACE to the intended project directory "
+                   "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+                   "then restart the MCP server",
+    }}
+    for root in roots:
+        assert str(root) not in error["error"]["message"]
+        assert not (root / ".aegis" / "state").exists()
+
+    # The recovery writes a real store; keep the refusal checks portable above.
+    probe = make_store(tmp_path)
+    probe.close()
+    monkeypatch.setattr(server, "_canonical_workspace", str(roots[0]))
+    server.handle_request({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"})
+    request, = server.take_outbox()
+    assert server.handle_request({"jsonrpc": "2.0", "id": request["id"],
+                                  "result": {"roots": [{"uri": root.as_uri()} for root in roots]}}) is None
+    text, failed = call("write", kind="text", content=CONTENT)
+    assert not failed, text
+    record = json.loads(text)
+    assert (roots[0] / ".aegis" / "state" / "messages" / (record["id"] + ".json")).is_file()
+    assert not (roots[1] / ".aegis" / "state").exists()
 
 
 @pytest.mark.parametrize("action", ["read", "write"])

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Optional Teams container adapter (C1): validation, same-path mounts and pure engine argv.
 
-Nothing here executes an engine, creates a directory or writes a run. The small CLI reads the isolation subset
-of team-run.json; C3 will connect it to the complete team config validator. Both plan and verify are read-only.
+The builders return engine argv; the verify CLI executes image inspect. No directories or runs are written.
+The small CLI reads the isolation subset of team-run.json. Both plan and verify are read-only.
 Exit codes: 0 valid/equal, 2 refused/mismatched, 3 internal error. Python 3.9, standard library only.
 """
 from __future__ import annotations
@@ -24,24 +24,9 @@ from hierarchy_mailbox import read_json, require, safe_path, strict_json, text  
 
 
 from hierarchy_container_verify import (  # noqa: E402,F401 (public adapter facade)
-    BASE_ENV_ALLOWLIST,
-    DEFAULT_PATH,
-    DIGEST_IMAGE,
-    ENGINE_ENV_KEYS,
-    ENV_NAME,
-    EXPECTED_ERROR_ORDER,
-    EXPECTED_FIELDS,
-    IMAGE_INFO_FIELDS,
-    IMAGE_PROTECTED_TREES,
-    IMAGE_SCRATCH_TREES,
-    IMAGE_SYSTEM_DIRS,
     ISOLATION_FIELDS,
     LINUX_ID_LIMIT,
-    MEMORY,
-    NAMESPACE_REQUESTS,
     NETWORK_MODE,
-    SECRET_PATHS,
-    SYMLINK_FOLLOW_LIMIT,
     _absolute,
     _canonical_path,
     _check_mount_overlap,

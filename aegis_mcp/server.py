@@ -295,11 +295,23 @@ def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     }
 
 
-def _message_refusal(req_id, code, *, detail=None):
+def _message_refusal(req_id, code, *, detail=None, binding_reason=None):
     from aegis_core.message_codec import CodecError
     from aegis_core.message_codec_format import frontend_error
 
     value = frontend_error(CodecError(code, detail=detail), detail=detail)
+    if code == "E_AUTH" and detail == "binding" and binding_reason == "pin_not_a_workspace":
+        value["error"]["message"] = (
+            "pinned directory is not an Aegis workspace; run aegis init in that directory "
+            "(aegis init --pin also pins the hosts), then restart the MCP server"
+        )
+    elif code == "E_AUTH" and detail in ("hold", "binding"):
+        status = "on hold" if detail == "hold" else "refused"
+        value["error"]["message"] = (
+            "workspace binding " + status + "; set AEGIS_WORKSPACE to the intended project directory "
+            "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+            "then restart the MCP server"
+        )
     return _tool_result(req_id, json.dumps(value, separators=(",", ":")), True)
 
 
@@ -371,7 +383,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return _message_refusal(req_id, "E_FORMAT")
     if _workspace_error is not None:
         if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
-            return _message_refusal(req_id, "E_AUTH", detail="binding")
+            return _message_refusal(req_id, "E_AUTH", detail="binding",
+                                    binding_reason=_workspace_error.reason)
         return _tool_result(req_id, json.dumps(_unbound_result(_workspace_error)), True)
     if not isinstance(params, dict):
         return _error(req_id, -32602, "Tool call params must be an object.")
@@ -409,8 +422,8 @@ def _repository_call(req_id, params, name, args):
         args["_unbound"] = binding.reason
     else:
         if name in ("aegis_msg_read", "aegis_msg_write"):
-            detail = "workspace" if binding.status == "unbound" else "binding"
-            return _message_refusal(req_id, "E_AUTH", detail=detail)
+            detail = {"unbound": "workspace", "hold": "hold"}.get(binding.status, "binding")
+            return _message_refusal(req_id, "E_AUTH", detail=detail, binding_reason=binding.reason)
         return _tool_result(req_id, json.dumps(_unbound_result(binding)), True)
     args["_host"] = _client_platform
     args["_session"] = _session_id
