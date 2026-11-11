@@ -57,8 +57,8 @@
       "stmts": 113
     },
     "aegis_core/verification/import_guard.py:check": {
-      "lines": 113,
-      "stmts": 56
+      "lines": 66,
+      "stmts": 27
     },
     "aegis_core/verification/mutation_tester.py:check": {
       "lines": 134,

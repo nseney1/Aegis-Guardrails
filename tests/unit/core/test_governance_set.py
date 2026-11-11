@@ -11,6 +11,7 @@ from aegis_core import governance
     (".aegis/rules/README.md", "rules"),
     (".aegis/config.json", "aegis-state"),
     (".aegis/team.json", "aegis-state"),
+    (".aegis/team/profile.json", "aegis-state"),
     (".aegis/baseline.json", "aegis-state"),
     (".aegis/adjudications/trap-x.jsonl", "aegis-state"),  # labels count only once merged (R-evidence-3)
     ("allowed_signers", "signers"),
@@ -60,6 +61,34 @@ def test_matching_is_case_folded_and_separator_agnostic():
     assert governance.touches_governance([".aegis\\config.json"]) == ["aegis-state"]
     assert governance.touches_governance(["./.github/Workflows/ci.yml"]) == ["workflows"]
     assert governance.touches_governance(["CONFTEST.PY"]) == ["test-infra"]
+    assert governance.touches_governance(["pkg\\.AEGIS\\TEAM\\PROFILE.JSON"]) == ["aegis-state"]
+
+
+@pytest.mark.parametrize("path", [".aegis/team/profile.json", "pkg/.aegis/team/profile.json"])
+def test_profile_is_governance_and_in_codeowners_samples(path):
+    assert governance.category_of(path) == "aegis-state"
+    assert governance.category_of(path, deleted=True) == "aegis-state"
+    assert "**/.aegis/team/profile.json @o" in governance.codeowners_lines("@o")
+    assert ".aegis/team/profile.json" in governance.coverage_samples()
+
+
+@pytest.mark.skipif(not __import__("shutil").which("git"), reason="needs git")
+def test_profile_changes_move_the_existing_human_gate_hash(tmp_path, monkeypatch):
+    from aegis_core import human_gate
+    from tests import helpers_humangate as hg
+
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(tmp_path / "home"))
+    repo = hg.make_repo(tmp_path)
+    before = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.write(".aegis/team/profile.json", '{"version":1,"preset":"pair"}\n')
+    repo.commit("profile pair")
+    pair = human_gate.governance_tree_hash(repo.root, "HEAD")
+    repo.write(".aegis/team/profile.json", '{"version":1,"preset":"solo"}\n')
+    repo.commit("profile solo")
+    solo = human_gate.governance_tree_hash(repo.root, "HEAD")
+    assert before != pair
+    assert pair != solo
 
 
 def test_a_present_test_file_is_not_governance_but_a_deleted_one_is():

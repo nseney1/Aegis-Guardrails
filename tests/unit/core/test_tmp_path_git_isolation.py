@@ -226,7 +226,7 @@ def test_separator_in_basetemp_refuses_before_test_body(tmp_path, repo_root, sep
 
 
 @pytest.mark.parametrize("marker", ["directory", "file"])
-def test_product_walks_respect_the_ceiling(tmp_path, monkeypatch, marker):
+def test_workspace_discovery_respects_ceiling_but_store_placement_does_not(tmp_path, monkeypatch, marker):
     from aegis_core.manager_policy import ManagerError
     from aegis_core.manager_store import ManagerStore
     from aegis_core.workspace import as_workspace
@@ -251,7 +251,8 @@ def test_product_walks_respect_the_ceiling(tmp_path, monkeypatch, marker):
     assert git_boundary(workspace) is None
     assert bounded_walk_up(workspace) is None
     assert as_workspace(workspace).root == workspace
-    assert ManagerStore(workspace / "audit").read() == []
+    with pytest.raises(ManagerError, match="^store_in_worktree$"):
+        ManagerStore(workspace / "audit").read()
     # Explicit forbidden roots remain authoritative even beyond the ceiling.
     with pytest.raises(ManagerError, match="^store_in_worktree$"):
         ManagerStore(workspace / "audit", forbidden_roots=[outer]).read()
@@ -585,7 +586,8 @@ def test_benign_symlinked_temproot_runs(tmp_path, repo_root, mode):
     assert (root / "pytest-of-rf81").exists() == (mode != "collect")
 
 
-def test_operator_ceiling_can_admit_manager_store_in_enclosing_checkout(enclosing_checkout, monkeypatch):
+@pytest.mark.parametrize("operation", ["read", "append", "transaction"])
+def test_operator_ceiling_cannot_admit_manager_store_in_enclosing_checkout(enclosing_checkout, monkeypatch, operation):
     from aegis_core.manager_policy import ManagerError
     from aegis_core.manager_store import ManagerStore
 
@@ -596,13 +598,14 @@ def test_operator_ceiling_can_admit_manager_store_in_enclosing_checkout(enclosin
         store.append({"kind": "scan"})
     assert not store.root.exists()
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
-    row = store.append({"kind": "scan"})
-    assert store.read() == [row]
-    preview = subprocess.run([shutil.which("git"), "clean", "-n", "-d", "-x"], cwd=outer,
-                             env=dict(os.environ, LC_ALL="C"), capture_output=True, text=True,
-                             timeout=_HANG_CEILING)
-    assert preview.returncode == 0, preview.stderr
-    assert "Would remove ceiling/" in preview.stdout
+    with pytest.raises(ManagerError, match="^store_in_worktree$"):
+        if operation == "read":
+            store.read()
+        elif operation == "append":
+            store.append({"kind": "scan"})
+        else:
+            store.transaction(lambda rows: pytest.fail("refused placement invoked callback"))
+    assert not store.root.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="control characters are not Windows path characters")
