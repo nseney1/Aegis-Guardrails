@@ -149,7 +149,7 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/config.py", "read_user_config", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
     ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
     ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): (1, "read earlier check records through the storage boundary"),
-    ("aegis_core/credit.py", "_read_ledger_events", "aegis_core.storage.read_jsonl"): (1, "read credit ledger events through the storage boundary"),
+    ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): (1, "read credit ledger events through the storage boundary"),
     ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): (1, "shared L0 regular-file descriptor delegate; caller supplies the reviewed read or private-create flags"),
     ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): (1, "sample the held lock file's filesystem clock for ledger evidence"),
     ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): (1, "read-only persisted-ledger generation snapshot"),
