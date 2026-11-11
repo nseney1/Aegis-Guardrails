@@ -36,6 +36,7 @@ __all__ = [
     "ASTDriverRegistry",
     "ASTDriverRunner",
     "resolve_driver_executable",
+    "split_driver_command",
     "enforce_source_size",
 ]
 
@@ -80,7 +81,7 @@ def _command_plan(command: str, ext: str, ws_root: Optional[Path] = None, where:
     current directory) would resolve against the workspace.
     """
     try:
-        parts = _split_command(command)
+        parts = split_driver_command(command)
     except ValueError as exc:  # unbalanced quotes
         return _DriverPlan(label=command, unavailable=f"the driver command cannot be parsed: {exc}")
     if parts and _is_python_name(parts[0]):
@@ -160,7 +161,7 @@ def _user_command_plan(command: str, ext: str, ws_root: Path) -> Optional[_Drive
     if plan.unavailable or not plan.argv:
         return plan
     argv = list(plan.argv)
-    first = _split_command(command)[0]
+    first = split_driver_command(command)[0]
     if not _is_python_name(first):  # python names already resolved to sys.executable, which runs aegis itself
         if not is_bare(first):
             # The child runs in an empty directory, so a relative path is joined to the
@@ -273,7 +274,7 @@ def _names_program(token: str) -> bool:
     return os.path.isabs(token) and os.path.isfile(token)
 
 
-def _split_command(cmd: str) -> list[str]:
+def split_driver_command(cmd: str) -> list[str]:
     """Split a driver command line string into argv arguments, preserving Windows paths."""
     parts = split_command(cmd)
     if os.name == "nt":
@@ -284,6 +285,10 @@ def _split_command(cmd: str) -> list[str]:
                 if _names_program(cand):
                     return [cand] + parts[i + 1 :]
     return parts
+
+
+# Compatibility for existing direct imports; consumers use the public decoder.
+_split_command = split_driver_command
 
 
 def resolve_driver_executable(name: str, workspace: Optional[Union[Path, str]] = None) -> Optional[str]:

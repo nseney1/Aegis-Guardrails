@@ -1103,9 +1103,12 @@ sys.stdout.write(json.dumps(found))
 
 
 def _child_env(home: Path) -> dict:
-    return {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
+    env = {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
             "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
+    if "GIT_CEILING_DIRECTORIES" in os.environ:
+        env["GIT_CEILING_DIRECTORIES"] = os.environ["GIT_CEILING_DIRECTORIES"]
+    return env
 
 
 def unexpected_modules(loaded, before) -> list:

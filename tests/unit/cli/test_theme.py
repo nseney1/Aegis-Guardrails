@@ -128,3 +128,22 @@ def test_without_args_an_interactive_tty_gets_color_and_emoji_not_json():
     for args in (None, argparse.Namespace()):
         ctx = OutputContext.from_env_and_args(args, environ={}, isatty=True)
         assert (ctx.json_mode, ctx.plain, ctx.color_enabled, ctx.emoji_enabled) == (False, False, True, True)
+
+
+def test_diagnostic_badge_selects_only_the_authored_icon():
+    plain = OutputContext(plain=True)
+    rich = OutputContext(emoji_enabled=True)
+    for icon, label in (("✅", "PASS"), ("⚠️ ", "WARN"), ("❌", "FAIL"), ("ℹ️ ", "INFO")):
+        assert plain.diagnostic_badge(icon, label) == f"[{label}]"
+        assert rich.diagnostic_badge(icon, label) == icon
+
+
+def test_diagnostic_text_canonicalizes_and_redacts_before_truncating():
+    from aegis_cli.ui.theme import diagnostic_text
+
+    token = "ghp_" + "A" * 20 + "\x1b[31m" + "B" * 16
+    shown = diagnostic_text("⚠️  caller " + token, 35)
+    assert "⚠️  caller" in shown
+    assert "REDACTED" in shown and "A" * 10 not in shown
+    assert "\x1b" not in shown and len(shown) <= 35
+    assert diagnostic_text("x" * 65537, 80) == "[diagnostic omitted: too_large]"
