@@ -417,7 +417,8 @@ def _shared_errors(base: Path):
 
 
 def _confined_shared(directory: Path, base: Path, create: bool) -> None:
-    return storage_shared.confined_shared(_DEPS, directory, base, create)
+    return storage_shared.confined_shared(_DEPS, directory, base, create,
+                                         shared_errors=lambda b: _shared_errors(b))
 
 
 def _shared_dir(base: Path, create: bool) -> Path:

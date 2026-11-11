@@ -854,7 +854,7 @@ def _run_insight(args: argparse.Namespace) -> int:
         else:
             print(f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
             if row["level"] != "H":
-                print(f"To record it at level H, sign a commit carrying this trailer, then re-run with --commit SHA:\n  {trailer}")
+                print(f'To record it at level H, run this command, then re-run with --commit SHA:\n  git -c core.hooksPath={os.devnull} commit -S --allow-empty --only -m "chore: approve insight" -m "{trailer}"')
         return 0
 
     if sub_action == "review":
