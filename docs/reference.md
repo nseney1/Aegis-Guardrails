@@ -729,6 +729,7 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 
 | Tool | Title |
 | --- | --- |
+| `aegis_team_config` | Team Config |
 | `aegis_scan` | Scan JIT Rules |
 | `aegis_report_outcome` | Report Outcome |
 | `aegis_create_rule` | Create Rule |
@@ -736,6 +737,24 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 | `aegis_capture_insight` | Capture Insight |
 | `aegis_msg_read` | Read Message |
 | `aegis_msg_write` | Write Message |
+
+### `aegis_team_config`
+
+**Team Config** (read-only, idempotent)
+
+Read the resolved team profile with per-value layer provenance.
+
+It takes no parameters.
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
+```
 
 ### `aegis_scan`
 

@@ -59,6 +59,7 @@ __all__ = [
     "denial",
     "denial_message",
     "git_boundary",
+    "git_discovery_ceiling",
     "git_discovery_paths",
     "home_message",
     "read_registry",
@@ -231,24 +232,40 @@ def _git_ceiling_entries() -> Iterable[str]:
         yield entry
 
 
-def git_discovery_paths(start: Path) -> Iterable[Path]:
-    """Walk physical ancestors, stopping before Git's longest proper ceiling.
+def _git_ceiling_for(physical: str) -> Optional[str]:
+    """The nearest matching ceiling spelling, sharing Git's entry semantics."""
+    nearest: Optional[str] = None
+    limit = -1
+    for entry in _git_ceiling_entries():
+        prefix = entry[:-1] if entry.endswith("/") else entry
+        length = len(prefix)
+        if physical == prefix or physical == entry:
+            return entry
+        if (physical.startswith(prefix) and physical[length:length + 1] == "/"
+                and physical[length + 1:] and length > limit):
+            nearest, limit = entry, length
+    return nearest
 
-    The starting directory is always inspected, even if listed as a ceiling.
+
+def git_discovery_ceiling(start: Path) -> Optional[Path]:
+    """Nearest ceiling at or above physical ``start``, or None; unresolvable starts raise OSError."""
+    entry = _git_ceiling_for(_resolve(start).as_posix())
+    return Path(entry) if entry is not None else None
+
+
+def git_discovery_paths(start: Path) -> Iterable[Path]:
+    """Walk physical ancestors within the configured discovery ceilings.
+
+    Inspect the starting directory, stopping there if it equals a ceiling;
+    otherwise stop before Git's longest proper ceiling.
     This limits discovery only; explicit workspace pins keep their authority.
     """
     try:
         start = start.resolve()
     except (OSError, RuntimeError, ValueError):
         return
-    physical = start.as_posix()
-    limit = -1
-    for entry in _git_ceiling_entries():
-        prefix = entry[:-1] if entry.endswith("/") else entry
-        length = len(prefix)
-        if (physical.startswith(prefix) and physical[length:length + 1] == "/"
-                and physical[length + 1:]):
-            limit = max(limit, length)
+    ceiling = _git_ceiling_for(start.as_posix())
+    limit = -1 if ceiling is None else len(ceiling[:-1] if ceiling.endswith("/") else ceiling)
     yield start
     for parent in start.parents:
         if len(parent.as_posix().rstrip("/")) <= limit:
@@ -257,13 +274,14 @@ def git_discovery_paths(start: Path) -> Iterable[Path]:
 
 
 def git_boundary(start: Path) -> Optional[Path]:
-    """The innermost repository root around ``start``: the nearer of the closest
+    """The innermost safe discovery boundary around ``start``: the nearer of the closest
     ancestor holding a ``.git`` entry and git's own toplevel (asked through gitsafe).
 
     The ``.git`` marker needs no subprocess and also bounds a broken or unreadable
-    repository; git's answer covers worktrees and ``GIT_DIR`` layouts. The deeper of
-    the two wins, so the bound is never looser than either. The marker walk obeys
-    GIT_CEILING_DIRECTORIES; explicit Git layouts can bypass discovery.
+    repository; git's answer covers worktrees and explicit layouts. For implicit
+    discovery the deeper candidate within the ceiling-bounded walk wins. Explicit
+    ``GIT_DIR``/``GIT_WORK_TREE`` layouts bypass ceilings, retaining ancestor and
+    marker checks. Without a usable candidate they stop discovery at ``start``.
     """
     from aegis_core import gitsafe
 
@@ -278,9 +296,13 @@ def git_boundary(start: Path) -> Optional[Path]:
             top = _resolve(top)
         except OSError:
             top = None
-    # An explicit Git directory/worktree bypasses ceiling discovery, as Git does.
-    found = [p for p in (marker, top) if p is not None and (p == start or p in start.parents)]
-    return max(found, key=lambda p: len(p.parts)) if found else None
+    explicit = "GIT_DIR" in os.environ or "GIT_WORK_TREE" in os.environ
+    # Implicit Git discovery can walk above an equal ceiling; discard that answer.
+    found = [p for p in (marker, top) if p is not None and (p == start or p in start.parents)
+             and (explicit or p in directories)]
+    if found:
+        return max(found, key=lambda p: len(p.parts))
+    return start if explicit else None
 
 
 def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = None) -> Optional[Path]:
