@@ -1085,6 +1085,8 @@ def fork_public_result(action, monkeypatch):
             os.waitpid(pid, 0)
 
 
+# A real fork is required to verify that children cannot use their parent's guards.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded, use of fork:DeprecationWarning")
 @pytest.mark.parametrize("purpose", ["genesis", "initial"])
 @pytest.mark.parametrize("lifetime", ["active", "precreated", "new"])
 def test_forked_process_cannot_use_owned_host_guards(api, tmp_path, monkeypatch,
