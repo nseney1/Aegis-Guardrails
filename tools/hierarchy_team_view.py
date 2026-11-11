@@ -128,8 +128,12 @@ def pending(lifecycle, wait=WAIT_SECONDS):
     why is awaiting_decision, escalated (by the Decider) or within_delegation (the Decider's to decide first; deciding
     it would pre-empt the Decider). lifecycle is a hierarchy_lifecycle.Lifecycle."""
     _policy, state = hierarchy_router.locked_load(lifecycle, wait)
-    return {"schema": PENDING, "content_trust": "untrusted_data", "pending": owed(state, timestamp()),
-            "execution_enabled": False}
+    result = {"schema": PENDING, "content_trust": "untrusted_data", "pending": owed(state, timestamp()),
+              "execution_enabled": False}
+    if any("small_change" in row for row in state["requests"].values()):
+        from hierarchy_small_change_dispatch import pending_plans
+        result["small_change_pending"] = pending_plans(state)
+    return result
 
 
 def loop_view(state_dir):
