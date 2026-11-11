@@ -22,6 +22,179 @@ import hierarchy_team  # noqa: E402
 
 
 SESSION = "4f1c2b9e-8d7a-4c3b-9a1e-2f6d5c4b3a21"
+
+
+@pytest.mark.parametrize("arguments,verdict", [
+    (["--session-id", SESSION, "--fork-session", "--resume", "/owned/source.jsonl"], "OWNED"),
+    (["--fork-session", "--resume", "/owned/source.jsonl", "--session-id", SESSION], "OWNED"),
+    (["--resume", "/owned/source.jsonl", "--fork-session", "--session-id", SESSION], "OWNED"),
+    (["--resume=/owned/source.jsonl", "--session-id=" + SESSION, "--fork-session"], "OWNED"),
+    (["--session-id", SESSION, "--fork-session", "--continue"], "OWNED"),
+    (["--fork-session", "-c", "--session-id", SESSION], "OWNED"),
+    (["--resume", SESSION, "--fork-session"], "NOT_OWNED"),
+    (["--fork-session", "--resume", SESSION], "NOT_OWNED"),
+    (["--session-id", "00000000-0000-0000-0000-000000000001", "--fork-session", "--resume", SESSION], "NOT_OWNED"),
+    (["--session-id", SESSION, "--session-id", "00000000-0000-0000-0000-000000000001", "--fork-session"], "HOLD"),
+    (["--session-id", SESSION, "--fork-session", "--resume"], "HOLD"),
+    (["--session-id", SESSION, "--fork-session", "--unlisted", "value"], "HOLD"),
+])
+def test_r23_fork_selects_the_explicit_session_id(arguments, verdict):
+    assert hierarchy_hosts.session_verdict("claude-code", ["claude", *arguments], SESSION) == verdict
+    assert not hierarchy_hosts.matches_session("claude-code", ["claude", *arguments], SESSION, "unproven")
+
+
+def test_r23_unrelated_discovery_never_runs_the_host_grammar(monkeypatch):
+    parsing, calls = hierarchy_hosts.session_verdict, []
+    def parsed(*args, **kwargs):
+        calls.append(args)
+        return parsing(*args, **kwargs)
+    monkeypatch.setattr(hierarchy_hosts, "session_verdict", parsed)
+    for index in range(100):
+        assert not hierarchy_hosts.names_session(["python3", "worker-%d.py" % index], SESSION)
+    assert calls == []
+
+
+def test_r23_ownership_parsing_never_copies_the_host_registry(monkeypatch):
+    copying, calls = hierarchy_hosts.entry, []
+    def copied(*args, **kwargs):
+        calls.append(args)
+        return copying(*args, **kwargs)
+    monkeypatch.setattr(hierarchy_hosts, "entry", copied)
+    assert hierarchy_hosts.matches_session("claude-code", ["claude", "--resume", SESSION], SESSION)
+    assert hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", SESSION], SESSION)
+    assert hierarchy_hosts.names_session(["claude", "--resume=modelled legacy session"], "modelled legacy session")
+    assert not hierarchy_hosts.names_session(["python3", "--config=modelled legacy session"], "modelled legacy session")
+    assert calls == []
+
+
+def test_r23_unsupported_mailbox_inspection_refuses_before_io(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "mailbox_wake_inspection_capable", lambda: False)
+    with pytest.raises(ValueError, match="^mailbox wake inspection unsupported on this platform; "
+                       "preserve the worktree and reconcile the marker manually$"):
+        hierarchy_launcher.mailbox_wake_pending(SimpleNamespace(root=tmp_path), "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r23_unsupported_admission_publication_refuses_before_io(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False)
+    with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
+        hierarchy_launcher.publish_wake_record(SimpleNamespace(base=tmp_path), "pilot/lane/review", {})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r22_unsupported_running_publication_refuses_before_effects(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False, raising=False)
+    launches = SimpleNamespace(base=tmp_path, folder=lambda endpoint: tmp_path / "launches" / endpoint.replace("/", "%2F"))
+    known = dict(host="codex-cli", session=SESSION, generation=1)
+    with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
+        hierarchy_launcher.write_running_wake(launches, "pilot/lane/review", known, "wake-" + "a" * 32, 123)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r20_unsupported_launch_descriptors_refuse_without_creating_files(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    # Only this module's OS boundary is modelled. No POSIX flags, symlinks or dir_fd are required by the test.
+    monkeypatch.setattr(hierarchy_launcher, "os", SimpleNamespace(name="nt"))
+    with pytest.raises(ValueError, match="^launch record descriptors unsupported on this platform$"):
+        hierarchy_launcher.launch_record_paths(tmp_path, "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r20_descriptor_probe_can_refuse_a_missing_os_capability(tmp_path, monkeypatch):
+    monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    with pytest.raises(ValueError, match="^launch record descriptors unsupported on this platform$"):
+        hierarchy_launcher.launch_record_paths(tmp_path, "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_r21_public_status_reads_without_descriptors(tmp_path, monkeypatch, capsys, historical):
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {
+        "pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/lane/review": {"kind": "reviewer"}},
+        "counterparts": [], "writer_limit": 1}
+    (mailbox / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "provision.json").write_text(json.dumps({"mailbox_root": str(mailbox)}), encoding="utf-8")
+    record = {"schema": hierarchy_launcher.SCHEMA, "action": "resume", "state": "resumed"}
+    if historical:
+        folder = tmp_path / "launches" / "pilot%2Flane%2Freview"
+        folder.mkdir(parents=True)
+        (folder / "old.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    assert hierarchy_launcher.main(["--base", str(tmp_path), "status", "--endpoint", "pilot/lane/review"]) == 0
+    assert json.loads(capsys.readouterr().out)["endpoints"]["pilot/lane/review"] == {
+        "binding": None, "last": record if historical else None, "records": int(historical)}
+    assert (tmp_path / "launches").exists() == historical and not (mailbox / "bindings").exists()
+
+
+@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize("bad", ["directory", "symlink", "fifo", "limit", "json", "oversize"])
+def test_r21_status_contains_bad_history_to_one_endpoint(tmp_path, monkeypatch, capsys, portable, bad):
+    from tests.conftest import symlink_or_skip
+
+    if not portable and not hierarchy_launcher.launch_descriptor_capable():
+        pytest.skip("launch descriptors unavailable")
+    if bad == "fifo" and os.name != "posix":
+        pytest.skip("FIFOs require POSIX")
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    names = ["pilot/lane/review", "pilot/orchestrator"]
+    (mailbox / "manifest.json").write_text(json.dumps({"schema": "aegis.hierarchy-pilot/v1",
+        "endpoints": {"pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/lane/review": {"kind": "reviewer"}},
+        "counterparts": [], "writer_limit": 1}), encoding="utf-8")
+    (tmp_path / "provision.json").write_text(json.dumps({"mailbox_root": str(mailbox)}), encoding="utf-8")
+    folders = [tmp_path / "launches" / name.replace("/", "%2F") for name in names]
+    record = {"state": "resumed"}
+    for folder in folders:
+        folder.mkdir(parents=True)
+        (folder / "old.json").write_text(json.dumps(record), encoding="utf-8")
+    path = folders[0] / "z-bad.json"
+    if bad == "directory":
+        path.mkdir()
+    elif bad == "symlink":
+        symlink_or_skip(folders[1] / "old.json", path)
+    elif bad == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_text("x" * 262145 if bad == "oversize" else "{" if bad == "json" else "{}", encoding="utf-8")
+    if bad == "limit":
+        monkeypatch.setattr(hierarchy_launcher, "MAX_RECORDS", 1)
+    if portable:
+        monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    assert hierarchy_launcher.main(["--base", str(tmp_path), "status"]) == 0
+    rows = json.loads(capsys.readouterr().out)["endpoints"]
+    assert set(rows) == set(names)
+    assert rows[names[0]]["state"] == "unknown" and rows[names[0]]["error"]
+    assert rows[names[0]]["last"] is None
+    assert rows[names[1]] == {"binding": None, "last": record, "records": 1}
+
+
+@pytest.mark.parametrize("size", [b"1048577\n", b"untrusted-size\n"])
+def test_r21_wake_source_limit_precedes_loading(tmp_path, monkeypatch, size):
+    from types import SimpleNamespace
+
+    calls = []
+    def git(source, *arguments):
+        calls.append(arguments)
+        assert arguments[:2] == ("cat-file", "-s"), "the oversized source body must never be read"
+        return size
+    monkeypatch.setattr(hierarchy_launcher, "hierarchy_runtime_source", SimpleNamespace(git=git))
+    launches = SimpleNamespace(setup={"source": str(tmp_path), "source_commit": "a" * 40})
+    with pytest.raises(ValueError, match="^invalid or oversized wake source$"):
+        hierarchy_launcher.load_wake(launches)
+    assert len(calls) == 1
+
+
+NODE_ARITIES = {"--loader": 1, "--experimental-loader": 1, "--import": 1, "-r": 1, "--require": 1,
+                "--env-file": 1, "--conditions": 1, "-C": 1, "--title": 1, "--input-type": 1,
+                "--no-warnings": 0, "--trace-warnings": 0}
 # Claude 2.1.316 print mode, values from a real wake log.
 REAL_RESULT = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 13, "session_id": SESSION,
                "total_cost_usd": 0.820714,
@@ -89,7 +262,7 @@ def test_describe_is_the_json_registry_and_callers_cannot_change_it():
     assert list(described["hosts"]) == list(hierarchy_hosts.HOST_KINDS)
     assert json.loads(json.dumps(described)) == described
     keys = {"kind", "family", "team_start", "home", "billing_variables", "session_variable", "transcripts", "usage",
-            "write_scope", "qualification"}
+            "write_scope", "qualification", "entrypoints", "session_selectors"}
     for kind, entry in described["hosts"].items():
         assert set(entry) == keys and entry["kind"] == kind
     claude, codex, native = (described["hosts"][kind] for kind in hierarchy_hosts.HOST_KINDS)
@@ -118,6 +291,152 @@ def test_an_unknown_host_kind_is_refused_with_its_name(kind):
                             (hierarchy_hosts.qualify, (False,)), (hierarchy_hosts.billing_set, ({},))):
         assert refusal(call, kind, *arguments) == expected
     assert refusal(hierarchy_hosts.transcripts, kind, "home", SESSION) == expected
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("claude-code", {"program_basenames": ["claude", "claude.exe", ".claude-wrapped"],
+                     "node_script_basenames": ["claude", ".claude-wrapped"],
+                     "node_script_suffixes": ["@anthropic-ai/claude-code/cli.js"]}),
+    ("codex-cli", {"program_basenames": ["codex"], "node_script_basenames": ["codex", "codex.js"],
+                   "node_script_suffixes": []}),
+    ("codex", {"program_basenames": [], "node_script_basenames": [], "node_script_suffixes": []}),
+])
+def test_host_entrypoints_are_json_data_and_cannot_be_mutated_by_callers(kind, expected):
+    expected["node_option_arities"] = {} if kind == "codex" else dict(NODE_ARITIES)
+    described = json.loads(json.dumps(hierarchy_hosts.describe()))
+    assert described["hosts"][kind]["entrypoints"] == expected
+    described["hosts"][kind]["entrypoints"]["program_basenames"].append("CHANGED")
+    assert hierarchy_hosts.entry(kind)["entrypoints"] == expected
+
+
+@pytest.mark.parametrize("kind,argv,expected", [
+    ("claude-code", ["node", "/nix/store/package/bin/.claude-wrapped"], True),
+    ("claude-code", ["node", "/lib/@anthropic-ai/claude-code/cli.js"], True),
+    ("claude-code", ["node", "/other/cli.js"], False),
+    ("codex-cli", ["/vendor/platform/bin/codex"], True),
+    ("codex-cli", ["node", "/lib/bin/codex"], True),
+    ("codex-cli", ["claude"], False),
+    ("claude-code", [], False),
+])
+def test_registry_matches_only_the_declared_entrypoints(kind, argv, expected):
+    assert hierarchy_hosts.matches_entrypoint(kind, argv) is expected
+
+
+def test_hosts_without_process_entrypoints_are_refused():
+    assert refusal(hierarchy_hosts.matches_entrypoint, "codex", ["codex"]) == "codex has no process entrypoints"
+    assert refusal(hierarchy_hosts.matches_entrypoint, "unknown", []) == "unsupported host kind: 'unknown'"
+
+
+@pytest.mark.parametrize("kind,argv", [
+    ("claude-code", ["node", "--no-warnings", "/nix/store/p/bin/.claude-wrapped"]),
+    ("claude-code", ["node", "--no-warnings", "/lib/@anthropic-ai/claude-code/cli.js"]),
+    ("claude-code", ["node", "-r", "preload", "--import", "module", "/lib/@anthropic-ai/claude-code/cli.js"]),
+    ("claude-code", ["node", "--require=preload", "--no-warnings", "--trace-warnings", "--flag=value", "/bin/claude"]),
+    ("codex-cli", ["node", "--require", "module", "/lib/@openai/codex/bin/codex.js"]),
+])
+def test_node_interpreter_options_precede_the_script(kind, argv):
+    assert hierarchy_hosts.matches_entrypoint(kind, argv)
+
+
+@pytest.mark.parametrize("option", ["-e", "--eval", "--eval=source", "--print=source", "-psource"])
+def test_node_source_text_does_not_make_a_host_script(option):
+    argv = ["node", option, "/lib/@anthropic-ai/claude-code/cli.js", "--resume", SESSION]
+    assert not hierarchy_hosts.matches_session("claude-code", argv, SESSION)
+
+
+@pytest.mark.parametrize("kind,argv,expected", [
+    ("claude-code", ["claude", "--resume", SESSION], True),
+    ("claude-code", ["claude", "--resume=" + SESSION], True),
+    ("claude-code", ["claude", "--session-id", SESSION, "--print", "prompt"], True),
+    ("claude-code", ["claude", "--session-id", "other", "--print", SESSION], False),
+    ("claude-code", ["claude", "--resume", SESSION, "--session-id", "other"], False),
+    ("claude-code", ["claude", "--resume", SESSION, "--session-id=" + SESSION], True),
+    ("claude-code", ["claude", "--print", SESSION], False),
+    ("claude-code", ["claude", "--", "--resume", SESSION], False),
+    ("claude-code", ["claude", "--resume"], False),
+    ("claude-code", ["node", "--no-warnings", "/nix/store/p/bin/.claude-wrapped", "--resume", SESSION], True),
+    ("claude-code", ["node", "--no-warnings", "/lib/@anthropic-ai/claude-code/cli.js", "--resume", SESSION], True),
+    ("codex-cli", ["codex", "resume", SESSION], True),
+    ("codex-cli", ["codex", "exec", "resume", SESSION], True),
+    ("codex-cli", ["node", "--require", "module", "/lib/@openai/codex/bin/codex.js", "exec", "resume", SESSION], True),
+    ("codex-cli", ["codex", "--disable", "apps", "exec", "--json", "-c", "model=\"fake\"", "resume", SESSION], True),
+    ("codex-cli", ["codex", "exec", SESSION], False),
+    ("codex-cli", ["codex", "exec", "--json", "prompt", "resume", SESSION], False),
+    ("codex-cli", ["codex", "resume", SESSION, "resume", "other"], False),
+])
+def test_session_selector_is_positional_and_unambiguous(kind, argv, expected):
+    assert hierarchy_hosts.matches_session(kind, argv, SESSION) is expected
+
+
+@pytest.mark.parametrize("value,expected", [(SESSION, True), (SESSION.upper(), True),
+                                         (SESSION.replace("-", ""), True), ("the", False),
+                                         ("review", False), ("prefix-" + SESSION, False)])
+def test_session_uuid_shape_distinguishes_ids_from_prompt_words(value, expected):
+    assert bool(hierarchy_hosts.SESSION_UUID.fullmatch(value)) is expected
+
+
+def test_unproven_selector_still_accepts_its_bound_legacy_session_id():
+    session = "modelled-legacy-session"
+    assert not hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
+
+
+@pytest.mark.parametrize("argv,verdict", [
+    (["python3", "tools/hierarchy_mailbox.py", "--after", "<T>"], "CLEAR"),
+    (["job.py", "--run", "<T>"], "CLEAR"),
+    (["claude", "--resume", "<T>"], "OTHER"),
+    (["codex", "exec", "resume", "<T>"], "OTHER"),
+    (["claude", "--resume", "--print", "<T>"], "HOLD"),
+    (["claude", "-r<T>", "-p", "wait"], "HOLD"),
+])
+def test_r20_only_parsed_other_host_selectors_spare_a_subtree(argv, verdict):
+    other = "00000000-0000-0000-0000-000000000001"
+    argv = [word.replace("<T>", other) for word in argv]
+    assert hierarchy_hosts.descendant_verdict(argv, SESSION) == verdict
+
+
+@pytest.mark.parametrize("spelling", ["--resume", "--session-id"])
+def test_r20_discovery_preserves_whole_equals_selector_values(spelling):
+    session = "modelled legacy session"
+    argv = ["claude", spelling + "=" + session]
+    assert hierarchy_hosts.matches_session("claude-code", argv, session)
+    assert hierarchy_hosts.names_session(argv, session)
+
+
+@pytest.mark.parametrize("evidence", ["proven", "unproven"])
+@pytest.mark.parametrize("kind,arguments", [
+    pytest.param("claude-code", ["--resume", "--", "--resume", SESSION], id="modelled-consumed-terminator"),
+    pytest.param("claude-code", ["--resume", "unknown", "--resume", SESSION], id="modelled-unknown-selection"),
+    pytest.param("claude-code", ["--resume", SESSION, "--session-id"], id="modelled-missing-selection"),
+    pytest.param("claude-code", ["--resume", SESSION, "--resume=--print"], id="modelled-equals-option-value"),
+    pytest.param("claude-code", ["--resume", "--print", "please", "--resume", SESSION],
+                 id="modelled-option-valued-selection"),
+    pytest.param("codex-cli", ["exec", "resume", "--last", "resume", SESSION],
+                 id="modelled-codex-option-valued-selection"),
+])
+def test_ambiguous_selection_cannot_be_replaced_by_a_later_match(kind, arguments, evidence):
+    program = "claude" if kind == "claude-code" else "codex"
+    assert not hierarchy_hosts.matches_session(kind, [program, *arguments], SESSION, evidence)
+    assert hierarchy_hosts.selects_other_session([program, *arguments], SESSION)
+
+
+@pytest.mark.parametrize("word", [
+    pytest.param("-r<T>", id="modelled-attached-short-alias"),
+    pytest.param("-a<T>", id="modelled-attached-hex-letter-alias"),
+    pytest.param("--unlisted=<T>", id="equals"),
+    pytest.param("prefix/<T>/suffix", id="bounded-path-occurrence"),
+    pytest.param("<T>", id="whole"),
+])
+def test_bounded_uuid_occurrences_only_spare_descendants(word):
+    other = "00000000-0000-0000-0000-000000000001"
+    argv = ["claude", word.replace("<T>", other)]
+    assert hierarchy_hosts.selects_other_session(argv, SESSION)
+    assert not hierarchy_hosts.matches_session("claude-code", argv, other)
+
+
+@pytest.mark.parametrize("word", ["-r<S>", "--unlisted=<S>", "a" * 64, "a<S>b"])
+def test_bound_uuid_and_longer_hex_values_do_not_claim_another_session(word):
+    word = word.replace("<S>", SESSION.replace("-", "") if word == "a<S>b" else SESSION)
+    assert not hierarchy_hosts.selects_other_session(["worker", word], SESSION)
 
 
 def test_qualify_gives_each_role_its_write_scope_and_refuses_native_threads():
@@ -646,3 +965,130 @@ def test_session_recorded_compares_an_existing_record_and_refuses_a_different_on
     path.write_text(json.dumps({**record, "start_mode": "background"}), encoding="utf-8")
     assert refusal(hierarchy_hosts.session_recorded, path, record) == (
         "session record for m1/lane/f2 generation 3 differs from this binding")
+
+
+# R2's finite, source-bound catalog, copied as test data rather than read from the matcher under test.
+# Public Codex rust-v0.167.0, commit 086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a:
+# G: cli/src/main.rs:127-141 + tui/src/cli.rs:66-67,128-135; E: exec/src/cli.rs:15-25;
+# R_exec globals: config_override.rs:29-36, main.rs:958-965 and exec/src/cli.rs:36-79,163-170.
+R2_CODEX_OPTIONS = [
+    (("-c", "--config"), ("G", "E", "R_exec"), 'model="modelled"'),
+    (("--enable",), ("G", "E", "R_exec"), "apps"),
+    (("--disable",), ("G", "E", "R_exec"), "apps"),
+    (("--model", "-m"), ("G", "E", "R_exec"), "modelled"),
+    (("--sandbox", "-s"), ("G", "E"), "workspace-write"),
+    (("--cd", "-C"), ("G", "E"), "/modelled path/resume data"),
+    (("--add-dir",), ("G", "E"), "/modelled path/additional"),
+    (("--profile", "-p"), ("G", "E"), "modelled-profile"),
+    (("--output-last-message", "-o"), ("E", "R_exec"), "/modelled output/message"),
+    (("--output-schema",), ("E", "R_exec"), "/modelled output/schema.json"),
+    (("--json", "--experimental-json"), ("E", "R_exec"), None),
+    (("--ignore-user-config",), ("E", "R_exec"), None),
+    (("--skip-git-repo-check",), ("E", "R_exec"), None),
+]
+
+
+@pytest.mark.parametrize("names,stages,value", R2_CODEX_OPTIONS)
+@pytest.mark.parametrize("stage", ["G", "E", "R_exec", "R_direct"])
+def test_r2_codex_option_stages_and_aliases_are_finite(names, stages, value, stage):
+    for name in names:
+        option = [name] + ([] if value is None else [value])
+        argv = {"G": ["codex", *option, "exec", "resume", SESSION],
+                "E": ["codex", "exec", *option, "resume", SESSION],
+                "R_exec": ["codex", "exec", "resume", *option, SESSION],
+                "R_direct": ["codex", "resume", *option, SESSION]}[stage]
+        assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION) is (stage in stages), argv
+
+
+@pytest.mark.parametrize("names,stages,value", R2_CODEX_OPTIONS)
+def test_r2_codex_unadmitted_equals_attached_and_post_sid_forms_hold(names, stages, value):
+    stage = "G" if "G" in stages else "E"
+    for name in names:
+        forms = [name + "=" + (value if value is not None else "true")]
+        if name.startswith("-") and not name.startswith("--") and value is not None:
+            forms.append(name + value)
+        for form in forms:
+            argv = (["codex", form, "exec", "resume", SESSION] if stage == "G" else
+                    ["codex", "exec", form, "resume", SESSION])
+            assert not hierarchy_hosts.matches_session("codex-cli", argv, SESSION), argv
+        after = ["codex", "exec", "resume", SESSION, name, *([] if value is None else [value])]
+        assert not hierarchy_hosts.matches_session("codex-cli", after, SESSION), after
+
+
+def test_r2_all_codex_builder_optional_combinations_preserve_opaque_atoms():
+    from itertools import product
+
+    other = "00000000-0000-0000-0000-000000000001"
+    disabled_lists = [[], ["apps"], ["apps", "plugins"], hierarchy_provision.CODEX_DISABLED,
+                      hierarchy_provision.CODEX_DISABLED + hierarchy_provision.CODEX_SHELL]
+    dirs = [[], ["/modelled path/one"], ["/modelled path/one", "/modelled path/resume " + other]]
+    profiles = vectors = 0
+    for sandbox, ignore, model, effort, tier, tmpdir, skip in product(
+            ("read-only", "workspace-write"), (False, True), (None, "model with spaces"), (None, "high"),
+            (None, "priority"), (None, "/modelled temp/quotes' resume " + other), (False, True)):
+        for disabled, add_dirs in product(disabled_lists, dirs):
+            profile = {"disabled_features": disabled, "ignore_user_config": ignore, "sandbox": sandbox,
+                       "approval_policy": "never", "writable_roots": ["/modelled roots/resume " + other],
+                       "network_access": False, "mcp_servers": {"mailbox": {"command": "python", "args": [
+                           "/modelled mcp.py", "--root", "resume " + other]}}, "cwd": "/modelled cwd/resume " + other,
+                       "model": model, "effort": effort, "service_tier": tier, "tmpdir": tmpdir,
+                       "add_dirs": add_dirs, "skip_git_repo_check": skip}
+            profiles += 1
+            for tail, expected in ((["resume " + SESSION], False), (["resume", SESSION], True),
+                                   (["resume", SESSION, "resume"], True),
+                                   (["resume", SESSION, "please resume " + other + " --resume " + other], True)):
+                argv = hierarchy_provision.codex_argv(profile, tail)
+                assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION) is expected, argv
+                vectors += 1
+    assert profiles == 1920 and vectors == 7680
+
+
+def test_r2_descendant_negative_guard_keeps_the_complete_resume_prompt_opaque():
+    # MODELLED complete atoms, using the admitted builder tail; the final resume is owner prompt data.
+    argv = ["codex", "exec", "resume", SESSION, "resume"]
+    assert hierarchy_hosts.matches_session("codex-cli", argv, SESSION)
+    assert not hierarchy_hosts.selects_other_session(argv, SESSION)
+
+
+def test_r2_all_claude_builder_optional_combinations_preserve_opaque_atoms():
+    from itertools import product
+
+    # Producer/modelled grammar only: no claim that an installed Claude accepted these option combinations.
+    other = "00000000-0000-0000-0000-000000000001"
+    catalog = json.dumps({"worker": {"prompt": "Explain --resume " + other}})
+    cases = 0
+    for bg, assistants, model, effort, ultra, allowed, dirs, selector, tools in product(
+            (False, True), (None, catalog), (None, "modelled"), (None, "high"), (False, True),
+            ([], ["Read", "Edit"]), ([], ["/modelled path/one"], ["/modelled path/one", "/modelled path/two"]),
+            ("--resume", "--session-id"), ([], ["Read", "Edit"])):
+        request = {"add_dirs": dirs}
+        if model is not None:
+            request["model"] = model
+        if effort is not None:
+            request["effort"] = effort
+        if ultra:
+            request["ultracode"] = True
+        argv = hierarchy_provision.claude_argv([selector, SESSION], "/modelled connection.json", tools, allowed,
+                                             request, assistants, "modelled background" if bg else None)
+        if bg:
+            argv += ["resume"]  # The builder's genuine -- protects its one opaque background prompt.
+        assert hierarchy_hosts.matches_session("claude-code", argv, SESSION), argv
+        cases += 1
+    assert cases == 768
+
+
+@pytest.mark.parametrize("kind,argv", [
+    ("codex-cli", ["codex", "--unknown=value", "exec", "resume", SESSION]),
+    ("codex-cli", ["node", "--unknown=value", "/bin/codex", "exec", "resume", SESSION]),
+    ("claude-code", ["claude", "--unknown=value", "--resume", SESSION]),
+    ("claude-code", ["node", "--unknown=value", "/bin/claude", "--resume", SESSION]),
+])
+def test_r2_unknown_host_or_node_options_cannot_establish_ownership(kind, argv):
+    assert not hierarchy_hosts.matches_session(kind, argv, SESSION)
+
+
+@pytest.mark.parametrize("family", [None, "", "unknown", "codex-with-empty-options"])
+def test_r13_unknown_grammar_family_refuses(monkeypatch, family):
+    grammar = hierarchy_hosts._HOSTS["claude-code"]["session_selectors"]["grammar"]
+    monkeypatch.setitem(grammar, "family", family)
+    assert hierarchy_hosts.session_verdict("claude-code", ["claude", "--resume", SESSION], SESSION) == "HOLD"

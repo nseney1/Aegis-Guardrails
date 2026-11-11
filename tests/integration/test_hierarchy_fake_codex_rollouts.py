@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+from tests.integration.hierarchy_fake_wrapper import shell_exec
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="the fake Codex uses POSIX shell scripts and process signals")
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +35,7 @@ class Fake:
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         codex = self.bin / "codex"
-        codex.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE_CODEX), encoding="utf-8")
+        codex.write_text('#!/bin/sh\n%s "$@"\n' % shell_exec("codex", FAKE_CODEX, self.tmp), encoding="utf-8")
         codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
         (self.bin / "sleep").symlink_to(shutil.which("sleep"))
         self.home = tmp_path / "home"
