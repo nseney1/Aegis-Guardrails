@@ -15,7 +15,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Tuple
+import unicodedata
 
 import pytest
 
@@ -193,6 +195,9 @@ def private_imports(sources: Iterable[Tuple[str, str]]) -> List[str]:
     """``label:line: aegis_core.redaction._name`` for each import of an underscore name of the module."""
     found = []
     for label, text in sources:
+        # Python normalizes identifiers with NFKC before exposing them in the AST.
+        if "redaction" not in text and (text.isascii() or "redaction" not in unicodedata.normalize("NFKC", text)):
+            continue
         for node in ast.walk(ast.parse(text)):
             if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "aegis_core.redaction":
                 found += [f"{label}:{node.lineno}: aegis_core.redaction.{a.name}" for a in node.names
@@ -206,13 +211,44 @@ def _python_sources() -> List[Tuple[str, str]]:
             for root in roots for path in sorted(root.rglob("*.py")) if "__pycache__" not in path.parts]
 
 
-def test_no_module_imports_a_private_name_of_redaction():
+def test_no_module_imports_a_private_name_of_redaction(monkeypatch: pytest.MonkeyPatch):
+    real_parse = ast.parse
+    parse_count = 0
+
+    def counted_parse(text):
+        nonlocal parse_count
+        parse_count += 1
+        return real_parse(text)
+
+    counted_ast = SimpleNamespace(**vars(ast))
+    counted_ast.parse = counted_parse
+    monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
     assert private_imports(_python_sources()) == []
+    assert 0 < parse_count <= 64, parse_count
 
 
 def test_an_import_of_a_private_redaction_name_is_named_with_its_line():
     src = "import os\nfrom aegis_core.redaction import SECRET_REPLACEMENTS, _x\n"
     assert private_imports([("fixture.py", src)]) == ["fixture.py:2: aegis_core.redaction._x"]
+
+
+@pytest.mark.parametrize("irrelevant", ["invalid syntax (\n", "# \u2500\ninvalid syntax (\n", "# \u00e9\ninvalid syntax (\n"])
+def test_private_redaction_import_scan_skips_sources_without_the_needle(irrelevant: str):
+    sources = [("irrelevant.py", irrelevant),
+               ("caller.py", "import os\nfrom aegis_core.redaction import _x\n")]
+    assert private_imports(sources) == ["caller.py:2: aegis_core.redaction._x"]
+
+
+def test_private_redaction_import_scan_reports_nfkc_normalized_imports():
+    source = "from aegis_core.redacti\uff4fn import _SECRET_REDACTIONS\n"
+    assert "redaction" not in source
+    assert private_imports([("caller.py", source)]) == ["caller.py:1: aegis_core.redaction._SECRET_REDACTIONS"]
+
+
+@pytest.mark.parametrize("source", ["redaction syntax (\n", "# \uff52edaction\ninvalid syntax (\n"])
+def test_private_redaction_import_scan_still_rejects_malformed_candidates(source: str):
+    with pytest.raises(SyntaxError):
+        private_imports([("caller.py", source)])
 
 
 _HOOK_ADAPTER_IMPORTS = (

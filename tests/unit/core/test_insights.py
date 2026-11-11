@@ -8,6 +8,8 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
+import unicodedata
 
 import pytest
 
@@ -685,17 +687,19 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
 
 
 def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
-    """Every Name and Attribute identifier used in the Python files under ``roots``, except
-    ``module_file`` itself (a package's ``__init__.py``: the whole package) and the nodes in ``skip``."""
-    import ast
-
+    """Identifiers in Python files mentioning insights before or after NFKC under ``roots``,
+    except ``module_file`` (a package's ``__init__.py``: the whole package) and nodes in ``skip``."""
     inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
     for root in roots:
         for path in root.rglob("*.py"):
             if path.resolve() == inside or inside in path.resolve().parents:
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            # Python normalizes identifiers with NFKC before exposing them in the AST.
+            if "insights" not in text and (text.isascii() or "insights" not in unicodedata.normalize("NFKC", text)):
+                continue
+            tree = ast.parse(text)
             skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
                        for n in ast.walk(top)}
             for node in ast.walk(tree):
@@ -712,13 +716,63 @@ def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
     return seen
 
 
-def test_every_name_in_insights_all_is_used_outside_the_module():
+@pytest.mark.parametrize("irrelevant", [
+    "coincidental_name = 1\n", "invalid syntax (\n", "# \u2500\ninvalid syntax (\n", "# \u00e9\ninvalid syntax (\n",
+])
+def test_insights_name_scan_skips_sources_without_the_needle(tmp_path: Path, irrelevant: str):
+    package = tmp_path / "insights"
+    package.mkdir()
+    module_file = package / "__init__.py"
+    module_file.write_text("# insights: invalid syntax (\n", encoding="utf-8")
+    (package / "internal.py").write_text("insights internal syntax (\n", encoding="utf-8")
+    (tmp_path / "irrelevant.py").write_text(irrelevant, encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        'from aegis_core.insights import used_alias\n'
+        'insights.used_attribute(used_name, "patched_name")\n'
+        'def excluded_test():\n    ignored_name()\n', encoding="utf-8",
+    )
+
+    seen = _defined_names_referenced_outside(module_file, [tmp_path], {"excluded_test"})
+
+    assert {"used_alias", "used_attribute", "used_name", "patched_name"} <= seen
+    assert "coincidental_name" not in seen
+    assert "ignored_name" not in seen
+
+
+def test_insights_name_scan_counts_nfkc_normalized_consumers(tmp_path: Path):
+    source = "from aegis_core.\uff49nsights import capture_suggestion\n"
+    assert "insights" not in source
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    seen = _defined_names_referenced_outside(tmp_path / "insights.py", [tmp_path], set())
+    assert "capture_suggestion" in seen
+
+
+@pytest.mark.parametrize("source", ["insights syntax (\n", "# \uff49nsights\ninvalid syntax (\n"])
+def test_insights_name_scan_still_rejects_malformed_candidates(tmp_path: Path, source: str):
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    with pytest.raises(SyntaxError):
+        _defined_names_referenced_outside(tmp_path / "insights.py", [tmp_path], set())
+
+
+def test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch: pytest.MonkeyPatch):
+    real_parse = ast.parse
+    parse_count = 0
+
+    def counted_parse(text):
+        nonlocal parse_count
+        parse_count += 1
+        return real_parse(text)
+
+    counted_ast = SimpleNamespace(**vars(ast))
+    counted_ast.parse = counted_parse
+    monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
     repo = Path(__file__).resolve().parents[3]
     roots = [repo / name for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests")]
     used = _defined_names_referenced_outside(Path(core_insights.__file__), roots,
                                              {"test_every_name_in_insights_all_is_used_outside_the_module"})
     assert sorted(set(core_insights.__all__) - used) == []
     assert all(hasattr(core_insights, name) for name in core_insights.__all__)
+    assert 0 < parse_count <= 80, parse_count
 
 
 def test_dead_insight_names_are_gone():
