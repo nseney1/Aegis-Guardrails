@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import sys
@@ -30,6 +31,10 @@ _MAX_COMMENT_CONFIG_BYTES = 65536
 _CUT_SUFFIX = b" ------------------------ >8 ------------------------"
 _CUT_LINE = b"#" + _CUT_SUFFIX
 _CUT_ENDINGS = (_CUT_SUFFIX, _CUT_SUFFIX + b"\r", _CUT_SUFFIX + b"\n", _CUT_SUFFIX + b"\r\n")
+_BELOW_CUT_AUTHORITY = re.compile(
+    r"^[ \t]*aegis-(?:approve(?:-insight)?|exempt-test)[ \t]*:|^aegis-manager-approve[ \t]*:",
+    re.I | re.M,
+)
 
 
 def _notice(reason: str) -> None:
@@ -57,36 +62,51 @@ def _comment_markers_supported(root: Path) -> bool:
     return True
 
 
-def _candidate_message(stream: BinaryIO) -> Tuple[bytes, Optional[str]]:
-    """Keep bounded message bytes, skipping comments and stopping before the diff."""
+def _candidate_message(stream: BinaryIO) -> Tuple[bytes, Optional[str], bool]:
+    """Bound candidate bytes and scan the entire bounded tail for authority."""
     from aegis_core.approval_shape import MAX_MESSAGE_BYTES
 
     candidate = bytearray()
     scanned, first, comment = 0, True, False
+    cut_padding = False
     tail = b""
     while scanned < MAX_MESSAGE_SCAN_BYTES:
         size = min(_MESSAGE_READ_BYTES, MAX_MESSAGE_SCAN_BYTES - scanned)
         part = stream.readline(size)
         if not part:
-            if not first and not comment and tail.endswith(_CUT_ENDINGS):
-                return b"", "comment character"
-            return bytes(candidate), None
+            if cut_padding or (not first and not comment and tail.endswith(_CUT_ENDINGS)):
+                return b"", "comment character", False
+            return bytes(candidate), None, False
         scanned += len(part)
         if first:
             comment = part.startswith(b"#")
             tail = b""
-            if part in (_CUT_LINE + b"\n", _CUT_LINE + b"\r\n") or (
-                    len(part) < size and part in (_CUT_LINE, _CUT_LINE + b"\r")):
-                return bytes(candidate), None
+            if part == _CUT_LINE + b"\n":
+                remaining = MAX_MESSAGE_SCAN_BYTES - scanned
+                if remaining <= 0:
+                    return b"", "scan limit", False
+                below_cut = stream.read(remaining)
+                if len(below_cut) == remaining:
+                    return b"", "scan limit", False
+                return bytes(candidate), None, _BELOW_CUT_AUTHORITY.search(
+                    below_cut.decode("utf-8", "surrogateescape")) is not None
+            cut_padding = part.startswith(_CUT_LINE)
+        if cut_padding:
+            # An editor can trim this into a cut. Track padding across chunks
+            # without buffering the comment or trusting an unfinished line.
+            padding = part[len(_CUT_LINE):] if first else part
+            cut_padding = not padding.strip(b" \t\r\n")
+            if cut_padding and (part.endswith(b"\n") or len(part) < size):
+                return b"", "comment character", False
         if not comment:
             tail = (tail + part)[-(len(_CUT_SUFFIX) + 2):]
             if (part.endswith(b"\n") or len(part) < size) and tail.endswith(_CUT_ENDINGS):
-                return b"", "comment character"
+                return b"", "comment character", False
             if len(candidate) + len(part) > MAX_MESSAGE_BYTES:
-                return b"", "message too large"
+                return b"", "message too large", False
             candidate.extend(part)
         first = part.endswith(b"\n")
-    return b"", "scan limit"
+    return b"", "scan limit", False
 
 
 def _record_check(root: Path, argument: str, line: str) -> None:
@@ -95,9 +115,12 @@ def _record_check(root: Path, argument: str, line: str) -> None:
 
     try:
         with open(argument, "rb") as stream:
-            raw, refusal = _candidate_message(stream)
+            raw, refusal, authority_after_cut = _candidate_message(stream)
     except (OSError, ValueError):
         _notice("unreadable")
+        return
+    if authority_after_cut:
+        _notice("authority below cut")
         return
     if refusal:
         _notice(refusal)
