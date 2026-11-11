@@ -296,6 +296,12 @@ def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     }
 
 
+def _json_tool_result(req_id: Any, value: Any, is_error: bool) -> Dict[str, Any]:
+    """Compact successful text payloads; keep refusal text formatting unchanged."""
+    separators = (", ", ": ") if is_error else (",", ":")
+    return _tool_result(req_id, json.dumps(value, separators=separators), is_error)
+
+
 def _message_refusal(req_id, code, *, detail=None, binding_reason=None):
     from aegis_core.message_codec import CodecError
     from aegis_core.message_codec_format import frontend_error
@@ -450,7 +456,7 @@ def _repository_call(req_id, params, name, args):
         return _tool_result(req_id, json.dumps(text, separators=(",", ":")) if needs_json else text,
                             needs_json and "error" in text)
     refused_config = name == "aegis_team_config" and result.get("status") == "refused"
-    return _tool_result(req_id, json.dumps(result), is_error_result(result) or refused_config)
+    return _json_tool_result(req_id, result, is_error_result(result) or refused_config)
 
 
 
@@ -492,7 +498,7 @@ def _manager_call(req_id, params):
             result = execute(_manager_config, _manager_digest, provenance, name, args)
     except (ValueError, OSError) as exc:
         return _tool_result(req_id, json.dumps({"status": "FAIL", "error": str(exc)}), True)
-    return _tool_result(req_id, json.dumps(result), is_error_result(result))
+    return _json_tool_result(req_id, result, is_error_result(result))
 
 
 def _start(environ: Optional[Dict[str, str]] = None) -> None:
