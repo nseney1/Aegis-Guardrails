@@ -77,6 +77,45 @@
       "stmts": 68
     }
   },
+  "grandfathered": {
+    "functions": {
+      "tools/hierarchy_candidate_status.py:Observer.suite": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_candidate_status.py:markup_region": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py:lifecycle_records": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py:mailbox_records": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_host_authority.py:OwnedHostBinding.from_owned_channels": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:admit": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:run_job": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:run_kind": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py:signal_process": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py:stop_owned": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py:ProtectedCanonicalDecisionWriter.commit_decision": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py:reduce_event": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox.py:main": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox_index.py:MailboxIndex._scan": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py:Runner.cleanup": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py:Runner.role_steps": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_provision.py:team_settings": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_small_change_dispatch.py:Row.check_receipts": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_team.py:owned_model_turn": "M69 in-flight lane pr6; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_wake.py:wake": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass"
+    },
+    "modules": {
+      "tools/hierarchy_candidate_status.py": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_host_authority.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_provision.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_root.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_small_change_dispatch.py": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_team.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass"
+    }
+  },
   "modules": {
     "aegis_cli/install_hosts.py": {
       "lines": 1034,

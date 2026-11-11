@@ -62,6 +62,7 @@ def test_lock_file_is_aegis_state_lock(tmp_path: Path):
     assert not (tmp_path / ".aegis" / "locks").exists()
 
 
+@pytest.mark.timing
 def test_nested_acquire_in_one_thread_does_not_deadlock(tmp_path: Path):
     started = time.monotonic()
     with locked(tmp_path):
