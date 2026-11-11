@@ -723,6 +723,7 @@ def test_failed_fixes_share_one_exemption_discovery(tmp_path, monkeypatch):
         (oid, "failed", None) for oid in fixes]
     assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == repo.git("rev-list", "main..HEAD").splitlines()
     assert sum(c[0] == "rev-list" for c in calls) == 2
+    assert sum(c[0] == "log" for c in calls) <= 2
 
 
 @needs_git
@@ -745,6 +746,383 @@ def test_exemption_discovery_timeout_is_not_retried_for_each_fix(tmp_path, monke
     report = regression.check_ci_regressions(repo.root, "main")
     assert [(c.reason, c.exemption_code) for c in report.commits] == [("no_test_changes", None)] * 3
     assert len(calls) == 1
+
+
+@needs_git
+def test_refusal_scan_failure_is_terminal_for_the_report(tmp_path, monkeypatch):
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    for i in range(3):
+        _fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i + 1)})
+    calls = []
+    real = gitsafe.run
+
+    def timeout(args, *rest, **kwargs):
+        if args[0] == "log" and any(arg.startswith("--grep=") for arg in args):
+            calls.append(args)
+            raise gitsafe.GitError("private diagnostic timeout")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", timeout)
+    report = regression.check_ci_regressions(repo.root, "main")
+    assert [(c.reason, c.exemption_code) for c in report.commits] == [("no_test_changes", None)] * 3
+    assert len(calls) == 1
+    assert "private diagnostic timeout" not in json.dumps(report.as_dict(repo.root))
+
+
+@needs_git
+def test_refusal_scan_has_one_shared_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    repo = make_repo(tmp_path)
+    for i in range(3):
+        _fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i + 1)})
+    now = [100.0]
+    tick = regression._GIT_TIMEOUT_S / 2 + 1
+    timeouts = []
+    real = gitsafe.run
+
+    def elapsed(args, *rest, **kwargs):
+        if args[0] == "log":
+            timeouts.append(kwargs["timeout"])
+            now[0] += tick
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(regression, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(gitsafe, "run", elapsed)
+    report = regression.check_ci_regressions(repo.root, "main")
+    assert [c.exemption_code for c in report.commits] == [None] * 3
+    assert timeouts == pytest.approx([regression._GIT_TIMEOUT_S, regression._GIT_TIMEOUT_S - tick])
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("exempt_first", [False, True])
+@pytest.mark.parametrize("failure", ["grep_error", "deadline", "read_limit"])
+def test_diagnostic_failure_preserves_independent_primary_exemptions(tmp_path, monkeypatch, exempt_first, failure):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, public)
+    names = ("exempt", "plain") if exempt_first else ("plain", "exempt")
+    fixes = {name: _fix(repo, f"fix: {name}", {f"src/{name}.py": "value = 1\n"}) for name in names}
+    repo.commit(human_gate.exemption_message(fixes["exempt"], "reviewed manually"), sign_key=key, allow_empty=True)
+    now = [100.0]
+    calls = []
+    real = gitsafe.run
+
+    def fail_diagnostic(args, *rest, **kwargs):
+        if args[0] == "log" and any(arg.startswith("--grep=") for arg in args):
+            calls.append(args)
+            if failure == "grep_error":
+                raise gitsafe.GitError("private diagnostic failure")
+            if failure == "deadline":
+                now[0] += kwargs["timeout"] + 1
+        if failure == "read_limit" and args[:2] == ["cat-file", "-s"]:
+            return subprocess.CompletedProcess(args, 0, f"{1 << 30}\n".encode(), b"")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(regression, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(gitsafe, "run", fail_diagnostic)
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert {c.commit: (c.status, c.exemption_code) for c in report.commits} == {
+        fixes["plain"]: ("failed", None), fixes["exempt"]: ("exempted", None)}
+    assert len(calls) == 1
+    assert "private diagnostic failure" not in json.dumps(report.as_dict(repo.root))
+
+
+def _refuse_exemption_at_git_boundary(monkeypatch, approval, code):
+    from aegis_core import gitsafe
+
+    real = gitsafe.run
+
+    def refuse(args, *rest, **kwargs):
+        if code == "unresolved" and args == ["rev-parse", "--verify", "--quiet", f"{approval}^{{commit}}"]:
+            return subprocess.CompletedProcess(args, 1, b"", b"private resolution failure")
+        if args[-1] == approval and "--format=%G?%n%GF" in args:
+            status = {"unverifiable": "E", "untrusted_signature": "U", "bad_signature": "B"}.get(code)
+            if status is not None:
+                return subprocess.CompletedProcess(args, 0, f"{status}\n".encode(), b"")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", refuse)
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("exempt_first", [False, True])
+@pytest.mark.parametrize("code", ["unresolved", "unverifiable"])
+def test_one_primary_rejection_preserves_other_fixes_exemptions(tmp_path, monkeypatch, exempt_first, code):
+    key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, public)
+    names = ("exempt", "refused") if exempt_first else ("refused", "exempt")
+    fixes = {name: _fix(repo, f"fix: {name}", {f"src/{name}.py": "value = 1\n"}) for name in names}
+    approval = repo.commit(human_gate.exemption_message(fixes["refused"], "reviewed manually"), allow_empty=True)
+    repo.commit(human_gate.exemption_message(fixes["exempt"], "reviewed manually"), sign_key=key, allow_empty=True)
+    _refuse_exemption_at_git_boundary(monkeypatch, approval, code)
+    assert human_gate.verify_test_exemption(repo.root, approval, fixes["refused"], "main").code == code
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert {c.commit: (c.status, c.exemption_code) for c in report.commits} == {
+        fixes["refused"]: ("failed", code), fixes["exempt"]: ("exempted", None)}
+    assert "private resolution failure" not in json.dumps(report.as_dict(repo.root))
+
+
+@needs_git
+@needs_signing
+def test_primary_verification_time_does_not_expire_in_memory_diagnostics(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aegis_core import approval_shape, gitsafe
+
+    _key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, public)
+    plain = _fix(repo, "fix: plain", {"src/plain.py": "value = 1\n"})
+    refused = _fix(repo, "fix: refused", {"src/refused.py": "value = 1\n"})
+    approval = repo.commit(human_gate.exemption_message(refused, "reviewed manually"), allow_empty=True)
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message + f"\nAegis-Exempt-Test: {refused} checked manually\n")
+    now = [100.0]
+    calls = []
+    real = gitsafe.run
+
+    def slow_primary(args, *rest, **kwargs):
+        if args[-1] == approval and "--format=%G?%n%GF" in args:
+            calls.append(args)
+            now[0] += regression._GIT_TIMEOUT_S + 1
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(regression, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(gitsafe, "run", slow_primary)
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert [(c.commit, c.exemption_code) for c in report.commits] == [(plain, None), (refused, "message_too_large")]
+    assert len(calls) == 1
+
+
+@needs_git
+def test_refusal_index_reads_an_oversized_candidate_once_for_all_fixes(tmp_path, monkeypatch):
+    from aegis_core import approval_shape
+
+    repo = make_repo(tmp_path)
+    fixes = [_fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i)}) for i in range(1, 4)]
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += "\n" + "".join(f"Aegis-Exempt-Test: {fix} reviewed by hand\n" for fix in fixes)
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+    approval = repo.head()
+    calls = _metadata_calls(monkeypatch)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert [c.exemption_code for c in report.commits] == ["message_too_large"] * len(fixes)
+    # One pinned discovery read plus one diagnostic read, independent of the number of named fixes.
+    assert sum(c[:3] == ["cat-file", "commit", approval] for c in calls) == 2
+    logs = [c for c in calls if c[0] == "log"]
+    assert len(logs) == 2
+    filtered, = [c for c in logs if any(arg.startswith("--grep=") for arg in c)]
+    assert not any(arg.startswith("--max-count") for arg in filtered)
+
+
+@needs_git
+def test_discovery_failure_does_not_start_a_diagnostic_reread(tmp_path, monkeypatch):
+    from aegis_core import approval_shape, gitsafe
+
+    repo = make_repo(tmp_path)
+    fixes = [_fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i)}) for i in range(1, 4)]
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += "\n" + "".join(f"Aegis-Exempt-Test: {fix} reviewed by hand\n" for fix in fixes)
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+    approval = repo.head()
+    reads = []
+    real = gitsafe.run
+
+    def timeout(args, *rest, **kwargs):
+        if args[:3] == ["cat-file", "commit", approval]:
+            reads.append(args)
+            raise gitsafe.GitError("private message timeout")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", timeout)
+    report = regression.check_ci_regressions(repo.root, "main")
+    assert [c.exemption_code for c in report.commits] == [None] * len(fixes)
+    assert len(reads) == 1
+
+
+@needs_git
+def test_refusal_index_checks_total_object_size_before_reading_content(tmp_path, monkeypatch):
+    from aegis_core import approval_shape, gitsafe
+
+    repo = make_repo(tmp_path)
+    fix = _fix(repo, "fix: diagnostic limit", {"src/app.py": APP.format(1)})
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fix} reviewed by hand\n"
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+    approval = repo.head()
+    reads = []
+    real = gitsafe.run
+
+    def oversized(args, *rest, **kwargs):
+        if args[:2] == ["cat-file", "-s"]:
+            return subprocess.CompletedProcess(args, 0, f"{1 << 30}\n".encode(), b"")
+        if args[:3] == ["cat-file", "commit", approval]:
+            reads.append(args)
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", oversized)
+    report = regression.check_ci_regressions(repo.root, "main")
+    assert report.commits[0].exemption_code is None
+    assert len(reads) == 1  # Only pinned discovery reads content; diagnostics stop at the size query.
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("newer_oversized", [True, False])
+@pytest.mark.parametrize("diagnostic_code", ["message_too_large", "message_line_too_long"])
+@pytest.mark.parametrize("primary_code", ["unsigned", "unresolved", "unverifiable", "no_allowed_signers",
+                                         "untrusted_signature", "bad_signature", "accept_reserved",
+                                         "multiple_trailers", "invalid_message_shape"])
+def test_refused_exemptions_keep_newest_first_order_across_both_indexes(
+        tmp_path, monkeypatch, newer_oversized, diagnostic_code, primary_code):
+    from aegis_core import approval_shape
+
+    _key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, None if primary_code == "no_allowed_signers" else public)
+    fix = _fix(repo, "fix: newest refusal", {"src/app.py": APP.format(1)})
+    oversized = ("prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1) if diagnostic_code == "message_too_large"
+                 else "x" * (approval_shape.MAX_LINE_LENGTH + 1) + "\n")
+    oversized += f"\nAegis-Exempt-Test: {fix} reviewed by hand\n"
+    ordinary = human_gate.exemption_message(fix, "reviewed manually")
+    if primary_code == "accept_reserved":
+        ordinary += "Aegis-Accept: reserved\n"
+    elif primary_code == "multiple_trailers":
+        ordinary += f"Aegis-Exempt-Test: {fix} reviewed again\n"
+    elif primary_code == "invalid_message_shape":
+        ordinary += " continued signed value\n"
+    for message in ((ordinary, oversized) if newer_oversized else (oversized, ordinary)):
+        repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+        if message == ordinary:
+            approval = repo.head()
+    # A resolution failure for this candidate must not also hide the report's head.
+    repo.commit("chore: finish refusal ordering fixture", allow_empty=True)
+    _refuse_exemption_at_git_boundary(monkeypatch, approval, primary_code)
+    assert human_gate.verify_test_exemption(repo.root, approval, fix, "main").code == primary_code
+
+    item, = regression.check_ci_regressions(repo.root, "main").commits
+
+    assert (item.status, item.exemption_code) == ("failed", diagnostic_code if newer_oversized else primary_code)
+
+
+@needs_git
+def test_oversized_exemption_bounds_precede_a_missing_reason(tmp_path):
+    from aegis_core import approval_shape
+
+    repo = make_repo(tmp_path)
+    fix = _fix(repo, "fix: bounds refusal", {"src/app.py": APP.format(1)})
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fix} \n"
+    repo.git("commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", "-", stdin=message)
+
+    item, = regression.check_ci_regressions(repo.root, "main").commits
+
+    assert (item.status, item.exemption_code) == ("failed", "message_too_large")
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("code", ["message_too_large", "message_line_too_long", "invalid_message_shape"])
+def test_refused_exemption_diagnostic_survives_discovery(tmp_path, code):
+    from aegis_core import approval_shape
+
+    key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, public)
+    repo.write("src/app.py", APP.format(1))
+    fix = repo.commit("fix: preserve rejected exemption diagnostics")
+    marker = "private-exemption-prose-do-not-display"
+    trailer = f"Aegis-Exempt-Test: {fix} checked manually\n"
+    if code == "message_too_large":
+        message = f"{marker}\n\n" + "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1) + "\n" + trailer
+    elif code == "message_line_too_long":
+        message = f"{marker}\n\n" + "x" * (approval_shape.MAX_LINE_LENGTH + 1) + "\n\n" + trailer
+    else:
+        message = f"{marker}\n\n{trailer} continued signed value\n"
+    repo.git("-c", "gpg.format=ssh", "-c", f"user.signingkey={key}",
+             "commit", "-q", "--allow-empty", "-S", "-F", "-", stdin=message)
+    assert human_gate.verify_test_exemption(repo.root, repo.head(), fix, "main").code == code
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    item, = report.commits
+    finding, = report.findings
+    assert (item.status, item.exemption_code) == ("failed", code)
+    assert f"(its test exemption was rejected: {code})" in finding.message
+    assert marker not in json.dumps(report.as_dict(repo.root))
+
+
+@needs_git
+def test_an_oversized_exemption_does_not_explain_another_fix(tmp_path):
+    from aegis_core import approval_shape
+
+    repo = make_repo(tmp_path)
+    fixes = []
+    for i in (1, 2):
+        repo.write("src/app.py", APP.format(i))
+        fixes.append(repo.commit(f"fix: constant {i}"))
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fixes[0]} reviewed by hand\n"
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    assert [(item.commit, item.exemption_code) for item in report.commits] == [
+        (fixes[0], "message_too_large"), (fixes[1], None)]
+
+
+@needs_git
+@needs_signing
+@pytest.mark.parametrize("valid_after", [False, True])
+def test_a_valid_exemption_still_wins_over_an_oversized_one(tmp_path, valid_after):
+    from aegis_core import approval_shape
+
+    key, public = hg.keygen(tmp_path / "keys", "human")
+    repo = make_repo(tmp_path, public)
+    repo.write("src/app.py", APP.format(1))
+    fix = repo.commit("fix: valid exemption wins")
+    if not valid_after:
+        repo.commit(human_gate.exemption_message(fix, "reviewed manually"), sign_key=key, allow_empty=True)
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fix} reviewed by hand\n"
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+    if valid_after:
+        repo.commit(human_gate.exemption_message(fix, "reviewed manually"), sign_key=key, allow_empty=True)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    item, = report.commits
+    assert (item.status, item.exemption_code) == ("exempted", None)
+    assert report.findings == ()
+
+
+@needs_git
+def test_unverified_tests_also_retain_a_rejected_exemption_code(tmp_path):
+    from aegis_core import approval_shape
+
+    repo = make_repo(tmp_path)
+    repo.write("pkg/handler.go", "package pkg\n\nfunc Handle() int { return 2 }\n")
+    repo.write("pkg/handler_test.go", 'package pkg\n\nimport "testing"\n\nfunc TestHandle(t *testing.T) {}\n')
+    fix = repo.commit("fix: go handler")
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fix} reviewed by hand\n"
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+
+    report = regression.check_ci_regressions(repo.root, "main")
+
+    item, = report.commits
+    assert (item.status, item.reason, item.exemption_code) == ("unverifiable", "no_driver", "message_too_large")
+    assert "(its test exemption was rejected: message_too_large)" in report.findings[0].message
 
 
 @needs_git

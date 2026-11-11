@@ -325,17 +325,90 @@ the manifest digest; mutations check under the same exclusive writer lock. An
 old running adapter is refused after replacement. This is configured provenance,
 not authenticated host identity. The adapter speaks baseline stdio MCP 2024-11-05.
 
-`mailbox_inbox` accepts optional `include_briefs`, `limit` and `after_message_id`.
-It returns only this endpoint's incoming messages and, when requested, their
-hash-verified brief text. A front door therefore needs no arbitrary filesystem
-reader. Results page at 20 messages by default, up to 100; `remaining` and
-`next_after` make omissions explicit. The CLI offers `--include-briefs`, `--limit`
-and `--after` for the same behavior. `status` and historical files remain available.
-The inbox also returns only this endpoint's current `binding`, including its
-checkpoint, canonical checkpoint hash and readiness. With `include_briefs`,
-`checkpoint_briefs` contains the checkpoint's hash-verified brief text, including
-outgoing briefs that would not occur in incoming messages. A replacement can
-inspect its own checkpoint before acknowledging it without a controller relay.
+`mailbox_inbox` returns only this endpoint's incoming messages. `include_briefs: true`
+adds their hash-verified brief text, so a front door needs no arbitrary filesystem
+reader. `limit` defaults to 20, up to 100; the response byte budget can shorten a
+page. While `remaining` is nonzero, pass the returned `next_after` as
+`after_message_id` to read the next page. The cursor is exclusive: that message
+will not be repeated. Read every page before treating an inbox walk as complete.
+`status` and historical files remain available.
+
+The adapter selects its inbox behavior from the `host-plan.json` in the mailbox
+root's parent directory; a plan held only by another provision base does not apply.
+An invalid plan refuses the call; it does not select legacy behavior.
+
+| Connection | Inbox behavior |
+| --- | --- |
+| No host plan (legacy) | Accepts `include_briefs`, `limit`, `after_message_id` and the separate `binding_only` view. Returns the full current `binding`, including checkpoint, canonical checkpoint hash and readiness. With `include_briefs`, `checkpoint_briefs` contains hash-verified text, including outgoing briefs absent from incoming messages. |
+| Validated host plan | Also accepts `order`, `since` and `briefs`. Later pages can slim `binding` and replace checkpoint brief text with hash checks, as described below. These options are MCP-only. |
+
+The CLI's `--include-briefs`, `--limit`, `--after` and `--binding-only` retain the
+legacy behavior; it has no equivalents for `order`, `since` or `briefs`.
+
+On a planned connection, `order` defaults to `"oldest"`; `"newest"` reverses
+the `(created_at, message_id)` order. Keep `order` and `since` unchanged through a
+walk and use its returned cursor. If a cursor is refused, restart without
+`after_message_id`. For example, these are successive `mailbox_inbox` arguments;
+replace `a-note-1` with the first response's actual `next_after`:
+
+```json
+{"include_briefs": true, "limit": 20, "order": "oldest"}
+```
+
+```json
+{"include_briefs": true, "limit": 20, "order": "oldest", "after_message_id": "a-note-1"}
+```
+
+For recent-generation triage on a planned connection:
+
+```json
+{"order": "newest", "since": "current_generation", "limit": 20}
+```
+
+`since: "current_generation"` selects messages at or after the current binding's
+creation time, plus its checkpoint's pending message IDs. The response's `excluded`
+count reports how many messages fall outside that selection; `remaining` counts only the selected
+walk. This is a timestamp filter, not an unread-mail filter. To recover older unread
+mail, restart oldest-first without `since` or `after_message_id` and drain every page.
+A changed cutoff, a cutoff more than five seconds in the future, or ambiguous
+timestamp ordering refuses the filtered read; recover with that same unfiltered walk.
+
+On a planned connection, a successfully flushed response of at most 60,000 bytes
+allows later responses on that connection, for the same binding and checkpoint, to
+return a slim `binding`: `endpoint`, `host`, `session`, `generation`,
+`checkpoint_sha256` and `ready`. Once checkpoint brief text has been included in
+such a response, later `include_briefs` reads may return `{path, sha256, ok}` checks
+instead of that text (`reason` explains a failed check). A later flushed planned inbox
+response over 60,000 bytes clears this suppression, so the next inbox read returns
+the full binding and, when requested, checkpoint brief text. Incoming message brief
+text is still included when requested. `binding_only` returns no text and does not
+advance this suppression state. A stdout flush proves transport progress, not model receipt
+or understanding; host truncation or context compaction can lose the text.
+
+After compaction or truncation, use this planned-connection recovery call:
+
+```json
+{"briefs": "full", "order": "oldest", "limit": 20}
+```
+
+`briefs: "full"` implies `include_briefs: true` and forces the full binding and
+hash-verified checkpoint brief text, so a successor can inspect its checkpoint
+before acknowledging it without a controller relay. It does not remove message
+filters or paging: omit `since` and the old cursor on the first recovery call.
+For continuation pages, use `include_briefs: true` without `briefs`, replacing
+`a-note-1` with the preceding response's actual `next_after`:
+
+```json
+{"include_briefs": true, "order": "oldest", "limit": 20, "after_message_id": "a-note-1"}
+```
+
+The cursor remains valid when switching these brief options. This keeps incoming
+message brief text while allowing checkpoint hash checks and a slim binding when
+the preceding response qualifies. Repeating `briefs: "full"` re-sends the full
+binding and every checkpoint brief's text on every page. Dropping `briefs` without
+adding `include_briefs: true` omits incoming messages' brief text. Continue with
+each `next_after` until `remaining` is zero. Read receipts cover only returned
+messages; stopping early can leave a wake reporting `woken_unread`.
 
 `mailbox_publish` takes the message fields except `from`, `host`, `session` and
 `binding_generation`, which the adapter supplies. It validates nested fields with

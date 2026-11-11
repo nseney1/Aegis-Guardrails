@@ -321,6 +321,29 @@ def test_a_rejected_exemption_shows_its_code_and_approve_agrees_with_ci(
 # ── X-t5-progress: the pytest reruns say what they are doing, on stderr only ─
 
 
+@needs_git
+def test_ci_displays_an_oversized_exemptions_refusal_code(tmp_path, capsys):
+    from aegis_core import approval_shape
+
+    repo = make_repo(tmp_path)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    fix = repo.commit("fix: preserve exemption refusal")
+    marker = "private-exemption-prose-do-not-display"
+    message = f"{marker}\n\n" + "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += f"\nAegis-Exempt-Test: {fix} reviewed by hand\n"
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+
+    rc, output, error = run_ci(repo, capsys)
+    assert rc == 0
+    assert "(its test exemption was rejected: message_too_large)" in output
+    assert marker not in output + error
+    rc, output, error = run_ci(repo, capsys, "--format", "json")
+    assert rc == 0
+    item, = json.loads(output)["regression"]["commits"]
+    assert (item["status"], item["exemption_code"]) == ("failed", "message_too_large")
+    assert marker not in output + error
+
+
 def _fake_pytest_and_rerun(monkeypatch: pytest.MonkeyPatch) -> list:
     from aegis_core import checkrun, gitsafe, testexec
 

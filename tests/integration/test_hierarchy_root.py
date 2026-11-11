@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
+from types import SimpleNamespace
 
 import pytest
 
@@ -263,6 +265,113 @@ def test_first_prompt_check_fails_without_a_user_record(tmp_path, prompt_file):
                             "--prompt-sha256", sha(prompt_file.read_bytes()))
     assert code == 2
     assert out["ok"] is False and out["first_user_record"] is None
+
+
+def observe_transcript(tool, transcript, prompt_file, monkeypatch):
+    monkeypatch.setattr(tool, "agents_rows", lambda: [])
+    record = {"id": SESSION[:8]}
+    spec = {"prompt": {"path": str(prompt_file), "sha256": sha(prompt_file.read_bytes())}}
+    args = SimpleNamespace(projects_dir=transcript.parent.parent, wait_s=0, dialog_wait_s=0, poll_s=0)
+    tool.observe_launch(record, spec, args, tool.time.monotonic())
+    return record
+
+
+@pytest.mark.parametrize("torn_tail", [None, '{"type":"assist'])
+def test_first_prompt_and_launch_preserve_complete_observations(tool, tmp_path, prompt_file,
+                                                              monkeypatch, torn_tail):
+    text = prompt_file.read_text(encoding="utf-8")
+    records = header_records() + [{"type": "assistant"}, user_record([
+        {"type": "text", "text": text[:5]}, {"type": "image", "data": "ignored"},
+        {"type": "text", "text": text[5:]}]), user_record("later prompt"), {"type": "assistant"}]
+    transcript = write_transcript(tmp_path / "projects" / "-workspace" / (SESSION + ".jsonl"),
+                                  records, torn_tail=torn_tail)
+    digest = sha(prompt_file.read_bytes())
+    expected = {"transcript": str(transcript), "prompt": str(prompt_file), "prompt_sha256": digest,
+                "expected_sha256": digest, "first_user_record": {
+                    "line": 4, "uuid": "u-1", "timestamp": "2026-11-02T16:00:01.000Z"},
+                "torn_tail": torn_tail is not None, "prompt_chars": len(text), "first_prompt_chars": len(text),
+                "equals_recorded": True, "prompt_sha256_ok": True, "prefix_matches": True,
+                "extra_chars": 0, "extra_head": "", "ok": True}
+    code, out, err = run_tool("first-prompt-check", "--transcript", transcript, "--prompt", prompt_file,
+                              "--prompt-sha256", digest)
+    assert code == 0 and err == ""
+    assert tool.encode_json(out) == tool.encode_json(expected)
+    observed = observe_transcript(tool, transcript, prompt_file, monkeypatch)
+    assert tool.encode_json(observed) == tool.encode_json({
+        "id": SESSION[:8], "transcript": str(transcript), "first_prompt_check": expected,
+        "first_assistant_line": 3, "agents_row": None, "session": SESSION})
+
+
+@pytest.mark.parametrize("consumer", ["first-prompt", "launch"])
+def test_prompt_observations_refuse_corruption_after_first_matches(tool, tmp_path, prompt_file,
+                                                                monkeypatch, consumer):
+    transcript = write_transcript(tmp_path / "projects" / "-workspace" / (SESSION + ".jsonl"),
+                                  [user_record(prompt_file.read_text(encoding="utf-8")),
+                                   {"type": "assistant"}], torn_tail='NOT JSON\n{}\n')
+    with pytest.raises(tool.Failure) as caught:
+        if consumer == "first-prompt":
+            tool.first_prompt_check(transcript, prompt_file, sha(prompt_file.read_bytes()))
+        else:
+            observe_transcript(tool, transcript, prompt_file, monkeypatch)
+    assert caught.value.code == 2
+    assert str(caught.value) == "unparsable JSON at line 3 of %s" % transcript
+
+
+@pytest.mark.parametrize("bad_text", [0, None])
+@pytest.mark.parametrize("corrupt", [False, True])
+@pytest.mark.parametrize("consumer", ["first-prompt", "launch"])
+def test_malformed_first_user_preserves_refusal_and_launch_evidence(tmp_path, stub, prompt_file,
+                                                                 bad_text, corrupt, consumer):
+    transcript = write_transcript(stub.projects / "-malformed" / (SESSION + ".jsonl"),
+                                  [user_record([{"type": "text", "text": bad_text}])],
+                                  torn_tail="NOT JSON\n{}\n" if corrupt else None)
+    expected = ("unparsable JSON at line 2 of %s" % transcript if corrupt
+                else "text block text must be a string")
+    if consumer == "first-prompt":
+        code, out, err = run_tool("first-prompt-check", "--transcript", transcript, "--prompt", prompt_file,
+                                  "--prompt-sha256", sha(prompt_file.read_bytes()))
+        assert code == 2 and err == "", (code, out, err)
+        assert out == {"ok": False, "error": expected}
+    else:
+        spec_path, spec = launch_spec(tmp_path, prompt_file)
+        stub.serve("launch.json", {"session": SESSION, "projects": str(tmp_path / "elsewhere"),
+                                   "assistant": True})
+        code, out, err = launch(stub, spec_path)
+        assert code == 2 and err == "", (code, out, err)
+        assert out["ok"] is False and stub.launched()
+        saved = json.loads(Path(spec["record_out"]).read_text(encoding="utf-8"))
+        assert saved == out["record"]
+        assert saved["observe_error"] == expected
+        assert saved["first_prompt_check"] is None
+        assert saved["stop_command"] == "claude stop " + SESSION[:8]
+        assert saved["attach_command"] == "claude attach " + SESSION[:8]
+
+
+@pytest.mark.parametrize("consumer", ["first-prompt", "launch"])
+def test_prompt_observations_stream_with_bounded_peak_memory(tool, tmp_path, prompt_file,
+                                                          monkeypatch, consumer):
+    transcript = write_transcript(tmp_path / "projects" / "-workspace" / (SESSION + ".jsonl"),
+                                  [user_record(prompt_file.read_text(encoding="utf-8")),
+                                   {"type": "assistant"}])
+    padding = json.dumps({"type": "progress", "data": "x" * 1024}) + "\n"
+    with transcript.open("a", encoding="utf-8") as stream:
+        for _ in range(10000):
+            stream.write(padding)
+    size = transcript.stat().st_size
+    tracemalloc.start()
+    try:
+        if consumer == "first-prompt":
+            check = tool.first_prompt_check(transcript, prompt_file, sha(prompt_file.read_bytes()))
+        else:
+            observed = observe_transcript(tool, transcript, prompt_file, monkeypatch)
+            assert observed["first_assistant_line"] == 2
+            check = observed["first_prompt_check"]
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert check["ok"] is True and check["torn_tail"] is False
+    assert size > 10 * 1024 * 1024
+    assert peak < size // 10, (consumer, peak, size)
 
 
 # --- T92, T100: check-hashes ------------------------------------------------------------------
@@ -885,12 +994,10 @@ def test_launch_refuses_a_cwd_a_background_session_cannot_trust(tmp_path, stub, 
 
 def test_launch_refuses_a_cwd_under_tmp_without_the_test_seam(tmp_path, stub, prompt_file):
     root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
-    cwd = Path(tempfile.mkdtemp(prefix="aegis47-hfix-cwd-", dir=root))
-    try:
-        spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
-        code, out, _ = run_tool("launch", "--spec", spec_path, "--plan", env=stub.env())
-    finally:
-        cwd.rmdir()
+    # The default-root refusal runs before launch and does not require an existing cwd.
+    cwd = Path(root) / tmp_path.name
+    spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
+    code, out, _ = run_tool("launch", "--spec", spec_path, "--plan", env=stub.env())
     assert code == 2, out
     assert "under %s" % Path(root).resolve() in out["error"]
 
@@ -1185,6 +1292,76 @@ def test_read_jsonl_skips_only_a_torn_last_line(tool, tmp_path):
     assert failure_code(tool, lambda: tool.read_jsonl(path, tolerate_torn_tail=False)) == 2
     path.write_text('{"a": 1}\n{"b": \n{"c": 3}\n', encoding="utf-8")
     assert failure_code(tool, lambda: tool.read_jsonl(path)) == 2
+
+
+@pytest.mark.parametrize("consume_first", [False, True])
+def test_read_jsonl_drains_early_reducers_before_returning(tool, tmp_path, consume_first):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"a":1}\nNOT JSON\n{"b":2}\n{"c":')
+    with pytest.raises(tool.Failure) as listed:
+        tool.read_jsonl(path)
+    with pytest.raises(tool.Failure) as reduced:
+        tool.read_jsonl(path, reduce_rows=lambda rows: next(rows, None) if consume_first else None)
+    assert reduced.value.code == listed.value.code == 2
+    assert str(reduced.value) == str(listed.value) == "unparsable JSON at line 2 of %s" % path
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_read_jsonl_drains_after_reducer_failures_and_closes_stream(tool, tmp_path, monkeypatch, corrupt):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"a":1}\n' + (b'NOT JSON\n' if corrupt else b'{"b":2}\n') + b'{}\n')
+    opened = []
+
+    def track_open(*args, **kwargs):
+        stream = open(*args, **kwargs)
+        opened.append(stream)
+        return stream
+
+    monkeypatch.setattr(tool, "open", track_open, raising=False)
+
+    def fail(rows):
+        next(rows)
+        raise TypeError("synthetic reducer failure")
+
+    expected = tool.Failure if corrupt else TypeError
+    with pytest.raises(expected) as caught:
+        tool.read_jsonl(path, reduce_rows=fail)
+    if corrupt:
+        assert caught.value.code == 2
+        assert str(caught.value) == "unparsable JSON at line 2 of %s" % path
+    else:
+        assert str(caught.value) == "synthetic reducer failure"
+    assert len(opened) == 1 and opened[0].closed
+
+
+@pytest.mark.parametrize("reduce_rows", [
+    lambda rows: rows,
+    lambda rows: (row for row in rows),
+    lambda rows: map(lambda row: row, rows),
+    lambda rows: filter(None, rows),
+], ids=["same-iterator", "generator", "map", "filter"])
+def test_read_jsonl_refuses_lazy_reducer_results(tool, tmp_path, reduce_rows):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"a":1}\n{"b":2}\n')
+    with pytest.raises(TypeError, match="^reduce_rows must return a materialised value, not an iterator$"):
+        tool.read_jsonl(path, reduce_rows=reduce_rows)
+
+
+@pytest.mark.parametrize("consume_first", [False, True])
+@pytest.mark.parametrize("tail", [b'{"c":', b'NOT JSON\n \t\r\n'])
+def test_read_jsonl_early_reducers_report_or_refuse_torn_tails(tool, tmp_path, consume_first, tail):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"a":1}\n{"b":2}\n' + tail)
+
+    def reduce_rows(rows):
+        return next(rows, None) if consume_first else None
+
+    expected = (1, {"a": 1}) if consume_first else None
+    assert tool.read_jsonl(path, reduce_rows=reduce_rows) == (expected, True)
+    with pytest.raises(tool.Failure) as caught:
+        tool.read_jsonl(path, tolerate_torn_tail=False, reduce_rows=reduce_rows)
+    assert caught.value.code == 2
+    assert str(caught.value) == "unparsable JSON at line 3 of %s" % path
 
 
 @pytest.mark.parametrize("body,expected,torn", [
