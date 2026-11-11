@@ -20,6 +20,7 @@ import uuid
 import pytest
 
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
+from tests.integration import test_hierarchy_provision as provision_fixtures
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 from tests.integration.test_hierarchy_workspace import write_lease
 
@@ -48,8 +49,8 @@ needs_bubblewrap = pytest.mark.skipif(not sys.platform.startswith("linux") or no
 
 
 class Shop(Setup):
-    def __init__(self, tmp_path):
-        super().__init__(tmp_path)
+    def __init__(self, tmp_path, *, source_seed=None):
+        super().__init__(tmp_path, source_seed=source_seed)
         self.init()
         self.orchestrator = self.add_role("pilot/orchestrator", cwd=str(tmp_path))
         self.add_role("pilot/root", "codex-cli", session="root-session")
@@ -162,8 +163,20 @@ class Shop(Setup):
 
 
 @pytest.fixture
-def shop(tmp_path):
-    return Shop(tmp_path)
+def shop(tmp_path, tmp_path_factory, request):
+    return Shop(tmp_path, source_seed=provision_fixtures.worker_source_seed(tmp_path_factory, request))
+
+
+@pytest.mark.parametrize("fixture", ["shop", "kind_shop"])
+def test_rf42_job_fixtures_reuse_the_worker_source_seed(tmp_path_factory, request, monkeypatch, fixture):
+    seed = provision_fixtures.worker_source_seed(tmp_path_factory, request)
+
+    def refuse_rebuild(source):
+        pytest.fail("job fixtures must reuse the worker source seed")
+
+    monkeypatch.setattr(provision_fixtures, "build_source", refuse_rebuild)
+    built = request.getfixturevalue(fixture)
+    assert git(built.source, "rev-parse", "HEAD") == git(seed, "rev-parse", "HEAD")
 
 
 def verified_evidence(receipt):
@@ -579,9 +592,10 @@ OTHER_KIND_CASES = [("heavy", "writer"), ("heavy", "heavy-tests"), ("heavy-tests
 
 
 @pytest.fixture
-def kind_shop(tmp_path_factory):
+def kind_shop(tmp_path_factory, request):
     # A fresh, uniquely named store per case; nothing is keyed to a reusable path.
-    return Shop(tmp_path_factory.mktemp("jobs-kind-" + uuid.uuid4().hex))
+    return Shop(tmp_path_factory.mktemp("jobs-kind-" + uuid.uuid4().hex),
+                source_seed=provision_fixtures.worker_source_seed(tmp_path_factory, request))
 
 
 def request_kind_job(shop, kind):
@@ -4595,12 +4609,12 @@ def remove_tree(folder):
 
 
 @pytest.mark.parametrize("sandbox", SANDBOXES)
-def test_a_clean_test_job_runs_in_the_export_and_bubblewrap_hides_the_live_checkout(sandbox):
+def test_a_clean_test_job_runs_in_the_export_and_bubblewrap_hides_the_live_checkout(sandbox, tmp_path_factory, request):
     # Outside /tmp, because bubblewrap mounts an empty /tmp anyway: a checkout there would look hidden even if the
     # export's own mounts left it visible.
     base = Path(tempfile.mkdtemp(prefix="aegis-jobs-", dir="/var/tmp"))
     try:
-        shop = Shop(base)
+        shop = Shop(base, source_seed=provision_fixtures.worker_source_seed(tmp_path_factory, request))
         clean_pytest_recipe(shop, sandbox)
         commit_ignore(shop, "build/")
         (shop.checkout / "build").mkdir()
