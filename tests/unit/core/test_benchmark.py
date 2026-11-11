@@ -329,6 +329,7 @@ def test_a_run_count_outside_one_to_the_maximum_is_refused(runs):
         benchmark.run_benchmark(runs)
 
 
+@pytest.mark.timing
 def test_a_real_run_measures_all_three_and_leaves_no_temporary_directory(tmp_path, monkeypatch):
     scratch = tmp_path / "tmp"
     scratch.mkdir()

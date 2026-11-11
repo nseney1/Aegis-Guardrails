@@ -18,6 +18,7 @@ import stat
 import subprocess
 import time
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import hierarchy_fresh_brief as fresh
 import hierarchy_jobs as jobs
@@ -186,25 +187,42 @@ def pending_plans(state):
     return result
 
 
-def exclusions(state, rows):
+class _WriterCustody(NamedTuple):
+    """Operation-local facts from finalization; never part of the presentation."""
+
+    request_id: str
+    writer: str
+    message_present: bool
+    state_head: str
+    history_verified: bool
+    released: bool
+
+
+def exclusions(state, custody):
     result = {team + "/" + role for team in active_teams(state) for role in ("orchestrator", "decider")}
-    for view in rows:
-        row = state["requests"][view["request_id"]]
+    captured = set()
+    for facts in custody:
+        require(type(facts) is _WriterCustody, "unverified writer custody input")
+        if facts.state_head != state["head"]:
+            continue
+        captured.add(facts.request_id)
+        row = state["requests"][facts.request_id]
         released = not row.get("lifecycle_unknown") and row["resolution"] is not None and row["resolution"]["kind"] in {"complete", "blocked"}
         # Canonical next disposition closes routing, but cannot release D7 custody.
-        if not released and (view.get("writer_message_present") or row["routed"] is not None) and not (
-                view.get("route_receipt") and view.get("writer_publication_verified")):
-            result.add(view["writer"])
+        if not released and (facts.message_present or row["routed"] is not None) and not facts.released:
+            result.add(facts.writer)
     # An unreadable mailbox cannot prove that no writer was delivered. Never
     # turn an unavailable listing into permission for sweep to wake that lane.
-    absent = {view["request_id"] for view in rows
-              if view.get("mailbox_history_verified") and not view.get("writer_message_present")}
+    absent = {facts.request_id for facts in custody if facts.state_head == state["head"]
+              and facts.history_verified and not facts.message_present}
     for key, row in state["requests"].items():
         # A verified complete listing can prove absence. A failed/oversized
         # listing, or unknown lifecycle effects, can never supply that proof.
         if key in absent and not row.get("lifecycle_unknown") and row["intent"] is None and row["start"] is None:
             continue
-        if "small_change" in row and (row.get("lifecycle_unknown") or row["routed"] is None) and not closed(row):
+        canonical_release = closed(row) and row["resolution"]["kind"] in {"complete", "blocked"}
+        if "small_change" in row and not canonical_release and (
+                key not in captured or row.get("lifecycle_unknown") or row["routed"] is None):
             plan = life.raw_value(row["small_change"]["registration"]["proposal"])["plan"]
             result.add(row["request"]["team"] + "/lane/" + plan["writing_lanes"][0]["lane"])
     return sorted(result)
@@ -597,7 +615,7 @@ class _CapturedStore:
             try:
                 event = self.operation.json(path, private=False)
                 fields(event, {"schema", "seq", "at", "kind", "data"})
-                require(event["schema"] == workspace.EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
+                require(event["schema"] in workspace.REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
                 parse_time(event["at"])
                 declared = event["data"]
                 guarded = event
@@ -644,6 +662,7 @@ class Row:
         self._completed_checks = []
         self._writer_receipt, self._writer_verified, self._writer_target_current = None, False, False
         self._verification_proof = None
+        self._custody = None
         self.setup = {}
         self.operation = operation
         self.operation.validators.append(self.recheck_jobs)
@@ -722,22 +741,27 @@ class Row:
         self.lifecycle.verify_dependencies(self.key)
 
     def clear_writer_release(self):
-        self.finalize_writer_release(clear_only=True)
+        self._custody = self.finalize_writer_release(clear_only=True)
 
     def finalize_writer_release(self, *, clear_only=False):
         # All release-key mutations, including recovery removals, live here.
         # Removals need no proof; grants below require the positive proof gate.
         self.view.pop("route_receipt", None)
         self.view.pop("writer_publication_verified", None)
-        if clear_only:
-            return
-        self.view.pop("mailbox_history_verified", None)
-        self.operation.verify()
-        self.view["mailbox_history_verified"] = self.mailbox is not None and self.mailbox._records is not None
-        if self._verification_proof is not None and self._writer_verified and self._writer_target_current:
-            self.view["writer_publication_verified"] = True
-            if self._writer_receipt is not None:
-                self.view["route_receipt"] = self._writer_receipt
+        released = False
+        history_verified = False
+        if not clear_only:
+            self.view.pop("mailbox_history_verified", None)
+            self.operation.verify()
+            history_verified = self.mailbox is not None and self.mailbox._records is not None
+            self.view["mailbox_history_verified"] = history_verified
+            if self._verification_proof is not None and self._writer_verified and self._writer_target_current:
+                self.view["writer_publication_verified"] = True
+                if self._writer_receipt is not None:
+                    self.view["route_receipt"] = self._writer_receipt
+                    released = True
+        return _WriterCustody(self.key, self.writer, identifier("scw", self.row) in self.records,
+                              self.state["head"], history_verified, released)
 
     def reload(self):
         self.policy, self.state = router.locked_load(self.lifecycle, self.wait)
@@ -1355,6 +1379,24 @@ class Row:
         except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
             raise Hold("small_change_message_conflict", str(exc)) from exc
 
+    def invalidate(self, reason, detail):
+        """Invalidate release and completion drafts, retaining owner HOLD evidence."""
+        self._verification_proof = None
+        self.clear_writer_release()
+        original = self.view["drafts"]
+        retained = []
+        for envelope in original:
+            event = envelope["event"]
+            if (event.get("resolution", {}).get("kind") == "blocked"
+                    and (event["type"] == "resolve" or (
+                        event["type"] == "disposition" and event.get("status") == "HOLD"))):
+                retained.append(envelope)
+        discarded = len(retained) != len(original)
+        if discarded:
+            self.view["drafts"] = retained
+        if discarded or self.view.get("state") not in {"held", "complete", "owned_hold"}:
+            self.view.update(state="held", reason=reason, detail=detail)
+
     def drafts(self, reason=None):
         self.operation.verify()
         if self.row.get("lifecycle_unknown"):
@@ -1518,20 +1560,22 @@ class Row:
         if auditing:
             self.view["state"] = "owned_hold" if blocked else "complete"
             if self.recipes is None:
-                self.view.update(state="owned_hold" if blocked else "held", reason="small_change_close_unverified", drafts=[],
+                self.view.update(state="owned_hold" if blocked else "held", reason="small_change_close_unverified",
                                  detail="rerun with --recipes <file> to verify closed evidence")
+                self.invalidate(self.view["reason"], self.view["detail"])
                 return
             if blocked:
                 self.view["reason"] = "small_change_close_due"
-                self.view["drafts"] = self.drafts("small_change_close_due") if self.recipes is not None else []
+                self.view["drafts"] = self.drafts("small_change_close_due")
             return
         self.live()
         self.view.update(state="held", reason="small_change_close_due", detail="owner records drafted coordinator events")
         if self.recipes is not None:
             self.view["drafts"] = self.drafts("small_change_close_due")
         else:
-            self.view.update(reason="small_change_close_unverified", drafts=[],
+            self.view.update(reason="small_change_close_unverified",
                              detail="rerun with --recipes <file> to verify checks before successful closure drafts")
+            self.invalidate(self.view["reason"], self.view["detail"])
 
     def verification_pass(self, mutate):
         # An old canonical publication is an effect even without a route receipt.
@@ -1568,10 +1612,8 @@ class Row:
         self._verification_proof = None
         try:
             self._verification_proof = self.operation.prove(self.verification_pass, mutate)
-            self.finalize_writer_release()
+            self._custody = self.finalize_writer_release()
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
-            self._verification_proof = None
-            self.clear_writer_release()
             reason = exc.reason if isinstance(exc, Hold) else "small_change_configuration"
             if isinstance(exc, fresh.CaptureChanged) and self.recipes is not None and exc.path == Path(self.recipes):
                 reason = "small_change_recipe_mismatch"
@@ -1579,7 +1621,7 @@ class Row:
                 reason = "small_change_receipt_invalid" if "receipt" in str(exc) else "small_change_result_invalid"
             if "referenced message does not exist" in str(exc):
                 reason = "small_change_message_lost"
-            self.view.update(state="held", reason=reason, detail=str(exc)[:1024], drafts=[])
+            self.view.update(state="held", reason=reason, detail=str(exc)[:1024])
             if self.mailbox is not None:
                 self.view["writer_message_present"] = identifier("scw", self.row) in self.records
             if self.view.get("writer_message_present") and self.row["routed"] is None and reason in {
@@ -1589,15 +1631,18 @@ class Row:
                 self.view["reason"] = "small_change_closed_unverified"
             elif closed(self.row) and self.row["resolution"]["kind"] == "blocked":
                 self.view["state"] = "owned_hold"
+            self.invalidate(self.view["reason"], self.view["detail"])
             try:
-                self.view["drafts"] = self.drafts(reason)
+                if not self.view["drafts"]:
+                    self.view["drafts"] = self.drafts(reason)
             except (ValueError, OSError, TypeError, KeyError) as draft_error:
                 self.view["draft_error"] = str(draft_error)[:1024]
+                self.invalidate(self.view["reason"], self.view["detail"])
             try:
-                self.finalize_writer_release()
+                self._custody = self.finalize_writer_release()
             except (ValueError, OSError, TypeError, KeyError, RecursionError) as release_error:
-                self.clear_writer_release()
-                self.view.update(drafts=[], release_validation_error=str(release_error)[:1024])
+                self.view["release_validation_error"] = str(release_error)[:1024]
+                self.invalidate(self.view["reason"], self.view["detail"])
         return self.view
 
     def publication_authority(self, request):
@@ -1622,6 +1667,8 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
 
     _operation, _lifecycle, _store, _policy, state, ledger = inputs()
     rows = []
+    custody = []
+    contexts = []
     for key, row in sorted(state["requests"].items()):
         if "small_change" not in row:
             continue
@@ -1647,20 +1694,35 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
                         actual, refusal = router.team_mailbox(current.ledger, row["request"]["team"])
                         check(refusal is None and actual == mailbox_root, "small_change_configuration", "team mailbox changed before lock")
                         rows.append(current.run(True))
+                        custody.append(current._custody)
+                        contexts.append(current)
                         appended = True
                     continue
                 except (ValueError, OSError) as exc:
                     if current is None:
                         current = Row(_lifecycle, _store, ledger, _policy, state, key, recipes, wait,
                                       fresh._Operation(reference_cache=reference_cache))
-                    current.clear_writer_release()
                     current.view.update(state="held", reason="small_change_configuration", detail=str(exc))
+                    current.invalidate("small_change_configuration", str(exc))
                     if not appended:
                         rows.append(current.view)
+                        custody.append(current._custody)
+                        contexts.append(current)
+                    else:
+                        custody[-1] = current._custody
+                        contexts[-1] = current
                     continue
-        rows.append(context().run(False))
+        current = context()
+        rows.append(current.run(False))
+        custody.append(current._custody)
+        contexts.append(current)
     final = fresh._Operation(reference_cache=reference_cache)
-    _policy, current = router.locked_load(final.lifecycle(root), wait)
+    _policy, planning = router.locked_load(final.lifecycle(root), wait)
+    for current in contexts:
+        if current._custody.state_head != planning["head"]:
+            reason = ("small_change_revoked" if router.last_decision(planning, current.key) == "deny"
+                      else "small_change_snapshot_changed")
+            current.invalidate(reason, "lifecycle snapshot changed after writer verification; rerun dispatch")
     final.verify()
-    return {"small_changes": rows, "planning_exclusions": exclusions(current, rows),
+    return {"small_changes": rows, "planning_exclusions": exclusions(planning, custody),
             "qualification_dependencies": ["D4 registry companion", "D5 lane lifecycle tools", "D7 independent early-release record seam"]}

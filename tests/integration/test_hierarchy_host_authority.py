@@ -1264,6 +1264,7 @@ def initial_control_runtime(api, tmp_path, monkeypatch, control_fault=None):
             binding.close()
 
 
+@pytest.mark.timing
 def test_bind_start_use_real_initial_and_one_owned_context(api, tmp_path, monkeypatch):
     with initial_control_runtime(api, tmp_path, monkeypatch) as values:
         lifecycle, binding, reservations, _, requests = values
@@ -1318,6 +1319,7 @@ def test_initial_bind_rejects_witness_dict_and_planned_successor(api, tmp_path, 
         assert [row["method"] for row in requests] == ["describe", "reserve_initial"]
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("fault,methods", [
     ("lost-bind_initial-reply", ["describe", "reserve_initial", "bind_initial"]),
     ("wrong-bind-cid", ["describe", "reserve_initial", "bind_initial"]),
@@ -1346,6 +1348,7 @@ def test_possible_initial_control_retains_unknown_without_retry(api, tmp_path, m
         assert lifecycle.Lifecycle(binding.canonical_root).initial_bootstrap() == before
 
 
+@pytest.mark.timing
 def test_initial_start_cannot_renew_original_bound_deadline(api, tmp_path, monkeypatch):
     with initial_control_runtime(api, tmp_path, monkeypatch) as values:
         _, binding, reservations, _, requests = values
@@ -1410,6 +1413,7 @@ def test_owned_constructor_unsupported_host_closes_transferred_channels(
                 binding.close()
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("stage", ["reserved", "bound"])
 def test_initial_context_without_start_cannot_open_live_session(
         api, tmp_path, monkeypatch, stage):
@@ -1427,6 +1431,7 @@ def test_initial_context_without_start_cannot_open_live_session(
         assert [row["method"] for row in requests] == methods
 
 
+@pytest.mark.timing
 def test_started_initial_with_legacy_role_ceiling_cannot_open_live_session(
         api, tmp_path, monkeypatch):
     with initial_control_runtime(api, tmp_path, monkeypatch) as values:
@@ -1518,6 +1523,7 @@ def test_close_interrupts_a_live_session_waiting_for_its_next_call(api, tmp_path
         assert [row["method"] for row in requests] == methods
 
 
+@pytest.mark.timing
 def test_close_during_post_reply_readback_refuses_with_a_typed_error(api, tmp_path, monkeypatch):
     with live_control_runtime(api, tmp_path, monkeypatch) as (_, binding, requests):
         session = binding.open_live_session("fixture-root")
@@ -1548,6 +1554,7 @@ def test_close_during_post_reply_readback_refuses_with_a_typed_error(api, tmp_pa
         assert len(closers) == 1 and not closers[0].is_alive()
 
 
+@pytest.mark.timing
 def test_real_initial_live_wire_creates_owned_invocation_and_both_fence_guard(
         api, tmp_path, monkeypatch):
     with live_control_runtime(api, tmp_path, monkeypatch) as (lifecycle, binding, requests):
@@ -1589,6 +1596,7 @@ def test_real_initial_live_wire_creates_owned_invocation_and_both_fence_guard(
             "describe_live", "enroll_live", "pending_call"]
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("fault,code", [
     ("profile", "HOST_PROFILE_UNQUALIFIED"), ("rpc", "CANONICAL_CORRELATION_MISMATCH")])
 def test_live_runtime_projection_cannot_replace_owned_profile_or_rpc_variant(
@@ -1602,6 +1610,7 @@ def test_live_runtime_projection_cannot_replace_owned_profile_or_rpc_variant(
         assert lifecycle.Lifecycle(binding.canonical_root).load() == before
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("field", ["event_id", "request_id", "request_sha256", "decision", "reason"])
 def test_all_five_dispatch_fields_must_match_actual_owned_frame_before_canonical_access(
         api, tmp_path, monkeypatch, field):
@@ -1632,6 +1641,7 @@ def test_all_five_dispatch_fields_must_match_actual_owned_frame_before_canonical
         assert lifecycle.Lifecycle(binding.canonical_root).load() == before
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("branch", ["changed-command", "exact-original-command"])
 def test_public_prior_guard_history_with_present_producer_stays_unknown(
         api, tmp_path, monkeypatch, branch):

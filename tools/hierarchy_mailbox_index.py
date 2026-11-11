@@ -83,6 +83,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+from typing import NamedTuple
 
 if __package__:
     from . import hierarchy_mailbox as hm
@@ -106,6 +107,18 @@ class _ChangedCheckObservation(Exception):
 class _PinnedCallError(Exception):
     def __init__(self, error):
         self.error = error
+
+
+class _ScanResult(NamedTuple):
+    records: dict
+    entries: dict
+    changes: list
+    observations: dict
+    folders: set
+    context: tuple
+    fresh: set
+    by_path: dict
+    folder_paths: dict
 
 
 _MISSING = object()
@@ -378,13 +391,8 @@ class MailboxIndex:
 
     def _read_message(self, path, *, previous=None):
         try:
-            if previous is None or not _checked_reads_supported():
-                raw = hm.read_bytes(path)
-            else:
-                hm.safe_path(path)
-                with self._open_checked(path, previous["key"], previous["device"]) as stream:
-                    raw = stream.read(hm.MAX_BYTES + 1)
-                hm.require(len(raw) <= hm.MAX_BYTES, "input exceeds 262144 bytes")
+            raw = (hm.read_bytes(path) if previous is None else
+                   self._read_raw(path, previous["key"], previous["device"]))
         except ValueError as exc:
             if str(exc) == "file unavailable: " + str(path) and not os.path.exists(path):
                 raise _ChangedDuringRead() from exc
@@ -394,6 +402,19 @@ class MailboxIndex:
         if previous is not None and previous["sha256"] == sha:
             return previous["message"], sha
         return self._parse_message(path, raw), sha
+
+    def _read_raw(self, path, key=None, device=None):
+        if not _checked_reads_supported():
+            return hm.read_bytes(path)
+        hm.safe_path(path)
+        if key is None:
+            metadata = os.lstat(path)
+            relative = Path(path).relative_to(self.mailbox.root).as_posix()
+            key, device = self._key(relative, metadata), metadata.st_dev
+        with self._open_checked(path, key, device) as stream:
+            raw = stream.read(hm.MAX_BYTES + 1)
+        hm.require(len(raw) <= hm.MAX_BYTES, "input exceeds 262144 bytes")
+        return raw
 
     def _remember_hash(self, path, sha):
         path = os.fspath(path)
@@ -463,15 +484,7 @@ class MailboxIndex:
                     # No original byte witness: even a canonically equal
                     # re-read could contain a newer frontmatter encoding.
                     raise _ChangedDuringRead()
-                if not _checked_reads_supported():
-                    raw = hm.read_bytes(path)
-                else:
-                    hm.safe_path(path)
-                    metadata = os.lstat(path)
-                    relative = Path(path).relative_to(self.mailbox.root).as_posix()
-                    with self._open_checked(path, self._key(relative, metadata), metadata.st_dev) as stream:
-                        raw = stream.read(hm.MAX_BYTES + 1)
-                hm.require(len(raw) <= hm.MAX_BYTES, "input exceeds 262144 bytes")
+                raw = self._read_raw(path)
                 sha = hashlib.sha256(raw).hexdigest()
                 self._remember_hash(path, sha)
                 if hm.encoded(self._parse_message(path, raw)) != hm.encoded(record["message"]):
@@ -526,6 +539,107 @@ class MailboxIndex:
         return tuple(tuple(value) if isinstance(value, list) else value
                      for value in (getattr(os, name)() for name in names))
 
+    def _list_folders(self, context):
+        root = context[0]
+        layout_key = context[:2]
+        if self._folder_layout is None or self._folder_layout[0] != layout_key:
+            relatives = {endpoint.split("/")[0] + "/" + endpoint.split("/")[1]
+                         for endpoint in self.mailbox.manifest["endpoints"]}
+            relatives |= {"across/" + role for role in hm.ACROSS_ROLES}
+            folders = [(os.path.join(root, *relative.split("/")), relative) for relative in relatives]
+            # Match Path ordering by components, not the separator in full strings.
+            folders.sort(key=lambda pair: tuple(os.path.normcase(part) for part in pair[1].split("/")))
+            self._folder_layout = layout_key, folders
+        return self._folder_layout[1]
+
+    def _list_folder(self, folder, observed):
+        folder_paths = self._folder_paths.get(folder)
+        if folder_paths is None:
+            folder_paths = self._paths(folder)
+        stable_folder = observed.stable(folder_paths)
+        if folder not in self._folder_checks or not stable_folder:
+            hm.safe_path(folder)
+            observed.confirm(folder_paths)
+        with os.scandir(folder) as listing:
+            names = sorted((item.name for item in listing), key=os.path.normcase)
+        return folder_paths, names
+
+    def _observe_entry(self, path, name, observed, record_count):
+        metadata = observed.observe(path)
+        if name.startswith(".pending-"):
+            hm.require(metadata is None or not stat.S_ISLNK(metadata.st_mode),
+                       "symlink mailbox entry is not supported")
+            return None
+        if metadata is None:
+            raise _ChangedDuringRead()
+        hm.require(not stat.S_ISLNK(metadata.st_mode), "symlink mailbox entry is not supported")
+        hm.require(name.endswith(".md") and len(name) > 3, "unexpected mailbox entry: " + path)
+        hm.require(record_count < hm.MAX_RECORDS, "mailbox exceeds record limit")
+        hm.require(stat.S_ISREG(metadata.st_mode), "input must be a regular file")
+        return metadata
+
+    def _confirm_entry(self, path, key, metadata, message, sha, dependencies, observed, fresh, validated):
+        if path not in fresh:
+            self._probe(path, key, metadata.st_dev)
+        if not validated:
+            destination = os.fspath(self.mailbox.validate_message(message, stored=True))
+        else:
+            # A new dependency may turn into a link between PIN's validation
+            # and its first observation. Reuse PIN's path check first.
+            destination = None
+            for dependency in dependencies:
+                value = observed.metadata[dependency]
+                if value is not None and stat.S_ISLNK(value.st_mode):
+                    hm.safe_path(dependency)
+        try:
+            observed.confirm(dependencies)
+        except _ChangedCheckObservation as exc:
+            if path in fresh:
+                # Retain this observed SHA; a canonical fallback still
+                # disclaims the bytes PIN actually read.
+                exc.candidate = (path, sha, hm.digest(message), _stat_key(metadata))
+            raise
+        return destination
+
+    def _validate_entry(self, path, relpath, metadata, observed, fresh, *, force, same_limit, reusable_context):
+        key = self._key(relpath, metadata)
+        previous = self._entries.get(relpath)
+        reuse = (not force and same_limit and previous is not None and previous["key"] == key
+                 and previous["path"] == path and previous["device"] == metadata.st_dev)
+        # The accepted POSIX key policy permits reuse before hashing. Other
+        # platforms must hash first; a changed header may drop old dependencies.
+        stable = reuse and _checked_reads_supported() and observed.stable(previous["paths"])
+        if stable:
+            message, sha = previous["message"], previous["sha256"]
+        else:
+            message, sha = self._read_message(path, previous=previous if reuse else None)
+            fresh.add(path)
+            if self._key(relpath, os.lstat(path)) != key:
+                raise _ChangedDuringRead()
+        validated = False
+        if reuse and previous["sha256"] == sha:
+            dependencies = previous["paths"]
+            stable = observed.stable(dependencies)
+        else:
+            destination = os.fspath(self.mailbox.validate_message(message, stored=True))
+            validated = True
+            dependencies = self._paths(path, message)
+            observed.stable(dependencies)
+            stable = False
+        checked = force or not stable or not reusable_context
+        if checked:
+            confirmed = self._confirm_entry(path, key, metadata, message, sha, dependencies,
+                                            observed, fresh, validated)
+            if not validated:
+                destination = confirmed
+        else:
+            destination = previous["destination"]
+        if reuse and previous["sha256"] == sha and not checked:
+            return previous
+        return {"key": key, "message": message, "sha256": sha, "path": path,
+                "device": metadata.st_dev, "paths": dependencies, "relpath": relpath,
+                "destination": destination, "record": {"path": path, "message": message}}
+
     def _scan(self, force):
         records, entries, by_path = {}, {}, {}
         checkpoint = self._evidence.checkpoint()
@@ -542,100 +656,21 @@ class MailboxIndex:
         reusable_context = identity is not None and context == self._context and _checked_reads_supported()
         same_limit = self._context is not None and self._context[2] == hm.MAX_BYTES
         folder_checks, folder_paths_used = set(), {}
-        layout_key = context[:2]
-        if self._folder_layout is None or self._folder_layout[0] != layout_key:
-            relatives = {endpoint.split("/")[0] + "/" + endpoint.split("/")[1]
-                         for endpoint in self.mailbox.manifest["endpoints"]}
-            relatives |= {"across/" + role for role in hm.ACROSS_ROLES}
-            folders = [(os.path.join(root, *relative.split("/")), relative) for relative in relatives]
-            # Match Path ordering by components, not the separator in full strings.
-            folders.sort(key=lambda pair: tuple(os.path.normcase(part) for part in pair[1].split("/")))
-            self._folder_layout = layout_key, folders
-        folders = self._folder_layout[1]
-        for folder, folder_rel in folders:
-            folder_paths = self._folder_paths.get(folder)
-            if folder_paths is None:
-                folder_paths = self._paths(folder)
+        for folder, folder_rel in self._list_folders(context):
+            folder_paths, names = self._list_folder(folder, observed)
             folder_paths_used[folder] = folder_paths
-            stable_folder = observed.stable(folder_paths)
-            if folder not in self._folder_checks or not stable_folder:
-                hm.safe_path(folder)
-                observed.confirm(folder_paths)
             folder_checks.add(folder)
-            with os.scandir(folder) as listing:
-                names = sorted((item.name for item in listing), key=os.path.normcase)
             for name in names:
                 path = os.path.join(folder, name)
-                metadata = observed.observe(path)
-                if name.startswith(".pending-"):
-                    hm.require(metadata is None or not stat.S_ISLNK(metadata.st_mode),
-                               "symlink mailbox entry is not supported")
-                    continue
+                metadata = self._observe_entry(path, name, observed, len(records))
                 if metadata is None:
-                    raise _ChangedDuringRead()
-                hm.require(not stat.S_ISLNK(metadata.st_mode), "symlink mailbox entry is not supported")
-                hm.require(name.endswith(".md") and len(name) > 3, "unexpected mailbox entry: " + path)
-                hm.require(len(records) < hm.MAX_RECORDS, "mailbox exceeds record limit")
-                hm.require(stat.S_ISREG(metadata.st_mode), "input must be a regular file")
+                    continue
                 relpath = folder_rel + "/" + name
-                key = self._key(relpath, metadata)
-                previous = self._entries.get(relpath)
-                reuse = (not force and same_limit and previous is not None and previous["key"] == key
-                         and previous["path"] == path and previous["device"] == metadata.st_dev)
-                # The accepted POSIX key policy permits reuse before hashing.
-                # Other platforms must hash first; a changed header may no
-                # longer need its old dependencies.
-                stable = reuse and _checked_reads_supported() and observed.stable(previous["paths"])
-                if stable:
-                    message, sha = previous["message"], previous["sha256"]
-                else:
-                    message, sha = self._read_message(path, previous=previous if reuse else None)
-                    fresh.add(path)
-                    if self._key(relpath, os.lstat(path)) != key:
-                        raise _ChangedDuringRead()
-                validated = False
-                if reuse and previous["sha256"] == sha:
-                    dependencies = previous["paths"]
-                    stable = observed.stable(dependencies)
-                else:
-                    destination = os.fspath(self.mailbox.validate_message(message, stored=True))
-                    validated = True
-                    dependencies = self._paths(path, message)
-                    observed.stable(dependencies)
-                    stable = False
-                checked = force or not stable or not reusable_context
-                if checked:
-                    if path not in fresh:
-                        self._probe(path, key, metadata.st_dev)
-                    if not validated:
-                        destination = os.fspath(self.mailbox.validate_message(message, stored=True))
-                    else:
-                        # A new dependency may turn into a link between PIN's
-                        # validation and its first observation. Reuse PIN's
-                        # path check before confirming that observation.
-                        for dependency in dependencies:
-                            value = observed.metadata[dependency]
-                            if value is not None and stat.S_ISLNK(value.st_mode):
-                                hm.safe_path(dependency)
-                    try:
-                        observed.confirm(dependencies)
-                    except _ChangedCheckObservation as exc:
-                        if path in fresh:
-                            # Retain this observed SHA; a canonical fallback
-                            # still disclaims the bytes PIN actually read.
-                            exc.candidate = (path, sha, hm.digest(message), _stat_key(metadata))
-                        raise
-                else:
-                    destination = previous["destination"]
-                hm.require(destination == folder, "message is in the wrong routing folder")
-                identifier = message["message_id"]
+                entry = self._validate_entry(path, relpath, metadata, observed, fresh, force=force,
+                                             same_limit=same_limit, reusable_context=reusable_context)
+                hm.require(entry["destination"] == folder, "message is in the wrong routing folder")
+                identifier = entry["message"]["message_id"]
                 hm.require(identifier not in records, "duplicate message_id in history")
-                if reuse and previous["sha256"] == sha and not checked:
-                    entry = previous
-                else:
-                    entry = {"key": key, "message": message, "sha256": sha, "path": path,
-                             "device": metadata.st_dev, "paths": dependencies, "relpath": relpath,
-                             "destination": destination, "record": {"path": path, "message": message}}
                 records[identifier], entries[relpath], by_path[path] = entry["record"], entry, entry
         for record in records.values():
             if "in_reply_to" in record["message"]:
@@ -646,21 +681,20 @@ class MailboxIndex:
         for path, entry in by_path.items():
             if path in fresh or path not in self._evidence.hashes:
                 self._admit_hash(path, entry["sha256"])
-        return (records, entries, self._evidence.changes(checkpoint), observed.snapshot(), folder_checks, context,
-                fresh, by_path, folder_paths_used)
+        return _ScanResult(records, entries, self._evidence.changes(checkpoint), observed.snapshot(), folder_checks,
+                           context, fresh, by_path, folder_paths_used)
 
     def _read_index(self, *, force=False):
         self.last_reconciliation = None
         error = None
         for attempt in range(2):
             try:
-                (records, entries, changes, observations, folders, context,
-                 fresh, by_path, folder_paths) = self._scan(force)
-                self._entries, self._by_path, self._fresh_reads = entries, by_path, fresh
-                self._observations, self._folder_checks, self._context = observations, folders, context
-                self._folder_paths = folder_paths
-                self.content_changed = deepcopy(changes)
-                return records
+                scan = self._scan(force)
+                self._entries, self._by_path, self._fresh_reads = scan.entries, scan.by_path, scan.fresh
+                self._observations, self._folder_checks, self._context = scan.observations, scan.folders, scan.context
+                self._folder_paths = scan.folder_paths
+                self.content_changed = deepcopy(scan.changes)
+                return scan.records
             except (_ChangedDuringRead, _ChangedCheckObservation, FileNotFoundError) as exc:
                 error = exc
                 if attempt == 0:
@@ -668,6 +702,11 @@ class MailboxIndex:
             except Exception as exc:
                 error = exc
             break
+        return self._reconcile(self.mailbox.messages, lambda records: records.values(),
+                               error=error, attempts=attempt + 1, full_history=True,
+                               candidate=getattr(error, "candidate", None))
+
+    def _reconcile(self, pinned, select, *, error, attempts, full_history=False, candidate=None):
         self._keep_changes = True
         # Keyed entries remain candidates only. Next call re-lists, re-stats and
         # re-checks context/dependencies before reuse. Canonical bytes below
@@ -675,13 +714,20 @@ class MailboxIndex:
         self._fresh_reads = None
         self.content_changed = []
         self._evict_contradicted()
-        self.last_reconciliation = {"kind": "pinned_fallback", "attempts": attempt + 1,
+        self.last_reconciliation = {"kind": "pinned_fallback", "attempts": attempts,
                                     "error_type": type(error).__module__ + "." + type(error).__qualname__}
-        records = self.mailbox.messages()
-        live = {record["path"]: record for record in records.values()}
-        self._evidence.prune(live)
-        self._admit_returned(records.values(), getattr(error, "candidate", None))
+        result = pinned()
+        selected = select(result)
+        if full_history:
+            live = {record["path"]: record for record in selected}
+            self._evidence.prune(live)
+        self._admit_returned(selected, candidate)
         self._evict_contradicted()
+        if full_history:
+            self._retain_live_entries(result, live)
+        return result
+
+    def _retain_live_entries(self, records, live):
         # Only a successful full canonical history establishes obsolescence.
         # Delete only absent paths. A changed live record's last SHA may be its
         # sole baseline when bounded history omitted it; invalidate its parsed
@@ -696,7 +742,6 @@ class MailboxIndex:
         dependencies = {path for paths in self._folder_paths.values() for path in paths}
         dependencies.update(path for entry in self._entries.values() for path in entry["paths"])
         self._observations = {path: value for path, value in self._observations.items() if path in dependencies}
-        return records
 
     def _materialize(self, selected):
         if self._fresh_reads is None:
@@ -742,15 +787,7 @@ class MailboxIndex:
                     raise  # Already the canonical exception; preserve its diagnostics.
                 error = exc
             break
-        self._fresh_reads = None
-        self.content_changed = []
-        self._evict_contradicted()
-        self.last_reconciliation = {"kind": "pinned_fallback", "attempts": attempt + 1,
-                                    "error_type": type(error).__module__ + "." + type(error).__qualname__}
-        result = pinned()
-        self._admit_returned(select(result))
-        self._evict_contradicted()
-        return result
+        return self._reconcile(pinned, select, error=error, attempts=attempt + 1)
 
     def _indexed_messages(self):
         def read():

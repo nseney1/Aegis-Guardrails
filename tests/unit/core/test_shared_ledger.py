@@ -342,6 +342,7 @@ WRITERS: Dict[str, Callable[[Path], object]] = {
 
 @needs_git
 @pytest.mark.parametrize("writer", sorted(WRITERS))
+@pytest.mark.timing
 def test_every_ledger_writer_waits_for_the_one_common_lock(repo: Path, worktree: Path, monkeypatch, writer: str):
     monkeypatch.setattr(storage, "LOCK_TIMEOUT_SECONDS", 0.3)
     lock = _site_dir(repo) / "lock"

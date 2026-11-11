@@ -1,10 +1,33 @@
 # Agent teams
 
+This guide covers repository lanes. Use the [team surface chooser](../README.md#agent-teams)
+for management audit or the source-checkout runtime prototype.
+
 A lane is an agent's worktree and branch. A dispatcher or person assigns paths,
-then checks the lane's committed changes before integration. Aegis supplies
-cooperative leases and a post-lane check; it does not start agents or manage their
+then checks the lane's committed changes before integration. The lease and lane-check
+commands supply cooperative leases and a post-lane check; they do not start agents or manage their
 worktrees. A read-only reviewer claims no paths, and its verdict applies to the
 exact tree it reviewed. Review verdicts belong in the pull request, not the ledger.
+
+## Setup and limits of each surface
+
+**Repository lanes** use `aegis team claim` and `aegis check --lane`, included in
+the installed CLI. Leases supply cooperative conflict information; these commands
+do not launch agents or reserve runtime capacity. The sections below cover lane
+setup, checks and lease operations.
+
+**Management audit** uses `aegis workspace` from the reviewed, source-pinned
+prototype CLI, with a separate manager registration and owner-approved policy
+and membership. Audit acknowledgements grant zero fitness credit, no execution
+authority and no native Teams enforcement. Follow the
+[manager workspace guide](manager-workspaces.md) to prepare and activate it.
+
+**Runtime team tools** are a source-checkout prototype; `tools/hierarchy_team.py`
+is outside the installed wheel. Team runs need Linux, Python 3.9+, Git, `bwrap`,
+the selected host CLI and a dedicated host login. They set up runs, start and stop
+supported CLI sessions, and inspect run status. Start with the
+[runtime guide](agent-hierarchies.md) and the
+[team-run prerequisites and configuration](hierarchy-team.md#prerequisites).
 
 ## Claim and finish a lane
 

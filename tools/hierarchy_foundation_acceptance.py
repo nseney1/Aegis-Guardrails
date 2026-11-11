@@ -16,7 +16,8 @@ import tempfile
 
 
 MANIFEST_SHA256 = "90260e8fbd15744cc46231dd7e74e46f257f8c28e670f1c37b1b1bb8823df76c"
-MAILBOX_SHA256 = "e657833bd436344d71a97ff52f8d6853959d50e789453fea8ca8656f420f3495"
+# fd-ownership successor (MAILBOX-FD-1 round 2, owner-approved 2026-11-11T13:13Z); historical corpus pins retained.
+MAILBOX_SHA256 = "472c96ab7959f5fbcfdee2e3d3a11a78864b0eb7a708029a1e419f410825a905"
 # Small-change terminal writer successor; historical request/corpus pins are retained.
 # This fixture replay pin is separate from every active team's runtime source pin.
 LIFECYCLE_SHA256 = "c941520a185de54a2e8e3419689220cd627aab5d80ea97ea36fb09f965d28ebf"

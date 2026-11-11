@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -271,6 +271,18 @@ Check profile completeness and host CLIs on PATH
 Delete expired leases
 
 Delete every expired lease by compare-and-swap; unreadable leases are kept.
+
+### `aegis team hosts`
+
+Read host capacity and per-host usage
+
+Read capacity advice: status \| usage \| check HOST KIND. KIND: writer, review, extra-review, doc, research, a declared role or lens. check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. Real usage readers are adapter extension points; credentials are never read.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `hosts_action` | `[VERB]` |  | status, check or usage |
+| `host` | `[HOST]` |  | Declared host alias (see status --json) |
+| `kind` | `[KIND]` |  | Job kind or declared role/lens |
 
 ### `aegis team list`
 
@@ -644,11 +656,11 @@ No selectors: pass through records up to 4000 canonical chars; otherwise show ou
 | `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
 | `ref` | `REF` |  | 64-hex id or unambiguous 16-64 lowercase hex prefix (required) |
 | `--fields` | `SEL` | `[]` | At most 16 selectors, depth 8: dotted paths, indices, one-level * and row projection findings.*.{id,severity,file,line}; comma separated; repeatable |
-| `--spans` | `N` | `[]` | Zero-based body span indices; at most 64 selections; repeatable |
+| `--spans` | `N` | `[]` | Zero-based body span indices; at most 64 selections; comma separated; repeatable |
 | `--outline` |  |  | Include outline; alone emits only the envelope and outline |
 | `--since` | `CURSOR` |  | Log rows after cursor; 0 starts a new cursor |
-| `--expand` | `NAME` | `[]` | Expand a named ref one level, charged to max-chars; repeatable |
-| `--format` | `FORMAT` | `"json"` | View format: json, md or tsv; MD fences data as untrusted, TSV uses JSON values |
+| `--expand` | `NAME` | `[]` | Expand a named ref one level, charged to max-chars; comma separated; repeatable |
+| `--format` | `FORMAT` | `"json"` | View format: json, md or tsv; --json requires json; MD fences data as untrusted, TSV uses JSON values |
 | `--max-chars` | `N` | `"60000"` | Output character limit; excess refuses with E_LIMIT: narrow the selectors |
 
 ### `aegis msg verify`
