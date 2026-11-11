@@ -24,7 +24,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
-from aegis_core import gitsafe, governance, human_gate, match, testexec
+from aegis_core import approval_shape, gitsafe, governance, human_gate, match, testexec
 from aegis_core.errors import AegisError
 from aegis_core.rules import workspace_root
 from aegis_core.verification.regression_commands import run_configured_snapshot
@@ -41,6 +41,10 @@ SCHEMA = "aegis.regression/v1"
 DEFAULT_TIER = "warning"
 DEFAULT_TIMEOUT_S = 120.0
 _GIT_TIMEOUT_S = 60.0
+# Diagnostic content only: fail closed before loading more than this total per report.
+_REFUSAL_READ_LIMIT = 16 * 1024 * 1024
+_REFUSAL_TARGET = re.compile(
+    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-f]{40}(?:[0-9a-f]{24})?)[ \t]+", re.I | re.M)
 EXEMPT_SCOPES = frozenset({"ci", "build", "docs", "deps", "release", "chore", "tests"})
 _DOC_DIRS = frozenset({"docs", "doc"})
 _DOC_EXTENSIONS = frozenset({".md", ".rst", ".txt", ".adoc", ".html", ".pdf", ".png", ".svg", ".jpg", ".jpeg", ".gif"})
@@ -325,6 +329,136 @@ def _resolve_commit_exemption(meta: _CommitMeta, find: Callable[[str], Optional[
     return (found, None) if found is None or found.valid else (None, found.code)
 
 
+def _diagnostic_object_ids(raw: bytes) -> List[str]:
+    # Bound before decoding or splitting, including a possible final newline.
+    if len(raw) > human_gate.MAX_SCANNED_COMMITS * 65:
+        raise gitsafe.GitError("exemption diagnostic index exceeds its limit")
+    ids = raw.decode("ascii", "replace").splitlines()
+    if (len(ids) > human_gate.MAX_SCANNED_COMMITS or len(set(ids)) != len(ids)
+            or any(_OID_RE.fullmatch(oid) is None for oid in ids)):
+        raise gitsafe.GitError("exemption diagnostic index contains an invalid object id")
+    return ids
+
+
+def _diagnostic_refusal_verdicts(ids: List[str], run: Callable[..., Any]) -> Dict[Tuple[str, str], human_gate.Approval]:
+    """Read each candidate once; memoise bounds refusals per (approval oid, target oid).
+
+    Bounded-message refusals are already handled by normal discovery. This index only
+    recovers the public bounds_refusal codes it skips, and cannot grant approval.
+    """
+    if not ids:
+        return {}
+    sizes = []
+    total = 0
+    for oid in ids:
+        described = run(["cat-file", "-s", oid]).stdout
+        if len(described) > 21:
+            raise gitsafe.GitError("exemption diagnostic object size is invalid")
+        size = described.rstrip(b"\n")
+        if not size or len(size) > 20 or not size.isdigit():
+            raise gitsafe.GitError("exemption diagnostic object size is invalid")
+        count = int(size)
+        total += count
+        if total > _REFUSAL_READ_LIMIT:
+            raise gitsafe.GitError("exemption diagnostic content exceeds its report limit")
+        sizes.append(count)
+    verdicts: Dict[Tuple[str, str], human_gate.Approval] = {}
+    for oid, size in zip(ids, sizes):
+        raw = run(["cat-file", "commit", oid]).stdout
+        if len(raw) != size:
+            raise gitsafe.GitError("exemption diagnostic object size changed")
+        message = raw.partition(b"\n\n")[2].decode("utf-8", "replace")
+        if refusal := approval_shape.bounds_refusal(message):
+            verdict = human_gate.Approval(False, refusal[0], refusal[1], oid)
+            for match in _REFUSAL_TARGET.finditer(message):
+                target = match.group(1).lower()
+                if target != oid:
+                    key = (oid, target)
+                    if key not in verdicts and len(verdicts) >= human_gate.MAX_SCANNED_COMMITS ** 2:
+                        raise gitsafe.GitError("exemption diagnostic verdict index exceeds its limit")
+                    verdicts[key] = verdict
+        del raw, message
+    return verdicts
+
+
+def _refused_exemption_finder(root: str, head: str,
+                             merge_commit: str) -> Callable[[str, Optional[human_gate.Approval]], Optional[human_gate.Approval]]:
+    """One candidate filter and one read per candidate under a shared diagnostic deadline."""
+    deadline = time.monotonic() + _GIT_TIMEOUT_S
+
+    def remaining() -> float:
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise gitsafe.GitError("exemption diagnostic deadline expired")
+        return seconds
+
+    def run(args: List[str], *, stdin: Optional[bytes] = None) -> Any:
+        result = gitsafe.run_checked(args, root, timeout=remaining(), stdin=stdin)
+        remaining()
+        return result
+
+    window = _diagnostic_object_ids(run(
+        ["log", "--no-patch", "--no-show-signature", "--no-notes", "--format=%H",
+         f"--max-count={human_gate.MAX_SCANNED_COMMITS}", f"{merge_commit}..{head}"]).stdout)
+    request = "".join(f"{oid}\n" for oid in window).encode("ascii")
+    ids = _diagnostic_object_ids(run(
+        ["log", "--no-patch", "--no-show-signature", "--no-notes", "--format=%H", "--no-walk=unsorted",
+         "--regexp-ignore-case", "--extended-regexp", "--grep=^[[:blank:]]*Aegis-Exempt-Test:", "--stdin"],
+        stdin=request).stdout) if window else []
+    if not set(ids).issubset(window):
+        raise gitsafe.GitError("exemption diagnostic candidate is outside the window")
+    verdicts = _diagnostic_refusal_verdicts(ids, run)
+
+    @functools.lru_cache(maxsize=human_gate.MAX_SCANNED_COMMITS)
+    def find(fix: str, prior: Optional[human_gate.Approval]) -> Optional[human_gate.Approval]:
+        if _OID_RE.fullmatch(fix) is None:
+            return None
+        for oid in window:
+            if prior is not None and oid == prior.commit:
+                return prior
+            verdict = verdicts.get((oid, fix))
+            if verdict is not None:
+                return verdict
+        return prior
+
+    return find
+
+
+def _report_exemption_finder(root: str, head: str, base: str,
+                            merge_commit: str) -> Callable[[str], Optional[human_gate.Approval]]:
+    """Latch discovery and diagnostic failures independently; preserve per-fix verification."""
+    primary_failed = False
+    diagnostic_failed = False
+
+    @functools.lru_cache(maxsize=1)
+    def primary() -> Callable[[str], Optional[human_gate.Approval]]:
+        return human_gate.exemption_finder(root, head, base)
+
+    @functools.lru_cache(maxsize=1)
+    def diagnostic() -> Callable[[str, Optional[human_gate.Approval]], Optional[human_gate.Approval]]:
+        return _refused_exemption_finder(root, head, merge_commit)
+
+    def find(fix: str) -> Optional[human_gate.Approval]:
+        nonlocal primary_failed, diagnostic_failed
+        if primary_failed:
+            return None
+        try:
+            finder = primary()
+        except (human_gate.HumanGateError, gitsafe.GitError):
+            primary_failed = True
+            return None
+        found = finder(fix)
+        if (found is not None and found.valid) or diagnostic_failed:
+            return found
+        try:
+            return diagnostic()(fix, found)
+        except (human_gate.HumanGateError, gitsafe.GitError):
+            diagnostic_failed = True
+            return found
+
+    return find
+
+
 def _run_pr_level(root: str, workspace: Path, merge_commit: str, head_commit: str, tests: Iterable[str],
                   timeout: float, progress: Callable[[str], None],
                   command: Optional[Sequence[str]] = None) -> Optional[Tuple[Any, Any]]:
@@ -527,7 +661,8 @@ def _evaluate_fix_commit(meta: _CommitMeta, find: Callable[[str], Optional[human
         nt_note += f" (Aegis-No-Test: {meta.no_test_reason!r} is an explanation only; exemption requires human_gate approval)"
     named = f"fix commit {meta.oid[:10]} ({meta.subject})"
     if reason in UNVERIFIED_CODES:
-        return (CommitRegression(meta.oid, meta.subject, "unverifiable", reason, f2p, meta.no_test_reason, languages=tuple(rows)),
+        return (CommitRegression(meta.oid, meta.subject, "unverifiable", reason, f2p, meta.no_test_reason,
+                                 exemption_code=rejected, languages=tuple(rows)),
                 RegressionFinding(reason, meta.oid, (other_tests or test_files or source_files or ("",))[0],
                                   f"{named}: regression tests unverified ({reason}){nt_note}", meta.no_test_reason))
     if approval is not None and approval.valid:
@@ -586,16 +721,11 @@ def check_ci_regressions(
             if selected else None)
     native = (run_native_regressions(root, workspace_path, merge_commit, head_commit, groups, say,
                                     timeout=timeout if timeout != DEFAULT_TIMEOUT_S else None) if groups and command is None else {})
-    @functools.lru_cache(maxsize=1)
-    def exemption_finder() -> Callable[[str], Optional[human_gate.Approval]]:
-        try:
-            return human_gate.exemption_finder(root, head_commit, base_commit)
-        except (human_gate.HumanGateError, gitsafe.GitError):
-            return lambda _oid: None
+    find_exemption = _report_exemption_finder(root, head_commit, base_commit, merge_commit)
 
     wanted = {path[:-3].replace("/", ".") for path in judged}
     indexed = _PythonResults(*runs, wanted) if runs is not None else None
-    results = [_evaluate_fix_commit(meta, lambda oid: exemption_finder()(oid), indexed, native, command is not None)
+    results = [_evaluate_fix_commit(meta, find_exemption, indexed, native, command is not None)
                for meta in fix_metas]
     return RegressionReport(DEFAULT_TIER, tuple(res for res, _finding in results),
                             tuple(f for _res, f in results if f is not None), tuple(untested))
