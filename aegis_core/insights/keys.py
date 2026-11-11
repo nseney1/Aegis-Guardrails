@@ -118,7 +118,12 @@ def read_link_key(home: Optional[Path] = None) -> Optional[bytes]:
         return None
     try:
         fd = os.open(str(layout.aegis_dir / "link.key"), os.O_RDONLY | _O_FLAGS)
-        with os.fdopen(fd, "rb") as fh:
+        try:
+            fh = os.fdopen(fd, "rb")
+        except OSError:
+            os.close(fd)
+            raise
+        with fh:
             data = fh.read(KEY_SIZE + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
     except OSError:
         return None

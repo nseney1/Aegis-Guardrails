@@ -34,6 +34,7 @@ EXPECTED_MCP_TOOLS = (
     "aegis_msg_write",
     "aegis_report_outcome",
     "aegis_scan",
+    "aegis_team_config",
 )
 MAX_MCP_STDOUT = 1024 * 1024
 MAX_MCP_TOOLS = 1024
