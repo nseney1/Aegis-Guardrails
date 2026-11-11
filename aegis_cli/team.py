@@ -9,10 +9,13 @@ Host capacity check exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
 Other exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
 git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
 that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
+``model`` uses the public model-selection core and always emits JSON, exiting 2
+on refusal. Its MCP counterpart shares the core; neither launches a host.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import json
 import sys
 import time
@@ -32,6 +35,242 @@ EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
 ACTIONS = ("claim", "renew", "transfer", "release", "gc", "list", "status", "metrics")
+
+MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds")
+MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
+
+
+def _model_output_safe(value):
+    """Refuse any changed field; successful operational values stay lossless."""
+    from aegis_core.redaction import redact_command_secrets
+
+    if isinstance(value, dict):
+        return all(_model_output_safe(key) and _model_output_safe(item) for key, item in value.items())
+    if isinstance(value, list):
+        return all(_model_output_safe(item) for item in value)
+    if isinstance(value, str):
+        return value == sanitize_display(redact_command_secrets(sanitize_display(value, max_len=None)), max_len=512)
+    return True
+
+
+def model_argument_refusal(arguments):
+    """Validate shape, types and bounds before workspace or path operations."""
+    from aegis_core.model_select import MAX_INPUT_BYTES
+
+    if (type(arguments) is not dict or
+            not set(MODEL_REQUIRED) <= arguments.keys() or
+            any(key not in MODEL_REQUIRED + MODEL_OPTIONAL for key in arguments)):
+        return {"error": "invalid_model_arguments"}
+    args = dict(arguments)
+    for key in MODEL_REQUIRED + MODEL_OPTIONAL:
+        if key in ("host_kinds", "record") or key not in args:
+            continue
+        value = args[key]
+        if (value is None and key in MODEL_OPTIONAL):
+            continue
+        if type(value) is not str or len(value) > MAX_INPUT_BYTES:
+            return {"error": "invalid_model_arguments"}
+    hosts = args["host_kinds"]
+    if (type(hosts) is not list or not 1 <= len(hosts) <= 256 or
+            any(type(host) is not str or len(host) > 128 for host in hosts) or
+            type(args.get("record", False)) is not bool):
+        return {"error": "invalid_model_arguments"}
+    return None
+
+
+def model_result(arguments, root=None):
+    """CLI/MCP adapter over the public selector; no adapter-owned file opens."""
+    from aegis_core import model_select
+    from aegis_core.config import env_workspace
+    from aegis_core.storage import LockTimeoutError
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.workspace import confine_path
+    from aegis_core.workspace.base import Workspace
+    from aegis_core.workspace.binding import resolve_cli_root
+    from aegis_core.workspace.layout import has_rules_dir
+
+    refusal = model_argument_refusal(arguments)
+    if refusal is not None:
+        return refusal
+    args = dict(arguments)
+    hosts = args["host_kinds"]
+    try:
+        if isinstance(root, Workspace):
+            root = root.root
+        if root is not None:
+            if not isinstance(root, (str, Path)):
+                return {"error": "model_workspace_unavailable"}
+            root = str(root)
+            if len(root) > model_select.MAX_INPUT_BYTES or root.count("/") + root.count("\\") > 256:
+                return {"error": "model_workspace_unavailable"}
+        workspace = Workspace(root=resolve_cli_root(explicit=root, pin=env_workspace()))
+        if not has_rules_dir(workspace.root):
+            return {"error": "model_workspace_unavailable"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_workspace_unavailable"}
+    try:
+        # Bound raw path text before pathlib allocation. The core owns no-follow
+        # descriptor walks, file byte caps and strict JSON validation.
+        for key in ("bindings", "policy", "history"):
+            value = args[key]
+            if value.count("/") + value.count("\\") > 256:
+                return {"error": "invalid_model_arguments"}
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                return {"error": "invalid_model_arguments"}
+            confine_path(value, workspace)
+            # Keep the original spelling so the core no-follow walk still rejects
+            # symlinks introduced before or after the confinement check.
+            args[key] = str(workspace.root / path)
+        requested = {key: args[key] for key in MODEL_REQUIRED + MODEL_OPTIONAL
+                     if key in args and key not in ("bindings", "policy", "history", "record")}
+        if not _model_output_safe(requested):
+            return {"error": "model_output_needs_redaction"}
+        options = {key: args[key] for key in ("subject", "intent", "author_family", "lane_family", "review_stage")
+                   if key in args and args[key] is not None}
+        if args.get("record", False):
+            choice, record = model_select.select_and_append(
+                args["history"], args["bindings"], args["policy"], args["task_kind"], args["role_kind"],
+                host_kinds=hosts, **options)
+        else:
+            history = model_select.read_decisions(args["history"])
+            try:
+                choice, record = model_select.select_model(
+                    args["bindings"], args["policy"], args["task_kind"], args["role_kind"], history,
+                    host_kinds=hosts, **options)
+            finally:
+                history.close()
+        result = {"choice": choice, "record": record}
+        return result if _model_output_safe(result) else {"error": "model_output_needs_redaction"}
+    except PathTraversalError:
+        return {"error": "invalid_model_arguments"}
+    except model_select.ModelSelectionError as exc:
+        error = str(exc)
+        return {"error": error if _model_output_safe(error) else "model_output_needs_redaction"}
+    except LockTimeoutError:
+        return {"error": "model_lock_timeout"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_io_unavailable"}
+
+
+class ModelArgumentError(ValueError):
+    """Parser signal without the parser's input-reflecting diagnostic."""
+
+
+class ModelHostKinds(argparse.Action):
+    """Bound repeated registry values before growing their retained list."""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        previous = getattr(namespace, self.dest, None) or []
+        if len(previous) >= 256 or len(value) > 128:
+            raise ModelArgumentError()
+        setattr(namespace, self.dest, previous + [value])
+
+
+class _SilentModelOutput:
+    """Discard incidental text without retaining or parsing untrusted output."""
+
+    def write(self, text):
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+class ModelErrorPolicy:
+    """Own the complete raw model invocation and publish one structured result."""
+
+    def __init__(self, fallback=None, *, argv=()):
+        self.fallback = fallback
+        self.payload = None
+        self.model_ready = False
+        self.model_invocation = False
+        seen_team = False
+        for token in argv:
+            if token == "--":
+                break
+            if token == "model" and seen_team:
+                self.model_invocation = True
+                break
+            if token == "team":
+                seen_team = True
+        self.model_errors = self.model_invocation
+
+    def run(self, operation):
+        if not self.model_invocation:
+            return operation()
+        with redirect_stdout(_SilentModelOutput()), redirect_stderr(_SilentModelOutput()):
+            try:
+                code = operation()
+            except (SystemExit, ModelArgumentError):
+                code = self.output({"error": "invalid_model_arguments"})
+            except (KeyboardInterrupt, Exception):
+                code = self.operation_error()
+        payload = self.payload
+        if (payload is None or
+                (code == EXIT_OK and (not self.model_ready or "error" in payload)) or
+                (code != EXIT_OK and "error" not in payload)):
+            payload, code = {"error": "invalid_model_arguments"}, EXIT_USAGE
+        _emit(payload)
+        return EXIT_OK if code == EXIT_OK else EXIT_USAGE
+
+    def output(self, payload):
+        if self.model_invocation:
+            self.payload = payload
+        else:
+            _emit(payload)
+        return EXIT_USAGE if "error" in payload else EXIT_OK
+
+    def select_parser(self, model_errors):
+        self.model_errors = self.model_invocation or model_errors
+
+    def __call__(self):
+        if self.model_errors or self.fallback is None:
+            raise ModelArgumentError()
+        self.fallback()
+
+    def removed_pointer(self, argv, lookup):
+        if self.model_invocation:
+            return None
+        return self.fallback.removed_pointer(argv, lookup) if self.fallback is not None else None
+
+    def parse(self, parser, argv):
+        from aegis_core.model_select import MAX_INPUT_BYTES
+
+        try:
+            args = self.fallback.parse(parser, argv) if self.fallback is not None else parser.parse_args(argv)
+            if isinstance(args, int):
+                return args
+            is_model = args.command == "team" and getattr(args, "team_action", None) == "model"
+            if self.model_invocation and not is_model:
+                raise ModelArgumentError()
+            if not is_model:
+                return args
+            values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
+            if model_argument_refusal(values) is not None:
+                raise ModelArgumentError()
+            raw = args.workspace
+            if raw is not None and (len(raw) > MAX_INPUT_BYTES or raw.count("/") + raw.count("\\") > 256):
+                raise ModelArgumentError()
+            # main attaches the workspace through the shared upward resolver;
+            # model_result then checks that the resolved root is initialized.
+            self.model_ready = True
+            if self.model_invocation:
+                args._model_error_policy = self
+            return args
+        except ModelArgumentError:
+            return self.output({"error": "invalid_model_arguments"})
+
+    def workspace_error(self, args, error):
+        if not self.model_invocation and (args.command != "team" or getattr(args, "team_action", None) != "model"):
+            return self.fallback.workspace_error(args, error) if self.fallback is not None else None
+        return self.output({"error": "model_workspace_unavailable"})
+
+    def operation_error(self):
+        return self.output({"error": "model_io_unavailable"})
 
 
 def _team_payload(action: str, root: Path, now: int, **scope: Any) -> Dict[str, Any]:
@@ -363,6 +602,15 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action == "model":
+        values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
+        root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
+        result = model_result(values, root)
+        policy = getattr(args, "_model_error_policy", None)
+        if policy is not None:
+            return policy.output(result)
+        _emit(result)
+        return EXIT_USAGE if "error" in result else EXIT_OK
     if action in ("config", "doctor", "hosts"):
         root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
         return _profile_command(args, root, int(time.time()))
@@ -382,6 +630,30 @@ def run_team(args: argparse.Namespace) -> int:
         return _failed(args, root, now, str(exc), EXIT_REFUSED)
 
 
+def _configure_model_parser(sub, common):
+    model = sub.add_parser("model", parents=[common], help="Select a model; optionally record the decision",
+                           description="Preview model selection as JSON; --record atomically selects and appends. "
+                           "Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. "
+                           "No model is launched; unprobed admission remains explicit.")
+    model._model_errors = True
+    for flag, help_text in (
+        ("bindings", "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)"),
+        ("policy", "Team selection policy JSON file inside the workspace (bounded, regular, no symlinks)"),
+        ("history", "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history"),
+        ("task-kind", "Task kind T1 through T14, validated by the core"),
+        ("role-kind", "Seat kind: orchestrator, decider, implementer, integrator or reviewer"),
+        ("subject", "Single-line lane/endpoint/generation identifier for this decision"),
+    ):
+        model.add_argument("--" + flag, required=True, help=help_text)
+    model.add_argument("--host-kind", dest="host_kinds", action=ModelHostKinds, required=True,
+                       help="Host registry kind; repeat for each host (at most 256)")
+    model.add_argument("--intent", help="Semantic intent: light, standard, deep, extended or max; default from policy/role band")
+    model.add_argument("--author-family", help="Author family required for reviews; T7 binds it to its chosen family")
+    model.add_argument("--lane-family", help="Lane family required for T3; writer lanes must match team_family")
+    model.add_argument("--review-stage", default="primary", help="Review stage: primary, correctness, security, whole or second as allowed by the task")
+    model.add_argument("--record", action="store_true", help="Atomically select and append under the history lock (60-second timeout); default preview")
+
+
 class TeamCommand(AegisCommand):
     """Lane leases: cooperative conflict input for parallel agents."""
 
@@ -396,6 +668,9 @@ class TeamCommand(AegisCommand):
     )
 
     def configure_parser(self, parser: argparse.ArgumentParser) -> None:
+        # Before a team action is recognized, malformed prefixes may target model.
+        # Each recognized non-model child restores its normal error policy.
+        parser._model_errors = True
         common = argparse.ArgumentParser(add_help=False)
         common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                             help="Emit machine-readable JSON output")
@@ -403,6 +678,7 @@ class TeamCommand(AegisCommand):
                             help="Strip ANSI styling and emoji")
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
+        _configure_model_parser(sub, common)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
