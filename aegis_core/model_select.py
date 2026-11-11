@@ -1,107 +1,4 @@
-"""Host-neutral policy selection with bounded, atomically published JSONL history.
-
-select_model returns (choice, record); subject identifies a lane/endpoint/generation.
-host_kinds is required registry data supplied by the caller, never inferred here.
-Policy requires team_id, team_family, manager_family, family_hosts (ordered host
-lists), family_order (two families), target_shares, flexible_tasks and review_families
-(task -> stage -> family, including primary). Optional task_intents maps task ->
-family -> intent. Hosts, models, shares, review families and effort overrides are
-data. Encode T4 correctness, T5 security, T6 lenses and T8 stage declarations in
-policy. T8 primary uses the marker "opposite" and optional second uses "author".
-The core infers no vendor from a name.
-
-T2 writers and T13 helpers stay on team_family; T3 requires lane_family matching
-team_family. Writer roles refuse a supplied lane_family outside team_family. T1 uses
-manager_family. Only explicitly flexible helper tasks split. The chooser ports
-family_split.py for nonzero shares: empty history picks family_order[0]; thereafter
-pick it while its share is strictly below target, otherwise family_order[1]. A
-zero-share flexible family is never chosen: this is an intentional divergence from
-the build tool's 0.0/1.0 quirks; the interior targets retain exact parity.
-Share arithmetic is exact Fraction.
-All reviews require a known author. T4/T5 primaries and T6 stages each cover both
-families; a security lens may share the author's family.
-T8 primary derives the opposite family and second derives the author's family,
-so paired checks always cover both families. Review stage names are closed.
-T7 records set author_family to the chosen family and refuse a contradictory
-author, providing the binding for a subsequent T8 check. No Router seat, launch
-or effort update is added.
-
-MR-1c exception: unprobed bindings remain usable until probes exist. Every choice
-and record carries admission (unprobed or admitted); rejected refuses. Validation
-matches MR-1's band/coverage/model-token rules with the caller's required registry.
-Standalone validate_bindings may infer hosts when inspecting a document only.
-Deferred to MR-1c/MR-3b: T6 whole-change on a non-coding model, and "Opus gating"
-for Claude-authored docs. These require further binding/admission policy data.
-
-File inputs must be regular, not symlinks, and are read with no-follow opens and
-a fixed byte cap before JSON decoding. Config opens walk from a held filesystem
-root descriptor with no-follow opens for every directory component and compare
-the final entry and descriptor with the expected inode. Parsed and file inputs
-share structural budgets before validation. OS path rejections use invalid_bindings,
-invalid_policy or unsafe_decision_path; semantic refusals, lock timeouts and
-descriptor write/fsync errors retain their own codes. Decision reads stream bounded lines with
-cumulative byte/record caps; read_decisions yields records without retaining them.
-Consume or close that iterator promptly: it holds the .lock during iteration.
-At the cap, archive/rotate the log and carry forward calibrated policy explicitly.
-Decision directories must exist, belong to the current uid, and forbid group/other
-writes. Logs must be owner-owned regular files without group/other write bits,
-verified on the opened descriptor. Log names ending in .lock refuse invalid_log_path.
-Missing-log reads in an existing valid directory create neither directories nor
-locks. Missing directories and any .. path component refuse unsafe_decision_path.
-Path text is capped at MAX_INPUT_BYTES characters and 256 separators before pathlib parsing, and
-invalid decision path types refuse unsafe_decision_path without raw TypeError.
-Platforms lacking
-POSIX directory descriptors refuse anchored_io_unavailable, with no path fallback.
-Directory acquisition resolves the parent once, then walks from the filesystem
-root with no-follow directory opens relative to held descriptors. The acquired
-leaf must match the expected and anchored-entry identities, owner and mode.
-An append streams validated old bytes and the new line into an exclusive no-follow
-sibling at a held directory descriptor, fchmods/fsyncs its descriptor, checks its
-identity, then renames within that descriptor and fsyncs the directory. A partial
-write/error before publication leaves the original untouched. Cleanup failures
-are chained under an original failure without masking its type or code. No corrupt history
-is repaired or reset. Use select_and_append for launches: its one anchored lock
-covers read, select and atomic publication. Low-level append_decision refuses a
-new stale_decision when counts_before disagrees with matching-split counts or
-previous_decision_id disagrees with the same-team chain head.
-Existing decision IDs may receive outcome observations; those keep decision_id.
-Counts use split_id, the hash of target_shares and family_order; unrelated policy
-edits preserve counts and policy_id remains audit provenance. Restoring an earlier
-split resumes only that split's counts. Every split_id requires its exact snapshot.
-An explicit outcome.launch_status="not_launched" excludes a HOLD or failed start;
-only an explicit "launched" can reverse that state. An initial decision without
-status counts as launched, while status-free observations preserve its state.
-Other outcome data is opaque.
-Each new launch hashes previous_decision_id (the previous new decision for its
-team, across policies); observations do not advance the chain. Replay refuses a
-broken chain with invalid_history:decision_chain: restore_complete_decision_log.
-Replay checks each new row's chronological counts_before per team/split and the
-split result (including zero-share exclusion); historical observations update
-counts without rechecking their original snapshot against later counts.
-Every reader enforces a fixed family set per team across all policies, including
-when selection is for another team. Recorded T4/T5 primaries under one policy
-identity must remain consistent and cover both families when both appear.
-Selection re-derives same-team history reasons, split eligibility and stage/fixed
-families from the supplied policy's rules. Earlier calibrated splits retain
-their own validated targets/order; a row claiming the supplied policy_id must
-match its current targets/order too. Policy rule changes that contradict earlier
-choices require a new history rather than silently reinterpreting those choices.
-Records include policy_id (SHA256 of bounded canonical policy JSON).
-Before hashing/encoding, records have 64-level, 1024-node, 256-item collection,
-425-bit integer and aggregate byte budgets; encoding stops at the line limit.
-Config input node budgets scale with MAX_INPUT_BYTES; the byte cap also bounds
-nodes because each JSON node consumes at least one byte. Record budgets stay fixed.
-History rows have one canonical form: sorted-key compact ASCII JSON plus one LF.
-Append, disk validation and replay measure those exact bytes including the LF;
-noncanonical disk rows refuse invalid_history, with no silent normalization.
-Internal reader rows are validated once per pass and reused by selection without
-re-encoding or hashing. select_and_append retains only validated immutable raw
-lines (at most MAX_HISTORY_BYTES, MAX_HISTORY_RECORDS) for publication under its
-same anchored lock, avoiding a second validation pass. Its explicit lock timeout
-is 60 seconds for the 4096-row cap and a queued peer. Low-level append validates
-its own streaming rewrite. Both remain O(n) under fixed caps. Identity is not authentication. These APIs
-grant neither admission authority nor native execution qualification.
-"""
+"""Host-neutral model selection; contract: docs/model-selection.md."""
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -117,7 +14,7 @@ import secrets
 import stat
 import sys
 
-from aegis_core.storage import LockTimeoutError, file_lock
+from aegis_core.storage import LockTimeoutError, file_generation, file_lock
 
 __all__ = ["MAX_LINE_BYTES", "MAX_INPUT_BYTES", "MAX_HISTORY_BYTES", "MAX_HISTORY_RECORDS",
            "ModelSelectionError", "validate_bindings", "select_model", "select_and_append",
@@ -196,7 +93,7 @@ def _constant(value):
 
 def _loads(raw, error):
     try:
-        return json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant)
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise ModelSelectionError(error) from exc
 
@@ -381,7 +278,7 @@ def _json_value(value, error, depth=0, budget=None, limit=MAX_LINE_BYTES):
         _require(math.isfinite(value), error)
         budget[1] += len(repr(value))
     elif type(value) in (list, dict):
-        _require(len(value) <= 256, too_large)
+        _require(len(value) <= (256 if limit <= MAX_LINE_BYTES else limit), too_large)
         budget[1] += 2 + max(0, len(value) - 1) + (len(value) if type(value) is dict else 0)
         if type(value) is dict:
             for key, item in value.items():
@@ -570,19 +467,19 @@ def _family(data, task, counts, author, lane, stage):
 
 
 def _policy_record(record, data, policy_id, split_id):
-    """Derive same-team history claims from supplied rules, not claimed eligibility."""
-    if record["policy_id"] == policy_id:
-        _require(record["split_id"] == split_id and record["target_shares"] == data["target_shares"] and
-                 record["family_order"] == data["family_order"], "invalid_history")
-    # Earlier calibrations have independent, already-validated split snapshots.
-    rules = dict(data, target_shares=record["target_shares"], family_order=record["family_order"])
+    """Re-derive current-policy claims; older policies retain structural replay checks."""
+    if record["policy_id"] != policy_id:
+        return
+    _require(record["split_id"] == split_id and record["target_shares"] == data["target_shares"] and
+             record["family_order"] == data["family_order"], "invalid_history")
+    error = "invalid_history:policy_rules_changed: start a new team history"
     try:
-        family, reason = _family(rules, record["task_kind"], record["counts_before"],
+        family, reason = _family(data, record["task_kind"], record["counts_before"],
                                  record["author_family"], data["team_family"], record["review_stage"])
     except ModelSelectionError as exc:
-        raise ModelSelectionError("invalid_history") from exc
+        raise ModelSelectionError(error) from exc
     _require(record["choice"]["reason"] == reason and record["split_eligible"] == (reason == "family_split") and
-             record["choice"]["family"] == family, "invalid_history")
+             record["choice"]["family"] == family, error)
 
 
 def select_model(bindings, policy, task_kind, role_kind, prior_decisions, *, host_kinds, subject=None, intent=None,
@@ -737,7 +634,8 @@ class _HistoryReader:
     """An owned disk iterator, never a trust marker attached to caller dictionaries."""
     def __init__(self, path, directory=None, *, capture=False):
         self._snapshot = [] if capture else None
-        rows = _read_rows(path, directory)
+        self._generation = None
+        rows = _read_rows(path, directory, snapshot=self if capture else None)
         self._rows = self._capture(rows) if capture else rows
 
     def _capture(self, rows):
@@ -770,28 +668,41 @@ def read_decisions(path):
     return _HistoryReader(path)
 
 
-def _read_rows(path, directory=None):
+def _read_rows(path, directory=None, *, snapshot=None):
     if directory is not None:
         try:
             stream = _open_log(path.name, directory)
         except FileNotFoundError:
             return
         with stream:
+            if snapshot is not None:
+                snapshot._generation = _log_generation(stream.fileno())
             yield from _history_rows(stream)
         return
+    with _locked_log(path, read=True) as (target, directory):
+        if directory is not None:
+            with _path_call(_open_log, target.name, directory) as stream:
+                yield from _history_rows(stream)
+
+
+@contextmanager
+def _locked_log(path, *, read=False):
+    """Own one anchored directory and the shared timeout for every log operation."""
     with _decision_path(path) as target:
         directory = _path_call(_decision_directory, target)
         try:
             # Check before creating the lock: a missing-log read has no side effects.
-            try:
-                probe = _open_log(target.name, directory)
-            except FileNotFoundError:
-                return
-            probe.close()
+            if read:
+                try:
+                    probe = _open_log(target.name, directory)
+                except FileNotFoundError:
+                    yield target, None
+                    return
+                probe.close()
             with ExitStack() as stack:
-                _path_call(stack.enter_context, file_lock(target.with_name(target.name + ".lock"), dir_fd=directory))
-                with _path_call(_open_log, target.name, directory) as stream:
-                    yield from _history_rows(stream)
+                _path_call(stack.enter_context, file_lock(target.with_name(target.name + ".lock"),
+                                                        timeout=_LOCK_TIMEOUT_SECONDS, dir_fd=directory))
+                yield target, directory
         finally:
             os.close(directory)
 
@@ -866,7 +777,23 @@ def _write_all(descriptor, payload):
         view = view[written:]
 
 
-def _publish(path, payload, directory, snapshot=None):
+def _log_generation(descriptor):
+    info = os.fstat(descriptor)
+    return (info.st_dev, info.st_ino, *file_generation(info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+
+
+def _check_log_generation(name, directory, expected):
+    try:
+        stream = _open_log(name, directory)
+    except FileNotFoundError:
+        actual = None
+    else:
+        with stream:
+            actual = _log_generation(stream.fileno())
+    _require(actual == expected, "stale_decision")
+
+
+def _publish(path, payload, directory, snapshot=None, generation=None):
     source, replay = None, None
     size, count = 0, 0
     if snapshot is None:
@@ -882,6 +809,8 @@ def _publish(path, payload, directory, snapshot=None):
         _require(size + len(payload) <= MAX_HISTORY_BYTES and count + 1 <= MAX_HISTORY_RECORDS, _HISTORY_LIMIT)
     descriptor, temporary = None, None
     try:
+        if source is not None:
+            generation = _log_generation(source.fileno())
         candidate = ".model-select-" + secrets.token_hex(16)
         descriptor = _path_call(os.open, candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW |
                                 getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=directory)
@@ -908,6 +837,7 @@ def _publish(path, payload, directory, snapshot=None):
         if source is not None:
             source.close()
         _same_file(temporary, descriptor, directory)
+        _check_log_generation(path.name, directory, generation)
         _path_call(os.rename, temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
         temporary = None
         os.fsync(directory)
@@ -942,14 +872,8 @@ def append_decision(path, record):
     previous_decision_id refuse stale_decision; use select_and_append for launches.
     """
     payload = _line(record)
-    with _decision_path(path) as target:
-        directory = _path_call(_decision_directory, target)
-        try:
-            with ExitStack() as stack:
-                _path_call(stack.enter_context, file_lock(target.with_name(target.name + ".lock"), dir_fd=directory))
-                _publish(target, payload, directory)
-        finally:
-            os.close(directory)
+    with _locked_log(path) as (target, directory):
+        _publish(target, payload, directory)
 
 
 def select_and_append(path, bindings, policy, task_kind, role_kind, *, host_kinds, subject=None, intent=None,
@@ -962,21 +886,14 @@ def select_and_append(path, bindings, policy, task_kind, role_kind, *, host_kind
     Low-level append_decision refuses stale new decisions. Existing decision IDs
     may receive further outcome observations without counting another launch.
     """
-    with _decision_path(path) as target:
-        directory = _path_call(_decision_directory, target)
+    with _locked_log(path) as (target, directory):
+        history = _HistoryReader(target, directory, capture=True)
         try:
-            with ExitStack() as stack:
-                _path_call(stack.enter_context, file_lock(target.with_name(target.name + ".lock"),
-                                                        timeout=_LOCK_TIMEOUT_SECONDS, dir_fd=directory))
-                history = _HistoryReader(target, directory, capture=True)
-                try:
-                    choice, record = select_model(bindings, policy, task_kind, role_kind, history,
-                                                  host_kinds=host_kinds, subject=subject, intent=intent,
-                                                  author_family=author_family, lane_family=lane_family,
-                                                  review_stage=review_stage)
-                finally:
-                    history.close()
-                _publish(target, _line(record), directory, history._snapshot)
-                return choice, record
+            choice, record = select_model(bindings, policy, task_kind, role_kind, history,
+                                          host_kinds=host_kinds, subject=subject, intent=intent,
+                                          author_family=author_family, lane_family=lane_family,
+                                          review_stage=review_stage)
         finally:
-            os.close(directory)
+            history.close()
+        _publish(target, _line(record), directory, history._snapshot, history._generation)
+        return choice, record

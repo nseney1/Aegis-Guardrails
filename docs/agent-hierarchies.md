@@ -1,5 +1,9 @@
 # Host-neutral hierarchy pilot prototype
 
+This guide covers the source-checkout runtime prototype. Use the
+[team surface chooser](../README.md#agent-teams) for repository lane leases or management audit.
+For a team run, start with the [prerequisites and configuration](hierarchy-team.md#prerequisites).
+
 This source-checkout prototype supplies eight role contracts, plain-file mailboxes,
 stable endpoint bindings, checkpoint handoffs and a workspace controller. The stdlib-only
 helper is `tools/hierarchy_mailbox.py`; it is outside Aegis core and is not installed
