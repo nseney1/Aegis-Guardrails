@@ -22,6 +22,8 @@ import stat
 import subprocess
 import sys
 import time
+import types
+import venv
 
 import pytest
 
@@ -472,6 +474,8 @@ def test_the_shipped_template_is_refused_until_its_placeholders_are_filled(run, 
     (lambda c: c["lanes"].append({"id": "f3", "kind": "integrator"}), "lanes[2]: kind must be implementer or reviewer"),
     (lambda c: c["preflight"]["recipes"].append("full-suite"),
      "preflight recipe full-suite is not in recipes.keep"),
+    (lambda c: c["recipes"].update(python=None), "invalid recipes.python"),
+    (lambda c: c["recipes"].update(python=""), "invalid recipes.python"),
     (lambda c: c["team"]["reasoning_by_kind"].update(router="low"),
      "team.reasoning_by_kind: router is not a team role kind (decider, implementer, integrator, orchestrator, reviewer)"),
 ])
@@ -552,6 +556,505 @@ def test_cargo_nextest_is_needed_only_when_a_kept_recipe_runs_it(run, capsys):
 
 
 # -- init ---------------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("interpreter", ["template", "omitted", "explicit"])
+def test_init_provisions_with_the_bound_or_explicit_interpreter(run, interpreter):
+    expected = sys.executable
+    if interpreter == "template":
+        template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        assert "python" not in template["recipes"]
+        recipes = template["recipes"]
+        recipes.update(keep=run.config["recipes"]["keep"], template=str(run.template))
+        # Fill the run-specific fields while retaining the shipped interpreter choice.
+        template.update(run.config)
+        template.update(recipes=recipes, live_checkouts=[])
+        run.config = template
+    elif interpreter == "omitted":
+        del run.config["recipes"]["python"]
+    else:
+        explicit = run.tmp / "explicit-python"
+        explicit.symlink_to(sys.executable)
+        expected = str(explicit)
+        run.config["recipes"]["python"] = expected
+    run.save()
+
+    assert run.team("init")["init"] == "complete"
+    for path in (run.run / "recipes.json", run.base_dir / "provision.json",
+                 run.run / "preflight" / "initiatives" / "pilotpre" / "provision.json"):
+        assert json.loads(path.read_text(encoding="utf-8"))["python"] == expected
+
+
+@pytest.mark.parametrize("choice", ["default", "explicit", "missing-pin"])
+def test_default_interpreter_custody_survives_interrupted_init(run, capsys, choice):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    first, second = run.tmp / "first-python", run.tmp / "second-python"
+    for path in (first, second):
+        path.symlink_to(sys.executable)
+    if choice == "explicit":
+        run.config["recipes"]["python"] = str(first)
+    else:
+        del run.config["recipes"]["python"]
+    run.config["limits"]["writer_limit"] = 0
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(first)))
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 2 and answer["step"] == "workspace", answer
+    assert answer["error"] == "workspace init: invalid writer_limit"
+    state_path = run.run / "team-state.json"
+    if choice == "missing-pin":
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["init"].pop("python", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = state_path.read_bytes(), (run.run / "recipes.json").read_bytes()
+    run.config["limits"]["writer_limit"] = 3
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(second)))
+    if choice != "explicit":
+        error = ("the default interpreter pin is missing; set recipes.python to the python recorded in recipes.json, "
+                 "then run init --continue; alternatively, restore team-state.json from a trusted backup") if choice == "missing-pin" else (
+            "the interpreter changed since init: recorded %s; current %s; re-run with the recorded interpreter or "
+            "set recipes.python to %s" % (first, second, first))
+        for words in (("init", "--continue"), ("status",), ("down",), ("root", "--session", "unused")):
+            assert in_process(run, *words, capsys=capsys) == (2, {"error": error})
+            assert (state_path.read_bytes(), (run.run / "recipes.json").read_bytes()) == before
+            if words[0] != "status":
+                logged = json.loads((run.run / "team-commands.jsonl").read_text().splitlines()[-1])
+                assert (logged["command"], logged["exit"]) == (words[0], 2)
+        if choice == "missing-pin":
+            run.config["recipes"]["python"] = str(first)
+            run.save()
+        else:
+            run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(first)))
+    code, answer = in_process(run, "init", "--continue", capsys=capsys)
+    assert code == 0 and answer["init"] == "complete", answer
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if choice == "default":
+        assert state["init"]["python"] == str(first)
+    else:
+        assert "python" not in state["init"]
+    for path in (run.run / "recipes.json", run.base_dir / "provision.json",
+                 run.run / "preflight" / "initiatives" / "pilotpre" / "provision.json"):
+        assert json.loads(path.read_text(encoding="utf-8"))["python"] == str(first)
+
+
+def test_completed_init_allows_status_and_down_under_a_different_interpreter(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    first, second = run.tmp / "first-python", run.tmp / "second-python"
+    for path in (first, second):
+        path.symlink_to(sys.executable)
+    del run.config["recipes"]["python"]
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(first)))
+    assert in_process(run, "init", capsys=capsys)[0] == 0
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(second)))
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    code, answer = in_process(run, "down", capsys=capsys)
+    assert code == 0, answer
+    assert answer["slots"] and all(row["state"] == "released" for row in answer["slots"])
+    assert answer["leases"] and all(row["state"] == "released" for row in answer["leases"])
+    assert answer["worktrees"] and all(row["state"] == "removed" for row in answer["worktrees"])
+
+
+@pytest.mark.parametrize("initialized", [False, True], ids=["before-init", "after-init"])
+def test_status_and_down_allow_a_relative_default_interpreter_without_consuming_it(run, capsys, initialized):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    if initialized:
+        assert in_process(run, "init", capsys=capsys)[0] == 0
+    invoking = run.tmp / "invoking"
+    (invoking / "bin").mkdir(parents=True)
+    (invoking / "bin" / "rb2b-python").symlink_to(sys.executable)
+    relative = "bin/rb2b-python"
+    assert not Path(relative).is_absolute()
+    assert invoking != ROOT and not (ROOT / relative).exists()
+    run.monkeypatch.chdir(invoking)
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=relative))
+    code, answer = in_process(run, "status", capsys=capsys)
+    assert code == 0, answer
+    code, answer = in_process(run, "down", capsys=capsys)
+    assert code == 0, answer
+    if initialized:
+        assert answer["slots"] and all(row["state"] == "released" for row in answer["slots"])
+        assert answer["leases"] and all(row["state"] == "released" for row in answer["leases"])
+        assert answer["worktrees"] and all(row["state"] == "removed" for row in answer["worktrees"])
+        state = json.loads((run.run / "team-state.json").read_text(encoding="utf-8"))
+        assert state["init"]["python"] == sys.executable
+    else:
+        assert not run.run.exists()
+
+
+def test_up_uses_the_invoking_orchestration_interpreter_when_the_loop_changes_cwd(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    for key, value in run.env().items():
+        run.monkeypatch.setenv(key, value)
+    del run.config["recipes"]["python"]
+    run.save()
+    assert in_process(run, "init", capsys=capsys)[0] == 0
+    assert in_process(run, "root", "--session", "root-session", capsys=capsys)[0] == 0
+    invoking = run.tmp / "invoking"
+    (invoking / "bin").mkdir(parents=True)
+    interpreter = invoking / "bin" / "rb2b-python"
+    interpreter.symlink_to(sys.executable)
+    relative = "bin/rb2b-python"
+    assert invoking != ROOT and invoking != run.run and not (run.run / relative).exists()
+    run.monkeypatch.chdir(invoking)
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=relative))
+    code, answer = in_process(run, "up", capsys=capsys)
+    assert code == 0, answer
+    assert answer["loop"]["state"] == "started"
+    assert [row["endpoint"] for row in answer["roles"]] == ROLE_ORDER
+    pid = answer["loop"]["pid"]
+    assert Path("/proc/%d/cmdline" % pid).read_bytes().split(b"\0")[0].decode() == str(interpreter)
+    code, answer = in_process(run, "down", capsys=capsys)
+    assert code == 0 and answer["loop"]["state"] == "stopped", answer
+    state = json.loads((run.run / "team-state.json").read_text(encoding="utf-8"))
+    assert state["init"]["python"] == sys.executable
+
+
+def test_orchestration_interpreter_is_captured_before_the_parent_directory_changes(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    invoking, later = run.tmp / "invoking", run.tmp / "later"
+    (invoking / "bin").mkdir(parents=True)
+    later.mkdir()
+    interpreter = invoking / "bin" / "rb2b-python"
+    interpreter.symlink_to(sys.executable)
+    run.monkeypatch.chdir(invoking)
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable="bin/rb2b-python"))
+    selected = hierarchy_team.Run(str(run.config_path))
+    run.monkeypatch.chdir(later)
+    code, answer, process = hierarchy_team.aegis(selected, "team", "list", "--workspace", str(run.project), "--json")
+    assert code == 0, answer
+    assert process.args[0] == str(interpreter)
+    assert selected.python == sys.executable
+
+
+def test_orchestration_interpreter_startup_cwd_failure_is_a_fixed_refusal(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    os_api = types.SimpleNamespace(**vars(os))
+
+    def unavailable():
+        raise OSError("fixture cwd error: do not echo")
+
+    os_api.getcwd = unavailable
+    run.monkeypatch.setattr(hierarchy_team, "os", os_api)
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable="bin/rb2b-python"))
+    assert in_process(run, "status", capsys=capsys) == (2, {
+        "error": "cannot resolve the orchestration interpreter from the invoking directory; run hierarchy_team "
+                 "through a valid absolute interpreter path"})
+    assert not run.run.exists()
+
+
+@pytest.mark.parametrize("executable", [None, "", "\x00", "x" * 4097], ids=["none", "empty", "nul", "oversize"])
+def test_orchestration_interpreter_refuses_bad_text_when_consumed(run, capsys, executable):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=executable))
+    selected = hierarchy_team.Run(str(run.config_path))
+    with pytest.raises(hierarchy_team.Stop) as refused:
+        hierarchy_team.aegis(selected, "team", "list", "--workspace", str(run.project), "--json")
+    assert refused.value.code == 2
+    assert str(refused.value) == (
+        "invalid orchestration interpreter; run hierarchy_team through a valid absolute interpreter path")
+
+
+@pytest.mark.parametrize("consumer", ["recipes", "provision", "preflight", "pin"])
+def test_every_interpreter_consumer_refuses_a_relative_default_before_writing(run, capsys, consumer):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable="../venv/bin/python"))
+    selected = hierarchy_team.Run(str(run.config_path))
+    # Exercise the public consumer functions with a real Run and no process/filesystem fakes.
+    with pytest.raises(hierarchy_team.Stop) as refused:
+        if consumer == "recipes":
+            hierarchy_team.recipe_file(selected)
+        elif consumer == "provision":
+            hierarchy_team.step_provision(selected, {"init": {"done": {}}})
+        elif consumer == "preflight":
+            hierarchy_team.step_preflight(selected, {"init": {"done": {}}})
+        else:
+            hierarchy_team.init(selected, types.SimpleNamespace(resume=False))
+    assert refused.value.code == 2
+    assert str(refused.value) == (
+        "invalid the interpreter running hierarchy_team (sys.executable); run hierarchy_team through an "
+        "absolute interpreter path without . or .. components, or set recipes.python explicitly")
+    assert not run.run.exists()
+
+
+def test_init_continuation_pin_check_refuses_and_audits_an_invalid_default_spelling(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    run.run.mkdir()
+    state_path = run.run / "team-state.json"
+    state_path.write_text(json.dumps({"init": {"python": sys.executable}}), encoding="utf-8")
+    before = state_path.read_bytes()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable="../venv/bin/python"))
+    assert in_process(run, "init", "--continue", capsys=capsys) == (2, {
+        "error": "invalid the interpreter running hierarchy_team (sys.executable); run hierarchy_team through an "
+                 "absolute interpreter path without . or .. components, or set recipes.python explicitly"})
+    assert state_path.read_bytes() == before
+    logged = json.loads((run.run / "team-commands.jsonl").read_text().splitlines()[-1])
+    assert (logged["command"], logged["exit"]) == ("init", 2)
+
+
+def test_default_interpreter_keeps_a_symlinked_bin_directory_and_its_virtual_environment(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    env_a, env_b = run.tmp / "envA", run.tmp / "envB"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(env_b)
+    env_a.mkdir()
+    config = (env_b / "pyvenv.cfg").read_text(encoding="utf-8")
+    (env_b / "pyvenv.cfg").write_text(config + "\nprompt = envB\n", encoding="utf-8")
+    (env_a / "pyvenv.cfg").write_text(config + "\nprompt = envA\n", encoding="utf-8")
+    (env_a / "bin").symlink_to(env_b / "bin", target_is_directory=True)
+    interpreters = [str(env / "bin" / "python") for env in (env_a, env_b)]
+    assert os.path.samefile(*interpreters)
+    observed = []
+    for env, interpreter in zip((env_a, env_b), interpreters):
+        probe = subprocess.run([interpreter, "-I", "-B", "-c",
+                                "import json, sys, sysconfig; print(json.dumps({'prefix': sys.prefix, "
+                                "'purelib': sysconfig.get_path('purelib')}))"],
+                               capture_output=True, text=True, timeout=15, check=True)
+        selection = json.loads(probe.stdout)
+        assert selection["prefix"] == str(env)
+        packages = Path(selection["purelib"])
+        packages.relative_to(env)
+        packages.mkdir(parents=True, exist_ok=True)
+        (packages / "rb2b_environment_marker.py").write_text("value = %r\n" % env.name, encoding="utf-8")
+        probe = subprocess.run([interpreter, "-I", "-B", "-c",
+                                "import rb2b_environment_marker; print(rb2b_environment_marker.value)"],
+                               capture_output=True, text=True, timeout=15, check=True)
+        assert probe.stdout.strip() == env.name
+        observed.append((selection["prefix"], probe.stdout.strip()))
+    assert observed[0] != observed[1]
+    del run.config["recipes"]["python"]
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=interpreters[0]))
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 0 and answer["init"] == "complete", answer
+    recorded = json.loads((run.run / "team-state.json").read_text())["init"]["python"]
+    assert recorded == interpreters[0]
+    for path in (run.run / "recipes.json", run.base_dir / "provision.json",
+                 run.run / "preflight" / "initiatives" / "pilotpre" / "provision.json"):
+        assert json.loads(path.read_text(encoding="utf-8"))["python"] == interpreters[0]
+
+
+def test_absolute_default_interpreter_keeps_its_final_symlink(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    alias = run.tmp / "bound-python"
+    alias.symlink_to(sys.executable)
+    del run.config["recipes"]["python"]
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=str(alias)))
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 0 and answer["init"] == "complete", answer
+    assert json.loads((run.run / "team-state.json").read_text())["init"]["python"] == str(alias)
+    for path in (run.run / "recipes.json", run.base_dir / "provision.json",
+                 run.run / "preflight" / "initiatives" / "pilotpre" / "provision.json"):
+        assert json.loads(path.read_text(encoding="utf-8"))["python"] == str(alias)
+
+
+@pytest.mark.parametrize("interpreter", [None, "", "\x00", "x" * 4097, ".", "..", "/", "/tmp/.", "/tmp/..", "/tmp/python/",
+                                         "python", "bin/python", "/tmp/./python", "/tmp/../python", "/tmp//python",
+                                         "//tmp/python"],
+                         ids=["none", "empty", "nul", "oversize", "dot", "parent", "root", "absolute-dot",
+                              "absolute-parent", "trailing-slash", "relative-name", "relative-path", "interior-dot",
+                              "interior-parent", "empty-component", "extra-leading-separator"])
+def test_invalid_default_interpreter_has_its_own_fixed_refusal(run, capsys, interpreter):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=interpreter))
+    assert in_process(run, "init", capsys=capsys) == (2, {
+        "error": "invalid the interpreter running hierarchy_team (sys.executable); run hierarchy_team through an "
+                 "absolute interpreter path without . or .. components, or set recipes.python explicitly"})
+    assert not run.run.exists()
+
+
+def test_missing_pin_recovery_before_recipes_exist_resumes_in_place(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    os_api = types.SimpleNamespace(**vars(os))
+
+    def unavailable(path, mode):
+        if path == run.codex_home:
+            raise OSError("fixture home mode unavailable")
+        return os.chmod(path, mode)
+
+    os_api.chmod = unavailable
+    run.monkeypatch.setattr(hierarchy_team, "os", os_api)
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 3 and answer["step"] == "codex-home", answer
+    assert answer["error"] == "fixture home mode unavailable"
+    assert not (run.run / "recipes.json").exists()
+    state_path = run.run / "team-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["init"].pop("python")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    before = state_path.read_bytes()
+    assert in_process(run, "init", "--continue", capsys=capsys) == (2, {
+        "error": "the default interpreter pin is missing; set recipes.python explicitly, then run init --continue; "
+                 "alternatively, restore team-state.json from a trusted backup"})
+    assert state_path.read_bytes() == before
+    assert not (run.run / "recipes.json").exists()
+    # Fix the independent OS fault and remove its empty, unmarked fixture home before resuming.
+    run.monkeypatch.setattr(hierarchy_team, "os", os)
+    assert not list(run.codex_home.iterdir())
+    run.codex_home.rmdir()
+    run.config["recipes"]["python"] = sys.executable
+    run.save()
+    code, answer = in_process(run, "init", "--continue", capsys=capsys)
+    assert code == 0 and answer["init"] == "complete", answer
+
+
+@pytest.mark.parametrize("pin", ["missing", "malformed"])
+def test_pin_recovery_after_branches_exist_resumes_using_the_recorded_recipe_interpreter(run, capsys, pin):
+    run.config["preflight"]["expect"]["targeted-tests"]["min_passed"] = 2
+    run.save()
+    code, answer = in_process(run, "init", capsys=capsys)
+    assert code == 3 and answer["step"] == "preflight", answer
+    assert answer["error"] == "preflight targeted-tests: expected at least 2 passed, the job reported 1"
+    assert git(run.project, "show-ref", "--verify", "refs/heads/" + BRANCH)
+    state_path = run.run / "team-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "python" not in state["init"]
+    if pin == "malformed":
+        state["init"]["python"] = []
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    del run.config["recipes"]["python"]
+    run.config["preflight"]["expect"]["targeted-tests"]["min_passed"] = 1
+    run.save()
+    before = state_path.read_bytes(), (run.run / "recipes.json").read_bytes()
+    assert in_process(run, "init", "--continue", capsys=capsys) == (2, {
+        "error": "the default interpreter pin is %s; set recipes.python to the python recorded in recipes.json, "
+                 "then run init --continue; alternatively, restore team-state.json from a trusted backup" % pin})
+    assert (state_path.read_bytes(), (run.run / "recipes.json").read_bytes()) == before
+    recorded = json.loads((run.run / "recipes.json").read_text(encoding="utf-8"))["python"]
+    run.config["recipes"]["python"] = recorded
+    run.save()
+    code, answer = in_process(run, "init", "--continue", capsys=capsys)
+    assert code == 0 and answer["init"] == "complete", answer
+    assert json.loads((run.base_dir / "provision.json").read_text(encoding="utf-8"))["python"] == recorded
+
+
+@pytest.mark.parametrize("initialized", [[], {}, {"python": None}, {"python": []}, {"python": ""},
+                                        {"python": "x" * 4097}, {"python": "/bad\x00python"},
+                                        {"python": "relative/python"}, {"python": "/tmp/../python"},
+                                        {"python": "/tmp/."}, {"python": "/tmp/python/"}],
+                         ids=["invalid-init", "missing", "none", "list", "empty", "oversize", "nul", "relative",
+                              "parent", "dot", "trailing-slash"])
+def test_a_malformed_default_interpreter_pin_is_refused(run, capsys, initialized):
+    del run.config["recipes"]["python"]
+    run.save()
+    run.run.mkdir()
+    state_path = run.run / "team-state.json"
+    state_path.write_text(json.dumps({"init": initialized}), encoding="utf-8")
+    before = state_path.read_bytes()
+    cause = "missing" if not isinstance(initialized, dict) or "python" not in initialized else "malformed"
+    assert in_process(run, "init", "--continue", capsys=capsys) == (2, {
+        "error": "the default interpreter pin is %s; set recipes.python explicitly, then run init --continue; "
+                 "alternatively, restore team-state.json from a trusted backup" % cause})
+    assert state_path.read_bytes() == before
+    logged = json.loads((run.run / "team-commands.jsonl").read_text().splitlines()[-1])
+    assert (logged["command"], logged["exit"]) == ("init", 2)
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="requires POSIX access checks as a non-root user")
+def test_missing_pin_recovery_stat_failure_is_a_fixed_refusal(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    run.run.mkdir()
+    state_path = run.run / "team-state.json"
+    state_path.write_text(json.dumps({"init": {}}), encoding="utf-8")
+    read = hierarchy_team.read_json
+
+    def unreadable_recipes(path):
+        value = read(path)
+        if path == state_path:
+            run.run.chmod(0o600)
+        return value
+
+    run.monkeypatch.setattr(hierarchy_team, "read_json", unreadable_recipes)
+    try:
+        assert in_process(run, "init", "--continue", capsys=capsys) == (2, {
+            "error": "the default interpreter pin is missing; cannot inspect recipes.json; repair access to "
+                     "recipes.json, then run init --continue; alternatively, restore team-state.json from a trusted backup"})
+    finally:
+        run.run.chmod(0o700)
+
+
+def test_interpreter_mismatch_canonicalizes_and_redacts_both_paths_before_truncating(run, capsys):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    recorded = "/" + "r" * 230 + "/ghp_" + "A" * 30 + "/" + "r" * 300
+    current = "/" + "c" * 230 + "/ｇｈｐ＿\u200b" + "B" * 30 + "/" + "c" * 300
+    del run.config["recipes"]["python"]
+    run.save()
+    run.run.mkdir()
+    (run.run / "team-state.json").write_text(json.dumps({"init": {"python": recorded}}), encoding="utf-8")
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=current))
+    code, answer = in_process(run, "init", "--continue", capsys=capsys)
+    assert code == 2, answer
+    message = answer["error"]
+    assert message.startswith("the interpreter changed since init: recorded ")
+    displayed_recorded, rest = message.split("recorded ", 1)[1].split("; current ")
+    displayed_current = rest.split("; re-run ")[0]
+    for displayed, secret in ((displayed_recorded, "A" * 20), (displayed_current, "B" * 20)):
+        assert "[REDACTED]" in displayed and secret not in displayed
+        assert displayed.endswith("...") and len(displayed) <= 259
+    assert "ｇ" not in message and "\u200b" not in message
+    assert message.endswith("set recipes.python to the interpreter recorded as init.python in team-state.json")
+
+
+@pytest.mark.parametrize("recorded", ["/tmp/" + "r" * 300, "/tmp/ｐｙｔｈｏｎ", "/tmp/two  spaces/python",
+                                      "/tmp/py\u200bthon", "/tmp/ghp_" + "A" * 30 + "/python"],
+                         ids=["truncated", "normalized", "whitespace", "format", "redacted"])
+def test_lossy_interpreter_recovery_points_to_the_stored_pin(run, capsys, recorded):
+    assert in_process(run, "status", capsys=capsys)[0] == 0
+    import hierarchy_team
+
+    del run.config["recipes"]["python"]
+    run.save()
+    run.run.mkdir()
+    (run.run / "team-state.json").write_text(json.dumps({"init": {"python": recorded}}), encoding="utf-8")
+    current = str(run.tmp / "current-python")
+    run.monkeypatch.setattr(hierarchy_team, "sys", types.SimpleNamespace(executable=current))
+    code, answer = in_process(run, "init", "--continue", capsys=capsys)
+    assert code == 2, answer
+    assert answer["error"].startswith("the interpreter changed since init: recorded ")
+    assert answer["error"].endswith("set recipes.python to the interpreter recorded as init.python in team-state.json")
+
 
 def test_init_runs_every_setup_step_and_indexes_each_output(run):
     answer = run.team("init")

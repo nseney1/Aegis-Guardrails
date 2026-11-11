@@ -14,14 +14,23 @@ import pytest
 import aegis_mcp.server as server
 from aegis_mcp.projection import project_response
 from aegis_mcp.tools import execute_tool
+from aegis_core.scan import estimate_tokens, scan
 
 BAD_WORKSPACE = "/invalid\0path"
 
 
-def _rule(root: Path, stem: str, frontmatter: str) -> None:
-    rules = root / ".aegis" / "rules" / "traps"
+def _rule(root: Path, stem: str, frontmatter: str, rule_type: str = "trap") -> None:
+    rules = root / ".aegis" / "rules" / f"{rule_type}s"
     rules.mkdir(parents=True, exist_ok=True)
     (rules / f"{stem}.md").write_text(f"---\n{frontmatter}---\nbody\n", encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
 
 @pytest.fixture
@@ -113,3 +122,213 @@ def test_frontmatter_keys_pass_through_the_full_view_unchanged(tmp_path):
     _rule(tmp_path, "trap-prompt", "type: trap\nprompt: kept as written\n")
     rules = execute_tool("aegis_list_rules", {"workspace": str(tmp_path), "view": "full"})["rules"]
     assert rules[0]["prompt"] == "kept as written"
+
+
+def _scan_payload(witnessed=True):
+    return {
+        "relevant_rules": [{"name": "inv-a", "type": "invariant", "hypothesis": "full guidance"}],
+        "invariant_warnings": [{"name": "inv-a", "type": "invariant"}],
+        "rules_staged": 1,
+        "guidance": "Read the full rule before editing.",
+        "omitted_mandatory": [{"name": "inv-b", "type": "invariant", "reason": "token_budget"}],
+        "stale_rules": [],
+        "stats": {"omitted": 4, "omitted_mandatory": 12, "clamped": True,
+                  "estimated_tokens": 500, "max_tokens_budget": 2000},
+        "rules_base": {"ref": "origin/HEAD" if witnessed else "HEAD", "commit": "a" * 40,
+                       "source": "origin-head" if witnessed else "local-head",
+                       "witnessed": witnessed, "label": "reviewed base" if witnessed else "local-head, not review-witnessed"},
+        "unreviewed_rules": [{"id": f"inv-{i}", "title": "branch-local title", "change": "changed"}
+                             for i in range(10)],
+        "unreviewed_total": 27,
+    }
+
+
+@pytest.mark.parametrize("witnessed", [True, False])
+def test_scan_summary_preserves_base_witness_and_exact_omission_totals(witnessed):
+    payload = _scan_payload(witnessed)
+    before = json.dumps(payload, sort_keys=True)
+    summary = project_response(payload, view="summary")
+    assert summary["omitted_mandatory_count"] == 12
+    assert summary["omitted_mandatory_listed_count"] == len(summary["omitted_mandatory"]) == 1
+    assert summary["omitted_mandatory"][0]["reason"] == "token_budget"
+    assert summary["stats"] == payload["stats"]
+    assert summary["rules_base"] == payload["rules_base"]
+    assert summary["unreviewed_total"] == summary["unreviewed_rules_count"] == 27
+    assert summary["unreviewed_rules_listed_count"] == len(summary["unreviewed_rules"]) == 10
+    assert "inspection" in summary["inspection"].lower()
+    assert "full" in summary["inspection"] and "before editing" in summary["inspection"]
+    assert "guidance" not in summary
+    assert json.dumps(payload, sort_keys=True) == before
+    assert project_response(payload, view="full") is payload
+
+
+@pytest.mark.parametrize("change", ["new", "changed", "removed"])
+def test_scan_summary_keeps_unreviewed_change_kinds(change):
+    payload = _scan_payload()
+    payload["unreviewed_rules"][0]["change"] = change
+    summary = project_response(payload, view="summary")
+    assert summary["unreviewed_rules"][0] == {"id": "inv-0", "change": change}
+
+
+@pytest.mark.parametrize("listed", [0, 1, 10, 12])
+def test_scan_summary_distinguishes_omitted_total_from_both_list_caps(listed):
+    payload = _scan_payload()
+    payload["omitted_mandatory"] *= listed
+    summary = project_response(payload, view="summary")
+    assert summary["omitted_mandatory_count"] == 12
+    assert summary["omitted_mandatory_listed_count"] == len(summary["omitted_mandatory"]) == min(listed, 10)
+
+
+def test_scan_summary_keeps_unreviewed_total_when_core_trimmed_all_names():
+    payload = _scan_payload()
+    payload["guidance"] = "Full rule guidance. " * 40
+    del payload["unreviewed_rules"]
+    summary = project_response(payload, view="summary")
+    assert summary["unreviewed_total"] == summary["unreviewed_rules_count"] == 27
+    assert summary["unreviewed_rules_listed_count"] == 0
+
+
+@pytest.mark.parametrize("budget", [200, 600, 2000])
+def test_public_scan_summary_keeps_exact_totals_within_the_scan_budget(tmp_path, monkeypatch, budget):
+    for i in range(40):
+        _rule(tmp_path, f"inv-{i:02d}", "type: invariant\nhypothesis: h\ntarget_paths: ['src/*.py']\n", "invariant")
+    monkeypatch.setenv("AEGIS_MAX_JIT_TOKENS", str(budget))
+    args = {"workspace": str(tmp_path), "files": ["src/app.py"]}
+    full = execute_tool("aegis_scan", args)
+    summary = execute_tool("aegis_scan", {**args, "view": "summary"})
+    assert estimate_tokens(json.dumps(summary)) <= budget
+    assert summary["stats"]["omitted_mandatory"] == full["stats"]["omitted_mandatory"]
+    assert summary["stats"]["omitted"] == full["stats"]["omitted"]
+    assert estimate_tokens(json.dumps(summary)) <= estimate_tokens(json.dumps(full))
+    if "inspection" in summary:
+        assert summary["omitted_mandatory_count"] == full["stats"]["omitted_mandatory"]
+        assert summary["omitted_mandatory_listed_count"] == len(summary["omitted_mandatory"])
+    else:
+        assert summary == full
+
+
+def test_scan_without_a_review_base_does_not_invent_one(workspace):
+    summary = execute_tool("aegis_scan", {"workspace": str(workspace), "files": ["src/app.py"], "view": "summary"})
+    assert "rules_base" not in summary
+    assert not {"unreviewed_rules", "unreviewed_rules_count", "unreviewed_rules_listed_count"} & summary.keys()
+    assert summary["omitted_mandatory_count"] == summary["omitted_mandatory_listed_count"] == 0
+
+
+def test_unbound_scan_summary_keeps_personal_rule_source_and_next_action(tmp_path):
+    _rule(Path.home(), "personal", "type: trap\nhypothesis: " + "Personal guidance. " * 40
+          + "\ntarget_paths: ['src/*.py']\n")
+    args = {"workspace": str(tmp_path / "unbound"), "files": ["src/app.py"], "_unbound": "no_workspace"}
+    full = execute_tool("aegis_scan", args)
+    summary = execute_tool("aegis_scan", {**args, "view": "summary"})
+    assert "inspection" in summary
+    assert summary["status"] == "not_governed"
+    assert summary["user_layer"] == full["user_layer"] == {"path": str(Path.home() / ".aegis/rules"), "rules": 1}
+    assert summary["message"] == full["message"] == 'not an Aegis workspace: run "aegis init" in your repository'
+    assert summary["reason"] == full["reason"] == "no_workspace"
+    assert not {"rules_base", "unreviewed_rules", "unreviewed_rules_count",
+                "unreviewed_rules_listed_count", "unreviewed_total"} & summary.keys()
+
+
+@pytest.mark.parametrize("guidance_length", [0, 2000])
+def test_scan_summary_returns_the_less_expensive_shape(guidance_length):
+    payload = {"relevant_rules": [], "omitted_mandatory": [], "guidance": "x" * guidance_length,
+               "stats": {"omitted": 0, "omitted_mandatory": 0, "max_tokens_budget": 2000}}
+    summary = project_response(payload, view="summary")
+    if guidance_length:
+        assert "inspection" in summary
+        assert estimate_tokens(json.dumps(summary)) < estimate_tokens(json.dumps(payload))
+    else:
+        assert summary is payload
+
+
+def test_scan_summary_returns_full_when_the_shapes_cost_the_same():
+    payload = {"relevant_rules": [], "omitted_mandatory": [], "guidance": "x" * 2000,
+               "stats": {"omitted": 0, "omitted_mandatory": 0, "max_tokens_budget": 2000}}
+    summary_tokens = estimate_tokens(json.dumps(project_response(payload, view="summary")))
+    candidates = ({**payload, "guidance": "x" * length} for length in range(400))
+    equal_cost = next(p for p in candidates if estimate_tokens(json.dumps(p)) == summary_tokens)
+    assert project_response(equal_cost, view="summary") is equal_cost
+
+
+@pytest.mark.parametrize("kind,guidance_length,budget", [("gate", 210, 204), ("gate", 130, None),
+                                                       ("invariant", 6, None), ("gate", 2000, 199),
+                                                       ("invariant", 2000, 214)])
+def test_scan_summary_never_trims_staged_rules_or_constraints(kind, guidance_length, budget):
+    payload = _scan_payload()
+    payload.update(
+        relevant_rules=[{"name": "g", "type": kind, "enforcement": "GATE (must pass)", "fitness": None,
+                         "hypothesis": "h", "prediction": "", "matched_files": ["a.py"],
+                         "_path": f".aegis/rules/{kind}s/g.md"}],
+        invariant_warnings=[] if kind == "gate" else [
+            {"name": "g", "type": "invariant", "tier": "gate", "hypothesis": "h",
+             "prediction": "", "matched_files": ["a.py"]}],
+        omitted_mandatory=[], guidance="x" * guidance_length,
+        stats={"omitted": 0, "omitted_mandatory": 0, "clamped": False, "max_tokens_budget": 2000},
+    )
+    del payload["unreviewed_rules"], payload["unreviewed_total"]
+    payload["stats"]["max_tokens_budget"] = budget or estimate_tokens(json.dumps(payload)) + 2
+    if budget == 204:
+        assert estimate_tokens(json.dumps(payload)) == 194
+    summary = project_response(payload, view="summary")
+    assert [rule["name"] for rule in summary["relevant_rules"]] == ["g"]
+    assert [rule["name"] for rule in summary["invariant_warnings"]] == ([] if kind == "gate" else ["g"])
+    assert summary["stats"] == payload["stats"]
+    if guidance_length == 2000:
+        # A lossy summary would be cheaper than full, exposing either trim regression.
+        assert summary is payload
+    else:
+        assert estimate_tokens(json.dumps(summary)) <= payload["stats"]["max_tokens_budget"]
+
+
+def test_scan_summary_cap_never_hides_a_staged_rule(tmp_path):
+    for index in range(11):
+        _rule(tmp_path, f"trap-{index:02d}", "type: trap\nhypothesis: h\ntarget_paths: ['src/*.py']\n")
+    full = scan(tmp_path, changed_files=["src/app.py"], budget=11, max_tokens=10000)
+    assert full["rules_staged"] == 11 and full["stats"]["omitted"] == 0
+    summary = project_response(full, view="summary")
+    assert summary is full
+
+
+def test_scan_summary_reports_stale_and_warning_totals_and_displayed_counts():
+    payload = _scan_payload()
+    payload["guidance"] = "Full guidance. " * 80
+    payload["stale_rules"] = [{"name": f"stale-{index:02d}"} for index in range(12)]
+    payload["warnings"] = [f"Warning {index:02d}." for index in range(12)]
+    summary = project_response(payload, view="summary")
+    for key in ("stale_rules", "warnings"):
+        assert summary[f"{key}_count"] == len(payload[key]) == 12
+        assert summary[f"{key}_listed_count"] == len(summary[key]) == 10
+
+
+def test_scan_summary_trims_names_to_pay_for_metadata_without_losing_totals():
+    payload = _scan_payload()
+    payload["guidance"] = ""
+    payload["relevant_rules"] = []
+    payload["invariant_warnings"] = []
+    payload["rules_staged"] = 0
+    for item in payload["unreviewed_rules"]:
+        del item["title"]
+    payload["stats"]["max_tokens_budget"] = estimate_tokens(json.dumps(payload))
+    before = json.dumps(payload, sort_keys=True)
+    summary = project_response(payload, view="summary")
+    assert "inspection" in summary
+    assert estimate_tokens(json.dumps(summary)) <= payload["stats"]["max_tokens_budget"]
+    assert summary["unreviewed_rules_count"] == 27
+    assert summary["unreviewed_rules_listed_count"] == len(summary["unreviewed_rules"]) < 10
+    assert summary["omitted_mandatory_count"] == 12
+    assert summary["rules_base"] == payload["rules_base"]
+    assert json.dumps(payload, sort_keys=True) == before
+
+
+def test_scan_summary_delivers_full_guidance_if_metadata_alone_cannot_fit():
+    payload = {"relevant_rules": [], "guidance": "No governance rules match your current changes.",
+               "omitted_mandatory": [],
+               "stats": {"omitted": 0, "omitted_mandatory": 0, "max_tokens_budget": 60}}
+    assert estimate_tokens(json.dumps(payload)) <= 60
+    assert project_response(payload, view="summary") is payload
+
+
+@pytest.mark.parametrize("view", ["full", "summary", "ids"])
+def test_scan_failure_is_never_compacted(view):
+    payload = {**_scan_payload(), "status": "FAIL", "error": "Scan refused."}
+    assert project_response(payload, view=view) is payload

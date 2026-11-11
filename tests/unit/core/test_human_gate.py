@@ -884,6 +884,11 @@ def test_the_aegis_jobs_of_a_workflow_are_the_jobs_that_run_aegis_check_ci():
     assert human_gate.aegis_check_jobs(text) == ["Aegis gate", "block"]
 
 
+def test_aegis_check_jobs_remains_a_public_human_gate_export():
+    assert "aegis_check_jobs" in human_gate.__all__
+    assert human_gate.aegis_check_jobs(_workflow()) == ["aegis-check"]
+
+
 @pytest.mark.parametrize("job", [
     "  aegis:\n    name: 'Aegis (${{ matrix.os }})'\n    steps:\n      - run: aegis check --ci\n",
     "  aegis:\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n    steps:\n      - run: aegis check --ci\n",

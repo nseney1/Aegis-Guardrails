@@ -21,14 +21,14 @@ from aegis_core import ghcli, gitevidence, gitsafe, human_gate
 from aegis_core import credit_memo as _credit_memo
 from aegis_core.errors import AegisError, PathTraversalError
 from aegis_core.primitives import utc_stamp
-from aegis_core.storage import ReportedRows, ledger_locked, read_jsonl
+from aegis_core.storage import RowsResult, ledger_locked, read_jsonl
 from aegis_core.telemetry_engine import ledger
 
 __all__ = [
     "EVENTS", "MAX_REPORT_ROWS_PER_SESSION", "CIUnavailable", "Credit", "CreditProjection",
     "GhRestClient", "ReportConflict", "approval_lookup", "check_ci_divergence", "claimed_summary",
     "confirm", "confirmed_outcome_rows", "derive", "exposed_rules", "format_trailer",
-    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "required_workflow",
+    "landed_lookup", "parse_trailer", "passing_check", "project_credits", "read_rows", "read_rows_with_report", "required_workflow",
     "record_adjudication", "record_detection", "record_detections", "record_exposure", "record_override",
     "record_void", "resolve_protected_branch", "select_ci_run", "submit_report",
     "verify_commit_trailers", "void_tree", "witnessed_exposed_rules",
@@ -78,21 +78,32 @@ def _event_rows(raw_rows: Iterable[Any]) -> List[Dict[str, Any]]:
 
 
 def _read_ledger_events(root: Any, view: Any = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """The event rows and why some could not be read; from ``view``'s snapshot when it holds one."""
+    """The event rows and why some could not be read; use ``view``'s snapshot if present."""
+    result, error = _read_ledger_events_with_report(root, view)
+    return result.rows, error
+
+
+def _read_ledger_events_with_report(root: Any, view: Any = None) -> Tuple[RowsResult, Optional[str]]:
+    """Keep descriptor evidence explicit while filtering a ledger read to credit events."""
     raw = getattr(view, "raw_rows", None)
     if raw is not None:
         skipped = view.skipped_lines
-        return _event_rows(raw), view.error or (f"{len(skipped)} unreadable line(s)" if skipped else None)
+        return RowsResult(_event_rows(raw)), view.error or (f"{len(skipped)} unreadable line(s)" if skipped else None)
     try:
         res = read_jsonl(ledger.ledger_path(root))
     except (PathTraversalError, OSError) as exc:
-        return [], str(exc)
+        return RowsResult([]), str(exc)
     err = res.error or (f"{len(res.skipped_lines)} unreadable line(s)" if res.skipped_lines else None)
-    return ReportedRows(_event_rows(res.rows), res.report), err
+    return RowsResult(_event_rows(res.rows), res.report), err
 
 
 def read_rows(root: Any) -> List[Dict[str, Any]]:
-    return _read_ledger_events(root)[0]
+    return read_rows_with_report(root).rows
+
+
+def read_rows_with_report(root: Any) -> RowsResult:
+    """Read credit events with optional evidence from the same descriptor."""
+    return _read_ledger_events_with_report(root)[0]
 
 
 def _of(rows: Iterable[Mapping[str, Any]], event: str) -> List[Mapping[str, Any]]:
@@ -296,8 +307,8 @@ def record_exposure(
     path_list = [str(p) for p in (paths or ()) if isinstance(p, str)]
     with ledger_locked(root) as site:
         before = _credit_memo.before_read(root_id, site)
-        read = read_rows(root)
-        seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read, "exposure")}
+        read = read_rows_with_report(root)
+        seen = {(str(r.get("session") or ""), str(r.get("rule") or r.get("for_rule") or ""), r.get("scope_basis")) for r in _of(read.rows, "exposure")}
         _credit_memo.reconcile(root_id, seen)
         to_append: List[Dict[str, Any]] = []
         for rule_id in rule_list:
@@ -320,7 +331,7 @@ def record_exposure(
                 row["heartbeat"] = bool(heartbeat)
             to_append.append(row)
         appended = ledger.append_rows(root, to_append) if to_append else []
-        _credit_memo.remember(root_id, kept, site.path, before, appended, getattr(read, "report", None))
+        _credit_memo.remember(root_id, kept, site.path, before, appended, read.report)
         return [_normalize_event_row(r) for r in appended]
 
 
