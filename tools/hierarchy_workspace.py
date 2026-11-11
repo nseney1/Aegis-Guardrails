@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 from statistics import median
 import sys
 import time
@@ -37,9 +39,9 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
-from hierarchy_mailbox import (GIT_ID, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, Mailbox, encoded, fields,  # noqa: E402
+from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, Mailbox, encoded, fields,  # noqa: E402
                                integer, matching, parse_time, publish_file, read_json, require, safe_path, strings,
-                               text, timestamp)
+                               strict_json, text, timestamp)
 
 
 EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v1"
@@ -125,6 +127,8 @@ class Ledger:
         self.limits = None
         self.initiatives = {}
         self.requests = {}
+        self.open_holders = set()
+        self.granted_counts = dict.fromkeys(KINDS, 0)
 
     def initiative(self, identifier):
         require(identifier in self.initiatives, "initiative is not registered: " + str(identifier))
@@ -172,7 +176,7 @@ def apply_set_limits(ledger, data, _event):
     for name in changes:
         kind, ceiling = LIMIT_FIELDS[name]
         integer(data[name], name, maximum=ceiling)
-        held = len(ledger.held(kind))
+        held = ledger.granted_counts[kind]
         require(data[name] >= held, "%s %d is below the %d granted %s requests" % (name, data[name], held, kind))
     for name in changes:
         ledger.limits[LIMIT_FIELDS[name][0]] = data[name]
@@ -232,15 +236,15 @@ def apply_request(ledger, data, event):
         require(previous["state"] != "granted",
                 identifier + " is granted: accepted work is never preempted; wait for its release")
         require(previous["state"] == "queued", "superseded request is not queued")
-    require(not any(r["kind"] == data["kind"] and r["holder"] == data["holder"] and r["state"] in ("queued", "granted")
-                    and r is not previous
-                    for r in ledger.requests.values()), "holder already has an open request")
+    holder = (data["kind"], data["holder"])
+    require(previous is not None or holder not in ledger.open_holders, "holder already has an open request")
     replacement = {**data, "state": "queued", "seq": previous["seq"] if previous is not None else event["seq"],
                    "requested_at": event["at"], "reserved_repository": initiative["repository"],
                    "reserved_paths": list(initiative["touched_paths"])}
     if previous is not None:
         previous.update(state="withdrawn", closed_at=event["at"], superseded_by=data["request_id"])
     ledger.requests[data["request_id"]] = replacement
+    ledger.open_holders.add(holder)
 
 
 def apply_withdraw(ledger, data, event):
@@ -249,14 +253,16 @@ def apply_withdraw(ledger, data, event):
     request = ledger.request(data["request_id"])
     require(request["state"] == "queued", "request is not queued: " + data["request_id"])
     request.update(state="withdrawn", closed_at=event["at"])
+    ledger.open_holders.remove((request["kind"], request["holder"]))
 
 
 def apply_grant(ledger, data, event):
     fields(data, {"request_id"})
     request = ledger.request(data["request_id"])
     require(request["state"] == "queued", "request is not queued: " + data["request_id"])
-    require(len(ledger.held(request["kind"])) < ledger.limits[request["kind"]], "ledger grant exceeds capacity")
+    require(ledger.granted_counts[request["kind"]] < ledger.limits[request["kind"]], "ledger grant exceeds capacity")
     request.update(state="granted", granted_at=event["at"])
+    ledger.granted_counts[request["kind"]] += 1
 
 
 def apply_release(ledger, data, event):
@@ -265,6 +271,8 @@ def apply_release(ledger, data, event):
     request = ledger.request(data["request_id"])
     require(request["state"] == "granted", "request is not granted: " + data["request_id"])
     request.update(state="released", closed_at=event["at"], evidence=data["evidence"])
+    ledger.open_holders.remove((request["kind"], request["holder"]))
+    ledger.granted_counts[request["kind"]] -= 1
 
 
 def apply_merge(ledger, data, event):
@@ -297,10 +305,76 @@ APPLY = {"init": apply_init, "register": apply_register, "update": apply_update,
          "clear_base_moved": apply_clear, "set_limits": apply_set_limits}
 
 
+def _memo_supported():
+    return (os.name == "posix" and all(hasattr(os, name) for name in ("O_PATH", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"))
+            and {"open", "stat"} <= {function.__name__ for function in os.supports_dir_fd}
+            and os.scandir in os.supports_fd)
+
+
+def _event_key(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 class Store:
     def __init__(self, path):
         self.path = safe_path(path)
         self.events = self.path / "events"
+        self._memo = None
+
+    @contextmanager
+    def _event_directory(self):
+        """Walk from the filesystem root with no-follow descriptors; never reopen by pathname."""
+        safe_path(self.events)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        search_flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = None
+        ancestors = []
+        try:
+            descriptor = os.open(self.events.anchor, search_flags)
+            for index, component in enumerate(self.events.parts[1:], 1):
+                info = os.fstat(descriptor)
+                ancestors.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid))
+                child = os.open(component, flags if index == len(self.events.parts) - 1 else search_flags,
+                                dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            info = os.fstat(descriptor)
+            ancestors.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid))
+            credentials = (os.getuid(), os.geteuid(), os.getgid(), os.getegid(), tuple(os.getgroups()))
+            yield descriptor, (tuple(ancestors), credentials)
+        except OSError as exc:
+            raise ValueError("workspace event directory is unavailable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _read_event(self, directory, path, key):
+        """Bound bytes before parsing, and bind them to the observed file identity."""
+        descriptor = None
+        try:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            info = os.fstat(descriptor)
+            require(stat.S_ISREG(info.st_mode), "input must be a regular file")
+            require(_event_key(info) == key, "workspace event changed while reading")
+            require(info.st_size <= MAX_BYTES, "input exceeds 262144 bytes")
+            raw = bytearray()
+            while len(raw) <= MAX_BYTES:
+                try:
+                    chunk = os.read(descriptor, MAX_BYTES + 1 - len(raw))
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            require(len(raw) == info.st_size and _event_key(os.fstat(descriptor)) == key
+                    and _event_key(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) == key,
+                    "workspace event changed while reading")
+            return strict_json(raw.decode("utf-8"))
+        except OSError as exc:
+            raise ValueError("workspace event is unavailable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @contextmanager
     def lock(self):
@@ -324,9 +398,46 @@ class Store:
         affected request's timing unknown without rewriting the durable event.
         """
         require(self.events.is_dir(), "workspace store is not initialized")
-        ledger = Ledger()
+        if not _memo_supported():
+            # Preserve the portable reader; metadata reuse needs checked descriptor reads.
+            self._memo = None
+            return self._replay(sorted(self.events.iterdir()), read_json, for_report)
+        with self._event_directory() as (directory, context):
+            paths = []
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = self.events / entry.name
+                    if entry.name.startswith(".pending-"):
+                        safe_path(path)
+                        continue
+                    require(len(paths) < MAX_RECORDS, "workspace event history exceeds record limit")
+                    paths.append(path)
+            paths.sort()
+            keys = []
+            for path in paths:
+                info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                require(not stat.S_ISLNK(info.st_mode), "symlink paths are not supported: " + str(path))
+                keys.append((path.name, _event_key(info)))
+            previous, self._memo = self._memo, None
+            ledger = None
+            # MB-1: in-process bytes only; full file lstat keys include ctime, mode and uid.
+            # Directory identities exclude timestamps; lock-file churn must not invalidate replay.
+            # Same-stat rewrites share MB-1's accepted metadata-observation limit.
+            if not for_report and previous is not None:
+                old_context, old_keys, old_ledger = previous
+                if context == old_context and keys[:len(old_keys)] == old_keys:
+                    ledger = deepcopy(old_ledger)
+            result = self._replay(paths, lambda path: self._read_event(directory, path, keys[int(path.stem) - 1][1]),
+                                  for_report, ledger)
+            if not for_report:
+                self._memo = (context, keys, deepcopy(result))
+            return result
+
+    def _replay(self, paths, reader, for_report, ledger=None):
+        ledger = Ledger() if ledger is None else ledger
+        replayed = ledger.seq
         count = 0
-        for path in sorted(self.events.iterdir()):
+        for path in paths:
             if path.name.startswith(".pending-"):
                 # Never read, but a planted symlink still fails loudly. Events get the same check inside
                 # read_json; checking them here too walked every ancestor twice per event on a full store.
@@ -337,8 +448,10 @@ class Store:
             count += 1
             require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
             require(int(name.group(1)) == count, "nonconsecutive workspace event: " + path.name)
+            if count <= replayed:
+                continue
             try:
-                event = read_json(path)
+                event = reader(path)
                 fields(event, {"schema", "seq", "at", "kind", "data"})
                 require(event["schema"] in REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
                 try:
