@@ -1,6 +1,22 @@
 {
   "tools": [
     {
+      "name": "aegis_team_config",
+      "description": "Read the resolved team profile with per-value layer provenance.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "title": "Team Config"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "aegis_scan",
       "description": "Call before editing files: returns the rules for `files` (default: the git diff), ranked by fitness within the token budget, and records this session's scan and rule exposure. Mandatory rules (gates, invariants) take at most two slots (the excess is in `omitted_mandatory`) and are served from the reviewed base, so branch-local edits to them do not bind and are listed in `unreviewed_rules`. Use `aegis_list_rules` to browse without recording and `aegis_report_outcome` after verifying. Fails closed if a rule file cannot be loaded.",
       "annotations": {

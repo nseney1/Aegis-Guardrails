@@ -34,6 +34,12 @@ def _write(title: str) -> dict:
 
 TOOL_DEFINITIONS = [
     {
+        "name": "aegis_team_config",
+        "description": "Read the resolved team profile with per-value layer provenance.",
+        "annotations": _read("Team Config"),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "aegis_scan",
         "description": (
             "Call before editing files: returns the rules for `files` (default: the git diff), ranked by "
