@@ -64,6 +64,7 @@ it and can verify the outcome afterwards. No deletes, no network.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -344,8 +345,9 @@ def read_jsonl(path, tolerate_torn_tail=True, *, reduce_rows=list):
 
     A live transcript's last line can be half written while the session runs, so an
     unparsable last line is skipped and reported (F1). An unparsable earlier line is
-    corruption and fails. The default retains the list API; a reducer must exhaust
-    the iterator to validate the complete stream, keeping only the state it needs.
+    corruption and fails. The default retains the list API; reducers may stop early.
+    The reader drains the iterator even if reduction fails, so corruption takes
+    precedence. Reducers must return a materialised value, never an iterator.
     """
     with open(path, "rb") as stream:
         torn = False
@@ -365,7 +367,14 @@ def read_jsonl(path, tolerate_torn_tail=True, *, reduce_rows=list):
                     raise Failure(EXIT_CRITICAL, "unparsable JSON at line %d of %s" % (number, path)) from None
                 yield number, record
 
-        rows = reduce_rows(records())
+        remaining = records()
+        try:
+            rows = reduce_rows(remaining)
+            if isinstance(rows, Iterator):
+                raise TypeError("reduce_rows must return a materialised value, not an iterator")
+        finally:
+            for _ in remaining:
+                pass
     return rows, torn
 
 
@@ -376,6 +385,10 @@ def record_text(record):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if not isinstance(block.get("text", ""), str):
+                    raise Failure(EXIT_CRITICAL, "text block text must be a string")
         return "".join(block.get("text", "") for block in content
                        if isinstance(block, dict) and block.get("type") == "text")
     return None
@@ -389,6 +402,23 @@ def first_user_record(rows):
     return None, None
 
 
+def _first_prompt_observation(rows):
+    """Keep only the first user's prompt and metadata while consuming the stream."""
+    observation = first_user_record(rows)
+    for _ in rows:
+        pass
+    return observation
+
+
+def _first_assistant_line(rows):
+    """Keep only the first assistant line while consuming the stream."""
+    first = None
+    for line, record in rows:
+        if first is None and isinstance(record, dict) and record.get("type") == "assistant":
+            first = line
+    return first
+
+
 def first_prompt_check(transcript, prompt, expected_sha256):
     """Compare a session's first prompt with the recorded prompt file (F-A).
 
@@ -397,8 +427,7 @@ def first_prompt_check(transcript, prompt, expected_sha256):
     """
     raw = Path(prompt).read_bytes()
     recorded = raw.decode("utf-8")
-    rows, torn = read_jsonl(transcript)
-    where, content = first_user_record(rows)
+    (where, content), torn = read_jsonl(transcript, reduce_rows=_first_prompt_observation)
     result = {"transcript": str(transcript), "prompt": str(prompt), "prompt_sha256": sha256_bytes(raw),
               "expected_sha256": expected_sha256, "first_user_record": where, "torn_tail": torn,
               "prompt_chars": len(recorded), "first_prompt_chars": None if content is None else len(content),
@@ -702,7 +731,8 @@ def observe_launch(record, spec, args, started):
     transcript = check = assistant = None
     while True:
         transcript = transcript or find_transcript(args.projects_dir, short)
-        if transcript is not None and first_user_record(read_jsonl(transcript)[0])[0] is not None:
+        if (transcript is not None
+                and read_jsonl(transcript, reduce_rows=_first_prompt_observation)[0][0] is not None):
             check = first_prompt_check(transcript, spec["prompt"]["path"], spec["prompt"]["sha256"])
             break
         if time.monotonic() - started >= args.wait_s:
@@ -711,8 +741,7 @@ def observe_launch(record, spec, args, started):
     record["transcript"] = None if transcript is None else str(transcript)
     record["first_prompt_check"] = check
     while transcript is not None:
-        assistant = next((line for line, row in read_jsonl(transcript)[0]
-                          if isinstance(row, dict) and row.get("type") == "assistant"), None)
+        assistant, _ = read_jsonl(transcript, reduce_rows=_first_assistant_line)
         if assistant is not None or time.monotonic() - started >= args.dialog_wait_s:
             break
         time.sleep(args.poll_s)
