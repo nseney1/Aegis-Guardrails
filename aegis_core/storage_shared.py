@@ -129,10 +129,10 @@ def shared_errors(deps: Any, base: Path, *, link_error, outside_error):
     return confined_link_error, confined_outside_error
 
 
-def confined_shared(deps: Any, directory: Path, base: Path, create: bool) -> None:
+def confined_shared(deps: Any, directory: Path, base: Path, create: bool, *, shared_errors) -> None:
     """``confined`` for a directory of the shared state under ``base`` (the resolved common
     dir); with ``create`` a missing one is made private and checked again."""
-    link_error, outside_error = deps._shared_errors(base)
+    link_error, outside_error = shared_errors(base)
     deps._confined(directory, base, link_error, outside_error)
     if create and not deps.os.path.lexists(directory):
         try:

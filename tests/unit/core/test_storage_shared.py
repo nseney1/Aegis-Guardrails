@@ -16,10 +16,16 @@ from aegis_cli.cli import main
 from tests import helpers_humangate as hg
 
 
-def test_storage_helpers_have_call_sites():
+@pytest.mark.parametrize("fast_mode", [False, True])
+def test_storage_helpers_need_no_repository_search(monkeypatch, fast_mode):
+    def unexpected_search(*args, **kwargs):
+        pytest.fail("storage helpers must have call sites without searching the repository")
+
+    monkeypatch.setattr(call_graph, "_get_searchable_source_files", unexpected_search)
     root = Path(__file__).resolve().parents[3]
-    result = call_graph.check(str(root / "aegis_core" / "storage.py"), str(root), fast_mode=False)
+    result = call_graph.check(str(root / "aegis_core" / "storage.py"), str(root), fast_mode=fast_mode)
     assert result.verdict is True, result.detail
+    assert "external candidates skipped" not in result.detail
 
 
 @pytest.mark.parametrize("path", ["aegis_core/storage.py", "aegis_core/storage_shared.py",
