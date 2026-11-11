@@ -570,6 +570,8 @@ def test_read_blob_returns_committed_bytes(repo: Path):
     (repo / "a.py").write_text("a = 9\n", encoding="utf-8")  # the worktree is not what is read
     assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
     assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None
+
+
     assert gitsafe.read_blob(repo, "no-such-rev", "a.py") is None
 
 
@@ -1609,3 +1611,152 @@ def test_read_blob_refuses_a_cat_file_header_whose_size_is_not_a_number(repo: Pa
 def test_read_blob_still_reads_a_blob_and_answers_none_for_a_missing_path(repo: Path):
     assert gitsafe.read_blob(repo, "HEAD", "a.py") == b"a = 1\n"
     assert gitsafe.read_blob(repo, "HEAD", "missing.py") is None
+@pytest.mark.parametrize("kind, revision", [("blob", "HEAD:a.py"), ("commit", "HEAD")])
+def test_declared_object_kind_batches_with_size_and_hash_checks(repo, kind, revision):
+    oid = _git(repo, "rev-parse", revision).strip()
+    expected = subprocess.run(["git", "cat-file", kind, oid], cwd=repo,
+                              capture_output=True, check=True).stdout
+    assert gitsafe.blob_sizes(repo, [oid], kind=kind) == {oid: len(expected)}
+    assert gitsafe.read_blobs(repo, [oid, oid], kind=kind) == {oid: expected}
+
+
+def test_commit_iterator_sizes_before_chunked_captures_and_deduplicates(repo, monkeypatch):
+    commits = [_git(repo, "rev-parse", "HEAD").strip()]
+    for index in range(3):
+        _git(repo, "commit", "--allow-empty", "-qm", f"commit {index}")
+        commits.append(_git(repo, "rev-parse", "HEAD").strip())
+    sizes = {oid: int(_git(repo, "cat-file", "-s", oid)) for oid in commits}
+    budget = max(sizes.values()) * 2
+    calls = []
+    real = gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[0] == "cat-file":
+            requested = kw["stdin"].decode("ascii").splitlines()
+            calls.append((args[1], requested))
+            if args[1] == "--batch":
+                assert calls[0] == ("--batch-check", commits)
+                assert sum(sizes[oid] for oid in requested) <= budget or len(requested) == 1
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    objects = dict(gitsafe.iter_objects(repo, commits + commits, kind="commit", byte_budget=budget))
+    assert list(objects) == commits
+    assert {oid: len(data) for oid, data in objects.items()} == sizes
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("header", ["{oid} blob 3", "{oid} commit -1", "{oid} commit 6x",
+                                    "{oid} missing", "{other} commit 3", "{oid} commit " + "9" * 5000],
+                         ids=["wrong-kind", "negative", "nondigit", "missing", "wrong-oid", "huge-decimal"])
+def test_commit_iterator_refuses_bad_preflight_before_content(repo, monkeypatch, header):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    calls = []
+
+    def forged(args, *a, **kw):
+        calls.append(args)
+        reply = header.format(oid=oid, other="1" * 40).encode("ascii") + b"\n"
+        return subprocess.CompletedProcess(args, 0, reply, b"")
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        list(gitsafe.iter_objects(repo, [oid], kind="commit"))
+    assert calls == [["cat-file", "--batch-check"]]
+
+
+@pytest.mark.parametrize("malformation", ["wrong-kind", "wrong-oid", "wrong-size", "hash", "delimiter", "trailing", "short"])
+def test_declared_commit_reader_refuses_corrupt_frames(repo, monkeypatch, malformation):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    data = subprocess.run(["git", "cat-file", "commit", oid], cwd=repo,
+                          capture_output=True, check=True).stdout
+    header = f"{oid} commit {len(data)}\n".encode("ascii")
+    frame = header + data + b"\n"
+    if malformation == "wrong-kind":
+        frame = frame.replace(b" commit ", b" blob ", 1)
+    elif malformation == "wrong-oid":
+        frame = b"1" * len(oid) + frame[len(oid):]
+    elif malformation == "wrong-size":
+        frame = f"{oid} commit {len(data) + 1}\n".encode("ascii") + data + b"\n"
+    elif malformation == "hash":
+        frame = header + b"X" + data[1:] + b"\n"
+    elif malformation == "delimiter":
+        frame = frame[:-1] + b"X"
+    elif malformation == "trailing":
+        frame += b"untrusted extra frame"
+    else:
+        frame = frame[:-2]
+    _answering(monkeypatch, frame)
+    with pytest.raises(gitsafe.GitError, match="^git (cannot read object|returned content for)"):
+        gitsafe.read_blobs(repo, [oid], kind="commit")
+
+
+@pytest.mark.parametrize("bad_oid", ["HEAD", "-x", "a\nprivate-input", "\N{SNOWMAN}", 123, []])
+def test_batch_reader_refuses_invalid_request_without_spawning(repo, monkeypatch, bad_oid):
+    def forbidden(*a, **kw):
+        pytest.fail("invalid request reached git")
+
+    monkeypatch.setattr(gitsafe, "run", forbidden)
+    for read in (gitsafe.read_blobs, gitsafe.blob_sizes):
+        with pytest.raises(gitsafe.GitError, match="^invalid object id$"):
+            read(repo, [bad_oid])
+
+
+def test_commit_iterator_reads_lone_object_above_budget_and_releases_capture(repo, monkeypatch):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    captured = []
+    real = gitsafe.run
+
+    def counted(args, *a, **kw):
+        if args[:2] == ["cat-file", "--batch"]:
+            captured.append(kw["stdin"])
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", counted)
+    objects = list(gitsafe.iter_objects(repo, [oid], kind="commit", byte_budget=1))
+    assert len(objects) == 1 and objects[0][0] == oid and len(objects[0][1]) > 1
+    assert captured == [oid.encode("ascii") + b"\n"]
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, "private-budget"])
+def test_commit_iterator_refuses_invalid_budget_before_git(repo, monkeypatch, budget):
+    def forbidden(*a, **kw):
+        pytest.fail("invalid budget reached git")
+
+    monkeypatch.setattr(gitsafe, "run", forbidden)
+    with pytest.raises(gitsafe.GitError, match="^byte budget must be a positive integer$"):
+        list(gitsafe.iter_objects(repo, [], byte_budget=budget))
+
+
+def test_commit_iterator_verifies_sha256_objects_when_git_supports_them(tmp_path, monkeypatch):
+    repo = tmp_path / "sha256"
+    repo.mkdir()
+    initialized = subprocess.run(["git", "init", "-q", "--object-format=sha256"], cwd=repo, capture_output=True)
+    if b"unknown option" in initialized.stderr or b"unknown hash algorithm" in initialized.stderr:
+        pytest.skip("git does not support SHA-256 repositories")
+    assert initialized.returncode == 0, initialized.stderr
+    _git(repo, "commit", "--allow-empty", "-qm", "SHA-256 commit")
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    assert len(oid) == 64
+    expected = subprocess.run(["git", "cat-file", "commit", oid], cwd=repo, capture_output=True, check=True).stdout
+    assert list(gitsafe.iter_objects(repo, [oid], kind="commit")) == [(oid, expected)]
+    forged = f"{oid} commit {len(expected)}\n".encode("ascii") + b"X" + expected[1:] + b"\n"
+    _answering(monkeypatch, forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git returned content for {oid} that does not match the object id$"):
+        gitsafe.read_blobs(repo, [oid], kind="commit")
+@pytest.mark.parametrize("extra_record", [True, False], ids=["extra-record", "missing-terminator"])
+def test_commit_iterator_refuses_malformed_preflight_framing_before_capture(repo, monkeypatch, extra_record):
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    size = int(_git(repo, "cat-file", "-s", oid))
+    header = f"{oid} commit {size}".encode("ascii")
+    calls = []
+
+    def forged(args, *a, **kw):
+        calls.append(args)
+        assert args == ["cat-file", "--batch-check"], "malformed preflight reached content capture"
+        out = (header + b"\n") * 2 if extra_record else header
+        return subprocess.CompletedProcess(args, 0, out, b"")
+
+    monkeypatch.setattr(gitsafe, "run", forged)
+    with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
+        list(gitsafe.iter_objects(repo, [oid], kind="commit"))
+    assert len(calls) == 1

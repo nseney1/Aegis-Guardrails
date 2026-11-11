@@ -1117,16 +1117,22 @@ def test_exemption_discovery_does_not_verify_unrelated_commits(tmp_path, monkeyp
     for i in range(8):
         repo.commit(f"chore: unrelated {i}", allow_empty=True)
     calls = []
+    requested = []
     real = gitsafe.run
 
     def spy(args, *a, **kw):
         calls.append(list(args))
+        if args[:2] == ["cat-file", "--batch"]:
+            requested.extend(kw["stdin"].decode("ascii").splitlines())
         return real(args, *a, **kw)
 
     monkeypatch.setattr(gitsafe, "run", spy)
     assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
     expected = repo.git("rev-list", "main..HEAD").splitlines()
-    assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == expected
+    assert requested == expected
+    assert sum(c[:2] == ["cat-file", "--batch-check"] for c in calls) == 1
+    assert sum(c[:2] == ["cat-file", "--batch"] for c in calls) == 1
+    assert not any(c[:2] == ["cat-file", "commit"] for c in calls)
     assert sum(c[0] == "rev-list" for c in calls) == 1
 
 
@@ -1180,6 +1186,7 @@ def test_large_commit_headers_are_read_one_at_a_time_and_released(tmp_path, monk
         approvals.append(parent)
     repo.git("update-ref", "HEAD", parent)
     held, captures = [0], []
+    discovering = True
     real = gitsafe.run
 
     class Capture(bytes):
@@ -1192,19 +1199,22 @@ def test_large_commit_headers_are_read_one_at_a_time_and_released(tmp_path, monk
             held[0] -= len(self)
 
     def counted(args, *a, **kw):
-        if args[0] == "cat-file":
-            assert args[:2] == ["cat-file", "commit"] and len(args) == 3, "discovery must read individual commit objects"
-            assert held[0] == 0, "previous commit object still retained at the next capture"
+        if discovering and args[0] == "cat-file":
+            assert args[1] in ("--batch-check", "--batch")
+            assert held[0] == 0, "previous chunk still retained at the next capture"
         result = real(args, *a, **kw)
-        if args[:2] == ["cat-file", "commit"]:
-            captures.append((args[2], len(result.stdout)))
+        if args[:2] == ["cat-file", "--batch"]:
+            requested = kw["stdin"].decode("ascii").splitlines()
+            captures.append((requested, len(result.stdout)))
             result.stdout = Capture(result.stdout)
         return result
 
     monkeypatch.setattr(gitsafe, "run", counted)
     find = human_gate.exemption_finder(repo.root, "HEAD", "main")
-    assert [oid for oid, _size in captures] == repo.git("rev-list", "main..HEAD").splitlines()
-    assert sum(size > 4 * 1024 * 1024 for _oid, size in captures) == len(approvals)
+    discovering = False
+    assert [oid for chunk, _size in captures for oid in chunk] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert len(captures) == 3
+    assert all(size <= 16 * 1024 * 1024 for _chunk, size in captures)
     assert held[0] == 0
     outcomes = [find(fix) for fix in fixes]
     assert [(verdict.code, verdict.commit) for verdict in outcomes] == [
@@ -1248,10 +1258,13 @@ def test_exemption_byte_limit_refuses_oversize_and_accepts_exact_bound(tmp_path,
 
     def counted(args, *a, **kw):
         if discovering and args[0] == "cat-file":
-            assert args[:2] == ["cat-file", "commit"] and len(args) == 3
+            assert args[1] in ("--batch-check", "--batch")
         result = real(args, *a, **kw)
         if args[:2] == ["cat-file", "commit"]:
             captures.append((args[2], len(result.stdout)))
+        elif args[:2] == ["cat-file", "--batch"]:
+            captures.extend((oid, int(repo.git("cat-file", "-s", oid)))
+                            for oid in kw["stdin"].decode("ascii").splitlines())
         return result
 
     monkeypatch.setattr(gitsafe, "run", counted)
@@ -1278,15 +1291,12 @@ def test_failed_exemption_object_read_returns_no_candidate(tmp_path, monkeypatch
 
     repo = hg.make_repo(tmp_path)
     fix = repo.commit("fix: no tests", allow_empty=True)
-    real = gitsafe.run
+    def failed(*a, **kw):
+        raise gitsafe.GitError("unreadable")
 
-    def failed(args, *a, **kw):
-        if args[:2] == ["cat-file", "commit"]:
-            return subprocess.CompletedProcess(args, 1, b"", b"unreadable")
-        return real(args, *a, **kw)
-
-    monkeypatch.setattr(gitsafe, "run", failed)
-    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    monkeypatch.setattr(gitsafe, "read_blobs", failed)
+    with pytest.raises(gitsafe.GitError, match="^unreadable$"):
+        human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
 
 
 @needs_git
@@ -1299,17 +1309,22 @@ def test_failed_object_read_discards_partial_exemption_candidates(tmp_path, monk
     for i in range(8):
         repo.commit(human_gate.exemption_message(fix, f"reviewed {i}") + "\nAegis-Accept: reserved\n", allow_empty=True)
     calls = []
-    real = gitsafe.run
+    real = gitsafe.read_blobs
+    real_iter = gitsafe.iter_objects
 
-    def failed(args, *a, **kw):
-        if args[:2] == ["cat-file", "commit"]:
-            calls.append(args)
-            if len(calls) == failed_read:
-                return subprocess.CompletedProcess(args, 1, b"", b"untrusted diagnostics")
-        return real(args, *a, **kw)
+    def one_per_chunk(cwd, oids, **kw):
+        return real_iter(cwd, oids, byte_budget=1, **kw)
 
-    monkeypatch.setattr(gitsafe, "run", failed)
-    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    def failed(cwd, oids, **kw):
+        calls.append(list(oids))
+        if len(calls) == failed_read:
+            raise gitsafe.GitError("untrusted diagnostics")
+        return real(cwd, oids, **kw)
+
+    monkeypatch.setattr(gitsafe, "iter_objects", one_per_chunk)
+    monkeypatch.setattr(gitsafe, "read_blobs", failed)
+    with pytest.raises(gitsafe.GitError, match="^untrusted diagnostics$"):
+        human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
     assert len(calls) == failed_read
 
 
@@ -1629,3 +1644,33 @@ def test_without_a_terminal_neither_flow_runs_the_signing_program(tmp_path, monk
     rc, doc = _approve_on_a_pty(repo, monkeypatch, exempt, tty=False)
     assert rc == 1 and doc["code"] == "no_terminal"
     assert not seen.exists() and repo.head() == before
+
+
+@needs_git
+@pytest.mark.parametrize("failure", ["wrong-kind", "timeout", "nonzero"])
+def test_batched_exemption_preflight_failure_has_no_candidates_or_diagnostics(tmp_path, monkeypatch, capsys, failure):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    repo.commit(human_gate.exemption_message(fix, "reviewed") + "\nAegis-Accept: reserved\n", allow_empty=True)
+    real = gitsafe.run
+    preflights = []
+
+    def failed(args, *a, **kw):
+        if args[:2] == ["cat-file", "--batch-check"]:
+            preflights.append(args)
+            if failure == "timeout":
+                raise gitsafe.GitError("private preflight diagnostic")
+            requested = kw["stdin"].decode("ascii").splitlines()
+            reply = b"".join(f"{oid} blob 3\n".encode("ascii") for oid in requested)
+            return subprocess.CompletedProcess(args, int(failure == "nonzero"), reply, b"private diagnostic")
+        assert args[:2] != ["cat-file", "--batch"], "content was captured after a failed size preflight"
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", failed)
+    with pytest.raises(gitsafe.GitError):
+        human_gate.exemption_finder(repo.root, "HEAD", "main")
+    assert len(preflights) == 1
+    output = capsys.readouterr()
+    assert "private" not in output.out + output.err
