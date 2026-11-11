@@ -80,7 +80,7 @@ def test_platform_without_checked_reads_hashes_and_validates(mailbox, monkeypatc
     if boundary == "no_nofollow":
         overrides.update(O_NOFOLLOW=0, open=unavailable)
     elif boundary == "unsupported_probe":
-        monkeypatch.setattr(module, "_checked_reads_supported", lambda: False, raising=False)
+        monkeypatch.setattr(module, "_checked_reads_supported", lambda: False)
         overrides["open"] = unavailable
     monkeypatch.setattr(module, "os", PlatformOS("nt" if boundary == "nt" else os.name,
                                                 base=module.os, **overrides))

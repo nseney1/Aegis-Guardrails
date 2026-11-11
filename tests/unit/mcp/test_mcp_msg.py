@@ -426,7 +426,7 @@ def test_selector_bounds_refuse_before_store_access(fields, workspace, monkeypat
     from aegis_core import storage
     def must_not_open(*args):
         pytest.fail("selector bounds must be checked before store access")
-    monkeypatch.setattr(storage, "message_store", must_not_open, raising=False)
+    monkeypatch.setattr(storage, "message_store", must_not_open)
     refuse("read", "E_SELECTOR", ref="a" * 64, fields=fields)
     assert not (workspace / ".aegis" / "state").exists()
 
@@ -463,7 +463,7 @@ def test_read_preflight_precedes_all_store_io(options, code, workspace, monkeypa
     from aegis_core import storage
     def must_not_open(*args, **kwargs):
         pytest.fail("invalid options reached store I/O")
-    monkeypatch.setattr(storage, "message_store", must_not_open, raising=False)
+    monkeypatch.setattr(storage, "message_store", must_not_open)
     refuse("read", code, ref="a" * 64, **options)
     assert not (workspace / ".aegis" / "state").exists()
 

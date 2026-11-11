@@ -10,7 +10,6 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
-import time
 from time import time_ns
 from types import SimpleNamespace
 
@@ -38,7 +37,7 @@ def _settle_ledger(root, monkeypatch):
 
 
 def _ledger_reads(monkeypatch):
-    reads, real_open, real_fdopen = [], open, ledger.os.fdopen
+    reads, real_fdopen = [], ledger.os.fdopen
 
     @contextmanager
     def observed(stream):
@@ -49,10 +48,11 @@ def _ledger_reads(monkeypatch):
                 return data
             yield SimpleNamespace(read=read, seek=fh.seek, fileno=fh.fileno)
 
-    monkeypatch.setattr(ledger, "open", lambda *a, **kw: observed(real_open(*a, **kw)), raising=False)
     monkeypatch.setattr(ledger, "os", SimpleNamespace(**dict(
         vars(ledger.os), fdopen=lambda *a, **kw: observed(real_fdopen(*a, **kw)))))
     return reads
+
+
 
 
 def _settle_keyed_index(root, monkeypatch):
@@ -134,7 +134,7 @@ def test_settled_index_open_refusal_matches_cold_read(tmp_path, monkeypatch, ope
         opened.append(Path(value))
         raise PermissionError(errno.EACCES, "injected ledger read refusal")
 
-    monkeypatch.setattr(ledger, "atomicio", SimpleNamespace(open_regular=refused), raising=False)
+    monkeypatch.setattr(ledger, "atomicio", SimpleNamespace(**dict(vars(atomicio), open_regular=refused)))
     for root in (tmp_path, cold):
         with pytest.raises(PermissionError) as caught:
             getattr(ledger, operation)(root, [event])
@@ -192,7 +192,7 @@ def test_ledger_index_closes_opened_descriptor_on_failure(tmp_path, monkeypatch,
     io = SimpleNamespace(**dict(vars(os),
         fstat=refused if stage == "fstat" else os.fstat,
         fdopen=refused if stage == "fdopen" else failing_stream))
-    monkeypatch.setattr(ledger, "atomicio", SimpleNamespace(open_regular=opened), raising=False)
+    monkeypatch.setattr(ledger, "atomicio", SimpleNamespace(**dict(vars(atomicio), open_regular=opened)))
     monkeypatch.setattr(ledger, "os", io)
     try:
         with pytest.raises(OSError) as caught:
@@ -303,8 +303,7 @@ def test_process_clock_ahead_of_coarse_filesystem_cannot_certify_erased_key(tmp_
     monkeypatch.setattr(ledger, "os", io)
     monkeypatch.setattr(storage, "os", io)
     monkeypatch.setattr(credit_memo, "os", io)
-    # Adversarial process clock, deliberately ahead of the filesystem clock.
-    monkeypatch.setattr(ledger, "time_ns", lambda: tick + 10_000_000_000, raising=False)
+    # Coarse filesystem evidence cannot certify an erased key.
     ledger.append(tmp_path, [event])
     original = path.read_bytes()
     replacement = original.replace(b'"key":"key-a"', b'"key":"key-b"')
@@ -336,10 +335,8 @@ def test_credit_memo_process_clock_cannot_certify_erased_exposure(tmp_path, monk
         lstat=lambda *a, **kw: stamps(os.lstat(*a, **kw)), fstat=lambda fd: stamps(os.fstat(fd))))
     for module in (storage, credit_memo, ledger):
         monkeypatch.setattr(module, "os", io)
-    monkeypatch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + 10_000_000_000)))
-    monkeypatch.setattr(credit_memo, "time_ns", lambda: tick + 10_000_000_000, raising=False)
     if unavailable:
-        monkeypatch.setattr(credit_memo, "filesystem_clock_supported", lambda: False, raising=False)
+        monkeypatch.setattr(credit_memo, "filesystem_clock_supported", lambda: False)
     assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
     original = path.read_bytes()
     replacement = original.replace(b'"rule-a"', b'"rule-b"')
@@ -524,13 +521,15 @@ def test_reset_before_append_report_under_clock_skew_never_fills(tmp_path, monke
             path.write_bytes(replacement)
             resets.append(True)
 
-    # Model process clocks ahead of the file clock: even apparently settled
-    # append evidence cannot certify a row erased before its report is captured.
-    monkeypatch.setattr(credit_memo, "time_ns", lambda: time_ns() + 10_000_000_000, raising=False)
+    # Append evidence cannot certify a row erased before its report is captured.
     with monkeypatch.context() as patch:
-        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: time_ns() + 3_000_000_000)))
         patch.setattr(storage, "os", SimpleNamespace(**dict(vars(credit_memo.os), fsync=fsync)))
         assert len(credit.record_exposure(tmp_path, "host", "session", ["rule-a"])) == 1
+    info = path.stat()
+    fresh = storage.FileReport((info.st_dev, info.st_ino), info.st_size,
+                               mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns,
+                               started_ns=info.st_mtime_ns)
+    assert not credit_memo.settled(fresh), "a process clock cannot settle fresh append evidence"
     assert resets == [True]
     assert [row["rule"] for row in credit.record_exposure(tmp_path, "host", "session", ["rule-a"])] == ["rule-a"]
     assert [row["rule"] for row in credit.read_rows(tmp_path)] == ["rule-b", "rule-a"]
@@ -572,9 +571,7 @@ def test_delayed_fill_with_coarse_unchanged_stamps_stays_ineligible(tmp_path, mo
         fstat=lambda fd: coarse(os.fstat(fd))))
     monkeypatch.setattr(storage, "os", io)
     monkeypatch.setattr(credit_memo, "os", io)
-    monkeypatch.setattr(credit_memo, "time_ns", lambda: tick + 10_000_000_000, raising=False)
     with monkeypatch.context() as patch:
-        patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + 500_000_000)))
         patch.setattr(credit, "read_rows_with_report", read)
         rules = ["rule-a"] if operation == "read" else ["rule-a", "rule-e"]
         credit.record_exposure(tmp_path, "other-host", "session", rules)
