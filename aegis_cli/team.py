@@ -5,7 +5,8 @@ The dispatcher runs these; there is no MCP tool for them. ``claim``, ``renew`` a
 the next ``--expect``. With ``--json`` stdout carries one document with ``source``,
 ``aegis_version``, ``checked_at`` (UTC) and ``scope``, refusals and errors included.
 
-Exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
+Host capacity check exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
+Other exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
 git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
 that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -211,6 +213,37 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
 }
 
 
+def _display_action_parts(parts, shown):
+    """Render service template literals and separately validated identities."""
+    from aegis_core.team_profile import JSON_SCHEMA, MAX_STRING
+    from aegis_core.team_hosts import NEXT_ACTION_TEMPLATES
+
+    if type(parts) is not list or not 0 < len(parts) <= 16:
+        return None
+    pattern = next(iter(JSON_SCHEMA["properties"]["model_settings"]["properties"]["hosts"]["patternProperties"]))
+    literals = {part for template in NEXT_ACTION_TEMPLATES.values() for part in template}
+    rendered, remaining = [], MAX_STRING
+    for part in parts:
+        marker = None
+        if type(part) is dict and len(part) == 1:
+            marker = next(iter(part))
+            if marker not in ("identifier", "text"):
+                return None
+            part = part[marker]
+        if type(part) is not str or len(part) > remaining:
+            return None
+        remaining -= len(part)
+        if marker == "identifier":
+            if len(part) > 64 or re.fullmatch(pattern, part) is None:
+                return None
+            rendered.append(shown(part, identifier=True))
+        elif marker == "text":
+            rendered.append(shown(part))
+        else:
+            rendered.append(sanitize_display(part, max_len=None) if part in literals else shown(part))
+    return sanitize_display("".join(rendered), max_len=512)
+
+
 def display_profile(value: Any) -> Any:
     """Keep untrusted profile text on the canonicalize/redact/truncate path."""
     from aegis_core.redaction import redact_command_secrets
@@ -242,8 +275,13 @@ def display_profile(value: Any) -> Any:
             return "[REDACTED]"
         if type(item) is dict:
             result = {}
+            action = (_display_action_parts(item["next_action_parts"], shown)
+                      if "next_action" in item and "next_action_parts" in item else None)
             for key, child in item.items():
-                reference = key in {"runner", "hosts", "host_pref", "applied_to", "applied_paths", "path"}
+                reference = key in {"runner", "hosts", "host", "host_kind", "selected_host", "kind", "decision",
+                                    "host_pref", "applied_to", "applied_paths", "path"}
+                reference = reference or (key == "next_action_parts" and action is not None)
+                reference = reference or (key == "identifier" and identifier and path[-2:-1] == ("next_action_parts",))
                 if key == "name":
                     # Doctor host aliases and review lens names are constrained
                     # identifiers. Gate names are free text and must be redacted,
@@ -252,14 +290,18 @@ def display_profile(value: Any) -> Any:
                     reference = reference or path[-4:-1] == ("policy", "review", "lenses")
                     reference = reference or (len(path) == 4 and path[0] == "values" and path[2] == "value" and
                                              tuple(values[path[1]]["path"]) == ("policy", "review", "lenses"))
-                reference = reference or (key in {"review", "doc"} and path[-1:] == ("fallback",))
+                reference = reference or path[-1:] == ("fallback",)
                 if key == "value" and len(path) == 2 and path[0] == "values":
                     components = tuple(values[path[1]]["path"])
-                    reference = components[-1:] in (("hosts",), ("host_pref",)) or components[-2:] in (("fallback", "review"), ("fallback", "doc"))
+                    reference = components[-1:] in (("hosts",), ("host_pref",)) or components[-2:-1] == ("fallback",)
                 result[shown(key, identifier=True)] = walk(child, (*path, key), reference)
+            if action is not None:
+                result["next_action"] = action
             return result
         if type(item) is list:
-            return [walk(child, (*path, index), identifier) for index, child in enumerate(item)]
+            return [walk(child, (*path, index), identifier and
+                         (path[-1:] != ("next_action_parts",) or type(child) is not str))
+                    for index, child in enumerate(item)]
         return shown(item, identifier) if type(item) is str else item
 
     return walk(value)
@@ -270,7 +312,9 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
     from aegis_core import team_profile
 
     noun = args.team_action
-    verb = getattr(args, "config_action", None) if noun == "config" else None
+    verb = getattr(args, "config_action", None) if noun == "config" else getattr(args, "hosts_action", None)
+    if noun == "hosts" and verb not in ("status", "check", "usage"):
+        verb = None
     command = noun + (" " + verb if verb else "")
     schema = "aegis.team." + command.replace(" ", ".") + "/v1"
     payload = primitives.envelope("aegis team " + command, {"workspace": str(root)}, now=now)
@@ -292,8 +336,11 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
                            next_action="Review the profile diff and use aegis approve; hosted aegis-governance gates approval before merge. Run aegis team doctor --json.")
         else:
             resolved = team_profile.load(root)
-            if noun == "doctor":
+            if noun == "hosts":
+                code = _hosts_result(args, resolved, payload)
+            elif noun == "doctor":
                 found = team_profile.doctor(resolved, root=root)
+                _doctor_capacity(resolved, found)
                 payload.update(found)
                 if found["healthy"]:
                     payload.update(status="done", next_action="Review the resolved profile with aegis team config show --json.")
@@ -334,6 +381,46 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
     return code
 
 
+def _doctor_capacity(resolved, found):
+    """Compose health and capacity views without a profile/service cycle."""
+    from aegis_core.team_hosts import HostCapacity
+
+    capacity = {row["host"]: row for row in HostCapacity(resolved).status()}
+    found["hosts"] = [{**host, **{key: value for key, value in capacity[host["name"]].items() if key != "host"}}
+                      for host in found["hosts"]]
+    found["write_scope"] = _capacity_write_scope(found["hosts"])
+
+
+def _capacity_write_scope(rows):
+    return list(dict.fromkeys(scope for row in rows for decision in row["decisions"]
+                              for scope in decision.get("write_scope", [])))
+
+
+def _hosts_result(args, resolved, payload):
+    """Thin host view; all policy and advice live in the shared service."""
+    from aegis_core import team_hosts, team_profile
+
+    verb = args.hosts_action
+    host, kind = args.host, args.kind
+    if (verb not in ("status", "check", "usage") or
+            (verb == "check" and (host is None or kind is None)) or
+            (verb != "check" and (host is not None or kind is not None))):
+        raise team_profile.ProfileError("use hosts status|usage or hosts check HOST KIND", layer="flags",
+                                        file="<command-line>", exit_code=2)
+    service = team_hosts.HostCapacity(resolved)
+    payload.update(status="done", exit_codes=team_hosts.EXIT_CODES,
+                   write_scope=resolved["write_scope"],
+                   next_action="Run aegis team hosts status --json to choose a declared host and kind, then aegis team hosts check HOST KIND --json.")
+    if verb == "check":
+        result = service.check(host, kind)
+        payload.update(result)
+        return result["exit_code"]
+    payload["hosts"] = service.status() if verb == "status" else service.usage()
+    if verb == "status":
+        payload["write_scope"] = _capacity_write_scope(payload["hosts"])
+    return EXIT_OK
+
+
 # ── Failures ─────────────────────────────────────────────────────────────────
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
@@ -370,7 +457,7 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
-    if action in ("config", "doctor"):
+    if action in ("config", "doctor", "hosts"):
         root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
         return _profile_command(args, root, int(time.time()))
     if action not in _HANDLERS:
@@ -419,6 +506,14 @@ class TeamCommand(AegisCommand):
         config_init.add_argument("--host", default=None, metavar="KIND", help="Bind the preset host kind at initialization; see config presets --json")
         config_init.add_argument("--force", action="store_true", help="Replace an existing valid profile")
         sub.add_parser("doctor", parents=[common], help="Check profile completeness and host CLIs on PATH")
+        hosts = sub.add_parser("hosts", parents=[common], help="Read host capacity and per-host usage",
+                               description="Read capacity advice: status | usage | check HOST KIND. "
+                               "KIND: writer, review, extra-review, doc, research, a declared role or lens. "
+                               "check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. "
+                               "Real usage readers are adapter extension points; credentials are never read.")
+        hosts.add_argument("hosts_action", nargs="?", metavar="VERB", help="status, check or usage")
+        hosts.add_argument("host", nargs="?", metavar="HOST", help="Declared host alias (see status --json)")
+        hosts.add_argument("kind", nargs="?", metavar="KIND", help="Job kind or declared role/lens")
         lane_help = f"Lane name: {team.LANE_GRAMMAR}"
         expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
 

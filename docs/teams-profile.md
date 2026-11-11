@@ -11,6 +11,9 @@ aegis team config init --preset solo --json
 aegis team config init --preset solo --host claude-code --json
 aegis team config show --json
 aegis team doctor --json
+aegis team hosts status --json
+aegis team hosts check primary writer --json
+aegis team hosts usage --json
 ```
 
 `init` creates `.aegis/team/profile.json` and refuses an existing profile unless
@@ -70,8 +73,10 @@ Credentials are always redacted.
 Display text is canonicalized, then secret values are redacted, then text is
 truncated, including JSON text. Schema-constrained identifiers and keys are not
 redacted; free text such as gate names is redacted in both profile and provenance.
-Reviewer hosts, optional/pinned-family settings, host-kind bindings and every
-review fallback are repository-only too. Only `lens.extra` may be optional.
+Reviewer `hosts`/`optional`/`pinned_family`, extra-lens routing settings,
+`fallback.review` chains and policy-lens `host_pref`/`pinned_family` refuse in
+the user and flag layers. Host-kind bindings are repository-only too.
+Only `lens.extra` may be optional.
 Validation checks declared hosts and transitive review fallbacks, including
 policy lenses. Host references, runner references and optional lens names use the
 same identifier grammar as named map keys. Correctness and voting lens routes must remain opposite the
@@ -84,11 +89,16 @@ only to roles declared by the resolved repository. Authentication and capacity
 preferences are keyed by registered host kind, independently of repository
 aliases, and apply to every alias of a declared kind. Undeclared roles or kinds
 are ignored. Other allowed role/route fields apply only when they repeat the
-repository value; different values are ignored. Repository-only fields listed
-above still refuse as malformed user configuration. Each entry has a
-`user.model_settings.*` record in `values` with `status` applied/ignored, a reason
-and affected resolved paths (`applied_paths` keeps exact components). A user
-value equal to the repository-resolved value records `status: applied` and
+repository value; different values are ignored. Review-routing fields listed
+above still refuse as malformed user configuration. User `optional` and
+`pinned_family` entries for `writer` and `research` are always ignored with
+reason `repository-only`, never applied, even when they repeat repository
+values. Flags refuse every repository-only field for every role.
+
+Each entry has a `user.model_settings.*` record in `values` with `status`
+applied/ignored, a reason and affected resolved paths (`applied_paths` keeps exact
+components). For other allowed preferences, a user value equal to the
+repository-resolved value records `status: applied` and
 `reason: repeats repository` without merging, preserving its repository/preset
 origin. This also applies to repetitions outside `model_settings`. Empty
 objects add no user origin. Valid global
@@ -109,23 +119,34 @@ does not reconfigure an existing run.
 | `policy` | `landing` | target_branch, strategy (combined-full/batch/direct), batch_max, signature_required_for array; publish object with remote and app |
 | `model_settings` | `hosts` | Named objects with registered `kind`; user-only auth_mode (sso/api/token) |
 | `model_settings` | `roles` | writer, reviewer.correctness, reviewer.security, lens.extra, research; each has hosts (an ordered declared chain), optional model and effort strings, optional and pinned_family booleans |
-| `model_settings` | `capacity` | Per declared host: usage_source (subscription-window/credits/none), thresholds (hold_pct/route_pct/flex_route_pct), fallback (review/doc arrays of declared hosts) |
+| `model_settings` | `capacity` | Per declared host: usage_source (subscription-window/credits/none), thresholds (hold_pct/route_pct/flex_route_pct), fallback (per-kind arrays of declared hosts or hold/skip terminals) |
 | `run_config` | `runners` | Named objects with cpus, image, provider; user-only pool, credentials and budget_usd_month |
 | `run_config` | `autopilot` | queue_full_on_ready, claim_next, resume_writer booleans; rulings |
 | `run_config` | `limits` | Repository-only writers_max, votes_max, research_max |
 | `run_config` | `token_budgets` | User-only map of per-role positive integer token budgets |
 
 Positive integer settings are capped at 1,000,000; budget values are finite
-numbers in [0, 1,000,000]; percentages are finite numbers in [0, 100]. Arrays and
-named maps hold at most 64 entries. Strings hold at most 4,096 characters. Files
-hold at most 128 KiB, nesting at most 16, and resolution at most 4,096 nodes.
+numbers in [0, 1,000,000]; percentages are finite numbers in [0, 100]. Routing
+allows at most 16 declared hosts, 16 entries per role `hosts` or lens `host_pref`
+binding, 8 targets per fallback chain, and 64 fallback targets across all hosts
+and fallback keys together. Every declared target counts, including duplicates,
+`hold`/`skip` terminals, overridden aliases and routes unused by an enabled job.
+Policy lenses and an enabled `lens.extra` share a total of 16 slots; an extra
+lens with an empty binding is disabled and uses no slot. These limits
+apply to the merged profile and are checked before route planning, including
+when a consumer revalidates a resolved profile. Larger profiles refuse with
+their input layer, file and field path. Presets and the examples below fit.
+Other arrays and named maps hold at most 64 entries. Strings hold at most 4,096
+characters. Files hold at most 128 KiB, nesting at most 16, and resolution at
+most 4,096 nodes.
 Duplicate JSON keys refuse. Native `codex` app threads remain registry entries
 that cannot bind team-run roles. `codex-cli` and `claude-code` retain the registry's
 qualification boundaries; finding a CLI proves neither login nor OS isolation.
 Claude writers explicitly show `write scope: permission rules, not OS-enforced`.
 Every role accepting `pinned_family` requires a single-family host chain; pinned
-review lenses also refuse transitive review fallbacks that change family. Per-host usage
-is never summed, and these commands do not query usage.
+review lenses also refuse transitive review fallbacks that change family.
+Per-host usage is never summed; the host commands read configured usage through
+the adapter interface described below.
 
 The signature floor always includes `main`, and rulings stay with the owner.
 All shipped presets retain `combined-full` and a full gate; the repository
@@ -203,9 +224,12 @@ The commands use `primitives.envelope` with source, aegis_version, checked_at an
 scope. Config verbs have distinct schemas `aegis.team.config.show/v1`,
 `aegis.team.config.presets/v1`, `aegis.team.config.init/v1`, plus
 `schema_family: aegis.team.config/v1`. Doctor uses `aegis.team.doctor/v1`.
+Host verbs use `aegis.team.hosts.<verb>/v1`, with
+`schema_family: aegis.team.hosts/v1`.
 Each result includes `status` and `next_action`. Refusals also include `reason`,
 `layer` and `file`, so an agent can identify the input to correct without finding
-repository-local documentation. Exit codes are 0 done, 1 refused, 2 usage.
+repository-local documentation. Configuration and doctor exit codes are 0 done,
+1 refused, 2 usage; host checks have additional decision codes listed below.
 Config without a verb and an invalid init preset/host return usage (2), without
 echoing the invalid input.
 
@@ -235,3 +259,47 @@ available binding of the current preset follow as an exact
 `aegis team config init --preset NAME --host KIND` command. The loaded snapshot
 records that observation in `repository_profile_exists`; unknown presence does
 not authorize init advice. No host is silently substituted.
+
+## Host capacity and usage
+
+`aegis team hosts status --json` lists each declared host's usage source,
+thresholds and current job decisions. Doctor includes those same decisions.
+`aegis team hosts usage --json` returns per-host measurements without totals.
+`aegis team hosts check HOST KIND --json` advises whether a new job may start;
+it does not launch a host or grant execution authority. HOST is a profile alias.
+KIND is `writer`, `research`, a declared reviewer role or lens, or generic `doc`.
+`review` aliases `reviewer.correctness`; `extra-review` aliases `lens.extra`.
+Undeclared or disabled role/lens bindings refuse.
+
+Per-host `usage_source` is `subscription-window`, `credits` or `none` (default).
+Adapters normalize a subscription snapshot to `window.used_pct` and UTC
+`window.resets_at`, or a credit snapshot to `credits_left`; zero credits hold.
+`none` disables usage tracking. Real host readers are extension points: no
+credential reader ships here. An unconfigured, failing or malformed reader
+produces `unknown` for that host and does not block work by capacity advice alone;
+profile refusals and family pins still apply.
+
+Default thresholds are `hold_pct: 99` for writers, `route_pct: 95` for voting
+reviews and `flex_route_pct: 80` for non-voting lenses and other flexible jobs.
+Usage at or above the relevant threshold holds or follows a fallback. Profile
+overrides must satisfy `flex_route_pct <= route_pct <= hold_pct`; unspecified
+lower thresholds clamp to an explicitly lower hold/route value. User preferences
+that conflict with repository thresholds are recorded as ignored.
+
+Canonical role-specific fallback keys override generic chains, including empty
+overrides. Aliases resolve before key selection. The first `hold` or `skip`
+terminal ends traversal; later hosts are unreachable. `skip` is allowed only for
+non-voting jobs; an exhausted chain holds. A held pinned role or lens waits
+without falling back. Window holds name the reset in `next_action`.
+
+Checks from a later admitted host retain explicit fallbacks to earlier hosts.
+Loading the profile validates the same plan from every bound or admitted host:
+each plan must respect family rules and pins, required votes, and destination
+admission. If restarting a plan exposes a forbidden terminal or a destination
+that cannot itself be checked for that job, the profile refuses at load.
+
+Check exits are 0 `go`, 3 `hold`, 4 `fallback:HOST`, 5 `skip`, 1 refusal or 2 usage.
+Each decision includes its reason and next action. Writer decisions identify
+`selected_host` and that host's `write_scope` and `write_boundary`, including a
+fallback's weaker boundary: Claude reports `permission rules, not OS-enforced`.
+Status and doctor retain the same destination boundary information.

@@ -248,6 +248,61 @@ def test_limits_before_json_parse(tmp_path, monkeypatch, content, message):
         profile.load(root, user_root=root)
 
 
+@pytest.mark.parametrize("limit,path", [
+    ("hosts", "model_settings.hosts"), ("chain", "model_settings.capacity.h00.fallback.review"),
+    ("lenses", "policy.review.lenses"), ("extra-lens", "policy.review.lenses"),
+    ("edges", "model_settings.capacity"), ("reviewer-profile", "model_settings.hosts"),
+])
+def test_routing_limits_refuse_at_load_before_traversal(tmp_path, monkeypatch, limit, path):
+    root = make_store(tmp_path)
+    settings = {"hosts": {f"h{i:02d}": {"kind": "codex-cli"} for i in range(16)}}
+    document = {"version": 1, "preset": "ci-only", "model_settings": settings}
+    if limit == "reviewer-profile":
+        names = [f"h{i:02d}" for i in range(64)]
+        settings["hosts"] = {name: {"kind": "codex-cli"} for name in names}
+        settings["roles"] = {kind: {"hosts": names[:1]} for kind in ("writer", "reviewer.correctness")}
+        settings["capacity"] = {name: {"fallback": {"review": [names[(i + offset) % 64]
+                                for offset in range(1, 41)]}} for i, name in enumerate(names)}
+        document["policy"] = {"review": {"require_cross_family": False, "lenses": [
+            {"name": f"audit{i:02d}", "host_pref": names[:1], "voting": True} for i in range(64)]}}
+    elif limit == "hosts":
+        settings["hosts"]["overflow"] = {"kind": "codex-cli"}
+    elif limit == "chain":
+        settings["capacity"] = {"h00": {"fallback": {"review": ["h00"] * 9}}}
+    elif limit == "edges":
+        settings["capacity"] = {"h00": {"fallback": {kind: ["h00"] * 8 for kind in profile.CAPACITY_KINDS}},
+                                "h01": {"fallback": {"writer": ["h00"]}}}
+    else:
+        document["policy"] = {"review": {"lenses": [
+            {"name": f"audit{i:02d}", "host_pref": ["h00"]} for i in range(17 if limit == "lenses" else 16)]}}
+        if limit == "extra-lens":
+            settings["roles"] = {"lens.extra": {"hosts": ["h00"], "optional": True}}
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(document), encoding="utf-8")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("traversal started before refusing an oversized routing graph")
+
+    monkeypatch.setattr(profile, "plan", forbidden)
+    with pytest.raises(profile.ProfileError, match="limit exceeded") as refused:
+        profile.load(root, user_root=root)
+    assert refused.value.exit_code == 1 and refused.value.layer == "repo"
+    assert refused.value.file == str(target) and refused.value.path == path
+
+
+def test_routing_host_limit_includes_preset_aliases(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("traversal started before counting the preset host")
+
+    monkeypatch.setattr(profile, "plan", forbidden)
+    with pytest.raises(profile.ProfileError, match="profile host limit exceeded") as refused:
+        profile.resolve(repo={"model_settings": {"hosts": {
+            f"h{i:02d}": {"kind": "codex-cli"} for i in range(16)}}})
+    assert refused.value.exit_code == 1 and refused.value.layer == "repo"
+    assert refused.value.file == "/".join(profile.REPO_PATH) and refused.value.path == "model_settings.hosts"
+
+
 @pytest.mark.parametrize("parts,component", [
     (profile.REPO_PATH, 0), (profile.REPO_PATH, 1), (profile.REPO_PATH, 2),
     (profile.USER_PATH, 2),
@@ -824,7 +879,7 @@ def test_counterfactual_attribution_includes_user_parse_failures(tmp_path, repo_
 @pytest.mark.parametrize("repo,flags,message", [
     ({"model_settings": {"hosts": {"alternate": {"kind": "claude-code"}},
                          "roles": {"writer": {"hosts": ["primary", "alternate"]}}}},
-     {"model_settings": {"roles": {"writer": {"pinned_family": True}}}}, "pinned role chain changes family"),
+     {"model_settings": {"roles": {"writer": {"pinned_family": True}}}}, "optional/pinned-family settings are repository-only; use the approval-before-merge path"),
     ({"preset": "ci-only"}, {"model_settings": {"roles": {"writer": {"model": "m"}}}}, "incomplete role: declared hosts required"),
     ({}, {"model_settings": {"roles": {"lens.extra": {"model": "m"}}}}, "incomplete role: declared hosts required"),
     ({}, {"model_settings": {"roles": {"lens.extra": {}}}}, "incomplete role: declared hosts required"),
