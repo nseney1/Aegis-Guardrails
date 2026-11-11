@@ -226,9 +226,12 @@ the failure report alone never permits release of resources.
 
 ## Job admission blockers
 
-`run-open` returns 3 for `waiting`, `running`, `abandoned`, `settle_pending` and
-`granted_elsewhere`; these rows need attention or another authorized pass. Code 2 is a
-refusal before a durable grant, not a claim that an acknowledged grant never happened.
+`run-open` returns 3 for `waiting`, `running`, `abandoned`, `settle_pending`,
+`mailbox_error` and `granted_elsewhere`; these rows need attention or another authorized
+pass. For `mailbox_error`, the initiative's mailbox could not be read or validated;
+the row's `error` names the cause, such as an unreadable or unsafe path, an invalid
+manifest, or a malformed or unexpected mailbox entry. Code 2 is a refusal before a
+durable grant, not a claim that an acknowledged grant never happened.
 Code 0 includes terminal failed jobs whose receipts were settled.
 
 Use this section for current job-state actions; `hierarchy-dogfood.md` is retained
@@ -252,6 +255,7 @@ stale-kind guidance and explicit post-grant fault recovery keep their contracts.
 | `running` | Another runner owns execution; preserve its claim |
 | `abandoned` | Inspect `process_alive` and `next_action`; preserve unknown custody. With a valid original stopped claim, stop any remaining group before `resolve --job <initiative>/<message-id> --reason "..."` |
 | `settle_pending` | Repair the reported per-job claim, mailbox, storage or settlement error and run `run-open` again; an existing claim is never executed twice |
+| `mailbox_error` | Read the row's `error`; repair the named mailbox path, manifest or entry, then run `run-open` again |
 | `granted_elsewhere` with `stale_kind` | Follow the matching-grant rule below; this grant alone does not authorize this job's execution |
 | Other `granted_elsewhere` | Re-admit a job holder through its owning initiative and clear blockers. A manual holder may start its already authorized work |
 | `reason` or `failure_reason` starting `post_grant_` | Preserve the durable grant, prior rows and census marker; root repairs ledger/audit access and reconciles using correlated terminal evidence |

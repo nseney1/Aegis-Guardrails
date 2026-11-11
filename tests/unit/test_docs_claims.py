@@ -129,6 +129,21 @@ def test_documented_commands_and_flags_exist():
     assert problems == []
 
 
+def test_recovery_doc_names_every_run_open_exit_three_state():
+    from tools import hierarchy_jobs
+
+    text = (ROOT / "docs/hierarchy-recovery.md").read_text(encoding="utf-8")
+    sentence = re.search(r"`run-open` returns 3 for (.*?);", text, re.DOTALL)
+    assert sentence is not None, "missing run-open exit-3 state list"
+    assert set(re.findall(r"`([^`]+)`", sentence.group(1))) == hierarchy_jobs.NEEDS_ROOT
+    table = re.search(r"^\| You see \| Next action \|\n(?:\|[^\n]*\n)+", text, re.MULTILINE)
+    assert table is not None, "missing job admission blocker action table"
+    table_states = set()
+    for row in table.group().splitlines()[2:]:
+        table_states.update(re.findall(r"`([^`]+)`", row.split("|")[1]))
+    assert hierarchy_jobs.NEEDS_ROOT <= table_states
+
+
 @pytest.mark.parametrize("example, message", [
     ("`aegis nonexistent`", "unknown command nonexistent"),
     ("`aegis check --nonexistent`", "unknown flag --nonexistent"),
