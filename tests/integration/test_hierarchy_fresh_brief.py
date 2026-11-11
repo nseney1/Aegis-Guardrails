@@ -1,4 +1,5 @@
 """Fresh-thread briefs through the CLI; records remain inert claims."""
+import ast
 import errno
 import hashlib
 import json
@@ -21,6 +22,436 @@ from tools.hierarchy_mailbox import Mailbox, safe_path
 
 
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
+
+
+def assert_latch_release_structure(source):
+    """Allow only explicit view producers, consumers and mutations.
+
+    Every view/rows/run escape is checked, including the read-only aliases in
+    exclusions(). Unknown shapes require review; key spelling is not the only
+    way to discover a protected value.
+    """
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    keys = {'route_receipt', 'writer_publication_verified'}
+    scopes = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    writes, writers, initializers, collections = [], set(), [], []
+
+    def ancestors(node):
+        chain = []
+        while node in parents:
+            node = parents[node]
+            chain.append(node)
+        return chain
+
+    def qualified(node):
+        return '.'.join(item.name for item in reversed(ancestors(node)) if isinstance(item, scopes))
+
+    def name(node, value):
+        return isinstance(node, ast.Name) and node.id == value
+
+    def string(node):
+        return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+    def view(node):
+        return isinstance(node, ast.Attribute) and node.attr == 'view' and name(node.value, 'self')
+
+    def literal_keys(node):
+        return isinstance(node, ast.Dict) and all(string(key) for key in node.keys)
+
+    def rows_append(call):
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and name(call.func.value, 'rows') and call.func.attr == 'append'
+                and len(call.args) == 1 and not call.keywords and qualified(call) == 'project')
+
+    def run_call(call):
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == 'run'
+                and (name(call.func.value, 'current') or (isinstance(call.func.value, ast.Call)
+                     and name(call.func.value.func, 'context') and not call.func.value.args
+                     and not call.func.value.keywords))
+                and len(call.args) == 1 and isinstance(call.args[0], ast.Constant)
+                and type(call.args[0].value) is bool and not call.keywords)
+
+    # There is no admitted reflective spelling of the protected view. Reject
+    # opaque reflection primitives too, including aliases to those primitives.
+    reflection = {'getattr', 'setattr', 'vars', 'eval', 'exec', 'globals', 'locals'}
+    for node in ast.walk(tree):
+        if ((isinstance(node, ast.Name) and node.id in reflection)
+                or (isinstance(node, ast.Attribute) and node.attr in reflection | {
+                    '__dict__', '__getattribute__', '__setattr__'})
+                or (string(node) and node.value == 'view')
+                or (isinstance(node, ast.keyword) and node.arg == 'view')):
+            raise AssertionError(('release reflection is not admitted', node.lineno))
+
+    producers = {key: [] for key in ('Row', 'Row.run', 'Row.finalize_writer_release', 'project', 'exclusions')}
+    returns = []
+    for node in ast.walk(tree):
+        scope = qualified(node)
+        if isinstance(node, scopes):
+            identity = '.'.join(part for part in (scope, node.name) if part)
+            if identity in producers:
+                producers[identity].append(node)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in {'Row', 'project', 'exclusions'}:
+            raise AssertionError(('release producer rebinding', node.lineno))
+        if scope == 'Row.run' and isinstance(node, ast.Return):
+            assert view(node.value), ('release producer must return its protected view', node.lineno)
+            returns.append(node)
+        if scope == 'Row.run' and isinstance(node, (ast.Yield, ast.YieldFrom)):
+            raise AssertionError(('release producer cannot yield a view', node.lineno))
+    assert all(len(definitions) == 1 for definitions in producers.values()), ('release producer definitions', producers)
+    run = producers['Row.run'][0]
+    assert (isinstance(run, ast.FunctionDef) and len(returns) == 1 and run.body[-1] is returns[0]), (
+        'release producer must have one final return')
+
+    # The only escaped views are Row.run's result, the project rows collection,
+    # and the read-only "view" iteration variable inside exclusions().
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        scope = qualified(node)
+        if isinstance(node, ast.Name) and node.id == 'self' and scope.startswith('Row.'):
+            allowed = isinstance(parent, ast.Attribute) and parent.value is node
+            allowed = allowed or (isinstance(parent, ast.Call) and name(parent.func, 'hasattr')
+                and len(parent.args) == 2 and parent.args[0] is node and string(parent.args[1])
+                and parent.args[1].value == 'result_record' and not parent.keywords
+                and scope == 'Row.foreign_publications')
+            assert allowed, ('release view escape through holder', node.lineno)
+        if isinstance(node, ast.Name) and node.id == 'current' and scope == 'project' and isinstance(node.ctx, ast.Load):
+            allowed = isinstance(parent, ast.Attribute) and parent.value is node
+            allowed = allowed or (isinstance(parent, ast.Compare) and parent.left is node
+                and len(parent.ops) == 1 and isinstance(parent.ops[0], ast.Is)
+                and len(parent.comparators) == 1 and isinstance(parent.comparators[0], ast.Constant)
+                and parent.comparators[0].value is None)
+            allowed = allowed or (isinstance(parent, ast.Call) and name(parent.func, 'exclusions')
+                and len(parent.args) == 2 and parent.args[0] is node and name(parent.args[1], 'rows')
+                and not parent.keywords)
+            assert allowed, ('release view escape through current', node.lineno)
+        if isinstance(node, ast.Name) and node.id == 'view':
+            allowed = False
+            if scope == 'exclusions':
+                if isinstance(node.ctx, ast.Store):
+                    allowed = (isinstance(parent, (ast.For, ast.comprehension))
+                               and parent.target is node and name(parent.iter, 'rows'))
+                elif isinstance(node.ctx, ast.Load):
+                    allowed = (isinstance(parent, ast.Subscript) and parent.value is node
+                               and isinstance(parent.ctx, ast.Load) and string(parent.slice))
+                    if isinstance(parent, ast.Attribute):
+                        call = parents[parent]
+                        allowed = (parent.attr == 'get' and isinstance(call, ast.Call) and call.func is parent
+                                   and 1 <= len(call.args) <= 2 and string(call.args[0]) and not call.keywords)
+            assert allowed, ('release view escape or mutation of alias', node.lineno)
+        if isinstance(node, ast.Name) and node.id == 'rows':
+            allowed = False
+            if isinstance(node.ctx, ast.Store):
+                allowed = (scope == 'project' and isinstance(parent, ast.Assign) and parent.targets == [node]
+                           and isinstance(parent.value, ast.List) and not parent.value.elts)
+                if allowed:
+                    collections.append(parent)
+            elif isinstance(node.ctx, ast.Load):
+                if scope == 'exclusions':
+                    allowed = (isinstance(parent, (ast.For, ast.comprehension))
+                               and parent.iter is node and name(parent.target, 'view'))
+                elif scope == 'project':
+                    if isinstance(parent, ast.Attribute):
+                        call = parents[parent]
+                        if rows_append(call):
+                            value = call.args[0]
+                            allowed = run_call(value) or (isinstance(value, ast.Attribute)
+                                      and name(value.value, 'current') and value.attr == 'view')
+                    elif isinstance(parent, ast.Call):
+                        allowed = (name(parent.func, 'exclusions') and len(parent.args) == 2
+                                   and name(parent.args[0], 'current') and parent.args[1] is node
+                                   and not parent.keywords)
+                    elif isinstance(parent, ast.Dict) and isinstance(parents[parent], ast.Return):
+                        allowed = any(value is node and string(key) and key.value == 'small_changes'
+                                      for key, value in zip(parent.keys, parent.values))
+            assert allowed, ('release view escape through rows', node.lineno)
+        if isinstance(node, ast.Attribute) and node.attr == 'run':
+            call = parent
+            assert (scope == 'project' and run_call(call) and call.func is node
+                    and rows_append(parents[call]) and parents[call].args == [call]), (
+                        'release view escape through run result', node.lineno)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr != 'view':
+            continue
+        parent, scope = parents[node], qualified(node)
+        assert ((name(node.value, 'self') and scope.startswith('Row.'))
+                or (name(node.value, 'current') and scope == 'project')), (
+                    'release view receiver is not admitted', node.lineno)
+        if isinstance(node.ctx, ast.Store):
+            assert (scope == 'Row.__init__' and isinstance(parent, ast.Assign) and parent.targets == [node]
+                    and literal_keys(parent.value)), ('unrecognized release view replacement', node.lineno)
+            initializers.append(parent)
+        elif isinstance(parent, ast.Subscript) and parent.value is node:
+            assert string(parent.slice), ('unrecognized release view key', node.lineno)
+            if not isinstance(parent.ctx, ast.Load):
+                statement = parents[parent]
+                assert (isinstance(parent.ctx, ast.Store) and isinstance(statement, ast.Assign)
+                        and statement.targets == [parent]), ('unrecognized release subscript mutation', node.lineno)
+        elif isinstance(parent, ast.Attribute):
+            call = parents[parent]
+            assert isinstance(call, ast.Call) and call.func is parent, ('unrecognized release view method', node.lineno)
+            if parent.attr == 'update':
+                assert (len(call.args) <= 1 and all(literal_keys(arg) for arg in call.args)
+                        and all(keyword.arg is not None for keyword in call.keywords)), (
+                            'unrecognized release view update', node.lineno)
+            elif parent.attr == 'get':
+                assert (1 <= len(call.args) <= 2 and string(call.args[0]) and not call.keywords), (
+                    'unrecognized release view read', node.lineno)
+            else:
+                assert (parent.attr == 'pop' and scope == 'Row.finalize_writer_release'
+                        and len(call.args) == 2 and string(call.args[0])
+                        and isinstance(call.args[1], ast.Constant) and call.args[1].value is None
+                        and not call.keywords and isinstance(parents[call], ast.Expr)), (
+                            'unrecognized release view call', node.lineno)
+        elif isinstance(parent, ast.Return) and view(node) and scope == 'Row.run':
+            continue
+        else:
+            assert (scope == 'project' and name(node.value, 'current') and rows_append(parent)
+                    and parent.args == [node]), ('release view escape', node.lineno)
+
+    def proof_read(node):
+        return (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+                and name(node.value, 'self') and node.attr == '_verification_proof')
+
+    def positive(test):
+        candidates = test.values if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And) else [test]
+        return any(isinstance(item, ast.Compare) and proof_read(item.left) and len(item.ops) == 1
+                   and isinstance(item.ops[0], ast.IsNot) and len(item.comparators) == 1
+                   and isinstance(item.comparators[0], ast.Constant) and item.comparators[0].value is None
+                   for item in candidates)
+
+    for token in ast.walk(tree):
+        parent = parents.get(token)
+        if isinstance(token, ast.keyword) and token.arg in keys:
+            raise AssertionError(('unrecognized release keyword', token.arg, token.lineno))
+        if isinstance(token, ast.Attribute) and token.attr in keys and isinstance(token.ctx, (ast.Store, ast.Del)):
+            raise AssertionError(('unrecognized release attribute write', token.attr, token.lineno))
+        if not string(token) or token.value not in keys:
+            continue
+        removal = False
+        if isinstance(parent, ast.Subscript) and parent.slice is token:
+            if isinstance(parent.ctx, ast.Load):
+                assert name(parent.value, 'view') and qualified(parent) == 'exclusions', (
+                    'unrecognized release key read', token.lineno)
+                continue
+            statement = parents[parent]
+            assert (view(parent.value) and isinstance(parent.ctx, ast.Store)
+                    and isinstance(statement, ast.Assign) and statement.targets == [parent]), (
+                        'unrecognized release subscript write', token.lineno)
+        elif (isinstance(parent, ast.Call) and parent.args and parent.args[0] is token
+              and isinstance(parent.func, ast.Attribute)):
+            if parent.func.attr == 'get':
+                assert name(parent.func.value, 'view') and qualified(parent) == 'exclusions', (
+                    'unrecognized release key read', token.lineno)
+                continue
+            statement = parents[parent]
+            assert (view(parent.func.value) and parent.func.attr == 'pop' and len(parent.args) == 2
+                    and isinstance(parent.args[1], ast.Constant) and parent.args[1].value is None
+                    and not parent.keywords and isinstance(statement, ast.Expr)), (
+                        'unrecognized release mutation call', token.lineno)
+            removal = True
+        else:
+            raise AssertionError(('unrecognized release key use', token.value, token.lineno))
+        chain, owner = ancestors(statement), qualified(statement)
+        assert owner == 'Row.finalize_writer_release', ('release writer', owner, token.lineno)
+        writes.append((owner, token.lineno))
+        writers.add(next(node for node in chain if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))))
+        if removal:
+            continue
+        guarded, child = False, statement
+        for ancestor in chain:
+            if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                break
+            if isinstance(ancestor, ast.If):
+                assert not (child in ancestor.orelse and any(proof_read(read) for read in ast.walk(ancestor.test))), (
+                    'release proof polarity: orelse of proof-reading If', token.lineno)
+                guarded = guarded or (child in ancestor.body and positive(ancestor.test))
+            child = ancestor
+        assert guarded, ('release proof polarity: positive body gate required', token.lineno)
+
+    assert len(initializers) == 1 and len(collections) == 1, ('release view initialization', len(initializers), len(collections))
+    assert writes and len(writers) == 1, ('release function definitions', len(writers))
+    return writes
+
+
+def test_latch_release_assignments_require_one_proof_reading_function():
+    # Tracked source is ordinary, cross-platform test input.
+    assert_latch_release_structure((ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize('line', [
+    'self.view.update(route_receipt=self._writer_receipt, writer_publication_verified=True)',
+    'self.view.update({"route_receipt": self._writer_receipt})',
+    'self.view.setdefault("route_receipt", self._writer_receipt)',
+    'self.view.__setitem__("route_receipt", self._writer_receipt)',
+    'self.view["route_receipt"] = self.view.pop("route_receipt", None)',
+    'self.view["writer_publication_verified"] = self._writer_verified',
+    'self.view["writer_publication_verified"] = False',
+    'self.view["route_receipt"]: object = self._writer_receipt',
+    'self.view["route_receipt"] += self._writer_receipt',
+    'del self.view["route_receipt"]',
+    'self.view = {"route_receipt": self._writer_receipt}',
+    'self.view = dict(writer_publication_verified=self._writer_verified)',
+    'setattr(self, "route_receipt", self._writer_receipt)',
+    'self.view.route_receipt = self._writer_receipt',
+    'key = "route_receipt"; self.view[key] = self._writer_receipt',
+    'publish_release(self.view, "route_receipt", self._writer_receipt)',
+    'self.view["route_" + "receipt"] = self._writer_receipt',
+    'self.view.update(self._writer_fields)',
+    'self.view = self._writer_fields',
+    'alias = self.view; alias.update(self._writer_fields)',
+    'self.view.clear()',
+    'self.view |= self._writer_fields',
+], ids=['update-keywords', 'update-dict', 'setdefault', 'setitem', 'pop-reassign', 'nonliteral',
+        'false-value', 'annotated', 'augmented', 'delete', 'dict-display', 'dict-call', 'setattr',
+        'attribute-store', 'key-alias', 'unknown-call', 'computed-key', 'opaque-update',
+        'opaque-replacement', 'view-alias', 'clear', 'inplace-update'])
+def test_latch_structure_rejects_release_mutations(line):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source += '\nclass Bypass:\n    def recover(self):\n        ' + line + '\n'
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('class_name', ['Bypass', 'Row'])
+def test_latch_structure_rejects_same_bare_function_name_in_another_class(class_name):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source += '''
+class CLASS_NAME:
+    def finalize_writer_release(self):
+        if self._verification_proof is not None:
+            self.view["writer_publication_verified"] = True
+'''.replace('CLASS_NAME', class_name)
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+def test_latch_structure_rejects_release_outside_the_proof_if():
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    row = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == 'Row')
+    release = next(node for node in row.body if isinstance(node, ast.FunctionDef)
+                   and node.name == 'finalize_writer_release')
+    lines = source.splitlines(keepends=True)
+    lines.insert(release.lineno, '        self.view["writer_publication_verified"] = True\n')
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(''.join(lines))
+
+
+def latch_insert(source, qualified, snippet):
+    """Insert static text before a function's final return, or at a class/body end."""
+    tree = ast.parse(source)
+    parts = qualified.split('.')
+    nodes = tree.body
+    for part in parts:
+        node = next(item for item in nodes if isinstance(item, (ast.ClassDef, ast.FunctionDef))
+                    and item.name == part)
+        nodes = node.body
+    lines = source.splitlines(keepends=True)
+    indent = ' ' * (node.col_offset + 4)
+    position = (node.body[-1].lineno - 1 if isinstance(node, ast.FunctionDef)
+                and isinstance(node.body[-1], ast.Return) else node.end_lineno)
+    lines.insert(position, ''.join(indent + line + '\n' for line in snippet.splitlines()))
+    return ''.join(lines)
+
+
+@pytest.mark.parametrize('gate', [
+    'if self._verification_proof is None or clear_only:\n    WRITE',
+    'if self._verification_proof is None:\n    WRITE',
+    'if self._verification_proof is not None:\n    pass\nelse:\n    WRITE',
+    'if self._verification_proof is not None:\n    if self._verification_proof is not None:\n        pass\n    else:\n        WRITE',
+    'if self._verification_proof is not None or clear_only:\n    WRITE',
+    'if not (self._verification_proof is None):\n    WRITE',
+], ids=['clear-only-arm', 'none-body', 'positive-else', 'nested-proof-else', 'positive-or', 'unadmitted-negation'])
+def test_latch_r3_rejects_wrong_proof_polarity(gate):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    writes = 'self.view["writer_publication_verified"] = True; self.view["route_receipt"] = self._writer_receipt'
+    snippet = gate.replace('WRITE', writes)
+    if gate.startswith('if self._verification_proof is None or clear_only:'):
+        # Place it after removals and before clear_only's return, so the inserted
+        # grant would survive the actual recovery clear rather than being dead code.
+        row = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == 'Row')
+        release = next(node for node in row.body if isinstance(node, ast.FunctionDef)
+                       and node.name == 'finalize_writer_release')
+        clear = next(node for node in ast.walk(release) if isinstance(node, ast.If)
+                     and isinstance(node.test, ast.Name) and node.test.id == 'clear_only')
+        lines = source.splitlines(keepends=True)
+        lines.insert(clear.lineno - 1, ''.join(' ' * clear.col_offset + line + '\n'
+                                             for line in snippet.splitlines()))
+        source = ''.join(lines)
+    else:
+        source = latch_insert(source, 'Row.finalize_writer_release', snippet)
+    with pytest.raises(AssertionError, match='release proof polarity'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('line', [
+    'setattr(self, "view", saved)',
+    'getattr(self, "view").update(saved)',
+    'self.__dict__["view"] = saved',
+    'getattr(self, "vi" + "ew").update(saved)',
+    'vars(self)["view"] = saved',
+], ids=['setattr-view', 'getattr-view', 'dunder-dict-view', 'computed-getattr', 'vars-view'])
+def test_latch_r3_rejects_reflective_view_access(line):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source = latch_insert(source, 'Row', 'def recover(self, saved):\n    ' + line)
+    with pytest.raises(AssertionError, match='release reflection'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('qualified, snippet', [
+    ('project', 'for view in rows:\n    view.update(fields)'),
+    ('project', 'for view in rows:\n    view["route_" + "receipt"] = True'),
+    ('project', 'for alias in rows:\n    alias.update(fields)'),
+    ('project', 'alias = rows[0]; alias.update(fields)'),
+    ('project', 'alias = current.run(True); alias.update(fields)'),
+    ('exclusions', 'view.update(fields)'),
+    ('exclusions', 'view["route_" + "receipt"] = True'),
+    ('exclusions', 'for alias in rows:\n    alias.update(fields)'),
+    ('project', 'alias = rows; alias.append(fields)'),
+    ('project', 'callback = current.run; callback(True)'),
+    ('project', 'publish(current)'),
+    ('Row.run', 'alias = self.view; alias.update(fields)'),
+    ('Row.run', 'publish(self)'),
+], ids=['rows-update', 'rows-computed-store', 'rows-renamed-alias', 'rows-index-alias',
+        'run-alias', 'existing-alias-update', 'existing-alias-computed-store', 'consumer-renamed-alias',
+        'collection-alias', 'run-method-alias', 'current-holder-escape', 'view-local-alias', 'self-holder-escape'])
+def test_latch_r3_rejects_escaped_view_mutation(qualified, snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source = latch_insert(source, qualified, snippet)
+    with pytest.raises(AssertionError, match='release view escape'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('gate', ['self._verification_proof is not None',
+                                'self._verification_proof is not None and self._writer_verified'])
+def test_latch_r3_admits_exact_positive_proof_body(gate):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source = latch_insert(source, 'Row.finalize_writer_release', 'if ' + gate + ':\n'
+                          '    self.view["writer_publication_verified"] = self._writer_verified\n'
+                          '    self.view["route_receipt"] = self._writer_receipt')
+    assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('variant', ['opaque-return', 'early-view-return', 'run-redefinition',
+                                     'row-redefinition', 'project-redefinition', 'consumer-redefinition'])
+def test_latch_r3_rejects_unadmitted_producers(variant):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    if variant == 'opaque-return':
+        source = latch_insert(source, 'Row.run', 'return fields')
+    elif variant == 'early-view-return':
+        source = latch_insert(source, 'Row.run', 'if mutate:\n    return self.view')
+    elif variant == 'run-redefinition':
+        source = latch_insert(source, 'Row', 'def run(self, mutate):\n    return fields')
+    elif variant == 'row-redefinition':
+        source += '\nclass Row:\n    pass\n'
+    else:
+        function = 'project' if variant == 'project-redefinition' else 'exclusions'
+        source += '\ndef ' + function + '(*args, **kwargs):\n    return fields\n'
+    with pytest.raises(AssertionError, match='release producer'):
+        assert_latch_release_structure(source)
+
+
 SECTIONS = ("Role contract", "Approved scope", "Source identity", "Open obligations",
             "Dependencies", "Unread work", "Evidence references")
 ENDPOINT = "a/lane/f2"
@@ -54,6 +485,111 @@ def sections(brief):
             result[current].append(json.loads(line[2:]))
     assert tuple(result) == SECTIONS
     return result
+
+
+@secure_publication
+@pytest.mark.parametrize('damage', ['changed', 'missing'])
+def test_latch_r3_authoritative_prepare_names_open_dispatch(pilot, damage):
+    from tools import hierarchy_fresh_brief as fresh
+
+    root, reference = pilot
+    identifier = 'latch-r3-open-dispatch'
+    invoke(root, 'publish', message(identifier=identifier, kind='dispatch', brief=reference))
+    packet = Path(reference['path'])
+    if damage == 'changed':
+        packet.write_bytes(b'changed open dispatch\n')
+    else:
+        packet.unlink()
+    args = SimpleNamespace(root=str(root), initiative='a', endpoint=ENDPOINT, lifecycle=None,
+                           delivery_dir=None, as_of=None, target_generation=None)
+    before = files(root.parent)
+    with pytest.raises(fresh.UnverifiedAttachment) as caught:
+        fresh.prepare(args, _request_id='latch-r3-fixture')
+    assert caught.value.message_id == identifier
+    assert str(caught.value) == 'authoritative brief attachment is unverified'
+    assert files(root.parent) == before
+
+
+@secure_publication
+@pytest.mark.parametrize('damage', ['missing', 'oversized'])
+def test_latch_standalone_unavailable_receipt_evidence_is_unverified(tmp_path, damage):
+    root, _, _ = receipt_fixture(tmp_path)
+    packet = tmp_path / 'packet.md'
+    packet.write_text(json.dumps({'schema': 'aegis.hierarchy-job-packet/v1', 'recipe': 'tests',
+                                 'checkout': str(tmp_path), 'commit': 'a' * 40, 'tree': 'b' * 40}))
+    evidence = tmp_path / 'log'
+    evidence.write_bytes(b'original receipt evidence')
+    reference = ref(evidence)
+    invoke(root, 'publish', message(recipient='a/root', identifier='latch-job',
+                                    kind='job_request', brief=ref(packet)))
+    invoke(root, 'publish', message('a/root', 'a/orchestrator', identifier='latch-receipt',
+        kind='job_receipt', in_reply_to='latch-job', receipt={'state': 'started', 'evidence': [reference]}))
+    if damage == 'missing':
+        evidence.unlink()
+    else:
+        with evidence.open('wb') as stream:
+            stream.truncate(64 * 1024 * 1024 + 1)
+    rows = sections(compose(root, 'a/orchestrator')['brief'])
+    assert any(row['kind'] == 'unverified_evidence' and row.get('declared') == reference
+               for row in rows['Evidence references'])
+
+
+@secure_publication
+@lifecycle_only
+def test_latch_standalone_missing_policy_authority_is_unverified(tmp_path):
+    root, _, _ = receipt_fixture(tmp_path)
+    fixture = tmp_path / 'lifecycle-fixture'
+    fixture.mkdir()
+    ledger = Ledger(fixture)
+    policy = json.loads((ledger.path / 'policy.json').read_text())
+    missing = Path(policy['authority'][0]['path'])
+    missing.unlink()
+    rows = sections(compose(root, 'a/orchestrator', lifecycle=ledger.path)['brief'])
+    assert any(row['kind'] == 'unverified_evidence' and row.get('declared', {}).get('path') == str(missing)
+               for row in rows['Evidence references'])
+
+
+@secure_publication
+@lifecycle_only
+def test_latch_standalone_unsettled_terminal_deleted_evidence_is_unverified(tmp_path):
+    root, _, _ = receipt_fixture(tmp_path)
+    fixture = tmp_path / 'terminal-fixture'
+    fixture.mkdir()
+    ledger = Ledger(fixture)
+    value = request('unsettled-terminal')
+    ledger.ready(value)
+    ledger.intent(value, intent_id='terminal-effect')
+    proof = fixture / 'terminal-proof'
+    proof.write_bytes(b'original terminal evidence\n')
+    reference = ref(proof)
+    ledger.event('terminal', actor=ledger.operator, result=raw_request({
+        'request_sha256': raw_request(value)['sha256'], 'intent_id': 'terminal-effect',
+        'outcome': 'passed', 'exit_code': 0, 'source': value['source'], 'evidence': [reference]}),
+        **ledger.target(value))
+    terminal = sorted((ledger.path / 'events').glob('*.json'))[-1]
+    proof.unlink()
+    rows = sections(compose(root, 'a/orchestrator', lifecycle=ledger.path)['brief'])
+    assert any(row['kind'] == 'unverified_evidence' and row.get('declared') == reference
+               and row['ref'] == ref(terminal) for row in rows['Evidence references'])
+    assert any(row.get('request_id') == value['id'] for row in rows['Open obligations'])
+
+
+@secure_publication
+@pytest.mark.parametrize('stale_first', [False, True])
+def test_latch_standalone_stale_note_is_unverified_independent_of_order(pilot, stale_first):
+    root, reference = pilot
+    current = Path(reference['path'])
+    stale = dict(reference)
+    invoke(root, 'publish', message(identifier='a-note' if stale_first else 'z-note',
+                                  kind='brief', brief=stale))
+    current.write_text('current note bytes')
+    invoke(root, 'publish', message(identifier='z-note' if stale_first else 'a-note',
+                                  kind='brief', brief=ref(current)))
+    rows = sections(compose(root)['brief'])
+    assert any(row['kind'] == 'unverified_evidence' and row.get('declared') == stale
+               for row in rows['Evidence references'])
+    assert any(row['kind'] == 'evidence' and row['ref'] == ref(current)
+               for row in rows['Evidence references'])
 
 
 def files(root):

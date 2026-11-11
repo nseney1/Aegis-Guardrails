@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from tests.helpers_manager import manager_root
+
 REPO = Path(__file__).resolve().parents[3]
 
 
@@ -138,9 +140,10 @@ def test_manager_protocol_rejects_ambiguous_json_and_continues(tmp_path, bad):
     assert frames[1] == {"jsonrpc": "2.0", "id": 4, "result": {}}
 
 
-def test_real_manager_scan_report_and_reconnect_keep_claims_separate(tmp_path):
+def test_real_manager_scan_report_and_reconnect_keep_claims_separate(manager_root):
     from tests.helpers_manager import active, prepare
 
+    tmp_path = manager_root
     prepared = prepare(tmp_path)
     active(prepared)
     digest = __import__("hashlib").sha256(prepared["config"].read_bytes()).hexdigest()
