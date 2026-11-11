@@ -42,7 +42,23 @@ def _ids(data: Any) -> Any:
         names = (_identity(item) if isinstance(item, Mapping) else item for item in data)
         return [name for name in names if name is not None]
     if isinstance(data, Mapping):
-        return {key: _ids(value) for key, value in data.items() if isinstance(value, list)}
+        ids: dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, list):
+                ids[key] = _ids(value)
+                if len(ids[key]) < len(value):
+                    ids[f"{key}_count"] = len(value)
+                    ids[f"{key}_listed_count"] = len(ids[key])
+        stats = data.get("stats")
+        if isinstance(stats, Mapping) and "omitted_mandatory" in stats:
+            ids.setdefault("omitted_mandatory", [])
+            ids["omitted_mandatory_count"] = stats["omitted_mandatory"]
+            ids["omitted_mandatory_listed_count"] = len(ids["omitted_mandatory"])
+        if "unreviewed_rules" in data or "unreviewed_total" in data:
+            ids.setdefault("unreviewed_rules", [])
+            ids["unreviewed_rules_count"] = data.get("unreviewed_total", len(data.get("unreviewed_rules", [])))
+            ids["unreviewed_rules_listed_count"] = len(ids["unreviewed_rules"])
+        return ids
     return data
 
 
@@ -61,10 +77,19 @@ def _summary(data: Any) -> Any:
             if isinstance(value, list):
                 summary[f"{key}_count"] = len(value)
                 summary[key] = [_summary_item(item) for item in value[:_SUMMARY_LIST_CAP]]
+                if len(value) > _SUMMARY_LIST_CAP:
+                    summary[f"{key}_listed_count"] = len(summary[key])
             elif key in SUMMARY_FIELDS:
                 summary[key] = value
         return summary
     return data
+
+
+def _prefer_smaller(data: Any, projected: Any) -> Any:
+    """Use the full response when inspection costs at least as many tokens."""
+    from aegis_core.scan import estimate_tokens
+
+    return projected if estimate_tokens(json.dumps(projected)) < estimate_tokens(json.dumps(data)) else data
 
 
 def _scan_summary(data: Mapping) -> Any:
@@ -113,18 +138,20 @@ def _scan_summary(data: Mapping) -> Any:
         summary[key].pop()
         if f"{key}_listed_count" in summary:
             summary[f"{key}_listed_count"] = len(summary[key])
-    return summary if estimate_tokens(json.dumps(summary)) < estimate_tokens(json.dumps(data)) else data
+    return _prefer_smaller(data, summary)
 
 
 def project_response(data: Any, view: Optional[str] = "full") -> Any:
     """Project a tool response for a client that asked for less than the full payload.
 
-    - ids: the rule names in each list of the response;
+    - ids: the rule names in each list of the response, with exact omission totals
+      and displayed counts when names are shortened;
     - summary: identity, type, status and fitness of each item, lists capped at 10;
       scans also keep provenance, exact omission totals and change kinds. Compact
       scans are inspection; fetch full guidance before editing. If the metadata
       cannot fit alongside the selected rules and constraints, the list cap would
-      hide them, or the full scan costs no more, return the original full scan.
+      hide them, return the original full scan. All summaries return the original
+      full response when it costs no more than the summary.
     - full (or anything else): the response unchanged.
 
     An error result is always returned whole, so the host still sees it as an error.
@@ -138,5 +165,5 @@ def project_response(data: Any, view: Optional[str] = "full") -> Any:
         if (isinstance(data, Mapping) and "relevant_rules" in data
                 and isinstance(data.get("stats"), Mapping) and "omitted_mandatory" in data["stats"]):
             return _scan_summary(data)
-        return _summary(data)
+        return _prefer_smaller(data, _summary(data))
     return data
