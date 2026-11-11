@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from itertools import islice
 import json
 import os
 import re
@@ -11,6 +12,9 @@ from typing import Any, Optional
 from aegis_cli import sanitize_display
 
 __all__ = [
+    "coverage_explanation",
+    "coverage_omitted_count",
+    "coverage_reason",
     "format_github_step_summary",
     "format_layer1_json_payload",
     "format_layer2_json",
@@ -187,13 +191,17 @@ def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, s
     its workspace-relative file (``owned``: (path or None, ToolEvidence)) with its lines, and each
     checkpoint issue as a line-less finding (an error when it blocks)."""
     from aegis_cli.checkpoint import is_blocking
+    from aegis_core.verification.strict_verdict import evidence_blocks
+
+    strict_causes = [{"rule": "strict:no-driver", "message": "Strict mode: no-driver coverage blocks; a verification driver is unavailable.",
+                      "level": "error"} for _path, e in owned if e.verdict and evidence_blocks(e.verdict, e.tool, strict=strict)]
 
     return {"passed": passed,
             "checkpoint_info": list(checkpoint_info or ()),
             "layer1": [{"tool": e.tool, "target": path or e.target, "verdict": bool(e.verdict), "detail": e.detail,
                         "lines": list(e.lines), **({"language": e.language} if getattr(e, "language", None) else {})} for path, e in owned],
             "findings": [{"rule": f"checkpoint:{issue.get('check', '')}", "message": issue.get("message", ""),
-                          "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues]}
+                          "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues] + strict_causes}
 
 
 def _split(document: dict[str, Any], workspace_root: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -223,6 +231,58 @@ def governance_note(document: dict[str, Any]) -> str:
 def _escape_annotation(text: str, prop: bool = False) -> str:
     text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def _coverage_line_count(value: Any) -> str:
+    """Only producer counts, never free text or unbounded integer conversions."""
+    return str(value) if type(value) is int and 0 <= value and value.bit_length() <= 63 else "unknown"
+
+
+def coverage_reason(coverage: dict[str, Any]) -> str:
+    """A closed availability category; full producer reasons belong only in JSON."""
+    reason = coverage.get("reason", "")
+    if not isinstance(reason, str) or len(reason) > 4096:
+        return "other"
+    reason = _flat(sanitize_display(reason, max_len=None)).lower()
+    if reason in ("timeout", "the coverage run timed out", "the coverage json timed out"):
+        return "timeout"
+    if reason.endswith("no module named coverage") or reason in ("tool_missing", "go_missing"):
+        return "tool missing"
+    if reason in ("report_missing", "coverage_report_invalid", "coverage wrote no readable report"):
+        return "no report"
+    if reason.startswith(("cannot diff ", "the checkout is not ", "the work tree has uncommitted changes",
+                          "cannot tell whether the work tree", "cannot use the state directory")) \
+            or reason in ("coverage_paths_unmapped", "coverage_command_invalid"):
+        return "validation failed"
+    if reason == "coverage_not_configured":
+        return "not configured"
+    return "partial coverage" if reason == "partial_coverage" else "other"
+
+
+def coverage_omitted_count(coverage: dict[str, Any]) -> str:
+    """Empty unverified inventories mean unavailable accounting, not zero omissions."""
+    inventory = coverage.get("unmeasured")
+    if not isinstance(inventory, list) or (not inventory and coverage.get("status") != "reported"):
+        return "unknown"
+    return str(len(inventory))
+
+
+def coverage_explanation(coverage: dict[str, Any]) -> str:
+    """One bounded explanation of the measured subset; JSON retains every path and language."""
+    languages = coverage.get("languages") or {}
+    unavailable = ((language, row) for language, row in languages.items() if row.get("status") != "reported")
+    shown = [f"{language if language in ('python', 'go', 'rust', 'ts') else 'other language'} ({coverage_reason(row)})"
+             for language, row in islice(unavailable, 4)]
+    remaining = sum(1 for _ in unavailable)
+    if remaining:
+        shown.append(f"{remaining} more (see JSON)")
+    covered = _coverage_line_count(coverage.get("covered_lines"))
+    total = _coverage_line_count(coverage.get("executable_lines"))
+    reason = coverage_reason(coverage) if coverage.get("reason") else ""
+    availability = ", ".join(shown) or ("not specified (see reason)" if not languages and coverage.get("status") != "reported" else "none")
+    return (f"Measured lines: {covered}/{total}; unavailable languages: {availability}; "
+            f"omitted paths: {coverage_omitted_count(coverage)}. See JSON for full detail."
+            + (f" Reason: {reason}." if reason else ""))
 
 
 def github_annotation_lines(document: dict[str, Any]) -> list[str]:
@@ -277,7 +337,9 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
         out.append(line("notice", "diff coverage",
                         f"{figure} of {cov.get('executable_lines', 0)} changed executable lines (report only)"))
     elif isinstance(cov, dict):
-        out.append(line("warning", "coverage unverified", cov.get("reason", "")))
+        out.append(line("warning", "coverage unverified", coverage_reason(cov)))
+    if isinstance(cov, dict):
+        out[-1] += esc(" " + coverage_explanation(cov))
     for row in document.get("layer1", ()):  # a Layer 1 report: only the first evidence line is annotated
         if not row["verdict"]:
             lines = row.get("lines") or ()
@@ -334,7 +396,8 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         ratio, measured = cov.get("ratio"), cov.get("status") == "reported"
         figure = "n/a" if ratio is None else f"{float(ratio) * 100.0:.1f}%"
         lines.append(f"### Diff Coverage (report only): {figure} of {cov.get('executable_lines', 0)} changed executable lines"
-                     if measured else f"### Diff Coverage: UNVERIFIED ({_md_code(cov.get('reason', ''))})")
+                     if measured else f"### Diff Coverage: UNVERIFIED ({_md_code(coverage_reason(cov))})")
+        lines.append(_md_code(coverage_explanation(cov)))
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
             spans = ", ".join(f"{int(s)}-{int(e)}" if s != e else str(int(s)) for s, e in ranges)
             lines.append(f"- {_md_code(path)}: uncovered lines {spans}")
@@ -367,7 +430,7 @@ def _fingerprints(anchored: list[dict[str, Any]]) -> list[str]:
 
 def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None,
                         error: str = "") -> str:
-    """A SARIF 2.1.0 log of the line-anchored findings; line-less ones go to the step summary only.
+    """A SARIF 2.1.0 log of line-anchored findings; strict causes are execution notifications.
     With ``error`` the run is reported as not completed, with no result."""
     anchored = [] if error else _split(report_dict, workspace_root)[0]
     rules_seen: dict[str, dict[str, Any]] = {}
@@ -388,8 +451,12 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
     if error:
         run["invocations"] = [{"executionSuccessful": False, "toolExecutionNotifications": [
             {"level": "error", "message": {"text": error}}]}]
-    elif report_dict.get("checkpoint_info"):
-        run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": [
-            {"level": "note", "message": {"text": note["message"]}} for note in report_dict["checkpoint_info"]]}]
+    else:
+        notifications = [{"level": "note", "message": {"text": note["message"]}}
+                         for note in report_dict.get("checkpoint_info", ())]
+        notifications.extend({"level": "error", "message": {"text": finding["message"]}}
+                             for finding in report_dict.get("findings", ()) if finding["rule"] == "strict:no-driver")
+        if notifications:
+            run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": notifications}]
     return json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [run]},
                       indent=2)
