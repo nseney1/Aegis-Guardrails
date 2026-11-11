@@ -15,7 +15,7 @@ from aegis_core.scaffolding import (
     ACTIVE_LABEL as _ACTIVE_LABEL,
     ACTIVE_STARTERS,
     CI_WORKFLOW_LABEL,
-    ci_workflow,
+    ci_workflow,  # noqa: F401 - retained by the public-names pin
 )
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
@@ -41,6 +41,7 @@ class Step:
     command: Optional[List[str]] = None
     names: Sequence[str] = ()
     kept: Sequence[str] = ()
+    workflow: str = ""  # CI's planned text, shared by the write path and the printed suggestion.
 
     def as_dict(self) -> Dict[str, Any]:
         return {"target": self.target, "result": self.result, "detail": self.detail, "command": self.command}
@@ -236,6 +237,6 @@ def _report_ci(report: Report, actions: Sequence[Step]) -> None:
     report.say(f"  {floor}")
     report.say(f"  {lead} Save this as {CI_WORKFLOW_LABEL}, or re-run aegis init with --ci to write it:")
     report.say()
-    for line in ci_workflow().splitlines():
+    for line in step.workflow.splitlines():
         report.say(f"      {line}".rstrip())
     report.say()

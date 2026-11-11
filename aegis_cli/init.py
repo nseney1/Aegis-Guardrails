@@ -214,7 +214,7 @@ def _with_surfaces(host_ids: Sequence[str]) -> str:
 # ── The CI floor ─────────────────────────────────────────────────────────────
 
 
-def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
+def _ci_step(root: Path, write: bool, dry_run: bool, workflow: str) -> "Step":
     """The CI workflow: with ``write`` (--ci) ``.github/workflows/aegis.yml`` is created
     unless a file is there; without it nothing is written, and the step says whether a
     workflow already runs aegis check (``present``) or init should print one (``suggested``,
@@ -229,7 +229,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
                                                       "aegis check")
         return Step(CI_WORKFLOW_LABEL, "suggested", "no GitHub Actions workflow runs aegis check; "
                                                     "aegis init --ci writes one",
-                    names=[f.relative_to(root).as_posix() for f in files])
+                    names=[f.relative_to(root).as_posix() for f in files], workflow=workflow)
     for directory in (root / ".github", workflows):
         label = directory.relative_to(root).as_posix()
         if directory.is_symlink():
@@ -241,9 +241,7 @@ def _ci_step(root: Path, write: bool, dry_run: bool) -> "Step":
             raise InstallError(f"{label}: resolves outside the repository; aegis init --ci writes the workflow only "
                                "inside it. Re-run without --ci.")
     dest = workflows / "aegis.yml"
-    from aegis_cli.language_capabilities import needs_go_setup
-
-    data = ci_workflow(go_enabled=needs_go_setup(root)).encode("utf-8")
+    data = workflow.encode("utf-8")
     if os.path.lexists(dest):
         try:
             same = not dest.is_symlink() and dest.is_file() and dest.read_bytes() == data
@@ -631,7 +629,7 @@ def _steps(ctx: _Context, dry_run: bool, actions: Optional[List[Step]] = None) -
     actions.append(_claude_shim(ctx, dry_run))
     if ctx.skills:
         actions.extend(_skills_steps(ctx, dry_run))
-    actions.append(_ci_step(root, ctx.ci, dry_run))
+    actions.append(_ci_step(root, ctx.ci, dry_run, ci_workflow(go_enabled="go" in drivers)))
 
     if not ctx.no_hooks:
         _hook_steps(root, dry_run, actions)
