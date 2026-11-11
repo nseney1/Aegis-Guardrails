@@ -140,8 +140,9 @@ terminal/result; live plan approval and no canonical deny; expiry; current parti
 supported recipes/hashes; packet sizes/attachments, binding readiness, existing same/conflict messages and record-limit headroom for the entire
 missing set. Failure publishes none of that set. Prepare deterministic packets in memory/content-addressed briefs, without descriptors. Then
 publish missing IDs in sorted check order in that lock. Immediately before EACH message, reload journal and require last_decision(request_id) !=
-deny (`tools/hierarchy_router.py:79-82`), recheck expiry and hash the configured recipe file's raw bytes as load_recipes does
-(`tools/hierarchy_jobs.py:247-279`); require that check's admitted hash. A concurrent denial after the live check remains a race like canonical
+deny (`tools/hierarchy_router.py:79-82`) and recheck expiry. R8 captures/parses/hashes the configured recipe file once per operation, using the
+same schema validation as load_recipes; require each check's admitted hash and revalidate the captured file witness at each effect boundary.
+A concurrent denial after the live check remains a race like canonical
 routing (`tools/hierarchy_router.py:285-290`).
 
 This batch is not atomic. On a crash after k of N, derive the entire set again from admission and published history; validate every existing
@@ -171,6 +172,12 @@ Read each regular file at most its initially observed N bytes through bounded ch
 to EOF. Short reads, growth or rewrites hold, followed by the existing identity/content-metadata/membership validation. Large valid regular logs
 have no mailbox-size cap; preserve the runner's 4 MiB result limit, 2000-byte numeric-log tail, empty-log fallback, UTF-8 replacement and control
 filtering. This snapshot is ephemeral, not a persistent store.
+R16b requires an exact positive integer group whenever a local process record exists; null/false/malformed groups contradict a claimed stop
+and hold even when process_stopped_confirmed is true. Observe that group for surviving members. Derive exact step-N.log and any captured
+step-N.out names from the producer's ordered Step objects; padded, signed, extra or aliased artifacts cannot satisfy a step.
+Original process-record binding in terminal receipts is explicitly DEFERRED to JOBS-PROC after JOBS-1 and dispatcher. Current v1 receipts
+contain step/result evidence without process.json; preserve exact original-receipt matching and pristine v1 progression. Local captured
+process observations do not authenticate the original process record. No new required receipt field, producer edit or replacement receipt ID.
 A valid retained failed/refused result with matching admitted recipe provenance holds small_change_check_failed even if terminal receipt
 publication failed. Publish no missing batch IDs or Reviewer work; only the unchanged runner settles the original job and reservation.
 Receipt history is checked before PR2 job_state: any valid failed/refused receipt holds small_change_check_failed whatever follows it, and a
@@ -188,19 +195,190 @@ reparse points, nonregular inputs and changed identities. Publication retains it
 This portable fallback is not an anchored-descriptor or hostile-same-user guarantee; Windows/macOS CI and native qualification remain separate.
 One stream routine hashes/captures at most the initial N bytes plus one EOF probe. Observed growth refuses before that probe; nonempty
 zero-size virtual inputs or any readable content beyond N refuse instead of authenticating an empty/truncated hash. The same routine serves
-retained job artifacts, preserving their limits, log tail and receipt body. Large unchanged regular evidence/logs have no mailbox-size cap.
+retained job artifacts, preserving their limits, log tail and receipt body. Large regular logs have no mailbox-size cap.
+R19 bounds the complete retained v1 artifact set before any artifact content open/hash: one anchored, non-following metadata gate refuses
+unsupported candidate names, nonregular/reparse entries, files over 64 MiB and a job total over 256 MiB. The per-artifact ceiling matches the
+operator/lifecycle reference ceiling; the aggregate bounds one stopped job's hash work to four such ceilings including metadata. Claim/process/
+packet metadata retain 262144 bytes and result metadata 4 MiB. Only canonical step-1 through step-20 log/out names are supported; recipe-exact
+step/capture validation still follows. All candidates must pass the metadata plan before capture; fstat must match the planned size/identity
+before reading. Logs stream into hashes and a 2000-byte tail, never a full in-memory log. Refusals retain the job with fixed-text
+small_change_receipt_invalid; no cancellation, deletion, replacement ID or canonical run-open gate is introduced.
 Dispatcher and composer attachment consumers first validate the public envelope without content IO, then validate SHA-256 against bounded
 captured bytes; packet comparisons, parsing and brief inspection consume those bytes without reopening through pinned Mailbox readers.
 Attachments keep the 262144-byte limit; result metadata keeps 4 MiB. Completed command results require nonempty steps, every exit code zero,
 and no timed-out step (timed_out, when present, must be boolean). Contradictions hold small_change_receipt_invalid; ordinary failed/refused
 jobs retain small_change_check_failed. No descriptor is held across a wake, and no pinned mailbox/job schema or recording authority changes.
+R7 extends captured-byte attachment handling to virtual Mailbox validation and publication hooks, including all three publication kinds
+and the Mailbox used by the fresh composer's locate/prepare path. One operation-local capture supplies the hash and consumed attachment
+bytes; subsequent validation/brief inspection reuses those bytes and rechecks ancestor/leaf identity and content metadata before publication.
+Identical check packets share staging/capture across a batch and partial-batch recovery; existing publication capability checks still apply.
+No persistent cache or module-global reader replacement is used. Portable witnesses compare file type, reparse status, available device/inode,
+size and timestamps, excluding pathname-derived permission bits; unchanged Windows executable references remain valid. Retained snapshots use
+the same witnesses. Type, identity, reparse and content changes still refuse; portable checks do not imply anchored or hostile-same-user custody.
+Completed fixed-command results also require reason=None, commit=None and internally consistent test counts, including recipe-less status.
+Configured status/dispatch loads the exact admitted recipe hash and, for expects_tests, requires non-null counts with total>0 and passed>0,
+matching the runner: failed/errors need not be zero if some tests passed. Recheck configured recipe semantics before Reviewer publication and
+successful owner closure drafts. Recipe-less status remains a read-only projection: it cannot verify expects_tests, guesses no recipe path,
+and emits no successful closure drafts. Publishing/closing paths require and verify the configured recipe; a durable recipe-semantics witness
+remains a separate protocol follow-up. No missing field is interpreted as expects_tests=False on an effectful path.
+With no terminal receipt, inspect only the original claim and reserved-version metadata before observing existing process identity/scope.
+A known-live runner reports check state running (row checking, complete=False), without log capture, missing-batch continuation or owner draft.
+Unknown liveness or a dead runner without its original terminal receipt holds small_change_unknown_effect, even with a retained completed
+result: no missing batch ID may publish before original run-open recovers that receipt/settlement. Retained failed/refused results keep
+small_change_check_failed precedence. Claim capture explicitly refuses absent POSIX descriptor capabilities before opening. No replay or signalling.
 Before accepting retained scr or surfacing successful closure drafts, require exactly the immutable assignment's verified writer-result,
 terminal and completed-check receipt references, including their hashes. Those references bind the writer's commit/tree transitively through
 the validated result; changing a source/proof reference cannot reuse a valid brief header. Assignment and lifecycle review timestamps must
 follow the writer terminal/result and every completed check receipt; the existing acceptance/completion chronology still applies. Scope or
 chronology mismatch holds small_change_message_conflict. This validation grants no Reviewer or coordinator recording authority.
 
+R8 extends the operation-local capture to message entries, bindings/read acknowledgments, manifest, journal policy/events and optional unread
+typed attachments on brief/ack/result/review/job_receipt messages. Bounded nonblocking no-follow reads supply both hashes and consumed bytes.
+For standalone fresh_brief compose, unread oversized/nonregular/linked attachments are labelled unverified from metadata, without opening
+them; missing/changed notes remain unverified too. Authoritative dispatcher composition holds small_change_brief_unverified;
+reconcile the declared attachment with its original durable reference, then rerun dispatch. Open dispatch/job packets still refuse.
+Ordinary non-attachment evidence keeps generic large-file hashing. Closed historical attachments retain the existing not_reverified contract.
+Journal replay uses the pinned reducers over captured bytes, indexes provenance per revision, and captures newly validated append records once;
+recipes parse once per row capture. Parsed JSON releases its raw bytes. A later typed consumer of a hash-only/parsed entry may perform a bounded
+content promotion only if its original hash, identity and ancestry witnesses still agree. No new persistent store, public jobs API or global patch.
+For borrowed dispatch/job_request publication, dispatch_history is the last virtual hook after binding/readiness checks: recheck all captured
+file/directory witnesses there and immediately after commit. A changed witness before commit refuses; after commit retain original ID/path/hash
+as partial_publication, hold, and record no route or further publication. Preserve specific known denial/recipe-drift reasons alongside that
+partial evidence. Route append also rechecks the same witnesses under journal exclusion. Standalone compose retains this operation through
+output publication and rechecks before replacement and after commit; post-commit uncertainty is explicitly reported without pretending rollback.
+Configured completed results must contain exactly the admitted recipe's ordered, expanded command steps, contiguous numeric log steps 1..N,
+and process.json at step N. Truncated/reordered/extra/gapped or contradictory process evidence holds small_change_receipt_invalid even when
+all supplied hashes/body were recomputed. R8b retains the frozen small_change_unknown_effect hold for a known-live runner after a terminal
+receipt; it clears when the runner exits. Started/live checks still report running, and an appearing claim is observed before classifying a
+lost receipt. Unknown liveness/dead unsettled effects still hold. Both capture paths check descriptor
+capabilities before accessing flags. These are modelled subprocess controls; platform/native runtime qualification remains separate.
+R9 extends bounded capture to role contracts, assignment templates, the host plan and workspace events. Parse/render and hash use the same
+captured bytes; contracts/plans retain the mailbox budget. Host-plan validation uses the existing pure schema validator, without its blocking
+file loader. Workspace replay uses the existing Ledger reducers without exposing mutation. Recipe hide/ro_binds paths and raw standalone
+verify paths refuse owner-private inputs before metadata discovery; recipe parser parity controls remain separate from this stricter privacy gate.
+Missing delivery/provision/wake/ack inputs retain absence witnesses. Receipt names and values use the same captured listing. Final verification
+groups file and directory witnesses by parent, opening one anchored parent per group, with the portable identity-check fallback retained.
+Provision discovery captures each initiative base's identity and its declared provision, without treating the tool's own new brief directory
+as an input-membership change. Actual mailbox, receipt, binding, workspace-event and lifecycle-event listings retain membership witnesses.
+Role-contract size refusal retains the existing fresh-brief budget message, still before opening oversized content. The final live-authority
+hook enforces writer/check expiry; verified read-only Reviewer dispatch may finish after execution expiry, without granting new execution.
+Retained job/result/process/claim/log and recipe witnesses participate in final pre-commit and post-commit checks, and read-only row/draft checks.
+Failure clears already computed success drafts. Post-commit mailbox failure retains the original record's path/hash without rereading a swapped
+file. Pre-commit composer CaptureChanged refuses with exit 2; post-commit refusal names the committed brief and reconciliation action.
+Recipe-less audit of a complete or owned-HOLD row reports small_change_close_unverified and rerun with --recipes <file>, with no success drafts;
+the recorded lifecycle disposition still determines planning-skip release. The runner exposes no pure bytes recipe parser, so private schema
+validation remains, checked against the public runner over shared valid/invalid files; no dependent-job or v2 metadata support is implied.
+One-read claims are per capture, excluding bounded promotions and cross-consumer retained-job reads. Canonical router status uses the captured
+lifecycle replay before project; the workspace Store preload remains unchanged. The pinned lifecycle implementation is never edited.
+R9b distinguishes a publication that returned from a lost reply inside publication. After a route append returns, sync its event directory
+before capture adoption/verification. Any subsequent failure holds small_change_committed_event with the original event ID, path and raw-byte
+sha256, without rereading the evidence or retrying a known publication because its error says busy. The writer remains excluded until reconciled.
+A lost reply inside publication still uses delivered_unrecorded and recovers the original receipt across succession without a second message.
+
+R10 closes the sibling registry/source-reader paths: composition captures the canonical role registry through the same bounded nonblocking
+operation reader, applies the existing pure registry validator, and resolves the endpoint role from those bytes. Its identity/content witness
+remains live through publication; a module-global registry cache cannot bypass it. Writer, Reviewer and standalone compose share this path.
+Fixed-v1 check preflight, including read-only status/planning, requires clean Git status before and after observing the exact revision/tree
+and rejects submodules. Dirty entries are refused without opening or fingerprinting their content; Git subprocess observations retain explicit
+environments and timeouts. This does not change canonical job admission or support dependent-job metadata.
+After mailbox publication returns, retain the original ID/path/hash before directory sync. A sync failure is small_change_partial_publication,
+with writer_message_present true and the writer excluded when its route remains unrecorded. Writer/check/Reviewer recovery inspects the retained
+message rather than issuing another one. No failure after a known publication claims rollback or clears custody.
+
+R12 checks the complete retained before/after source-witness schema, clean status/content digests and integer-zero dirty-entry counts, with
+equal observations before Reviewer progression. Git observation drains both pipes incrementally under a 4 MiB combined byte ceiling and
+10,000 index-record ceiling; the first dirty-status byte refuses immediately. Directory capture and revalidation share incremental discovery
+with 10,000-entry and 10,240,000-byte name budgets, counting ignored/pending names before retaining them. No unbounded listing precedes these checks.
+Private-root preflight derives configured home variables and default owner folders from the host registry. Case-variant containment uses
+read-only public-sibling probes in each differing component's parent; it never discovers or opens a protected root, and ambiguity refuses.
+Git children remove every registry host's declared billing variables and session variable equally, including newly declared hosts.
+HOSTENV-1, after pr4b, will declare extra session markers and one shared environment policy, then migrate this reader, the frozen loop child
+launcher and object_read_env callers; the loop's existing marker filter remains outside this admission until then.
+
+R13 preserves the existing per-row private-evidence refusal and the public preflight's exact ValueError contract. A typed private router
+privacy error for a row's exact declared evidence
+is caught only during that row's read replay. Validate the original event chain, schema, actor, custody, hashes, consumption and accounting;
+retain every original record/reference. An operation-local reducer namespace runs the pinned functions' original code/defaults/closures,
+changing only the path validator for those already-refused declarations to absolute/no-traversal lexical validation. It performs no
+private metadata discovery, changes no lifecycle module globals and is never used for recording. Malformed hashes, roles and other inputs
+still refuse globally. This is inert claim replay, not successful evidence verification or authority to act on the refused row.
+Before row composition/publication, project that row as held/small_change_configuration with owner-private detail (closed-row audit and
+recorded owned-HOLD rules still apply). Preserve unknown effects, retained messages and accounting. Other rows validate their own references;
+their briefs list the refused row as a hold linked to its original journal record, without promoting its private declaration into approved
+scope or a usable artifact reference. Global policy/store/configuration failures remain global; row reference refusals remain scoped.
+
+R15 extends this read-only quarantine to canonical rows and list-valued scope paths, before any private metadata discovery. R16 restores
+inert canonical evidence in status/route: lexical privacy quarantine only, without evidence metadata/content reads. Changed/missing/huge
+canonical artifacts do not hold ready work or override routed/closed/denied states. Small-change consumption lazily validates its complete
+authority/prerequisite closure, with cycle protection. R17 supersedes the aggregate 1 MiB budget: each consumed reference uses the operator
+producer's 64 MiB limit, checked from captured metadata before content open, allocation or hashing. Every claimed hash still checks. Policy
+authority, review and delivery evidence use the same bounded reference reader. Hashes are memoized only within one pass by path and identity/
+content mark; matching ancestry and fresh witnesses remain required. Valid producer logs do not become permanently unconsumable as a closure grows.
+Dispatcher composition selects only its request's authority/prerequisite closure, including completed dependency proof records, without
+promoting completed paths into new approved work. Unrelated rows' evidence is never opened. Standalone composition keeps journal-wide coverage.
+Consumed dependency captures revalidate under the journal writer lock immediately before a small-change route append and after commit; a
+pre-commit failure leaves the journal unchanged, while a post-commit failure retains the original receipt evidence for reconciliation.
+The consumed dependency check follows the parent operation's witness check, immediately before append, so a change during that parent check
+cannot commit a route receipt. Malformed publish envelopes and non-object raw requests refuse as typed lifecycle input before field access;
+composition/planning reports the existing hold and lets canonical run-open continue, without an AttributeError/KeyError traceback.
+R18 applies one closed event-shape validator before correlation for every v1 event, including INITIAL bootstrap records. Request events
+require their complete key set and typed ID/hash before target lookup. Meter/succession records remain global even if an attacker supplies
+request fields: malformed global/accounting input cannot become a row-only quarantine. Shape refusals are static; original pinned reducers
+still validate all roles, payloads, custody, transitions and accounting. Validated replay supplies the other event readers; route recording
+uses the same shape validator. No protected reducer or protocol changes.
+Retained identical canonical deliveries still recover their original receipt. Stored-message protocol validation keeps references
+inert; a private message is listed as held and cannot close an assignment or poison another endpoint's composition. In standalone composition,
+missing/changed regular attachments on unread typed notes remain unverified; open dispatch/job packets retain their existing refusals.
+R16b preflights nested string values and keys, including exact decoded raw capsules, through an iterative walk capped at 64 levels and
+1,048,576 visited/pending nodes. Bound JSON structure before recursive protocol validators or hashing; decoder recursion becomes a static
+invalid-input refusal. Reduced lifecycle marks containing a raw capsule are not themselves capsules. Reuse the operation-local private-root
+policy during traversal; preserve per-row quarantine and verify the policy before effects. Standalone inspection uses this same preflight.
+Canonical status/route/report use captured workspace events and mailbox readers for original-delivery classification, endpoint readiness,
+binding histories and generation-two checkpoints. Recheck those mailbox witnesses before reporting facts; no plain-Mailbox fallback can
+discover an unchecked private checkpoint. Malformed mailbox input holds its initiative while independent canonical routing continues.
+Store checkouts, mailbox_root and delivery_dir retain the closed Ledger schemas' lexical validation and per-initiative private-path
+quarantine. Captured canonical reads keep other initiatives available; each mailbox consumer preflights its declared root before metadata.
+An uncorrelatable malformed event (including event=[]) refuses with a static global planning error; never advance accounting past it or guess
+a request ID. Malformed meter/start-budget events remain global UNKNOWN. A semantic refusal on a non-accounting row event is quarantined only
+after the original actor/custody and request-hash checks succeed. Reduction uses an isolated trial; retain the accepted prefix and raw hash chain,
+without a successful event receipt or validated provenance entry. The row and requests depending on it through authority/prerequisites remain UNKNOWN, including
+their planner/writer exclusions and closure refusal; subsequent events cannot manufacture a successful recovery. Canonical run-open continues.
+Read-only projection shares the validated journal replay/index across rows while keeping each
+row's mailbox/store/reference captures independent. Mutation still reacquires fresh state under the relevant mailbox lock.
+Workspace register/update checkouts remain inert declarations under the original pure Ledger reducers: refuse a private current checkout at
+that initiative's dispatch boundary, before any effect or metadata access. Other store fields and structural failures retain strict global
+validation. Stored mailbox roots preflight before constructor metadata. Quarantined private message references cannot become usable briefs;
+their contextual malformed-message diagnostic remains visible. A classified legacy canonical route retains only its actual recipients' custody,
+plus any separately observed scw exclusion; an unreadable listing still cannot prove writer absence. Invalid plan registration is global UNKNOWN,
+because treating an unestablished small-change row as absent could release planners. Never manufacture its registration or a lifecycle receipt.
+Completed checks require a well-formed source_export bound exactly to the packet commit/tree as well as the clean/equal before/after witnesses.
+Canonical denial is checked even when auditing an owned HOLD, and cannot draft successful delivery/resolve. Recovery parses exact, unique
+Endpoint and Target generation headers and one exact request/plan assignment. An unavailable/oversized mailbox never proves writer absence:
+an open unrouted small-change row conservatively excludes its admitted writer unless a complete, verified mailbox snapshot proves its scw absent.
+The mailbox_history_verified projection marks that captured proof; failed listings and lifecycle UNKNOWN never establish absence.
+Recorded intent/start also retains writer custody even when the mailbox is empty. Refused event IDs remain reserved without successful
+receipts; the existing route dry-run rejects both accepted-ID conflicts and refused-ID reuse before any mailbox publication. Canonical
+delivery revalidates captured journal witnesses before publication, independently of mailbox witnesses.
+Canonical post-commit fsync/witness failure catches only the known committed-event exception: return a held delivery_error with the original
+message ID and journal path/hash as partial_publication, continue remaining rows and emit JSON/exit 0. This pass reports reconciliation rather
+than losing known effects in a traceback; later reads recover the recorded original receipt without a second message.
+Each read operation captures registry-derived private-root policy once, reducing repeated password-database/registry queries for inert
+history. Candidate paths still normalize lexically and refuse before metadata; UID or home-variable changes refuse on every read, and
+password-database home plus registry declarations revalidate with captured witnesses before effects. Windows uses the OS current-user profile
+location (CSIDL_PROFILE), with the same registry-declared owner folders even when home override variables are absent. Never infer the owner's
+default profile from HOME/USERPROFILE; an unavailable profile location refuses before input discovery. No global cache or authority is created.
+Whole-file recipe-parser parity (including census_outside_policy) is explicitly deferred by R15 until JOBS-1's public validate_recipes(data)
+lands. recipe_file is unchanged this round; its dedicated strict xfail records this known gap, not activation or recipe qualification.
+
 ## 5. Loop-only skips, reporting and holds
+
+R15 activation is explicit: --dispatcher-host-plan <absolute-host-plan> selects the dispatcher path using an existing
+aegis.hierarchy-host-plan/v1 record, validated through hierarchy_hosts.validate_plan with a bounded captured reader. The argument and record
+are independent of the journal and status.json; loss of status cannot lift the activated skip. This selects loop behavior, granting no
+mailbox, lifecycle, capacity or native authority and satisfying none of D4/D5/D7's outstanding qualification requirements. Invalid configured
+plan input holds dispatcher planning/sweep while canonical run-open continues. With no activation argument, dispatch and refresh_planning
+are absent from the pass: valid unplanned runs follow the tip's legacy steps, including independent Codex wakes while the journal is busy.
+The loop tests retain the frozen R15 named-tip (d69acf0b) bytes; activated hold assertions live in dispatcher tests.
 
 Canonical-compatibility successor to prior R4 b087f711ae76460591095c81760f10454d1806d56379772e07f0f065110ff17b:
 the seven malformed-status failures retained in receiver-20261108/dispatcher-full require independent durable reconstruction.
@@ -213,12 +391,57 @@ projection with _decode_dispatch(..., status=True), never the canonical decoder.
 they do not prove durable inputs unreadable or block healthy independent work. No cached report, failed payload or empty-default evidence.
 Use the validated team-scoped exclusion set (Orchestrator AND Decider), plus writer-lane exclusions for scw present/conflicting without verified
 route receipt. Release query locks before wakes. An empty canonical projection keeps small_changes=None and omits that output field.
+R16b requires both the original route receipt and the validated original writer publication before releasing writer custody. A retained
+receipt alone cannot release a lost/conflicting message, mismatched plan body, corrupt brief or unready historical binding. The informational
+writer_publication_verified marker follows full identity/header/binding/proof validation, including a newly published writer before reporting
+release; it is reconstructed, not a new record or authority. Recorded complete/owned-HOLD closure keeps its existing release rules.
+R17 publishes route_receipt and writer_publication_verified only after the final operation/dependency verification succeeds. A failed
+verification latches uncertainty for this operation; exception and mailbox-lock-exit paths clear both public release flags and retain writer
+custody. DISP-LATCH-1 supersedes release from an ordinary row hold: release requires a complete positive verification pass. No failed capture can
+become a release by a later successful metadata check in the same operation; a fresh pass must reconcile the original durable records.
+R18 retains consumed dependency operations across journal replay and propagates failed reference captures/checks into their parent operation.
+Once latched, verification refuses even if the original path is restored; neither append nor recovery can recapture a replacement as the
+original witness. Finalization first clears the prior mailbox-absence marker as well as release flags, and establishes it only after successful
+final verification. A fresh projection may reconcile the original records; it creates no new store and never replays a writer effect.
+The latch retains its first typed validation cause, so later refusal preserves the original diagnostic without retrying or clearing uncertainty.
+R19 retains operation capture-failure boundaries for reference reads/promotions, JSON/path/discovery checks, publication adoption and retained-job/
+claim construction. DISP-LATCH-1 also covers subsequent checks that fail before registering a validator. A failed constructor latches immediately. Dependency operations propagate
+their failure to the publishing parent; a cached same-inode proof with changed ancestry cannot become unverified prose that permits a writer
+publish. Restoring a symlinked claim or a temporarily failed read before recovery cannot restore either release flag in that operation.
+Standalone descriptive composition checks optional evidence and unread typed notes in a separate capture operation; a failed declaration stays
+latched there and renders unverified, including missing/oversized receipt evidence, missing policy authority and stale notes in either ID order.
+Already consumed/cached identity witnesses and shared privacy-policy failures still latch that standalone parent's operation. A declaration's
+expected-hash mismatch alone cannot poison that parent. Dispatcher composition uses the publishing parent's latch for all references, including
+retained-job paths absent from the cache. Unverified attachments, including open job packets, open dispatches and unread typed notes, hold
+small_change_brief_unverified and identify their message in unverified_message_id (redacted for display). Reconcile that message's original
+durable reference, then rerun dispatch. Failed shared authority witnesses retain their original diagnostics.
+This internal distinction follows the existing request-closure argument, never configuration or a caller-selectable dispatch gate. Required
+captures cannot become unverified prose: authoritative evidence and unread-attachment checks propagate their refusals immediately. Standalone
+composition alone catches declaration refusals as unverified prose. A fresh projection reconciles retained original evidence.
+DISP-LATCH-1 creates a positive proof only at the end of the parent operation's complete row pass and final witness verification. The sequence
+includes attachment reads and expected hashes, both reference-check classes, both live retained-claim validations, and every capture. Any
+exception or Hold leaves no proof. Only finalize_writer_release writes the release fields, and it requires that proof plus the verified current
+writer publication and route receipt. Recovery may recheck stable metadata and draft owner reconciliation, but cannot create proof or release
+custody. A fresh full pass is required; absence of a recorded failure never suffices. This proof is internal, operation-local and authoritative
+dispatcher-only; it adds no public gate or durable record. Artifact budgets before open and dependency-failure propagation remain unchanged.
+Writer custody releases only when target_generation still names the current acknowledged recipient binding, in addition to its historical
+existence at publication. An unacknowledged target, or a superseded target without verified original completion, holds without replay. Valid
+completion recorded before handoff may feed subsequent checks, preserving historical semantics, but cannot establish either writer release flag.
+Configured-plan structural/depth refusals are contained at dispatch and reconstruction: owner planning_exclusions_unavailable, skipped sweep,
+unchanged canonical run-open. No missing/invalid planning input supplies an empty exclusion set or consumes retained unread mail.
 Pass the sweep's generic --skip (`tools/hierarchy_sweep.py:296-301`); never put these
 sets in Pass.skipped, keep_skips or status.json as skip authority. Change loop skipped-row handling (`tools/hierarchy_loop.py:469-485`):
 planning skips retain unread counts and a small_change_planning_skipped report, never a fabricated start_failing. Existing start_failing
 handling stays separate (`:512-518`, `:643-644`). Losing status.json cannot release a planning skip. Actual busy, corrupt, unreadable, private
 or symlinked durable input, or invalid projection, means owner planning_exclusions_unavailable and skipped sweep, with the cross-team wake
 delay explicit; run-open still runs. This projection records no event/publication and changes no capacity, claim or accounting authority.
+
+R9 selects rows using a read-only capture, then captures again inside each row's mailbox lock with a fresh operation, and independently reads
+the final lifecycle revision for planning exclusions. Other teams' mailbox churn is not in the row's witness set. Replay advanced by composition
+requires a fresh live-authority check before publication, including the final mailbox hook; a newly adopted denial prevents writer delivery.
+Composition itself takes no journal writer lock. R9b's approved count oracle requires one recipe read/parse per command and at most one journal
+read per distinct capture phase: selection, each locked row and final planning. One-check and three-check runs must have equal journal counts;
+the work may grow with rows/revisions, without growing with checks multiplied by publications. Row isolation and freshness checks remain.
 
 Malformed durable policy roles that raise TypeError/KeyError at this reconstruction boundary also produce planning_exclusions_unavailable;
 the finite exception boundary does not hide failures elsewhere. Under the mailbox lock, canonical delivery reloads the journal and classifies
@@ -261,6 +484,8 @@ team_status's legacy routed state remains a canonical projection, with separate 
 | small_change_configuration / small_change_binding_changed | Endpoint/recipe unsupported, participant changed, borrowed Orchestrator binding unready, or concurrent planning turn. Owner action; after acknowledged Orchestrator succession use the same IDs. |
 | small_change_planning_skipped / small_change_mixed_queue | D7 holds a mixed live canonical/small-change queue in one initiative: stop new route/dispatch there and list both queues; other initiatives and the existing global job runner continue. An open canonical row alongside an open small-change row is mixed; completed, denied or owned-HOLD rows are not pending work. Correlated foreign IDs also hold; deterministic IDs do not prevent outside publications. |
 | small_change_close_due / small_change_closed_unverified | Owner closure drafts due; audit complete rows too and flag missing scr/check receipts. Lifecycle completion alone does not verify jobs; do not undo or conceal an already recorded completion. |
+| small_change_close_unverified / small_change_partial_publication | Recipe-less close has no success drafts: rerun with --recipes <file>. A post-commit witness failure retains the committed message and holds further work; never replay or erase the effect. |
+| small_change_committed_event | Route publication returned but directory sync or subsequent capture verification failed. Hold with original route-event path/sha256 and retain writer custody; this is distinct from a lost publication reply. |
 
 Receipt validation additionally checks retained packet, recipe, before/after source witnesses, evidence hashes, receipt_matches, stopped
 processes and settled reservation (`tools/hierarchy_jobs.py:862-891`, `:1312-1353`). Use PR2 job_state ordering for later unknown/ties

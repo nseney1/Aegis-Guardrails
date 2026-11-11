@@ -13,15 +13,20 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
+import subprocess
+import time
 from types import SimpleNamespace
 
 import hierarchy_fresh_brief as fresh
 import hierarchy_jobs as jobs
+import hierarchy_hosts
 import hierarchy_lifecycle as life
 import hierarchy_router as router
+import hierarchy_workspace as workspace
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, MAX_RECORDS, SLUG, TERMINAL_JOB_STATES, digest, encoded, fields,
-                               matching, parse_time, read_bytes, read_json, require, safe_path, strict_json, timestamp,
+                               matching, parse_time, require, safe_path, strict_json, timestamp,
                                writer_lock)
 
 
@@ -30,6 +35,81 @@ STATES = {"writer_ready", "writer_sent", "writing", "checking", "review_ready", 
           "held", "complete", "owned_hold"}
 TERMINAL_REF = re.compile(r"lifecycle-terminal:([0-9a-f]{64})\Z")
 RESERVE_SECONDS = 30
+MAX_GIT_BYTES = jobs.MAX_RESULT_BYTES
+# Match the lifecycle/operator evidence ceiling; the job total is four such
+# ceilings including metadata. JSON/packet metadata retain their smaller limits.
+MAX_RETAINED_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_RETAINED_JOB_BYTES = 256 * 1024 * 1024
+
+
+def _git_read(checkout, environment, arguments, *, clean_status=False):
+    """Drain both pipes incrementally; only this owned read-only Git child can be stopped."""
+    process = subprocess.Popen(jobs.object_read_argv(*arguments), cwd=checkout, env=environment,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               bufsize=0)
+    output, used, records = bytearray(), 0, 0
+    deadline = time.monotonic() + jobs.GIT_STATUS_TIMEOUT_SECONDS
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "git identity check timed out")
+                for key, _mask in selector.select(remaining):
+                    size = 1 if clean_status and key.fileobj is process.stdout else min(65536, MAX_GIT_BYTES - used + 1)
+                    try:
+                        chunk = os.read(key.fd, size)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    require(not (clean_status and key.fileobj is process.stdout), "source does not match packet")
+                    require(len(chunk) <= MAX_GIT_BYTES - used, "Git output exceeds byte limit")
+                    if arguments[0] == "ls-files" and key.fileobj is process.stdout:
+                        records += chunk.count(b"\0")
+                        require(records <= MAX_RECORDS, "Git output exceeds entry limit")
+                    used += len(chunk)
+                    if key.fileobj is process.stdout:
+                        output.extend(chunk)
+            try:
+                code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("git identity check timed out") from exc
+        require(code == 0, "git identity check failed")
+        return bytes(output)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
+
+
+def _clean_source(checkout):
+    """Fixed-v1 checks require clean source; never fingerprint a dirty worktree entry."""
+    checkout = checked_path(checkout)
+    environment = jobs.object_read_env(inherit_config=True)
+    for host in hierarchy_hosts.describe()["hosts"].values():
+        for name in host["billing_variables"]:
+            environment.pop(name, None)
+        environment.pop(host["session_variable"]["name"], None)
+
+    def read(*arguments):
+        return _git_read(checkout, environment, arguments, clean_status=arguments[0] == "status")
+
+    status = ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    require(not read(*status), "source does not match packet")
+    listed = read("ls-files", "--stage", "-z")
+    gitlinks = [entry.partition(b"\t")[2] for entry in listed.split(b"\0") if entry.startswith(b"160000 ")]
+    require(not gitlinks, "submodules are not supported, because their content cannot be witnessed byte for byte: "
+            + ", ".join(sorted({os.fsdecode(path) for path in gitlinks}))[:1024])
+    revision = read("rev-parse", "HEAD").decode("ascii").rstrip("\r\n")
+    tree = read("rev-parse", "HEAD^{tree}").decode("ascii").rstrip("\r\n")
+    require(not read(*status), "source does not match packet")
+    return revision, tree
 
 
 class Hold(ValueError):
@@ -48,40 +128,23 @@ def checked_path(path):
     return safe_path(path)
 
 
-def reference(path):
-    path = checked_path(path)
-    return fresh.file_ref(path)
-
-
 def _attachment(mailbox, ref):
     fields(ref, {"path", "sha256"})
     checked_path(ref["path"])
     return fresh._attachment(mailbox, ref)
 
 
-def verify(ref):
-    fields(ref, {"path", "sha256"})
-    require(reference(ref["path"]) == ref, "evidence reference hash mismatch")
-    return ref
+def protect_references(value, *, paths=None):
+    """Bound every nested string before the composer/evidence readers inspect paths."""
+    fresh._private_paths(value, paths=paths)
 
 
-def protect_references(value):
-    """Validate declared paths before the composer or evidence readers can open them."""
-    if isinstance(value, dict):
-        if "path" in value and "sha256" in value:
-            checked_path(value["path"])
-        for item in value.values():
-            protect_references(item)
-    elif isinstance(value, list):
-        for item in value:
-            protect_references(item)
-
-
-def inspect_brief(raw):
+def inspect_brief(raw, mailbox=None):
     for line in raw.decode("utf-8").splitlines():
         if line.startswith("- "):
-            protect_references(strict_json(line[2:]))
-    return fresh.inspect(raw)
+            protect_references(fresh._bounded_json(line[2:]),
+                               paths=mailbox.operation.path_guard if mailbox is not None else None)
+    return fresh.inspect(raw, _check_ref=mailbox.check_ref, _operation=mailbox.operation) if mailbox is not None else fresh.inspect(raw)
 
 
 def identifier(stage, row, check_id=None):
@@ -91,12 +154,12 @@ def identifier(stage, row, check_id=None):
 
 def closed(row):
     resolution = row["resolution"]
-    return resolution is not None and resolution["kind"] in {"complete", "next", "blocked"}
+    return not row.get("lifecycle_unknown") and resolution is not None and resolution["kind"] in {"complete", "next", "blocked"}
 
 
 def active_teams(state):
     return {row["request"]["team"] for row in state["requests"].values()
-            if "small_change" in row and (row["resolution"] is None
+            if "small_change" in row and (row.get("lifecycle_unknown") or row["resolution"] is None
                 or row["resolution"]["kind"] not in {"complete", "blocked"})}
 
 
@@ -126,8 +189,24 @@ def pending_plans(state):
 def exclusions(state, rows):
     result = {team + "/" + role for team in active_teams(state) for role in ("orchestrator", "decider")}
     for view in rows:
-        if view.get("writer_message_present") and not view.get("route_receipt"):
+        row = state["requests"][view["request_id"]]
+        released = not row.get("lifecycle_unknown") and row["resolution"] is not None and row["resolution"]["kind"] in {"complete", "blocked"}
+        # Canonical next disposition closes routing, but cannot release D7 custody.
+        if not released and (view.get("writer_message_present") or row["routed"] is not None) and not (
+                view.get("route_receipt") and view.get("writer_publication_verified")):
             result.add(view["writer"])
+    # An unreadable mailbox cannot prove that no writer was delivered. Never
+    # turn an unavailable listing into permission for sweep to wake that lane.
+    absent = {view["request_id"] for view in rows
+              if view.get("mailbox_history_verified") and not view.get("writer_message_present")}
+    for key, row in state["requests"].items():
+        # A verified complete listing can prove absence. A failed/oversized
+        # listing, or unknown lifecycle effects, can never supply that proof.
+        if key in absent and not row.get("lifecycle_unknown") and row["intent"] is None and row["start"] is None:
+            continue
+        if "small_change" in row and (row.get("lifecycle_unknown") or row["routed"] is None) and not closed(row):
+            plan = life.raw_value(row["small_change"]["registration"]["proposal"])["plan"]
+            result.add(row["request"]["team"] + "/lane/" + plan["writing_lanes"][0]["lane"])
     return sorted(result)
 
 
@@ -153,14 +232,14 @@ def in_force(mailbox, message):
 
 
 def _artifact_mark(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns)
+    return fresh._reference_mark(info)
 
 
 class _RetainedJob:
     """Captured bytes plus identity witnesses; temporary anchored handles validate publication safety."""
 
-    def __init__(self, store, initiative, message):
+    def __init__(self, store, initiative, message, *, _claim=None):
+        self.descriptors()
         self.id = initiative["id"] + "/" + message["message_id"]
         self.holder = "job:" + self.id
         self.message = message
@@ -174,19 +253,31 @@ class _RetainedJob:
             self._missing = missing
             if missing is None:
                 self._directory = _artifact_mark(os.fstat(directory))
-                self._members = tuple(os.listdir(directory))
+                self._members = fresh._directory_names(directory)
                 for name in ("execution.json", "derivation.json", "admitted.json"):
                     require(name not in self._members, "unsupported retained v1 metadata: " + name)
-                for name in self._members:
-                    if name.startswith("step-") or name.startswith("derivation") or name in {
-                            "claim.json", "process.json", "result.json", "packet.md"}:
-                        self._capture(directory, name)
+                candidates = [name for name in self._members if name.startswith(("step-", "derivation")) or name in {
+                    "claim.json", "process.json", "result.json", "packet.md"}]
+                metadata = self._artifact_metadata(directory, candidates)
+                for name, before in metadata.items():
+                    if name == "claim.json" and _claim is not None and name in _claim.entries:
+                        entry = _claim.entries[name]
+                        require(fresh._same_mark(_artifact_mark(before), entry["mark"]), "retained claim changed")
+                        self.entries[name] = entry
+                    else:
+                        self._capture(directory, name, before=before)
             self._validate_snapshot(directory, links, missing)
         self.claim = self._json("claim.json")
         self.process = self._json("process.json")
         require("claim.json" not in self.entries or isinstance(self.claim, dict), "retained claim must be an object")
         require("process.json" not in self.entries or isinstance(self.process, dict), "retained process must be an object")
         self.result = self._result()
+
+    @staticmethod
+    def descriptors():
+        require(os.name == "posix" and all(hasattr(os, name) for name in (
+            "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")),
+            "retained descriptor capture requires POSIX directory descriptors")
 
     @contextmanager
     def _directories(self, *, expected=False):
@@ -204,10 +295,11 @@ class _RetainedJob:
                     break
                 descriptors.append(child)
                 info = os.fstat(child)
-                identity = (info.st_dev, info.st_ino, info.st_mode)
-                require(stat.S_ISDIR(info.st_mode), "retained job ancestor is not a directory")
+                identity = fresh._directory_mark(info)
+                require(stat.S_ISDIR(info.st_mode) and not fresh._reparse(info), "retained job ancestor is not a directory")
                 if expected:
-                    require(index < len(self._ancestors) and (part, identity) == self._ancestors[index],
+                    require(index < len(self._ancestors) and part == self._ancestors[index][0]
+                            and fresh._same_mark(identity, self._ancestors[index][1]),
                             "retained job directory identity changed")
                 links.append((parent, part, child, identity))
                 parent = child
@@ -216,68 +308,88 @@ class _RetainedJob:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    def _capture(self, directory, name):
-        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        require(stat.S_ISREG(before.st_mode), "retained artifact is not a regular file: " + name)
-        limit = (jobs.MAX_RESULT_BYTES if name == "result.json" else
-                 MAX_BYTES if name in {"claim.json", "process.json", "packet.md"} else None)
-        require(limit is None or before.st_size <= limit, "retained metadata exceeds its limit: " + name)
+    def _artifact_metadata(self, directory, names):
+        """Plan the entire capture from anchored, non-following metadata before any content open."""
+        metadata, total = {}, 0
+        for name in names:
+            step = re.fullmatch(r"step-([1-9][0-9]?)\.(log|out)", name)
+            require(name in {"claim.json", "process.json", "result.json", "packet.md"}
+                    or (step is not None and int(step[1]) <= jobs.MAX_STEPS),
+                    "completed job artifacts differ from admitted recipe")
+            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            require(stat.S_ISREG(before.st_mode) and not fresh._reparse(before),
+                    "retained artifact is not a regular file: " + name)
+            limit = jobs.MAX_RESULT_BYTES if name == "result.json" else MAX_BYTES if step is None else MAX_RETAINED_ARTIFACT_BYTES
+            require(0 <= before.st_size <= limit,
+                    "retained artifact exceeds byte limit" if step else "retained metadata exceeds its limit: " + name)
+            total += before.st_size
+            require(total <= MAX_RETAINED_JOB_BYTES, "retained job evidence exceeds byte limit")
+            metadata[name] = before
+        return metadata
+
+    def _capture(self, directory, name, *, before=None):
+        if before is None:
+            before = self._artifact_metadata(directory, (name,))[name]
+        metadata = name in {"claim.json", "process.json", "result.json", "packet.md"}
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
         try:
             opened = os.fstat(descriptor)
-            require(stat.S_ISREG(opened.st_mode) and _artifact_mark(opened) == _artifact_mark(before),
+            require(stat.S_ISREG(opened.st_mode) and not fresh._reparse(opened)
+                    and fresh._same_mark(_artifact_mark(opened), _artifact_mark(before)),
                     "retained artifact changed at open: " + name)
             total, tail, chunks = 0, b"", []
 
             def consume(chunk):
                 nonlocal total, tail
                 total += len(chunk)
-                require(limit is None or total <= limit, "retained metadata grew beyond its limit: " + name)
+                require(total <= before.st_size, "retained artifact changed while reading: " + name)
                 tail = (tail + chunk)[-jobs.TAIL_BYTES:]
-                if limit is not None:
+                if metadata:
                     chunks.append(chunk)
 
             try:
                 sha = fresh._stream_reference(descriptor, before, self.folder / name, consume)
             except ValueError as exc:
                 raise ValueError("retained artifact changed while reading: " + name) from exc
-            require(_artifact_mark(os.fstat(descriptor)) == _artifact_mark(before) and total == before.st_size,
+            require(fresh._same_mark(_artifact_mark(os.fstat(descriptor)), _artifact_mark(before)) and total == before.st_size,
                     "retained artifact changed while reading: " + name)
             self.entries[name] = {"mark": _artifact_mark(before), "sha256": sha,
-                                  "tail": tail, "raw": b"".join(chunks) if limit is not None else None}
+                                  "tail": tail, "raw": b"".join(chunks) if metadata else None}
         finally:
             os.close(descriptor)
 
     def _validate_snapshot(self, directory, links, missing):
-        require(tuple((name, identity) for _parent, name, _child, identity in links) == self._ancestors
+        require(fresh._same_ancestors(tuple((name, identity) for _parent, name, _child, identity in links), self._ancestors)
                 and missing == self._missing, "retained job directory identity changed")
 
         def validate_links():
             for parent, name, child, identity in links:
                 current = os.stat(name, dir_fd=parent, follow_symlinks=False)
                 opened = os.fstat(child)
-                require((current.st_dev, current.st_ino, current.st_mode) == identity
-                        == (opened.st_dev, opened.st_ino, opened.st_mode),
+                require(fresh._same_mark(fresh._directory_mark(current), identity)
+                        and fresh._same_mark(fresh._directory_mark(opened), identity),
                         "retained job directory identity changed")
 
         def validate_directory():
-            require(_artifact_mark(os.fstat(directory)) == self._directory
-                    and sorted(os.listdir(directory)) == sorted(self._members),
+            require(fresh._same_mark(_artifact_mark(os.fstat(directory)), self._directory)
+                    and fresh._directory_names(directory) == tuple(sorted(self._members)),
                     "retained job directory membership changed")
 
         validate_links()
         if missing is not None:
             return
         validate_directory()
+        metadata = self._artifact_metadata(directory, self.entries)
         for name, entry in self.entries.items():
-            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            require(stat.S_ISREG(current.st_mode) and _artifact_mark(current) == entry["mark"],
+            current = metadata[name]
+            require(stat.S_ISREG(current.st_mode) and not fresh._reparse(current)
+                    and fresh._same_mark(_artifact_mark(current), entry["mark"]),
                     "retained artifact identity/content metadata changed: " + name)
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                                  dir_fd=directory)
             try:
-                require(_artifact_mark(os.fstat(descriptor)) == entry["mark"]
-                        == _artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)),
+                require(fresh._same_mark(_artifact_mark(os.fstat(descriptor)), entry["mark"])
+                        and fresh._same_mark(_artifact_mark(os.stat(name, dir_fd=directory, follow_symlinks=False)), entry["mark"]),
                         "retained artifact identity/content metadata changed: " + name)
             finally:
                 os.close(descriptor)
@@ -291,7 +403,7 @@ class _RetainedJob:
 
     def _json(self, name):
         entry = self.entries.get(name)
-        return strict_json(entry["raw"].decode("utf-8")) if entry is not None else None
+        return fresh._bounded_json(entry["raw"].decode("utf-8")) if entry is not None else None
 
     def _result(self):
         if "result.json" not in self.entries:
@@ -339,6 +451,11 @@ class _RetainedJob:
                 or (result["state"] == "failed" and type(code) is int and code != 0),
                 "job result state and exit code disagree")
         if result["state"] == "completed":
+            require(result.get("reason") is None, "completed job result has a reason")
+            require(result.get("commit") is None, "completed fixed-command result has a new commit")
+            tests = result.get("tests")
+            require(tests is None or tests["total"] == sum(tests[key] for key in ("passed", "failed", "errors", "skipped")),
+                    "completed job result test counts disagree")
             require(bool(result["steps"]) and all(step["exit_code"] == 0 and not step.get("timed_out", False)
                                                 for step in result["steps"]),
                     "completed job result has missing, failed or timed-out steps")
@@ -396,7 +513,7 @@ class _RetainedJob:
                     and type(record.get("group")) is int and record["group"] > 0,
                     "executed steps lack process stop evidence: " + self.id)
         group = (record or {}).get("group")
-        require(not group or (type(group) is int and group > 0), "invalid job process group")
+        require(record is None or (type(group) is int and group > 0), "invalid job process group")
         require(not (group and jobs.group_members(group)), "job process group is still running: " + str(group))
         numbers = [int(n[5:-4]) for n in self.entries if n.startswith("step-") and n.endswith(".log") and n[5:-4].isdigit()]
         latest = max(numbers, default=0)
@@ -406,8 +523,109 @@ class _RetainedJob:
                 "job has an unrecorded process effect: " + self.id)
 
 
+class _RunnerClaim(_RetainedJob):
+    """Capture only the original claim before observing liveness; never enumerate or read growing logs."""
+    def __init__(self, store, initiative, message):
+        self.descriptors()
+        self.id = initiative["id"] + "/" + message["message_id"]
+        self.folder = checked_path(Path(store) / "jobs" / initiative["id"] / message["message_id"])
+        self.entries = {}
+        self.result_present = False
+        with self._directories() as (directory, links, missing):
+            self._ancestors = tuple((name, identity) for _parent, name, _child, identity in links)
+            self._missing = missing
+            if missing is None:
+                for name in ("execution.json", "derivation.json", "admitted.json"):
+                    try:
+                        os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise ValueError("unsupported retained v1 metadata: " + name)
+                try:
+                    self._capture(directory, "claim.json")
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.stat("result.json", dir_fd=directory, follow_symlinks=False)
+                    self.result_present = True
+                except FileNotFoundError:
+                    pass
+        self.claim = self._json("claim.json")
+        require(self.claim is None or isinstance(self.claim, dict), "retained claim must be an object")
+
+    def validate(self):
+        with self._directories(expected=True) as (directory, links, missing):
+            require(missing == self._missing and fresh._same_ancestors(
+                tuple((name, identity) for _parent, name, _child, identity in links), self._ancestors),
+                "retained claim directory identity changed")
+            for parent, name, _child, identity in links:
+                require(fresh._same_mark(fresh._directory_mark(os.stat(name, dir_fd=parent, follow_symlinks=False)), identity),
+                        "retained claim directory identity changed")
+            if missing is None:
+                for name in ("execution.json", "derivation.json", "admitted.json"):
+                    try:
+                        os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    raise ValueError("unsupported retained v1 metadata: " + name)
+            if missing is None and "claim.json" in self.entries:
+                require(fresh._same_mark(_artifact_mark(os.stat("claim.json", dir_fd=directory, follow_symlinks=False)),
+                                         self.entries["claim.json"]["mark"]), "retained claim changed")
+
+
+class _CapturedStore:
+    """Read-only workspace replay from captured bytes using the existing public reducers."""
+    def __init__(self, path, operation):
+        self.path, self.operation = checked_path(path), operation
+
+    def load(self):
+        ledger, count = workspace.Ledger(), 0
+        self.private_refusals = {}
+        try:
+            paths = self.operation.entries(self.path / "events")
+        except NotADirectoryError as exc:
+            raise ValueError("workspace store is not initialized") from exc
+        for path in paths:
+            if path.name.startswith(".pending-"):
+                checked_path(path)
+                continue
+            name = workspace.EVENT_NAME.fullmatch(path.name)
+            require(name is not None, "unexpected workspace store entry: " + path.name)
+            count += 1
+            require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
+            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + path.name)
+            try:
+                event = self.operation.json(path, private=False)
+                fields(event, {"schema", "seq", "at", "kind", "data"})
+                require(event["schema"] == workspace.EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
+                parse_time(event["at"])
+                declared = event["data"]
+                guarded = event
+                if event["kind"] in {"register", "update"} and isinstance(declared, dict):
+                    # These closed-schema declarations are validated lexically by
+                    # Ledger, without metadata access. Quarantine only their own
+                    # initiative below; consumers preflight them before opening.
+                    inert = {"checkouts"}
+                    if event["kind"] == "register":
+                        inert.update({"mailbox_root", "delivery_dir"})
+                    guarded = {**event, "data": {k: v for k, v in declared.items() if k not in inert}}
+                fresh._private_paths(guarded, paths=self.operation.path_guard)
+                ledger.apply(event)
+            except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+                raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
+        require(ledger.limits is not None, "workspace store is not initialized")
+        for team, initiative in ledger.initiatives.items():
+            declarations = [*initiative["checkouts"], *(initiative[k] for k in ("mailbox_root", "delivery_dir") if k in initiative)]
+            for declaration in declarations:
+                try:
+                    self.operation.path_guard.refuse(declaration)
+                except router.PrivatePathError as exc:
+                    self.private_refusals.setdefault(team, []).append(str(exc))
+        return ledger
+
+
 class Row:
-    def __init__(self, lifecycle, store, ledger, policy, state, key, recipes, wait):
+    def __init__(self, lifecycle, store, ledger, policy, state, key, recipes, wait, operation):
         self.lifecycle, self.store, self.ledger = lifecycle, store, ledger
         self.policy, self.state, self.key = policy, state, key
         self.row = state["requests"][key]
@@ -423,14 +641,103 @@ class Row:
         self.records = {}
         self.proofs = []
         self._retained_jobs = []
+        self._completed_checks = []
+        self._writer_receipt, self._writer_verified, self._writer_target_current = None, False, False
+        self._verification_proof = None
         self.setup = {}
+        self.operation = operation
+        self.operation.validators.append(self.recheck_jobs)
+        self.operation.validators.append(self.recheck_dependencies)
+
+    def reference(self, path):
+        with self.operation.capture():
+            return self.operation.reference(checked_path(path))
+
+    def verify(self, ref):
+        with self.operation.capture():
+            fields(ref, {"path", "sha256"})
+            require(self.reference(ref["path"]) == ref, "evidence reference hash mismatch")
+            return ref
+
+    def recipe_file(self):
+        with self.operation.capture():
+            path = checked_path(self.recipes)
+        if path in self.operation.parsed:
+            return self.operation.parsed[path]
+        raw = self.operation.read(path)[1]
+        recipes = strict_json(raw.decode("utf-8"))
+        fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
+        if "min_free_gigabytes" in recipes:
+            jobs.integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
+        require(recipes["schema"] == jobs.RECIPES_SCHEMA, "unsupported recipes schema")
+        require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
+        jobs.strings(recipes["path"], "path", nonempty=True)
+        require(all(Path(folder).is_absolute() for folder in recipes["path"]), "path must list absolute folders")
+        for label in ("hide", "ro_binds"):
+            folders = recipes.get(label, [])
+            jobs.strings(folders, label)
+            for folder in folders:
+                checked_path(folder)
+            jobs.existing_folders(folders, label)
+        prefix = recipes.get("prefix", [])
+        jobs.strings(prefix, "prefix")
+        require(not prefix or Path(prefix[0]).is_absolute(), "prefix must start with an absolute command")
+        env = recipes.get("env", {})
+        require(isinstance(env, dict) and all(isinstance(value, str) for value in env.values()), "invalid env")
+        for key, value in env.items():
+            require(re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is not None, "invalid env name: " + key)
+            require("$" not in value or value in jobs.ENV_TOKENS, "unsupported token in env: " + value)
+        table = recipes["recipes"]
+        require(isinstance(table, dict) and table, "recipes must not be empty")
+        for name, recipe in table.items():
+            jobs.validate_recipe(name, recipe)
+        if any(recipe["kind"] in ("commit", "merge") for recipe in table.values()):
+            identity = recipes.get("identity")
+            require(isinstance(identity, dict), "a commit or merge recipe needs an identity")
+            fields(identity, {"name", "email"})
+            jobs.text(identity["name"], "identity name", 256)
+            jobs.text(identity["email"], "identity email", 256)
+        # Hashed from the bytes that were parsed, so a result names exactly the recipe file it ran under. The key cannot come
+        # from the file: fields() above refuses it there.
+        recipes["recipes_sha256"] = hashlib.sha256(raw).hexdigest()
+        self.operation.parsed[path] = recipes
+        ref, _raw, witness = self.operation.files[path]
+        self.operation.files[path] = ref, None, witness
+        return recipes
 
     def recheck_jobs(self):
         try:
-            for job in self._retained_jobs:
-                job.validate()
+            with self.operation.capture():
+                for job in self._retained_jobs:
+                    job.validate()
+                if self.recipes is not None:
+                    for admission, job in self._completed_checks:
+                        self.required_tests(admission, job)
+        except Hold:
+            raise
         except (ValueError, OSError) as exc:
             raise Hold("small_change_receipt_invalid", str(exc)) from exc
+
+    def recheck_dependencies(self):
+        self.lifecycle.verify_dependencies(self.key)
+
+    def clear_writer_release(self):
+        self.finalize_writer_release(clear_only=True)
+
+    def finalize_writer_release(self, *, clear_only=False):
+        # All release-key mutations, including recovery removals, live here.
+        # Removals need no proof; grants below require the positive proof gate.
+        self.view.pop("route_receipt", None)
+        self.view.pop("writer_publication_verified", None)
+        if clear_only:
+            return
+        self.view.pop("mailbox_history_verified", None)
+        self.operation.verify()
+        self.view["mailbox_history_verified"] = self.mailbox is not None and self.mailbox._records is not None
+        if self._verification_proof is not None and self._writer_verified and self._writer_target_current:
+            self.view["writer_publication_verified"] = True
+            if self._writer_receipt is not None:
+                self.view["route_receipt"] = self._writer_receipt
 
     def reload(self):
         self.policy, self.state = router.locked_load(self.lifecycle, self.wait)
@@ -439,15 +746,14 @@ class Row:
 
     def event_ref(self, kind, mark=None):
         matches = []
-        for sequence in range(1, self.state["sequence"] + 1):
-            path = self.lifecycle.root / "events" / ("%06d.json" % sequence)
-            record = read_json(checked_path(path))
+        for record in self.lifecycle.index.get((self.key, kind), []):
+            path = self.lifecycle.root / "events" / ("%06d.json" % record["sequence"])
             event, envelope = record["envelope"]["event"], record["envelope"]
             target = life.raw_value(event["request"])["id"] if event["type"] == "publish" else event.get("request_id")
             if event["type"] == kind and target == self.key:
                 if mark is None or (envelope["actor"] == mark["actor"] and envelope["generation"] == mark["generation"]
                                     and record["at"] == mark["at"]):
-                    matches.append(reference(path))
+                    matches.append(self.reference(path))
         require(bool(matches), "lifecycle event provenance missing: " + kind)
         return matches[-1]
 
@@ -458,22 +764,30 @@ class Row:
     def inputs(self):
         checked_path(self.lifecycle.root)
         store = checked_path(self.store.path)
+        failures = self.store.private_refusals.get(self.team, [])
+        check(not failures, "small_change_configuration", failures[0] if failures else "")
         output = checked_path(self.mailbox.root.parent / "briefs")
         require(output != store and store not in output.parents and output not in store.parents,
                 "output directory overlaps coordination store: " + str(store))
-        for value in (self.policy, self.state, self.records):
-            protect_references(value)
+        parents = {identifier("scw", self.row), identifier("scr", self.row)}
+        if self.change["admission"]:
+            parents.update(identifier("scj", self.row, c["check"]) for c in self.change["admission"]["checks"])
+        relevant = {k: r for k, r in self.records.items() if k in parents or r["message"].get("in_reply_to") in parents}
+        for value in (self.policy, self.row, relevant):
+            protect_references(value, paths=self.operation.path_guard)
         provision = checked_path(self.mailbox.root.parent / "provision.json")
-        if provision.exists():
-            setup = read_json(provision)
+        if self.operation.exists(provision):
+            setup = self.operation.json(provision)
             require(isinstance(setup, dict), "provision record must be an object")
-            protect_references(setup)
+            protect_references(setup, paths=self.operation.path_guard)
             for key in ("source", "delivery_dir", "store", "board", "mailbox_root"):
                 if key in setup:
                     checked_path(setup[key])
             self.setup = setup
 
     def live(self, *, writing=False, expiry=False):
+        failures = self.lifecycle.refusals_for(self.key, consume=True)
+        check(not failures, "small_change_configuration", failures[0][1] if failures else "")
         check(self.team not in mixed_teams(self.state), "small_change_mixed_queue", "mixed initiative queues are held")
         check(router.last_decision(self.state, self.key) != "deny", "small_change_revoked", "canonical decision denied")
         try:
@@ -521,7 +835,7 @@ class Row:
             return None
         message = record["message"]
         try:
-            body = strict_json(message["body"])
+            body = fresh._bounded_json(message["body"])
             expected = self.metadata(stage, **(extra or {}))
             if stage != "check":
                 fields(body, set(expected) | {"target_generation"})
@@ -543,36 +857,57 @@ class Row:
                     "stored attachment is not content addressed")
             raw = _attachment(self.mailbox, message["brief"])
             for ref in body["witnesses"]:
-                verify(ref)
+                self.verify(ref)
             if stage != "check":
-                inspect_brief(raw)
-                require(("Endpoint: " + to) in raw.decode(), "brief target endpoint mismatch")
-                require(("Target generation: %s" % body["target_generation"]) in raw.decode(), "brief target generation mismatch")
-                require(self.row["raw"]["sha256"] in raw.decode() and self.view["plan_sha256"] in raw.decode(),
-                        "brief lacks request/plan witnesses")
+                inspect_brief(raw, self.mailbox)
+                lines = raw.decode().splitlines()
+                require([s for s in lines if s.startswith("Endpoint: ")] == ["Endpoint: " + to], "brief target endpoint mismatch")
+                require([s for s in lines if s.startswith("Target generation: ")] == ["Target generation: %s" % body["target_generation"]],
+                        "brief target generation mismatch")
+                assignments = [fresh._bounded_json(s[2:]) for s in lines if s.startswith("- ")]
+                assignments = [a for a in assignments if a.get("kind") == "small_change_assignment"]
+                require(len(assignments) == 1 and all(assignments[0].get(k) == v for k, v in body.items()),
+                        "brief lacks exact request/plan assignment")
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
             raise Hold("small_change_message_conflict", str(exc)) from exc
         try:
             in_force(self.mailbox, message)
+            if stage == "writer":
+                target = self.mailbox.bindings(to)[body["target_generation"] - 1]
+                require(self.mailbox.ready(target), "writer target binding is unacknowledged")
+                self._writer_target_current = self.mailbox.current_binding(to)["generation"] == target["generation"]
         except ValueError as exc:
             raise Hold("small_change_binding_changed", str(exc)) from exc
         return record
 
     def compose(self, target, stage):
-        args = SimpleNamespace(root=str(self.mailbox.root), initiative=self.team, endpoint=target,
-                               lifecycle=str(self.lifecycle.root), delivery_dir=None, as_of=timestamp(),
-                               target_generation=self.mailbox.current_binding(target)["generation"])
-        raw, answer = fresh.prepare(args)
-        assignment = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **self.metadata(stage, target),
-                      "instructions": ("Verify route receipt before intent/start; publish result lane_check as "
-                                       "lifecycle-terminal:<raw terminal sha256>. Never repeat an unknown effect."
-                                       if stage == "writer" else "Read-only review of the exact writer commit/tree and all check receipts."),
-                      "evidence": self.proofs}
-        raw = raw.replace(b"## Approved scope\n", b"## Approved scope\n\n- " + encoded(assignment) + b"\n", 1)
-        inspect_brief(raw)
-        ref = {"path": str(Path(answer["brief"]["path"]).parent / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")),
-               "sha256": hashlib.sha256(raw).hexdigest()}
-        return raw, ref
+        with self.operation.capture():
+            args = SimpleNamespace(root=str(self.mailbox.root), initiative=self.team, endpoint=target,
+                                   lifecycle=str(self.lifecycle.root), delivery_dir=None, as_of=timestamp(),
+                                   target_generation=self.mailbox.current_binding(target)["generation"])
+            try:
+                raw, answer = fresh.prepare(args, _mailbox=self.mailbox, _request_id=self.key)
+            except fresh.UnverifiedAttachment as exc:
+                self.view["next_action"] = "reconcile the attachment's original durable reference, then rerun dispatch"
+                if exc.message_id is not None:
+                    # The validated ASCII slug is already canonical and bounded.
+                    # Use the shared secret table before the final display bound.
+                    from hierarchy_board import secret_patterns
+                    message_id = exc.message_id
+                    for pattern in secret_patterns():
+                        message_id = pattern.sub("[REDACTED]", message_id)
+                    self.view["unverified_message_id"] = message_id[:80]
+                raise Hold("small_change_brief_unverified", "authoritative brief attachment is unverified") from exc
+            assignment = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **self.metadata(stage, target),
+                          "instructions": ("Verify route receipt before intent/start; publish result lane_check as "
+                                           "lifecycle-terminal:<raw terminal sha256>. Never repeat an unknown effect."
+                                           if stage == "writer" else "Read-only review of the exact writer commit/tree and all check receipts."),
+                          "evidence": self.proofs}
+            raw = raw.replace(b"## Approved scope\n", b"## Approved scope\n\n- " + encoded(assignment) + b"\n", 1)
+            inspect_brief(raw, self.mailbox)
+            ref = {"path": str(Path(answer["brief"]["path"]).parent / ("fresh-" + hashlib.sha256(raw).hexdigest() + ".md")),
+                   "sha256": hashlib.sha256(raw).hexdigest()}
+            return raw, ref
 
     def publication(self, msg_id, to, kind, body, brief, *, staged=False):
         binding = self.mailbox.current_binding(self.team + "/orchestrator")
@@ -595,9 +930,32 @@ class Row:
 
     def publish(self, request):
         self.recheck_jobs()
-        record = self.mailbox.publish(request)
-        life.sync_directory(Path(record["path"]).parent)
-        self.records[request["message_id"]] = record
+        try:
+            record = self.mailbox.publish(request)
+            # Publication returned: retain its original evidence even if directory durability is unknown.
+            self.records[request["message_id"]] = record
+            try:
+                life.sync_directory(Path(record["path"]).parent)
+            except (ValueError, OSError) as exc:
+                raise fresh.PartialPublication(record, exc) from exc
+        except fresh.PartialPublication as exc:
+            self.records[request["message_id"]] = exc.record
+            self.view["partial_publication"] = {"message_id": request["message_id"],
+                                                "evidence": {"path": exc.record["path"], "sha256": exc.record["sha256"]}}
+            if isinstance(exc.error, Hold):
+                raise Hold(exc.error.reason, str(exc)) from exc
+            if isinstance(exc.error, fresh.CaptureChanged) and self.recipes is not None and exc.error.path == Path(self.recipes):
+                raise Hold("small_change_recipe_mismatch", str(exc)) from exc
+            # An independently appended deny is durable evidence, not a generic transport failure.
+            # This refresh has no effects; unknown/malformed input still retains the partial-publication hold.
+            try:
+                self.reload()
+                self.live(expiry=request["type"] == "job_request")
+            except Hold as current:
+                raise Hold(current.reason, str(exc) + "; " + str(current)) from exc
+            except (ValueError, OSError, TypeError, KeyError):
+                pass
+            raise Hold("small_change_partial_publication", str(exc)) from exc
         return record
 
     def route_receipt(self):
@@ -607,13 +965,13 @@ class Row:
             check(self.row["routed"] is None, "small_change_message_conflict", "route exists under a different event identity")
             return None
         path = self.lifecycle.root / "events" / ("%06d.json" % receipt["sequence"])
-        record = read_json(checked_path(path))
+        record = self.operation.json(checked_path(path), limit=life.MAX_BYTES)
         envelope = record["envelope"]
         require(record["event_sha256"] == receipt["event_sha256"], "route receipt hash mismatch")
         expected = {"type": "route", "request_id": self.key, "request_sha256": self.row["raw"]["sha256"], "to": self.writer}
         check(envelope["id"] == msg_id and envelope["event"] == expected
               and self.policy["actors"][envelope["actor"]]["role"] == "router", "small_change_message_conflict", "route receipt identity mismatch")
-        self.view["route_receipt"] = receipt
+        self._writer_receipt = receipt
         return receipt
 
     def writer_dispatch(self, mutate):
@@ -622,6 +980,7 @@ class Row:
         receipt = self.route_receipt()
         prior = self.prior(msg_id, "writer", self.writer)
         check(not receipt or prior is not None, "small_change_message_lost", "route receipt exists without its writer message")
+        self._writer_verified = prior is not None
         if receipt:
             return prior
         check(self.row["intent"] is None and self.row["start"] is None, "small_change_result_invalid", "intent/start lacks matching route receipt")
@@ -646,19 +1005,30 @@ class Row:
                           and not self.validated_closure(r["message"], history)
                           for r in self.records.values()), "small_change_configuration", "writer lane already has an open dispatch")
             raw, ref = self.compose(self.writer, "writer")
+            self.reload()
+            self.live(writing=True, expiry=True)
+            actor = self.state["current"]["router"]
+            router.router_actor(self.policy, self.state, actor)
+            envelope = router.route_envelope(self.policy, self.state, actor, self.key, self.row["raw"], self.writer)
+            envelope["id"] = msg_id
+            router.journal_accepts(self.policy, self.state, envelope)
             remaining = (parse_time(self.row["request"]["continuation"]["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
             check(remaining > 2 * self.wait + RESERVE_SECONDS, "small_change_expired", "writer expiry margin insufficient")
             require(len(self.records) < MAX_RECORDS, "mailbox history limit reached")
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
             prior = self.publish(self.publication(msg_id, self.writer, "dispatch", self.metadata("writer", self.writer), ref))
             self.view["writer_message_present"] = True
         try:
             receipt = router.patient(lambda: self.lifecycle.record(envelope), self.wait)
+        except fresh._CommittedEvent as exc:
+            self.view["partial_publication"] = exc.record
+            raise Hold("small_change_committed_event", str(exc)) from exc
         except (ValueError, OSError) as exc:
             raise Hold("delivered_unrecorded", str(exc)) from exc
-        self.view["route_receipt"] = receipt
+        self._writer_receipt = receipt
         self.reload()
+        self._writer_verified = self.prior(msg_id, "writer", self.writer) is not None
         return prior
 
     def completion(self, dispatch, endpoint):
@@ -668,7 +1038,7 @@ class Row:
         complete = [r for r in replies if r["message"]["type"] in {"result", "review"}
                     or r["message"].get("acknowledgment") == "completed"]
         check(len(accepted) <= 1 and len(complete) <= 1, "small_change_result_invalid", "duplicate acceptance/completion")
-        target_generation = strict_json(dispatch["message"]["body"])["target_generation"]
+        target_generation = fresh._bounded_json(dispatch["message"]["body"])["target_generation"]
         try:
             in_force(self.mailbox, dispatch["message"])
         except ValueError as exc:
@@ -703,6 +1073,8 @@ class Row:
 
     def writer_result(self, dispatch):
         record, accepted = self.completion(dispatch, self.writer)
+        check(self._writer_target_current or record is not None, "small_change_binding_changed",
+              "superseded writer target lacks a verified original completion")
         self.view["state"] = "writing" if accepted else "writer_sent"
         terminal = self.row["terminal"]
         if terminal is not None:
@@ -719,8 +1091,8 @@ class Row:
         match = TERMINAL_REF.fullmatch(record["message"]["result"]["lane_check"])
         check(match is not None and match.group(1) == terminal["sha256"], "small_change_result_invalid", "terminal/result reference mismatch")
         for ref in terminal["value"]["evidence"]:
-            verify(ref)
-        self.proofs += [reference(record["path"]), self.event_ref("terminal", terminal)]
+            self.verify(ref)
+        self.proofs += [self.reference(record["path"]), self.event_ref("terminal", terminal)]
         self.result_record, self.accepted = record, accepted
         self.review_not_before = max(parse_time(record["message"]["created_at"]), parse_time(terminal["at"]))
         return record
@@ -733,7 +1105,7 @@ class Row:
 
     def job_extra(self, admission):
         return {"check": admission["check"], "recipe": admission["recipe"], "recipes_sha256": admission["recipes_sha256"],
-                "result": reference(self.result_record["path"])}
+                "result": self.reference(self.result_record["path"])}
 
     def job_records(self):
         entries = []
@@ -743,7 +1115,7 @@ class Row:
             prior = self.prior(msg_id, "check", self.team + "/root", extra=self.job_extra(admission))
             if prior is None:
                 folder = checked_path(self.store.path / "jobs" / self.team / msg_id)
-                check(not folder.exists(), "small_change_message_lost", "check message missing with retained job evidence: " + msg_id)
+                check(not self.operation.exists(folder), "small_change_message_lost", "check message missing with retained job evidence: " + msg_id)
             if prior:
                 check(_attachment(self.mailbox, prior["message"]["brief"]) == encoded(packet),
                       "small_change_message_conflict", "job packet differs from admitted fixed source")
@@ -752,6 +1124,7 @@ class Row:
 
     def check_receipts(self, entries):
         complete = True
+        self.running_checks = False
         self.view["checks"] = []
         for admission, packet, msg_id, record in entries:
             item = {"check": admission["check"], "message_id": msg_id, "state": "unpublished"}
@@ -780,7 +1153,38 @@ class Row:
                 check(all(s in TERMINAL_JOB_STATES for s in history[settled:]), "small_change_receipt_invalid",
                       "nonterminal job receipt follows a terminal receipt: " + msg_id)
                 check(state != "unknown", "small_change_unknown_effect", "job receipt has unresolved uncertainty: " + msg_id)
-                job = _RetainedJob(self.store.path, self.initiative, record["message"])
+                with self.operation.capture():
+                    claim = _RunnerClaim(self.store.path, self.initiative, record["message"])
+                if claim.claim is None and state == "started":
+                    # Absence read no claim bytes. Observe a just-published claim once before classifying a lost effect.
+                    with self.operation.capture():
+                        claim = _RunnerClaim(self.store.path, self.initiative, record["message"])
+                if claim.claim is not None:
+                    check(claim.claim.get("recipes_sha256") == admission["recipes_sha256"],
+                          "small_change_recipe_mismatch", "job claim recipe file changed")
+                    alive = claim.runner_alive()
+                    if alive is True:
+                        check(state != "completed", "small_change_unknown_effect", "job runner is live or unknown")
+                        claim.validate()
+                        self._retained_jobs.append(claim)
+                        self.running_checks, complete = True, False
+                        item["state"] = "running"
+                        continue
+                    check(alive is False, "small_change_unknown_effect", "job runner is unknown: " + msg_id)
+                if not any(s in TERMINAL_JOB_STATES for s in history):
+                    if state == "started" or claim.claim is not None:
+                        alive = claim.runner_alive()
+                        if alive is True:
+                            claim.validate()
+                            self._retained_jobs.append(claim)
+                            self.running_checks, complete = True, False
+                            item["state"] = "running"
+                            continue
+                        check(alive is False, "small_change_unknown_effect", "job runner is unknown: " + msg_id)
+                        check(claim.result_present, "small_change_unknown_effect",
+                              "stopped runner lacks terminal result/receipt: " + msg_id)
+                with self.operation.capture():
+                    job = _RetainedJob(self.store.path, self.initiative, record["message"], _claim=claim)
                 self._retained_jobs.append(job)
                 if job.claim is not None:
                     claim = job.claim
@@ -790,6 +1194,14 @@ class Row:
                     check(result.get("recipes_sha256") == admission["recipes_sha256"], "small_change_recipe_mismatch", "job result recipe file changed")
                     check(result["state"] not in {"failed", "refused"}, "small_change_check_failed",
                           "retained job did not pass: " + msg_id)
+                if state == "started" and result is None:
+                    raise Hold("small_change_unknown_effect", "stopped runner lacks terminal result/receipt: " + msg_id)
+                if settled == len(history) and job.entries:
+                    if job.claim is not None and job.runner_alive() is True:
+                        self.running_checks, complete = True, False
+                        item["state"] = "running"
+                        continue
+                    raise Hold("small_change_unknown_effect", "original terminal job receipt is missing: " + msg_id)
             except Hold:
                 raise
             except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
@@ -802,15 +1214,26 @@ class Row:
                 require(result is not None and result["state"] == "completed" and result["exit_code"] == 0, "missing successful retained job result")
                 require(witness["message"]["message_id"] == jobs.receipt_id(job, "completed"), "completed receipt is not the original runner receipt")
                 require(result["recipe"] == packet["recipe"], "job recipe differs")
+                if self.recipes is not None:
+                    self.required_tests(admission, job)
                 require(job.entries.get("packet.md", {}).get("raw") == encoded(packet), "retained packet differs")
                 for name in ("before", "after"):
                     source = result[name]
+                    fields(source, {"worktree", "source_revision", "source_tree", "dirty_state_sha256", "dirty_entries", "dirty_content_sha256"})
                     require(source["worktree"] == packet["checkout"] and source["source_revision"] == packet["commit"]
-                            and source["source_tree"] == packet["tree"] and source["dirty_content_sha256"] == jobs.EMPTY_STATUS,
+                            and source["source_tree"] == packet["tree"] and source["dirty_content_sha256"] == jobs.EMPTY_STATUS
+                            and source["dirty_state_sha256"] == jobs.EMPTY_STATUS
+                            and type(source["dirty_entries"]) is int and source["dirty_entries"] == 0,
                             "retained job source witness differs")
+                require(result["before"] == result["after"], "retained job source witnesses differ before/after")
+                export = result.get("source_export")
+                require(isinstance(export, dict), "missing or malformed source export")
+                fields(export, {"commit", "tree", "entries", "bytes", "removed"}, {"git_stub"})
+                require(export["commit"] == packet["commit"] and export["tree"] == packet["tree"], "source export differs from packet")
+                require(all(type(export[k]) is int and export[k] >= 0 for k in ("entries", "bytes"))
+                        and type(export["removed"]) is bool and ("git_stub" not in export or type(export["git_stub"]) is bool),
+                        "malformed source export")
                 expected = {"state": "completed", "exit_code": 0, "evidence": job.evidence()}
-                if result.get("reason") is not None:
-                    expected["reason"] = result["reason"][:4096]
                 require(jobs.receipt_matches(job, witness["message"], expected, job.body()), "receipt does not match retained evidence")
                 check(job.runner_alive() is False, "small_change_unknown_effect", "job runner is live or unknown")
                 job.check_stopped()
@@ -820,24 +1243,52 @@ class Row:
                 raise
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 raise Hold("small_change_receipt_invalid", str(exc)) from exc
-            self.proofs.append(reference(witness["path"]))
+            self.proofs.append(self.reference(witness["path"]))
+            self._completed_checks.append((admission, job))
             self.review_not_before = max(self.review_not_before, parse_time(witness["message"]["created_at"]))
         return complete
+
+    def required_tests(self, admission, job):
+        result = job.result
+        recipe = self.configured_recipe(admission)
+        packet = fresh._bounded_json(job.entries["packet.md"]["raw"].decode("utf-8"))
+        packet = {"paths": [], **packet}
+        recipes = self.recipe_file()
+        # The runner's list order is its step identity; v1 results have no step-number field.
+        checkout = str(job.folder / jobs.EXPORT_FOLDER) if recipe.get("require_clean") else packet["checkout"]
+        steps = list(jobs.command_steps(recipe, packet, recipes, job, checkout))
+        expected = [step.argv for step in steps]
+        require([step["argv"] for step in result["steps"]] == expected,
+                "completed job steps differ from admitted recipe")
+        artifacts = {name for name in job.entries if name.startswith("step-")}
+        names = {"step-%d.log" % n for n in range(1, len(steps) + 1)}
+        names |= {"step-%d.out" % n for n, step in enumerate(steps, 1) if step.capture}
+        require(artifacts == names, "completed job artifacts differ from admitted recipe")
+        require(job.process is not None and type(job.process.get("step")) is int
+                and job.process["step"] == len(expected), "completed job process step differs from admitted recipe")
+        if recipe.get("expects_tests", False):
+            tests = result.get("tests")
+            require(tests is not None and tests["total"] > 0 and tests["passed"] > 0,
+                    "completed job result lacks required passing tests")
+
+    def configured_recipe(self, admission):
+        require(self.recipes is not None, "dispatch requires configured recipes")
+        recipes = self.recipe_file()
+        check(recipes["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "admitted recipe file changed")
+        recipe = recipes["recipes"].get(admission["recipe"])
+        check(recipe is not None and recipe["kind"] == "command" and recipe.get("require_clean") is True
+              and not any("$paths" in step for step in recipe["steps"]), "small_change_configuration", "unsupported check recipe or $paths")
+        return recipe
 
     def publish_checks(self, entries, mutate=True):
         missing = [entry for entry in entries if entry[3] is None]
         if not missing:
             return
         self.live(expiry=True)
-        require(self.recipes is not None, "dispatch requires configured recipes")
-        recipes = jobs.load_recipes(checked_path(self.recipes))
         staged = []
         check(len(self.records) + len(missing) <= MAX_RECORDS, "small_change_configuration", "mailbox has no batch headroom")
         for admission, packet, msg_id, prior in entries:
-            check(recipes["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "admitted recipe file changed")
-            recipe = recipes["recipes"].get(admission["recipe"])
-            check(recipe is not None and recipe["kind"] == "command" and recipe.get("require_clean") is True
-                  and not any("$paths" in step for step in recipe["steps"]), "small_change_configuration", "unsupported check recipe or $paths")
+            self.configured_recipe(admission)
             raw = encoded(packet)
             ref = {"path": str(self.mailbox.root.parent / "briefs" / ("check-" + hashlib.sha256(raw).hexdigest() + ".md")),
                    "sha256": hashlib.sha256(raw).hexdigest()}
@@ -846,19 +1297,18 @@ class Row:
                 # Public runner validation is read-only; the attached packet must first exist.
                 # Validate equivalent source/recipe constraints before staging any packet.
                 require(packet["checkout"] in self.initiative["checkouts"], "checkout is not registered")
-                observed = jobs.source_state(self.mailbox, packet["checkout"])
-                require((observed["source_revision"], observed["source_tree"], observed["dirty_content_sha256"]) ==
-                        (packet["commit"], packet["tree"], jobs.EMPTY_STATUS), "source does not match packet")
+                require(_clean_source(packet["checkout"]) == (packet["commit"], packet["tree"]),
+                        "source does not match packet")
                 staged.append((admission, raw, ref, request))
         if not mutate:
             return
         for admission, raw, ref, request in staged:
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
         for admission, raw, ref, request in staged:
             self.reload()
             self.live(expiry=True)
-            current = jobs.load_recipes(checked_path(self.recipes))
+            current = self.recipe_file()
             check(current["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "recipe changed during batch publication")
             self.publish(request)
 
@@ -872,8 +1322,9 @@ class Row:
         self.live()
         self.view["state"] = "review_ready"
         if mutate:
+            require(self.recipes is not None, "Reviewer publication requires configured recipes")
             raw, ref = self.compose(self.reviewer, "reviewer")
-            fresh.publish(raw, ref)
+            self.mailbox.stage(raw, ref)
             life.sync_directory(Path(ref["path"]).parent)
             self.reload()
             self.live()
@@ -888,9 +1339,9 @@ class Row:
         """Bind the immutable review scope to the exact writer/terminal/settled-receipt witnesses."""
         try:
             message = record["message"]
-            body = strict_json(message["body"])
+            body = fresh._bounded_json(message["body"])
             raw = _attachment(self.mailbox, message["brief"])
-            assignments = [strict_json(line[2:]) for line in raw.decode("utf-8").splitlines() if line.startswith("- ")]
+            assignments = [fresh._bounded_json(line[2:]) for line in raw.decode("utf-8").splitlines() if line.startswith("- ")]
             assignments = [item for item in assignments if item.get("kind") == "small_change_assignment"]
             expected = {"kind": "small_change_assignment", "ref": self.witnesses()[1], **body,
                         "instructions": "Read-only review of the exact writer commit/tree and all check receipts.",
@@ -905,11 +1356,16 @@ class Row:
             raise Hold("small_change_message_conflict", str(exc)) from exc
 
     def drafts(self, reason=None):
+        self.operation.verify()
+        if self.row.get("lifecycle_unknown"):
+            return []
         blocked = self.row["resolution"] is not None and self.row["resolution"]["kind"] == "blocked"
         if closed(self.row) and not blocked:
             return []
         evidence = self.proofs or [self.event_ref("small_change_plan", self.change["registration"])]
         success = reason == "small_change_close_due"
+        if success:
+            check(router.last_decision(self.state, self.key) != "deny", "small_change_revoked", "canonical decision denied")
         if blocked and not success:
             return []
         resolution = ({"kind": "complete", "evidence": evidence} if success else
@@ -943,7 +1399,7 @@ class Row:
         delivery = self.mailbox.root.parent / "delivery"
         delivery = checked_path(self.setup.get("delivery_dir", str(delivery)))
         read_ids = set()
-        if delivery.exists():
+        if self.operation.exists(delivery):
             for receipt in self.mailbox.delivery_receipts(delivery, "reads", self.team + "/orchestrator", self.records):
                 read_ids.update(receipt["message_ids"])
         self.view["retained_replies"] = [{"message_id": r["message"]["message_id"], "parent": r["message"]["in_reply_to"],
@@ -963,6 +1419,7 @@ class Row:
             return False
         try:
             for m in [message, accepted[0], completed[0]]:
+                require(m["message_id"] not in self.mailbox.message_refusals, "foreign assignment reference unavailable")
                 in_force(self.mailbox, m)
             require(all(m["from"] == message["to"] and m["to"] == message["from"] for m in accepted + completed),
                     "foreign assignment reply endpoints differ")
@@ -997,7 +1454,7 @@ class Row:
                 # A job packet is inert data. This reports overlap; it never gates the existing runner.
                 malformed = "malformed foreign job packet: " + message["message_id"]
                 try:
-                    packet = strict_json(jobs.packet_text(_attachment(self.mailbox, message["brief"])))
+                    packet = fresh._bounded_json(jobs.packet_text(_attachment(self.mailbox, message["brief"])))
                 except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
                     raise Hold("small_change_mixed_queue", malformed) from exc
                 check(isinstance(packet, dict), "small_change_mixed_queue", malformed)
@@ -1007,12 +1464,13 @@ class Row:
                         raise Hold("small_change_mixed_queue", "foreign fixed-source job: " + message["message_id"])
 
     def progress(self, mutate):
+        check(router.last_decision(self.state, self.key) != "deny", "small_change_revoked", "canonical decision denied")
         check(self.row["resolution"] is None or self.row["resolution"]["kind"] != "next",
               "small_change_configuration", "next disposition does not release the planning skip")
         self.endpoints()
         if not closed(self.row):
             for role in ("orchestrator", "decider"):
-                check(not self.mailbox.wake_marker(self.team + "/" + role).exists(),
+                check(not self.operation.exists(self.mailbox.wake_marker(self.team + "/" + role)),
                       "small_change_configuration", "planning wake requires owner reconciliation: " + role)
         self.retained()
         self.foreign_publications()
@@ -1035,7 +1493,7 @@ class Row:
         complete = self.check_receipts(entries)
         if not complete:
             check(not auditing, "small_change_closed_unverified", "closed row lacks verified checks")
-            if mutate or self.recipes is not None:
+            if not self.running_checks and (mutate or self.recipes is not None):
                 self.publish_checks(entries, mutate)
             self.view["state"] = "checking"
             return
@@ -1056,46 +1514,72 @@ class Row:
         reviewed = completion["message"]["result"]
         original = result["message"]["result"]
         check(all(reviewed[k] == original[k] for k in ("source_revision", "source_tree")), "small_change_result_invalid", "Reviewer source differs")
-        self.proofs += [reference(completion["path"]), self.event_ref("review", review)]
+        self.proofs += [self.reference(completion["path"]), self.event_ref("review", review)]
         if auditing:
             self.view["state"] = "owned_hold" if blocked else "complete"
+            if self.recipes is None:
+                self.view.update(state="owned_hold" if blocked else "held", reason="small_change_close_unverified", drafts=[],
+                                 detail="rerun with --recipes <file> to verify closed evidence")
+                return
             if blocked:
                 self.view["reason"] = "small_change_close_due"
-                self.view["drafts"] = self.drafts("small_change_close_due")
+                self.view["drafts"] = self.drafts("small_change_close_due") if self.recipes is not None else []
             return
         self.live()
         self.view.update(state="held", reason="small_change_close_due", detail="owner records drafted coordinator events")
-        self.view["drafts"] = self.drafts("small_change_close_due")
+        if self.recipes is not None:
+            self.view["drafts"] = self.drafts("small_change_close_due")
+        else:
+            self.view.update(reason="small_change_close_unverified", drafts=[],
+                             detail="rerun with --recipes <file> to verify checks before successful closure drafts")
+
+    def verification_pass(self, mutate):
+        # An old canonical publication is an effect even without a route receipt.
+        # Inspect it before active-team, participant, admission or host readiness checks.
+        self.initiative = self.ledger.initiatives.get(self.team)
+        check(self.initiative is not None and "mailbox_root" in self.initiative,
+              "small_change_configuration", "team has no registered mailbox")
+        root = self.initiative["mailbox_root"]
+        self.mailbox = fresh._CapturedMailbox(checked_path(root), _operation=self.operation)
+        self.mailbox.before_publication = self.publication_authority
+        self.records = self.mailbox.messages()
+        prior = router.prior_delivery(self.mailbox, self.team, self.key, self.row["raw"])
+        if prior is not None:
+            original = self.records[router.route_id(self.row["raw"]["sha256"])]
+            self.view["legacy_delivery"] = {"message_id": original["message"]["message_id"],
+                                            "evidence": self.reference(original["path"])}
+            raise Hold("small_change_legacy_delivery" if prior == "same" else "route_message_conflict",
+                       "retained canonical publication requires owner disposition; never dispatch again")
+        parents = {identifier("scw", self.row), identifier("scr", self.row)}
+        if self.change["admission"]:
+            parents.update(identifier("scj", self.row, c["check"]) for c in self.change["admission"]["checks"])
+        for key, errors in self.mailbox.message_refusals.items():
+            if key in parents or self.records[key]["message"].get("in_reply_to") in parents:
+                raise Hold("small_change_configuration", errors[0])
+        _root, reason = router.team_mailbox(self.ledger, self.team)
+        check(reason is None, "small_change_configuration", reason or "")
+        refusals = self.lifecycle.refusals_for(self.key, consume=True)
+        if refusals:
+            raise router.PrivatePathError(*refusals[0])
+        self.inputs()
+        self.progress(mutate)
 
     def run(self, mutate):
+        self._verification_proof = None
         try:
-            # An old canonical publication is an effect even without a route receipt.
-            # Inspect it before active-team, participant, admission or host readiness checks.
-            self.initiative = self.ledger.initiatives.get(self.team)
-            check(self.initiative is not None and "mailbox_root" in self.initiative,
-                  "small_change_configuration", "team has no registered mailbox")
-            root = self.initiative["mailbox_root"]
-            self.mailbox = Mailbox(checked_path(root))
-            self.records = self.mailbox.messages()
-            prior = router.prior_delivery(self.mailbox, self.team, self.key, self.row["raw"])
-            if prior is not None:
-                original = self.records[router.route_id(self.row["raw"]["sha256"])]
-                self.view["legacy_delivery"] = {"message_id": original["message"]["message_id"],
-                                                "evidence": reference(original["path"])}
-                raise Hold("small_change_legacy_delivery" if prior == "same" else "route_message_conflict",
-                           "retained canonical publication requires owner disposition; never dispatch again")
-            _root, reason = router.team_mailbox(self.ledger, self.team)
-            check(reason is None, "small_change_configuration", reason or "")
-            self.inputs()
-            self.progress(mutate)
-            self.recheck_jobs()
+            self._verification_proof = self.operation.prove(self.verification_pass, mutate)
+            self.finalize_writer_release()
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
+            self._verification_proof = None
+            self.clear_writer_release()
             reason = exc.reason if isinstance(exc, Hold) else "small_change_configuration"
+            if isinstance(exc, fresh.CaptureChanged) and self.recipes is not None and exc.path == Path(self.recipes):
+                reason = "small_change_recipe_mismatch"
             if "malformed mailbox message" in str(exc):
                 reason = "small_change_receipt_invalid" if "receipt" in str(exc) else "small_change_result_invalid"
             if "referenced message does not exist" in str(exc):
                 reason = "small_change_message_lost"
-            self.view.update(state="held", reason=reason, detail=str(exc)[:1024])
+            self.view.update(state="held", reason=reason, detail=str(exc)[:1024], drafts=[])
             if self.mailbox is not None:
                 self.view["writer_message_present"] = identifier("scw", self.row) in self.records
             if self.view.get("writer_message_present") and self.row["routed"] is None and reason in {
@@ -1109,31 +1593,71 @@ class Row:
                 self.view["drafts"] = self.drafts(reason)
             except (ValueError, OSError, TypeError, KeyError) as draft_error:
                 self.view["draft_error"] = str(draft_error)[:1024]
+            try:
+                self.finalize_writer_release()
+            except (ValueError, OSError, TypeError, KeyError, RecursionError) as release_error:
+                self.clear_writer_release()
+                self.view.update(drafts=[], release_validation_error=str(release_error)[:1024])
         return self.view
+
+    def publication_authority(self, request):
+        self.reload()
+        writing = request["type"] == "dispatch" and request["to"] == self.writer
+        self.live(writing=writing, expiry=writing or request["type"] == "job_request")
 
 
 def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
     router.preflight_paths(lifecycle.root, store.path)
-    policy, state = router.locked_load(lifecycle, wait)
-    ledger = store.load()
+    root, store_path = lifecycle.root, store.path
+    reference_cache = {}
+
+    def inputs():
+        operation = fresh._Operation(reference_cache=reference_cache)
+        captured = operation.lifecycle(root)
+        policy, state = router.locked_load(captured, wait)
+        captured_store = _CapturedStore(store_path, operation)
+        ledger = captured_store.load()
+        operation.verify()
+        return operation, captured, captured_store, policy, state, ledger
+
+    _operation, _lifecycle, _store, _policy, state, ledger = inputs()
     rows = []
     for key, row in sorted(state["requests"].items()):
         if "small_change" not in row:
             continue
-        context = Row(lifecycle, store, ledger, policy, state, key, recipes, wait)
+        def context():
+            if not mutate:
+                # Share only the journal replay/index. Each row keeps independent
+                # mailbox/store captures, so another team's artifacts cannot poison it.
+                operation = fresh._Operation(reference_cache=reference_cache)
+                captured_store = _CapturedStore(store_path, operation)
+                current_ledger = captured_store.load()
+                return Row(_lifecycle, captured_store, current_ledger, _policy, state, key, recipes, wait, operation)
+            operation, captured, captured_store, policy, current, current_ledger = inputs()
+            return Row(captured, captured_store, current_ledger, policy, current, key, recipes, wait, operation)
+
         if mutate:
-            root, reason = router.team_mailbox(ledger, row["request"]["team"])
+            mailbox_root, reason = router.team_mailbox(ledger, row["request"]["team"])
             if reason is None:
+                current = None
                 try:
-                    with writer_lock(checked_path(root)):
-                        context.reload()
-                        rows.append(context.run(True))
+                    with writer_lock(checked_path(mailbox_root)):
+                        current = context()
+                        actual, refusal = router.team_mailbox(current.ledger, row["request"]["team"])
+                        check(refusal is None and actual == mailbox_root, "small_change_configuration", "team mailbox changed before lock")
+                        rows.append(current.run(True))
                     continue
                 except (ValueError, OSError) as exc:
-                    context.view.update(state="held", reason="small_change_configuration", detail=str(exc))
-                    rows.append(context.view)
+                    if current is None:
+                        current = Row(_lifecycle, _store, ledger, _policy, state, key, recipes, wait,
+                                      fresh._Operation(reference_cache=reference_cache))
+                    current.clear_writer_release()
+                    current.view.update(state="held", reason="small_change_configuration", detail=str(exc))
+                    rows.append(current.view)
                     continue
-        rows.append(context.run(False))
-    _policy, current = router.locked_load(lifecycle, wait)
+        rows.append(context().run(False))
+    final = fresh._Operation(reference_cache=reference_cache)
+    _policy, current = router.locked_load(final.lifecycle(root), wait)
+    final.verify()
     return {"small_changes": rows, "planning_exclusions": exclusions(current, rows),
             "qualification_dependencies": ["D4 registry companion", "D5 lane lifecycle tools", "D7 independent early-release record seam"]}

@@ -478,6 +478,14 @@ class Pass:
                           request_id=row["request_id"])
 
     def dispatch(self, status):
+        if not getattr(self.args, "dispatcher_host_plan", None):
+            return
+        try:
+            self.validate_dispatcher_plan()
+        except ERRORS + (RecursionError, TypeError, KeyError) as exc:
+            self.steps.append({"step": "dispatch", "state": "hold", "exit": 2})
+            self.hold("dispatch", "planning_exclusions_unavailable", str(exc), "owner")
+            return
         # Canonical-only reports remain byte-compatible; the stage is an inert no-op there.
         if status is not None and "small_changes" not in status:
             return
@@ -490,9 +498,22 @@ class Pass:
             self.steps.append({"step": "dispatch", "state": "hold", "exit": code})
             self.hold("dispatch", "dispatch_error", (result or {}).get("error", stderr or problem), "owner")
 
+    def validate_dispatcher_plan(self):
+        # Explicit opt-in is independent of journal availability and status.json.
+        # This is configuration selection, not a role/binding/activation grant.
+        from hierarchy_router import preflight_paths
+        from hierarchy_fresh_brief import _Operation
+        from hierarchy_hosts import validate_plan
+        path = self.args.dispatcher_host_plan
+        preflight_paths(path)
+        operation = _Operation()
+        validate_plan(operation.json(path))
+        operation.verify()
+
     def refresh_planning(self):
         # Child reports can fail independently of durable evidence, including after publication.
         try:
+            self.validate_dispatcher_plan()
             from hierarchy_router import preflight_paths
             from hierarchy_lifecycle import Lifecycle
             from hierarchy_workspace import Store
@@ -513,7 +534,7 @@ class Pass:
         return True
 
     def sweep(self):
-        if not self.refresh_planning():
+        if getattr(self.args, "dispatcher_host_plan", None) and not self.refresh_planning():
             self.steps.append({"step": "sweep", "state": "skipped"})
             return
         args = self.common("sweep") + ["--rounds", "1", "--durable"]
@@ -610,7 +631,9 @@ class Pass:
     def run(self):
         """Steps in order; a stop request is honoured only between them."""
         status = rows = None
-        for step in ("router_status", "route", "dispatch", "sweep", "run_open"):
+        steps = (("router_status", "route", "dispatch", "sweep", "run_open")
+                 if getattr(self.args, "dispatcher_host_plan", None) else ("router_status", "route", "sweep", "run_open"))
+        for step in steps:
             if Stop.requested:
                 return True
             self.beat(step)
@@ -841,6 +864,7 @@ def main(argv=None):
     parser.add_argument("--recipes", required=True, help="Absolute path to root's recipe file")
     parser.add_argument("--state-dir", required=True, help="Absolute path to the folder for status.json")
     parser.add_argument("--max-jobs", type=int, help="Passed to run-open")
+    parser.add_argument("--dispatcher-host-plan", help="Opt in to model-free dispatch using this existing host-plan record")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("once", help="Run one pass")
     runner = commands.add_parser("run", help="Run passes until SIGTERM or SIGINT, or until --passes are done")
@@ -850,6 +874,15 @@ def main(argv=None):
     shown.add_argument("--text", action="store_true", help="Holds grouped by who must act")
     args = parser.parse_args(argv)
     try:
+        from hierarchy_router import preflight_paths
+        preflight_paths(*(getattr(args, flag) for flag in ("lifecycle", "store", "recipes", "state_dir")
+                          if getattr(args, flag) is not None))
+        if args.dispatcher_host_plan is not None:
+            # Parse without discovery; invalid plan IO is a planned-pass hold,
+            # leaving independent canonical run-open work available.
+            args.dispatcher_host_plan = Path(args.dispatcher_host_plan)
+            if not args.dispatcher_host_plan.is_absolute() or ".." in args.dispatcher_host_plan.parts:
+                refuse("--dispatcher-host-plan must be absolute without traversal")
         for flag in ("lifecycle", "store", "recipes", "state_dir"):
             setattr(args, flag, cli_path(getattr(args, flag), "--" + flag.replace("_", "-")))
         positive(args.max_jobs, "--max-jobs")
