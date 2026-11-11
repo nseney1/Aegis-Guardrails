@@ -108,6 +108,7 @@ __all__ = [
     "atomic_write_text",
     "create_private_file",
     "file_generation",
+    "file_report",
     "file_lock",
     "fsync_dir",
     "ledger_locked",
@@ -733,13 +734,11 @@ def file_generation(size: int, mtime_ns: int, ctime_ns: int) -> Tuple[int, int, 
 
 @dataclass(frozen=True)
 class FileReport:
-    """Descriptor evidence for one I/O operation, with at most 256 bytes at each end."""
+    """Descriptor identity, size and generation; optional filesystem read-start evidence."""
 
     identity: Tuple[int, int]
     size: int
-    tail: bytes
     added: int = 0
-    head: bytes = b""
     mtime_ns: int = 0
     ctime_ns: int = 0
     started_ns: Optional[int] = None
@@ -762,15 +761,17 @@ class ReportedRows(list):
         self.report = report
 
 
-def _file_report(fd: int, data: bytes, *, appended: bool = False,
+def file_report(fd: int, data: bytes, *, appended: bool = False,
                  started_ns: Optional[int] = None) -> Optional[FileReport]:
     try:
         info = os.fstat(fd)
     except OSError:
         return None  # Evidence is optional; a completed I/O operation still succeeded.
-    return FileReport((info.st_dev, info.st_ino), info.st_size if appended else len(data),
-                      data[-256:], len(data) if appended else 0, b"" if appended else data[:256],
-                      info.st_mtime_ns, info.st_ctime_ns, started_ns)
+    identity = (info.st_dev, info.st_ino)
+    if appended:
+        return FileReport(identity, info.st_size, added=len(data))
+    return FileReport(identity, len(data), mtime_ns=info.st_mtime_ns,
+                      ctime_ns=info.st_ctime_ns, started_ns=started_ns)
 
 
 def _encode_rows(rows: Iterable[Dict[str, Any]]) -> bytes:
@@ -794,7 +795,6 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     the torn bytes stay as one unreadable line and the new rows stay intact. Callers that
     need ordering or deduplication hold ``locked()``. Returns the number of rows written,
     with optional ``report`` evidence captured from the descriptor after the write.
-    Generation stamps and the I/O start time are captured without extra reads.
     """
     rows = list(rows)
     payload = _encode_rows(rows)
@@ -803,7 +803,6 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     created = not os.path.lexists(target)
-    started_ns = time.time_ns()
     fd = _open_regular(target, os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=mode)
     try:
         size = os.fstat(fd).st_size
@@ -813,7 +812,7 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
                 payload = b"\n" + payload
         _write_all(fd, payload)
         os.fsync(fd)
-        report = _file_report(fd, payload, appended=True, started_ns=started_ns)
+        report = file_report(fd, payload, appended=True)
     finally:
         os.close(fd)
     if created:
@@ -935,7 +934,6 @@ def read_jsonl(
     caller passes bytes every wanted row carries verbatim and re-checks the fields.
     """
     report = None
-    started_ns = time.time_ns()
     try:
         # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
         fd = _open_regular(Path(path), os.O_RDONLY | _O_NONBLOCK)
@@ -945,20 +943,17 @@ def read_jsonl(
         return JsonlRead([], [], [], error=f"cannot read {path}: {exc}")
     except OSError as exc:
         return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
-    if tail_bytes is not None:
-        try:
+    try:
+        if tail_bytes is not None:
             data = _read_tail_from_fd(fd, tail_bytes)
-        except OSError as exc:
-            return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
-        finally:
-            os.close(fd)
-    else:
-        try:
-            with os.fdopen(fd, "rb") as fh:
+        else:
+            with os.fdopen(fd, "rb", closefd=False) as fh:
                 data = fh.read()
-                report = _file_report(fh.fileno(), data, started_ns=started_ns)
-        except OSError as exc:
-            return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
+                report = file_report(fh.fileno(), data)
+    except OSError as exc:
+        return JsonlRead([], [], [], error=f"cannot read {path}: {exc.strerror or exc}")
+    finally:
+        os.close(fd)
 
     result = parse_jsonl(data, errors, contains=contains)
     return JsonlRead(result.rows, result.line_numbers, result.skipped_lines,
