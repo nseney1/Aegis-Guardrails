@@ -254,6 +254,16 @@ def validate_manifest(manifest):
 
 
 @contextmanager
+def _writer_stream(fd):
+    """Own the raw descriptor while a non-owning stream wraps it."""
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
+@contextmanager
 def writer_lock(root):
     lock = safe_path(root / ".write.lock")
     try:
@@ -261,7 +271,7 @@ def writer_lock(root):
     except FileExistsError as exc:
         raise ValueError("mailbox writer is busy; inspect an abandoned lock before retrying") from exc
     try:
-        with os.fdopen(fd, "wb") as stream:
+        with _writer_stream(fd) as stream:
             stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
         yield
     finally:
@@ -307,7 +317,7 @@ def publish_file(path, raw, *, limit=MAX_BYTES):
     pending = path.parent / (".pending-" + uuid.uuid4().hex)
     try:
         fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as stream:
+        with _writer_stream(fd) as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())

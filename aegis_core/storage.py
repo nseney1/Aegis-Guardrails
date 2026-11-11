@@ -52,9 +52,13 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Set, Tuple, Union
 
 from aegis_core import gitsafe, storage_shared
+
+if TYPE_CHECKING:  # Lazy re-exports served by __getattr__; the runtime import set is unchanged.
+    from aegis_core.storage_confined import ConfinedFileError, confined_file
+    from aegis_core.storage_confined import descriptor_supported as confined_descriptor_supported
 from aegis_core.atomicio import (
     _O_CLOEXEC,
     _O_NOFOLLOW,
@@ -95,6 +99,9 @@ except ImportError:  # POSIX
 _DEPS = sys.modules[__name__]
 
 __all__ = [
+    "ConfinedFileError",
+    "confined_file",
+    "confined_descriptor_supported",
     "FileReport",
     "AppendResult",
     "JsonlRead",
@@ -129,6 +136,15 @@ __all__ = [
     "workspace_relative",
     "worktree_label",
 ]
+
+
+def __getattr__(name):
+    # Hooks import storage without using confined files; preserve their load set.
+    if name in {"ConfinedFileError", "confined_file", "confined_descriptor_supported"}:
+        from aegis_core import storage_confined
+        target = "descriptor_supported" if name == "confined_descriptor_supported" else name
+        return getattr(storage_confined, target)
+    raise AttributeError("unknown storage attribute")
 
 
 # ── The one workspace lock ───────────────────────────────────────────────────

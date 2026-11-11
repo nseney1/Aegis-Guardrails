@@ -2,8 +2,8 @@
 
 No process or network probes occur here. Host capabilities below mirror the
 registry in tools/hierarchy_hosts.py; native app threads cannot bind run roles.
-Anchored feature-owned I/O remains until STORE-API-1 supplies the shared boundary
-and platform support. Windows filesystem-backed operations currently refuse.
+Confined reads and publication use the shared storage boundary. Windows
+filesystem-backed operations currently refuse.
 """
 from __future__ import annotations
 
@@ -16,10 +16,9 @@ import os
 from pathlib import Path
 import re
 import stat
-import uuid
 from typing import Any
 
-from aegis_core import pathlookup
+from aegis_core import pathlookup, storage
 from aegis_core.primitives import sanitize_display as sanitize_display
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
@@ -684,34 +683,25 @@ def governance_status():
 
 
 def descriptor_supported():
-    names = {function.__name__ for function in os.supports_dir_fd}
-    return (os.name == "posix" and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
-            and {"open", "mkdir", "link", "rename", "unlink"} <= names)
+    return storage.confined_descriptor_supported()
 
 
 @contextmanager
-def _directory(root, components=(), create=False):
+def _profile_file(root, parts, create=False):
     if not descriptor_supported():
         raise ProfileError("unsupported platform: anchored profile operations unavailable")
-    given = Path(root)
-    if not given.is_absolute() or ".." in given.parts:
-        raise ProfileError("unsafe profile root; use an absolute trusted directory")
-    fd = None
-    try:
-        fd = os.open(given.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-        for index, component in enumerate((*given.parts[1:], *components)):
-            if create and index >= len(given.parts) - 1:
-                try:
-                    os.mkdir(component, 0o700, dir_fd=fd)
-                except FileExistsError:
-                    pass
-            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
-            parent, fd = fd, child
-            os.close(parent)
-        yield fd
-    finally:
-        if fd is not None:
-            os.close(fd)
+    with storage.confined_file(root, parts, create_parents=create) as handle:
+        yield handle
+
+
+def _file_refusal(error):
+    messages = {
+        "unsupported": "unsupported platform: anchored profile operations unavailable",
+        "invalid_path": "unsafe profile root; use an absolute trusted directory",
+        "too_large": "profile size limit exceeded",
+        "exists": "profile already exists; inspect it or use --force",
+    }
+    return ProfileError(messages.get(error.reason, "unsafe or unreadable profile path"))
 
 
 def _pairs(items):
@@ -793,44 +783,21 @@ def _parse(data):
     return value
 
 
-def _read_at(parent, name):
-    fd = None
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ProfileError("unsafe profile: regular file required")
-        if info.st_size > MAX_BYTES:
-            raise ProfileError("profile size limit exceeded")
-        data = bytearray()
-        while len(data) <= MAX_BYTES:
-            chunk = os.read(fd, min(8192, MAX_BYTES + 1 - len(data)))
-            if not chunk:
-                break
-            data.extend(chunk)
-        if len(data) > MAX_BYTES:
-            raise ProfileError("profile size limit exceeded")
-        return _parse(data)
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
 def _read(root, parts, layer):
     file = str(Path(root).joinpath(*parts))
     try:
-        with _directory(root, parts[:-1]) as parent:
+        with _profile_file(root, parts) as handle:
             if layer == "user":
-                info = os.fstat(parent)
+                info = handle.parent_stat()
                 if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise ProfileError("user profile directory must be owned by the current user and not group/other-writable")
-            return _read_at(parent, parts[-1])
-    except FileNotFoundError:
-        return {}
+            return _parse(handle.read_bytes(MAX_BYTES))
+    except storage.ConfinedFileError as error:
+        if error.reason == "missing":
+            return {}
+        raise _context(_file_refusal(error), layer, file) from None
     except ProfileError as error:
         raise _context(error, layer, file)
-    except OSError:
-        raise ProfileError("unsafe or unreadable profile path", layer=layer, file=file) from None
 
 
 def load(root, *, user_root=None):
@@ -912,51 +879,25 @@ def _preset_document(preset, host=None):
 def initialize(root, preset, *, host=None, force=False):
     document = _preset_document(preset, host)
     data = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-    fd = None
-    temporary = ".profile-" + uuid.uuid4().hex
     try:
-        with _directory(root, REPO_PATH[:-1], create=True) as parent:
+        with _profile_file(root, REPO_PATH, create=True) as handle:
             try:
-                existing = _read_at(parent, REPO_PATH[-1])
+                existing = _parse(handle.read_bytes(MAX_BYTES))
                 if not force:
                     raise ProfileError("profile already exists; inspect it or use --force")
                 # N/N-1: --force never authorizes misreading a future schema.
                 resolve(repo=existing)
-            except FileNotFoundError:
-                pass
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-            try:
-                view = memoryview(data)
-                while view:
-                    count = os.write(fd, view)
-                    if count <= 0:
-                        raise ProfileError("profile write failed")
-                    view = view[count:]
-                os.fsync(fd)
-                os.close(fd)
-                fd = None
-                if force:
-                    os.replace(temporary, REPO_PATH[-1], src_dir_fd=parent, dst_dir_fd=parent)
-                else:
-                    os.link(temporary, REPO_PATH[-1], src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
-                os.fsync(parent)
-            finally:
-                if fd is not None:
-                    os.close(fd)
-                    fd = None
-                try:
-                    os.unlink(temporary, dir_fd=parent)
-                except FileNotFoundError:
-                    pass
-    except FileExistsError:
-        raise ProfileError("profile already exists; inspect it or use --force", layer="repo", file=str(Path(root).joinpath(*REPO_PATH))) from None
+            except storage.ConfinedFileError as error:
+                if error.reason != "missing":
+                    raise
+            handle.publish_bytes(data, replace=force)
+    except storage.ConfinedFileError as error:
+        raise _context(_file_refusal(error), "repo", str(Path(root).joinpath(*REPO_PATH))) from None
     except ProfileError as error:
         error = _context(error, "repo")
         if error.layer == "repo":
             error.file = str(Path(root).joinpath(*REPO_PATH))
         raise error
-    except OSError:
-        raise ProfileError("unsafe or unreadable profile path", layer="repo", file=str(Path(root).joinpath(*REPO_PATH))) from None
     return document
 
 

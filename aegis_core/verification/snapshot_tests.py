@@ -123,7 +123,13 @@ def run_snapshot_tests(workspace: Path, snapshot: Path, scratch: Path, *, timeou
     started = time.monotonic()
     limit = testexec.DEFAULT_TIMEOUT_S if timeout is None else timeout
     deadline = started + limit
-    command = testexec.user_test_command(workspace)
+    try:
+        command = testexec.user_test_command(workspace)
+    except ValueError:
+        refused = testexec.TestsRun(exit=2, complete=False)
+        row = {'language': 'global', 'witness': 'aegis', **refused.as_dict(),
+               'evidence': False, 'reason': 'invalid tests.command'}
+        return _aggregate([row], time.monotonic() - started, False), ['invalid tests.command']
     if command is not None:
         return _python(workspace, snapshot, scratch / 'wrapper', command, limit)
     groups, python = _inventory(snapshot)

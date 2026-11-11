@@ -125,6 +125,7 @@ def _scan(ws: Path) -> Dict:
 
 # ── (a) and (b): git spawns per scan ────────────────────────────────────────
 
+@pytest.mark.timing
 def test_a_scan_outside_git_starts_one_git_process(plain_ws, monkeypatch):
     _scan(plain_ws)
     assert len(_count(monkeypatch, lambda: _scan(plain_ws)).git()) == 1
@@ -138,6 +139,7 @@ def _mcp_scan(ws: Path, session: str = "s1") -> Dict:
     return result
 
 
+@pytest.mark.timing
 def test_an_mcp_scan_with_a_session_outside_git_starts_one_git_process(plain_ws, monkeypatch):
     _mcp_scan(plain_ws)
     assert len(_count(monkeypatch, lambda: _mcp_scan(plain_ws)).git()) == 1
@@ -146,6 +148,7 @@ def test_an_mcp_scan_with_a_session_outside_git_starts_one_git_process(plain_ws,
 _OBJECT_READS = {"ls-tree", "cat-file", "rev-list", "merge-base"}
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("how", ["core", "mcp"])
 def test_a_warm_scan_asks_no_object_question_it_already_answered(git_ws, monkeypatch, how):
     run = (lambda: _scan(git_ws)) if how == "core" else (lambda: _mcp_scan(git_ws))
@@ -168,6 +171,7 @@ def test_a_commit_between_two_scans_serves_the_new_base(git_ws, monkeypatch):
     assert "unreviewed_rules" not in second
 
 
+@pytest.mark.timing
 def test_a_warm_scan_in_git_starts_at_most_four_and_no_tree_reads(git_ws, monkeypatch):
     _scan(git_ws)
     spawned = _count(monkeypatch, lambda: _scan(git_ws)).git()
@@ -181,6 +185,7 @@ def _seed_ledger(ws: Path) -> None:
     ledger.append(ws, [{"rule": "perf-rule-0", "outcome": "tp", "source": "ci", "key": f"k{i}"} for i in range(3)])
 
 
+@pytest.mark.timing
 def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
     _seed_ledger(git_ws)
     _scan(git_ws)
@@ -323,6 +328,7 @@ def _projections(monkeypatch) -> List[int]:
     return calls
 
 
+@pytest.mark.timing
 def test_a_scan_that_matches_no_rule_opens_no_ledger_and_projects_no_credit(git_ws, monkeypatch):
     _seed_exposures(git_ws)
     projected = _projections(monkeypatch)
@@ -336,6 +342,7 @@ def test_a_scan_that_matches_no_rule_opens_no_ledger_and_projects_no_credit(git_
     assert not [argv for argv in seen.spawns if Path(argv[0]).stem.lower() == "gh"]
 
 
+@pytest.mark.timing
 def test_a_rule_that_cannot_load_fails_the_scan_before_any_fitness_work(git_ws, monkeypatch):
     _seed_exposures(git_ws)
     (git_ws / ".aegis" / "rules" / "traps" / "bad-paths.md").write_text(
@@ -378,6 +385,7 @@ def _hook_spawns(ws: Path, monkeypatch, delay: float = 0.0) -> Dict[str, int]:
     return {"edit": len(_count(monkeypatch, edit, delay).git()), "bash": len(_count(monkeypatch, bash, delay).git())}
 
 
+@pytest.mark.timing
 def test_the_pre_tool_hook_spawns_at_most_two_gits_on_edit_and_none_on_bash(git_ws, monkeypatch, capsys):
     counts = _hook_spawns(git_ws, monkeypatch)
     assert counts["edit"] <= 2 and counts["bash"] == 0, counts
@@ -400,6 +408,7 @@ def test_a_no_cue_insight_prompt_does_not_import_credit(git_ws, isolated):
 
 # ── (g): a slow machine changes no verdict ──────────────────────────────────
 
+@pytest.mark.timing
 def test_slowed_spawns_change_no_count(plain_ws, git_ws, monkeypatch, capsys):
     _scan(plain_ws)
     plain = len(_count(monkeypatch, lambda: _scan(plain_ws)).git())
