@@ -12,6 +12,8 @@ import pytest
 from aegis_core import inference_provider, testexec, testplans
 from aegis_core.ast import runner
 from aegis_core.verification import perf_check
+from tests import helpers_humangate as hg
+from tests import helpers_verified as hv
 
 
 CONSUMERS = ("model", "tests", "language", "coverage", "perf", "driver")
@@ -140,7 +142,80 @@ def test_malformed_quotes_keep_each_consumers_refusal(commands, platform, consum
         assert plan.argv == ()
         assert plan.unavailable == "the driver command cannot be parsed: No closing quotation"
     else:
-        assert read(consumer, command) is None
+        with pytest.raises(ValueError, match=r"^invalid tests\.command$"):
+            read(consumer, command)
+
+
+def test_unset_global_command_remains_unset(commands, platform):
+    _read, _program, root, _calls = commands
+    hv.write_user_config(root.parent / "home")
+    assert testexec.user_test_command(root) is None
+
+
+def test_malformed_global_command_is_unavailable_in_capabilities(commands, platform):
+    from aegis_cli.language_capabilities import capability_data, capability_lines
+
+    _read, _program, root, _calls = commands
+    hv.write_user_config(root.parent / "home", tests={"command": 'pytest "private-unclosed'})
+    row, = capability_data(root, languages={"python"})
+    assert row["coverage"] == "unavailable (invalid tests.command)"
+    text = "\n".join(capability_lines(root, languages={"python"}))
+    assert "invalid tests.command" in text and "private-unclosed" not in text
+
+
+@pytest.fixture
+def malformed_project(tmp_path, monkeypatch):
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    repo = hv.make_project(tmp_path, real_tests=True)
+    for key, value in repo.home.env.items():
+        monkeypatch.setenv(key, value)
+    for key in ("GIT_CONFIG_GLOBAL", "GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF"):
+        monkeypatch.delenv(key, raising=False)
+    repo.write("src/app.py", "def app():\n    return 2\n")
+    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    repo.commit("fix: change app with a regression test")
+    hv.write_user_config(repo.home.path, tests={"command": 'pytest "private-unclosed'})
+    calls = []
+
+    def execute(argv, *args, **kwargs):
+        calls.append(list(argv))
+        return testexec.TestsRun(exit=0, collected=1, passed=1)
+
+    monkeypatch.setattr(testexec, "run_tests", execute)
+    return repo, calls
+
+
+def test_malformed_global_command_refuses_record_and_replay(malformed_project, platform, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    from aegis_core import checkrun
+
+    repo, calls = malformed_project
+    monkeypatch.chdir(repo.root)
+    assert main(["check", "--record", "--tests", "--base", "main"]) == 1
+    output = capsys.readouterr()
+    assert "invalid tests.command" in output.out + output.err
+    assert "private-unclosed" not in output.out + output.err
+    row, = hv.rows_of(repo.root, "check")
+    assert row["passed"] is False and row["tests"]["complete"] is False
+    assert row["tests"]["languages"][0]["reason"] == "invalid tests.command"
+    assert checkrun.rerun_commit_snapshot(repo.root, "HEAD", "main") == {"tree": row["tree"], "exit": 2}
+    assert calls == []
+
+
+def test_malformed_global_command_refuses_regression(malformed_project, platform, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    from aegis_core import regression
+
+    repo, calls = malformed_project
+    with pytest.raises(regression.RegressionError, match=r"^invalid tests\.command$"):
+        regression.check_ci_regressions(repo.root, "main")
+    monkeypatch.chdir(repo.root)
+    assert main(["check", "--ci", "--base", "main"]) == 1
+    output = capsys.readouterr()
+    assert "invalid tests.command" in output.err
+    assert "private-unclosed" not in output.out + output.err
+    assert calls == []
 
 
 @pytest.mark.parametrize("consumer", CONSUMERS)

@@ -187,13 +187,13 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "read-only bounded existing config or migration source bytes"),
     ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): (2, "bounded migration rule and target reads through the declared partial"),
     ("aegis_core/migrate.py", "apply", "aegis_core.migrate._input"): (2, "bounded config and unchanged-input reads through the declared partial"),
+    ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): (1, "read-only anchored decision log generation check before atomic publication"),
     ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): (1, "read-only bounded decision input config inspection"),
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._decision_directory"): (1, "validate and bind the caller-selected decision log directory for the shared lock context"),
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._open_log"): (1, "read-only decision log existence probe before creating the shared lock"),
     ("aegis_core/model_select.py", "_publish", "aegis_core.model_select._open_log"): (1, "read-only replay of the bound decision log"),
-    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._decision_directory"): (1, "validate and bind the caller-selected decision log directory"),
-    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._open_log"): (3, "read-only replay of the bound decision log"),
-    ("aegis_core/model_select.py", "append_decision", "aegis_core.model_select._decision_directory"): (1, "validate and bind the caller-selected decision log directory"),
+    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._open_log"): (2, "read-only replay of the bound decision log"),
     ("aegis_core/model_select.py", "append_decision", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
-    ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._decision_directory"): (1, "validate and bind the caller-selected decision log directory"),
     ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
     ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): (1, "read the existing export manifest through the storage boundary"),
     ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): (1, "read-only bounded stable rule inventory bytes"),
@@ -248,11 +248,6 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/model_select.py", "_publish", "os.rename"): (1, "publish the decision log within the same bound directory"),
     ("aegis_core/rule_inventory.py", "_read_stable_file", "os.open"): (1, "read-only stable rule snapshot"),
     ("aegis_core/team.py", "load_team", "os.open"): (1, "read-only team metadata inspection"),
-    ("aegis_core/team_profile.py", "_directory", "os.open"): (2, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "_read_at", "os.open"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.open"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.replace"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.link"): (1, "feature-owned until STORE-API-1"),
     ("aegis_core/testexec.py", "_inspect_junit", "os.open"): (1, "read-only bounded test report inspection"),
     ("aegis_core/verification/runner.py", "_identical_work_file", "os.open"): (1, "read-only working file comparison"),
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): (1, "read-only SARIF root directory descriptor"),
@@ -1104,7 +1099,7 @@ def test_state_and_rule_writes_go_through_storage():
         capability_sites.extend(visitor.references)
         scopes.update({(rel, name[len(visitor.module) + 1:]): line for name, line in visitor.definitions.items()})
         forwarding.update({name: (rel, line) for name, line in visitor.forwarding.items()})
-        if rel == "aegis_core/storage.py":
+        if rel in {"aegis_core/storage.py", "aegis_core/storage_confined.py"}:
             continue
         for scope, lineno, what in visitor.found:
             if _reviewed_operation(what):

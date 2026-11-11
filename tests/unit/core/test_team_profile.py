@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from aegis_core import team_profile as profile
+from aegis_core import storage, storage_confined, team_profile as profile
 
 
 def make_store(root):
@@ -244,7 +244,7 @@ def test_descriptor_cleanup_on_failures(tmp_path, monkeypatch, operation):
             return getattr(os, name)
 
     module_os = ModuleOS(open=opened, close=closed, **{operation: failed})
-    monkeypatch.setattr(profile, "os", module_os)
+    monkeypatch.setattr(storage_confined, "os", module_os)
     with pytest.raises(profile.ProfileError, match="unsafe|unreadable"):
         if operation == "write":
             profile.initialize(root, "pair", force=True)
@@ -277,7 +277,7 @@ def test_rename_symlink_race_stays_anchored(tmp_path, monkeypatch):
         def __getattr__(self, name):
             return getattr(os, name)
 
-    monkeypatch.setattr(profile, "os", ModuleOS(open=opened))
+    monkeypatch.setattr(storage_confined, "os", ModuleOS(open=opened))
     result = profile.load(root, user_root=root)
     assert result["profile"]["preset"] == "solo"
     assert not list(outside.iterdir())
@@ -465,7 +465,7 @@ def test_user_alias_read_remains_anchored_during_rename(tmp_path, monkeypatch, c
         def __getattr__(self, name):
             return getattr(os, name)
 
-    monkeypatch.setattr(profile, "os", ModuleOS(open=opened))
+    monkeypatch.setattr(storage_confined, "os", ModuleOS(open=opened))
     result = profile.load(root, user_root=home)
     assert changed == [True]
     assert result["values"]["run_config.runners.local.cpus"]["value"] == 3
@@ -772,7 +772,7 @@ def test_stow_directory_requires_owner_and_private_write_access(tmp_path, monkey
         def __getattr__(self, name):
             return getattr(os, name)
 
-    monkeypatch.setattr(profile, "os", ModuleOS(fstat=inspected))
+    monkeypatch.setattr(storage_confined, "os", ModuleOS(fstat=inspected))
     with pytest.raises(profile.ProfileError, match="user profile directory must be owned by the current user and not group/other-writable") as refused:
         profile.load(root, user_root=root)
     assert refused.value.layer == "user" and refused.value.file == str(actual / "team.json")
@@ -996,3 +996,18 @@ def test_load_records_repository_profile_presence_from_anchored_read(tmp_path, p
         profile.initialize(root, "solo")
     resolved = profile.load(root, user_root=root)
     assert resolved["repository_profile_exists"] is present
+
+
+def test_profile_reads_and_publishes_through_shared_storage(tmp_path, monkeypatch):
+    root = make_store(tmp_path)
+    original = storage.confined_file
+    calls = []
+
+    def confined(root, parts, **kwargs):
+        calls.append(tuple(parts))
+        return original(root, parts, **kwargs)
+
+    monkeypatch.setattr(storage, "confined_file", confined)
+    profile.initialize(root, "solo")
+    assert profile.load(root, user_root=root)["profile"]["preset"] == "solo"
+    assert calls == [profile.REPO_PATH, profile.REPO_PATH, profile.USER_PATH[-1:]]

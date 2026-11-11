@@ -185,6 +185,8 @@ class RemovedOption(argparse.Action):
         self.pointer = pointer
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(parser, "_error_policy", None) is not None:
+            parser._error_policy()
         print(f"{parser.prog} {self.option_strings[0]} was removed in v4: {self.pointer}", file=sys.stderr)
         parser.exit(2)
 

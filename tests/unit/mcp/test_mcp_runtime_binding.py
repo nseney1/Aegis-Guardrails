@@ -388,13 +388,17 @@ def test_a_registry_rewritten_mid_session_is_read_on_the_next_call(home, tmp_pat
     _registry(home, a)
     scan_b = {"files": [str(b / "src" / "app.py")]}
 
-    def steps():
-        yield _init("antigravity-client") + "\n"
-        yield _call(1, "aegis_scan", scan_b) + "\n"
-        _registry(home, a, b)  # `aegis init` in b, from another process
-        yield _call(2, "aegis_scan", scan_b) + "\n"
+    before_refresh = _init("antigravity-client") + "\n" + _call(1, "aegis_scan", scan_b) + "\n"
 
-    monkeypatch.setattr("sys.stdin", steps())
+    class RefreshingInput(io.StringIO):
+        def readline(self, size=-1):
+            assert size > 0
+            if self.tell() == len(before_refresh):
+                _registry(home, a, b)  # `aegis init` in b, from another process
+            return super().readline(size)
+
+    stream = RefreshingInput(before_refresh + _call(2, "aegis_scan", scan_b) + "\n")
+    monkeypatch.setattr("sys.stdin", stream)
     assert server.run_stdio_server() == 0
     frames = {f["id"]: f for f in map(json.loads, capsys.readouterr().out.splitlines()) if "method" not in f}
 
