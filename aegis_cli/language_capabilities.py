@@ -9,7 +9,8 @@ import stat
 from aegis_core.ast.detect import LANGUAGE_DEFINITIONS, detect_project_languages
 from aegis_core.config import read_user_config
 
-__all__ = ['capability_lines', 'runner_suggestion', 'needs_go_setup']
+__all__ = ['capability_data', 'capability_lines', 'render_capabilities',
+           'runner_suggestion', 'render_runner_suggestion', 'needs_go_setup']
 
 _PACKAGE_LIMIT = 1 << 20
 _JEST_BOOTSTRAP = (
@@ -64,14 +65,16 @@ def _parser_label(root, language):
     return next(iter(labels)) if len(labels) == 1 else 'mixed drivers (see extension details)'
 
 
-def capability_lines(root: Path, languages=None):
-    """Describe installed packs and user-scope settings; never validate by executing commands."""
+def capability_data(root: Path, languages=None):
+    """Bounded labels from known languages and user settings; never execute commands."""
     from aegis_core.verification.security_pack import SECURITY_RULES_BY_LANGUAGE
 
     languages = detect_project_languages(root) if languages is None else languages
     user = read_user_config(root) or {}
-    lines = []
-    for language in sorted(languages):
+    capabilities = []
+    for language in sorted(LANGUAGE_DEFINITIONS):
+        if language not in languages:
+            continue
         tests = {'python': 'pytest', 'go': 'go test (default)', 'rust': 'cargo test (default)'}.get(language, 'not configured')
         coverage = {'python': 'coverage.py', 'go': 'coverprofile (default)'}.get(language, 'not configured')
         if language == 'python':
@@ -80,10 +83,24 @@ def capability_lines(root: Path, languages=None):
             command = user_test_command(root)
             if command and pytest_args(command) is None:
                 coverage = 'unavailable (tests.command is not pytest-based)'
-        lines.append(f"  {language}: parser {_parser_label(root, language)}; pack {len(SECURITY_RULES_BY_LANGUAGE[language])}; "
-                     f"tests {_command_label(user, 'tests', language, tests)}; "
-                     f"coverage {_command_label(user, 'coverage', language, coverage)}")
-    return lines
+        capabilities.append({
+            'language': language, 'parser': _parser_label(root, language),
+            'security_rules': len(SECURITY_RULES_BY_LANGUAGE[language]),
+            'tests': _command_label(user, 'tests', language, tests),
+            'coverage': _command_label(user, 'coverage', language, coverage),
+        })
+    return capabilities
+
+
+def render_capabilities(capabilities):
+    """Render the same capability records retained by init JSON."""
+    return [f"  {item['language']}: parser {item['parser']}; pack {item['security_rules']}; "
+            f"tests {item['tests']}; coverage {item['coverage']}" for item in capabilities]
+
+
+def capability_lines(root: Path, languages=None):
+    """Describe installed packs and user-scope settings without executing commands."""
+    return render_capabilities(capability_data(root, languages))
 
 
 def _package(root):
@@ -108,32 +125,71 @@ def _package(root):
         return None, 'package.json cannot be read as JSON'
 
 
-def runner_suggestion(root: Path):
+def _runner_result(status='none', runner=None, configuration=None, messages=()):
+    return {'status': status, 'runner': runner, 'configuration': configuration, 'messages': list(messages)}
+
+
+def _runner_configuration(root, runner):
+    from aegis_cli import sanitize_display
+    from aegis_core.redaction import redact_command_secrets
+
+    # Refuse a changed/oversized display path rather than suggesting a different executable.
+    if len(str(root)) > 4096:
+        return None
+    if runner == 'vitest':
+        command = ['node', str(root / 'node_modules/vitest/vitest.mjs'), 'run', '--reporter=junit',
+                   '--outputFile={junit}', '{files}']
+    else:
+        command = ['node', '-e', _JEST_BOOTSTRAP, '{junit}', str(root / 'node_modules/jest/bin/jest.js'),
+                   '--runInBand', '--reporters=default', '--reporters=' + str(root / 'node_modules/jest-junit'),
+                   '--runTestsByPath', '{files}']
+    displayed = [redact_command_secrets(sanitize_display(word, max_len=None))[:4096] for word in command]
+    if displayed != command:
+        return None
+    return {'tests': {'languages': {'ts': {'command': displayed}}}}
+
+
+def render_runner_suggestion(data):
+    """Render inert guidance without executing or persisting its configuration."""
+    lines = list(data['messages'])
+    if data['configuration'] is not None:
+        lines.insert(1, '  ' + json.dumps(data['configuration'], ensure_ascii=True))
+    return lines
+
+
+def runner_suggestion(root: Path, *, structured=False):
     """Fixed argv templates selected by declared package names, never package scripts or bins."""
+    def result(*args, **kwargs):
+        data = _runner_result(*args, **kwargs)
+        return data if structured else render_runner_suggestion(data)
+
     package, problem = _package(root)
     if problem:
-        return ['  Runner suggestion unavailable: ' + problem]
+        return result('unavailable', messages=['  Runner suggestion unavailable: ' + problem])
     if package is None:
-        return []
+        return result()
     dependencies = set()
     for field in ('dependencies', 'devDependencies'):
         table = package.get(field, {})
         if isinstance(table, dict):
-            dependencies.update(name for name, version in table.items() if isinstance(version, str) and version)
+            dependencies.update(name for name in ('vitest', 'jest', 'jest-junit')
+                                if isinstance(table.get(name), str) and table[name])
     if 'vitest' in dependencies:
-        command = ['node', str(root / 'node_modules/vitest/vitest.mjs'), 'run', '--reporter=junit', '--outputFile={junit}', '{files}']
+        runner = 'vitest'
     elif 'jest' in dependencies:
         if 'jest-junit' not in dependencies:
-            return ['  Jest needs jest-junit for JUnit evidence; configure a user-authorized runner after adding that reporter.']
-        command = ['node', '-e', _JEST_BOOTSTRAP, '{junit}', str(root / 'node_modules/jest/bin/jest.js'),
-                   '--runInBand', '--reporters=default', '--reporters=' + str(root / 'node_modules/jest-junit'),
-                   '--runTestsByPath', '{files}']
+            return result('needs_reporter', runner='jest', messages=[
+                '  Jest needs jest-junit for JUnit evidence; configure a user-authorized runner after adding that reporter.'])
+        runner = 'jest'
     else:
-        return []
-    snippet = {'tests': {'languages': {'ts': {'command': command}}}}
-    return ['  Suggested user configuration (review before adding to ~/.aegis/config.json; nothing is written):',
-            '  ' + json.dumps(snippet, ensure_ascii=True),
-            '  The runner and its dependencies must already be installed; this runs repository code only when tests are requested.']
+        return result()
+    snippet = _runner_configuration(root, runner)
+    if snippet is None:
+        return result('unavailable', messages=[
+            '  Runner suggestion unavailable: workspace path cannot be safely displayed'])
+    return result('suggested', runner, snippet, [
+        '  Suggested user configuration (review before adding to ~/.aegis/config.json; nothing is written):',
+        '  The runner and its dependencies must already be installed; this runs repository code only when tests are requested.'])
 
 
 def needs_go_setup(root: Path):
