@@ -706,7 +706,7 @@ Call before editing files: returns the rules for `files` (default: the git diff)
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `files` | array of string | no | Paths you are about to edit; omitted or empty means the files changed in the git work tree and index. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget. |
 
 Input schema:
 
@@ -728,7 +728,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
+      "description": "Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget."
     }
   },
   "additionalProperties": false
@@ -750,7 +750,7 @@ Call after verifying a change with tests or `aegis check`, naming rules from `ae
 | `rework_count` | integer | no | Accepted for compatibility; ignored, never stored. |
 | `notes` | string | no | Accepted for compatibility; ignored, never stored. |
 | `files` | array of string | no | Paths edited in this change, for scan-before-edit compliance only (at most one 'edit' event per report); never affects credit. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget. |
 
 Input schema:
 
@@ -812,7 +812,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
+      "description": "Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget."
     }
   },
   "required": [
@@ -879,7 +879,7 @@ Lists every rule with metadata and ledger fitness (`_error` if unloadable, `_exp
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `rule_type` | string: one of `"invariant"`, `"trap"`, `"gate"`, `"boundary"`, `"persona"`, `"contract"` | no | Only rules and stale_rules of this type. |
-| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | 'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'. |
+| `view` | string: one of `"full"`, `"summary"`, `"ids"` | no | Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget. |
 
 Input schema:
 
@@ -906,7 +906,7 @@ Input schema:
         "summary",
         "ids"
       ],
-      "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'."
+      "description": "Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget."
     }
   },
   "additionalProperties": false
