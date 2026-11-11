@@ -680,10 +680,7 @@ def _announce(report: Report, root: Path, selected: List[str], detected: List[st
         report.say(f"  Detected language(s): {', '.join(k.title() for k in sorted(languages))}")
     else:
         report.say("  Project type: unknown (rules are language-agnostic)")
-    from aegis_cli.language_capabilities import capability_lines, runner_suggestion
-
-    for line in capability_lines(root, languages) + runner_suggestion(root):
-        report.say(line)
+    report.language_guidance(root, languages)
     if selected:
         report.say(f"  Hosts: {_with_surfaces(selected)}")
     else:
