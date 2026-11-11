@@ -5,6 +5,7 @@ neither a real model binary nor the real ~/.codex is ever reached. These tests p
 verdict rules; the fake's sandbox is a simulation, so they support no claim about real enforcement.
 """
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -12,13 +13,19 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 import uuid
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from tests.integration.hierarchy_fake_wrapper import shell_exec
+from tests.integration.test_hierarchy_launcher import LINUX_HOST_PROGRAMS
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the probe drives POSIX process groups")
-ROOT = Path(__file__).resolve().parents[2]
 PROBE = ROOT / "tools" / "hierarchy_native_probe.py"
 FAKE_CODEX = Path(__file__).resolve().with_name("hierarchy_fake_codex.py")
 GIT = shutil.which("git")
@@ -42,7 +49,7 @@ if [ "$1" = login ]; then
   fi
   exit 0
 fi
-exec "%s" "%s" "$@"
+%s "$@"
 """
 
 
@@ -51,6 +58,745 @@ def git(cwd, *words):
                           env={"PATH": os.path.dirname(GIT), "HOME": str(cwd), **IDENTITY})
     assert done.returncode == 0, done.stderr
     return done.stdout
+
+
+MODELLED_PROBE_HANDSHAKE_SECONDS = 30.0
+
+
+def modelled_json(path, value):
+    """Private fixture control files are atomic, owned, and never follow a linked path."""
+    path = Path(path)
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise RuntimeError("modelled probe: linked control path")
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex)
+    with temporary.open("x", encoding="utf-8") as stream:
+        os.chmod(temporary, 0o600)
+        json.dump(value, stream)
+    os.replace(temporary, path)
+
+
+def modelled_read(path):
+    path = Path(path)
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise RuntimeError("modelled probe: linked control path")
+    info = path.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        raise RuntimeError("modelled probe: control owner/mode/link mismatch")
+    return json.loads(path.read_text())
+
+
+def reviewed_git(argv):
+    prefix = ["git", "--no-optional-locks", "--no-replace-objects", "-c", "core.fsmonitor=false",
+              "-c", "protocol.allow=never"]
+    tail = argv[len(prefix):]
+    return argv[:len(prefix)] == prefix and (
+        tail in (["rev-parse", "--show-toplevel", "HEAD", "HEAD^{tree}"],
+                 ["ls-files", "-v", "-z"], ["ls-files", "--others", "-z"], ["cat-file", "--batch"]) or
+        (len(tail) == 5 and tail[:3] == ["diff-index", "--cached", "--name-only"] and tail[-1] == "--" and
+         len(tail[3]) == 40 and all(c in "0123456789abcdef" for c in tail[3])) or
+        (len(tail) == 4 and tail[:3] == ["ls-tree", "-r", "-z"] and len(tail[3]) == 40 and
+         all(c in "0123456789abcdef" for c in tail[3])))
+
+
+MODELLED_PROBE_BOOTSTRAP = r'''import json, os, runpy, select, signal, stat, sys, threading, time
+from pathlib import Path
+__GIT_CATALOG__
+
+def read(path):
+    path = Path(path)
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise RuntimeError("modelled probe: linked bootstrap input")
+    info = path.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        raise RuntimeError("modelled probe: bootstrap input owner/mode/link mismatch")
+    return json.loads(path.read_text())
+
+config = read(sys.argv[1])
+if config["bootstrap"] != __file__ or sys.argv[2:] != config["argv"]:
+    raise RuntimeError("modelled probe: bootstrap constructor differs")
+folder = Path(config["folder"])
+def watchdog():
+    deadline = time.monotonic() + 180
+    try:
+        while time.monotonic() < deadline:
+            if select.select([config["safety_read"]], [], [], .1)[0] and not os.read(config["safety_read"], 1):
+                os._exit(0)
+    except BaseException:
+        os._exit(76)
+    os._exit(75)
+
+previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+try:
+    threading.Thread(target=watchdog, daemon=True).start()
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+imports = folder / (config["slot"] + ".imports.json")
+temporary = imports.with_name(imports.name + "." + str(os.getpid()))
+with temporary.open("x", encoding="utf-8") as stream:
+    os.fchmod(stream.fileno(), 0o600)
+    json.dump({"pytest": "pytest" in sys.modules}, stream)
+os.replace(temporary, imports)
+birth = Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+hello = {"nonce": config["nonce"], "slot": config["slot"], "event": "hello", "pid": os.getpid(), "birth": birth}
+raw = (json.dumps(hello) + "\n").encode()
+if os.write(config["report_write"], raw) != len(raw):
+    raise RuntimeError("modelled probe: incomplete bootstrap hello")
+deadline = time.monotonic() + __MODELLED_HANDSHAKE_SECONDS__
+gate = folder / (config["slot"] + ".body")
+while not gate.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("modelled probe: body admission timed out")
+    time.sleep(.005)
+if read(gate) != {"nonce": config["nonce"]}:
+    raise RuntimeError("modelled probe: wrong body gate")
+operation = config.get("constructor")
+if config["target"] is None and operation is not None and operation["kind"] == "git":
+    if operation["argv"] != config["argv"] or not reviewed_git(operation["argv"]):
+        raise RuntimeError("modelled probe: unreviewed Git constructor")
+    with (folder / (config["slot"] + ".git-exec.json")).open("x", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        json.dump({"argv": operation["argv"], "pytest": "pytest" in sys.modules}, stream)
+    os.execvpe(operation["argv"][0], operation["argv"], dict(os.environ))
+root = __TRUSTED_ROOT__
+sys.path.insert(0, root)
+scope = runpy.run_path(str(Path(root) / "tests/integration/test_hierarchy_native_probe.py"))
+sys.exit(scope["modelled_probe_entry"](sys.argv[1:]))
+'''
+
+
+def reviewed_constructor(argv, catalog, mcp=()):
+    for row in catalog:
+        if argv == row["argv"]:
+            return row["operation"]
+    for command in mcp:
+        if argv == command:
+            return {"kind": "mcp", "argv": argv}
+    if reviewed_git(argv):
+        # These are Git's in-process object/index readers: no shell, transport, hooks or fsmonitor.
+        return {"kind": "git", "argv": argv}
+    raise RuntimeError("modelled probe: unreviewed constructor")
+
+
+class ModelledProbeProcesses:
+    """The pytest parent keeps physical custody even when a probe runner is SIGKILLed.
+
+    Only logical argv is projected. Every fixture Popen first reports its real identity from behind a gate;
+    native wait reports, raw command lines, UIDs, parents, process groups, pidfds and signals stay physical.
+    The file channel avoids any AF_UNIX dependency. It is private test plumbing, not a product provider.
+    """
+    LIMIT = MODELLED_PROBE_HANDSHAKE_SECONDS
+    MAX_ACTORS = 128
+
+    def __init__(self, folder, catalog=()):
+        import inspect
+        from tests.integration.test_hierarchy_launcher import R2Custody, R2Processes
+
+        self.folder = Path(folder)
+        self.folder.mkdir(mode=0o700)
+        # Capture from a small stdlib-only gate before importing pytest/test modules. A busy machine must
+        # not spend the entire physical-capture deadline importing the eventual trusted actor body.
+        self.bootstrap = self.folder / "modelled-entry.py"
+        with self.bootstrap.open("x", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(MODELLED_PROBE_BOOTSTRAP.replace("__TRUSTED_ROOT__", repr(str(ROOT))).replace(
+                "__GIT_CATALOG__", inspect.getsource(reviewed_git)).replace(
+                "__MODELLED_HANDSHAKE_SECONDS__", repr(MODELLED_PROBE_HANDSHAKE_SECONDS)))
+        self.requests = self.folder / "requests"
+        self.requests.mkdir(mode=0o700)
+        self.physical = R2Custody(self.folder / "physical", self.folder / "UNKNOWN.json")
+        self.projection = R2Processes(self.folder / "projection")
+        self.rows, self.handled, self.errors = {}, set(), []
+        self.negative_empty = {}
+        self.lock, self.ending = threading.RLock(), threading.Event()
+        self.report = None
+        self.catalog = list(catalog)
+        self.worker = threading.Thread(target=self.service, daemon=True)
+        self.worker.start()
+
+    def reserve(self, parent, argv, target=None, entry=None, logical=None, leaf=False, constructor=None):
+        self.physical.admit_check()
+        if len(self.rows) >= self.MAX_ACTORS or (parent is not None and parent not in self.physical.entries):
+            raise RuntimeError("modelled probe: creation bound or unknown parent")
+        slot = "native-%d" % len(self.rows)
+        self.physical.plan({slot: {"kind": "H" if parent is None else "M", "parent": parent, "child": None}})
+        path = self.folder / (slot + ".json")
+        data = {"nonce": self.physical.nonce, "slot": slot, "parent": parent, "argv": list(argv),
+                "target": str(target) if target else None, "entry": entry, "logical": logical,
+                "target_sha256": hashlib.sha256(Path(target).read_bytes()).hexdigest() if target else None,
+                "leaf": leaf, "requests": str(self.requests), "receipt": str(self.projection.path),
+                "catalog": self.catalog, "constructor": constructor,
+                "receipt_nonce": self.projection.nonce, "folder": str(self.folder), "config": str(path),
+                "inherited": [self.physical.safety_read, self.physical.report_write],
+                "bootstrap": str(self.bootstrap),
+                "safety_read": self.physical.safety_read, "report_write": self.physical.report_write}
+        modelled_json(path, data)
+        self.rows[slot] = {"config": data, "state": "RESERVED", "pending": False}
+        return data
+
+    def start(self, words, env):
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+
+        with self.lock:
+            self.check()
+            config = self.reserve(None, [str(PROBE), *words], PROBE, "probe")
+            argv = [*python_argv("python", self.bootstrap, self.folder),
+                    config["config"], *config["argv"]]
+            process = self.physical.launch(config, config["slot"], env, argv=argv,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.await_file(self.folder / (config["slot"] + ".captured"))
+        modelled_json(self.folder / (config["slot"] + ".body"), {"nonce": config["nonce"]})
+        return process
+
+    def await_file(self, path):
+        deadline = time.monotonic() + self.LIMIT
+        while not path.exists():
+            self.check()
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: bounded parent handshake failed")
+            time.sleep(0.005)
+
+    def check(self):
+        if self.errors:
+            raise RuntimeError("modelled probe fixture: " + "\n".join(self.errors))
+
+    def request(self, path):
+        from tests.integration.test_hierarchy_launcher import r2_kernel_process
+
+        data = modelled_read(path)
+        common = {"nonce", "parent", "pid", "birth", "id", "operation"}
+        fields = {"spawn": {"argv", "target", "entry", "logical", "leaf"},
+                  "observe": set(), "close": {"slot"}}
+        if (not isinstance(data, dict) or data.get("operation") not in fields or
+                set(data) != common | fields[data["operation"]]):
+            raise RuntimeError("modelled probe: request fields differ")
+        parent = data["parent"]
+        row = self.physical.entries.get(parent)
+        if (data["nonce"] != self.physical.nonce or row is None or data["pid"] != row["pid"] or
+                data["birth"] != row["birth"]):
+            raise RuntimeError("modelled probe: unregistered request identity")
+        reply = path.with_suffix(".reply")
+        if self.physical.observe(parent) is not None:
+            modelled_json(reply, {"error": "request parent exited"})
+            return True
+        try:
+            physical = r2_kernel_process(row["pid"])
+        except (OSError, ValueError, RuntimeError):
+            if self.physical.observe(parent) is None:
+                raise
+            modelled_json(reply, {"error": "request parent exited"})
+            return True
+        receipt = self.projection.receipts.get(str(row["pid"]))
+        if (physical["birth"] != row["birth"] or physical["uid"] != os.geteuid() or
+                physical["euid"] != os.geteuid() or receipt is None or
+                receipt["state"] != "READY" or physical["digest"] != receipt["digest"]):
+            raise RuntimeError("modelled probe: request parent changed")
+        operation = data["operation"]
+        if operation == "spawn":
+            argv = data["argv"]
+            if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and "\0" not in a for a in argv):
+                raise RuntimeError("modelled probe: malformed constructor array")
+            target = data["target"]
+            if target is not None and Path(target) not in (FAKE_CODEX, FAKE_CODEX.with_name("hierarchy_fake_host.py")):
+                raise RuntimeError("modelled probe: unreviewed fake target")
+            mcp = []
+            parent_config = self.rows[parent]["config"]
+            if target is None and parent_config["entry"] == "main":
+                from tests.integration.hierarchy_fake_host import server_definitions
+
+                # A captured fake host's complete constructor atoms are the catalog source. Do not reread
+                # connection paths while a negative test deliberately swaps their containing directories.
+                definitions = server_definitions(parent_config["argv"][2:])
+                mcp = [[definition["command"], *definition.get("args", [])]
+                       for definition in definitions.values()]
+            constructor = reviewed_constructor(argv, self.catalog, mcp) if target is None else None
+            if (not isinstance(data["leaf"], bool) or data["leaf"] !=
+                    (constructor is not None and constructor["kind"] == "git") or
+                    (target == str(FAKE_CODEX) and
+                     (self.rows[parent]["config"]["entry"] != "probe" or
+                      data["entry"] != "rollout_main" or data["logical"] != argv)) or
+                    (target != str(FAKE_CODEX) and data["logical"] is not None) or
+                    (target is None and data["entry"] != "constructor") or
+                    (target is not None and target != str(FAKE_CODEX) and data["entry"] != "main")):
+                raise RuntimeError("modelled probe: constructor provenance differs")
+            config = self.reserve(parent, argv, target, data["entry"], data["logical"], data["leaf"], constructor)
+            modelled_json(reply, {"config": config["config"]})
+        elif operation == "observe":
+            if any(r["pending"] or r["state"] == "RESERVED" for r in self.rows.values()):
+                return False
+            for slot, actor in self.physical.entries.items():
+                if self.physical.observe(slot) is not None:
+                    continue
+                try:
+                    observed = r2_kernel_process(actor["pid"])
+                except (OSError, ValueError, RuntimeError):
+                    if self.physical.observe(slot) is None:
+                        raise
+                    continue
+                if (observed["birth"] != actor["birth"] or observed["uid"] != os.geteuid() or
+                        observed["euid"] != os.geteuid()):
+                    raise RuntimeError("modelled probe: observation identity changed")
+                if not observed["raw"] and not observed["state"].startswith("Z"):
+                    self.negative_empty[slot] = {key: observed[key] for key in ("birth", "uid", "euid", "state")}
+                    self.negative_empty[slot]["pid"] = actor["pid"]
+                    modelled_json(self.folder / "negative-empty-observations.json", self.negative_empty)
+            modelled_json(reply, {})
+        elif operation == "close":
+            selected = {data["slot"]}
+            if self.rows[data["slot"]]["config"]["parent"] != parent:
+                raise RuntimeError("modelled probe: cleanup outside captured child")
+            for slot, state in self.rows.items():
+                if state["config"]["parent"] in selected:
+                    selected.add(slot)
+            for slot in reversed(list(self.rows)):
+                if slot in selected and slot in self.physical.entries:
+                    self.physical.kill_owned(slot)
+            modelled_json(reply, {})
+        else:
+            raise RuntimeError("modelled probe: unknown operation")
+        return True
+
+    def service(self):
+        from tests.integration.test_hierarchy_launcher import R2OwnedChild
+
+        try:
+            while not self.ending.is_set():
+                with self.lock:
+                    self.physical.pump()
+                    for slot, state in list(self.rows.items()):
+                        row = self.physical.slots[slot]
+                        if not row["hello"]:
+                            continue
+                        actor = R2OwnedChild(self.physical, slot)
+                        if state["state"] == "RESERVED":
+                            self.projection.pending(actor)
+                            state["pending"] = True
+                            row["released"] = True
+                            if not state["config"]["leaf"]:
+                                self.projection.ready(actor, state["config"]["logical"])
+                                state["pending"] = False
+                            state["state"] = "CAPTURED"
+                            modelled_json(self.folder / (slot + ".captured"), {"nonce": self.physical.nonce})
+                        if state["pending"] and self.physical.observe(slot) is not None:
+                            # Only the reviewed, non-forking Git reader execs. This proves this captured PID's
+                            # exit, not closure of a shell's descendants or availability of a native status.
+                            self.projection.receipts.pop(str(actor.pid))
+                            self.projection.save()
+                            state["pending"] = False
+                            state["state"] = "EXITED"
+                    for path in sorted(self.requests.glob("*.request")):
+                        if path.name not in self.handled and self.request(path):
+                            self.handled.add(path.name)
+                self.ending.wait(0.005)
+        except BaseException:
+            import traceback
+            self.errors.append(traceback.format_exc())
+            modelled_json(self.folder / "service-errors.json", self.errors)
+            self.physical.control_unknown = True
+
+    def close(self):
+        if self.report is not None:
+            return self.report
+        deadline = time.monotonic() + self.LIMIT
+        while any(r["pending"] for r in self.rows.values()) and not self.errors and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.ending.set()
+        self.worker.join(timeout=self.LIMIT)
+        if self.worker.is_alive() or self.errors or any(r["pending"] for r in self.rows.values()):
+            self.physical.control_unknown = True
+        self.physical.errors.extend("modelled broker: " + error for error in self.errors)
+        self.report = self.physical.close()
+        return self.report
+
+
+class ModelledProbeClient:
+    def __init__(self, config):
+        self.config = config
+        self.birth = (Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19]).decode()
+        self.view = self.projected_module = None
+        self.neutral = {}
+
+    def emit(self, event, **values):
+        raw = (json.dumps({"nonce": self.config["nonce"], "slot": self.config["slot"],
+                           "event": event, **values}) + "\n").encode()
+        if len(raw) > 4096 or os.write(self.config["report_write"], raw) != len(raw):
+            raise RuntimeError("modelled probe: incomplete creation report")
+
+    def request(self, operation, **values):
+        identifier = uuid.uuid4().hex
+        path = Path(self.config["requests"]) / (identifier + ".request")
+        modelled_json(path, {"nonce": self.config["nonce"], "parent": self.config["slot"],
+                            "pid": os.getpid(), "birth": self.birth, "id": identifier,
+                            "operation": operation, **values})
+        reply = path.with_suffix(".reply")
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
+        while not reply.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: bounded " + operation + " response failed")
+            time.sleep(0.005)
+        result = modelled_read(reply)
+        if "error" in result:
+            raise RuntimeError("modelled probe: " + result["error"])
+        return result
+
+    def refresh(self):
+        from tests.integration.test_hierarchy_launcher import R2Processes
+
+        self.request("observe")
+        fresh = R2Processes.load(self.config["receipt"], self.config["receipt_nonce"])
+        for pid, row in fresh.receipts.items():
+            if row["state"] != "READY":
+                continue
+            if row["argv"] is None:
+                self.neutral.setdefault(pid, row)
+            if self.view is not None:
+                self.view.receipts.setdefault(pid, row)
+        return fresh
+
+    def reader(self):
+        from tests.integration.test_hierarchy_launcher import R2Processes, launcher_module
+        from tests.integration.test_hierarchy_launcher import r2_kernel_process
+
+        if self.view is None:
+            self.view = R2Processes.load(self.config["receipt"], self.config["receipt_nonce"])
+            self.view.receipts = {pid: row for pid, row in self.view.receipts.items()
+                                  if row["state"] == "READY"}
+            positive_authorize = self.view.authorize
+
+            def authorize(pid):
+                if str(pid) not in self.neutral:
+                    return positive_authorize(pid)
+                receipt = self.neutral[str(pid)]
+                physical = r2_kernel_process(pid)
+                if (physical["birth"] != receipt["birth"] or physical["uid"] != os.geteuid() or
+                        physical["euid"] != os.geteuid() or
+                        (not physical["state"].startswith("Z") and physical["digest"] != receipt["digest"])):
+                    raise RuntimeError("modelled probe: neutral instance changed")
+
+            self.view.authorize = authorize
+            # Neutral actors never have their argv projected: even their empty exit observation is physical.
+            # New positive receipts are added once; existing evidence is never refreshed or replaced.
+            self.refresh()
+            self.projected_module = launcher_module(self.view)
+            physical_path = self.projected_module.Path
+            client = self
+
+            class CapturedCensusPath(type(physical_path())):
+                def iterdir(path):
+                    if str(path) == "/proc":
+                        # Transport once before each census, including newly captured children. The
+                        # reader still checks every actual birth/UID/argv and each signal independently.
+                        client.refresh()
+                    yield from physical_path(path).iterdir()
+
+            self.projected_module.Path = CapturedCensusPath
+        return self.projected_module
+
+    def snapshot(self, action):
+        reader = self.reader()
+        self.refresh()  # Observe and transport new captures before enumerating the declared cohort.
+        return action(reader)
+
+    def popen(self, argv, *args, **options):
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+        from tests.integration.test_hierarchy_launcher import WitnessedPopen
+
+        if args or options.get("shell"):
+            raise RuntimeError("modelled probe: undeclared constructor form")
+        argv = list(argv)
+        native = self.config["entry"] == "probe"
+        if native and (Path(argv[0]).name != "codex" or argv[1:2] == ["login"]):
+            return subprocess.Popen(argv, **options)
+        target, entry, logical, leaf = None, None, None, False
+        if native:
+            target, entry, logical, leaf = FAKE_CODEX, "rollout_main", argv, False
+        elif len(argv) > 1 and Path(argv[1]) == FAKE_CODEX.with_name("hierarchy_fake_host.py"):
+            target, entry, leaf = Path(argv[1]), "main", False
+        if target is None:
+            mcp = []
+            if self.config["entry"] == "main":
+                from tests.integration.hierarchy_fake_host import server_definitions
+                mcp = [[definition["command"], *definition.get("args", [])]
+                       for definition in server_definitions(self.config["argv"][2:]).values()]
+            constructor = reviewed_constructor(argv, self.config.get("catalog", ()), mcp)
+            entry, leaf = "constructor", constructor["kind"] == "git"
+        reply = self.request("spawn", argv=argv, target=str(target) if target else None,
+                             entry=entry, logical=logical, leaf=leaf)
+        path = Path(reply["config"])
+        child_config = modelled_read(path)
+        self.emit("creation_intent", child=child_config["slot"])
+        command = [*python_argv("codex" if native else "python", Path(self.config["bootstrap"]),
+                                Path(self.config["folder"])), str(path), *argv]
+        env = {k: v for k, v in options.get("env", os.environ).items()
+               if k not in ("CLAUDECODE", "CLAUDE_PID") and not k.startswith("CLAUDE_CODE_")}
+        options.update(env=env, pass_fds=tuple(self.config["inherited"]))
+        process = WitnessedPopen(command, **options)
+        from tests.integration.test_hierarchy_launcher import r2_kernel_process
+        birth = r2_kernel_process(process.pid)["birth"]
+        self.emit("created", child=child_config["slot"], child_pid=process.pid, child_birth=birth)
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
+        captured = Path(self.config["folder"]) / (child_config["slot"] + ".captured")
+        while not captured.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: child was not captured")
+            time.sleep(0.005)
+        if native:
+            # Verify in THIS loaded reader before the fake's body may run/exit. This is actual full-raw
+            # observation, not a copied verifier fingerprint or authorization to send a signal later.
+            self.refresh()
+            self.reader().read_process(process.pid)
+        child = ModelledProbeChild(process, self, child_config["slot"], birth)
+        if native:
+            # Popen's logical entry must be ready before the product starts its context deadline.
+            # Capture, test-module imports and gate admission are fixture work, not a host turn.
+            child.await_entry()
+            from tests.integration import hierarchy_fake_codex as fake
+
+            try:
+                finishes = fake.pick_turn(argv[-1]).get("finish_before_stop") is True
+            except fake.ScriptError:
+                finishes = False  # The real fake entry still owns its invalid-script refusal.
+            if finishes:
+                # This scripted case promises actual exit before stop, rather than a SIGTERM mask
+                # which the stop's SIGKILL escalation can bypass while captured helpers import.
+                child.wait(timeout=MODELLED_PROBE_HANDSHAKE_SECONDS)
+        return child
+
+    def run(self, argv, input=None, capture_output=False, timeout=None, check=False, **options):
+        if self.config["entry"] == "probe":
+            return subprocess.run(argv, input=input, capture_output=capture_output, timeout=timeout,
+                                  check=check, **options)
+        if capture_output:
+            options.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if input is not None:
+            options["stdin"] = subprocess.PIPE
+        process = self.popen(argv, **options)
+        try:
+            out, err = process.communicate(input, timeout=timeout)
+        except BaseException:
+            self.request("close", slot=process.slot)
+            process.wait(timeout=3)
+            raise
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+        if check and process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, argv, output=out, stderr=err)
+        return subprocess.CompletedProcess(argv, process.returncode, out, err)
+
+
+class ModelledProbeChild:
+    def __init__(self, process, client, slot, birth):
+        self.process, self.client, self.slot, self.birth = process, client, slot, birth
+        self.started, self.reported = False, False
+
+    def __getattr__(self, name):
+        if name in ("stdin", "stdout", "stderr"):
+            self.begin()
+        return getattr(self.process, name)
+
+    def begin(self):
+        if not self.started:
+            modelled_json(Path(self.client.config["folder"]) / (self.slot + ".body"),
+                          {"nonce": self.client.config["nonce"]})
+            self.started = True
+
+    def await_entry(self):
+        self.begin()
+        path = Path(self.client.config["folder"]) / (self.slot + ".entry-ready")
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
+        while not path.exists():
+            if self.process.poll() is not None:
+                self.report()
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: logical entry handshake failed")
+            time.sleep(0.005)
+        if modelled_read(path) != {"nonce": self.client.config["nonce"]}:
+            raise RuntimeError("modelled probe: logical entry handshake differs")
+
+    def report(self):
+        from tests.integration.test_hierarchy_launcher import native_wait_fields
+
+        proof = native_wait_fields(self.process)
+        if not self.reported and (proof is not None or self.process.native_wait_unavailable):
+            self.client.emit("reaped" if proof is not None else "wait_unavailable",
+                             child=self.slot, child_pid=self.pid, child_birth=self.birth, **(proof or {}))
+            self.reported = True
+
+    def poll(self):
+        self.begin()
+        result = self.process.poll()
+        self.report()
+        return result
+
+    def wait(self, *args, **kwargs):
+        self.begin()
+        try:
+            return self.process.wait(*args, **kwargs)
+        finally:
+            self.report()
+
+    def communicate(self, *args, **kwargs):
+        self.begin()
+        try:
+            return self.process.communicate(*args, **kwargs)
+        finally:
+            self.report()
+
+
+def run_reviewed_constructor(config, client):
+    """Bounded actor operations replace shell interpreters; every subprocess still goes through the broker."""
+    import builtins
+    from types import ModuleType
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    operation = config["constructor"]
+    kind = operation["kind"]
+    if kind == "git":
+        raise RuntimeError("modelled probe: Git must exec from its captured bootstrap")
+    if kind == "mcp":
+        argv = operation["argv"]
+        if argv[1:3] != ["-I", "-B"] or Path(argv[3]).name != "runtime-source.py":
+            raise RuntimeError("modelled probe: unreviewed MCP bootstrap")
+        bootstrap = Path(argv[3])
+        trusted = ROOT / "tools/hierarchy_runtime_source.py"
+        if bootstrap.is_symlink() or bootstrap.read_bytes() != trusted.read_bytes():
+            raise RuntimeError("modelled probe: MCP verifier differs from trusted source")
+        importing = builtins.__import__
+        process_view = R2Facade(subprocess, Popen=client.popen, run=client.run)
+
+        def isolated(name, globals=None, locals=None, fromlist=(), level=0):
+            return (process_view if level == 0 and name == "subprocess" else
+                    importing(name, globals, locals, fromlist, level))
+
+        module = ModuleType("_reviewed_mcp_verifier")
+        module.__dict__.update(__file__=str(bootstrap), __package__="",
+                               __builtins__={**vars(builtins), "__import__": isolated})
+        exec(compile(trusted.read_bytes(), str(bootstrap), "exec"), module.__dict__)
+        return module.main(argv[4:])
+
+    def no_process_creation(event, arguments):
+        if (event in ("subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.exec", "os.system",
+                      "os.spawn") or event.startswith("ctypes.")):
+            raise RuntimeError("modelled probe: unreviewed process creation")
+
+    # This is a dedicated captured actor, not a global patch in pytest or a production interpreter.
+    # It cannot fork/exec an unregistered child, even if a reviewed negative-control payload tries to do so.
+    sys.addaudithook(no_process_creation)
+    if kind == "attempt":
+        helper = Path(operation["helper"])
+        template = ROOT / "tools/hierarchy_templates/native-probe-attempt.py"
+        if any(p.is_symlink() for p in (helper, *helper.parents)) or helper.read_bytes() != template.read_bytes():
+            print("modelled probe: unreviewed attempt helper", file=sys.stderr)
+            return 1
+        namespace = {"__name__": "_reviewed_attempt", "__file__": str(helper)}
+        exec(compile(template.read_bytes(), str(helper), "exec"), namespace)
+        return namespace["main"]([operation["path"], operation["nonce"]])
+    if kind == "hold":
+        if Path(operation["done"]).exists():
+            print("already held")
+            return 0
+        deadline = time.monotonic() + 600
+        while not Path(operation["release"]).exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        return 0
+    if kind == "append_catalog":
+        text = Path(operation["record"]).read_text()
+        for path in Path(operation["home"]).glob("sessions/*/*/*/rollout-*.jsonl"):
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(text)
+        return 0
+    if kind == "append_file":
+        with Path(operation["path"]).open("a", encoding="utf-8") as stream:
+            stream.write(operation["text"])
+        return 0
+    if kind == "python_code":
+        exec(compile(operation["code"], "<reviewed-test-command>", "exec"), {"__name__": "__main__"})
+        return 0
+    raise RuntimeError("modelled probe: unreviewed operation")
+
+
+def modelled_probe_entry(arguments):
+    """Trusted test entry; never imports or executes the planned worktree's control code."""
+    import builtins
+    import contextlib
+    import io
+    import signal
+    from types import ModuleType
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    path = Path(arguments[0])
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise RuntimeError("modelled probe: linked entry input")
+    config = modelled_read(path)
+    if list(arguments[1:]) != config["argv"]:
+        raise RuntimeError("modelled probe: constructor/display mismatch")
+    client = ModelledProbeClient(config)
+
+    client.emit("running")
+    if config["target"] is None:
+        return run_reviewed_constructor(config, client)
+    target = Path(config["target"])
+    if target not in (PROBE, FAKE_CODEX, FAKE_CODEX.with_name("hierarchy_fake_host.py")) or target.is_symlink():
+        raise RuntimeError("modelled probe: unreviewed entry target")
+    if hashlib.sha256(target.read_bytes()).hexdigest() != config["target_sha256"]:
+        raise RuntimeError("modelled probe: trusted target changed")
+    importing = builtins.__import__
+    process_view = R2Facade(subprocess, Popen=client.popen, run=client.run)
+
+    def session_processes(*args, **kwargs):
+        return client.snapshot(lambda module: module.session_processes(*args, **kwargs))
+
+    def isolated(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name == "subprocess":
+            return process_view
+        if level == 0 and name == "hierarchy_launcher":
+            return R2Facade(importing(name), session_processes=session_processes)
+        return importing(name, globals, locals, fromlist, level)
+
+    sys.path.insert(0, str(target.parent))
+    tail = config["argv"][2:] if config["entry"] == "main" else config["argv"][1:]
+    sys.argv = [str(target), *tail]
+    if config["entry"] == "probe":
+        sys.argv = list(config["argv"])
+    module = ModuleType("_modelled_probe_target")
+    module.__dict__.update(__file__=str(target), __package__="",
+                           __builtins__={**vars(builtins), "__import__": isolated})
+    exec(compile(target.read_bytes(), str(target), "exec"), module.__dict__)
+    if config["entry"] == "probe":
+        original_runner = module.Runner
+
+        class ScopedRunner(original_runner):
+            def launcher(self, base, *words):
+                if words[0] != "stop":
+                    return super().launcher(base, *words)
+
+                def stopping(launcher):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        code = launcher.main(["--base", str(base), *words])
+                    return code, json.loads(output.getvalue())
+                return client.snapshot(stopping)
+
+        def stop_group(process):
+            if isinstance(process, ModelledProbeChild):
+                if process.process.poll() is None:
+                    client.request("close", slot=process.slot)
+                process.process.wait(timeout=3)
+                process.report()
+                for stream in (process.process.stdin, process.process.stdout, process.process.stderr):
+                    if stream is not None:
+                        stream.close()
+            else:
+                raise RuntimeError("modelled probe: unregistered cleanup target")
+
+        module.Runner, module.stop_group = ScopedRunner, stop_group
+        return module.main(config["argv"][1:])
+    if config["entry"] == "rollout_main":
+        modelled_json(Path(config["folder"]) / (config["slot"] + ".entry-ready"), {"nonce": config["nonce"]})
+        return module.rollout_main(config["argv"][1:])
+    return module.main()
 
 
 class Probe:
@@ -72,7 +818,7 @@ class Probe:
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         self.codex = self.bin / "codex"
-        self.codex.write_text(WRAPPER % (sys.executable, FAKE_CODEX), encoding="utf-8")
+        self.codex.write_text(WRAPPER % shell_exec("codex", FAKE_CODEX, self.tmp), encoding="utf-8")
         self.codex.chmod(self.codex.stat().st_mode | stat.S_IXUSR)
         (self.bin / "git").symlink_to(GIT)
         (self.bin / "ps").symlink_to(PS)
@@ -90,6 +836,8 @@ class Probe:
         self.host_plan = tmp_path / "fake-host-plan.json"
         self.host_plan.write_text("{}", encoding="utf-8")
         self.plan_answer = None
+        self.process_scope = None
+        self.reviewed_commands = []
 
     @property
     def codex_home(self):
@@ -107,10 +855,56 @@ class Probe:
         return {key: value for key, value in env.items() if value is not None}
 
     def invoke(self, *words, expect=0, timeout=120, **changes):
-        done = subprocess.run([sys.executable, "-I", str(PROBE), *words], capture_output=True, text=True,
-                              timeout=timeout, env=self.env(**changes), stdin=subprocess.DEVNULL)
+        if sys.platform.startswith("linux") and words and words[0] in ("run", "cleanup"):
+            process = self.started(*words, **changes)
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+            done = subprocess.CompletedProcess(words, process.returncode, stdout, stderr)
+        else:
+            done = subprocess.run([sys.executable, "-I", str(PROBE), *words], capture_output=True, text=True,
+                                  timeout=timeout, env=self.env(**changes), stdin=subprocess.DEVNULL)
         assert done.returncode == expect, (done.stdout[-4000:], done.stderr[-4000:])
         return done.stdout
+
+    def started(self, *words, **changes):
+        if self.process_scope is None:
+            self.process_scope = ModelledProbeProcesses(self.tmp / "modelled-processes", self.constructor_catalog())
+        return self.process_scope.start(words, self.env(**changes))
+
+    def constructor_catalog(self):
+        catalog = list(self.reviewed_commands)
+        for role in self.plan_answer["roles"] if self.plan_answer else []:
+            hold = role["hold"]
+            catalog.append({"argv": ["/bin/sh", "-c", hold["command"]],
+                            "operation": {"kind": "hold", "done": hold["done"], "release": hold["release"]},
+                            "reason": "the plan's bounded one-shot hold operation"})
+            for attempt in role["attempts"]:
+                if attempt["channel"] != "shell":
+                    continue
+                nonce = attempt["nonce"]
+                variants = [nonce, hashlib.sha256(nonce.encode()).hexdigest()[:max(len(nonce), 8)]]
+                for value in variants:
+                    catalog.append({"argv": ["/bin/sh", "-c", attempt["command"].replace(nonce, value)],
+                                    "operation": {"kind": "attempt", "helper": self.plan_answer["helper"]["path"],
+                                                  "path": attempt["path"].replace(nonce, value), "nonce": value},
+                                    "reason": "the plan's append helper, including the fake's fixed wrong-nonce case"})
+        return catalog
+
+    def review_python(self, command, reason):
+        reasons = {"rewrite_helper", "delete_nonce", "swap_folder", "restore_folder", "process_creation_guard"}
+        words = shlex.split(command)
+        if reason not in reasons or words[:2] != [sys.executable, "-c"] or len(words) != 3:
+            raise RuntimeError("modelled probe: unknown reviewed Python constructor")
+        self.reviewed_commands.append({"argv": ["/bin/sh", "-c", command],
+                                       "operation": {"kind": "python_code", "code": words[2]}, "reason": reason})
+
+    def close(self):
+        if self.process_scope is not None:
+            return self.process_scope.close()
 
     def plan(self, roles, expect=0, **changes):
         request = {"source": str(self.source), "probe_root": str(self.root), "roles": roles, "channels": ["shell"],
@@ -178,7 +972,11 @@ class Probe:
 
 @pytest.fixture
 def probe(tmp_path):
-    return Probe(tmp_path)
+    made = Probe(tmp_path)
+    try:
+        yield made
+    finally:
+        made.close()
 
 
 def verdicts(report, role):
@@ -249,6 +1047,7 @@ def test_a_plan_refuses_an_existing_probe_root(probe):
     assert probe.plan([{"role": "implementer"}], expect=2)["error"] == "probe_root already exists: " + str(probe.root)
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery(probe):
     plan = probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}, {"role": "router"}])
     probe.script_turns()
@@ -306,6 +1105,7 @@ def test_the_happy_path_gives_each_role_kind_its_verdicts_lifecycle_and_recovery
     assert "  multi-agent: MULTI_AGENT_OFF, version not recorded, agent tools none" in text
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_stop_mid_turn_then_a_wake_shows_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -322,6 +1122,7 @@ def test_a_stop_mid_turn_then_a_wake_shows_recovery(probe):
     assert len(resumes) == 3 and all(call["argv"][call["argv"].index("resume") + 1] == row["session"] for call in resumes)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_declined_or_renonced_attempt_is_not_attempted_never_refused(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "worktree"): "no-event", ("implementer", "outside"): "wrong-nonce",
@@ -338,6 +1139,7 @@ def test_a_declined_or_renonced_attempt_is_not_attempted_never_refused(probe):
     assert report["summary"]["unexpected"] == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_channel_without_patch_records_is_not_attempted(probe):
     plan = probe.plan([{"role": "reviewer", "reader_shell": True}], channels=["shell", "apply_patch"])
     patch = [row for row in probe.role("reviewer")["attempts"] if row["channel"] == "apply_patch"]
@@ -351,6 +1153,7 @@ def test_a_patch_channel_without_patch_records_is_not_attempted(probe):
     assert {found[("shell", target)] for target in TARGETS} == {("REFUSED", "REFUSED", "as_expected")}
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_lying_refusal_is_flagged_unexpected(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "outside"): "lie"})
@@ -451,11 +1254,15 @@ def test_a_probe_root_runs_once(probe):
     assert second["error"] == "this probe root already ran; plan a new one"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_change_to_the_home_codex_folder_fails_the_run(probe):
     (probe.home / ".codex").mkdir()
     (probe.home / ".codex" / "config.toml").write_text("model = \"owner\"\n")
     probe.plan([{"role": "implementer"}])
     changed = probe.home / ".codex" / "config.toml"
+    probe.reviewed_commands.append({"argv": ["/bin/sh", "-c", "printf '# changed\\n' >> %s" % changed],
+                                    "operation": {"kind": "append_file", "path": str(changed), "text": "# changed\n"},
+                                    "reason": "append the fixture's temporary HOME config tamper marker"})
     probe.script_turns(extra={"implementer": [{"command": "printf '# changed\\n' >> %s" % changed, "target": None}]})
     report = probe.run(expect=3, cap=4)
     assert report["home_codex"]["state"] == "changed"
@@ -503,6 +1310,7 @@ OFFERED_FAILURE = ("the session was offered sub-agent tools: %s (multi_agent_ver
                    % ", ".join(V2_AGENT_TOOLS))
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_role_offered_codex_sub_agent_tools_fails_the_run_and_names_them(probe):
     probe.plan([{"role": "implementer"}])
     record = probe.tmp / "additional-tools.jsonl"
@@ -510,6 +1318,10 @@ def test_a_role_offered_codex_sub_agent_tools_fails_the_run_and_names_them(probe
     # The fake starts with an empty catalog; the probe turn appends the live catalog to the only rollout.
     append = 'for f in %s/sessions/*/*/*/rollout-*.jsonl; do /bin/cat %s >> "$f"; done' % (
         shlex.quote(str(probe.codex_home)), shlex.quote(str(record)))
+    probe.reviewed_commands.append({"argv": ["/bin/sh", "-c", append],
+                                    "operation": {"kind": "append_catalog", "home": str(probe.codex_home),
+                                                  "record": str(record)},
+                                    "reason": "append this test's explicit additional-tools record"})
     probe.script_turns(first={"implementer": [{"command": append, "target": None}]})
     report = probe.run(expect=3, cap=4)
     row = role_report(report, "implementer")
@@ -712,6 +1524,7 @@ def test_the_digest_sees_a_content_change_that_keeps_size_and_mtime(tmp_path):
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads a mode-000 file")
+@LINUX_HOST_PROGRAMS
 def test_an_unreadable_home_codex_entry_fails_the_run_but_still_writes_the_report_and_releases_the_lock(probe):
     (probe.home / ".codex").mkdir()
     secret = probe.home / ".codex" / "auth.json"
@@ -734,11 +1547,15 @@ def test_an_unreadable_home_codex_entry_fails_the_run_but_still_writes_the_repor
     assert probe.run(cap=4, expect=2)["error"] == "this probe root already ran; plan a new one"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_change_to_the_passwd_home_codex_folder_fails_the_run_when_home_is_overridden(probe):
     (probe.passwd_home / ".codex").mkdir()
     changed = probe.passwd_home / ".codex" / "config.toml"
     changed.write_text("model = \"owner\"\n")
     probe.plan([{"role": "implementer"}])
+    probe.reviewed_commands.append({"argv": ["/bin/sh", "-c", "printf '# changed\\n' >> %s" % changed],
+                                    "operation": {"kind": "append_file", "path": str(changed), "text": "# changed\n"},
+                                    "reason": "append the fixture's temporary passwd-home config tamper marker"})
     probe.script_turns(extra={"implementer": [{"command": "printf '# changed\\n' >> %s" % changed, "target": None}]})
     report = probe.run(expect=3, cap=4)
     home, passwd = report["home_codex"]["folders"]
@@ -748,6 +1565,7 @@ def test_a_change_to_the_passwd_home_codex_folder_fails_the_run_when_home_is_ove
 
 # ---------------------------------------------------------------- end to end against the fake
 
+@LINUX_HOST_PROGRAMS
 def test_a_lie_on_an_allowed_target_fails_the_run(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "worktree"): "lie"})
@@ -758,6 +1576,7 @@ def test_a_lie_on_an_allowed_target_fails_the_run(probe):
 
 
 @pytest.mark.parametrize("mode", ["fail", "enoent"])
+@LINUX_HOST_PROGRAMS
 def test_a_recorded_failure_without_the_helpers_refusal_is_inconclusive(probe, mode):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(modes={("implementer", "outside"): mode})
@@ -767,6 +1586,7 @@ def test_a_recorded_failure_without_the_helpers_refusal_is_inconclusive(probe, m
     assert report["summary"]["unexpected"] == [] and report["summary"]["passed"] is False
 
 
+@LINUX_HOST_PROGRAMS
 def test_recorded_patches_are_judged_from_file_change_records(probe):
     probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
     probe.script_turns(patches=True)
@@ -782,6 +1602,7 @@ def test_recorded_patches_are_judged_from_file_change_records(probe):
     assert report["summary"]["passed"] is True
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_that_fails_on_context_is_inconclusive_never_refused(probe):
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
     probe.script_turns(patches=True, patch_modes={("implementer", "outside"): "mismatch"})
@@ -802,6 +1623,7 @@ def test_a_plan_takes_each_roles_expected_reviewer_from_the_request_only(probe):
     assert "approvals_reviewer_from" not in plan["roles"][0]
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_unrequested_model_is_unchecked_and_fails_the_settings_check(probe):
     probe.plan([{"role": "implementer"}], model=None)
     probe.script_turns()
@@ -813,6 +1635,7 @@ def test_an_unrequested_model_is_unchecked_and_fails_the_settings_check(probe):
     assert "implementer probe turn settings: model unchecked: no value was requested" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_probe_turn_that_never_starts_is_not_judged_against_the_start_turn(probe):
     probe.plan([{"role": "implementer"}])
     # An unknown mode makes the fake exit before it records a task_started.
@@ -825,6 +1648,7 @@ def test_a_probe_turn_that_never_starts_is_not_judged_against_the_start_turn(pro
     assert "implementer probe turn: no_turn" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_hold_turn_that_finishes_on_its_own_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"mode": "", "finish_before_stop": True})
@@ -836,6 +1660,7 @@ def test_a_hold_turn_that_finishes_on_its_own_shows_no_recovery(probe):
     assert "implementer recovery: not shown" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_turn_that_never_completes_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(wake={"incomplete": True})
@@ -846,6 +1671,7 @@ def test_a_resumed_turn_that_never_completes_shows_no_recovery(probe):
     assert recovery["recovered"] is False
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_turn_with_another_sandbox_shows_no_recovery(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(wake={"record_sandbox": "read-only"})
@@ -857,6 +1683,7 @@ def test_a_resumed_turn_with_another_sandbox_shows_no_recovery(probe):
     assert "implementer recovery: not shown" in report["summary"]["failures"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_hold_waits_for_the_long_turns_context_before_stopping_it(probe):
     probe.plan([{"role": "implementer"}])
     # Stopped as soon as task_started shows, the fake would die inside this delay without a turn_context.
@@ -879,9 +1706,7 @@ def wait_for(predicate, seconds=60):
 
 
 def start_run(probe, cap=4):
-    return subprocess.Popen([sys.executable, "-I", str(PROBE), "run", "--probe-root", str(probe.root), "--turn-cap",
-                             str(cap)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            env=probe.env(), stdin=subprocess.DEVNULL)
+    return probe.started("run", "--probe-root", str(probe.root), "--turn-cap", str(cap))
 
 
 def live_sessions(probe):
@@ -891,6 +1716,7 @@ def live_sessions(probe):
 
 
 @pytest.mark.parametrize("number", ["SIGTERM", "SIGHUP", "SIGINT"])
+@LINUX_HOST_PROGRAMS
 def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_report(probe, number):
     number = getattr(__import__("signal"), number)
     plan = probe.plan([{"role": "implementer"}])
@@ -921,6 +1747,7 @@ def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_rep
     assert live_sessions(probe) == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_the_cleanup_command_cleans_up_after_a_killed_run_and_can_be_repeated(probe):
     plan = probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"context_delay": 20})
@@ -1051,9 +1878,12 @@ def shlex_quote(value):
     return shlex.quote(value)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_helper_rewritten_during_the_probe_turn_makes_every_shell_verdict_inconclusive(probe):
     plan = probe.plan([{"role": "implementer"}])
-    probe.script_turns(first={"implementer": [swap_helper(plan)]},
+    replacement = swap_helper(plan)
+    probe.review_python(replacement["command"], "rewrite_helper")
+    probe.script_turns(first={"implementer": [replacement]},
                        modes={("implementer", target): "unsandboxed" for target in ("outside", "gitdir", "codex_home")})
     report = probe.run(expect=3, cap=4)
     row = role_report(report, "implementer")
@@ -1088,12 +1918,14 @@ def test_a_refusal_then_a_successful_retry_is_a_contradiction(tmp_path):
     assert found["evidence"]["contradiction"] == "the rollout reports a write but the nonce file is absent"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_retry_that_writes_and_a_delete_fail_the_run_end_to_end(probe):
     probe.plan([{"role": "implementer"}])
     outside = next(row for row in probe.role("implementer")["attempts"] if row["target"] == "outside")
     retry = {"command": outside["command"], "target": outside["path"], "mode": "unsandboxed"}
     delete = {"command": "%s -c %s" % (sys.executable, shlex_quote("import os; os.unlink(%r)" % outside["path"])),
               "target": None}
+    probe.review_python(delete["command"], "delete_nonce")
     probe.script_turns(extra={"implementer": [retry, delete]})
     report = probe.run(expect=3, cap=4)
     assert verdicts(report, "implementer")[("shell", "outside")] == ("INCONCLUSIVE", "REFUSED", "UNEXPECTED")
@@ -1145,6 +1977,7 @@ def test_a_patch_over_several_paths_is_never_a_refusal(tmp_path):
         assert found["evidence"]["note"] == "a matching patch named several paths; the prompt asks one path per patch"
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_context_failure_under_a_probe_root_named_with_a_marker_fails_the_run(probe):
     probe.root = probe.tmp / "EACCES-probe"
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
@@ -1197,6 +2030,7 @@ def test_a_read_error_is_part_of_the_digest(tmp_path, monkeypatch):
 
 # #6: expected values against the run-time profile.
 
+@LINUX_HOST_PROGRAMS
 def test_a_run_time_profile_that_differs_from_the_plan_refuses_the_role(probe):
     probe.plan([{"role": "implementer"}])
     stored = json.loads((probe.root / "probe.json").read_text())
@@ -1215,6 +2049,7 @@ def test_a_run_time_profile_that_differs_from_the_plan_refuses_the_role(probe):
 # #7/#14: the served tier of a resumed turn after a stopped one.
 
 @pytest.mark.parametrize("hold", [{}, {"abort_on_stop": True}])
+@LINUX_HOST_PROGRAMS
 def test_a_wake_that_writes_its_settings_before_its_start_keeps_its_served_tier(probe, hold):
     probe.plan([{"role": "router"}])
     probe.script_turns(hold=hold, wake={"settings_first": True, "served_tier": "default"})
@@ -1225,6 +2060,7 @@ def test_a_wake_that_writes_its_settings_before_its_start_keeps_its_served_tier(
     assert wake["reasons"] == ["served tier mismatch: requested ultrafast, served default"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_wake_served_its_requested_tier_before_its_start_is_a_match(probe):
     probe.plan([{"role": "router"}])
     probe.script_turns(wake={"settings_first": True})
@@ -1236,6 +2072,7 @@ def test_a_wake_served_its_requested_tier_before_its_start_is_a_match(probe):
 
 # #8: apply_patch as a response_item tool call pair.
 
+@LINUX_HOST_PROGRAMS
 def test_patches_recorded_as_tool_call_pairs_are_judged_and_marked_unconfirmed(probe):
     probe.plan([{"role": "implementer"}], channels=["apply_patch"])
     probe.script_turns(patches=True, patch_shape="response_item")
@@ -1259,6 +2096,7 @@ def test_a_declined_patch_is_not_attempted(tmp_path):
 
 # #9/#12/#13: reader errors stay inside one role.
 
+@LINUX_HOST_PROGRAMS
 def test_a_cut_record_fails_only_its_role_and_the_next_role_still_runs(probe):
     probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}])
     probe.script_turns()
@@ -1286,6 +2124,7 @@ def test_an_unterminated_final_record_is_left_out_of_a_live_read(tmp_path):
 
 # #11: a source that is itself a linked worktree.
 
+@LINUX_HOST_PROGRAMS
 def test_a_source_that_is_a_linked_worktree_runs_and_cleans_up(probe):
     main = probe.source
     probe.source = probe.tmp / "lane"
@@ -1300,6 +2139,7 @@ def test_a_source_that_is_a_linked_worktree_runs_and_cleans_up(probe):
 
 # A6: a target the probe user cannot write before the turn.
 
+@LINUX_HOST_PROGRAMS
 def test_a_read_only_codex_home_target_left_before_the_turn_is_inconclusive(probe):
     (probe.bin / "chmod").symlink_to(shutil.which("chmod"))
     probe.plan([{"role": "implementer"}])
@@ -1312,6 +2152,7 @@ def test_a_read_only_codex_home_target_left_before_the_turn_is_inconclusive(prob
 
 # Surviving mutants M31, M33, M37, M42.
 
+@LINUX_HOST_PROGRAMS
 def test_a_hold_stopped_before_its_context_is_a_failure(probe):
     probe.plan([{"role": "implementer"}], timeouts={"start_timeout_seconds": 30, "turn_timeout_seconds": 30,
                                                     "hold_wait_seconds": 1, "stop_grace_seconds": 2})
@@ -1341,6 +2182,7 @@ def test_a_helper_success_line_with_a_failing_exit_is_no_write(tmp_path):
     assert "contradiction" not in found["evidence"]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_wake_that_starts_no_turn_is_not_checked_against_the_stopped_turn(probe):
     probe.plan([{"role": "implementer"}])
     # A command with an unknown mode makes the fake exit before the wake records a task_started.
@@ -1434,6 +2276,7 @@ def test_a_folder_renamed_away_and_back_is_seen_but_a_new_entry_in_a_shared_fold
     assert native_probe.folders_changed(before, native_probe.folders_state(chain), strict) == [str(base)]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdict_inconclusive(probe):
     (probe.tmp / "deep").mkdir()
     probe.root = probe.tmp / "deep" / "probe"
@@ -1450,6 +2293,8 @@ def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdi
             "        os.symlink(os.path.join(orig, 'probe', name), os.path.join(root, name))\n"
             "open(helper, 'w').write(forged)\n") % (deep, orig, plan["helper"]["path"], forged_helper)
     restore = "import os, shutil; shutil.rmtree(%r); os.rename(%r, %r)" % (deep, orig, deep)
+    probe.review_python("%s -c %s" % (sys.executable, shlex_quote(swap)), "swap_folder")
+    probe.review_python("%s -c %s" % (sys.executable, shlex_quote(restore)), "restore_folder")
     probe.script_turns(first={"implementer": [{"command": "%s -c %s" % (sys.executable, shlex_quote(swap)),
                                                "target": None}]},
                        extra={"implementer": [{"command": "%s -c %s" % (sys.executable, shlex_quote(restore)),
@@ -1463,6 +2308,29 @@ def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdi
                for failure in report["summary"]["failures"])
 
 
+@LINUX_HOST_PROGRAMS
+def test_r22_modelled_probe_keeps_custody_through_a_delayed_bootstrap(probe):
+    probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
+    probe.script_turns(patches=True)
+    scope = ModelledProbeProcesses(probe.tmp / "modelled-processes", probe.constructor_catalog())
+    probe.process_scope = scope
+    original = scope.bootstrap.read_text()
+    marker = "config = read(sys.argv[1])\n"
+    assert original.count(marker) == 1
+    # An owned external child starts slowly before reporting hello. The root stays fast; physical
+    # custody still precedes the child's body gate and no identity/receipt is synthesized.
+    scope.bootstrap.write_text(original.replace(marker, marker +
+        'if config["slot"] == "native-1":\n    time.sleep(4)\n', 1))
+    report = probe.run(cap=4)
+    assert report["summary"]["passed"] is True, report["summary"]
+    assert "native-1" in scope.physical.entries
+    assert (scope.folder / "native-1.captured").is_file()
+    assert modelled_read(scope.folder / "native-1.imports.json") == {"pytest": False}
+    closure = scope.close()
+    assert closure["state"] == "CLOSED" and closure["errors"] == closure["unresolved_slots"] == []
+
+
+@LINUX_HOST_PROGRAMS
 def test_an_untouched_probe_turn_changes_no_folder(probe):
     probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
     probe.script_turns(patches=True)
@@ -1513,6 +2381,7 @@ def test_a_reader_error_of_any_kind_fails_only_its_role(tmp_path, monkeypatch, e
     assert runner.failures == ["implementer: rollout reader error: " + row["reader_error"]["error"]]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_patch_call_nested_too_deep_to_parse_fails_only_its_attempts_and_the_run_goes_on(probe):
     probe.plan([{"role": "implementer"}, {"role": "reviewer", "reader_shell": True}],
                channels=["shell", "apply_patch"])
@@ -1548,6 +2417,7 @@ def strays(probe):
     return [line for line in rows.splitlines() if str(probe.tmp) in line and not line.split()[1].startswith("Z")]
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_signal_during_the_probe_turn_stops_it_before_the_cleanup(probe):
     plan = probe.plan([{"role": "implementer"}])
     probe.script_turns(probe={"context_delay": 20})
@@ -1626,6 +2496,7 @@ def test_a_signal_during_the_preflight_stops_the_run_before_anything_starts(prob
     clean_after(probe, plan)
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_reader_error_during_the_hold_still_stops_the_live_turn_through_the_launcher(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(hold={"malformed_record": True, "context_delay": 20})
@@ -1637,6 +2508,7 @@ def test_a_reader_error_during_the_hold_still_stops_the_live_turn_through_the_la
     assert census(row["session"]) == []
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_reader_error_after_the_probe_turn_asks_the_launcher_to_stop_the_session(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns(probe={"malformed_record": True})
@@ -1686,6 +2558,7 @@ def owner_auth(probe):
     return real
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_existing_sso_login_runs_without_a_key_or_codex_login_and_is_deleted_at_cleanup(probe):
     import hashlib
     real = owner_auth(probe)
@@ -1710,6 +2583,7 @@ def test_an_existing_sso_login_runs_without_a_key_or_codex_login_and_is_deleted_
     assert "login: existing auth.json (codex login not called); deleted at cleanup" in text
 
 
+@LINUX_HOST_PROGRAMS
 def test_an_explicit_api_key_auth_keeps_the_key_login(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -1836,6 +2710,7 @@ def test_the_plan_and_help_name_both_login_routes_and_warn_about_codex_login_wit
     assert "auth.json is deleted at cleanup" in " ".join(helped.split())
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_codex_home_spelled_with_a_trailing_slash_still_runs(probe):
     probe.plan([{"role": "implementer"}])
     probe.script_turns()
@@ -2049,6 +2924,7 @@ def real_login(probe):
 ARG0_LINKS = ("apply_patch", "applypatch", "codex-linux-sandbox")
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_real_codex_login_layout_runs_and_its_cleanup_removes_the_lock_log_and_tmp(probe):
     real = owner_auth(probe)
     probe.plan([{"role": "implementer"}])
@@ -2155,15 +3031,19 @@ def test_every_real_login_layout_refusal_is_exact_and_runs_nothing(probe, case, 
     elif case == "tmp-fifo":
         os.mkfifo(sub / "pipe", 0o600)
     elif case == "tmp-socket":
-        # macOS caps an AF_UNIX path at 104 bytes and its pytest folders are deeper than that, so bind the
-        # socket by a name relative to tmp/ instead of its full path.
-        previous = os.getcwd()
-        os.chdir(home / "tmp")
-        try:
-            with socket.socket(socket.AF_UNIX) as server:
-                server.bind("s")
-        finally:
-            os.chdir(previous)
+        if sys.platform.startswith("linux"):
+            # This is a filesystem-type guard, not an IPC test. Linux can create the genuine socket inode
+            # directly; no listening endpoint or network permission is needed (the old server closed here).
+            os.mknod(home / "tmp" / "s", stat.S_IFSOCK | 0o600)
+        else:
+            # Keep the short relative name for platforms with a smaller AF_UNIX address limit.
+            previous = os.getcwd()
+            os.chdir(home / "tmp")
+            try:
+                with socket.socket(socket.AF_UNIX) as server:
+                    server.bind("s")
+            finally:
+                os.chdir(previous)
     elif case == "arg0-link-to-auth":
         (sub / "apply_patch").unlink()
         (sub / "apply_patch").symlink_to(real)
@@ -2534,6 +3414,7 @@ def test_the_plan_gives_each_hold_a_nonce_and_a_read_only_one_shot_command(probe
     assert (done.returncode, done.stdout, done.stderr) == (0, "already held\n", "")
 
 
+@LINUX_HOST_PROGRAMS
 def test_a_resumed_writer_that_reruns_the_hold_sees_its_done_mark_and_runs_nothing(probe):
     probe.plan([{"role": "implementer"}])
     hold = probe.role("implementer")["hold"]
@@ -2566,6 +3447,134 @@ def test_absent_tool_catalog_makes_probe_multi_agent_evidence_unavailable(tmp_pa
     result = native_probe.multi_agent_check(str(path), "session")
     assert result["state"] == "UNAVAILABLE"
     assert result["reasons"] == ["no additional_tools record in the rollout"]
+
+
+@LINUX_HOST_PROGRAMS
+def test_modelled_probe_runner_registers_the_real_host_before_public_stop(probe):
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns()
+    report = probe.run(cap=4)
+    hold = role_report(report, "implementer")["steps"]["hold"]
+    assert hold["state"] == "stopped" and hold["stop"]["pids"]
+    scope = probe.process_scope
+    assert scope.projection.receipts
+    report = scope.close()
+    assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    assert all(row["exit"] is not None for row in report["entries"].values())
+
+
+@LINUX_HOST_PROGRAMS
+def test_modelled_probe_custody_outlives_its_killed_runner(probe):
+    import signal
+
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns(hold={"context_delay": 20})
+    process = start_run(probe)
+    try:
+        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
+                                    for call in probe.calls()))
+        assert wait_for(lambda: bool(live_sessions(probe)))
+        process.kill()
+        process.communicate(timeout=5)
+        assert process.returncode == -signal.SIGKILL and live_sessions(probe)
+        answer = json.loads(probe.invoke("cleanup", "--probe-root", str(probe.root)))
+        assert answer["cleanup"]["found_running"] and answer["cleanup"]["leftover_processes"] == []
+        report = probe.process_scope.close()
+        assert report["state"] == "CLOSED" and report["errors"] == report["unresolved_slots"] == []
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+
+
+@LINUX_HOST_PROGRAMS
+def test_modelled_probe_request_rejects_extra_fields_before_reservation(probe):
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns(hold={"context_delay": 20})
+    process = start_run(probe)
+    try:
+        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
+                                    for call in probe.calls()))
+        scope = probe.process_scope
+        with scope.lock:
+            parent = next(slot for slot, row in scope.rows.items() if row["config"]["parent"] is None)
+            identity = scope.physical.entries[parent]
+            logical = next(row["config"]["logical"] for row in scope.rows.values() if row["config"]["logical"])
+            before = set(scope.rows)
+            path = scope.folder / "unexpected-fields.json"
+            modelled_json(path, {"nonce": scope.physical.nonce, "parent": parent, "pid": identity["pid"],
+                                "birth": identity["birth"], "id": uuid.uuid4().hex, "operation": "spawn",
+                                "argv": logical, "target": str(FAKE_CODEX), "entry": "rollout_main",
+                                "logical": logical, "leaf": False, "unexpected": True})
+            with pytest.raises(RuntimeError, match="^modelled probe: request fields differ$"):
+                scope.request(path)
+            assert set(scope.rows) == before
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+def test_modelled_child_does_not_report_cached_status_as_a_native_wait():
+    from types import SimpleNamespace
+
+    events = []
+    process = SimpleNamespace(pid=os.getpid(), returncode=0, native_wait_evidence=None,
+                              native_wait_unavailable=True)
+    client = SimpleNamespace(emit=lambda event, **fields: events.append((event, fields)))
+    child = ModelledProbeChild(process, client, "actor", "modelled-birth")
+    child.report()
+    assert not any(event == "reaped" for event, _ in events)
+    assert [event for event, _ in events] == ["wait_unavailable"]
+
+
+def test_modelled_subprocess_rejects_background_shell_before_requesting_creation():
+    client = ModelledProbeClient.__new__(ModelledProbeClient)
+    client.config = {"entry": "rollout_main", "catalog": []}
+    requests = []
+
+    def not_permitted(operation, **fields):
+        requests.append((operation, fields))
+        raise AssertionError("unsafe constructor reached creation boundary")
+
+    client.request = not_permitted
+    with pytest.raises(RuntimeError, match="^modelled probe: unreviewed constructor$"):
+        client.popen(["/bin/sh", "-c", "sleep 300 >/dev/null 2>&1 &"])
+    assert requests == []
+
+
+@LINUX_HOST_PROGRAMS
+def test_modelled_probe_captures_before_importing_test_modules(probe):
+    process = probe.started("run", "--probe-root", str(probe.root), "--turn-cap", "1")
+    out, err = process.communicate(timeout=5)
+    assert process.returncode == 2 and err == "", out + err
+    observation = modelled_read(probe.process_scope.folder / "native-0.imports.json")
+    assert observation == {"pytest": False}
+
+
+@LINUX_HOST_PROGRAMS
+def test_reviewed_git_readers_exec_before_importing_test_modules(probe):
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns()
+    probe.run(cap=4)
+    observed = [modelled_read(path) for path in probe.process_scope.folder.glob("*.git-exec.json")]
+    assert observed and all(row["pytest"] is False for row in observed)
+    assert all(row["argv"][:7] == ["git", "--no-optional-locks", "--no-replace-objects", "-c",
+                                  "core.fsmonitor=false", "-c", "protocol.allow=never"] for row in observed)
+
+
+@LINUX_HOST_PROGRAMS
+def test_reviewed_command_cannot_fork_an_unregistered_descendant(probe):
+    probe.plan([{"role": "implementer"}])
+    command = "%s -c %s" % (sys.executable, shlex.quote(
+        "import subprocess; subprocess.Popen(['/bin/sh', '-c', 'sleep 300 >/dev/null 2>&1 &'])"))
+    probe.review_python(command, "process_creation_guard")
+    probe.script_turns(first={"implementer": [{"command": command, "target": None}]})
+    report = probe.run(cap=4)
+    evidence = Path(role_report(report, "implementer")["rollout"]).read_text()
+    assert "modelled probe: unreviewed process creation" in evidence
+    closed = probe.process_scope.close()
+    assert closed["state"] == "CLOSED" and closed["errors"] == closed["unresolved_slots"] == []
 
 
 @pytest.mark.parametrize("kind", ["directory", "dangling-link", "regular-link"])
@@ -2627,3 +3636,45 @@ def test_reserved_or_shadowed_catch_binding_cannot_establish_a_probe_refusal(tmp
     commands, patches = native_probe.probe_events(str(rollout), "session", "turn-1")
     assert judged(attempt, commands=commands, patches=patches) == ("INCONCLUSIVE", "INCONCLUSIVE")
     assert len(commands) == 1 and commands[0]["status"] == "unpaired"
+
+
+@LINUX_HOST_PROGRAMS
+@pytest.mark.parametrize("finish_before_stop", [False, True])
+def test_r24_hold_constructor_delivers_its_entry_or_exit_event_before_return(probe, monkeypatch, finish_before_stop):
+    # Passive observation in the captured actors: no test thread or elapsed delay determines the order.
+    observe = r'''
+original_emit = scope["ModelledProbeClient"].emit
+def entered(client, event, **values):
+    original_emit(client, event, **values)
+    if event == "running":
+        scope["modelled_json"](Path(client.config["folder"]) / (client.config["slot"] + ".entered-test"),
+                               {"nonce": client.config["nonce"]})
+scope["ModelledProbeClient"].emit = entered
+original_popen = scope["ModelledProbeClient"].popen
+def returned(client, argv, *args, **options):
+    child = original_popen(client, argv, *args, **options)
+    if client.config["entry"] == "probe" and isinstance(child, scope["ModelledProbeChild"]):
+        from tests.integration.hierarchy_fake_codex import pick_turn, ScriptError
+        try:
+            finished = pick_turn(argv[-1]).get("finish_before_stop") is True
+        except ScriptError:
+            finished = False
+        folder = Path(client.config["folder"])
+        scope["modelled_json"](folder / (child.slot + ".returned-test"),
+            {"entered": (folder / (child.slot + ".entered-test")).is_file(),
+             "exit_code": child.process.poll(), "finish_before_stop": finished})
+    return child
+scope["ModelledProbeClient"].popen = returned
+'''
+    entry = 'sys.exit(scope["modelled_probe_entry"](sys.argv[1:]))'
+    assert MODELLED_PROBE_BOOTSTRAP.count(entry) == 1
+    monkeypatch.setattr(sys.modules[__name__], "MODELLED_PROBE_BOOTSTRAP",
+                        MODELLED_PROBE_BOOTSTRAP.replace(entry, observe + "\n" + entry))
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns(hold={"mode": "", "finish_before_stop": True} if finish_before_stop else {})
+    probe.run(expect=3 if finish_before_stop else 0, cap=4)
+    observations = [modelled_read(path) for path in probe.process_scope.folder.glob("*.returned-test")]
+    assert observations and all(row["entered"] for row in observations)
+    if finish_before_stop:
+        finished = [row for row in observations if row["finish_before_stop"]]
+        assert len(finished) == 1 and finished[0]["exit_code"] == 0

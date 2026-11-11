@@ -106,10 +106,31 @@ class Hosts(Launch):
         """Put a shell wrapper around the fake on the sealed PATH; the PATH guard still finds the fake in it."""
         path = self.bin / "claude"
         path.unlink()
-        path.write_text("#!/bin/sh\n" + body % {"python": shlex.quote(sys.executable), "fake": shlex.quote(str(fake.HERE))}
+        path.write_text("#!/bin/bash\n" + body % {"python": shlex.quote(sys.executable),
+                                                  "host": fake.shell_exec("claude", fake.HERE, self.tmp)}
                         + "\n", encoding="utf-8")
         path.chmod(0o700)
         fake.require_fake(str(self.bin))
+
+    def captured_claude(self, context, argv):
+        """MODELLED OS argv only; declare every real MCP child before starting the held fake."""
+        from tests.integration.hierarchy_fake_wrapper import python_argv
+
+        helper = ROOT / "tests/integration/test_hierarchy_launcher.py"
+        prefix = python_argv("claude", helper, self.tmp, "r2_captured_entry")
+        wrapper = self.bin / "claude"
+        wrapper.write_text("#!/bin/sh\n%s \"$@\"\n" %
+                           shlex.join(["exec", *prefix, str(fake.HERE), "main"]), encoding="utf-8")
+        wrapper.chmod(0o700)
+        fake.require_fake(str(self.bin))
+        captured = []
+        for index, word in enumerate(argv[:-1]):
+            if word == "--mcp-config":
+                definitions = json.loads(Path(argv[index + 1]).read_text())["mcpServers"]
+                for definition in definitions.values():
+                    child = [definition["command"], *definition.get("args", [])]
+                    captured.append({"argv": child, "expected_argv": child, "logical_argv": None})
+        return [*prefix, str(fake.HERE), "main", *argv[1:]], captured
 
 
 def write_plan(hosts, team):
@@ -352,7 +373,7 @@ def test_a_native_host_is_refused_at_start(hosts, monkeypatch, capsys):
 
 def test_an_init_event_that_reports_another_session_is_a_failed_start(claude_team):
     # sed by its absolute path: the sealed PATH holds no sed.
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\" | %s 's/\"session_id\": \"[^\"]*\"/\"session_id\": \"%s\"/g'"
+    claude_team.wrap_claude("(%%(host)s \"$@\") | %s 's/\"session_id\": \"[^\"]*\"/\"session_id\": \"%s\"/g'"
                             % (shlex.quote(shutil.which("sed")), OTHER_SESSION))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     assert answer["state"] == "failed_to_start" and answer["session"] is None
@@ -366,7 +387,7 @@ def test_a_start_whose_transcript_is_not_under_the_runs_claude_home_is_a_failed_
     elsewhere = tmp_path / "other-claude-home"
     elsewhere.mkdir(mode=0o700)
     claude_team.login(elsewhere)
-    claude_team.wrap_claude("CLAUDE_CONFIG_DIR=%s exec %%(python)s %%(fake)s \"$@\"" % shlex.quote(str(elsewhere)))
+    claude_team.wrap_claude("CLAUDE_CONFIG_DIR=%s %%(host)s \"$@\"" % shlex.quote(str(elsewhere)))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     session = chosen(answer)
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
@@ -383,7 +404,7 @@ def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_co
     outside, relink = tmp_path / "outside", tmp_path / "relink.py"
     outside.mkdir()
     relink.write_text(RELINK, encoding="utf-8")
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\"\ncode=$?\n%%(python)s -I %s \"$CLAUDE_CONFIG_DIR\" %s %s\n"
+    claude_team.wrap_claude("(%%(host)s \"$@\")\ncode=$?\n%%(python)s -I %s \"$CLAUDE_CONFIG_DIR\" %s %s\n"
                             "exit $code" % (shlex.quote(str(relink)), shlex.quote(str(outside)), what))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     session = chosen(answer)
@@ -401,7 +422,7 @@ def test_a_transcript_that_is_a_symlink_or_resolves_outside_the_home_does_not_co
 
 def test_a_start_whose_output_has_no_init_event_is_a_failed_start(claude_team):
     # grep by its absolute path: the sealed PATH holds no grep.
-    claude_team.wrap_claude("%%(python)s %%(fake)s \"$@\" | %s -v '\"subtype\": \"init\"'"
+    claude_team.wrap_claude("(%%(host)s \"$@\") | %s -v '\"subtype\": \"init\"'"
                             % shlex.quote(shutil.which("grep")))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
@@ -484,27 +505,36 @@ def test_a_held_start_lock_refuses_a_claude_start_under_its_host(claude_team):
 # -- stop and resume of a Claude-started role -------------------------------------------------------------------------
 
 def test_stop_ends_a_hung_turn_of_a_claude_started_role(claude_team, tmp_path):
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
+
     answer = claude_team.start(endpoint=IMPLEMENTER)
     session = answer["session"]
     wake = json.loads(Path(answer["wake_profile"]).read_text())
     out = tmp_path / "hung.stdout"
+    context = R2Case(claude_team)
+    launcher_module = context.module
+    expected, captured = claude_team.captured_claude(context, wake["argv"])
     # The role's own wake argv, as a wake would run it, left hanging after its init event.
-    with open(answer["prompt_file"], "rb") as prompt, open(out, "wb") as stdout:
-        hung = subprocess.Popen(wake["argv"], cwd=wake["cwd"], stdin=prompt, stdout=stdout, stderr=subprocess.DEVNULL,
-                                env=claude_team.env(FAKE_CLAUDE_MODE="hang"), start_new_session=True)
     try:
+        with open(answer["prompt_file"], "rb") as prompt, open(out, "wb") as stdout:
+            hung = context.spawn_exec(wake["argv"], wake["argv"], expected, cwd=wake["cwd"], stdin=prompt,
+                                      stdout=stdout, environment=claude_team.env(FAKE_CLAUDE_MODE="hang"),
+                                      captured=captured, target=(fake.HERE, "main"))
+
+        def initialized():
+            context.service_exec_children()
+            return '"subtype": "init"' in out.read_text()
+
         # After init, the fake's MCP probes (which also name the session) have ended; only the turn is left.
-        wait_until(lambda: '"subtype": "init"' in out.read_text(), 30)
-        wait_until(lambda: census(session) == [hung.pid])
+        wait_until(initialized, 30)
+        wait_until(lambda: launcher_module().session_processes(session, set(), CLAUDE) == [(hung.pid, hung.pid)])
         stopped = claude_team.run("stop", "--endpoint", IMPLEMENTER, "--grace-seconds", "2")
         assert stopped["state"] == "stopped" and stopped["pids"] == [hung.pid]
         assert (stopped["host"], stopped["session"]) == (CLAUDE, session)
         assert hung.wait(timeout=5) < 0
         assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["bound", "stopped"]
     finally:
-        if hung.poll() is None:
-            os.killpg(hung.pid, 9)
-            hung.wait(timeout=5)
+        context.close()
 
 
 def test_resume_dry_run_of_a_claude_started_role_runs_the_claude_wake_argv(claude_team):
