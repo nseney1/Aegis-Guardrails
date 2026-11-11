@@ -38,7 +38,6 @@
       "rust-lint",
       "commit-exact"
     ],
-    "python": "/usr/bin/python3",
     "commit_identity": {
       "name": "Aegis M1 Implementer",
       "email": "m1-run@localhost"
