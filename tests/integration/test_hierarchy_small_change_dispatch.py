@@ -4090,7 +4090,8 @@ os.stat, os.fstat = inspected, opened
         assert len(world.messages("dispatch")) == 1
 
 
-def test_r7_public_live_runner_is_running_without_log_capture_or_batch_continuation(tmp_path):
+@pytest.mark.parametrize("publication_pause", ["steady", "receipt", "unlock"])
+def test_r7_public_live_runner_is_running_without_log_capture_or_batch_continuation(tmp_path, publication_pause):
     import time
     (tmp_path / ".keep").write_text("R7 concurrent public command runner; temporary fixture process only\n")
     started, release = tmp_path / "started", tmp_path / "release"
@@ -4104,21 +4105,72 @@ def test_r7_public_live_runner_is_running_without_log_capture_or_batch_continuat
     world.finish_writer()
     world.dispatch(fault="batch")
     requests = world.messages("job_request")
+    paused, resume = tmp_path / "publication-paused", tmp_path / "resume-publication"
+    # Delay only this runner's mailbox OS boundary, leaving pytest's globals alone.
+    script = r"""
+import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('hierarchy_jobs', sys.argv[1])
+jobs = importlib.util.module_from_spec(spec); sys.modules[spec.name] = jobs; spec.loader.exec_module(jobs)
+import hierarchy_mailbox as mailbox
+real_os = mailbox.os
+class PublicationOS:
+    published = False
+    def __getattr__(self, name): return getattr(real_os, name)
+    def pause(self):
+        Path(sys.argv[3]).write_text('publication paused')
+        deadline = time.monotonic() + 10
+        while not Path(sys.argv[4]).exists():
+            if time.monotonic() >= deadline: raise TimeoutError('fixture publication was not resumed')
+            time.sleep(0.01)
+    def link(self, src, dst, *args, **kwargs):
+        if Path(dst).name.endswith('-started.md'):
+            if sys.argv[2] == 'receipt': self.pause()
+            result = real_os.link(src, dst, *args, **kwargs)
+            self.published = True
+            return result
+        return real_os.link(src, dst, *args, **kwargs)
+    def unlink(self, path, *args, **kwargs):
+        if self.published and Path(path).name == '.write.lock':
+            self.published = False
+            if sys.argv[2] == 'unlock': self.pause()
+        return real_os.unlink(path, *args, **kwargs)
+mailbox.os = PublicationOS()
+sys.exit(jobs.main(sys.argv[5:]))
+"""
     env = {k: v for k, v in os.environ.items()
            if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
-    process = subprocess.Popen([sys.executable, "-I", "-B", str(JOBS), "--store", str(world.workspace.store),
+    argv = [sys.executable, "-I", "-B", str(JOBS)]
+    if publication_pause != "steady":
+        argv = [sys.executable, "-I", "-B", "-c", script, str(JOBS), publication_pause, str(paused), str(resume)]
+    process = subprocess.Popen(argv + ["--store", str(world.workspace.store),
         "--recipes", str(world.recipes_path), "run-open"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 10
-        while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+        ready = False
+        while process.poll() is None and time.monotonic() < deadline:
+            publication_is_paused = paused.exists() and not resume.exists()
+            started_receipt = any(record["message"]["in_reply_to"] == requests[0]["message"]["message_id"]
+                and record["message"]["receipt"]["state"] == "started"
+                for record in world.messages("job_receipt"))
+            locked = (world.root / ".write.lock").exists()
+            if publication_is_paused:
+                assert locked, "fixture did not retain the publication lock"
+                assert started_receipt == (publication_pause == "unlock"), "fixture paused at the wrong boundary"
+                resume.write_text("resume owned fixture publication\n")
+            ready = started.exists() and started_receipt and not locked
+            if ready:
+                break
             time.sleep(0.01)
-        assert started.exists(), "public runner did not reach the owned fixture step"
+        assert ready, "public runner did not finish publishing its start receipt"
+        assert publication_pause == "steady" or resume.exists(), "fixture did not pause publication"
         for command in ("status", "dispatch"):
             row = world.dispatch(command=command)["small_changes"][0]
             assert row["state"] == "checking" and row["checks"][0]["state"] == "running", row
             assert not row["drafts"]
             assert world.messages("job_request") == requests and len(world.messages("dispatch")) == 1
     finally:
+        resume.write_text("resume owned fixture publication\n")
         release.write_text("finish original fixture check\n")
         stdout, stderr = process.communicate(timeout=20)
     assert process.returncode == 0 and not stderr, stdout + stderr
