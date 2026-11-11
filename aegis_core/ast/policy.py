@@ -293,19 +293,8 @@ def _decorator_hits(normalized_ast: NormalizedAST, forbidden: Any, fp: str, impo
     return [dec for dec in pats if dec and any(index.matches(name, _decorator_pattern(dec)) for name in names)]
 
 
-def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> list[dict[str, Any]]:
-    """The one forbid_ast evaluator: a finding per matched site, imports then calls then decorators
-    (each in spec order, sites by line). A finding is ``{rule, kind, pattern, path, line, snippet,
-    unknown, override}``: ``line`` is 0 for a decorator; ``snippet`` is the site's source line with
-    whitespace collapsed (``target(arguments)`` when no source exists); ``unknown`` marks a site
-    whose ``where`` cannot be decided (advisory); ``override`` is the reason of a ``# aegis: allow``
-    on that line naming this rule or none, and such a hit is kept, never dropped.
-
-    ``source`` is the file text (allow comments and snippets); ``""`` means none. Without it the
-    tree's own allow comments and the file it names are read, once."""
-    if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
-        return []
-    fp = str(getattr(normalized_ast, "file_path", "") or "")
+def _import_tables(normalized_ast: NormalizedAST) -> Tuple[List[Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Build import spellings and binding tables without changing the tree."""
     parsed_imports: list[Any] = []
     imported_qual_map: dict[str, Any] = {}
     aliases: dict[str, Any] = {}
@@ -345,6 +334,37 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
                 continue
             if sym and marker is not True and (sym != src or marker is False or normalized_ast.language in ('javascript', 'typescript', 'rust')):
                 add_binding(imported_qual_map, sym, f"{src}.{sym}")
+    return parsed_imports, imported_qual_map, aliases, bound_origins
+
+
+def _allow_comments(normalized_ast: NormalizedAST, source: Optional[str], text: Optional[str]) -> Dict[int, List[Dict[str, Any]]]:
+    """Select parser comments or Python source comments in precedence order."""
+    meta = getattr(normalized_ast, "metadata", None)
+    language = str(getattr(normalized_ast, "language", "") or "").lower()
+    if language != "python" and isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
+        return meta["allow_comments"]
+    elif isinstance(source, str):
+        return parse_allow_comments(source, language)
+    elif isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
+        return meta["allow_comments"]
+    else:
+        return parse_allow_comments(text or "", language)
+
+
+def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: dict[str, Any], *, rule_id: Optional[str] = None, source: Optional[str] = None) -> list[dict[str, Any]]:
+    """The one forbid_ast evaluator: a finding per matched site, imports then calls then decorators
+    (each in spec order, sites by line). A finding is ``{rule, kind, pattern, path, line, snippet,
+    unknown, override}``: ``line`` is 0 for a decorator; ``snippet`` is the site's source line with
+    whitespace collapsed (``target(arguments)`` when no source exists); ``unknown`` marks a site
+    whose ``where`` cannot be decided (advisory); ``override`` is the reason of a ``# aegis: allow``
+    on that line naming this rule or none, and such a hit is kept, never dropped.
+
+    ``source`` is the file text (allow comments and snippets); ``""`` means none. Without it the
+    tree's own allow comments and the file it names are read, once."""
+    if normalized_ast is None or not forbid_spec or not isinstance(forbid_spec, dict):
+        return []
+    fp = str(getattr(normalized_ast, "file_path", "") or "")
+    parsed_imports, imported_qual_map, aliases, bound_origins = _import_tables(normalized_ast)
     by_line = lambda hit: _line_of(hit[0]) or 0
     hits: List[Tuple[str, str, Any, Optional[bool]]] = []
     for raw_mod in forbid_spec["imports"] if isinstance(forbid_spec.get("imports"), (list, tuple, set)) else ():
@@ -356,24 +376,19 @@ def evaluate_forbid_ast_structured(normalized_ast: NormalizedAST, forbid_spec: d
             hits.extend(("imports", mod, site, verdict) for site, verdict in matched)
     raw_call_sites = getattr(normalized_ast, "call_sites", ()) or ()
     call_index = _SpellingIndex(imported_qual_map, aliases, qualify_heads=True, bound_origins=bound_origins)
-    defined_names = {str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", "")) for d in (getattr(normalized_ast, "definitions", ()) or ()) if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")}
+    defined_names = {
+        str(getattr(d, "name", "") if not isinstance(d, Mapping) else d.get("name", ""))
+        for d in (getattr(normalized_ast, "definitions", ()) or ())
+        if (getattr(d, "kind", "") if not isinstance(d, Mapping) else d.get("kind", "")) in ("function", "class")
+    }
     for raw_call in forbid_spec["calls"] if isinstance(forbid_spec.get("calls"), (list, tuple, set)) else ():
         call, matched = _eval_call_entry(raw_call, raw_call_sites, call_index, defined_names, _driver_extracts_args(normalized_ast))
         hits.extend(("calls", call, site, verdict) for site, verdict in sorted(matched, key=by_line))
     hits.extend(("decorators", dec, None, True) for dec in _decorator_hits(normalized_ast, forbid_spec.get("decorators"), fp, imported_qual_map, aliases, bound_origins))
     if not hits:
         return []
-    meta = getattr(normalized_ast, "metadata", None)
     text = source if isinstance(source, str) else _read_source(fp)
-    language = str(getattr(normalized_ast, "language", "") or "").lower()
-    if language != "python" and isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
-        allows = meta["allow_comments"]
-    elif isinstance(source, str):
-        allows = parse_allow_comments(source, language)
-    elif isinstance(meta, Mapping) and isinstance(meta.get("allow_comments"), dict):
-        allows = meta["allow_comments"]
-    else:
-        allows = parse_allow_comments(text or "", language)
+    allows = _allow_comments(normalized_ast, source, text)
     # Universal newlines, as the parsers count lines; split once per call, never per finding.
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if text else []
     findings: list[dict[str, Any]] = []

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +28,76 @@ def _where(value, condition):
         _tree(args={"value": value}),
         {"calls": [{"name": "danger", "where": {"value": condition}}]}, source="",
     )
+
+
+def test_structured_evaluator_keeps_language_driver_headroom():
+    tree = ast.parse(Path(policy.__file__).read_text(encoding="utf-8"))
+    evaluator = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "evaluate_forbid_ast_structured")
+    # Restore at least the pre-driver budget without changing the shared ratchet.
+    assert evaluator.end_lineno - evaluator.lineno + 1 <= 65
+    assert sum(isinstance(node, ast.stmt) for node in ast.walk(evaluator)) <= 52
+
+
+@pytest.mark.parametrize("language", ["python", "javascript", "typescript", "rust", "go"])
+@pytest.mark.parametrize("supplied_source", [False, True], ids=["file", "supplied"])
+@pytest.mark.parametrize("parser_comments", [False, True], ids=["no-metadata", "metadata"])
+def test_structured_findings_preserve_bytes_and_inputs(
+    tmp_path, language, supplied_source, parser_comments,
+):
+    lines = [
+        "from first import run as dispatch",
+        "from second import run",
+        "dispatch()",
+        "run()  # aegis: allow[rule] source reason",
+        "dynamic()",
+    ]
+    source = "\n".join(lines) + "\n"
+    target = tmp_path / "fixture.txt"
+    target.write_bytes(source.encode("utf-8"))
+    metadata = {"capabilities": ["args"], "decorators": ["dispatch"]}
+    if parser_comments:
+        metadata["allow_comments"] = {4: [{"rules": ["rule"], "reason": "parser reason"}]}
+    tree = NormalizedAST.from_dict({
+        "file_path": str(target), "language": language,
+        "imports": [
+            {"source": "first", "imported_symbols": ["run"],
+             "aliases": [["dispatch", "run"]], "is_namespace": False, "line": 1},
+            {"source": "second", "imported_symbols": ["run"], "is_namespace": False, "line": 2},
+        ],
+        "call_sites": [
+            {"target": "dynamic", "line": 5, "args": {"value": "<expr>"}},
+            {"target": "dispatch", "line": 3},
+            {"target": "run", "line": 4},
+        ],
+        "metadata": metadata,
+    })
+    spec = {"imports": ["second", "first"],
+            "calls": ["second.run", "first.run", {"name": "dynamic", "where": {"value": True}}],
+            "decorators": ["first.run"]}
+    before = tree.to_json(), json.dumps(spec)
+    override = ("source reason" if language == "python" and supplied_source
+                else "parser reason" if parser_comments
+                else "source reason" if language == "python" else None)
+    expected = [
+        {"rule": "rule", "kind": kind, "pattern": pattern, "path": str(target), "line": line,
+         "snippet": " ".join(lines[line - 1].split()) if line else "",
+         "unknown": unknown, "override": reason}
+        for kind, pattern, line, unknown, reason in [
+            ("imports", "second", 2, False, None),
+            ("imports", "first", 1, False, None),
+            ("calls", "second.run", 4, False, override),
+            ("calls", "first.run", 3, False, None),
+            ("calls", "dynamic", 5, True, None),
+            ("decorators", "first.run", 0, False, None),
+        ]
+    ]
+    for _ in range(2):
+        findings = evaluate_forbid_ast_structured(
+            tree, spec, rule_id="rule", source=source if supplied_source else None,
+        )
+        assert json.dumps(findings) == json.dumps(expected)
+        assert (tree.to_json(), json.dumps(spec)) == before
 
 
 @pytest.mark.parametrize("value,condition", [

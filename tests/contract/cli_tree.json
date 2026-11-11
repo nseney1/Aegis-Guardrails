@@ -4135,6 +4135,350 @@
             "description": "Refuse when a live lease of another lane may overlap the paths; otherwise create the lane's lease, or take over its expired lease. Prints the new lease oid.",
             "help": "Lease a lane's paths; prints the lease oid"
           },
+          "config": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "config_action",
+                "flags": [],
+                "help": null,
+                "kind": "parsers",
+                "metavar": null,
+                "nargs": "A...",
+                "required": false
+              }
+            ],
+            "commands": {
+              "init": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "preset",
+                    "flags": [
+                      "--preset"
+                    ],
+                    "help": "Preset name from config presets",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "host",
+                    "flags": [
+                      "--host"
+                    ],
+                    "help": "Bind the preset host kind at initialization; see config presets --json",
+                    "kind": "store",
+                    "metavar": "KIND",
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "force",
+                    "flags": [
+                      "--force"
+                    ],
+                    "help": "Replace an existing valid profile",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Write the repository team profile"
+              },
+              "presets": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "List built-in team presets"
+              },
+              "show": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "Show every resolved value and its layer"
+              }
+            },
+            "description": null,
+            "help": "Inspect or initialize a layered team profile"
+          },
+          "doctor": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              }
+            ],
+            "description": null,
+            "help": "Check profile completeness and host CLIs on PATH"
+          },
           "gc": {
             "aliases": [],
             "arguments": [
