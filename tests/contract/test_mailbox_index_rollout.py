@@ -34,7 +34,8 @@ from tests.contract.test_process_ratchets import ScopedNames
 
 REPO = Path(__file__).resolve().parents[2]
 INDEX = "tools/hierarchy_mailbox_index.py"
-ADMITTED_IMPORTERS = frozenset()  # Phase 1 requires an owner-approved change.
+# Owner approved Phase 1 for the read-only doctor (MB-5 round 1b, Addendum A).
+ADMITTED_IMPORTERS = frozenset({"tools/hierarchy_mailbox_doctor.py"})
 RECEIVER_ATTR_ALLOW = frozenset({"_path_key"})
 RECEIVER_ATTR_DENY = frozenset({"mode", "__init__", "__new__", "__dict__", "__class__"})
 NEEDLES = (b"MailboxIndex", b"hierarchy_mailbox_index")
@@ -440,7 +441,8 @@ def test_round3_planted_shadow_adoption_refuses(pipeline_repo):
 
 def test_tip_prefilters_once_with_clean_git_environment(monkeypatch):
     real_run, real_parse = subprocess.run, ast.parse
-    calls, parsed = [], []
+    calls, parsed, tracked = [], [], []
+    real_tracked_names = _tracked_names
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "gIt_DIR"):
         monkeypatch.setenv(key, "RF24-untrusted-environment")
 
@@ -453,12 +455,30 @@ def test_tip_prefilters_once_with_clean_git_environment(monkeypatch):
         parsed.append(kwargs.get("filename"))
         return real_parse(*args, **kwargs)
 
+    def observed_tracked_names(root):
+        names = real_tracked_names(root)
+        tracked.extend(names)
+        return names
+
     monkeypatch.setattr(subprocess, "run", observed_run)
     monkeypatch.setattr(ast, "parse", observed_parse)
+    monkeypatch.setitem(globals(), "_tracked_names", observed_tracked_names)
     assert _runtime_violations(REPO) == []
     assert len(calls) == 1 and "ls-files" in calls[0]
     assert all(path in calls[0] for path in ("tools", "aegis_*", "rules", "skills"))
-    assert parsed == [INDEX]
+    assert parsed == [INDEX] + sorted(ADMITTED_IMPORTERS.intersection(tracked))
+
+
+def test_owner_admits_only_doctor_and_refuses_a_second_importer(shadow_signature):
+    doctor = "tools/hierarchy_mailbox_doctor.py"
+    assert ADMITTED_IMPORTERS == frozenset({doctor})
+    raw = b'from tools.hierarchy_mailbox_index import MailboxIndex\nMailboxIndex(mailbox, mode="shadow")\n'
+    assert _importer_violations(raw, doctor, shadow_signature) == []
+    second = "tools/second_reader.py"
+    assert _importer_violations(raw, second, shadow_signature) == [_message(second, 1, "RF24_MENTION")]
+    # New files may be untracked in a writer handoff. Check the admitted source
+    # directly too; this remains a plain bounded read of our own repository.
+    assert _importer_violations(_read_source(REPO, doctor, MAX_SOURCE), doctor, shadow_signature) == []
 
 
 def _symlink(target, link, directory=False):
