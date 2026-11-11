@@ -41,6 +41,7 @@ from .projection import is_error_result
 from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
 from aegis_mcp.handlers.msg import message_result
 from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
+from .stdio_reader import FrameError, MANAGER_MAX_BYTES, REPOSITORY_MAX_BYTES, input_stream, read_frame
 from .tools import SERVER_INJECTED, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
@@ -548,7 +549,18 @@ def run_stdio_server():
     harden_process()
     _start()
     try:
-        for line in sys.stdin:
+        stream = input_stream(sys.stdin)
+        max_bytes = REPOSITORY_MAX_BYTES if _manager_config is None else MANAGER_MAX_BYTES
+        while True:
+            try:
+                line = read_frame(stream, max_bytes)
+            except FrameError as exc:
+                send_error(None, -32700, "Parse error")
+                if exc.terminal:
+                    break
+                continue
+            if line is None:
+                break
             line = line.strip()
             if not line:
                 continue

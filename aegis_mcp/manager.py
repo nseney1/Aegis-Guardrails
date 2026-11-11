@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from aegis_core.primitives import strict_loads
+from .stdio_reader import MANAGER_MAX_BYTES, check_text_size
 
 __all__ = ["INSTRUCTIONS", "TOOL_DEFINITIONS", "decode_frame", "execute", "validate_call"]
 
@@ -105,7 +106,6 @@ def execute(config_path: str, config_digest: str, provenance: dict, name: str, a
 
 def decode_frame(line: str):
     """Manager transport rejects duplicate keys and non-finite JSON before dispatch."""
-    if len(line.encode("utf-8")) > 262144:
-        raise ValueError("manager frame exceeds 262144 bytes")
+    check_text_size(line, MANAGER_MAX_BYTES, "manager frame exceeds 262144 bytes")
 
     return strict_loads(line)
