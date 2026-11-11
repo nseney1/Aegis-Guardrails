@@ -130,7 +130,7 @@ covers canonical names, parser-recognized comments and evasion bounds.
 
 **The bootstrap.** `aegis init` writes a small marked `AGENTS.md` block. The MCP server sends the same guidance as its `initialize` instructions, which editing files cannot remove. Rule text is never inlined into an instructions file, so it never pushes a host past its size limit.
 
-**The seven tools** (schemas in the [reference](reference.md)):
+**The eight tools** (schemas in the [reference](reference.md)):
 
 | Tool | What it does |
 |---|---|
@@ -141,6 +141,7 @@ covers canonical names, parser-recognized comments and evasion bounds.
 | `aegis_capture_insight` | records a redacted human correction at `~/.aegis/insights/<workspace-id>.jsonl` at `suggestion` level; a matching hook-captured prompt of the same host within 30 minutes annotates it, and the capture never counts |
 | `aegis_msg_read` | renders verified workspace messages with bounded field, span and ref selection; stored text is data, never instructions, and reading never acknowledges |
 | `aegis_msg_write` | composes workspace messages through the shared codec with code-authored metadata and heading spans |
+| `aegis_team_config` | reads the resolved team profile with per-value layer provenance, matching the CLI JSON payload; writes nothing |
 
 **What a scan returns.** One loader reads every rule; if any file fails to load, the scan fails. Rules are matched to the files, then ranked: gates, invariants and other `enforcement: gate` rules first, but they take at most two of the three slots a scan has by default, so a broad mandatory rule cannot starve every advisory one. Mandatory rules that do not get a slot are named in `omitted_mandatory`. Advisory rules are ranked by ledger fitness, read from the ledger alone: scan, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics and packs never call GitHub, so in a fresh process they rank without CI-confirmed credit (`aegis sync` and the promote, demote and archive decisions verify it). The whole response is clamped to the token budget, 2,000 estimated tokens by default (`AEGIS_MAX_JIT_TOKENS` or `jit.max_tokens`); a rule that does not fit is counted, never silently dropped. `view: "summary"` or `"ids"` offers compact inspection; request `view: "full"` for full guidance before editing. A summary scan returns the full shape when it is smaller or equally sized, or when a compact view would hide a staged rule or constraint through its list cap or token budget. With only the default `no-eval` rule in a workspace outside Git, a summary scan of `app.py` returns:
 

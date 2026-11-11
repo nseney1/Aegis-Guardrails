@@ -10,18 +10,378 @@ import os
 import re
 import sys
 import textwrap
+from types import SimpleNamespace
+
+import pytest
 
 
 REPO_ROOT = str(next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists()))
 sys.path.insert(0, REPO_ROOT)
 
 from aegis_core.verification import ToolEvidence
+from tests.conftest import symlink_or_skip
 from tests.helpers_popen import install_fake_popen
 from unittest.mock import patch, MagicMock
 
 
 class TestMutationTesterContract:
     """Behavioral contract for mutation_tester.check()."""
+
+    @pytest.mark.parametrize("marker", ["pyproject.toml", "pytest.ini", "setup.cfg", "conftest.py"])
+    def test_basetemp_inside_checkout_respects_git_ceiling(self, tmp_path, monkeypatch, marker):
+        from aegis_core.verification import mutation_tester
+
+        checkout = tmp_path / "checkout"
+        basetemp = checkout / "basetemp"
+        workspace = basetemp / "workspace"
+        workspace.mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        (checkout / marker).write_text("", encoding="utf-8")
+        (checkout / "conftest.py").write_text(
+            "raise RuntimeError('enclosing checkout conftest was loaded')\n", encoding="utf-8"
+        )
+        src = workspace / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        test = workspace / "test_target.py"
+        test.write_text(
+            f"import sys\nsys.path.insert(0, {str(workspace)!r})\n"
+            "from target import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(basetemp))
+
+        result = mutation_tester.check(str(src), "add", str(test))
+
+        assert result.verdict is True, result.detail
+        assert result.detail == "0/2 survived (1 test file ran)"
+
+    @pytest.mark.parametrize("marker", ["pyproject.toml", "pytest.ini", "setup.cfg", "conftest.py", None])
+    def test_symlinked_test_paths_keep_conftest_boundary(self, tmp_path, monkeypatch, marker):
+        from aegis_core.verification import mutation_tester
+
+        checkout = tmp_path / "checkout"
+        basetemp = checkout / "basetemp"
+        workspace = basetemp / "workspace"
+        tests = workspace / "tests"
+        tests.mkdir(parents=True)
+        (checkout / "conftest.py").write_text(
+            "raise RuntimeError('conftest above the ceiling was loaded')\n", encoding="utf-8"
+        )
+        if marker is not None:
+            (workspace / marker).write_text("", encoding="utf-8")
+            (workspace / "conftest.py").write_text(
+                "import pytest\n@pytest.fixture\ndef local_value():\n    return 5\n", encoding="utf-8"
+            )
+        src = workspace / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        parameter = "local_value" if marker is not None else ""
+        expected = "local_value" if marker is not None else "5"
+        (tests / "test_target.py").write_text(
+            f"import sys\nsys.path.insert(0, {str(workspace)!r})\n"
+            f"from target import add\ndef test_add({parameter}):\n    assert add(2, 3) == {expected}\n",
+            encoding="utf-8",
+        )
+        alias = tmp_path / "alias"
+        symlink_or_skip(checkout, alias, target_is_directory=True)
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(basetemp))
+
+        result = mutation_tester.check(str(src), "add", str(alias / "basetemp/workspace/tests/test_target.py"))
+
+        assert result.verdict is True, result.detail
+        assert result.detail == "0/2 survived (1 test file ran)"
+
+    @pytest.mark.parametrize("test_path", ["", "untrusted\x00test.py"])
+    def test_invalid_test_paths_are_refused_before_spawn(self, tmp_path, monkeypatch, test_path):
+        from aegis_core.verification import mutation_tester
+
+        src = tmp_path / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        process_api = SimpleNamespace(**vars(mutation_tester.subprocess))
+
+        def refuse_spawn(*args, **kwargs):
+            raise AssertionError("invalid test paths must be refused before spawning")
+
+        process_api.Popen = refuse_spawn
+        monkeypatch.setattr(mutation_tester, "subprocess", process_api)
+
+        result = mutation_tester.check(str(src), "add", test_path)
+
+        assert result.verdict is False
+        assert result.lines == [-1]
+        assert result.detail == (
+            "Baseline tests fail against the unmutated code "
+            "(cannot resolve test paths; 1 test file ran); cannot assess mutations"
+        )
+
+    @pytest.mark.parametrize("layout", ["single-at-ceiling", "two-workspaces"])
+    @pytest.mark.parametrize("config_marker", [True, False], ids=["config-root", "conftest-root"])
+    def test_common_test_directory_equal_to_ceiling_stops_discovery(self, tmp_path, monkeypatch, layout, config_marker):
+        from aegis_core.verification import mutation_tester
+
+        checkout = tmp_path / "checkout"
+        basetemp = checkout / "basetemp"
+        basetemp.mkdir(parents=True)
+        if config_marker:
+            (checkout / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+        (checkout / "conftest.py").write_text(
+            "raise RuntimeError('enclosing checkout conftest was loaded')\n", encoding="utf-8"
+        )
+        src = basetemp / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        test_files = []
+        for name in (["a"] if layout == "single-at-ceiling" else ["a", "b"]):
+            folder = basetemp if layout == "single-at-ceiling" else basetemp / ("ws_" + name)
+            folder.mkdir(exist_ok=True)
+            test = folder / ("test_" + name + ".py")
+            test.write_text(
+                f"import sys\nsys.path.insert(0, {str(basetemp)!r})\n"
+                "from target import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+                encoding="utf-8",
+            )
+            test_files.append(str(test))
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(basetemp))
+
+        result = mutation_tester.check(str(src), "add", test_files)
+
+        assert result.verdict is True, result.detail
+        assert result.detail == (
+            "0/2 survived (1 test file ran)" if layout == "single-at-ceiling"
+            else "0/2 survived (2 test files ran)"
+        )
+
+    def test_discovery_walk_at_ceiling_keeps_start_only(self, tmp_path, monkeypatch):
+        from aegis_core.workspace.binding import bounded_walk_up, git_discovery_paths
+
+        checkout = tmp_path / "checkout"
+        (checkout / ".aegis" / "rules").mkdir(parents=True)
+        ceiling = checkout / "basetemp"
+        ceiling.mkdir()
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
+
+        assert list(git_discovery_paths(ceiling)) == [ceiling.resolve()]
+        assert bounded_walk_up(ceiling) is None
+        (ceiling / ".aegis" / "rules").mkdir(parents=True)
+        assert bounded_walk_up(ceiling) == ceiling.resolve()
+
+    def test_argon_alias_ceiling_and_test_path_share_physical_boundary(self, tmp_path, monkeypatch):
+        from aegis_core.verification import mutation_tester
+
+        real = tmp_path / "real"
+        checkout = real / "checkout"
+        workspace = checkout / "basetemp" / "workspace"
+        workspace.mkdir(parents=True)
+        (workspace / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+        (checkout / "conftest.py").write_text(
+            "raise RuntimeError('enclosing checkout conftest was loaded')\n", encoding="utf-8"
+        )
+        src = workspace / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (workspace / "test_target.py").write_text(
+            f"import sys\nsys.path.insert(0, {str(workspace)!r})\n"
+            "from target import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+            encoding="utf-8",
+        )
+        alias = tmp_path / "link"
+        symlink_or_skip(real, alias, target_is_directory=True)
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(alias / "checkout/basetemp"))
+
+        result = mutation_tester.check(
+            str(src), "add", str(alias / "checkout/basetemp/workspace/test_target.py")
+        )
+
+        assert result.verdict is True, result.detail
+        assert result.detail == "0/2 survived (1 test file ran)"
+
+    @pytest.mark.parametrize("marker", ["pyproject.toml", "pytest.ini", "setup.cfg", None, "no-markers"])
+    @pytest.mark.parametrize("layout", [
+        "distinct", "argon-distinct", "mixed", "missing-outside", "nested-conflict", "nested-compatible",
+    ])
+    def test_each_selection_keeps_its_ceiling_before_aggregation(self, tmp_path, monkeypatch, marker, layout):
+        from aegis_core.verification import mutation_tester
+
+        checkout = tmp_path / "checkout"
+        first = checkout / "basetemp_a"
+        second = checkout / "basetemp_b"
+        if layout == "argon-distinct":
+            first, second = checkout / "basetemp/a", checkout / "basetemp/b"
+        if layout.startswith("nested"):
+            second = first / "inner"
+            folders = [second / "ws_a", (second if layout == "nested-compatible" else first) / "ws_b"]
+            ceilings = [first, second]
+        else:
+            folders = [first / "ws_a", second / "ws_b"]
+            ceilings = [first, second] if layout in ("distinct", "argon-distinct") else [first]
+        for folder in folders:
+            folder.mkdir(parents=True)
+        if marker not in (None, "no-markers"):
+            (checkout / marker).write_text("", encoding="utf-8")
+        loaded = checkout / "outer-conftest-loaded"
+        if marker != "no-markers":
+            (checkout / "conftest.py").write_text(
+                f"from pathlib import Path\nPath({str(loaded)!r}).write_text('loaded', encoding='utf-8')\n"
+                "raise RuntimeError('enclosing checkout conftest was loaded')\n", encoding="utf-8"
+            )
+        src = checkout / "target.py"
+        src.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        selections = []
+        for name, folder in zip(("a", "b"), folders):
+            test = folder / ("test_" + name + ".py")
+            if layout != "missing-outside" or name != "b":
+                test.write_text(
+                    f"import sys\nsys.path.insert(0, {str(checkout)!r})\n"
+                    "from target import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+                    encoding="utf-8",
+                )
+            selections.append(str(test))
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", os.pathsep.join(map(str, ceilings)))
+        process_api = SimpleNamespace(**vars(mutation_tester.subprocess))
+        real_popen, spawned = process_api.Popen, []
+
+        def spawn(*args, **kwargs):
+            spawned.append(args)
+            return real_popen(*args, **kwargs)
+
+        process_api.Popen = spawn
+        monkeypatch.setattr(mutation_tester, "subprocess", process_api)
+
+        result = mutation_tester.check(str(src), "add", selections)
+
+        if layout == "nested-compatible":
+            assert result.verdict is True, result.detail
+            assert result.detail == "0/2 survived (2 test files ran)"
+        else:
+            assert result.verdict is False
+            assert result.lines == [-1]
+            assert result.detail == (
+                "Baseline tests fail against the unmutated code "
+                "(test selections have no shared discovery boundary; check the selections separately; "
+                "2 test files ran); cannot assess mutations"
+            )
+            assert spawned == []
+        assert not loaded.exists()
+
+    def test_equal_ceiling_native_git_cannot_conflict_with_pin(self, tmp_path, monkeypatch):
+        import shutil
+        import subprocess
+        from aegis_core.workspace.binding import WorkspaceHold, resolve_cli_root
+
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git is not available")
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+            monkeypatch.delenv(name, raising=False)
+        checkout = tmp_path / "checkout"
+        subprocess.run([git, "init", "--quiet", str(checkout)], check=True, capture_output=True, timeout=30)
+        basetemp = checkout / "basetemp"
+        basetemp.mkdir()
+        pinned = tmp_path / "other_ws"
+        (pinned / ".aegis" / "rules").mkdir(parents=True)
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(basetemp))
+
+        try:
+            root = resolve_cli_root(pin=str(pinned), cwd=basetemp)
+        except WorkspaceHold as refusal:
+            root = refusal.binding.reason
+
+        assert root == pinned.resolve()
+
+    @pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+    @pytest.mark.parametrize("git_answer", ["malformed-config", "query-failure", "off-path", "unresolvable"])
+    @pytest.mark.parametrize("outer_workspace", [True, False], ids=["outer-workspace", "no-outer-workspace"])
+    def test_unusable_explicit_git_layout_keeps_inner_marker(
+        self, tmp_path, monkeypatch, layout_variable, git_answer, outer_workspace
+    ):
+        import shutil
+        import subprocess
+        import aegis_core
+        from aegis_core import gitsafe
+        from aegis_core.workspace.binding import WorkspaceHold, bounded_walk_up, git_boundary, resolve_cli_root
+
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git is not available")
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+            monkeypatch.delenv(name, raising=False)
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        start = inner / "src"
+        start.mkdir(parents=True)
+        subprocess.run([git, "init", "--quiet", str(inner)], check=True, capture_output=True, timeout=30)
+        if outer_workspace:
+            (outer / ".aegis" / "rules").mkdir(parents=True)
+        pinned = tmp_path / "other_ws"
+        (pinned / ".aegis" / "rules").mkdir(parents=True)
+        off_path = tmp_path / "off-path"
+        off_path.mkdir()
+        subprocess.run([git, "-C", str(inner), "config", "core.worktree", str(off_path.resolve())],
+                       check=True, capture_output=True, timeout=30)
+        value = inner / ".git" if layout_variable == "GIT_DIR" else off_path
+        monkeypatch.setenv(layout_variable, str(value))
+
+        if git_answer == "malformed-config":
+            (inner / ".git" / "config").write_text("[invalid\n", encoding="utf-8")
+            assert gitsafe.toplevel(start) is None
+        elif git_answer == "off-path":
+            assert gitsafe.toplevel(start) == off_path.resolve()
+        else:
+            class UnresolvablePath(type(Path())):
+                def resolve(self, *args, **kwargs):
+                    raise OSError("Git top cannot be resolved")
+
+            reported = UnresolvablePath(off_path) if git_answer == "unresolvable" else None
+            git_api = SimpleNamespace(**vars(gitsafe))
+            git_api.toplevel = lambda cwd: reported
+            monkeypatch.setattr(aegis_core, "gitsafe", git_api)
+
+        assert git_boundary(start) == inner.resolve()
+        assert bounded_walk_up(start) is None
+        assert resolve_cli_root(cwd=start) == start.resolve()
+        with pytest.raises(WorkspaceHold) as refusal:
+            resolve_cli_root(pin=str(pinned), cwd=start)
+        assert refusal.value.binding.reason == "pin_conflicts_with_cwd"
+        assert dict(refusal.value.binding.details)["cwd_root"] == str(inner.resolve())
+
+    @pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+    @pytest.mark.parametrize("git_answer", ["query-failure", "off-path", "unresolvable"])
+    @pytest.mark.parametrize("outer_workspace", [True, False], ids=["outer-workspace", "no-outer-workspace"])
+    def test_unusable_explicit_git_layout_without_marker_stops_at_start(
+        self, tmp_path, monkeypatch, layout_variable, git_answer, outer_workspace
+    ):
+        import aegis_core
+        from aegis_core import gitsafe
+        from aegis_core.workspace.binding import WorkspaceHold, bounded_walk_up, git_boundary, resolve_cli_root
+
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+            monkeypatch.delenv(name, raising=False)
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        start = inner / "src"
+        start.mkdir(parents=True)
+        if outer_workspace:
+            (outer / ".aegis" / "rules").mkdir(parents=True)
+        pinned = tmp_path / "other_ws"
+        (pinned / ".aegis" / "rules").mkdir(parents=True)
+        off_path = tmp_path / "off-path"
+        off_path.mkdir()
+        value = inner / ".git" if layout_variable == "GIT_DIR" else off_path
+        monkeypatch.setenv(layout_variable, str(value))
+
+        class UnresolvablePath(type(Path())):
+            def resolve(self, *args, **kwargs):
+                raise OSError("Git top cannot be resolved")
+
+        reported = {"query-failure": None, "off-path": off_path, "unresolvable": UnresolvablePath(off_path)}[git_answer]
+        git_api = SimpleNamespace(**vars(gitsafe))
+        git_api.toplevel = lambda cwd: reported
+        monkeypatch.setattr(aegis_core, "gitsafe", git_api)
+
+        assert git_boundary(start) == start.resolve()
+        assert bounded_walk_up(start) is None
+        assert resolve_cli_root(cwd=start) == start.resolve()
+        with pytest.raises(WorkspaceHold) as refusal:
+            resolve_cli_root(pin=str(pinned), cwd=start)
+        assert refusal.value.binding.reason == "pin_conflicts_with_cwd"
+        assert dict(refusal.value.binding.details)["cwd_root"] == str(start.resolve())
 
     def test_returns_tool_evidence(self, tmp_path):
         """check() must return a passing ToolEvidence for a well-tested function."""

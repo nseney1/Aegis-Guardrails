@@ -8395,3 +8395,37 @@ def test_latch_r3_open_attachment_refusal_names_its_message(tmp_path, damage):
     assert row['detail'] == 'authoritative brief attachment is unverified', row
     assert str(packet) not in json.dumps(row), row
     assert snapshot_v1_unchanged(world) == before
+
+
+@pytest.mark.parametrize("failure", ["none", "enter", "exit"])
+def test_mutating_projection_appends_once_when_writer_lock_fails(tmp_path, failure):
+    world = DispatchWorld(tmp_path)
+    injection = r'''
+from contextlib import contextmanager
+import hierarchy_small_change_dispatch as dispatch
+original = dispatch.writer_lock
+seen.update(entered=False, exited=False)
+@contextmanager
+def writer_lock(root):
+    if FAILURE == 'enter':
+        raise OSError('fixture writer lock enter refused')
+    with original(root):
+        seen['entered'] = True
+        yield
+    seen['exited'] = True
+    if FAILURE == 'exit':
+        raise OSError('fixture writer lock exit refused')
+dispatch.writer_lock = writer_lock
+'''.replace('FAILURE', repr(failure))
+    answer, seen = r7_router_probe(world, injection)
+    assert len(answer['small_changes']) == 1, answer
+    row = answer['small_changes'][0]
+    assert seen == {'entered': failure != 'enter', 'exited': failure != 'enter'}
+    assert len(world.messages('dispatch')) == (0 if failure == 'enter' else 1)
+    if failure == 'none':
+        assert row['writer_publication_verified'] is True, row
+        assert row['route_receipt'], row
+    else:
+        assert row['state'] == 'held' and row['reason'] == 'small_change_configuration', row
+        assert row['detail'] == 'fixture writer lock %s refused' % failure, row
+        assert 'writer_publication_verified' not in row and 'route_receipt' not in row, row
