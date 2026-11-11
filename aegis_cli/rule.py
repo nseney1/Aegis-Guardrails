@@ -811,6 +811,37 @@ def _default_proposal_id(insight_ids: Sequence[str]) -> str:
     return "trap-" + hashlib.sha256("\n".join(sorted(set(insight_ids))).encode("utf-8")).hexdigest()[:8]
 
 
+_INSIGHT_APPROVAL_ACTIONS = {
+    "invalid_input": ("Provide a non-empty approval commit id and insight text.", False),
+    "unresolved": ("Check the approval commit argument and base reference.", False),
+    "unverifiable": ("Check Git and SSH signature verification, then retry verification.", False),
+    "no_allowed_signers": ("Add the signer to the base branch's allowed_signers.", False),
+    "untrusted_signature": ("Sign the approval with a key trusted by the base branch.", False),
+    "bad_signature": ("Configure a trusted SSH signing key, then create a new approval.", False),
+    "unsigned": ("Sign the approval commit with a trusted key.", True),
+    "no_trailer": ("Create an approval with the exact Aegis-Approve-Insight trailer shown below.", True),
+    "hash_mismatch": ("Create an approval for the exact insight text using the trailer shown below.", True),
+    "message_too_large": ("Create a shorter approval message using the trailer shown below.", True),
+    "message_line_too_long": ("Create an approval message with shorter lines using the trailer shown below.", True),
+    "multiple_trailers": ("Create an approval with exactly one Aegis-Approve-Insight trailer.", True),
+    "invalid_message_shape": ("Create an approval whose signed trailer value occupies one printable line.", True),
+    "accept_reserved": ("Remove the reserved Aegis-Accept line from the approval message.", True),
+}
+
+
+def _insight_recipe_applies(row: Dict[str, Any]) -> bool:
+    code = row.get("approval_code")
+    return row["level"] != "H" and (not code or _INSIGHT_APPROVAL_ACTIONS.get(code, ("", False))[1])
+
+
+def _print_added_insight(row: Dict[str, Any]) -> None:
+    print(f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
+    if row.get("approval_code"):
+        code = row["approval_code"] if row["approval_code"] in _INSIGHT_APPROVAL_ACTIONS else "unverifiable"
+        print(f"Approval refused: {code}")
+        print(_INSIGHT_APPROVAL_ACTIONS[code][0])
+
+
 def _run_insight(args: argparse.Namespace) -> int:
     from aegis_core.insights import (
         add_insight, measure_recurrence, record_decision, review_insights, write_proposal,
@@ -852,8 +883,8 @@ def _run_insight(args: argparse.Namespace) -> int:
         if use_json:
             print(json.dumps({**row, "approval_trailer": trailer}, indent=2))
         else:
-            print(f"Recorded insight {row['id']} (level={row['level']}, psrc={row['psrc']})")
-            if row["level"] != "H":
+            _print_added_insight(row)
+            if _insight_recipe_applies(row):
                 print(f'To record it at level H, run this command, then re-run with --commit SHA:\n  git -c core.hooksPath={os.devnull} commit -S --allow-empty --only -m "chore: approve insight" -m "{trailer}"')
         return 0
 

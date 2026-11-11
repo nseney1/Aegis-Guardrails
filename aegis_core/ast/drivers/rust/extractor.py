@@ -53,6 +53,7 @@ class Extractor:
         self.skip, self.imports, self.definitions, self.calls = set(), [], [], []
         self.groups, self.attributes, self.scopes = {}, {}, {}
         self.decorators, self.tests, self.local = [], [], set()
+        self.decorator_names = set()
         self.opaque, self.control_blocks, self.import_sources, self.matches = {}, set(), set(), set()
         self.test_module, self.import_bindings = False, set()
         self.generic_punct = set()
@@ -196,7 +197,8 @@ class Extractor:
                         error('invalid attribute', self.t[i].line)
                     self.attributes[i] = (end, name, self.text(opening + 1, end))
                     self.skip.update(range(i, end + 1))
-                    if name and name not in self.decorators:
+                    if name and name not in self.decorator_names:
+                        self.decorator_names.add(name)
                         self.decorators.append(name)
                     i = end
             elif value == 'use' and not self.t[i].raw:
