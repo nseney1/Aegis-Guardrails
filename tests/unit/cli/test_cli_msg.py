@@ -61,6 +61,10 @@ def assert_error(output, code, detail=None):
         "workspace": "workspace is not initialized; run aegis init",
         "binding": "workspace binding refused; check --workspace / AEGIS_WORKSPACE",
         "root": "workspace root refused; choose a project directory",
+        "pin_not_a_workspace": (
+            "pinned directory is not an Aegis workspace; run aegis init in that directory "
+            "(aegis init --pin also pins the hosts)"
+        ),
         "attachment": "workspace attachment unavailable; check permissions",
         "input": "input file unreadable",
         "write_ref": "write reference must be a full 64-hex id present in the target store",
@@ -559,6 +563,67 @@ def test_msg_denied_workspace_has_distinct_fixed_error(target, workspace, tmp_pa
     path = home if target == "home" else Path(workspace.anchor)
     assert main(["--workspace", str(path), "msg", "verify", "a" * 64]) == 2
     assert_error(capsys.readouterr(), "E_AUTH", "root")
+
+
+@pytest.mark.parametrize("action", ["read", "verify", "write"])
+@pytest.mark.parametrize("pin_state", ["uninitialized", "missing", "file", "home", "root"])
+def test_msg_pin_refusals_have_fixed_guidance(action, pin_state, workspace, tmp_path, monkeypatch, capsys):
+    pin = tmp_path / "HOSTILE_MARKER-sk-private-customer"
+    if pin_state == "uninitialized":
+        pin.mkdir()
+    elif pin_state == "file":
+        pin.write_bytes(b"unchanged")
+    elif pin_state == "home":
+        pin.mkdir()
+        monkeypatch.setenv("HOME", str(pin))
+        monkeypatch.setenv("USERPROFILE", str(pin))
+    elif pin_state == "root":
+        pin = Path(workspace.anchor)
+    monkeypatch.setenv("AEGIS_WORKSPACE", str(pin))
+    monkeypatch.setattr(sys, "stdin", None)  # Refuse before reading write input.
+    argv = (["write", "--kind", "text", "--in", "-"] if action == "write"
+            else [action, "a" * 64])
+    assert main(["msg", *argv]) == 2
+    output = capsys.readouterr()
+    assert_error(output, "E_AUTH", "pin_not_a_workspace" if pin_state == "uninitialized" else "root")
+    assert "HOSTILE_MARKER" not in output.out + output.err
+    assert "sk-private-customer" not in output.out + output.err
+    assert not (workspace / ".aegis" / "state").exists()
+    if pin_state in ("uninitialized", "home"):
+        assert list(pin.iterdir()) == []
+    elif pin_state == "missing":
+        assert not pin.exists()
+    elif pin_state == "file":
+        assert pin.read_bytes() == b"unchanged"
+
+
+def test_msg_pin_diagnostic_failure_preserves_fixed_refusal(workspace, tmp_path, monkeypatch, capsys):
+    from aegis_core.workspace import binding
+
+    pin = tmp_path / "HOSTILE_MARKER"
+    pin.mkdir()
+    monkeypatch.setenv("AEGIS_WORKSPACE", str(pin))
+
+    def unavailable(**kwargs):
+        raise OSError("HOSTILE_MARKER")
+
+    monkeypatch.setattr(binding, "resolve_binding", unavailable)
+    assert main(["msg", "read", "a" * 64]) == 2
+    output = capsys.readouterr()
+    assert_error(output, "E_AUTH", "root")
+    assert "HOSTILE_MARKER" not in output.out + output.err
+    assert list(pin.iterdir()) == []
+
+
+def test_msg_invalid_explicit_path_keeps_refusal_with_uninitialized_pin(workspace, tmp_path, monkeypatch, capsys):
+    pin = tmp_path / "HOSTILE_MARKER"
+    pin.mkdir()
+    monkeypatch.setenv("AEGIS_WORKSPACE", str(pin))
+    assert main(["--workspace", "HOSTILE_MARKER\x00", "msg", "read", "a" * 64]) == 2
+    output = capsys.readouterr()
+    assert_error(output, "E_AUTH", "root")
+    assert "HOSTILE_MARKER" not in output.out + output.err
+    assert list(pin.iterdir()) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
