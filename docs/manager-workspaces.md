@@ -32,15 +32,24 @@ AEGIS_MANAGER_BIN=/absolute/source-pinned-venv/bin/aegis
 
 `init` creates a draft external configuration and initial audit record, then prints
 a separately named `aegis-manager` registration proposal. It installs no host
-registration and activates no policy. It refuses ordinary repository locations
-for config/signers and implementation worktrees for audit storage, as discovered
-under the operator's trusted Git environment. An operator-set
-`GIT_CEILING_DIRECTORIES` inside a worktree can admit an audit store below that
-ceiling: discovery from the store no longer reaches the enclosing worktree.
-This does not isolate the store from commands started at the worktree root;
-`git clean -fdx` from that root can still reach and delete it. Prefer an external
-store when it must be protected from worktree cleanup. Explicitly forbidden
-worktree roots remain refused regardless of the ceiling. The control
+registration and activates no policy. Configuration, signer and audit-store
+placement strictly resolves the longest existing path prefix and checks every
+physical ancestor for a `.git` entry, regardless of `GIT_CEILING_DIRECTORIES`.
+Only a genuinely missing suffix may remain unresolved; the resolver refuses `.`
+and `..` components before inspecting the existing prefix. Every component uses
+`part.split(":")[0].rstrip(". ").casefold()`; a result of `.git` is reserved even
+before creation, including trailing-dot/space and NTFS stream spellings on all
+platforms. Resolution or marker-inspection errors refuse with `unsafe_store` for
+an audit path or `unsafe_config` for a config/signer path. The affected path is
+diagnostic error data and is never echoed in the fixed refusal text. Config and
+signer worktree refusals are `config_in_repository` and `trust_root_in_repository`,
+respectively. Benign directory aliases are resolved to their physical locations;
+the store's direct descriptor opens still refuse symlinks. Windows execution,
+including existing short-name resolution, is checked in the end-of-build platform
+pass. Stores must be outside worktrees so that worktree cleanup cannot delete the
+audit history. Workspace
+discovery still respects the operator's ceiling. Explicitly forbidden worktree
+roots remain refused as well. The control
 repository is a distinct local Git repository; it must remain private if published.
 The workspace parent needs neither `.git` nor an ordinary `.aegis/` directory.
 

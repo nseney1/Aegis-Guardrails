@@ -38,6 +38,7 @@ __all__ = [
     "resolve_driver_executable",
     "split_driver_command",
     "enforce_source_size",
+    "source_limit_from_error",
 ]
 
 _PYTHON_NAMES = frozenset({"{python}", "python3", "python", "python.exe", "python3.exe"})
@@ -50,7 +51,24 @@ SOURCE_LIMIT_BYTES = 2 * 1024 * 1024
 def enforce_source_size(file_path: Path | str) -> None:
     """Apply the byte-size policy after the caller confines the source path."""
     if Path(file_path).stat().st_size > SOURCE_LIMIT_BYTES:
-        raise ASTDriverError('source exceeds 2 MiB', reason='too_large')
+        raise ASTDriverError(f'source exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB', reason='too_large', limit_bytes=SOURCE_LIMIT_BYTES)
+
+
+def source_limit_from_error(exc: BaseException) -> Optional[int]:
+    """Read the refusing producer's byte limit through typed extraction wrappers.
+
+    Missing provenance stays unknown: a current configuration value cannot tell
+    which of the independent producer limits refused an earlier parse.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, ASTDriverError) and getattr(exc, 'reason', None) == 'too_large':
+            limit = getattr(exc, 'limit_bytes', None)
+            if type(limit) is int and limit > 0:
+                return limit
+        exc = exc.__cause__
+    return None
 
 
 def _is_python_name(name: str) -> bool:
@@ -488,7 +506,7 @@ class ASTDriverRunner:
             with target_path.open('rb') as stream:
                 data = stream.read(SOURCE_LIMIT_BYTES + 1)
             if len(data) > SOURCE_LIMIT_BYTES:
-                raise ASTDriverError('native source exceeds 2 MiB', reason='too_large')
+                raise ASTDriverError(f'native source exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB', reason='too_large', limit_bytes=SOURCE_LIMIT_BYTES)
             try:
                 source = data.decode('utf-8')
             except UnicodeError as exc:
