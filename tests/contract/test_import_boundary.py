@@ -53,6 +53,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.hosts": 0,
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
+    # STORE-API-1: the confined read/publish boundary storage.confined_file delegates to (stdlib only).
+    "aegis_core.storage_confined": 0,
     "aegis_core.storage_shared": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.atomicio": 0,
