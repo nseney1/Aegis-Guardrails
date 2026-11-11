@@ -22,6 +22,176 @@ import hierarchy_team  # noqa: E402
 
 
 SESSION = "4f1c2b9e-8d7a-4c3b-9a1e-2f6d5c4b3a21"
+
+
+@pytest.mark.parametrize("arguments,verdict", [
+    (["--session-id", SESSION, "--fork-session", "--resume", "/owned/source.jsonl"], "OWNED"),
+    (["--fork-session", "--resume", "/owned/source.jsonl", "--session-id", SESSION], "OWNED"),
+    (["--resume", "/owned/source.jsonl", "--fork-session", "--session-id", SESSION], "OWNED"),
+    (["--resume=/owned/source.jsonl", "--session-id=" + SESSION, "--fork-session"], "OWNED"),
+    (["--session-id", SESSION, "--fork-session", "--continue"], "OWNED"),
+    (["--fork-session", "-c", "--session-id", SESSION], "OWNED"),
+    (["--resume", SESSION, "--fork-session"], "NOT_OWNED"),
+    (["--fork-session", "--resume", SESSION], "NOT_OWNED"),
+    (["--session-id", "00000000-0000-0000-0000-000000000001", "--fork-session", "--resume", SESSION], "NOT_OWNED"),
+    (["--session-id", SESSION, "--session-id", "00000000-0000-0000-0000-000000000001", "--fork-session"], "HOLD"),
+    (["--session-id", SESSION, "--fork-session", "--resume"], "HOLD"),
+    (["--session-id", SESSION, "--fork-session", "--unlisted", "value"], "HOLD"),
+])
+def test_r23_fork_selects_the_explicit_session_id(arguments, verdict):
+    assert hierarchy_hosts.session_verdict("claude-code", ["claude", *arguments], SESSION) == verdict
+    assert not hierarchy_hosts.matches_session("claude-code", ["claude", *arguments], SESSION, "unproven")
+
+
+def test_r23_unrelated_discovery_never_runs_the_host_grammar(monkeypatch):
+    parsing, calls = hierarchy_hosts.session_verdict, []
+    def parsed(*args, **kwargs):
+        calls.append(args)
+        return parsing(*args, **kwargs)
+    monkeypatch.setattr(hierarchy_hosts, "session_verdict", parsed)
+    for index in range(100):
+        assert not hierarchy_hosts.names_session(["python3", "worker-%d.py" % index], SESSION)
+    assert calls == []
+
+
+def test_r23_ownership_parsing_never_copies_the_host_registry(monkeypatch):
+    copying, calls = hierarchy_hosts.entry, []
+    def copied(*args, **kwargs):
+        calls.append(args)
+        return copying(*args, **kwargs)
+    monkeypatch.setattr(hierarchy_hosts, "entry", copied)
+    assert hierarchy_hosts.matches_session("claude-code", ["claude", "--resume", SESSION], SESSION)
+    assert hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", SESSION], SESSION)
+    assert hierarchy_hosts.names_session(["claude", "--resume=modelled legacy session"], "modelled legacy session")
+    assert not hierarchy_hosts.names_session(["python3", "--config=modelled legacy session"], "modelled legacy session")
+    assert calls == []
+
+
+def test_r23_unsupported_mailbox_inspection_refuses_before_io(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "mailbox_wake_inspection_capable", lambda: False)
+    with pytest.raises(ValueError, match="^mailbox wake inspection unsupported on this platform; "
+                       "preserve the worktree and reconcile the marker manually$"):
+        hierarchy_launcher.mailbox_wake_pending(SimpleNamespace(root=tmp_path), "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r23_unsupported_admission_publication_refuses_before_io(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False)
+    with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
+        hierarchy_launcher.publish_wake_record(SimpleNamespace(base=tmp_path), "pilot/lane/review", {})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r22_unsupported_running_publication_refuses_before_effects(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False, raising=False)
+    launches = SimpleNamespace(base=tmp_path, folder=lambda endpoint: tmp_path / "launches" / endpoint.replace("/", "%2F"))
+    known = dict(host="codex-cli", session=SESSION, generation=1)
+    with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
+        hierarchy_launcher.write_running_wake(launches, "pilot/lane/review", known, "wake-" + "a" * 32, 123)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r20_unsupported_launch_descriptors_refuse_without_creating_files(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    # Only this module's OS boundary is modelled. No POSIX flags, symlinks or dir_fd are required by the test.
+    monkeypatch.setattr(hierarchy_launcher, "os", SimpleNamespace(name="nt"))
+    with pytest.raises(ValueError, match="^launch record descriptors unsupported on this platform$"):
+        hierarchy_launcher.launch_record_paths(tmp_path, "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r20_descriptor_probe_can_refuse_a_missing_os_capability(tmp_path, monkeypatch):
+    monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    with pytest.raises(ValueError, match="^launch record descriptors unsupported on this platform$"):
+        hierarchy_launcher.launch_record_paths(tmp_path, "pilot/lane/review")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_r21_public_status_reads_without_descriptors(tmp_path, monkeypatch, capsys, historical):
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    manifest = {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {
+        "pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/lane/review": {"kind": "reviewer"}},
+        "counterparts": [], "writer_limit": 1}
+    (mailbox / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (tmp_path / "provision.json").write_text(json.dumps({"mailbox_root": str(mailbox)}), encoding="utf-8")
+    record = {"schema": hierarchy_launcher.SCHEMA, "action": "resume", "state": "resumed"}
+    if historical:
+        folder = tmp_path / "launches" / "pilot%2Flane%2Freview"
+        folder.mkdir(parents=True)
+        (folder / "old.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    assert hierarchy_launcher.main(["--base", str(tmp_path), "status", "--endpoint", "pilot/lane/review"]) == 0
+    assert json.loads(capsys.readouterr().out)["endpoints"]["pilot/lane/review"] == {
+        "binding": None, "last": record if historical else None, "records": int(historical)}
+    assert (tmp_path / "launches").exists() == historical and not (mailbox / "bindings").exists()
+
+
+@pytest.mark.parametrize("portable", [False, True])
+@pytest.mark.parametrize("bad", ["directory", "symlink", "fifo", "limit", "json", "oversize"])
+def test_r21_status_contains_bad_history_to_one_endpoint(tmp_path, monkeypatch, capsys, portable, bad):
+    from tests.conftest import symlink_or_skip
+
+    if not portable and not hierarchy_launcher.launch_descriptor_capable():
+        pytest.skip("launch descriptors unavailable")
+    if bad == "fifo" and os.name != "posix":
+        pytest.skip("FIFOs require POSIX")
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    names = ["pilot/lane/review", "pilot/orchestrator"]
+    (mailbox / "manifest.json").write_text(json.dumps({"schema": "aegis.hierarchy-pilot/v1",
+        "endpoints": {"pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/lane/review": {"kind": "reviewer"}},
+        "counterparts": [], "writer_limit": 1}), encoding="utf-8")
+    (tmp_path / "provision.json").write_text(json.dumps({"mailbox_root": str(mailbox)}), encoding="utf-8")
+    folders = [tmp_path / "launches" / name.replace("/", "%2F") for name in names]
+    record = {"state": "resumed"}
+    for folder in folders:
+        folder.mkdir(parents=True)
+        (folder / "old.json").write_text(json.dumps(record), encoding="utf-8")
+    path = folders[0] / "z-bad.json"
+    if bad == "directory":
+        path.mkdir()
+    elif bad == "symlink":
+        symlink_or_skip(folders[1] / "old.json", path)
+    elif bad == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_text("x" * 262145 if bad == "oversize" else "{" if bad == "json" else "{}", encoding="utf-8")
+    if bad == "limit":
+        monkeypatch.setattr(hierarchy_launcher, "MAX_RECORDS", 1)
+    if portable:
+        monkeypatch.setattr(hierarchy_launcher, "launch_descriptor_capable", lambda: False)
+    assert hierarchy_launcher.main(["--base", str(tmp_path), "status"]) == 0
+    rows = json.loads(capsys.readouterr().out)["endpoints"]
+    assert set(rows) == set(names)
+    assert rows[names[0]]["state"] == "unknown" and rows[names[0]]["error"]
+    assert rows[names[0]]["last"] is None
+    assert rows[names[1]] == {"binding": None, "last": record, "records": 1}
+
+
+@pytest.mark.parametrize("size", [b"1048577\n", b"untrusted-size\n"])
+def test_r21_wake_source_limit_precedes_loading(tmp_path, monkeypatch, size):
+    from types import SimpleNamespace
+
+    calls = []
+    def git(source, *arguments):
+        calls.append(arguments)
+        assert arguments[:2] == ("cat-file", "-s"), "the oversized source body must never be read"
+        return size
+    monkeypatch.setattr(hierarchy_launcher, "hierarchy_runtime_source", SimpleNamespace(git=git))
+    launches = SimpleNamespace(setup={"source": str(tmp_path), "source_commit": "a" * 40})
+    with pytest.raises(ValueError, match="^invalid or oversized wake source$"):
+        hierarchy_launcher.load_wake(launches)
+    assert len(calls) == 1
+
+
 NODE_ARITIES = {"--loader": 1, "--experimental-loader": 1, "--import": 1, "-r": 1, "--require": 1,
                 "--env-file": 1, "--conditions": 1, "-C": 1, "--title": 1, "--input-type": 1,
                 "--no-warnings": 0, "--trace-warnings": 0}
@@ -208,6 +378,28 @@ def test_session_uuid_shape_distinguishes_ids_from_prompt_words(value, expected)
 def test_unproven_selector_still_accepts_its_bound_legacy_session_id():
     session = "modelled-legacy-session"
     assert not hierarchy_hosts.matches_session("codex-cli", ["codex", "exec", "resume", session], session, "unproven")
+
+
+@pytest.mark.parametrize("argv,verdict", [
+    (["python3", "tools/hierarchy_mailbox.py", "--after", "<T>"], "CLEAR"),
+    (["job.py", "--run", "<T>"], "CLEAR"),
+    (["claude", "--resume", "<T>"], "OTHER"),
+    (["codex", "exec", "resume", "<T>"], "OTHER"),
+    (["claude", "--resume", "--print", "<T>"], "HOLD"),
+    (["claude", "-r<T>", "-p", "wait"], "HOLD"),
+])
+def test_r20_only_parsed_other_host_selectors_spare_a_subtree(argv, verdict):
+    other = "00000000-0000-0000-0000-000000000001"
+    argv = [word.replace("<T>", other) for word in argv]
+    assert hierarchy_hosts.descendant_verdict(argv, SESSION) == verdict
+
+
+@pytest.mark.parametrize("spelling", ["--resume", "--session-id"])
+def test_r20_discovery_preserves_whole_equals_selector_values(spelling):
+    session = "modelled legacy session"
+    argv = ["claude", spelling + "=" + session]
+    assert hierarchy_hosts.matches_session("claude-code", argv, session)
+    assert hierarchy_hosts.names_session(argv, session)
 
 
 @pytest.mark.parametrize("evidence", ["proven", "unproven"])
@@ -893,3 +1085,10 @@ def test_r2_all_claude_builder_optional_combinations_preserve_opaque_atoms():
 ])
 def test_r2_unknown_host_or_node_options_cannot_establish_ownership(kind, argv):
     assert not hierarchy_hosts.matches_session(kind, argv, SESSION)
+
+
+@pytest.mark.parametrize("family", [None, "", "unknown", "codex-with-empty-options"])
+def test_r13_unknown_grammar_family_refuses(monkeypatch, family):
+    grammar = hierarchy_hosts._HOSTS["claude-code"]["session_selectors"]["grammar"]
+    monkeypatch.setitem(grammar, "family", family)
+    assert hierarchy_hosts.session_verdict("claude-code", ["claude", "--resume", SESSION], SESSION) == "HOLD"

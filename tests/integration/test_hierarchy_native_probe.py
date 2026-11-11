@@ -60,6 +60,9 @@ def git(cwd, *words):
     return done.stdout
 
 
+MODELLED_PROBE_HANDSHAKE_SECONDS = 30.0
+
+
 def modelled_json(path, value):
     """Private fixture control files are atomic, owned, and never follow a linked path."""
     path = Path(path)
@@ -138,7 +141,7 @@ hello = {"nonce": config["nonce"], "slot": config["slot"], "event": "hello", "pi
 raw = (json.dumps(hello) + "\n").encode()
 if os.write(config["report_write"], raw) != len(raw):
     raise RuntimeError("modelled probe: incomplete bootstrap hello")
-deadline = time.monotonic() + 3
+deadline = time.monotonic() + __MODELLED_HANDSHAKE_SECONDS__
 gate = folder / (config["slot"] + ".body")
 while not gate.exists():
     if time.monotonic() >= deadline:
@@ -181,7 +184,7 @@ class ModelledProbeProcesses:
     native wait reports, raw command lines, UIDs, parents, process groups, pidfds and signals stay physical.
     The file channel avoids any AF_UNIX dependency. It is private test plumbing, not a product provider.
     """
-    LIMIT = 3.0
+    LIMIT = MODELLED_PROBE_HANDSHAKE_SECONDS
     MAX_ACTORS = 128
 
     def __init__(self, folder, catalog=()):
@@ -196,7 +199,8 @@ class ModelledProbeProcesses:
         with self.bootstrap.open("x", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(MODELLED_PROBE_BOOTSTRAP.replace("__TRUSTED_ROOT__", repr(str(ROOT))).replace(
-                "__GIT_CATALOG__", inspect.getsource(reviewed_git)))
+                "__GIT_CATALOG__", inspect.getsource(reviewed_git)).replace(
+                "__MODELLED_HANDSHAKE_SECONDS__", repr(MODELLED_PROBE_HANDSHAKE_SECONDS)))
         self.requests = self.folder / "requests"
         self.requests.mkdir(mode=0o700)
         self.physical = R2Custody(self.folder / "physical", self.folder / "UNKNOWN.json")
@@ -424,7 +428,7 @@ class ModelledProbeClient:
                             "pid": os.getpid(), "birth": self.birth, "id": identifier,
                             "operation": operation, **values})
         reply = path.with_suffix(".reply")
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
         while not reply.exists():
             if time.monotonic() >= deadline:
                 raise RuntimeError("modelled probe: bounded " + operation + " response failed")
@@ -444,7 +448,7 @@ class ModelledProbeClient:
                 continue
             if row["argv"] is None:
                 self.neutral.setdefault(pid, row)
-            elif self.view is not None:
+            if self.view is not None:
                 self.view.receipts.setdefault(pid, row)
         return fresh
 
@@ -455,7 +459,7 @@ class ModelledProbeClient:
         if self.view is None:
             self.view = R2Processes.load(self.config["receipt"], self.config["receipt_nonce"])
             self.view.receipts = {pid: row for pid, row in self.view.receipts.items()
-                                  if row["state"] == "READY" and row["argv"] is not None}
+                                  if row["state"] == "READY"}
             positive_authorize = self.view.authorize
 
             def authorize(pid):
@@ -471,13 +475,26 @@ class ModelledProbeClient:
             self.view.authorize = authorize
             # Neutral actors never have their argv projected: even their empty exit observation is physical.
             # New positive receipts are added once; existing evidence is never refreshed or replaced.
-            self.view.before_read.append(lambda pid, count: self.refresh())
             self.refresh()
             self.projected_module = launcher_module(self.view)
+            physical_path = self.projected_module.Path
+            client = self
+
+            class CapturedCensusPath(type(physical_path())):
+                def iterdir(path):
+                    if str(path) == "/proc":
+                        # Transport once before each census, including newly captured children. The
+                        # reader still checks every actual birth/UID/argv and each signal independently.
+                        client.refresh()
+                    yield from physical_path(path).iterdir()
+
+            self.projected_module.Path = CapturedCensusPath
         return self.projected_module
 
     def snapshot(self, action):
-        return action(self.reader())
+        reader = self.reader()
+        self.refresh()  # Observe and transport new captures before enumerating the declared cohort.
+        return action(reader)
 
     def popen(self, argv, *args, **options):
         from tests.integration.hierarchy_fake_wrapper import python_argv
@@ -516,7 +533,7 @@ class ModelledProbeClient:
         from tests.integration.test_hierarchy_launcher import r2_kernel_process
         birth = r2_kernel_process(process.pid)["birth"]
         self.emit("created", child=child_config["slot"], child_pid=process.pid, child_birth=birth)
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
         captured = Path(self.config["folder"]) / (child_config["slot"] + ".captured")
         while not captured.exists():
             if time.monotonic() >= deadline:
@@ -525,8 +542,24 @@ class ModelledProbeClient:
         if native:
             # Verify in THIS loaded reader before the fake's body may run/exit. This is actual full-raw
             # observation, not a copied verifier fingerprint or authorization to send a signal later.
+            self.refresh()
             self.reader().read_process(process.pid)
-        return ModelledProbeChild(process, self, child_config["slot"], birth)
+        child = ModelledProbeChild(process, self, child_config["slot"], birth)
+        if native:
+            # Popen's logical entry must be ready before the product starts its context deadline.
+            # Capture, test-module imports and gate admission are fixture work, not a host turn.
+            child.await_entry()
+            from tests.integration import hierarchy_fake_codex as fake
+
+            try:
+                finishes = fake.pick_turn(argv[-1]).get("finish_before_stop") is True
+            except fake.ScriptError:
+                finishes = False  # The real fake entry still owns its invalid-script refusal.
+            if finishes:
+                # This scripted case promises actual exit before stop, rather than a SIGTERM mask
+                # which the stop's SIGKILL escalation can bypass while captured helpers import.
+                child.wait(timeout=MODELLED_PROBE_HANDSHAKE_SECONDS)
+        return child
 
     def run(self, argv, input=None, capture_output=False, timeout=None, check=False, **options):
         if self.config["entry"] == "probe":
@@ -567,6 +600,20 @@ class ModelledProbeChild:
             modelled_json(Path(self.client.config["folder"]) / (self.slot + ".body"),
                           {"nonce": self.client.config["nonce"]})
             self.started = True
+
+    def await_entry(self):
+        self.begin()
+        path = Path(self.client.config["folder"]) / (self.slot + ".entry-ready")
+        deadline = time.monotonic() + MODELLED_PROBE_HANDSHAKE_SECONDS
+        while not path.exists():
+            if self.process.poll() is not None:
+                self.report()
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: logical entry handshake failed")
+            time.sleep(0.005)
+        if modelled_read(path) != {"nonce": self.client.config["nonce"]}:
+            raise RuntimeError("modelled probe: logical entry handshake differs")
 
     def report(self):
         from tests.integration.test_hierarchy_launcher import native_wait_fields
@@ -747,6 +794,7 @@ def modelled_probe_entry(arguments):
         module.Runner, module.stop_group = ScopedRunner, stop_group
         return module.main(config["argv"][1:])
     if config["entry"] == "rollout_main":
+        modelled_json(Path(config["folder"]) / (config["slot"] + ".entry-ready"), {"nonce": config["nonce"]})
         return module.rollout_main(config["argv"][1:])
     return module.main()
 
@@ -2261,6 +2309,28 @@ def test_a_folder_above_the_probe_root_swapped_during_the_turn_makes_every_verdi
 
 
 @LINUX_HOST_PROGRAMS
+def test_r22_modelled_probe_keeps_custody_through_a_delayed_bootstrap(probe):
+    probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
+    probe.script_turns(patches=True)
+    scope = ModelledProbeProcesses(probe.tmp / "modelled-processes", probe.constructor_catalog())
+    probe.process_scope = scope
+    original = scope.bootstrap.read_text()
+    marker = "config = read(sys.argv[1])\n"
+    assert original.count(marker) == 1
+    # An owned external child starts slowly before reporting hello. The root stays fast; physical
+    # custody still precedes the child's body gate and no identity/receipt is synthesized.
+    scope.bootstrap.write_text(original.replace(marker, marker +
+        'if config["slot"] == "native-1":\n    time.sleep(4)\n', 1))
+    report = probe.run(cap=4)
+    assert report["summary"]["passed"] is True, report["summary"]
+    assert "native-1" in scope.physical.entries
+    assert (scope.folder / "native-1.captured").is_file()
+    assert modelled_read(scope.folder / "native-1.imports.json") == {"pytest": False}
+    closure = scope.close()
+    assert closure["state"] == "CLOSED" and closure["errors"] == closure["unresolved_slots"] == []
+
+
+@LINUX_HOST_PROGRAMS
 def test_an_untouched_probe_turn_changes_no_folder(probe):
     probe.plan([{"role": "implementer"}], channels=["shell", "apply_patch"])
     probe.script_turns(patches=True)
@@ -2961,15 +3031,19 @@ def test_every_real_login_layout_refusal_is_exact_and_runs_nothing(probe, case, 
     elif case == "tmp-fifo":
         os.mkfifo(sub / "pipe", 0o600)
     elif case == "tmp-socket":
-        # macOS caps an AF_UNIX path at 104 bytes and its pytest folders are deeper than that, so bind the
-        # socket by a name relative to tmp/ instead of its full path.
-        previous = os.getcwd()
-        os.chdir(home / "tmp")
-        try:
-            with socket.socket(socket.AF_UNIX) as server:
-                server.bind("s")
-        finally:
-            os.chdir(previous)
+        if sys.platform.startswith("linux"):
+            # This is a filesystem-type guard, not an IPC test. Linux can create the genuine socket inode
+            # directly; no listening endpoint or network permission is needed (the old server closed here).
+            os.mknod(home / "tmp" / "s", stat.S_IFSOCK | 0o600)
+        else:
+            # Keep the short relative name for platforms with a smaller AF_UNIX address limit.
+            previous = os.getcwd()
+            os.chdir(home / "tmp")
+            try:
+                with socket.socket(socket.AF_UNIX) as server:
+                    server.bind("s")
+            finally:
+                os.chdir(previous)
     elif case == "arg0-link-to-auth":
         (sub / "apply_patch").unlink()
         (sub / "apply_patch").symlink_to(real)
@@ -3562,3 +3636,45 @@ def test_reserved_or_shadowed_catch_binding_cannot_establish_a_probe_refusal(tmp
     commands, patches = native_probe.probe_events(str(rollout), "session", "turn-1")
     assert judged(attempt, commands=commands, patches=patches) == ("INCONCLUSIVE", "INCONCLUSIVE")
     assert len(commands) == 1 and commands[0]["status"] == "unpaired"
+
+
+@LINUX_HOST_PROGRAMS
+@pytest.mark.parametrize("finish_before_stop", [False, True])
+def test_r24_hold_constructor_delivers_its_entry_or_exit_event_before_return(probe, monkeypatch, finish_before_stop):
+    # Passive observation in the captured actors: no test thread or elapsed delay determines the order.
+    observe = r'''
+original_emit = scope["ModelledProbeClient"].emit
+def entered(client, event, **values):
+    original_emit(client, event, **values)
+    if event == "running":
+        scope["modelled_json"](Path(client.config["folder"]) / (client.config["slot"] + ".entered-test"),
+                               {"nonce": client.config["nonce"]})
+scope["ModelledProbeClient"].emit = entered
+original_popen = scope["ModelledProbeClient"].popen
+def returned(client, argv, *args, **options):
+    child = original_popen(client, argv, *args, **options)
+    if client.config["entry"] == "probe" and isinstance(child, scope["ModelledProbeChild"]):
+        from tests.integration.hierarchy_fake_codex import pick_turn, ScriptError
+        try:
+            finished = pick_turn(argv[-1]).get("finish_before_stop") is True
+        except ScriptError:
+            finished = False
+        folder = Path(client.config["folder"])
+        scope["modelled_json"](folder / (child.slot + ".returned-test"),
+            {"entered": (folder / (child.slot + ".entered-test")).is_file(),
+             "exit_code": child.process.poll(), "finish_before_stop": finished})
+    return child
+scope["ModelledProbeClient"].popen = returned
+'''
+    entry = 'sys.exit(scope["modelled_probe_entry"](sys.argv[1:]))'
+    assert MODELLED_PROBE_BOOTSTRAP.count(entry) == 1
+    monkeypatch.setattr(sys.modules[__name__], "MODELLED_PROBE_BOOTSTRAP",
+                        MODELLED_PROBE_BOOTSTRAP.replace(entry, observe + "\n" + entry))
+    probe.plan([{"role": "implementer"}])
+    probe.script_turns(hold={"mode": "", "finish_before_stop": True} if finish_before_stop else {})
+    probe.run(expect=3 if finish_before_stop else 0, cap=4)
+    observations = [modelled_read(path) for path in probe.process_scope.folder.glob("*.returned-test")]
+    assert observations and all(row["entered"] for row in observations)
+    if finish_before_stop:
+        finished = [row for row in observations if row["finish_before_stop"]]
+        assert len(finished) == 1 and finished[0]["exit_code"] == 0

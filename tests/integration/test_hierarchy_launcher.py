@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.integration.hierarchy_fake_wrapper import shell_exec
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
-from tests.integration.test_hierarchy_provision import Setup, provision
+from tests.integration.test_hierarchy_provision import Setup, provision, worker_source_seed
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
@@ -43,11 +43,13 @@ START_HEADER = ("The Aegis launcher started this session for %s as %s. This turn
                 "you; it is your role contract.")
 START_FOOTER = "Reply READY. Act only when woken."
 ROOT_SESSION = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
+# Bounded outer wait for the complete stop operation, including durable checkpoints and grace.
+R2_STOP_TIMEOUT_SECONDS = 60
 
 
 class Launch(Setup):
-    def __init__(self, tmp_path):
-        super().__init__(tmp_path)
+    def __init__(self, tmp_path, *, source_seed=None):
+        super().__init__(tmp_path, source_seed=source_seed)
         self.bin = tmp_path / "fake-bin"
         self.bin.mkdir()
         codex = self.bin / "codex"
@@ -69,17 +71,40 @@ class Launch(Setup):
             raise RuntimeError("R2 fixture: stop runners require physical custody; use the managed runner")
         return [sys.executable, "-I", str(LAUNCHER), "--base", str(self.base), *words]
 
-    def run(self, *words, expect=0, timeout=60, **extra):
+    def run(self, *words, expect=0, timeout=R2_STOP_TIMEOUT_SECONDS, **extra):
         context = getattr(self, "stop_case", None)
         if words and words[0] == "stop" and context is not None:
-            process, _ = context.runner(stop_words=words)
-            out, err = process.communicate(timeout=min(timeout, 5))
+            process, _ = context.runner(stop_words=words, timeout=timeout)
+            out, err = process.communicate(timeout=timeout)
             result = subprocess.CompletedProcess(words, process.returncode, out, err)
         else:
             result = subprocess.run(self.argv(*words), capture_output=True, text=True, timeout=timeout, env=self.env(**extra))
+        if words and words[0] == "resume" and result.returncode != expect:
+            self.report_resume_child_errors()
         assert not result.stderr, result.stderr
         assert result.returncode == expect, result.stdout
         return json.loads(result.stdout)
+
+    def report_resume_child_errors(self):
+        # Keep the original assertions/outcome. A disposable container must not discard the real child's
+        # import error when pytest prints only the launcher's summary. Read only this fixture's own logs.
+        folder = self.base / "delivery" / "wake-logs"
+        if self.tmp not in folder.parents:
+            raise RuntimeError("test wake log folder escapes its owned fixture")
+        current = folder
+        while current != self.tmp:
+            if current.is_symlink():
+                raise RuntimeError("test wake log folder contains a symlink")
+            current = current.parent
+        for path in sorted(folder.rglob("*.stderr"))[:8]:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                raise RuntimeError("test wake log is not an owned regular file")
+            with path.open("rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - 8192))
+                tail = stream.read(8192).decode("utf-8", "replace")
+            print("owned wake child stderr (%s):\n%s" % (path.relative_to(self.tmp), tail), file=sys.stderr)
 
     def start_request(self, **request):
         path = self.tmp / ("start-%s.json" % uuid.uuid4().hex)
@@ -111,16 +136,16 @@ class Launch(Setup):
 
 
 @pytest.fixture
-def launch(tmp_path):
-    built = Launch(tmp_path)
+def launch(tmp_path, tmp_path_factory, request):
+    built = Launch(tmp_path, source_seed=worker_source_seed(tmp_path_factory, request))
     built.init()
     return built
 
 
 @pytest.fixture
-def team(tmp_path):
+def team(tmp_path, tmp_path_factory, request):
     """Every endpoint role the launcher starts, Router and Decider included."""
-    built = Launch(tmp_path)
+    built = Launch(tmp_path, source_seed=worker_source_seed(tmp_path_factory, request))
     provision("init", built.init_request(roles=["router", "decider"]))
     return built
 
@@ -468,6 +493,19 @@ def test_resume_runs_the_wake_with_the_bound_profile_and_records_it(launch):
     assert [row["state"] for row in launch.records()] == ["bound", "resumed"]
 
 
+def test_unexpected_resume_failure_reports_the_owned_wake_child_stderr(launch, capsys):
+    launch.start()
+    launch.publish_to(REVIEW, "for-review")
+    # MODELLED failed launcher, not a running session host. Preserve the actual wake child's exit/stderr.
+    (launch.bin / "codex").write_text("#!/bin/sh\nprintf 'modelled wake import error\\n' >&2\nexit 7\n")
+    with pytest.raises(AssertionError, match="resumed_unread"):
+        launch.run("resume", "--endpoint", REVIEW)
+    captured = capsys.readouterr()
+    assert "owned wake child stderr" in captured.err
+    assert "modelled wake import error" in captured.err
+    assert launch.records()[-1]["wake"]["exit_code"] == 7
+
+
 def test_resume_dry_run_launches_nothing(launch):
     launch.start()
     launch.publish_to(REVIEW, "for-review")
@@ -735,7 +773,7 @@ def test_stop_spares_a_caller_that_names_the_session(launch):
                                stop_words=("stop", "--endpoint", REVIEW, "--grace-seconds", "2"))
     try:
         wait_until(lambda: hung.pid in owned_pids(session, projection=context.projection))
-        out, err = caller.communicate(timeout=5)
+        out, err = caller.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert caller.returncode == 0 and err == "", out + err
         answer, last = out.splitlines()
         assert last == "exit=0"
@@ -747,7 +785,7 @@ def test_stop_spares_a_caller_that_names_the_session(launch):
 
 
 @LINUX_HOST_PROGRAMS
-def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
+def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch, capsys):
     session = launch.start()["session"]
     from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
 
@@ -758,8 +796,9 @@ def test_stop_spares_a_group_whose_leader_does_not_name_the_session(launch):
         wait_until(lambda: len(owned_pids(session, projection=context.projection)) == 1 and len(group(leader.pid)) == 3)
         [named] = census(session, projection=context.projection)
         others = [pid for pid in group(leader.pid) if pid not in (leader.pid, named)]
-        answer = launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "2")
-        assert answer["state"] == "stopped" and answer["pids"] == [named]
+        code, answer = context.stop(context.module(False), capsys, 0)
+        assert code == 3 and answer["state"] == "stop_failed" and answer["pids"] == [named]
+        assert set(answer["unresolved_pids"]) == {leader.pid, *others}
         assert leader.poll() is None and all(alive(pid) for pid in others)
     finally:
         context.close()
@@ -785,16 +824,50 @@ def test_stop_kills_a_session_that_ignores_sigterm_after_the_grace(launch, grace
         context.close()
 
 
-def test_stop_records_a_failed_process_census(launch, monkeypatch, capsys):
+@pytest.mark.parametrize("stage", ["census", "ancestors"])
+def test_stop_records_a_failed_process_census(launch, monkeypatch, capsys, stage):
     launch.start()
     module, is_dir = launcher_module(), Path.is_dir
-    monkeypatch.setattr(module, "ancestors", lambda: set())
+    if stage == "census":
+        monkeypatch.setattr(module, "ancestors", lambda: set())
     monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc" else is_dir(path))
     monkeypatch.setenv("PATH", str(launch.bin))
     assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW]) == 2
     refused = json.loads(capsys.readouterr().out)
     assert refused["error"] == "[Errno 2] No such file or directory: 'ps'" and refused["state"] == "refused"
     assert [row["state"] for row in launch.records()] == ["bound", "refused"]
+
+
+def test_endpoint_namespace_unsupported_probe_refuses_before_opening(tmp_path, monkeypatch):
+    module = launcher_module()
+    opened = []
+    monkeypatch.setattr(module, "launch_descriptor_capable", lambda: False)
+    opening = module.os.open
+    def open_path(*args, **kwargs):
+        opened.append(True)
+        return opening(*args, **kwargs)
+    monkeypatch.setattr(module, "os", R2Facade(module.os, open=open_path))
+    with pytest.raises(ValueError, match="^endpoint namespace descriptors unsupported on this platform$"):
+        with module.stop_endpoint_lock(tmp_path, "pilot/lane/review", create=True):
+            pytest.fail("unsupported endpoint namespace admitted an effect")
+    assert not opened
+
+
+@pytest.mark.parametrize("failure", ["probe", "descriptors"])
+def test_r31_unavailable_pid_namespace_probe_refuses_without_opening(monkeypatch, failure):
+    module = launcher_module()
+    opened = []
+    def forbidden(*args, **kwargs):
+        opened.append(True)
+        raise AssertionError("unavailable namespace must not open a descriptor")
+    if failure == "probe":
+        monkeypatch.setattr(module, "pid_namespace_probe", lambda: None)
+    else:
+        monkeypatch.setattr(module, "launch_descriptor_capable", lambda: False)
+    monkeypatch.setattr(module, "os", R2Facade(module.os, open=forbidden))
+    with pytest.raises(ValueError) as refusal:
+        module.require_pid_namespace()
+    assert str(refusal.value) == module.PID_NAMESPACE_REFUSAL and not opened
 
 
 def launcher_module(projection=None):
@@ -869,8 +942,83 @@ class WitnessedPopen(subprocess.Popen):
             raise RuntimeError("R2 fixture: wait status is not for the original child")
         self.native_wait_evidence = {"wait_pid": pid, "wait_status": status}
         self.returncode = os.waitstatus_to_exitcode(status)
+        self.capture_event("native_wait", pid=pid, status=status)
         self.close_native_handle()
         return self.returncode
+
+    def capture_event(self, event, **details):
+        path = getattr(self, "capture_trace_path", None)
+        if path is not None:
+            events = getattr(self, "capture_events", [])
+            events.append(dict(event=event, at_ns=time.monotonic_ns(), **details))
+            self.capture_events = events
+            path.write_text(json.dumps(events) + "\n")
+
+    def communicate(self, *args, **kwargs):
+        self.capture_event("communicate_enter")
+        try:
+            if hasattr(self, "pipe_capture"):
+                out, err = self.captured_communicate(*args, **kwargs)
+            else:
+                out, err = super().communicate(*args, **kwargs)
+            self.capture_event("communicate_return", stdout_size=len(out or ""), stderr_size=len(err or ""))
+            return out, err
+        except BaseException as exc:
+            self.capture_event("communicate_error", kind=type(exc).__name__)
+            raise
+
+    def start_capture(self):
+        """Drain both runner pipes before staging observations can block their writer. No signal authority."""
+        import threading
+
+        if hasattr(self, "pipe_capture"):
+            raise RuntimeError("R2 fixture: runner capture already started")
+        self.pipe_capture = []
+        for stream in (self.stdout, self.stderr):
+            if stream is None:
+                raise RuntimeError("R2 fixture: runner capture requires both pipes")
+            state = dict(stream=stream, chunks=[], size=0, error=None, done=threading.Event())
+            self.pipe_capture.append(state)
+
+            def drain(state=state):
+                try:
+                    while True:
+                        raw = os.read(state["stream"].fileno(), 65536)
+                        if not raw:
+                            break
+                        state["size"] += len(raw)
+                        if state["size"] <= 16 * 1024 * 1024:
+                            state["chunks"].append(raw)
+                        else:
+                            # Keep draining to avoid pipe deadlock, but never return truncated output as success.
+                            state["error"] = RuntimeError("R2 fixture: runner capture exceeds 16 MiB")
+                except BaseException as exc:
+                    state["error"] = exc
+                finally:
+                    state["done"].set()
+
+            threading.Thread(target=drain, daemon=True).start()
+
+    def captured_communicate(self, input=None, timeout=None):
+        if input is not None:
+            raise RuntimeError("R2 fixture: captured runner has no input protocol")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None or not all(row["done"].is_set() for row in self.pipe_capture):
+            observer = getattr(self, "wait_observer", None)
+            if observer is not None:
+                observer()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout,
+                                                *(b"".join(row["chunks"]) for row in self.pipe_capture))
+            time.sleep(.005)
+        values = []
+        for row in self.pipe_capture:
+            if row["error"] is not None:
+                raise row["error"]
+            raw, stream = b"".join(row["chunks"]), row["stream"]
+            values.append(self._translate_newlines(raw, stream.encoding, stream.errors) if self.text_mode else raw)
+            stream.close()
+        return tuple(values)
 
     def close_native_handle(self):
         if self.native_handle is not None:
@@ -1018,7 +1166,7 @@ class R2Custody:
         return process if process is not None else R2OwnedChild(self, slot)
 
     def launch(self, config, slot, env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, extra=(),
-               argv=None, cwd=None, stdin=subprocess.DEVNULL):
+               argv=None, cwd=None, stdin=subprocess.DEVNULL, new_session=True):
         self.admit_check()
         self.slots[slot]["starting"] = True
         self.slots[slot]["permitted"] = True
@@ -1032,7 +1180,7 @@ class R2Custody:
         try:
             process = WitnessedPopen(command,
                                        env=dict(env), cwd=str(self.folder if cwd is None else cwd), stdin=stdin,
-                                       stdout=stdout, stderr=stderr, text=True, start_new_session=True,
+                                       stdout=stdout, stderr=stderr, text=True, start_new_session=new_session,
                                        pass_fds=tuple(config["inherited"]))
         finally:
             if captured_stderr is not None:
@@ -1347,7 +1495,7 @@ def r2_map_present(observation, transform):
 
 
 class R2Processes:
-    """MODELLED complete argv, real PID/birth/raw/UID/ancestry and actual individual signals.
+    """MODELLED process cohort and complete argv, real identity/ancestry and individual signals.
 
     This fixture is explicit and opt-in. Shared fake wrappers and production CLI/environment stay unchanged.
     Receipts are test inputs, never grants. Only known Popen instances can enter the signal allow-list.
@@ -1359,8 +1507,12 @@ class R2Processes:
         self.path = self.folder / "receipts.json"
         self.nonce = uuid.uuid4().hex
         self.receipts, self.handles, self.events, self.opens = {}, {}, [], []
+        # Negative-only OS cohort, independent of mutable projection receipts. Remembering a PID
+        # never authorizes a signal, and deleting a receipt must not hide its physical actor.
+        self.census_births = {}
         self.before_read, self.after_present, self.after_signal = [], [], []
         self.read_counts = {}
+        self.processes, self.group_reaping = {}, True
         self.save()
 
     def save(self):
@@ -1387,17 +1539,22 @@ class R2Processes:
         made = cls.__new__(cls)
         made.folder, made.path, made.nonce = path.parent, path, nonce
         made.receipts, made.handles, made.events, made.opens = data["receipts"], {}, [], []
+        made.census_births = ({pid: row.get("birth") for pid, row in made.receipts.items() if isinstance(row, dict)}
+                             if isinstance(made.receipts, dict) else {})
         made.before_read, made.after_present, made.after_signal, made.read_counts = [], [], [], {}
+        made.processes, made.group_reaping = {}, True
         return made
 
     def pending(self, process):
         if str(process.pid) in self.receipts:
             raise RuntimeError("R2 fixture: an existing receipt cannot be renewed")
+        self.processes[process.pid] = process
         physical = r2_kernel_process(process.pid)
         if physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid():
             raise RuntimeError("R2 fixture: child is not ours")
         self.receipts[str(process.pid)] = {"state": "PENDING", "birth": physical["birth"],
                                           "digest": None, "argv": None}
+        self.census_births[str(process.pid)] = physical["birth"]
         self.save()
 
     def ready(self, process, argv=None):
@@ -1451,6 +1608,24 @@ class R2Processes:
     def install(self, module):
         self.check_ready()
         reading, real_os, real_signal = module.read_process, module.os, module.signal
+        physical_path = module.Path
+        cohort = self.census_births
+        projection = self
+
+        class CensusPath(type(physical_path())):
+            def iterdir(path):
+                if str(path) == "/proc":
+                    # File/RPC readers can transport new, unchanged READY receipts after install.
+                    # Adding an observation never renews an existing birth or grants signal authority.
+                    for pid, receipt in list(projection.receipts.items()):
+                        cohort.setdefault(pid, receipt.get("birth") if isinstance(receipt, dict) else None)
+                for child in physical_path(path).iterdir():
+                    if str(path) != "/proc" or child.name in cohort:
+                        yield child
+
+        # MODELLED declared process population, with actual metadata and lifetime. Other tests'
+        # transient helpers cannot contribute an unrelated unavailable row to this case's census.
+        module.Path = CensusPath
         # A verified receipt belongs to this loaded OS-reader view, never to another module or runner.
         verified_receipts = {}
 
@@ -1481,9 +1656,13 @@ class R2Processes:
                     if isinstance(receipt, dict) and row.start_time == receipt.get("birth") and row.state.startswith("Z"):
                         return row  # A matching physical zombie is exit evidence, not a stale live receipt.
                     current = fingerprint(receipt)
+                    if pid in verified_receipts and verified_receipts[pid] != current:
+                        raise RuntimeError("R2 fixture: stale/unknown projection receipt; no native fallback")
                     if row.start_time != receipt["birth"]:
                         raise RuntimeError("R2 fixture: stale/unknown projection receipt; no native fallback")
                     if row.cmdline == b"" and row.argv == ():
+                        if receipt["argv"] is None:
+                            return row  # Native empty data stays negative; no logical argv is projected.
                         if verified_receipts.get(pid) != current:
                             raise RuntimeError("R2 fixture: stale/unknown projection receipt; no native fallback")
                         # The same original process may expose an empty command line while exiting. This is
@@ -1494,7 +1673,9 @@ class R2Processes:
                     verified_receipts.setdefault(pid, current)
                     if receipt["argv"] is not None:
                         row = row._replace(argv=tuple(receipt["argv"]))
-                elif pid in verified_receipts:
+                elif str(pid) in cohort or pid in verified_receipts:
+                    if row.start_time == cohort.get(str(pid)) and row.state.startswith("Z"):
+                        return row  # A physically retired pending actor may have no remaining receipt.
                     raise RuntimeError("R2 fixture: stale/unknown projection receipt; no native fallback")
                 for hook in self.after_present:
                     row = hook(pid, count, row)
@@ -1531,8 +1712,16 @@ class R2Processes:
                     hook(pid, number)
             return answer
 
-        def no_group_signal(*args):
-            raise RuntimeError("R2 fixture: a receipt never authorizes a process group")
+        def no_group_signal(group, number):
+            if number != 0:
+                raise RuntimeError("R2 fixture: a receipt never authorizes a process group")
+            if self.group_reaping:
+                for process in self.processes.values():
+                    process.poll()  # A normal test parent reaps its own real children; no fabricated ESRCH.
+                observer = getattr(self, "group_observer", None)
+                if observer is not None:
+                    observer()
+            return real_os.killpg(group, 0)  # Actual kernel evidence, never a projected empty group.
 
         def closed(fd):
             self.handles.pop(fd, None)
@@ -1572,6 +1761,9 @@ class R2Processes:
             def is_dir(self):
                 return False if str(self) == "/proc" and not proc_available else original(self).is_dir()
 
+            def iterdir(self):
+                return original(self).iterdir()
+
         module.Path = LocalPath
 
 
@@ -1581,7 +1773,54 @@ def r2_stop_main(arguments):
     projection = R2Processes.load(path, nonce)
     if len(words) < 3 or words[0] != "--base" or words[2] != "stop":
         raise RuntimeError("R2 fixture: non-stop runner request")
-    return launcher_module(projection).main(words)
+    module = launcher_module(projection)
+    # Passive, bounded diagnostics: mmap updates add no fsync/pipe write to the measured path. They never
+    # affect identity, projection, signal authorization or the production API's decisions.
+    import mmap
+    import stat
+    trace = Path(path).parent / ("stop-timing-%d-evidence.json" % os.getpid())
+    fd = os.open(trace, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.ftruncate(fd, 65536)
+    region = mmap.mmap(fd, 65536)
+    os.close(fd)
+    region[:] = b" " * 65536
+    events, phase = [], ["main"]
+
+    def event(name, **details):
+        if len(events) < 256:
+            events.append(dict(event=name, at_ns=time.monotonic_ns(), phase=phase[0], **details))
+            raw = json.dumps(events).encode()
+            if len(raw) > len(region):
+                raise RuntimeError("R2 fixture: timing evidence exceeds its bound")
+            region[:len(raw)] = raw
+
+    syncing, saving = module.os.fsync, module.StopCustody.save
+
+    def fsync(descriptor):
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        event("fsync_enter", kind=kind)
+        try:
+            return syncing(descriptor)
+        finally:
+            event("fsync_return", kind=kind)
+
+    def save(custody, observed, attempted, active=True):
+        previous, phase[0] = phase[0], "checkpoint" if active else "terminal_clear"
+        event("save_enter")
+        try:
+            return saving(custody, observed, attempted, active)
+        finally:
+            event("save_return")
+            phase[0] = previous
+
+    module.os.fsync, module.StopCustody.save = fsync, save
+    try:
+        event("main_enter")
+        code = module.main(words)
+        event("main_return", code=code)
+        return code
+    finally:
+        region.close()
 
 
 def r2_legacy_child_gate(config, slot):
@@ -1802,6 +2041,12 @@ sys.exit(scope["r2_actor_main"](config, slot))
 def r2_actor_main(config, slot):
     """Private test-only actor protocol. This process has already been captured and admitted through its gate."""
     node = config["nodes"][slot]
+    fork_gap = config.get("fork_gap")
+    if fork_gap and slot == fork_gap["root"]:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # Child-local Linux subreaper, never the pytest process.
+            raise OSError(ctypes.get_errno(), "fork-gap reaper unavailable")
 
     def emit(event, **extra):
         data = {"nonce": config["nonce"], "slot": slot, "event": event, **extra}
@@ -1825,13 +2070,29 @@ def r2_actor_main(config, slot):
         # inherits only the EOF reader (never the writer), and cannot fork/execute the runner before capture.
         created = WitnessedPopen([sys.executable, "-I", "-B", config["script"], config["config"], requested],
                                    env=dict(os.environ), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, pass_fds=tuple(config["inherited"]))
+                                   stderr=subprocess.PIPE, text=True, pass_fds=tuple(config["inherited"]),
+                                   start_new_session=bool(fork_gap and slot == fork_gap["root"]))
         birth = r2_kernel_process(created.pid)["birth"]
         emit("created", child=requested, child_pid=created.pid, child_birth=birth)
+        if config["nodes"][requested]["kind"] == "R":
+            created.start_capture()
         if requested == child_slot:
             child, child_birth = created, birth
     Path(node["started"]).write_text("RUNNING", encoding="utf-8")
     emit("running")
+    if fork_gap and slot == fork_gap["forker"]:
+        if os.read(fork_gap["release_read"], 1) != b"X":
+            raise RuntimeError("fork-gap exit was not released")
+        return 0
+    if fork_gap and slot == fork_gap["root"]:
+        child.wait(timeout=R2_STOP_TIMEOUT_SECONDS)
+        proof = native_wait_fields(child)
+        if proof is None:
+            raise RuntimeError("fork-gap parent has no native wait proof")
+        emit("reaped", child=child_slot, child_pid=child.pid, child_birth=child_birth, **proof)
+        os.write(fork_gap["reaped_write"], b"C")
+        adopted, status = os.waitpid(-1, 0)
+        os.write(fork_gap["reaped_write"], (json.dumps(dict(pid=adopted, status=status)) + "\n").encode())
     command = config.get("exec_children", {}).get(slot, config.get("exec_argv") if node["kind"] == "H" else None)
     if command is not None:
         if (child_slot is not None or sidecars or not isinstance(command, list) or
@@ -1848,7 +2109,7 @@ def r2_actor_main(config, slot):
                 return 124
             time.sleep(0.01)
         try:
-            out, err = child.communicate(timeout=config.get("runner_timeout", 3))
+            out, err = child.communicate(timeout=config.get("runner_timeout", R2_STOP_TIMEOUT_SECONDS))
         except subprocess.TimeoutExpired:
             emit("timeout")
             return 124  # The fixture still owns the gated/registered runner; caller exit is never its closure.
@@ -1857,12 +2118,27 @@ def r2_actor_main(config, slot):
              child=child_slot, child_pid=child.pid, child_birth=child_birth, **(proof or {}))
         sys.stdout.write(out)
         sys.stderr.write(err)
+        if config.get("runner_action") == "burst":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            Path(node["started"]).with_suffix(".capture-ready").touch()
         if config.get("echo_exit"):
             print("exit=%d" % child.returncode)
         return child.returncode
     if node["kind"] == "R" and config.get("runner_action") != "hang":
+        if config.get("runner_action") == "burst":
+            # Test-only transport pressure; whitespace preserves the real public stop JSON verbatim.
+            sys.stdout.write(" " * (2 * 1024 * 1024))
+            sys.stdout.flush()
+            sys.stderr.write("E" * (2 * 1024 * 1024))
+            sys.stderr.flush()
         request = config["runner_request"]
-        return r2_stop_main([request["receipt"], request["nonce"], *request["words"]])
+        code = r2_stop_main([request["receipt"], request["nonce"], *request["words"]])
+        if config.get("runner_action") == "burst":
+            sys.stdout.flush()
+            sys.stderr.flush()
+            Path(node["started"]).with_suffix(".capture-ready").touch()
+        return code
     while not Path(config["exit_file"]).exists():
         time.sleep(0.02)
     return 0
@@ -1945,7 +2221,7 @@ def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(
         def failing_after_the_first(*args):
             if args[0] == hung.pid:
                 calls.append(args)
-                if len(calls) > 2:  # Initial census, verification, then the post-signal census fails.
+                if (hung.pid, signal.SIGTERM) in context.projection.events:
                     raise OSError(2, "No such file or directory: 'ps'")
             return real(*args)
         monkeypatch.setattr(module, "read_process", failing_after_the_first)

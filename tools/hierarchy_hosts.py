@@ -108,11 +108,12 @@ _HOSTS = {
                         "node_script_suffixes": ("@anthropic-ai/claude-code/cli.js",),
                         "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": ("--resume", "--session-id"), "commands": (),
-                              "grammar": {"stage": "C", "flags": CLAUDE_STOP_FLAGS,
+                              "grammar": {"family": "claude", "stage": "C", "flags": CLAUDE_STOP_FLAGS,
                                           "split_one": CLAUDE_STOP_VALUES, "equals_one": ("--tools",),
                                           "repeatable": ("--add-dir", "--plugin-dir"),
                                           "exclusive_modes": ("--print", "--bg")},
-                              "conflicting_flags": ("--fork-session",),
+                              "conflicting_flags": (), "fork_flag": "--fork-session",
+                              "continue_flags": ("--continue", "-c"),
                               "value_options": ("--model", "--settings", "--permission-mode", "--output-format",
                                                 "--input-format", "--system-prompt", "--append-system-prompt",
                                                 "--mcp-config", "--agent", "--agents", "--tools", "--allowedTools",
@@ -135,7 +136,7 @@ _HOSTS = {
         "entrypoints": {"program_basenames": ("codex",), "node_script_basenames": ("codex", "codex.js"),
                         "node_script_suffixes": (), "node_option_arities": NODE_ARITIES},
         "session_selectors": {"options": (), "commands": (("resume",), ("exec", "resume")),
-                              "grammar": {"options": CODEX_STOP_OPTIONS, "exec": "exec", "resume": "resume"},
+                              "grammar": {"family": "codex", "options": CODEX_STOP_OPTIONS, "exec": "exec", "resume": "resume"},
                               "conflicting_flags": (),
                               "value_options": ("-c", "--config", "--disable", "--enable", "--sandbox", "-s",
                                                 "-C", "--cd", "--add-dir", "--model", "-m", "--profile", "-p",
@@ -200,7 +201,8 @@ def entrypoints(kind):
 
 def _host_arguments(kind, argv, strict=False):
     """Host arguments after env and an optional Node interpreter, or None for another program."""
-    found = entrypoints(kind)
+    found = _host(kind)["entrypoints"]
+    require(any(found.values()), "%s has no process entrypoints" % kind)
     if argv and Path(argv[0]).name == "env":
         argv = argv[1:]
         while argv and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", argv[0]):
@@ -322,7 +324,7 @@ def _codex_selection(selectors, arguments, session):
     index += 1
     # The only remaining position is ONE owner prompt. Never scan its contents as another command/selector.
     if len(arguments) - index > 1:
-        return "HOLD"
+        return "AMBIGUOUS_SESSION" if arguments[index] == grammar["resume"] else "HOLD"
     if index < len(arguments) and options and arguments[index].startswith("-") and arguments[index] != "-":
         return "HOLD"
     return "OWNED" if shape == "bound" else "NOT_OWNED"
@@ -330,7 +332,8 @@ def _codex_selection(selectors, arguments, session):
 
 def _claude_selection(selectors, arguments, session):
     grammar, index, options, prompts = selectors["grammar"], 0, True, 0
-    seen, selected = set(), []
+    seen, selected, explicit = set(), [], []
+    forked, continued = False, False
     flags = {name: row[0] for row in grammar["flags"] for name in row}
     while index < len(arguments):
         word = arguments[index]
@@ -344,15 +347,26 @@ def _claude_selection(selectors, arguments, session):
             index += 1
             continue
         option, equal, value = word.partition("=")
-        if option in selectors["conflicting_flags"]:
-            return "NOT_OWNED"
-        if option in selectors["options"]:
+        if option == selectors["fork_flag"]:
+            if equal or forked:
+                return "HOLD"
+            forked = True
+            index += 1
+        elif option in selectors["continue_flags"]:
+            if equal or continued:
+                return "HOLD"
+            continued = True
+            index += 1
+        elif option in selectors["options"]:
             if not equal:
                 value = arguments[index + 1] if index + 1 < len(arguments) else None
             shape = _selector_value(value, session)
-            if shape not in ("bound", "other"):
-                return "HOLD"  # In particular, a pending selector cannot consume a terminator.
+            if shape == "ambiguous":
+                # A pending selector cannot consume a terminator or renew a previous S selection.
+                return "AMBIGUOUS_SESSION" if "bound" in selected else "HOLD"
             selected.append(shape)
+            if option == "--session-id":
+                explicit.append(shape)
             index += 1 if equal else 2
         elif word in flags:
             canonical = flags[word]
@@ -377,11 +391,21 @@ def _claude_selection(selectors, arguments, session):
             index += 2  # One complete opaque atom: prompts, quotes and UUIDs inside it are data.
         else:
             return "HOLD"
+    # Fork creates the explicitly named session, not the source selected by resume/continue.
+    # Defer source classification until all flags are read: either flag order is emitted by hosts.
+    if forked:
+        selected = explicit
+    elif continued:
+        return "HOLD"
+    if any(shape not in ("bound", "other") for shape in selected):
+        return "AMBIGUOUS_SESSION" if "bound" in selected else "HOLD"
+    if "bound" in selected and "other" in selected:
+        return "AMBIGUOUS_SESSION"
     return "OWNED" if selected and all(shape == "bound" for shape in selected) else "NOT_OWNED"
 
 
-def session_verdict(kind, argv, session, argv_boundaries="proven"):
-    """Closed complete-atom grammar; flattened ps text never establishes first ownership."""
+def _session_selection(kind, argv, session, argv_boundaries="proven"):
+    """Internal reason distinguishes selector ambiguity from negative-only foreign UUID sparing."""
     selectors = _host(kind)["session_selectors"]
     if argv_boundaries != "proven":
         return "HOLD"
@@ -392,8 +416,33 @@ def session_verdict(kind, argv, session, argv_boundaries="proven"):
         return "HOLD"
     if arguments is None:
         return "NOT_OWNED"
-    return (_claude_selection(selectors, arguments, session) if selectors["options"]
-            else _codex_selection(selectors, arguments, session))
+    family = selectors.get("grammar", {}).get("family")
+    if family == "claude":
+        return _claude_selection(selectors, arguments, session)
+    if family == "codex":
+        return _codex_selection(selectors, arguments, session)
+    return "HOLD"
+
+
+def session_verdict(kind, argv, session, argv_boundaries="proven"):
+    """Closed complete-atom grammar; flattened ps text never establishes first ownership."""
+    if kind is None:
+        verdicts = [session_verdict(host, argv, session, argv_boundaries) for host in TEAM_HOSTS]
+        return "OWNED" if "OWNED" in verdicts else "HOLD" if "HOLD" in verdicts else "NOT_OWNED"
+    selection = _session_selection(kind, argv, session, argv_boundaries)
+    return "HOLD" if selection == "AMBIGUOUS_SESSION" else selection
+
+
+def names_session(argv, session):
+    """Discovery only: preserve whole atoms and conservatively notice glued UUID spellings too."""
+    if any(atom == session or any(word == session or word.partition("=")[2] == session
+                                 for word in atom.split()) or
+           any(found.group() == session for found in SESSION_UUID_OCCURRENCE.finditer(atom)) for atom in argv):
+        return True
+    # Only whole equals values with whitespace/embedded '=' can need the old ownership shortcut.
+    # Unrelated rows never enter a host grammar; opaque diagnostic equals values keep their old result.
+    return (any(atom.partition("=")[2] == session for atom in argv) and
+            session_verdict(None, argv, session) == "OWNED")
 
 
 def matches_session(kind, argv, session, argv_boundaries="proven"):
@@ -403,21 +452,24 @@ def matches_session(kind, argv, session, argv_boundaries="proven"):
 
 def descendant_verdict(argv, session):
     """Negative-only CLEAR/OTHER/HOLD: definite exclusion differs from unresolved selection."""
-    if any(found.group() != session for word in argv for found in SESSION_UUID_OCCURRENCE.finditer(word)):
-        return "OTHER"
     for kind in TEAM_HOSTS:
         selectors = _host(kind)["session_selectors"]
         arguments = _host_arguments(kind, argv, strict=True)
         if arguments is False:
             return "HOLD"
         if arguments is not None:
-            if any(word.partition("=")[0] in selectors["conflicting_flags"] for word in arguments):
-                return "OTHER"
-            if session_verdict(kind, argv, session) == "HOLD":
+            selection = session_verdict(kind, argv, session)
+            if selection == "OWNED":
+                return "CLEAR"
+            if selection == "HOLD":
                 return "HOLD"
-            # Complete admitted host syntax already identifies command/value/prompt positions. Its opaque
-            # prompt must not be rescanned for selector-looking words. UUID sparing above remains separate.
-            return "CLEAR"
+            # A message/job UUID is not another session. Reuse the complete ownership grammar to prove
+            # that a validated host actually selects T, rather than treating a prompt/alias as exclusion.
+            for word in arguments:
+                for found in SESSION_UUID_OCCURRENCE.finditer(word):
+                    if found.group() != session and session_verdict(kind, argv, found.group()) == "OWNED":
+                        return "OTHER"
+            return "HOLD"  # A separate host with no provable selector must not borrow parent authority.
     for kind in TEAM_HOSTS:
         selectors = _host(kind)["session_selectors"]
         # Unknown descendants may still carry a known ambiguous selector. This never establishes ownership.
