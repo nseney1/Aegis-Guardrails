@@ -989,20 +989,17 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
 @gitsafe.scrubbed()
 def exemption_finder(root: Any, head: str, base_ref: str) -> Callable[[str], Optional[Approval]]:
     """Index once, newest first: lookups return the first valid exemption, else first rejection, else None.
-    Read full commit messages individually; release each before reading the next object."""
+    Size objects first; discovery GitError propagates so callers can latch terminal failure."""
     top = _top(root)
     scan = _commits_in(top, head, base_ref)
     candidates: Dict[str, List[str]] = {}
     if scan is not None:
-        for oid in scan[2]:
-            message = _commit_message(top, oid)
-            if message is None:
-                candidates.clear()
-                break
+        for oid, raw in gitsafe.iter_objects(top, scan[2], kind="commit"):
+            message = raw.decode("utf-8", "replace").partition("\n\n")[2]
             for target in dict.fromkeys(t.lower() for t, _why in (
                     () if _approval_shape.bounds_refusal(message) else _EXEMPT_TEST_LINE.findall(message)) if t.lower() != oid):
                 candidates.setdefault(target, []).append(oid)
-            del message  # Release the full message before reading the next raw object.
+            del raw, message
     @gitsafe.scrubbed()
     def find(fix_commit: str) -> Optional[Approval]:
         fix_oid = gitsafe.resolve_commit(top, fix_commit)

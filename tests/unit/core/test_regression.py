@@ -716,36 +716,71 @@ def test_failed_fixes_share_one_exemption_discovery(tmp_path, monkeypatch):
     for i in range(8):
         repo.commit(f"chore: unrelated {i}", allow_empty=True)
     calls = _metadata_calls(monkeypatch)
+    batches = _commit_batch_reads(monkeypatch)
 
     report = regression.check_ci_regressions(repo.root, "main")
 
     assert [(c.commit, c.status, c.exemption_code) for c in report.commits] == [
         (oid, "failed", None) for oid in fixes]
-    assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert [oid for chunk in batches for oid in chunk] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert len(batches) == 1
+    assert sum(c[:2] == ["cat-file", "--batch-check"] for c in calls) == 1
+    assert sum(c[:2] == ["cat-file", "--batch"] for c in calls) == 1
     assert sum(c[0] == "rev-list" for c in calls) == 2
     assert sum(c[0] == "log" for c in calls) <= 2
 
 
 @needs_git
-def test_exemption_discovery_timeout_is_not_retried_for_each_fix(tmp_path, monkeypatch):
-    from aegis_core import gitsafe
+@pytest.mark.parametrize("phase", ["preflight", "early-chunk", "later-chunk"])
+@pytest.mark.parametrize("fault", ["error", "timeout"])
+def test_exemption_discovery_timeout_is_not_retried_for_each_fix(tmp_path, monkeypatch, phase, fault):
+    from aegis_core import approval_shape, gitsafe
 
     repo = make_repo(tmp_path)
-    for i in range(3):
-        _fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i + 1)})
+    fixes = [_fix(repo, f"fix: constant {i}", {"src/app.py": APP.format(i)}) for i in range(1, 4)]
+    message = "prose\n" * (approval_shape.MAX_MESSAGE_BYTES // 6 + 1)
+    message += "\n" + "".join(f"Aegis-Exempt-Test: {fix} reviewed by hand\n" for fix in fixes)
+    repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
+    git_calls = _metadata_calls(monkeypatch)
     calls = []
-    real = gitsafe.run
+    chunks = []
+    preflights = []
+    real_read = gitsafe.read_blobs
+    real_sizes = gitsafe.blob_sizes
+    real_iter = gitsafe.iter_objects
+    error = "git cat-file timed out" if fault == "timeout" else "private discovery failure"
 
-    def timeout(args, *a, **kw):
-        if args[:2] == ["cat-file", "commit"]:
-            calls.append(args)
-            raise gitsafe.GitError("git cat-file timed out")
-        return real(args, *a, **kw)
+    def fail():
+        calls.append(len(git_calls))
+        raise gitsafe.GitError(error)
 
-    monkeypatch.setattr(gitsafe, "run", timeout)
+    def sizes(cwd, oids, **kw):
+        if kw.get("kind") == "commit":
+            preflights.append(phase)
+            if phase == "preflight":
+                fail()
+        return real_sizes(cwd, oids, **kw)
+
+    def read(cwd, oids, **kw):
+        if kw.get("kind") == "commit":
+            chunks.append(list(oids))
+            if len(chunks) == (2 if phase == "later-chunk" else 1):
+                fail()
+        return real_read(cwd, oids, **kw)
+
+    def one_per_chunk(cwd, oids, **kw):
+        return real_iter(cwd, oids, byte_budget=1, **kw)
+
+    monkeypatch.setattr(gitsafe, "blob_sizes", sizes)
+    monkeypatch.setattr(gitsafe, "read_blobs", read)
+    monkeypatch.setattr(gitsafe, "iter_objects", one_per_chunk)
     report = regression.check_ci_regressions(repo.root, "main")
-    assert [(c.reason, c.exemption_code) for c in report.commits] == [("no_test_changes", None)] * 3
     assert len(calls) == 1
+    assert git_calls[calls[0]:] == [], "failed discovery must not start diagnostic subprocesses"
+    assert len(preflights) == 1
+    assert len(chunks) == {"preflight": 0, "early-chunk": 1, "later-chunk": 2}[phase]
+    assert [(c.reason, c.exemption_code) for c in report.commits] == [("no_test_changes", None)] * 3
+    assert error not in json.dumps(report.as_dict(repo.root))
 
 
 @needs_git
@@ -915,12 +950,14 @@ def test_refusal_index_reads_an_oversized_candidate_once_for_all_fixes(tmp_path,
     repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
     approval = repo.head()
     calls = _metadata_calls(monkeypatch)
+    batches = _commit_batch_reads(monkeypatch)
 
     report = regression.check_ci_regressions(repo.root, "main")
 
     assert [c.exemption_code for c in report.commits] == ["message_too_large"] * len(fixes)
     # One pinned discovery read plus one diagnostic read, independent of the number of named fixes.
-    assert sum(c[:3] == ["cat-file", "commit", approval] for c in calls) == 2
+    assert sum(approval in chunk for chunk in batches) == 1
+    assert sum(c[:3] == ["cat-file", "commit", approval] for c in calls) == 1
     logs = [c for c in calls if c[0] == "log"]
     assert len(logs) == 2
     filtered, = [c for c in logs if any(arg.startswith("--grep=") for arg in c)]
@@ -938,18 +975,22 @@ def test_discovery_failure_does_not_start_a_diagnostic_reread(tmp_path, monkeypa
     repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
     approval = repo.head()
     reads = []
-    real = gitsafe.run
+    git_calls = _metadata_calls(monkeypatch)
+    real = gitsafe.read_blobs
 
-    def timeout(args, *rest, **kwargs):
-        if args[:3] == ["cat-file", "commit", approval]:
-            reads.append(args)
+    def timeout(cwd, oids, **kwargs):
+        requested = list(oids)
+        if kwargs.get("kind") == "commit" and approval in requested:
+            reads.append((requested, len(git_calls)))
             raise gitsafe.GitError("private message timeout")
-        return real(args, *rest, **kwargs)
+        return real(cwd, requested, **kwargs)
 
-    monkeypatch.setattr(gitsafe, "run", timeout)
+    monkeypatch.setattr(gitsafe, "read_blobs", timeout)
     report = regression.check_ci_regressions(repo.root, "main")
-    assert [c.exemption_code for c in report.commits] == [None] * len(fixes)
     assert len(reads) == 1
+    assert git_calls[reads[0][1]:] == [], "failed discovery must not start a diagnostic reread"
+    assert [c.exemption_code for c in report.commits] == [None] * len(fixes)
+    assert "private message timeout" not in json.dumps(report.as_dict(repo.root))
 
 
 @needs_git
@@ -963,6 +1004,7 @@ def test_refusal_index_checks_total_object_size_before_reading_content(tmp_path,
     repo.git("commit", "-q", "--allow-empty", "-F", "-", stdin=message)
     approval = repo.head()
     reads = []
+    batches = _commit_batch_reads(monkeypatch)
     real = gitsafe.run
 
     def oversized(args, *rest, **kwargs):
@@ -975,7 +1017,8 @@ def test_refusal_index_checks_total_object_size_before_reading_content(tmp_path,
     monkeypatch.setattr(gitsafe, "run", oversized)
     report = regression.check_ci_regressions(repo.root, "main")
     assert report.commits[0].exemption_code is None
-    assert len(reads) == 1  # Only pinned discovery reads content; diagnostics stop at the size query.
+    assert sum(approval in chunk for chunk in batches) == 1
+    assert reads == []  # Only batched discovery reads content; diagnostics stop at the size query.
 
 
 @needs_git
@@ -1525,3 +1568,20 @@ def test_unrelated_histories_raise_regression_error(tmp_path: Path):
     repo.commit("orphan")
     with pytest.raises(RegressionError, match="share no history"):
         regression.check_ci_regressions(repo.root, "main", "HEAD")
+
+
+def _commit_batch_reads(monkeypatch):
+    """Observe declared commit reads at the public reader boundary, without changing content."""
+    from aegis_core import gitsafe
+
+    batches = []
+    real = gitsafe.read_blobs
+
+    def counted(cwd, oids, **kwargs):
+        requested = list(oids)
+        if kwargs.get("kind") == "commit":
+            batches.append(requested)
+        return real(cwd, requested, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "read_blobs", counted)
+    return batches
