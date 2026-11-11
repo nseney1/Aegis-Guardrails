@@ -25,6 +25,7 @@ import uuid
 import pytest
 
 from tests.integration.test_hierarchy_mailbox import ROOT
+from tests.integration import test_hierarchy_provision as provision_fixtures
 from tests.integration.test_hierarchy_provision import PROVISION, Setup
 
 
@@ -98,7 +99,7 @@ def variants(host):
             "codex": [{}]}[host]
 
 
-def build(tmp_path):
+def build(tmp_path, source_seed):
     snapshot = {}
     interpreters = {}
     for host in ("claude-code", "codex-cli", "codex"):
@@ -106,7 +107,7 @@ def build(tmp_path):
             # A fresh initiative per variant, so one role's binding never decides another variant's answer.
             folder = tmp_path / ("%s-%d" % (host, index))
             folder.mkdir()
-            setup = Setup(folder)
+            setup = Setup(folder, source_seed=source_seed)
             setup.init()
             python = normalized(json.loads((setup.base / "provision.json").read_text(encoding="utf-8"))["python"], folder)
             writable = folder / "writable"
@@ -137,11 +138,11 @@ def build(tmp_path):
     return snapshot, interpreters
 
 
-def team_kinds(tmp_path):
+def team_kinds(tmp_path, source_seed):
     """Which reasoning_by_kind keys team.json accepts, for every legacy role kind and a typo."""
     folder = tmp_path / "team"
     folder.mkdir()
-    setup = Setup(folder)
+    setup = Setup(folder, source_seed=source_seed)
     setup.init()
     accepted = {}
     for kind in ("orchestrator", "implementer", "integrator", "reviewer", "front-door", "root", "lane", "builder"):
@@ -155,12 +156,18 @@ def team_kinds(tmp_path):
     return accepted
 
 
-def test_every_legacy_role_keeps_its_exact_profile(tmp_path):
+def test_every_legacy_role_keeps_its_exact_profile(tmp_path, tmp_path_factory, request, monkeypatch):
+    seed = provision_fixtures.worker_source_seed(tmp_path_factory, request)
+
+    def refuse_rebuild(source):
+        pytest.fail("role profiles must reuse the worker source seed")
+
+    monkeypatch.setattr(provision_fixtures, "build_source", refuse_rebuild)
     expected = json.loads(GOLDEN.read_text(encoding="utf-8"))
     expected["profiles"]['claude-code pilot/front-door {"tools": "Read"}'] = {
         "error": "the front-door role does not permit file tool: Read"}
-    profiles, interpreters = build(tmp_path)
-    actual = {"profiles": profiles, "team_kinds": team_kinds(tmp_path)}
+    profiles, interpreters = build(tmp_path, seed)
+    actual = {"profiles": profiles, "team_kinds": team_kinds(tmp_path, seed)}
     assert set(actual["profiles"]) == set(expected["profiles"])
     for key in sorted(expected["profiles"]):
         assert actual["profiles"][key] == with_runtime_bootstrap(expected["profiles"][key], interpreters[key]), key

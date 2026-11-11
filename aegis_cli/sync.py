@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
+from aegis_cli.ui.theme import diagnostic_text
 from aegis_core.errors import AegisError
 from aegis_core.telemetry_engine.ledger import incomplete as ledger_incomplete
 
@@ -25,10 +26,11 @@ __all__ = ["SyncCommand", "run_sync"]
 EXIT_OK = 0
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
-LEDGER_WARNING = (
-    "⚠️  The ledger is incomplete ({}): fitness counts only the rows that could be read, "
+_LEDGER_MESSAGE = (
+    "The ledger is incomplete ({}): fitness counts only the rows that could be read, "
     "so moves that rely on it (sync --apply, rule archive, tier changes) are refused"
 )
+LEDGER_WARNING = "⚠️  " + _LEDGER_MESSAGE
 
 
 def _rows(derived: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -79,18 +81,18 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any)
         for line in tbl.render(ui).splitlines():
             print(f"  {line}")
     for error in result.derived["errors"]:
-        print(f"  ❌ {sanitize_display(error['path'])}: {sanitize_display(error['error'], 300)}")
+        print(f"  {ui.diagnostic_badge('❌', 'FAIL')} {diagnostic_text(error['path'])}: {diagnostic_text(error['error'], 300)}")
     for ignored in result.derived["ignored"]:
-        print(f"  ⚠️  {sanitize_display(ignored['path'])}: {ignored['reason']}")
+        print(f"  {ui.diagnostic_badge('⚠️ ', 'WARN')} {diagnostic_text(ignored['path'])}: {diagnostic_text(ignored['reason'], 4096)}")
     for rule in result.derived["untargeted"]:
-        print(f"  ⚠️  {sanitize_display(str(rule['id']))}: applies to no file (no target_paths)")
+        print(f"  {ui.diagnostic_badge('⚠️ ', 'WARN')} {diagnostic_text(str(rule['id']))}: applies to no file (no target_paths)")
     missing = ledger_incomplete(result.derived["ledger"])
     if missing:
-        print(f"  {LEDGER_WARNING.format(sanitize_display(missing, 300))}")
+        print(f"  {ui.diagnostic_badge('⚠️ ', 'WARN')} {_LEDGER_MESSAGE.format(diagnostic_text(missing, 300))}")
     cut = next((row for row in rows if row.get("evidence_available") is False), None)
     if cut is not None:
         reason = str(cut.get("evidence_error") or "the evidence is unavailable")
-        print(f"  ⚠️  Evidence unavailable, so nothing is suggested: {sanitize_display(reason, 300)}")
+        print(f"  {ui.diagnostic_badge('⚠️ ', 'WARN')} Evidence unavailable, so nothing is suggested: {diagnostic_text(reason, 300)}")
     for action in result.applied:
         detail = f" ({action['from_type']} -> {action['to_type']})" if action.get("to_type") else ""
         print(f"  {action['action']} {sanitize_display(action['rule'])}: {action['status']}{detail}")
@@ -99,11 +101,11 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any)
         if pr_status == "opened" and result.pr.get("url"):
             print(f"  Opened PR: {result.pr['url']} (branch {result.pr.get('branch')})")
         elif pr_status == "failed" and result.pr.get("error"):
-            print(f"  ❌ PR creation failed: {result.pr['error']}")
+            print(f"  {ui.diagnostic_badge('❌', 'FAIL')} PR creation failed: {diagnostic_text(result.pr['error'], 4096)}")
         elif pr_status == "no_transitions":
             print("  No decided transitions to open a PR for.")
     if result.refused:
-        print(f"  ❌ {result.refused}")
+        print(f"  {ui.diagnostic_badge('❌', 'FAIL')} {diagnostic_text(result.refused, 4096)}")
     from aegis_core.sync import base_fetch, replay_lines
 
     for line in replay_lines(result.replay):
@@ -119,6 +121,9 @@ def _print_text(args: argparse.Namespace, result: Any, rel_path: str, root: Any)
     print(f"Wrote {rel_path} ({len(rows)} rules, {pending} suggested transitions).")
     if pending and not result.applied and not result.refused:
         print("Apply the suggestions with: aegis sync --apply")
+    if _inert_expiry(root):
+        print(f"  {ui.diagnostic_badge('ℹ️ ', 'INFO')} expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
+              "rules decay by exposed sessions (half_life_sessions), never by calendar days")
 
 
 def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
@@ -182,9 +187,6 @@ def run_sync(args: argparse.Namespace, *, gh_runner: Any = None) -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         _print_text(args, result, rel_path, root)
-        if _inert_expiry(root):
-            print("  ℹ️  expiry.days and expiry.per_type in .aegis/config.json no longer change fitness: "
-                  "rules decay by exposed sessions (half_life_sessions), never by calendar days")
         if claimed["claimed"]:
             print(f"  {claimed['label']}: {claimed['claimed']} report(s) from {claimed['sessions']} session(s), "
                   "no rule's evidence")
