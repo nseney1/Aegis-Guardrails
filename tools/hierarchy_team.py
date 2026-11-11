@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 
 sys.dont_write_bytecode = True
@@ -65,6 +66,7 @@ INDEX_SCHEMA = "aegis.team-evidence-index/v1"
 STATUS_SCHEMA = "aegis.team-run-status/v1"
 LEDGER_SCHEMA = "aegis.team-turn-ledger/v1"
 OK, REFUSED, FAILED = 0, 2, 3
+PYTHON_TEXT_LIMIT = 4096
 CODEX = hierarchy_provision.CODEX
 CLAUDE = hierarchy_provision.CLAUDE
 V1_HOSTS = {"root": CODEX, "team": CODEX}
@@ -160,6 +162,28 @@ def absolute(value, label):
     return hierarchy_container_verify._absolute(value, label)
 
 
+def interpreter_display(value):
+    """Display a validated path: canonicalize, redact with Aegis's secret table, then bound the field."""
+    from hierarchy_board import secret_patterns
+
+    canonical = unicodedata.normalize("NFKC", value)
+    canonical = " ".join("".join(char for char in canonical if unicodedata.category(char)[0] != "C").split())
+    for pattern in secret_patterns():
+        canonical = pattern.sub("[REDACTED]", canonical)
+    return canonical[:256] + ("..." if len(canonical) > 256 else "")
+
+
+def default_python_recovery(run):
+    try:
+        recipes_exist = run.recipes.is_file()
+    except OSError:
+        return ("cannot inspect recipes.json; repair access to recipes.json, then run init --continue; "
+                "alternatively, restore team-state.json from a trusted backup")
+    setting = ("set recipes.python to the python recorded in recipes.json" if recipes_exist else
+               "set recipes.python explicitly")
+    return setting + ", then run init --continue; alternatively, restore team-state.json from a trusted backup"
+
+
 def part(where, check):
     """Runs a check on part of the config and names that part in its refusal."""
     try:
@@ -244,12 +268,24 @@ class Run:
                 require(lane.branch != other.branch, "lanes %s and %s share branch %s; give each implementer its own "
                         "branch" % (lane.id, other.id, lane.branch))
         self.recipes_config = value["recipes"]
-        part("recipes", lambda: fields(self.recipes_config, {"keep", "python", "commit_identity"}, {"template"}))
+        part("recipes", lambda: fields(self.recipes_config, {"keep", "commit_identity"}, {"template", "python"}))
         keep = self.recipes_config["keep"]
         require(isinstance(keep, list) and keep and len(keep) == len(set(keep)) and
                 all(isinstance(name, str) and name for name in keep), "recipes.keep must list recipe names, once each")
         self.keep = keep
-        self.python = str(absolute(self.recipes_config["python"], "recipes.python"))
+        self.python_defaulted = "python" not in self.recipes_config
+        interpreter = sys.executable
+        self.python = interpreter if self.python_defaulted else self.recipes_config["python"]
+        self._orchestration_python = interpreter
+        # Anchor valid relative process paths once; malformed values remain deferred until consumed.
+        if (isinstance(interpreter, str) and 0 < len(interpreter) <= PYTHON_TEXT_LIMIT and "\x00" not in interpreter
+                and not os.path.isabs(interpreter)):
+            try:
+                invoking = text(os.getcwd(), "invoking directory", PYTHON_TEXT_LIMIT)
+                self._orchestration_python = os.path.join(invoking, interpreter)
+            except (OSError, ValueError):
+                refuse("cannot resolve the orchestration interpreter from the invoking directory; run hierarchy_team "
+                       "through a valid absolute interpreter path")
         identity = self.recipes_config["commit_identity"]
         part("recipes.commit_identity", lambda: fields(identity, {"name", "email"}))
         part("recipes.commit_identity", lambda: (text(identity["name"], "name", 256), text(identity["email"], "email", 256)))
@@ -286,6 +322,38 @@ class Run:
         self.inputs = self.run / "inputs"
         if self.uses(CLAUDE):
             self.validated_homes = {CODEX: safe_codex_home(self), CLAUDE: safe_claude_home(self)}
+
+    @property
+    def python(self):
+        """The selected interpreter, validated only when consumed; its default spelling selects the venv."""
+        if not self.python_defaulted:
+            return self._python
+        label = "the interpreter running hierarchy_team (sys.executable)"
+        try:
+            python = text(self._python, label, PYTHON_TEXT_LIMIT)
+            components = re.split("[" + re.escape(os.sep + (os.altsep or "")) + "]", python)
+            # Only a root separator (or the two separators of a Windows UNC root) may be empty.
+            leading = 2 if os.name == "nt" and components[:2] == ["", ""] else int(components[0] == "")
+            require(Path(python).is_absolute() and all(p not in ("", ".", "..") for p in components[leading:]),
+                    "invalid interpreter spelling")
+        except ValueError:
+            refuse("invalid the interpreter running hierarchy_team (sys.executable); run hierarchy_team through "
+                   "an absolute interpreter path without . or .. components, or set recipes.python explicitly")
+        return python
+
+    @python.setter
+    def python(self, value):
+        self._python = value if self.python_defaulted else str(absolute(value, "recipes.python"))
+
+    @property
+    def orchestration_python(self):
+        """The captured child-process interpreter, separate from the verbatim MCP interpreter."""
+        try:
+            interpreter = text(self._orchestration_python, "orchestration interpreter", PYTHON_TEXT_LIMIT)
+            require(Path(interpreter).is_absolute(), "invalid orchestration interpreter")
+        except ValueError:
+            refuse("invalid orchestration interpreter; run hierarchy_team through a valid absolute interpreter path")
+        return interpreter
 
     def check_hosts(self):
         if self.raw["schema"] == SCHEMA:
@@ -356,8 +424,9 @@ class Run:
 # -- recipes --------------------------------------------------------------------------------------------------------------
 
 def recipe_file(run):
-    """The run's recipe file: the template with the home folder filled in, the configured python and commit identity,
+    """The run's recipe file: the template with the home folder filled in, the selected interpreter and commit identity,
     and only the kept recipes. The jobs tool validates the result (check-recipes)."""
+    python = run.python
     try:
         raw = run.template.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -368,7 +437,7 @@ def recipe_file(run):
             "the recipe template has no recipes: %s" % run.template)
     for name in run.keep:
         require(name in value["recipes"], "the recipe template has no recipe %s: %s" % (name, run.template))
-    value["python"] = run.python
+    value["python"] = python
     value["identity"] = dict(run.recipes_config["commit_identity"])
     value["recipes"] = {name: value["recipes"][name] for name in run.keep}
     left = [word for word in json.dumps(value).split('"') if "REPLACE" in word]
@@ -680,7 +749,7 @@ def last_json(stdout):
 
 def tool(run, name, *arguments):
     """(exit code, last JSON object of stdout, process) of one hierarchy tool run as a child."""
-    argv = [sys.executable, "-I", "-B", str(HERE / ("hierarchy_%s.py" % name)), *map(str, arguments)]
+    argv = [run.orchestration_python, "-I", "-B", str(HERE / ("hierarchy_%s.py" % name)), *map(str, arguments)]
     proc = subprocess.run(argv, capture_output=True, text=True, env=child_env(run), stdin=subprocess.DEVNULL)
     return proc.returncode, last_json(proc.stdout), proc
 
@@ -714,7 +783,7 @@ def aegis(run, *arguments):
     env = child_env(run)
     for name in AEGIS_OVERRIDES:
         env.pop(name, None)
-    proc = subprocess.run([sys.executable, "-I", "-B", "-c", code, *arguments], cwd=str(REPO), capture_output=True,
+    proc = subprocess.run([run.orchestration_python, "-I", "-B", "-c", code, *arguments], cwd=str(REPO), capture_output=True,
                           text=True, env=env, stdin=subprocess.DEVNULL)
     try:
         answer = json.loads(proc.stdout)
@@ -967,6 +1036,7 @@ def preflight_result(run, recipe, job, expect, recipes_sha256):
 
 def step_preflight(run, state):
     """The kept recipes on the base, in a store of their own, with stand-in sessions that never run."""
+    python = run.python
     pre = run.run / "preflight"
     pre_id = run.id + "pre"
     require(SLUG.fullmatch(pre_id) is not None, "initiative id %s is too long for the preflight's %s" % (run.id, pre_id))
@@ -975,7 +1045,7 @@ def step_preflight(run, state):
                                                         "init", "--request", run.inputs / "limits.json"))
     once(run, state, "preflight-provision", lambda: checked(
         run, "preflight provision init", "provision", "init", "--request", request_file(run, "preflight-init.json", {
-            "store": str(store), "base": str(base), "source": str(run.source), "python": run.python,
+            "store": str(store), "base": str(base), "source": str(run.source), "python": python,
             "lanes": {"p": "implementer"},
             "initiative": {**run.initiative, "id": pre_id, "repository": run.initiative["repository"] + "-preflight",
                            "checkouts": [str(run.project)], "source": "owner"}})))
@@ -1058,6 +1128,8 @@ def init(run, args):
                  "custody": custody(run),
                  "init": {"steps": {}, "done": {}, "failed": None, "complete_at": None, "base_tree": tree},
                  "root": None, "up": None, "down": {"done": {}}}
+        if run.python_defaulted:
+            state["init"]["python"] = run.python
         revalidate_run(run)
         run.run.mkdir(parents=True, exist_ok=True, mode=0o700)
         save_state(run, state)
@@ -1473,7 +1545,7 @@ def start_loop(run):
         if parts[:1] != [cargo_dir]:
             env["PATH"] = os.pathsep.join([cargo_dir] + [p for p in parts if p])
     run.loop_state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    argv = [sys.executable, "-I", "-B", str(HERE / "hierarchy_loop.py"), *map(str, loop_flags(run)), "run",
+    argv = [run.orchestration_python, "-I", "-B", str(HERE / "hierarchy_loop.py"), *map(str, loop_flags(run)), "run",
             "--interval", str(run.interval)]
     with open(run.log_path, "ab") as log:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env,
@@ -2243,6 +2315,26 @@ def main(argv=None):
     try:
         run = Run(args.config)
         state = load_state(run)
+        if state is not None and run.python_defaulted:
+            initialized = state.get("init") if isinstance(state, dict) else None
+            if not isinstance(initialized, dict) or not init_complete(state):
+                if not isinstance(initialized, dict) or "python" not in initialized:
+                    refuse("the default interpreter pin is missing; " + default_python_recovery(run))
+                recorded = initialized["python"]
+                try:
+                    text(recorded, "default interpreter pin")
+                    require(os.path.basename(recorded) not in ("", ".", ".."), "invalid interpreter basename")
+                    absolute(recorded, "default interpreter pin")
+                except ValueError:
+                    refuse("the default interpreter pin is malformed; " + default_python_recovery(run))
+                current = run.python
+                if recorded != current:
+                    recorded_display, current_display = interpreter_display(recorded), interpreter_display(current)
+                    recovery = ("set recipes.python to " + recorded_display if recorded_display == recorded else
+                                "set recipes.python to the interpreter recorded as init.python in team-state.json")
+                    refuse("the interpreter changed since init: recorded %s; current %s; re-run with the recorded "
+                           "interpreter or %s" % (recorded_display, current_display, recovery))
+                run.python = recorded
         if args.command != "status" and state and "custody" in state and state["custody"] != custody(run):
             refuse("run custody changed since init; restore the recorded configuration")
         guard(run, args.command)
