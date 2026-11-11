@@ -13,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from aegis_core import gitsafe, pathlookup
+from aegis_core import approval_shape as _approval_shape, gitsafe, pathlookup
 from aegis_core.atomicio import create_private_file
 from aegis_core.config import manager_registration_env
 from aegis_core.manager_policy import ManagerError, canonical, digest
@@ -24,6 +24,7 @@ __all__ = ["initialize", "load_config", "public_file", "verify_owner"]
 _KEYS = {"schema", "workspace_id", "control_root", "store_root", "trusted_signers", "trusted_signers_digest"}
 _TOKEN = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_OWNER_LINE = re.compile(r"^Aegis-Manager-Approve: ([0-9a-f]{64})$", re.MULTILINE)
 
 
 def _path(value):
@@ -147,10 +148,11 @@ def verify_owner(config, statement, approval):
         result = gitsafe.run(["-c", "gpg.format=ssh", "-c", "gpg.ssh.allowedSignersFile=" + str(signers),
                               "-c", "gpg.ssh.program=" + program, "log", "-1", "--format=%G?%n%GS%n%B", oid],
                              control, timeout=5)
-    lines = result.stdout.decode("utf-8", "replace").splitlines()
-    expected = "Aegis-Manager-Approve: " + digest(statement)
-    trailers = [line for line in lines[2:] if line.startswith("Aegis-Manager-Approve:")]
-    if result.returncode or len(lines) < 3 or lines[:2] != ["G", "owner"] or trailers != [expected]:
+    lines = result.stdout.decode("utf-8", "replace").split("\n", 2)
+    message = lines[2] if len(lines) == 3 else ""
+    trailers = [] if _approval_shape.bounds_refusal(message) else _OWNER_LINE.findall(message)
+    if result.returncode or len(lines) < 3 or lines[:2] != ["G", "owner"] or trailers != [digest(statement)] \
+            or _approval_shape.refusal(message, _OWNER_LINE, "Aegis-Manager-Approve"):
         raise ManagerError("invalid_owner_signature")
     return {"state": "owner_signature_verified", "approval_commit": oid,
             "statement_digest": digest(statement), "signers_digest": config["trusted_signers_digest"]}
