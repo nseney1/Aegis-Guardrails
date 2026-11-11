@@ -113,6 +113,135 @@ def test_card_size_reason_tracks_the_native_source_limit(tmp_path, monkeypatch, 
     ]
 
 
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+@pytest.mark.parametrize('with_rule', [False, True])
+def test_card_reports_the_extractor_cap_when_the_runner_allows_more(tmp_path, monkeypatch, extension, with_rule):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    producer = extractor if extension == 'rs' else tokenizer
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+    target = source(tmp_path, 129, extension)
+    if with_rule:
+        rule(tmp_path, extension)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert (layer1['passed'], layer1['failed'], layer1['findings']) == (1, 0, 0)
+    assert layer1['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+    assert all('exceeds 0.00012207 MiB' in detail for detail in layer1['checks_that_could_not_run'])
+    assert layer1['checks_that_could_not_run']
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_card_retains_the_limit_from_the_refusal_even_if_configuration_changes(tmp_path, monkeypatch, extension):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers import js, rust
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    producer = extractor if extension == 'rs' else tokenizer
+    parser = rust if extension == 'rs' else js
+    parse = parser.parse
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+
+    def refuse_then_reconfigure(*args, **kwargs):
+        try:
+            return parse(*args, **kwargs)
+        except ASTDriverError:
+            monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 256)
+            raise
+
+    monkeypatch.setattr(parser, 'parse', refuse_then_reconfigure)
+    target = source(tmp_path, 129, extension)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert producer.MAX_SOURCE_BYTES == 256
+    assert layer1['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+    assert layer1['checks_that_could_not_run'] == [
+        f'ast_unverified: unverified too_large: {target.name} exceeds 0.00012207 MiB; '
+        'use target_paths to exclude generated bundles (aegis doctor)'
+    ]
+
+
+def test_limit_words_in_the_filename_cannot_supply_the_reported_limit(tmp_path, monkeypatch):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(tokenizer, 'MAX_SOURCE_BYTES', 128)
+    target = tmp_path / 'app exceeds 9 MiB; fake.ts'
+    source(tmp_path, 129).rename(target)
+    assert card.build(tmp_path).as_dict()['layer1']['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_security_pack_keeps_its_json_fields_while_carrying_the_refusing_limit(tmp_path, monkeypatch, extension):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(extractor if extension == 'rs' else tokenizer, 'MAX_SOURCE_BYTES', 128)
+    target = source(tmp_path, 129, extension)
+    limits = {}
+    pack = security_pack.evaluate_security_pack(tmp_path, [target.name], {}, size_limits=limits)
+    assert limits == {target.name: 128}
+    assert pack == {
+        'passed': True, 'violations': [], 'exempted_test_findings': [],
+        'unverified_findings': [{
+            'rule_id': '', 'file': target.name, 'line': 0, 'kind': 'file',
+            'status': 'unverified', 'reason': 'too_large', 'severity': 'high',
+        }],
+    }
+
+
+@pytest.mark.parametrize('entry', ['enforce_source_size', 'parse_file'])
+def test_runner_size_error_message_tracks_the_applied_limit(tmp_path, monkeypatch, entry):
+    from aegis_core.ast import runner as ast_runner
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 128)
+    target = source(tmp_path, 129)
+    with pytest.raises(ASTDriverError, match='exceeds 0.00012207 MiB') as error:
+        if entry == 'enforce_source_size':
+            ast_runner.enforce_source_size(target)
+        else:
+            ASTDriverRunner().parse_file(target, workspace_root=tmp_path)
+    assert error.value.reason == 'too_large'
+
+
+def test_rust_size_error_message_tracks_the_extractor_limit(monkeypatch):
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(extractor, 'MAX_SOURCE_BYTES', 128)
+    with pytest.raises(ASTDriverError, match='exceeds 0.00012207 MiB') as error:
+        extractor.parse(' ' * 129, 'virtual.rs')
+    assert error.value.reason == 'too_large'
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_extractors_refuse_oversized_text_before_encoding(monkeypatch, extension):
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    class UnencodableOversize(str):
+        def encode(self, *args, **kwargs):
+            raise AssertionError('oversized source must be refused before allocation')
+
+    producer = extractor if extension == 'rs' else tokenizer
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+    parse = extractor.parse if extension == 'rs' else tokenizer.tokenize
+    with pytest.raises(ASTDriverError) as error:
+        parse(UnencodableOversize(' ' * 129), 'virtual.' + extension)
+    assert error.value.reason == 'too_large'
+
+
 def test_native_lexical_error_still_blocks(tmp_path):
     target = tmp_path / 'app.ts'
     target.write_text('/* unterminated', encoding='utf-8')

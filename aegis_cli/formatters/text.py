@@ -1,8 +1,8 @@
 """Terminal text for the reports aegis_core returns as data.
 
 Each renderer takes a report's ``as_dict()`` document, the same one ``--json`` prints, and returns
-its lines; the caller strips terminal controls when it prints them (repository text is not
-sanitized here). Core computes, the CLI renders: the five reports carry no text method. The
+its lines; the caller strips terminal controls when it prints them. Could-not-run details are
+also canonicalized, redacted and bounded here. Core computes, the CLI renders: the five reports carry no text method. The
 report modules are imported when a report is rendered, so importing this module costs nothing on
 paths that print none of them (the pre-commit check).
 """
@@ -19,7 +19,9 @@ _NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
 
 def render_card(doc: Mapping[str, Any]) -> List[str]:
     """The day-0 card (``aegis check --card``, the end of ``aegis init``)."""
+    from aegis_cli import sanitize_display
     from aegis_core.card import NEXT_RULE
+    from aegis_core.redaction import redact_command_secrets
 
     scope, rules, layer1 = doc["scope"], doc["rules"], doc["layer1"]
     lines = ["Aegis day-0 card", f"  workspace: {scope['workspace']}"]
@@ -55,6 +57,14 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
         lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files without blocking findings "
                      f"({layer1['passed']} of {layer1['checked']}); "
                      f"{layer1['findings']} finding(s) in {layer1['failed']} file(s)")
+    unavailable = layer1.get("checks_that_could_not_run", [])
+    if unavailable:
+        lines.append("  checks that could not run:")
+        for detail in unavailable[:20]:
+            clean = redact_command_secrets(sanitize_display(detail, max_len=None))
+            lines.append("    " + sanitize_display(clean, max_len=300))
+        if len(unavailable) > 20:
+            lines.append(f"    ... and {len(unavailable) - 20} more")
     not_analyzed = layer1.get("not_analyzed", [])
     if not_analyzed:
         coverage = "Layer 1 coverage" if layer1["pass_rate"] is None else "AST coverage"
