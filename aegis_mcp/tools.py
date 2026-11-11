@@ -10,6 +10,69 @@ from aegis_mcp.handlers.msg import handle_msg_read, handle_msg_write
 from aegis_mcp.projection import project_response
 from aegis_mcp.registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 
+
+def _team_config_payload() -> dict:
+    from aegis_core import primitives, team_profile
+
+    payload = primitives.envelope("aegis team config show", {})
+    payload.update(schema="aegis.team.config.show/v1", schema_family="aegis.team.config/v1",
+                   governance=team_profile.governance_status())
+    return payload
+
+
+def _team_config_argument_refusal() -> dict:
+    """The closed-input refusal, shared by raw-client and direct dispatch checks."""
+    from aegis_core.team_profile import display_profile
+
+    payload = _team_config_payload()
+    payload.update(status="refused", reason="aegis_team_config accepts no arguments",
+                   layer="flags", file="<command-line>",
+                   next_action="Call aegis_team_config with an empty arguments object.")
+    return display_profile(payload)
+
+
+def _handle_team_config(args: dict) -> dict:
+    """Read the CLI's resolved snapshot without exposing an initialization path."""
+    from pathlib import Path
+
+    from aegis_core import team_profile
+    from aegis_core.config import env_workspace
+    from aegis_core.team_profile import display_profile
+    from aegis_core.workspace.base import Workspace
+    from aegis_core.workspace.binding import resolve_cli_root
+
+    if not isinstance(args, dict) or any(key not in SERVER_INJECTED for key in args):
+        return _team_config_argument_refusal()
+    payload = _team_config_payload()
+    try:
+        raw = args.get("workspace")
+        if isinstance(raw, Workspace):
+            root = raw.root
+        elif isinstance(raw, (str, Path)):
+            root = resolve_cli_root(explicit=raw, pin=env_workspace())
+        elif raw is None:
+            root = resolve_cli_root(pin=env_workspace())
+        else:
+            raise ValueError("workspace unavailable")
+    except (OSError, ValueError, RuntimeError):
+        payload.update(status="refused", reason="profile operation unavailable", layer="filesystem",
+                       file="<workspace>",
+                       next_action="Check the trusted workspace and home directories and retry on a platform with anchored file operations.")
+        return display_profile(payload)
+    payload["scope"] = {"workspace": str(root)}
+    try:
+        payload.update(status="done", **team_profile.load(root),
+                       next_action="Run aegis team doctor --json before starting a run.")
+    except team_profile.ProfileError as exc:
+        payload.update(status="refused", reason=str(exc), layer=exc.layer, file=exc.file,
+                       next_action="Correct the indicated file or command-line layer, then retry. Run aegis team config presets --json for preset and host choices; repository policy changes need aegis approve before merge.")
+    except (OSError, ValueError, RuntimeError):
+        payload.update(status="refused", reason="profile operation unavailable", layer="filesystem",
+                       file=str(root.joinpath(*team_profile.REPO_PATH)),
+                       next_action="Check the trusted workspace and home directories and retry on a platform with anchored file operations.")
+    return display_profile(payload)
+
+
 _TOOL_HANDLERS = {
     "aegis_scan": handle_scan,
     "aegis_report_outcome": handle_report_outcome,
@@ -18,6 +81,7 @@ _TOOL_HANDLERS = {
     "aegis_capture_insight": handle_capture_insight,
     "aegis_msg_read": handle_msg_read,
     "aegis_msg_write": handle_msg_write,
+    "aegis_team_config": _handle_team_config,
 }
 
 # Set by the server (or passed by an in-process caller), never part of a tool schema.
@@ -66,8 +130,13 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
     return None
 
 
-def execute_tool(name: str, args: dict) -> Any:
+def execute_tool(name: str, args: dict, *, client_arguments: bool = False) -> Any:
     """Check the arguments against the schema, dispatch, and project the response if a view is asked for."""
+    if name == "aegis_team_config":
+        # This closed read surface owns non-echoing, CLI-shaped argument refusals.
+        if client_arguments and (not isinstance(args, dict) or args):
+            return _team_config_argument_refusal()
+        return _handle_team_config(args)
     if name in ("aegis_msg_read", "aegis_msg_write"):
         # The codec owns fixed, non-echoing errors and bounds for this surface.
         from aegis_core.message_codec import CodecError
