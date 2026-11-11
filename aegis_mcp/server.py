@@ -376,6 +376,12 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _manager_config is not None:
         return _manager_call(req_id, params)
 
+    if isinstance(params, dict) and params.get("name") == "aegis_team_config":
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or supplied):
+            # The empty client schema applies before reserved keys can be stripped.
+            result = execute_tool("aegis_team_config", supplied, client_arguments=True)
+            return _tool_result(req_id, json.dumps(result), True)
     if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
         supplied = params.get("arguments")
         if supplied is not None and (not isinstance(supplied, dict) or
@@ -442,7 +448,8 @@ def _repository_call(req_id, params, name, args):
         text, needs_json = message_result(result)
         return _tool_result(req_id, json.dumps(text, separators=(",", ":")) if needs_json else text,
                             needs_json and "error" in text)
-    return _tool_result(req_id, json.dumps(result), is_error_result(result))
+    refused_config = name == "aegis_team_config" and result.get("status") == "refused"
+    return _tool_result(req_id, json.dumps(result), is_error_result(result) or refused_config)
 
 
 
