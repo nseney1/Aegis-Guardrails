@@ -1,7 +1,14 @@
-"""Fresh-thread briefs through the CLI; records remain inert claims."""
+"""Fresh-thread briefs through the CLI; records remain inert claims.
+
+The real-dispatcher invariant table is the primary writer-release barrier.
+Structural checks are secondary syntax allowlists: they do not prove Python
+control flow, binding identity or absence of side effects. Runtime mutation
+controls cover those subtler forms without treating an AST match as proof.
+"""
 import ast
 import errno
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -24,12 +31,577 @@ from tools.hierarchy_mailbox import Mailbox, safe_path
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
 
 
+LATCH_STATES = list(itertools.product((False, True), repeat=3))
+LATCH_OUTCOMES = list(itertools.product(('missing', 'failed', 'proved'),
+                                       ('enter', 'exit', 'ok'), (True, False)))
+
+
+LATCH_PROJECT_DRIVER = r'''
+import json, sys
+from contextlib import contextmanager
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import hierarchy_small_change_dispatch as dispatch
+from hierarchy_lifecycle import Lifecycle
+from hierarchy_workspace import Store
+
+lifecycle, store, recipes, mailbox, lock, mutate = sys.argv[2:8]
+race = sys.argv[8] if len(sys.argv) > 8 else None
+mutate = mutate == 'True'
+observed = {'proofs': 0, 'finalizers': [], 'custody': [], 'locks': [], 'unknown': None, 'resolved': None, 'routed': None,
+            'race': False, 'exit_collections': None, 'collections': None}
+proof_tokens = {}
+
+def collections(frame):
+    while frame is not None:
+        if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name == 'project':
+            values = frame.f_locals
+            return {'rows': [row['request_id'] for row in values['rows']],
+                    'custody': [facts.request_id for facts in values['custody']],
+                    'contexts': [holder.key for holder in values['contexts']],
+                    'released': [facts.released for facts in values['custody']]}
+        frame = frame.f_back
+    raise AssertionError('project collection frame is missing')
+
+original_lock = dispatch.writer_lock
+@contextmanager
+def writer_lock(root):
+    assert Path(root) == Path(mailbox)
+    observed['locks'].append('enter')
+    if lock == 'enter':
+        raise OSError('table writer lock enter refusal')
+    with original_lock(root):
+        yield
+    observed['locks'].append('exit')
+    observed['exit_collections'] = collections(sys._getframe())
+    if lock == 'exit':
+        raise OSError('table writer lock exit refusal')
+dispatch.writer_lock = writer_lock  # Only this module's OS-lock reference.
+
+if race:
+    import subprocess
+    original_journal_lock = dispatch.router.writer_lock
+    @contextmanager
+    def journal_lock(root):
+        frame, final_snapshot = sys._getframe(), False
+        while frame is not None:
+            if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name == 'project':
+                final_snapshot = 'final' in frame.f_locals
+                break
+            frame = frame.f_back
+        if final_snapshot and not observed['race']:
+            observed['race'] = True
+            # The concurrent writer uses the real public lifecycle recorder in
+            # another process, before this final snapshot acquires its lock.
+            program = ('import json,sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\n'
+                       'from hierarchy_lifecycle import Lifecycle\nfrom hierarchy_mailbox import digest\n'
+                       'ledger=Lifecycle(Path(sys.argv[2]))\n'
+                       'for value in json.loads(Path(sys.argv[3]).read_text()):\n'
+                       '    event=value["event"]\n'
+                       '    if event["type"] == "small_change_admit":\n'
+                       '        row=ledger.load()[1]["requests"][event["request_id"]]\n'
+                       '        event["decision_sha256"]=digest(row["small_change"]["decisions"][-1])\n'
+                       '    ledger.record(value)\n')
+            child = subprocess.run([sys.executable, '-I', '-B', '-c', program, sys.argv[1], lifecycle, race],
+                                   capture_output=True, text=True, timeout=30)
+            assert child.returncode == 0 and not child.stderr, (child.stdout, child.stderr)
+        with original_journal_lock(root):
+            yield
+    dispatch.router.writer_lock = journal_lock  # Only the reader module's OS-lock reference.
+
+def observe(frame, event, value):
+    if event != 'return':
+        return
+    if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name == 'project':
+        observed['collections'] = collections(frame)
+    if frame.f_code.co_filename == dispatch.fresh.__file__ and frame.f_code.co_name == 'prove':
+        if value is not None:
+            observed['proofs'] += 1
+            proof_tokens[id(frame.f_locals['self'])] = value
+    if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name == 'finalize_writer_release':
+        holder = frame.f_locals['self']
+        token = proof_tokens.get(id(holder.operation))
+        observed['finalizers'].append({'proof': token is not None and token is holder._verification_proof,
+            'clear': frame.f_locals['clear_only'], 'released': bool(value and value.released)})
+    if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name == 'run':
+        row = frame.f_locals['self'].row
+        observed.update(unknown=bool(row.get('lifecycle_unknown')), resolved=row['resolution'] is not None,
+                        routed=row['routed'] is not None)
+    if frame.f_code.co_filename == dispatch.__file__ and frame.f_code.co_name in {'run', 'clear_writer_release'}:
+        holder = frame.f_locals['self']
+        token = proof_tokens.get(id(holder.operation))
+        facts = holder._custody
+        if facts is not None:
+            observed['custody'].append({'released': facts.released,
+                'proof': token is not None and token is holder._verification_proof})
+
+previous = sys.getprofile()
+try:
+    sys.setprofile(observe)
+    result = dispatch.project(Lifecycle(Path(lifecycle)), Store(Path(store)), recipes=Path(recipes),
+                              wait=0.1, mutate=mutate)
+finally:
+    sys.setprofile(previous)
+print(json.dumps({'result': result, 'observed': observed}))
+'''
+
+
+def latch_unknown_event(world):
+    """A correlated, hash-valid historical refusal, matching the replay fixtures."""
+    paths = sorted((world.ledger.path / 'events').glob('*.json'))
+    previous = json.loads(paths[-1].read_text())
+    value = {'request_sha256': raw_request(world.change.value)['sha256'], 'intent_id': 'table-unknown',
+             'outcome': 'passed', 'exit_code': 'invalid', 'source': SOURCE, 'evidence': world.ledger.evidence}
+    envelope = {'id': 'table-unknown', 'actor': world.ledger.operator, 'generation': 1,
+                'custody': {'cid': world.ledger.root_actor, 'generation': 1},
+                'event': {'type': 'terminal', **world.ledger.target(world.change.value), 'result': raw_request(value)}}
+
+    def sha(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                         ensure_ascii=True).encode()).hexdigest()
+
+    record = {**previous, 'sequence': previous['sequence'] + 1, 'previous': sha(previous),
+              'envelope': envelope, 'event_sha256': sha(envelope)}
+    (paths[-1].parent / ('%06d.json' % record['sequence'])).write_text(json.dumps(record))
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='real dispatcher fixtures require Linux process evidence')
+@pytest.mark.parametrize('routed,resolved,unknown', LATCH_STATES,
+                         ids=['routed-%s-resolved-%s-unknown-%s' % state for state in LATCH_STATES])
+def test_latch_release_invariant_table(tmp_path, routed, resolved, unknown):
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld
+
+    folder = tmp_path / 'world'
+    folder.mkdir()
+    world = DispatchWorld(folder)
+    initial = world.dispatch()
+    assert initial['small_changes'][0]['writer_publication_verified'] is True, initial
+    writer_packet = Path(world.messages('dispatch')[0]['message']['brief']['path'])
+    if not routed:
+        last = sorted((world.ledger.path / 'events').glob('*.json'))[-1]
+        assert json.loads(last.read_text())['envelope']['event']['type'] == 'route'
+        last.unlink()  # Model retained delivery without the final journal receipt.
+    if resolved:
+        world.ledger.event('disposition', status='FINAL', resolution={'kind': 'next',
+            'request': raw_request(request('table-next')), 'evidence': world.ledger.evidence},
+            **world.ledger.target(world.change.value))
+    if unknown:
+        latch_unknown_event(world)
+    snapshot = tmp_path / 'snapshot'
+    shutil.copytree(folder, snapshot, symlinks=True)
+    for verification, lock, mutate in LATCH_OUTCOMES:
+        # Restore at the SAME path: durable references remain genuine absolute
+        # paths. Only owned fixture directories are replaced between scenarios.
+        shutil.rmtree(folder)
+        shutil.copytree(snapshot, folder, symlinks=True)
+        if verification == 'failed':
+            writer_packet.write_bytes(b'table changed writer attachment\n')
+        elif verification == 'missing':
+            writer_packet.unlink()
+        process = subprocess.run([sys.executable, '-I', '-B', '-c', LATCH_PROJECT_DRIVER, str(ROOT / 'tools'),
+            str(world.ledger.path), str(world.workspace.store), str(world.recipes_path), str(world.root),
+            lock, str(mutate)], capture_output=True, text=True, timeout=30)
+        scenario = (routed, resolved, unknown, verification, lock, mutate)
+        assert process.returncode == 0 and not process.stderr, (scenario, process.stdout, process.stderr)
+        answer = json.loads(process.stdout)
+        result, observed = answer['result'], answer['observed']
+        expected = (verification == 'proved' and not resolved and not unknown and (routed or mutate)
+                    and (not mutate or lock == 'ok'))
+        rows = [row for row in result['small_changes'] if row['request_id'] == world.change.value['id']]
+        assert len(rows) == 1, (scenario, answer)
+        row = rows[0]
+        finalizers = observed['finalizers']
+        assert all(not facts['released'] or facts['proof'] for facts in finalizers + observed['custody']), (scenario, answer)
+        assert bool(row.get('route_receipt') and row.get('writer_publication_verified')) == expected, (scenario, answer)
+        assert result['planning_exclusions'].count('engine/lane/fix') == (0 if expected else 1), (scenario, answer)
+        collected = observed['collections']
+        identifiers = [world.change.value['id']]
+        assert collected['rows'] == collected['custody'] == collected['contexts'] == identifiers, (scenario, answer)
+        assert collected['released'] == [expected], (scenario, answer)
+        if mutate and lock != 'enter':
+            before_exit = observed['exit_collections']
+            assert before_exit['rows'] == before_exit['custody'] == before_exit['contexts'] == identifiers, (scenario, answer)
+            if lock == 'exit' and verification == 'proved' and routed and not resolved and not unknown:
+                assert before_exit['released'] == [True], (scenario, answer)
+        if expected:
+            assert observed['proofs'] == 1, (scenario, answer)
+            assert sum(facts['released'] for facts in finalizers) == 1, (scenario, answer)
+            assert row['state'] != 'held', (scenario, answer)
+        else:
+            assert row['state'] == 'held', (scenario, answer)
+            assert not finalizers[-1]['released'], (scenario, answer)
+            if verification != 'proved' and not resolved and not unknown and (not mutate or lock == 'ok'):
+                assert any(facts['clear'] for facts in finalizers), (scenario, answer)
+                assert any(not facts['clear'] for facts in finalizers), (scenario, answer)
+        if not mutate:
+            assert observed['locks'] == [], (scenario, answer)
+        if observed['unknown'] is not None:
+            assert observed['unknown'] == unknown and observed['resolved'] == resolved, (scenario, answer)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='real dispatcher fixtures require Linux process evidence')
+@pytest.mark.parametrize('mutate', [False, True], ids=['read', 'mutate'])
+@pytest.mark.parametrize('race', ['new-request', 'new-decision'])
+@pytest.mark.parametrize('verification', ['proved', 'failed'])
+def test_latch_snapshot_race_table(tmp_path, race, mutate, verification):
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld
+
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    directory = world.ledger.path / 'events'
+    before = set(directory.glob('*.json'))
+    if race == 'new-request':
+        change = SmallChange(world.ledger, request('table-raced-request'))
+        change.plan['plan']['writing_lanes'][0]['lane'] = 'other'
+        change.register()
+        change.decide()
+        change.admit()
+        world.ledger.event('route', actor='router-1', to='engine/lane/other',
+                           **world.ledger.target(change.value))
+    else:
+        world.ledger.event('decision', actor=world.ledger.root_actor, decision='deny',
+                           reason='table decision changed after verification',
+                           **world.ledger.target(world.change.value))
+    appended = sorted(set(directory.glob('*.json')) - before)
+    events = [json.loads(path.read_text())['envelope'] for path in appended]
+    for path in appended:
+        path.unlink()
+    packet = tmp_path / 'race-events.json'
+    packet.write_text(json.dumps(events))
+    if verification == 'failed':
+        writer_packet = Path(world.messages('dispatch')[0]['message']['brief']['path'])
+        writer_packet.write_bytes(b'table failed writer before snapshot race\n')
+    before_race = world.dispatch(command='status')['small_changes'][0]
+    process = subprocess.run([sys.executable, '-I', '-B', '-c', LATCH_PROJECT_DRIVER, str(ROOT / 'tools'),
+        str(world.ledger.path), str(world.workspace.store), str(world.recipes_path), str(world.root),
+        'ok', str(mutate), str(packet)], capture_output=True, text=True, timeout=45)
+    assert process.returncode == 0 and not process.stderr, (process.stdout, process.stderr)
+    answer = json.loads(process.stdout)
+    result, observed = answer['result'], answer['observed']
+    assert observed['race'] and observed['proofs'] == (1 if verification == 'proved' else 0), answer
+    canonical = world.ledger.status()
+    if race == 'new-request':
+        assert canonical['requests'][change.value['id']]['routed'] is not None, canonical
+    else:
+        decisions = [value for value in canonical['decisions'] if value['request_id'] == world.change.value['id']]
+        assert decisions[-1]['decision'] == 'deny', canonical
+    assert result['planning_exclusions'].count('engine/lane/fix') == 1, answer
+    row = result['small_changes'][0]
+    assert row['state'] == 'held' and not row.get('route_receipt') and not row.get('writer_publication_verified'), answer
+    if verification == 'failed':
+        assert row['reason'] == before_race['reason'] and row['detail'] == before_race['detail'], answer
+    if race == 'new-request':
+        assert result['planning_exclusions'].count('engine/lane/other') == 1, answer
+        assert not any(row.get('writer_publication_verified') for row in result['small_changes']
+                       if row['request_id'] == change.value['id']), answer
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='real dispatcher fixtures require Linux process evidence')
+@pytest.mark.parametrize('failure', ['review', 'check'])
+def test_latch_head_advance_preserves_owner_hold_drafts_and_evidence(tmp_path, failure):
+    from tests.integration.test_hierarchy_mailbox import mailbox_snapshot
+    from tests.integration.test_hierarchy_small_change_dispatch import (
+        DispatchWorld, r13_second_team, ready_reviewer, record_drafts, review_result,
+    )
+
+    world = DispatchWorld(tmp_path)
+    if failure == 'review':
+        review_result(world, ready_reviewer(world), 'reject')
+        reason = 'small_change_review_rejected'
+    else:
+        world.dispatch()
+        world.finish_writer()
+        world.dispatch()
+        job = world.messages('job_request')[0]['message']
+        invoke(world.root, 'publish', {'message_id': 'owner-check-refused', 'from': 'engine/root',
+            'to': 'engine/orchestrator', 'host': 'host-one', 'session': 'engine/root', 'binding_generation': 1,
+            'type': 'job_receipt', 'in_reply_to': job['message_id'], 'body': 'owner retains refused check',
+            'receipt': {'state': 'refused', 'reason': 'owner refused original check'}})
+        reason = 'small_change_check_failed'
+    _other_root, other = r13_second_team(world, 'zz-next-route')
+    assert world.change.value['id'] < other.value['id']
+    before = world.dispatch(command='status')['small_changes'][0]
+    assert before['state'] == 'held' and before['reason'] == reason, before
+    assert before['drafts'], before
+    assert all(draft['event']['status'] == 'HOLD' and draft['event']['resolution']['kind'] == 'blocked'
+               and draft['event']['resolution']['evidence'] for draft in before['drafts']), before
+    evidence = {ref['path']: Path(ref['path']).read_bytes() for draft in before['drafts']
+                for ref in draft['event']['resolution']['evidence']}
+    retained = mailbox_snapshot(world.root)
+    original = world.ledger.status()
+    answer = world.dispatch()
+    canonical = world.ledger.status()
+    assert canonical['head'] != original['head'], answer
+    assert canonical['requests'][other.value['id']]['routed'] is not None, answer
+    assert canonical['requests'][world.change.value['id']] == original['requests'][world.change.value['id']]
+    row = answer['small_changes'][0]
+    assert row['drafts'] == before['drafts'], (before, answer)
+    assert row == before, (before, answer)
+    assert mailbox_snapshot(world.root) == retained
+    assert {path: Path(path).read_bytes() for path in evidence} == evidence
+    assert not row.get('route_receipt') and not row.get('writer_publication_verified'), row
+    assert answer['planning_exclusions'].count('engine/lane/fix') == 1, answer
+    # Exact envelopes remain consumable through the owner's public recorder.
+    record_drafts(world, row)
+    resolution = world.change.row()['resolution']
+    assert resolution == row['drafts'][-1]['event']['resolution']
+
+
+LATCH_DRAFT_DRIVER = r'''
+import json, sys, subprocess
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import hierarchy_small_change_dispatch as dispatch
+from hierarchy_lifecycle import Lifecycle
+from hierarchy_workspace import Store
+lifecycle, store, recipes, packet, cause = sys.argv[2:7]
+observed = {'injected': False, 'before': None, 'frames': [], 'capture_changed': False}
+
+def boundary():
+    frame, holder, names, final = sys._getframe(1), None, [], False
+    while frame is not None:
+        if frame.f_code.co_filename == dispatch.__file__:
+            names.append(frame.f_code.co_name)
+            if frame.f_code.co_name == 'run':
+                holder = frame.f_locals['self']
+            if frame.f_code.co_name == 'project':
+                final = 'final' in frame.f_locals
+                if final:
+                    holder = frame.f_locals['contexts'][0]
+        frame = frame.f_back
+    return holder, names, final
+
+def inject(holder, names):
+    assert holder is not None and holder.view['drafts']
+    observed.update(injected=True, before=json.loads(json.dumps(holder.view['drafts'])), frames=names)
+    if cause == 'capture':
+        # Every pass captures policy, including a check refused before recipes
+        # are read. Whitespace changes its witness without changing its policy.
+        with (Path(lifecycle) / 'policy.json').open('ab') as stream:
+            stream.write(b'\n')
+    else:
+        program = ('import json,sys\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\n'
+                   'from hierarchy_lifecycle import Lifecycle\n'
+                   'Lifecycle(Path(sys.argv[2])).record(json.loads(Path(sys.argv[3]).read_text()))\n')
+        child = subprocess.run([sys.executable, '-I', '-B', '-c', program, sys.argv[1], lifecycle, packet],
+                               capture_output=True, text=True, timeout=30)
+        assert child.returncode == 0 and not child.stderr, (child.stdout, child.stderr)
+
+original_os = dispatch.fresh.os
+def stat(path, *args, **kwargs):
+    holder, names, final = boundary()
+    if (not observed['injected'] and holder is not None and holder.view['drafts']
+            and ((cause == 'capture' and not final)
+                 or (cause == 'release-journal' and 'finalize_writer_release' in names))):
+        inject(holder, names)
+    return original_os.stat(path, *args, **kwargs)
+# Patch only the captured-reader module's OS reference, never the shared os module.
+dispatch.fresh.os = SimpleNamespace(**dict(vars(original_os), stat=stat))
+
+original_journal_lock = dispatch.router.writer_lock
+@contextmanager
+def journal_lock(root):
+    holder, names, final = boundary()
+    if cause in {'head', 'denial'} and final and not observed['injected']:
+        inject(holder, names)
+    with original_journal_lock(root):
+        yield
+dispatch.router.writer_lock = journal_lock
+
+original_lock = dispatch.writer_lock
+@contextmanager
+def writer_lock(root):
+    with original_lock(root):
+        yield
+    if cause == 'lock-exit':
+        # The Row.run frame has returned, but collection is complete before exit.
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_name != 'project':
+            frame = frame.f_back
+        holder = frame.f_locals['current']
+        observed.update(injected=True, before=json.loads(json.dumps(holder.view['drafts'])), frames=['lock-exit'])
+        raise OSError('draft table lock exit refusal')
+dispatch.writer_lock = writer_lock
+def observe(frame, event, value):
+    if (event == 'return' and frame.f_code.co_filename == dispatch.fresh.__file__
+            and frame.f_code.co_name == 'verify'):
+        operation = frame.f_locals.get('self')
+        if isinstance(getattr(operation, 'validation_failure', None), dispatch.fresh.CaptureChanged):
+            observed['capture_changed'] = True
+previous = sys.getprofile()
+try:
+    sys.setprofile(observe)
+    result = dispatch.project(Lifecycle(Path(lifecycle)), Store(Path(store)), recipes=Path(recipes), wait=0.1, mutate=True)
+finally:
+    sys.setprofile(previous)
+print(json.dumps({'result': result, 'observed': observed}))
+'''
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='real dispatcher fixtures require Linux process evidence')
+@pytest.mark.parametrize('case', ['final', 'resolve', 'review-hold', 'check-hold'])
+@pytest.mark.parametrize('cause', ['head', 'denial', 'capture', 'release-journal', 'lock-exit'])
+def test_latch_draft_invalidation_table(tmp_path, case, cause):
+    from tests.integration.test_hierarchy_mailbox import mailbox_snapshot
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld, ready_reviewer, review_result
+
+    world = DispatchWorld(tmp_path)
+    if case == 'check-hold':
+        world.dispatch()
+        world.finish_writer()
+        world.dispatch()
+        job = world.messages('job_request')[0]['message']
+        invoke(world.root, 'publish', {'message_id': 'draft-check-refused', 'from': 'engine/root',
+            'to': 'engine/orchestrator', 'host': 'host-one', 'session': 'engine/root', 'binding_generation': 1,
+            'type': 'job_receipt', 'in_reply_to': job['message_id'], 'body': 'owner retains refused check',
+            'receipt': {'state': 'refused', 'reason': 'owner refused original check'}})
+    else:
+        reviewer = ready_reviewer(world)
+        if case == 'resolve':
+            world.ledger.event('disposition', status='HOLD', resolution={'kind': 'blocked', 'owner': 'owner',
+                'next_decision': 'review', 'condition': 'owner waiting for review', 'evidence': world.ledger.evidence},
+                **world.ledger.target(world.change.value))
+        review_result(world, reviewer, 'reject' if case == 'review-hold' else 'accept')
+    other = request('draft-other-team', team='docs')
+    world.ledger.publish(other)
+    before = world.dispatch(command='status')['small_changes'][0]
+    assert before['drafts'], before
+    terminal = before['drafts'][-1]['event']
+    if case in {'final', 'resolve'}:
+        assert terminal['type'] == ('disposition' if case == 'final' else 'resolve'), before
+        assert terminal['resolution']['kind'] == 'complete', before
+    else:
+        assert terminal['status'] == 'HOLD' and terminal['resolution']['kind'] == 'blocked', before
+    evidence = {ref['path']: Path(ref['path']).read_bytes() for draft in before['drafts']
+                for ref in draft['event'].get('evidence', draft['event'].get('resolution', {}).get('evidence', []))}
+    retained = mailbox_snapshot(world.root)
+    # Prepare a real public journal envelope, then retain it for the concurrent
+    # recorder to append at the chosen OS boundary rather than before the pass.
+    events = world.ledger.path / 'events'
+    previous = set(events.glob('*.json'))
+    target = world.change.value if cause == 'denial' else other
+    world.ledger.event('decision', actor=world.ledger.root_actor,
+        decision='deny' if cause == 'denial' else 'approve', reason='draft table concurrent decision',
+        **world.ledger.target(target))
+    added = set(events.glob('*.json')) - previous
+    assert len(added) == 1
+    path = added.pop()
+    packet = tmp_path / 'draft-race.json'
+    packet.write_text(json.dumps(json.loads(path.read_text())['envelope']))
+    path.unlink()
+    process = subprocess.run([sys.executable, '-I', '-B', '-c', LATCH_DRAFT_DRIVER, str(ROOT / 'tools'),
+        str(world.ledger.path), str(world.workspace.store), str(world.recipes_path), str(packet), cause],
+        capture_output=True, text=True, timeout=60)
+    assert process.returncode == 0 and not process.stderr, (process.stdout, process.stderr)
+    answer = json.loads(process.stdout)
+    row, observed = answer['result']['small_changes'][0], answer['observed']
+    assert observed['injected'] and observed['before'] == before['drafts'], answer
+    if cause in {'capture', 'release-journal'}:
+        assert observed['capture_changed'], answer
+    if cause == 'capture':
+        assert 'release_validation_error' in row, answer
+    if cause == 'release-journal':
+        assert 'finalize_writer_release' in observed['frames'] and 'run' in observed['frames'], answer
+        if case.endswith('hold'):
+            assert 'release_validation_error' in row, answer
+    assert row['state'] in {'held', 'owned_hold'}, answer
+    if case.endswith('hold'):
+        assert row['drafts'] == before['drafts'], answer
+    else:
+        assert row['drafts'] == [], answer
+        expected_reason = {'head': 'small_change_snapshot_changed', 'denial': 'small_change_revoked',
+            'capture': 'small_change_configuration', 'release-journal': 'small_change_configuration',
+            'lock-exit': 'small_change_configuration'}[cause]
+        assert row['reason'] == expected_reason, answer
+    assert not row.get('route_receipt') and not row.get('writer_publication_verified'), answer
+    assert mailbox_snapshot(world.root) == retained
+    assert {path: Path(path).read_bytes() for path in evidence} == evidence
+
+
+def assert_draft_invalidation_structure(source):
+    """Draft creation is explicit; only invalidate may replace existing drafts."""
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    creation = {'Row.__init__', 'Row.progress', 'Row.run'}
+
+    def scope(node):
+        names = []
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.append(node.name)
+        return '.'.join(reversed(names))
+
+    def view(node):
+        return (isinstance(node, ast.Attribute) and node.attr == 'view' and isinstance(node.value, ast.Name)
+                and node.value.id == 'self')
+
+    invalidators = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == 'invalidate' and scope(node) == 'Row']
+    assert len(invalidators) == 1 and isinstance(invalidators[0], ast.FunctionDef), (
+        'draft invalidation must have one synchronous policy function')
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == 'drafts':
+            raise AssertionError(('draft keyword write is not creation', node.lineno))
+        if not isinstance(node, ast.Constant) or node.value != 'drafts':
+            continue
+        parent, owner = parents[node], scope(node)
+        if isinstance(parent, ast.Dict) and node in parent.keys:
+            assignment = parents[parent]
+            assert (owner == 'Row.__init__' and isinstance(assignment, ast.Assign)
+                    and len(assignment.targets) == 1 and view(assignment.targets[0])
+                    and isinstance(parent.values[parent.keys.index(node)], ast.List)
+                    and not parent.values[parent.keys.index(node)].elts), ('draft initialization', node.lineno)
+            continue
+        assert isinstance(parent, ast.Subscript) and parent.slice is node and view(parent.value), (
+            'draft access is not admitted', node.lineno)
+        statement = parents[parent]
+        if isinstance(parent.ctx, ast.Store):
+            assert isinstance(statement, ast.Assign) and statement.targets == [parent], ('draft assignment', node.lineno)
+            assert owner in creation | {'Row.invalidate'}, ('draft write outside creation/invalidation', node.lineno)
+            if owner != 'Row.invalidate':
+                value = statement.value
+                assert (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                        and isinstance(value.func.value, ast.Name) and value.func.value.id == 'self'
+                        and value.func.attr == 'drafts' and not value.keywords
+                        and len(value.args) == 1 and not isinstance(value.args[0], ast.Starred)), (
+                            'draft creation must use the draft builder', node.lineno)
+        else:
+            assert isinstance(parent.ctx, ast.Load) and (owner == 'Row.invalidate' or (
+                owner == 'Row.run' and isinstance(statement, ast.UnaryOp) and isinstance(statement.op, ast.Not))), (
+                    'draft alias or mutation outside invalidation', node.lineno)
+
+
+def test_latch_draft_writes_are_creation_or_central_invalidation():
+    assert_draft_invalidation_structure((ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8'))
+
+
+def test_latch_draft_structure_rejects_async_policy_shadow():
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source = latch_insert(source, 'Row', 'async def invalidate(self, reason, detail):\n    pass')
+    with pytest.raises(AssertionError, match='draft invalidation'):
+        assert_draft_invalidation_structure(source)
+
+
+@pytest.mark.parametrize('snippet', [
+    'self.view["drafts"] = []', 'self.view.update(drafts=[])',
+    'self.view.update({"drafts": []})', 'self.view["drafts"].clear()',
+    'alias = self.view["drafts"]; alias.clear()', 'del self.view["drafts"]',
+    'self.view["drafts"] += []', 'self.view["drafts"][:] = []',
+])
+def test_latch_draft_structure_rejects_scattered_invalidation(snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    with pytest.raises(AssertionError, match='draft'):
+        assert_draft_invalidation_structure(latch_insert(source, 'Row.run', snippet))
+
+
 def assert_latch_release_structure(source):
     """Allow only explicit view producers, consumers and mutations.
 
-    Every view/rows/run escape is checked, including the read-only aliases in
-    exclusions(). Unknown shapes require review; key spelling is not the only
-    way to discover a protected value.
+    This is a secondary syntax barrier. The real project() table determines
+    release outcomes, including side effects and skipped collection.
     """
     tree = ast.parse(source)
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
@@ -76,6 +648,18 @@ def assert_latch_release_structure(source):
     # opaque reflection primitives too, including aliases to those primitives.
     reflection = {'getattr', 'setattr', 'vars', 'eval', 'exec', 'globals', 'locals'}
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith('__'):
+            parent = parents[node]
+            # All special attribute access requires an admitted shape. This
+            # includes protocols reached indirectly through a bound method.
+            assert (qualified(node) == 'Hold.__init__' and node.attr == '__init__'
+                    and isinstance(node.value, ast.Call) and name(node.value.func, 'super')
+                    and not node.value.args and not node.value.keywords
+                    and isinstance(parent, ast.Call) and parent.func is node
+                    and len(parent.args) == 1 and name(parent.args[0], 'detail') and not parent.keywords), (
+                        'release reflection: unadmitted special attribute', node.lineno)
+        if isinstance(node, ast.Attribute) and node.attr == 'project':
+            raise AssertionError(('release producer result escape', node.lineno))
         if ((isinstance(node, ast.Name) and node.id in reflection)
                 or (isinstance(node, ast.Attribute) and node.attr in reflection | {
                     '__dict__', '__getattribute__', '__setattr__'})
@@ -103,42 +687,72 @@ def assert_latch_release_structure(source):
     assert (isinstance(run, ast.FunctionDef) and len(returns) == 1 and run.body[-1] is returns[0]), (
         'release producer must have one final return')
 
-    # The only escaped views are Row.run's result, the project rows collection,
-    # and the read-only "view" iteration variable inside exclusions().
+    row_class = producers['Row'][0]
+    methods = {node.name for node in row_class.body if isinstance(node, ast.FunctionDef)}
+    assert all(node.args.args and node.args.args[0].arg == 'self'
+               for node in row_class.body if isinstance(node, ast.FunctionDef)), 'release holder parameter'
+    assert not row_class.bases and not row_class.decorator_list, 'release holder definition'
+    assert all(not method.startswith('__') or method == '__init__' for method in methods), (
+        'release holder protocols are not admitted')
+    # A positive list of ordinary fields and methods, rather than a list of
+    # known state-exposing protocols. New holder attributes require review.
+    holder_fields = {
+        '_completed_checks', '_custody', '_retained_jobs', '_verification_proof',
+        '_writer_receipt', '_writer_target_current', '_writer_verified', 'accepted',
+        'change', 'initiative', 'key', 'ledger', 'lifecycle', 'mailbox', 'operation',
+        'plan', 'policy', 'proofs', 'recipes', 'records', 'result_record',
+        'review_not_before', 'reviewer', 'row', 'running_checks', 'setup', 'state',
+        'store', 'team', 'view', 'wait', 'writer',
+    }
+
+    # Views leave Row only through run() and the project rows collection.
+    # The custody consumer has no presentation alias.
     for node in ast.walk(tree):
         parent = parents.get(node)
         scope = qualified(node)
+        if isinstance(node, ast.Name) and node.id == 'project' and isinstance(node.ctx, ast.Load):
+            raise AssertionError(('release producer result escape', node.lineno))
+        if isinstance(node, ast.Name) and node.id == 'context' and isinstance(node.ctx, ast.Load) and scope == 'project':
+            statement = parents.get(parent)
+            assert (isinstance(parent, ast.Call) and parent.func is node
+                    and isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and name(statement.targets[0], 'current')), ('release view escape through context', node.lineno)
         if isinstance(node, ast.Name) and node.id == 'self' and scope.startswith('Row.'):
-            allowed = isinstance(parent, ast.Attribute) and parent.value is node
+            allowed = (isinstance(parent, ast.Attribute) and parent.value is node
+                       and parent.attr in holder_fields | methods)
             allowed = allowed or (isinstance(parent, ast.Call) and name(parent.func, 'hasattr')
                 and len(parent.args) == 2 and parent.args[0] is node and string(parent.args[1])
                 and parent.args[1].value == 'result_record' and not parent.keywords
                 and scope == 'Row.foreign_publications')
             assert allowed, ('release view escape through holder', node.lineno)
+            if isinstance(parent, ast.Attribute) and parent.attr in methods:
+                use = parents[parent]
+                direct = isinstance(use, ast.Call) and use.func is parent
+                callback = (isinstance(use, ast.Call) and isinstance(use.func, ast.Attribute)
+                    and ((parent.attr in {'recheck_jobs', 'recheck_dependencies'} and use.func.attr == 'append')
+                         or (parent.attr == 'verification_pass' and use.func.attr == 'prove')))
+                callback = callback or (parent.attr == 'publication_authority' and isinstance(use, ast.Assign)
+                                        and scope == 'Row.verification_pass')
+                assert direct or callback, ('release view escape through bound method', node.lineno)
         if isinstance(node, ast.Name) and node.id == 'current' and scope == 'project' and isinstance(node.ctx, ast.Load):
-            allowed = isinstance(parent, ast.Attribute) and parent.value is node
+            allowed = (isinstance(parent, ast.Attribute) and parent.value is node
+                       and parent.attr in holder_fields | methods)
             allowed = allowed or (isinstance(parent, ast.Compare) and parent.left is node
                 and len(parent.ops) == 1 and isinstance(parent.ops[0], ast.Is)
                 and len(parent.comparators) == 1 and isinstance(parent.comparators[0], ast.Constant)
                 and parent.comparators[0].value is None)
             allowed = allowed or (isinstance(parent, ast.Call) and name(parent.func, 'exclusions')
-                and len(parent.args) == 2 and parent.args[0] is node and name(parent.args[1], 'rows')
+                and len(parent.args) == 2 and parent.args[0] is node and name(parent.args[1], 'custody')
                 and not parent.keywords)
+            allowed = allowed or (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Attribute)
+                and name(parent.func.value, 'contexts') and parent.func.attr == 'append'
+                and parent.args == [node] and not parent.keywords)
+            allowed = allowed or (isinstance(parent, ast.Assign)
+                and ast.dump(parent, include_attributes=False) == ast.dump(
+                    ast.parse('contexts[-1] = current').body[0], include_attributes=False))
             assert allowed, ('release view escape through current', node.lineno)
         if isinstance(node, ast.Name) and node.id == 'view':
-            allowed = False
-            if scope == 'exclusions':
-                if isinstance(node.ctx, ast.Store):
-                    allowed = (isinstance(parent, (ast.For, ast.comprehension))
-                               and parent.target is node and name(parent.iter, 'rows'))
-                elif isinstance(node.ctx, ast.Load):
-                    allowed = (isinstance(parent, ast.Subscript) and parent.value is node
-                               and isinstance(parent.ctx, ast.Load) and string(parent.slice))
-                    if isinstance(parent, ast.Attribute):
-                        call = parents[parent]
-                        allowed = (parent.attr == 'get' and isinstance(call, ast.Call) and call.func is parent
-                                   and 1 <= len(call.args) <= 2 and string(call.args[0]) and not call.keywords)
-            assert allowed, ('release view escape or mutation of alias', node.lineno)
+            raise AssertionError(('release view escape or mutation of alias', node.lineno))
         if isinstance(node, ast.Name) and node.id == 'rows':
             allowed = False
             if isinstance(node.ctx, ast.Store):
@@ -147,20 +761,13 @@ def assert_latch_release_structure(source):
                 if allowed:
                     collections.append(parent)
             elif isinstance(node.ctx, ast.Load):
-                if scope == 'exclusions':
-                    allowed = (isinstance(parent, (ast.For, ast.comprehension))
-                               and parent.iter is node and name(parent.target, 'view'))
-                elif scope == 'project':
+                if scope == 'project':
                     if isinstance(parent, ast.Attribute):
                         call = parents[parent]
                         if rows_append(call):
                             value = call.args[0]
                             allowed = run_call(value) or (isinstance(value, ast.Attribute)
                                       and name(value.value, 'current') and value.attr == 'view')
-                    elif isinstance(parent, ast.Call):
-                        allowed = (name(parent.func, 'exclusions') and len(parent.args) == 2
-                                   and name(parent.args[0], 'current') and parent.args[1] is node
-                                   and not parent.keywords)
                     elif isinstance(parent, ast.Dict) and isinstance(parents[parent], ast.Return):
                         allowed = any(value is node and string(key) and key.value == 'small_changes'
                                       for key, value in zip(parent.keys, parent.values))
@@ -168,7 +775,8 @@ def assert_latch_release_structure(source):
         if isinstance(node, ast.Attribute) and node.attr == 'run':
             call = parent
             assert (scope == 'project' and run_call(call) and call.func is node
-                    and rows_append(parents[call]) and parents[call].args == [call]), (
+                    and ((rows_append(parents[call]) and parents[call].args == [call])
+                         or isinstance(parents[call], ast.Expr))), (
                         'release view escape through run result', node.lineno)
 
     for node in ast.walk(tree):
@@ -231,20 +839,12 @@ def assert_latch_release_structure(source):
             continue
         removal = False
         if isinstance(parent, ast.Subscript) and parent.slice is token:
-            if isinstance(parent.ctx, ast.Load):
-                assert name(parent.value, 'view') and qualified(parent) == 'exclusions', (
-                    'unrecognized release key read', token.lineno)
-                continue
             statement = parents[parent]
             assert (view(parent.value) and isinstance(parent.ctx, ast.Store)
                     and isinstance(statement, ast.Assign) and statement.targets == [parent]), (
                         'unrecognized release subscript write', token.lineno)
         elif (isinstance(parent, ast.Call) and parent.args and parent.args[0] is token
               and isinstance(parent.func, ast.Attribute)):
-            if parent.func.attr == 'get':
-                assert name(parent.func.value, 'view') and qualified(parent) == 'exclusions', (
-                    'unrecognized release key read', token.lineno)
-                continue
             statement = parents[parent]
             assert (view(parent.func.value) and parent.func.attr == 'pop' and len(parent.args) == 2
                     and isinstance(parent.args[1], ast.Constant) and parent.args[1].value is None
@@ -272,7 +872,125 @@ def assert_latch_release_structure(source):
 
     assert len(initializers) == 1 and len(collections) == 1, ('release view initialization', len(initializers), len(collections))
     assert writes and len(writers) == 1, ('release function definitions', len(writers))
+    assert_custody_channel(tree, parents, qualified)
     return writes
+
+
+def assert_custody_channel(tree, parents, qualified):
+    """Secondary syntax checks only; the runtime table owns control-flow safety."""
+    def shape(node):
+        return ast.dump(node, include_attributes=False)
+
+    def expression(source):
+        return shape(ast.parse(source, mode='eval').body)
+
+    definitions = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == '_WriterCustody']
+    assert len(definitions) == 1, 'release custody record definition'
+    record = definitions[0]
+    assert (not record.decorator_list and len(record.bases) == 1
+            and isinstance(record.bases[0], ast.Name) and record.bases[0].id == 'NamedTuple'), (
+                'release custody record must be immutable')
+    fields = [node.target.id for node in record.body if isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)]
+    assert fields == ['request_id', 'writer', 'message_present', 'state_head', 'history_verified', 'released'], (
+        'release custody record fields')
+    assert all(isinstance(node, ast.AnnAssign) or (
+        isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+        for node in record.body), 'release custody record body'
+
+    # This small authority consumer admits only this complete parsed shape,
+    # including its bindings and calls. Checking selected keyword spellings
+    # cannot classify unpacking, aliases or an injected replacement statement.
+    consumer = ast.parse('''
+def exclusions(state, custody):
+    result = {team + "/" + role for team in active_teams(state) for role in ("orchestrator", "decider")}
+    captured = set()
+    for facts in custody:
+        require(type(facts) is _WriterCustody, "unverified writer custody input")
+        if facts.state_head != state["head"]:
+            continue
+        captured.add(facts.request_id)
+        row = state["requests"][facts.request_id]
+        released = not row.get("lifecycle_unknown") and row["resolution"] is not None and row["resolution"]["kind"] in {"complete", "blocked"}
+        if not released and (facts.message_present or row["routed"] is not None) and not facts.released:
+            result.add(facts.writer)
+    absent = {facts.request_id for facts in custody if facts.state_head == state["head"]
+              and facts.history_verified and not facts.message_present}
+    for key, row in state["requests"].items():
+        if key in absent and not row.get("lifecycle_unknown") and row["intent"] is None and row["start"] is None:
+            continue
+        canonical_release = closed(row) and row["resolution"]["kind"] in {"complete", "blocked"}
+        if "small_change" in row and not canonical_release and (
+                key not in captured or row.get("lifecycle_unknown") or row["routed"] is None):
+            plan = life.raw_value(row["small_change"]["registration"]["proposal"])["plan"]
+            result.add(row["request"]["team"] + "/lane/" + plan["writing_lanes"][0]["lane"])
+    return sorted(result)
+''').body[0]
+    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'exclusions']
+    assert len(definitions) == 1 and shape(definitions[0]) == shape(consumer), (
+        'release custody consumer has an unadmitted shape')
+    constructor = expression('_WriterCustody(self.key, self.writer, identifier("scw", self.row) in self.records, '
+                             'self.state["head"], history_verified, released)')
+    collection_initializers = []
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        scope = qualified(node)
+        if ((isinstance(node, ast.Attribute) and node.attr == 'finalize_writer_release')
+                or (isinstance(node, ast.Name) and node.id == 'finalize_writer_release')):
+            assert not isinstance(node.ctx, (ast.Store, ast.Del)), ('release finalizer rebinding', node.lineno)
+        if ((isinstance(node, ast.Attribute) and node.attr == '_replace')
+                or (isinstance(node, ast.Name) and node.id == '_replace')):
+            raise AssertionError(('release custody replacement is not admitted', node.lineno))
+        if isinstance(node, ast.Name) and node.id == '_WriterCustody':
+            assert isinstance(node.ctx, ast.Load) and (
+                (scope == 'Row.finalize_writer_release' and isinstance(parent, ast.Call) and parent.func is node
+                 and shape(parent) == constructor and isinstance(parents.get(parent), ast.Return))
+                or (scope == 'exclusions' and isinstance(parent, ast.Compare))), 'release custody constructor escape'
+        if isinstance(node, ast.alias):
+            assert (node.asname or node.name) not in {'_WriterCustody', 'exclusions', 'project', 'Row'}, (
+                'release custody import rebinding')
+        if isinstance(node, ast.Attribute) and node.attr in {'_custody', '_WriterCustody'}:
+            if isinstance(node.ctx, ast.Store):
+                admitted = {
+                    'Row.__init__': {'None'},
+                    'Row.run': {'self.finalize_writer_release()'},
+                    'Row.clear_writer_release': {'self.finalize_writer_release(clear_only=True)'},
+                }
+                assert (isinstance(node.value, ast.Name) and node.value.id == 'self'
+                        and isinstance(parent, ast.Assign) and parent.targets == [node]
+                        and shape(parent.value) in {expression(value) for value in admitted.get(scope, set())}), (
+                            'release custody write', node.lineno)
+            else:
+                collected = (scope == 'project' and shape(node) == expression('current._custody')
+                        and isinstance(parent, ast.Call) and shape(parent) == expression('custody.append(current._custody)')
+                        and isinstance(parents[parent], ast.Expr))
+                head = (scope == 'project' and isinstance(parent, ast.Attribute)
+                        and shape(parent) == expression('current._custody.state_head'))
+                replaced = (scope == 'project' and isinstance(parent, ast.Assign)
+                            and shape(parent) == shape(ast.parse('custody[-1] = current._custody').body[0]))
+                assert collected or head or replaced, ('release custody escape', node.lineno)
+        if isinstance(node, ast.Name) and node.id == 'custody':
+            if scope == 'exclusions':
+                continue
+            admitted = (scope == 'project' and isinstance(node.ctx, ast.Store)
+                        and isinstance(parent, ast.Assign) and parent.targets == [node]
+                        and shape(parent.value) == expression('[]'))
+            if admitted:
+                collection_initializers.append(node)
+            if scope == 'project' and isinstance(node.ctx, ast.Load):
+                admitted = (isinstance(parent, ast.Attribute) and isinstance(parents[parent], ast.Call)
+                            and shape(parents[parent]) == expression('custody.append(current._custody)')
+                            and isinstance(parents[parents[parent]], ast.Expr))
+                admitted = admitted or (isinstance(parent, ast.Call)
+                                        and shape(parent) == expression('exclusions(planning, custody)'))
+                statement = parents.get(parent)
+                admitted = admitted or (isinstance(parent, ast.Subscript) and isinstance(statement, ast.Assign)
+                    and shape(statement) == shape(ast.parse('custody[-1] = current._custody').body[0]))
+            assert admitted, ('release custody collection escape', node.lineno)
+        if isinstance(node, ast.Name) and node.id == 'exclusions' and isinstance(node.ctx, ast.Load):
+            assert (scope == 'project' and isinstance(parent, ast.Call)
+                    and shape(parent) == expression('exclusions(planning, custody)')), 'release custody consumer escape'
+    assert len(collection_initializers) == 1, 'release custody collection must have one initialization'
 
 
 def test_latch_release_assignments_require_one_proof_reading_function():
@@ -355,6 +1073,135 @@ def latch_insert(source, qualified, snippet):
     return ''.join(lines)
 
 
+LATCH_REVIEW_MUTATIONS = (
+    'collection-reset', 'skipped-appends', 'self-finalizer-rebind', 'current-finalizer-rebind',
+    'class-finalizer-rebind', 'class-field-finalizer-rebind', 'replace-released',
+    'walrus-released-assign', 'walrus-released-update', 'walrus-released-condition',
+    'walrus-history-assign', 'walrus-history-update', 'walrus-history-condition',
+    'argon-forged-proof', 'argon-clear-flags',
+)
+
+
+def latch_review_mutation(source, variant):
+    """Trusted reviewer mutation recipes for temporary RED runs, never product configuration."""
+    assert variant in LATCH_REVIEW_MUTATIONS
+
+    def once(old, new):
+        assert source.count(old) == 1, (variant, old)
+        return source.replace(old, new)
+
+    if variant == 'collection-reset':
+        line = '    final = fresh._Operation(reference_cache=reference_cache)\n'
+        return once(line, '    custody = []\n' + line)
+    if variant == 'skipped-appends':
+        lines, changed = [], 0
+        for line in source.splitlines(keepends=True):
+            if line.lstrip().startswith('custody.append('):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.extend([indent + 'if False:\n', '    ' + line])
+                changed += 1
+            else:
+                lines.append(line)
+        assert changed == 3
+        return ''.join(lines)
+    if variant == 'self-finalizer-rebind':
+        header = '    def run(self, mutate):\n'
+        return once(header, header + '        original = self.finalize_writer_release\n'
+                    '        self.finalize_writer_release = lambda **kw: original(**kw)._replace(released=True)\n')
+    if variant == 'current-finalizer-rebind':
+        line = '                        rows.append(current.run(True))\n'
+        return once(line, '                        original = current.finalize_writer_release\n'
+                    '                        current.finalize_writer_release = lambda **kw: original(**kw)._replace(released=True)\n'
+                    + line)
+    if variant == 'class-finalizer-rebind':
+        header = '    def run(self, mutate):\n'
+        return once(header, header + '        original = Row.finalize_writer_release\n'
+                    '        Row.finalize_writer_release = lambda holder, **kw: original(holder, **kw)._replace(released=True)\n')
+    if variant == 'class-field-finalizer-rebind':
+        return latch_insert(source, 'Row', '_original_finalizer = finalize_writer_release\n'
+            'def replacement_finalizer(self, **kw):\n'
+            '    return self._original_finalizer(**kw)._replace(released=True)\n'
+            'finalize_writer_release = replacement_finalizer')
+    if variant == 'replace-released':
+        return once('history_verified, released)', 'history_verified, released)._replace(released=True)')
+    if variant == 'argon-forged-proof':
+        line = '        self._verification_proof = None\n        self.clear_writer_release()\n'
+        return once(line, line + '        self._verification_proof = True\n'
+                    '        self._writer_verified = True\n'
+                    '        self._writer_target_current = True\n'
+                    '        self._writer_receipt = True\n')
+    if variant == 'argon-clear-flags':
+        return latch_insert(source, 'Row.finalize_writer_release',
+            'if self._verification_proof is not None:\n'
+            '    self.view["writer_publication_verified"] = True\n'
+            '    self.view["route_receipt"] = self._writer_receipt')
+    _, field, form = variant.split('-')
+    field = 'history_verified' if field == 'history' else 'released'
+    expression = '(' + field + ' := True)'
+    snippet = {'assign': 'self.view["state"] = ' + expression,
+               'update': 'self.view.update(state=' + expression + ')',
+               'condition': 'if ' + expression + ':\n    self.view["state"] = "held"'}[form]
+    return latch_insert(source, 'Row.finalize_writer_release', snippet)
+
+
+@pytest.mark.parametrize('qualified, snippet', [
+    ('project', 'custody = []'),
+    ('Row.run', 'self.finalize_writer_release = lambda **kw: forged'),
+    ('project', 'current.finalize_writer_release = lambda **kw: forged'),
+    ('project', 'Row.finalize_writer_release = lambda **kw: forged'),
+    ('Row', 'finalize_writer_release = lambda **kw: forged'),
+    ('Row.run', 'self.view["state"] = saved._replace(released=True)'),
+    ('Row.run', 'self.view["state"] = saved._replace(custody=True)'),
+])
+def test_latch_secondary_syntax_bans(qualified, snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(latch_insert(source, qualified, snippet))
+
+
+@pytest.mark.parametrize('snippet', [
+    'facts = facts._replace(**{"released": True})',
+    'changes = {"released": True}; facts = facts._replace(**changes)',
+    'facts = facts._replace(**dict([(key, True)]))',
+    'facts = facts._replace(*(), **{"released": True})',
+    'facts = facts._replace(*arguments)',
+    'replace = facts._replace; facts = replace(released=True)',
+    'replace = facts._replace; facts = replace(**changes)',
+    'replace = facts._replace; facts = replace(*arguments, **changes)',
+    'facts = getattr(facts, "_replace")(**changes)',
+    'setattr(facts, "released", True)',
+    'object.__setattr__(facts, "released", True)',
+    'alias = facts; facts = alias._replace(**changes)',
+    'alias = facts; alias.released = True',
+    'facts.released = True',
+    'facts = forged',
+    'custody = forged',
+    'custody[0] = forged',
+    'for alias in custody:\n    alias = alias._replace(**changes)',
+], ids=['unpacked-literal', 'unpacked-variable', 'dynamic-keywords', 'star-and-unpack', 'starred',
+        'bound-alias', 'unpacked-alias', 'starred-alias', 'getattr', 'setattr', 'object-setattr',
+        'record-alias', 'alias-write', 'attribute-write', 'record-rebinding', 'collection-rebinding',
+        'collection-write', 'iteration-alias'])
+def test_latch_custody_consumer_rejects_unadmitted_shapes(snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    anchor = '    for facts in custody:\n'
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, anchor + ''.join('        ' + line + '\n' for line in snippet.splitlines()))
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('qualified, snippet', [
+    ('Row', 'def recover(holder):\n    publish(holder)'),
+    ('project', 'holder = context(); publish(holder)'),
+    ('Row.run', 'publish(self.clear_writer_release)'),
+])
+def test_latch_argon_holder_syntax_bans(qualified, snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(latch_insert(source, qualified, snippet))
+
+
 @pytest.mark.parametrize('gate', [
     'if self._verification_proof is None or clear_only:\n    WRITE',
     'if self._verification_proof is None:\n    WRITE',
@@ -368,13 +1215,14 @@ def test_latch_r3_rejects_wrong_proof_polarity(gate):
     writes = 'self.view["writer_publication_verified"] = True; self.view["route_receipt"] = self._writer_receipt'
     snippet = gate.replace('WRITE', writes)
     if gate.startswith('if self._verification_proof is None or clear_only:'):
-        # Place it after removals and before clear_only's return, so the inserted
-        # grant would survive the actual recovery clear rather than being dead code.
+        # Place it after removals and before the non-clearing verification arm,
+        # so the inserted grant survives recovery rather than being dead code.
         row = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef) and node.name == 'Row')
         release = next(node for node in row.body if isinstance(node, ast.FunctionDef)
                        and node.name == 'finalize_writer_release')
         clear = next(node for node in ast.walk(release) if isinstance(node, ast.If)
-                     and isinstance(node.test, ast.Name) and node.test.id == 'clear_only')
+                     and isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)
+                     and isinstance(node.test.operand, ast.Name) and node.test.operand.id == 'clear_only')
         lines = source.splitlines(keepends=True)
         lines.insert(clear.lineno - 1, ''.join(' ' * clear.col_offset + line + '\n'
                                              for line in snippet.splitlines()))
@@ -397,6 +1245,71 @@ def test_latch_r3_rejects_reflective_view_access(line):
     source = latch_insert(source, 'Row', 'def recover(self, saved):\n    ' + line)
     with pytest.raises(AssertionError, match='release reflection'):
         assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('protocol', ['__reduce__()', '__reduce_ex__(4)', '__getstate__()',
+                                     'verification_pass.__self__.__reduce_ex__(4)',
+                                     'verification_pass.__self__.__reduce__()'])
+def test_latch_rejects_unadmitted_state_protocols(protocol):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    state = '' if protocol == '__getstate__()' else '[2]'
+    source = latch_insert(source, 'Row', 'def recover(self, saved):\n'
+                          '    self.' + protocol + state + '["vi" + "ew"].update(saved)')
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('snippet', [
+    'answer = project(lifecycle, store)\nfor item in answer["small_changes"]:\n'
+    '    item.update(saved)\nanswer["planning_exclusions"] = exclusions(state, answer["small_changes"])',
+    'callback = project\nanswer = callback(lifecycle, store)',
+    'answer = dispatcher.project(lifecycle, store)\nfor item in answer["small_changes"]:\n'
+    '    item.update(saved)',
+])
+def test_latch_rejects_unadmitted_projection_aliases(snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source += '\ndef bypass(lifecycle, store, state, saved):\n' + ''.join(
+        '    ' + line + '\n' for line in snippet.splitlines())
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+@pytest.mark.parametrize('qualified, snippet', [
+    ('Row.run', 'self._custody = forged'),
+    ('Row.run', 'alias = self._custody'),
+    ('project', 'alias = custody; alias.clear()'),
+    ('project', 'current._custody = forged'),
+    ('project', 'custody.append(_WriterCustody(key, writer, True, state_head, True, True))'),
+    ('project', 'publish(custody)'),
+    ('project', 'callback = exclusions'),
+])
+def test_latch_rejects_unadmitted_custody_transfers(qualified, snippet):
+    source = (ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8')
+    source = latch_insert(source, qualified, snippet)
+    with pytest.raises(AssertionError, match='release'):
+        assert_latch_release_structure(source)
+
+
+def test_latch_exclusions_refuses_presentation_dicts():
+    # Run the public consumer in an isolated interpreter, without platform I/O.
+    driver = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from hierarchy_small_change_dispatch import exclusions
+state = {"requests": {"request": {"request": {"team": "a"}, "resolution": None,
+    "routed": {}, "intent": None, "start": None, "small_change": {}}}}
+view = {"request_id": "request", "writer": "a/lane/fix", "writer_message_present": True,
+    "route_receipt": "forged", "writer_publication_verified": True}
+try:
+    exclusions(state, [view])
+except ValueError as exc:
+    assert str(exc) == "unverified writer custody input", str(exc)
+else:
+    raise AssertionError("presentation dictionaries granted writer release")
+'''
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', driver, str(ROOT / 'tools')],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize('qualified, snippet', [

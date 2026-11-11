@@ -8,6 +8,7 @@ with one line on stderr naming its replacement.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import os
 import sys
 from pathlib import Path
@@ -42,20 +43,6 @@ def _positionals(argv: List[str]) -> List[str]:
     return out
 
 
-def _message_request(argv: List[str]) -> bool:
-    """Reserve fixed errors for a msg token anywhere, including after --."""
-    return "msg" in argv
-
-
-def _message_error_policy(parser: argparse.ArgumentParser) -> None:
-    """Apply the argv policy to every parser that can refuse this request."""
-    parser._message_argv_errors = True
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for child in action.choices.values():
-                _message_error_policy(child)
-
-
 def removed_command_pointer(argv: List[str]) -> Optional[str]:
     """The one-line pointer for a removed command in argv, or None.
 
@@ -83,20 +70,19 @@ class AegisParser(argparse.ArgumentParser):
             return get_default_registry().format_categorized_help(prog=self.prog) + "\n"
         return super().format_help()
 
+    def __init__(self, *args, error_policy=None, **kwargs):
+        self._error_policy = error_policy
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):
+        factory = kwargs.get("parser_class", type(self))
+        kwargs["parser_class"] = partial(factory, error_policy=self._error_policy)
+        return super().add_subparsers(**kwargs)
+
     def error(self, message: str) -> None:
-        if getattr(self, "_message_argv_errors", False) or getattr(self, "_message_errors", False):
-            from aegis_cli.msg import MsgArgumentError
-
-            raise MsgArgumentError()
+        if self._error_policy is not None:
+            self._error_policy()
         super().error(message)
-
-    def parse_known_args(self, args=None, namespace=None):
-        ns, remaining = super().parse_known_args(args=args, namespace=namespace)
-        if hasattr(ns, "command"):
-            # parse_args reports trailing unknown flags after this returns. Use
-            # argparse's command, including when global flags are abbreviated.
-            self._message_errors = ns.command == "msg"
-        return ns, remaining
 
     def parse_args(self, args=None, namespace=None):
         ns = super().parse_args(args=args, namespace=namespace)
@@ -115,7 +101,7 @@ class AegisParser(argparse.ArgumentParser):
         return ns
 
 
-def _build_parser(prog: str = PROG) -> argparse.ArgumentParser:
+def _build_parser(prog: str = PROG, *, error_policy=None) -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     # SUPPRESS, not False: a subparser writes its defaults over the namespace
     # the top-level parser filled, so a False default here drops a `--json`
@@ -129,6 +115,7 @@ def _build_parser(prog: str = PROG) -> argparse.ArgumentParser:
 
     parser = AegisParser(
         prog=prog,
+        error_policy=error_policy,
         description="Aegis Governance — make AI coding agents trustworthy",
         parents=[common_parser],
     )
@@ -289,26 +276,18 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
         return run_hook_argv(argv[2:])
 
-    # A workspace value may itself be a removed command name. For msg, let
-    # the parser decide arguments under its fixed JSON error policy.
-    message_request = _message_request(argv)
-    pointer = None if message_request else removed_command_pointer(argv)
+    from aegis_cli.msg import MsgErrorPolicy
+
+    policy = MsgErrorPolicy(argv)
+    pointer = policy.removed_pointer(argv, removed_command_pointer)
     if pointer is not None:
         print(pointer, file=sys.stderr)
         return 2
 
-    parser = _build_parser(prog=prog)
-    if message_request:
-        _message_error_policy(parser)
-    from aegis_cli.msg import MsgArgumentError
-
-    try:
-        args = parser.parse_args(argv)
-    except MsgArgumentError:
-        from aegis_cli.msg import emit_error
-        from aegis_core.message_codec import CodecError
-
-        return emit_error(CodecError("E_FORMAT"), detail="arguments")
+    parser = _build_parser(prog=prog, error_policy=policy)
+    args = policy.parse(parser, argv)
+    if isinstance(args, int):
+        return args
     args.prog = prog
     if args.command is None:
         parser.print_help()
@@ -323,26 +302,9 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
             if args.command != "workspace":
                 _attach_workspace(args)
         except (WorkspaceError, OSError) as exc:
-            if args.command == "msg":
-                from aegis_cli.msg import emit_error
-                from aegis_core.message_codec import CodecError
-                from aegis_core.errors import WorkspaceNotFoundError
-
-                detail = ("attachment" if isinstance(exc, OSError) else
-                          "root" if isinstance(exc, WorkspaceNotFoundError) else "binding")
-                # _cli_path chains resolution errors before pin validation runs.
-                if detail == "root" and exc.__cause__ is None:
-                    from aegis_core.config import env_workspace
-                    from aegis_core.workspace.binding import resolve_binding
-
-                    pin = env_workspace()
-                    try:
-                        if pin and resolve_binding(pin=pin).reason == "pin_not_a_workspace":
-                            detail = "pin_not_a_workspace"
-                    except OSError:
-                        # A changing/unreadable pin cannot replace the original refusal.
-                        pass
-                return emit_error(CodecError("E_AUTH"), detail=detail)
+            refusal = policy.workspace_error(args, exc)
+            if refusal is not None:
+                return refusal
             if not isinstance(exc, WorkspaceError):
                 raise
             if isinstance(exc, WorkspaceHold):

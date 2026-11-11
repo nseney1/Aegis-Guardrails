@@ -56,6 +56,13 @@ def choose(bindings, policy, **kwargs):
     return select_model(bindings, policy, "T9", "implementer", [], **kwargs)
 
 
+def test_model_selection_document_names_every_public_function():
+    document = (Path(__file__).resolve().parents[3] / "docs/model-selection.md").read_text(encoding="utf-8")
+    for name in core.__all__:
+        if callable(getattr(core, name)) and not isinstance(getattr(core, name), type):
+            assert name in document
+
+
 @pytest.mark.parametrize("task,role,error", [
     ("unknown", "implementer", "unknown_task_kind"),
     ("T2", "router", "unknown_role_kind"),
@@ -315,8 +322,8 @@ def test_lock_timeout_is_explicit(bindings, policy, tmp_path):
     path = tmp_path / "decisions.jsonl"
     _, record = choose(bindings, policy)
     append_decision(path, record)
-    code = ("from aegis_core.model_select import read_decisions; "
-            "list(read_decisions(" + repr(str(path)) + "))")
+    code = ("from aegis_core import model_select as core; core._LOCK_TIMEOUT_SECONDS = 0.05; "
+            "list(core.read_decisions(" + repr(str(path)) + "))")
     with file_lock(path.with_name(path.name + ".lock")):
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=15)
     assert proc.returncode != 0
@@ -1677,7 +1684,7 @@ def test_round7b_replay_derives_split_eligibility_from_policy(bindings, policy, 
     original = (json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     path.write_bytes(original)
     path.chmod(0o600)
-    with pytest.raises(ModelSelectionError, match="^invalid_history$"):
+    with pytest.raises(ModelSelectionError, match="^invalid_history:policy_rules_changed: start a new team history$"):
         if surface == "transaction":
             core.select_and_append(path, bindings, policy, "T9", "implementer",
                                    host_kinds=("codex-cli", "claude-code"), subject="same")
@@ -1726,7 +1733,7 @@ def test_round7b_replay_derives_each_family_from_supplied_policy(bindings, polic
         # T8 follows the author marker, so this is a valid change of request, not a forgery.
         assert select_model(bindings, policy, "T9", "implementer", [forged])[1]["counts_before"] == {"first": 0, "second": 0}
     else:
-        with pytest.raises(ModelSelectionError, match="^invalid_history$"):
+        with pytest.raises(ModelSelectionError, match="^invalid_history:policy_rules_changed: start a new team history$"):
             select_model(bindings, policy, "T9", "implementer", [forged])
 
 
@@ -1903,3 +1910,244 @@ def test_round7b_path_depth_is_bounded_before_parent_allocation(bindings, policy
     finally:
         tracemalloc.stop()
     assert peak < 512 * 1024
+
+
+@pytest.mark.parametrize("change", ["manager", "team", "flexible", "formal", "lenses", "second"])
+@pytest.mark.parametrize("surface", ["parsed", pytest.param("reader", marks=requires_anchored_io),
+                                   pytest.param("transaction", marks=requires_anchored_io)])
+def test_mr3c_older_policy_rules_preserve_history(bindings, policy, tmp_path, change, surface):
+    history = []
+    for task, role, stage in [("T9", "implementer", "primary"), ("T9", "implementer", "primary"),
+                              ("T1", "orchestrator", "primary"), ("T2", "implementer", "primary"),
+                              ("T4", "reviewer", "primary"), ("T5", "reviewer", "primary"),
+                              ("T6", "reviewer", "whole"), ("T8", "reviewer", "second")]:
+        history.append(select_model(bindings, policy, task, role, history, review_stage=stage,
+                                    author_family="first" if role == "reviewer" else None)[1])
+    original = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+                        for row in history)
+    if change == "manager":
+        policy["manager_family"] = "first"
+    elif change == "team":
+        policy["team_family"] = "second"
+    elif change == "flexible":
+        policy["flexible_tasks"] = []
+    elif change == "formal":
+        policy["review_families"]["T4"]["primary"] = "first"
+        policy["review_families"]["T5"]["primary"] = "second"
+    elif change == "lenses":
+        policy["review_families"]["T6"] = {"primary": "second", "whole": "first"}
+    else:
+        del policy["review_families"]["T8"]["second"]
+    path = tmp_path / "log"
+    if surface != "parsed":
+        path.write_bytes(original)
+        path.chmod(0o600)
+    if surface == "transaction":
+        _, row = core.select_and_append(path, bindings, policy, "T9", "implementer",
+                                       host_kinds=("codex-cli", "claude-code"), subject="new")
+        assert read_decisions(path) == history + [row]
+        assert path.read_bytes().startswith(original)
+    else:
+        _, row = select_model(bindings, policy, "T9", "implementer",
+                              history if surface == "parsed" else core_read_decisions(path))
+    assert row["policy_id"] != history[-1]["policy_id"]
+    assert row["split_id"] == history[-1]["split_id"]
+    assert row["counts_before"] == {"first": 1, "second": 1}
+    assert row["previous_decision_id"] == history[-1]["decision_id"]
+
+
+def test_mr3c_current_policy_missing_review_stage_has_action(bindings, policy):
+    _, forged = select_model(bindings, policy, "T6", "reviewer", [], author_family="first")
+    forged["review_stage"] = "security"  # Structurally valid, absent from supplied policy.
+    reidentify_record(forged)
+    with pytest.raises(ModelSelectionError, match="^invalid_history:policy_rules_changed: start a new team history$"):
+        select_model(bindings, policy, "T9", "implementer", [forged])
+
+
+@requires_anchored_io
+@pytest.mark.parametrize("surface", ["append", "read", "transaction"])
+def test_mr3c_every_log_lock_uses_policy_timeout(bindings, policy, tmp_path, surface):
+    import sys
+    from aegis_core.storage import file_lock
+
+    path = tmp_path / "log"
+    _, row = choose(bindings, policy)
+    append_decision(path, row)
+    timeouts, previous = [], sys.getprofile()
+
+    def profile(frame, event, function):
+        if event == "call" and frame.f_code is file_lock.__wrapped__.__code__:
+            timeouts.append(frame.f_locals["timeout"])
+
+    sys.setprofile(profile)
+    try:
+        if surface == "append":
+            append_decision(path, dict(row, outcome={"launch_status": "not_launched"}))
+        elif surface == "read":
+            assert read_decisions(path) == [row]
+        else:
+            core.select_and_append(path, bindings, policy, "T9", "implementer",
+                                   host_kinds=("codex-cli", "claude-code"), subject="new")
+    finally:
+        sys.setprofile(previous)
+    # Generator profiling records both initial entry and resumption after yield.
+    assert timeouts and set(timeouts) == {core._LOCK_TIMEOUT_SECONDS}
+
+
+@pytest.mark.parametrize("surface", ["parsed", pytest.param("file", marks=requires_anchored_io),
+                                   pytest.param("transaction", marks=requires_anchored_io)])
+def test_mr3c_260_bindings_have_mr1_parity(bindings, policy, tmp_path, monkeypatch, surface):
+    import importlib
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "tools"))
+    provision = importlib.import_module("hierarchy_provision")
+    registry = tuple("host-%d" % i for i in range(65))
+    templates = [row for row in bindings["hosts"] if row["host"] == "codex-cli"]
+    bindings["hosts"] = [dict(copy.deepcopy(row), host=host) for host in registry for row in templates]
+    raw = json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert len(bindings["hosts"]) == 260
+    assert len(raw) < core.MAX_INPUT_BYTES
+    path = tmp_path / "bindings.json"
+    path.write_bytes(raw)
+    monkeypatch.setattr(provision.hierarchy_hosts, "TEAM_HOSTS", registry)
+    monkeypatch.setattr(provision, "read_pinned_bindings", lambda setup, base: (path, raw))
+    roles, hosts, _, _ = provision.load_model_bindings({}, tmp_path)
+    supplied = path if surface != "parsed" else bindings
+    assert core.validate_bindings(supplied, host_kinds=registry) == (roles, hosts)
+    policy["family_hosts"] = {"first": [registry[0]], "second": [registry[1]]}
+    if surface == "transaction":
+        choice, _ = core.select_and_append(tmp_path / "log", supplied, policy, "T9", "implementer",
+                                           host_kinds=registry, subject="large")
+    else:
+        choice, _ = choose(supplied, policy, host_kinds=registry)
+    assert choice["host"] == registry[0]
+
+
+@requires_anchored_io
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "utf-32",
+                                      "utf-32-le", "utf-32-be", "invalid-utf-8"])
+@pytest.mark.parametrize("field", ["bindings", "policy"])
+def test_mr3c_config_bytes_require_strict_utf8(bindings, policy, tmp_path, encoding, field):
+    text = json.dumps(bindings if field == "bindings" else policy)
+    raw = text.encode(encoding) if encoding != "invalid-utf-8" else b"\xff" + text.encode("utf-8")
+    path = tmp_path / "config.json"
+    path.write_bytes(raw)
+    with pytest.raises(ModelSelectionError, match="^invalid_" + field + "$"):
+        choose(path if field == "bindings" else bindings, path if field == "policy" else policy)
+
+
+@requires_anchored_io
+@pytest.mark.parametrize("surface", ["append", "transaction"])
+@pytest.mark.parametrize("change", ["rewrite", "grow", "replace", "unlink", "create"])
+def test_mr3c_publication_refuses_changed_log(bindings, policy, tmp_path, monkeypatch, surface, change):
+    from types import SimpleNamespace
+
+    path = tmp_path / "log"
+    _, first = choose(bindings, policy)
+    if change != "create":
+        append_decision(path, first)
+    history = [] if change == "create" else [first]
+    _, pending = select_model(bindings, policy, "T9", "implementer", history, subject="pending")
+    fsync, changed = os.fsync, []
+
+    def sync_and_change(descriptor):
+        fsync(descriptor)
+        if changed:
+            return
+        if change == "unlink":
+            path.unlink()
+            changed.append(None)
+            return
+        if change == "replace":
+            replacement = tmp_path / "replacement"
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o600)
+            replacement.replace(path)
+        elif change == "rewrite":
+            before = path.stat()
+            raw = path.read_bytes()
+            path.write_bytes(raw.replace(b'lane-one', b'lane-two'))
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))
+        else:
+            with path.open("ab") as stream:
+                stream.write(b"external\n")
+            path.chmod(0o600)
+        changed.append(path.read_bytes())
+
+    monkeypatch.setattr(core, "os", SimpleNamespace(**dict(vars(os), fsync=sync_and_change)))
+    with pytest.raises(ModelSelectionError, match="^stale_decision$"):
+        if surface == "append":
+            append_decision(path, pending)
+        else:
+            core.select_and_append(path, bindings, policy, "T9", "implementer",
+                                   host_kinds=("codex-cli", "claude-code"), subject="pending")
+    assert changed
+    assert (path.read_bytes() if path.exists() else None) == changed[0]
+    assert not list(tmp_path.glob(".model-select-*"))
+
+
+@requires_anchored_io
+def test_mr3c_generation_failure_closes_source(bindings, policy, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    path = tmp_path / "log"
+    _, row = choose(bindings, policy)
+    append_decision(path, row)
+    original = path.read_bytes()
+    open_log, fstat, streams = core._open_log, os.fstat, []
+
+    def track_open(name, directory):
+        stream = open_log(name, directory)
+        streams.append(stream)
+        return stream
+
+    def fail_generation(descriptor):
+        if streams and not streams[0].closed and descriptor == streams[0].fileno():
+            raise OSError(errno.EIO, "generation unavailable")
+        return fstat(descriptor)
+
+    monkeypatch.setattr(core, "_open_log", track_open)
+    monkeypatch.setattr(core, "os", SimpleNamespace(**dict(vars(os), fstat=fail_generation)))
+    with pytest.raises(OSError, match="generation unavailable") as raised:
+        append_decision(path, dict(row, outcome={"tests_passed": True}))
+    assert raised.value.errno == errno.EIO
+    assert streams and all(stream.closed for stream in streams)
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".model-select-*"))
+
+
+@requires_anchored_io
+@pytest.mark.parametrize("surface", ["append", "transaction"])
+def test_mr3c_stale_probe_fdopen_failure_closes_descriptor(bindings, policy, tmp_path, monkeypatch, surface):
+    from types import SimpleNamespace
+
+    path = tmp_path / "log"
+    _, row = choose(bindings, policy)
+    append_decision(path, row)
+    original = path.read_bytes()
+    fdopen, fsync, synced, failed = os.fdopen, os.fsync, [], []
+
+    def track_sync(descriptor):
+        fsync(descriptor)
+        synced.append(descriptor)
+
+    def fail_probe(descriptor, *args, **kwargs):
+        if synced:
+            failed.append(descriptor)
+            raise OSError(errno.EIO, "probe stream unavailable")
+        return fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(core, "os", SimpleNamespace(**dict(vars(os), fdopen=fail_probe, fsync=track_sync)))
+    with pytest.raises(OSError, match="probe stream unavailable") as raised:
+        if surface == "append":
+            append_decision(path, dict(row, outcome={"tests_passed": True}))
+        else:
+            core.select_and_append(path, bindings, policy, "T9", "implementer",
+                                   host_kinds=("codex-cli", "claude-code"), subject="new")
+    assert raised.value.errno == errno.EIO
+    assert len(failed) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(failed[0])
+    assert closed.value.errno == errno.EBADF
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".model-select-*"))

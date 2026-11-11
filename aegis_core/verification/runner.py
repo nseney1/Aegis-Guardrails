@@ -17,7 +17,7 @@ from aegis_core.workspace.layout import RULES_RELDIR
 from typing import Any, Optional
 
 from . import ToolEvidence, persistence_checker, call_graph, import_guard, mutation_tester, ast_checks, structural_checks
-from .ast_checks import NO_DRIVER_NOTE_TOOL
+from .strict_verdict import NO_DRIVER_NOTE_TOOL, evidence_blocks
 
 VerificationResult = ToolEvidence
 
@@ -692,14 +692,14 @@ def gate_verdict(results: list[ToolEvidence], *, strict: bool = False) -> bool:
     """Simple gate: PASS if all tools pass. Empty results (no changed files) is a clean pass."""
     if not results:
         return True
-    return all(r.verdict and not (strict and r.tool == NO_DRIVER_NOTE_TOOL) for r in results)
+    return all(not evidence_blocks(r.verdict, r.tool, strict=strict) for r in results)
 
 
 def format_summary(results: list[ToolEvidence], *, strict: bool = False) -> str:
     """One-line summary of Layer 1 results."""
     if not results:
         return "Layer 1: No changed files to verify (0 checks run, PASSED)"
-    failed_rows = [r for r in results if not r.verdict or (strict and r.tool == NO_DRIVER_NOTE_TOOL)]
+    failed_rows = [r for r in results if evidence_blocks(r.verdict, r.tool, strict=strict)]
     failed = len(failed_rows)
     passed = len(results) - failed
     total = len(results)

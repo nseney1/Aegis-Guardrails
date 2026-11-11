@@ -1,4 +1,5 @@
 """Exercise the prototype convention through its standalone public CLI."""
+import errno
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import venv
 
 import pytest
@@ -285,6 +287,64 @@ def test_receipt_freshness_preserves_historical_receipts_and_checks_before_dedup
 
 def published(root):
     return sorted(root.glob("**/*.md"))
+
+
+@pytest.mark.parametrize("operation", ["writer_lock", "publish_file"])
+@pytest.mark.parametrize("raw_cleanup", [False, True], ids=["before-cleanup", "after-cleanup"])
+@pytest.mark.parametrize("failure", [OSError(errno.EMFILE, "injected fdopen failure"),
+                                     ValueError("injected fdopen failure"), KeyboardInterrupt(),
+                                     MemoryError("injected buffered writer allocation failure")],
+                         ids=["os-error", "value-error", "interrupted", "allocation-error"])
+def test_fdopen_failure_closes_descriptor(tmp_path, monkeypatch, operation, raw_cleanup, failure):
+    from tools import hierarchy_mailbox as mailbox
+
+    descriptors = []
+    closes = []
+    live_descriptors = set()
+
+    def close(fd):
+        closes.append(fd)
+        os.close(fd)
+        live_descriptors.remove(fd)
+
+    def fail_fdopen(fd, *args, **kwargs):
+        descriptors.append(fd)
+        live_descriptors.add(fd)
+        if raw_cleanup:
+            # Model buffered-writer construction failing after creating FileIO:
+            # io.open closes its raw stream, honoring the supplied closefd flag.
+            raw = os.fdopen(fd, *args, buffering=0, **kwargs)
+            owns_fd = raw.closefd
+            raw.close()
+            assert raw.closed
+            if owns_fd:
+                closes.append(fd)
+                live_descriptors.remove(fd)
+        raise failure
+
+    # Replace only this module's OS boundary; pytest teardown keeps the real os.
+    local_os = SimpleNamespace(**vars(os))
+    local_os.fdopen = fail_fdopen
+    local_os.close = close
+    monkeypatch.setattr(mailbox, "os", local_os)
+    try:
+        with pytest.raises(type(failure)) as raised:
+            if operation == "writer_lock":
+                with mailbox.writer_lock(tmp_path):
+                    pytest.fail("writer lock yielded after fdopen failed")
+            else:
+                mailbox.publish_file(tmp_path / "record.json", b"{}")
+        assert raised.value is failure
+        assert len(descriptors) == 1
+        assert closes == descriptors
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+        assert not list(tmp_path.iterdir())
+    finally:
+        # Keep the RED run from leaking the descriptor it demonstrates.
+        for fd in live_descriptors:
+            os.close(fd)
 
 
 @pytest.mark.parametrize("sender,recipient", [
