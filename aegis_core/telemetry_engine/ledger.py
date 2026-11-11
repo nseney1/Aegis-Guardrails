@@ -42,7 +42,7 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from aegis_core import gitsafe
+from aegis_core import atomicio, credit_memo, gitsafe, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import is_within, utc_stamp
 from aegis_core.storage import (
@@ -314,19 +314,12 @@ def _payload_digest(row: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("ascii")).hexdigest()
 
 
-# How many indexed bytes before the offset are re-read to confirm the cached index still
-# describes this file: (device, inode) alone passes a ledger deleted and recreated on a
-# reused inode, or rewritten in place, as long as it is at least as large as before.
-_TAIL_CHECK_BYTES = 256
-
-
 @dataclass
 class _Index:
     """What appends need from the ledger: the next seq and the (key, rule) identities.
 
-    Cached per ledger file and refreshed from the bytes appended since the last look,
-    so an append in a long-lived process reads only the new tail. ``tail`` holds the
-    last indexed bytes (up to _TAIL_CHECK_BYTES before ``offset``).
+    Reuse only an unchanged generation captured by a settled read. An append or
+    rewrite rebuilds the index: matching end bytes cannot prove prefix continuity.
     """
 
     device: int = -1
@@ -334,7 +327,7 @@ class _Index:
     offset: int = 0
     last_seq: int = 0
     keyed: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)
-    tail: bytes = b""
+    report: Optional[FileReport] = None
 
     def absorb(self, raw_rows: Iterable[Dict[str, Any]]) -> None:
         for raw in raw_rows:
@@ -367,24 +360,37 @@ def _parse_tail(data: bytes) -> List[Dict[str, Any]]:
     return rows
 
 
-def _unread(path: Path, index: Optional[_Index], st: os.stat_result) -> Tuple[_Index, bytes]:
+def _unread(path: Path, index: Optional[_Index], st: os.stat_result,
+            clock_path: Path) -> Tuple[_Index, bytes]:
     """The cached index if it still describes ``path``, else a new one; plus the bytes
     after its offset."""
-    with open(path, "rb") as fh:
-        if (
-            index is not None
-            and (index.device, index.inode) == (st.st_dev, st.st_ino)
-            and st.st_size >= index.offset
-        ):
-            fh.seek(index.offset - len(index.tail))
+    generation = storage.file_generation(st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    fd = atomicio.open_regular(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        opened = os.fstat(fd)
+        same_descriptor = ((opened.st_dev, opened.st_ino) == (st.st_dev, st.st_ino)
+                           and storage.file_generation(opened.st_size, opened.st_mtime_ns,
+                                                       opened.st_ctime_ns) == generation)
+        if (same_descriptor and index is not None and index.report is not None
+                and (index.device, index.inode) == (st.st_dev, st.st_ino)
+                and index.offset == st.st_size
+                and credit_memo.settled(index.report)
+                and storage.file_generation(index.report.size, index.report.mtime_ns,
+                                            index.report.ctime_ns) == generation):
+            return index, b""
+        started_ns = credit_memo.filesystem_now(clock_path, opened.st_dev)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
             data = fh.read()
-            if data.startswith(index.tail):
-                return index, data[len(index.tail):]
-            fh.seek(0)
-        return _Index(device=st.st_dev, inode=st.st_ino), fh.read()
+            report = storage.file_report(fh.fileno(), data, started_ns=started_ns)
+        if (report is not None and (not same_descriptor or report.identity != (st.st_dev, st.st_ino)
+                or storage.file_generation(report.size, report.mtime_ns, report.ctime_ns) != generation)):
+            report = None  # A read spanning a generation change cannot certify a later hit.
+        return _Index(device=opened.st_dev, inode=opened.st_ino, report=report), data
+    finally:
+        os.close(fd)
 
 
-def _current_index(path: Path) -> _Index:
+def _current_index(path: Path, clock_path: Path) -> _Index:
     """The index of ``path`` as it is on disk now. Call with the workspace lock held.
 
     A final line without a newline is read on every call and never cached: a torn
@@ -402,31 +408,28 @@ def _current_index(path: Path) -> _Index:
         with _INDEX_GUARD:
             _INDEXES[key] = index
         return index
-    index, data = _unread(path, index, st)
+    index, data = _unread(path, index, st, clock_path)
     complete = data.rfind(b"\n") + 1
     if complete:
         index.absorb(_parse_tail(data[:complete]))
         index.offset += complete
-        index.tail = (index.tail + data[:complete])[-_TAIL_CHECK_BYTES:]
     with _INDEX_GUARD:
         _INDEXES[key] = index
     unterminated = _parse_tail(data[complete:])
     if not unterminated:
         return index
-    view = _Index(index.device, index.inode, index.offset, index.last_seq, dict(index.keyed), index.tail)
+    view = _Index(index.device, index.inode, index.offset, index.last_seq, dict(index.keyed), index.report)
     view.absorb(unterminated)
     return view
 
 
 def _write(path: Path, rows: List[Dict[str, Any]]) -> Optional[FileReport]:
-    """Append rows and absorb them into the index. Call with the workspace lock held."""
+    """Append rows and invalidate the index. Call with the workspace lock held."""
     try:
         written = append_jsonl(path, rows)
-    except BaseException:
+    finally:
         with _INDEX_GUARD:
-            _INDEXES.pop(str(path), None)  # the file may hold part of the write: re-read it next time
-        raise
-    _current_index(path)
+            _INDEXES.pop(str(path), None)  # A failed write may also have changed the file.
     return getattr(written, "report", None)
 
 
@@ -490,7 +493,7 @@ def append(workspace: Any, events: Iterable[Dict[str, Any]]) -> List[Dict[str, A
         return []
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
+        index = _current_index(path, site.lock)
         seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
         results: List[Dict[str, Any]] = []
         new_rows: List[Dict[str, Any]] = []
@@ -527,7 +530,7 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("note must be a mapping")
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
+        index = _current_index(path, site.lock)
         row = {"v": LEDGER_VERSION, "seq": index.last_seq + 1, "ts": utc_stamp(), "epoch": note}
         if site.worktree is not None:
             row["worktree"] = site.worktree
@@ -543,7 +546,7 @@ def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, An
     """
     with ledger_locked(workspace) as site:
         path = site.path
-        index = _current_index(path)
+        index = _current_index(path, site.lock)
         seq = index.last_seq
         seen = set(index.keyed)
         new_rows = []

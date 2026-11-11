@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from aegis_core import primitives
 from aegis_core import codeowners as _codeowners
-from aegis_core import ghcli, gitsafe, governance, pathlookup
+from aegis_core import approval_shape as _approval_shape, ghcli, gitsafe, governance, pathlookup
 from aegis_core.errors import AegisError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
@@ -76,10 +76,10 @@ _STATEMENTS = {
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
 _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULTILINE)
-_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
-_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
 _EXEMPT_TEST_LINE = re.compile(
-    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*?)[ \t]*$",
+    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 _JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
@@ -727,8 +727,8 @@ def _commit_message(top: Path, oid: str) -> Optional[str]:
 def _read_message(top: Path, oid: str) -> Union[str, Approval]:
     message = _commit_message(top, oid)
     return (_no("unresolved", f"cannot read commit {oid}", oid) if message is None else
-            _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
-            if _ACCEPT_LINE.search(message) else message)
+            _no(*limit, oid) if (limit := _approval_shape.bounds_refusal(message)) else
+            _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid) if _ACCEPT_LINE.search(message) else message)
 
 
 def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str, List[str]]]:
@@ -770,8 +770,8 @@ def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name:
         values = rx.findall(message)
         if not values:
             return _no("no_trailer", f"no {name} trailer", oid)
-        if len(values) > 1:
-            return _no("multiple_trailers", f"more than one {name} trailer", oid)
+        if refusal := _approval_shape.refusal(message, rx, name):
+            return _no(*refusal, oid)
         if values[0].lower() != expected.lower():
             return _no("hash_mismatch", mismatch_msg, oid)
         return _verify_commit_sig(top, oid, base, ok_msg)
@@ -825,8 +825,8 @@ def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base
         reasons = [r.strip() for t, r in entries if t.lower() == fix_oid.lower()]
         if not reasons:
             return _no("commit_mismatch", f"Aegis-Exempt-Test does not name fix commit {fix_oid[:12]}", oid)
-        if len(reasons) > 1:
-            return _no("multiple_trailers", "more than one Aegis-Exempt-Test trailer for this commit", oid)
+        if refusal := _approval_shape.refusal(message, _EXEMPT_TEST_LINE, "Aegis-Exempt-Test"):
+            return _no(*refusal, oid)
         return _verify_commit_sig(top, oid, base, f"good test exemption for {fix_oid[:12]}: {reasons[0]}")
     except gitsafe.GitError as exc:
         return _no("unresolved", str(exc), str(approval_commit))
@@ -899,7 +899,7 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
         return None
     for record in res.stdout.split(b"\0"):
         oid, _, message = record.decode("utf-8", "replace").lstrip("\n").partition("\n")
-        if not _FULL_OID.fullmatch(oid) or not _APPROVE_LINE.search(message):
+        if not _FULL_OID.fullmatch(oid) or _approval_shape.bounds_refusal(message) or not _APPROVE_LINE.search(message):
             continue
         verdict = _verify_candidate(top, oid, base_target, _APPROVE_LINE, "Aegis-Approve", digest,
                                     _APPROVE_MISMATCH, _APPROVE_OK)
@@ -998,10 +998,10 @@ def exemption_finder(root: Any, head: str, base_ref: str) -> Callable[[str], Opt
             if message is None:
                 candidates.clear()
                 break
-            for target in dict.fromkeys(t.lower() for t, _why in _EXEMPT_TEST_LINE.findall(message) if t.lower() != oid):
+            for target in dict.fromkeys(t.lower() for t, _why in (
+                    () if _approval_shape.bounds_refusal(message) else _EXEMPT_TEST_LINE.findall(message)) if t.lower() != oid):
                 candidates.setdefault(target, []).append(oid)
             del message  # Release the full message before reading the next raw object.
-
     @gitsafe.scrubbed()
     def find(fix_commit: str) -> Optional[Approval]:
         fix_oid = gitsafe.resolve_commit(top, fix_commit)
