@@ -619,3 +619,142 @@ def test_a_route_refusal_carries_no_source(loop):
     (Path(loop.workspace.store) / "events" / "junk").write_text("x")
 
     assert "source" not in loop.route(expect=2)
+
+
+@pytest.mark.parametrize("home_kind", ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "TEST_EXTRA_PRIVATE_HOME", "default-codex", "default-claude", "unrelated"])
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+def test_r12_public_router_private_roots_refuse_before_discovery(tmp_path, home_kind, command):
+    import shutil
+    world = Loop(tmp_path)
+    home = tmp_path / "modelled-account"
+    home.mkdir()
+    private = home / (".codex" if home_kind == "default-codex" else ".claude") if home_kind.startswith("default-") else tmp_path / "relocated-private"
+    private.mkdir()
+    target = private / "journal" if home_kind != "unrelated" else tmp_path / "public-journal"
+    shutil.copytree(world.ledger.path, target)
+    script = r"""
+import importlib.util, json, os, pwd, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec=importlib.util.spec_from_file_location('hierarchy_router',sys.argv[1])
+router=importlib.util.module_from_spec(spec);spec.loader.exec_module(router)
+import hierarchy_hosts
+pwd.getpwuid=lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
+if sys.argv[3]=='TEST_EXTRA_PRIVATE_HOME':
+    data=hierarchy_hosts.describe()
+    data['hosts']['fixture-extra']={**next(iter(data['hosts'].values())),
+        'home':{'variable':'TEST_EXTRA_PRIVATE_HOME','owner_folder':'.fixture-private','run_folder':'fixture-home'}}
+    hierarchy_hosts.describe=lambda:data
+for host in hierarchy_hosts.describe()['hosts'].values(): os.environ.pop(host['home']['variable'],None)
+if not sys.argv[3].startswith('default-'): os.environ[sys.argv[3] if sys.argv[3]!='unrelated' else 'CODEX_HOME']=sys.argv[4]
+private=Path(sys.argv[4]); accesses=[]
+def observe(path):
+    if isinstance(path,(str,bytes,os.PathLike)):
+        value=Path(os.fsdecode(path))
+        if value==private or private in value.parents: accesses.append(str(value))
+old_stat,old_lstat=os.stat,os.lstat
+def checked_stat(path,*a,**kw): observe(path);return old_stat(path,*a,**kw)
+def checked_lstat(path,*a,**kw): observe(path);return old_lstat(path,*a,**kw)
+os.stat,os.lstat=checked_stat,checked_lstat
+sys.addaudithook(lambda event,args: observe(args[0]) if event in {'open','os.scandir','os.listdir','os.mkdir'} and args else None)
+try: code=router.main(sys.argv[6:])
+finally: Path(sys.argv[5]).write_text(json.dumps(accesses))
+sys.exit(code)
+"""
+    telemetry = tmp_path / "r12-private-accesses.json"
+    args = ["--lifecycle", str(target), "--store", str(world.workspace.store), command]
+    if command == "dispatch": args += ["--recipes", str(tmp_path / "absent-recipes"), "--evidence-only"]
+    before = world.ledger.files(), tuple((p.relative_to(target).as_posix(), p.read_bytes()) for p in target.rglob("*") if p.is_file())
+    process = subprocess.run([sys.executable,"-I","-B","-c",script,str(TOOL),str(home),home_kind,
+        str(private),str(telemetry),*args],env=os.environ.copy(),capture_output=True,text=True,timeout=20)
+    assert process.stderr == "", process.stdout + process.stderr
+    answer = json.loads(process.stdout)
+    assert json.loads(telemetry.read_text()) == [], answer
+    if home_kind == "unrelated":
+        assert process.returncode == 0, answer
+    else:
+        assert process.returncode == 2 and answer["error"] == "owner-private host directory is not an input", answer
+    assert (world.ledger.files(), tuple((p.relative_to(target).as_posix(),p.read_bytes()) for p in target.rglob("*") if p.is_file())) == before
+
+
+def test_r12_case_variant_private_root_on_case_insensitive_filesystem(tmp_path):
+    # Probe the actual owned fixture filesystem; this is not native macOS/Windows qualification.
+    sentinel = tmp_path / "CaseProbe"
+    sentinel.write_text("modelled public sibling")
+    if not (tmp_path / "cASEpROBE").exists():
+        pytest.skip("owned fixture filesystem is case-sensitive; case-insensitive behavior requires that filesystem")
+    world = Loop(tmp_path)
+    private = tmp_path / "PrivateHome"
+    private.mkdir()
+    import shutil
+    shutil.copytree(world.ledger.path, private / "journal")
+    env = {**os.environ, "CODEX_HOME": str(private)}
+    p = subprocess.run([sys.executable,"-I","-B",str(TOOL),"--lifecycle",str(tmp_path / "pRIVATEhOME/journal"),
+        "--store",str(world.workspace.store),"status"],env=env,capture_output=True,text=True,timeout=20)
+    assert p.returncode == 2 and json.loads(p.stdout)["error"] == "owner-private host directory is not an input", p.stdout
+
+
+@pytest.mark.parametrize("insensitive", [False, True])
+def test_r12_case_probe_is_read_only_outside_private_roots(tmp_path, insensitive):
+    import shutil
+    # Resolve only the owned fixture root (/var and /tmp may be links on macOS).
+    tmp_path = tmp_path.resolve()
+    world=Loop(tmp_path)
+    private=tmp_path / "PrivateHome";private.mkdir()
+    candidate=tmp_path / "pRIVATEhOME"
+    if candidate.exists():
+        pytest.skip("distinct public/private case spellings require a case-sensitive fixture volume; the native case-insensitive guard is tested separately")
+    candidate.mkdir()
+    shutil.copytree(world.ledger.path,candidate / "journal")
+    telemetry=tmp_path / "r12-case-io.json"
+    script=r"""
+import importlib.util,json,os,pwd,sys
+from pathlib import Path
+from types import SimpleNamespace
+spec=importlib.util.spec_from_file_location('hierarchy_router',sys.argv[1]);router=importlib.util.module_from_spec(spec);spec.loader.exec_module(router)
+pwd.getpwuid=lambda uid:SimpleNamespace(pw_dir=sys.argv[2])
+private=Path(sys.argv[3]);os.environ['CODEX_HOME']=str(private)
+insensitive=sys.argv[4]=='True';seen={'case_probes':0,'private':[]}
+aliases={p.name.swapcase():p for p in private.parent.iterdir() if p.name.casefold()!=private.name.casefold()}
+old_stat,old_lstat,old_open,old_close=os.stat,os.lstat,os.open,os.close
+fd_paths={}
+def actual(path,kw):
+    if isinstance(path,int):return fd_paths.get(path)
+    value=Path(os.fsdecode(path))
+    if not value.is_absolute() and kw.get('dir_fd') is not None:
+        parent=fd_paths.get(kw['dir_fd'])
+        assert parent is not None, 'untracked fixture directory descriptor'
+        value=parent/value
+    return value
+def record(path,kw):
+    value=actual(path,kw)
+    if value is not None and (str(value).casefold()==str(private).casefold() or str(value).casefold().startswith(str(private).casefold()+'/')):
+        seen['private'].append(str(value))
+    return value
+def inspected(path,*a,**kw):
+    value=record(path,kw)
+    if value is not None and value.parent==private.parent and value.name in aliases:
+        seen['case_probes']+=1
+        if insensitive:return old_stat(aliases[value.name],follow_symlinks=False)
+    return old_stat(path,*a,**kw)
+def linspected(path,*a,**kw):record(path,kw);return old_lstat(path,*a,**kw)
+def opened(path,*a,**kw):
+    value=record(path,kw);fd=old_open(path,*a,**kw)
+    if value is not None:fd_paths[fd]=value
+    return fd
+def closed(fd):fd_paths.pop(fd,None);return old_close(fd)
+os.stat,os.lstat,os.open,os.close=inspected,linspected,opened,closed
+try:code=router.main(sys.argv[6:])
+finally:Path(sys.argv[5]).write_text(json.dumps(seen))
+sys.exit(code)
+"""
+    p=subprocess.run([sys.executable,"-I","-B","-c",script,str(TOOL),str(tmp_path / "account"),str(private),str(insensitive),str(telemetry),
+        "--lifecycle",str(candidate / "journal"),"--store",str(world.workspace.store),"status"],
+        env=os.environ.copy(),capture_output=True,text=True,timeout=20)
+    assert not p.stderr,p.stdout+p.stderr
+    seen=json.loads(telemetry.read_text());answer=json.loads(p.stdout)
+    assert seen['case_probes']>0,(seen,answer)
+    if insensitive:
+        assert p.returncode==2 and answer['error']=='owner-private host directory is not an input',answer
+        assert seen['private']==[],seen
+    else:assert p.returncode==0,answer

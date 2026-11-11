@@ -246,7 +246,11 @@ def test_registered_plan_is_held_before_routing_and_cannot_bypass_via_route_even
     change.decide()
     change.admit()
     before = loop.ledger.files()
-    assert loop.status()[change.value["id"]]["reason"] == "small_change_dispatch_unavailable"
+    projection = loop.run("status")
+    assert projection["requests"] == []
+    assert projection["small_changes"][0]["request_id"] == change.value["id"]
+    assert projection["small_changes"][0]["state"] == "held"
+    assert projection["small_changes"][0]["reason"] == "small_change_configuration"
     assert loop.route()["routed"] == []
     assert loop.inbox("engine") == []
     assert loop.ledger.event("route", actor="router-1", to="engine/orchestrator",
@@ -265,7 +269,16 @@ def test_lost_legacy_delivery_is_visible_and_held_without_duplicate_after_plan_r
     # The existing delivery cannot be recalled. Keep it visible and held; never send it again.
     assert loop.route()["routed"] == []
     assert [m["message"]["message_id"] for m in loop.inbox("engine")] == [published]
-    assert loop.status()[change.value["id"]]["state"] == "delivered_unrecorded"
+    status = loop.run("status")
+    assert status["requests"] == []
+    matching = [row for row in status["small_changes"] if row["request_id"] == change.value["id"]]
+    assert len(matching) == 1
+    row = matching[0]
+    assert (row["state"], row["reason"]) == ("held", "small_change_legacy_delivery")
+    assert row["legacy_delivery"]["message_id"] == published
+    evidence = row["legacy_delivery"]["evidence"]
+    with open(evidence["path"], "rb") as stream:
+        assert evidence["sha256"] == hashlib.sha256(stream.read()).hexdigest()
     assert loop.ledger.files() == before
 
 

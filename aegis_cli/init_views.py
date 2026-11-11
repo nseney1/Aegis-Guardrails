@@ -55,7 +55,19 @@ class Report:
         self.source = source
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        self.setup_guidance: Dict[str, Any] = {}
         self.muted = False  # the check pass before a real run stays quiet; the run reports
+
+    def language_guidance(self, root: Path, languages) -> None:
+        from aegis_cli.language_capabilities import (
+            capability_data, render_capabilities, render_runner_suggestion, runner_suggestion,
+        )
+
+        capabilities = capability_data(root, languages)
+        suggestion = runner_suggestion(root, structured=True)
+        self.setup_guidance = {'language_capabilities': capabilities, 'runner_suggestion': suggestion}
+        for line in render_capabilities(capabilities) + render_runner_suggestion(suggestion):
+            self.say(line)
 
     def say(self, line: str = "") -> None:
         if not self.json_mode:
@@ -86,6 +98,7 @@ class Report:
             "actions": [a.as_dict() for a in actions],
             "errors": self.errors,
             "warnings": self.warnings,
+            **self.setup_guidance,
         }, indent=2))
 
 
