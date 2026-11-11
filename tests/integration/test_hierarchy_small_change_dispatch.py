@@ -8429,3 +8429,42 @@ dispatch.writer_lock = writer_lock
         assert row['state'] == 'held' and row['reason'] == 'small_change_configuration', row
         assert row['detail'] == 'fixture writer lock %s refused' % failure, row
         assert 'writer_publication_verified' not in row and 'route_receipt' not in row, row
+
+
+@pytest.mark.parametrize('supersede', [False, True], ids=['v1-only', 'v2-supersede'])
+def test_bl03_workspace_schemas_replay_through_status_without_mutation(tmp_path, supersede):
+    from tools import hierarchy_workspace as workspace
+    from tests.integration.test_hierarchy_workspace import event_files
+
+    world = DispatchWorld(tmp_path)
+    old = world.workspace.ask('engine', 'heavy', 'bl03-holder')
+    new = old
+    if supersede:
+        new = world.workspace.run('request', {'initiative': 'engine', 'kind': 'heavy',
+            'holder': 'bl03-holder', 'supersedes': old})['request']['request_id']
+    before = {p.name: p.read_bytes() for p in event_files(world.workspace)}
+    ledger = workspace.Store(world.workspace.store).load()
+    assert ledger.requests[new]['state'] == 'queued'
+    if supersede:
+        assert ledger.requests[old]['superseded_by'] == new
+        assert ledger.requests[old]['state'] == 'withdrawn'
+    assert world.dispatch(command='status')['small_changes'][0]['state'] == 'writer_ready'
+    assert {p.name: p.read_bytes() for p in event_files(world.workspace)} == before
+
+
+@pytest.mark.parametrize('damage', ['unknown-schema', 'wrong-sequence'])
+def test_bl03_both_workspace_replay_loaders_refuse_unknown_schema_or_sequence(tmp_path, damage):
+    from tests.integration.test_hierarchy_workspace import event_files
+
+    world = DispatchWorld(tmp_path)
+    path = event_files(world.workspace)[-1]
+    event = json.loads(path.read_text())
+    if damage == 'unknown-schema':
+        event['schema'] = 'aegis.hierarchy-workspace-event/v999'
+    else:
+        event['seq'] += 1
+    path.write_text(json.dumps(event))
+    before = {p.name: p.read_bytes() for p in event_files(world.workspace)}
+    assert 'wrong event schema or sequence' in world.workspace.run('status', expect=2)['error']
+    assert 'wrong event schema or sequence' in world.dispatch(command='status', expect=2)['error']
+    assert {p.name: p.read_bytes() for p in event_files(world.workspace)} == before
