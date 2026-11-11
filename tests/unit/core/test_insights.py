@@ -1376,6 +1376,7 @@ with file_lock(Path(sys.argv[2])):
 """
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_a_prompt_waits_out_a_lock_held_past_5s_and_keeps_its_row(tmp_path: Path, hb_home: Path, newline):
     """Sad path, deterministic stand-in for the two-process race above (which once lost a row to
