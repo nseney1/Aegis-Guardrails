@@ -1321,7 +1321,7 @@ def test_a_durable_grant_fault_retains_rows_audit_and_recovers(kind_shop, monkey
         shop.request_job("job-high", "heavy", root=other_root, prefix="urgent", checkout=checkout)
         foreign = shop.workspace.ask("urgent", "heavy", "job:urgent/job-high")
     jobs = load_jobs_module()
-    original_append, original_link, original_unlink, original_open = jobs.Store.append, os.link, Path.unlink, io.open
+    original_append, original_link, original_unlink, original_load = jobs.Store.append, os.link, Path.unlink, jobs.Store.load
     events, census_folder = shop.workspace.store / "events", shop.workspace.store / "census"
     lock = shop.workspace.store / ".write.lock"
     first_event = sorted(events.iterdir())[0]
@@ -1356,13 +1356,13 @@ def test_a_durable_grant_fault_retains_rows_audit_and_recovers(kind_shop, monkey
                 raise PermissionError("private-publication-error-must-not-leak")
         return original_link(source, target, *args, **kwargs)
 
-    def open_event(path, mode="r", *args, **kwargs):
-        if fault == "extra-replay" and str(path) == str(first_event) and mode == "rb" and durable:
+    def load(store):
+        if fault == "extra-replay" and durable:
             post_reads.append("replay")
             if len(post_reads) == 1:  # The first locked post-grant snapshot; no redundant detail-only replay exists.
                 first_event.write_bytes(b"{}")
                 injected.append("malformed-event")
-        return original_open(path, mode, *args, **kwargs)
+        return original_load(store)
 
     flags = ("--initiative", "pilot") if fault == "publication-busy" else ()
     try:
@@ -1370,7 +1370,7 @@ def test_a_durable_grant_fault_retains_rows_audit_and_recovers(kind_shop, monkey
             patch.setattr(jobs.Store, "append", append)
             patch.setattr(Path, "unlink", unlink)
             patch.setattr(os, "link", link)
-            patch.setattr(io, "open", open_event)
+            patch.setattr(jobs.Store, "load", load)
             code = jobs.main(shop.argv("run-open", *flags, census=[], lock_wait=0)[3:])
             report = json.loads(capsys.readouterr().out)
     finally:
