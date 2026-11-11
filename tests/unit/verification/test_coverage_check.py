@@ -403,6 +403,14 @@ class TestReportOnlyCoverage:
         res = run_diff_coverage(repo.root, "main", "HEAD")
         assert (res["status"], res["reason"], calls) == ("unverified", "tests.command is not pytest-based", [])
 
+    def test_a_malformed_global_test_command_is_unverified_and_runs_nothing(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        user_command(cov_env, 'pytest "private-unclosed')
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["reason"], res["ratio"], calls) == (
+            "unverified", "invalid tests.command", None, [])
+
     @pytest.mark.parametrize("command", ["pytest -x tests/unit", "python -m pytest -x tests/unit",
                                          ["/opt/venv/bin/python3", "-m", "pytest", "-x", "tests/unit"]])
     def test_the_user_scope_test_command_gives_the_pytest_arguments(self, tmp_path, cov_env, monkeypatch, command):
