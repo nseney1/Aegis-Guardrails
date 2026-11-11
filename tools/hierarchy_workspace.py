@@ -13,6 +13,12 @@ It is a record kept under one OS user, not a security boundary: a same-user proc
 edit the files. A hash chain would not change that, so damage is only detected when it
 breaks the history. A clear lease check is advice, not a lock, because Aegis leases are
 cooperative and the check and the claim are separate steps.
+
+Ordinary events retain the v1 encoding. A request with supersedes uses v2 and
+atomically withdraws its queued predecessor, inheriting that row's queue sequence.
+Both versions replay here and in the dispatcher. Older readers refuse a v2 store
+with "wrong event schema or sequence"; they must be upgraded before reading it.
+Holder identity is nominal free text, under this controller's same-user authority.
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+from statistics import median
 import sys
 import time
 
@@ -36,6 +43,8 @@ from hierarchy_mailbox import (GIT_ID, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, M
 
 
 EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v1"
+SUPERSEDE_EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v2"
+REPLAY_SCHEMAS = frozenset((EVENT_SCHEMA, SUPERSEDE_EVENT_SCHEMA))
 # Ceilings for a store's limits. They are the owner's current limits, and raising them is an owner
 # decision after measuring the machine, so it takes a reviewed code change. MAX_WRITERS is 5 by
 # owner-writers-5 (requests/root-c6-owner-decisions-20261102.json) and lives in hierarchy_mailbox,
@@ -203,7 +212,7 @@ def apply_update(ledger, data, _event):
 
 
 def apply_request(ledger, data, event):
-    fields(data, {"request_id", "initiative", "kind", "holder"}, {"reference"})
+    fields(data, {"request_id", "initiative", "kind", "holder"}, {"reference", "supersedes"})
     initiative = ledger.initiative(data["initiative"])
     require(initiative["state"] == "active", "initiative is not active: " + initiative["id"])
     require(isinstance(data["kind"], str) and data["kind"] in KINDS, "invalid kind")
@@ -211,11 +220,27 @@ def apply_request(ledger, data, event):
     if "reference" in data:
         text(data["reference"], "reference")
     require(data["request_id"] not in ledger.requests, "duplicate request id")
+    previous = None
+    if "supersedes" in data:
+        identifier = text(data["supersedes"], "supersedes", 12)
+        require(re.fullmatch(r"req-[0-9]{8}", identifier) is not None, "invalid supersedes")
+        require(event["schema"] == SUPERSEDE_EVENT_SCHEMA, "supersedes requires workspace event v2")
+        require(identifier in ledger.requests, "superseded request does not exist")
+        previous = ledger.requests[identifier]
+        require(all(previous[key] == data[key] for key in ("initiative", "holder", "kind")),
+                "superseded request must have the same initiative, holder and kind")
+        require(previous["state"] != "granted",
+                identifier + " is granted: accepted work is never preempted; wait for its release")
+        require(previous["state"] == "queued", "superseded request is not queued")
     require(not any(r["kind"] == data["kind"] and r["holder"] == data["holder"] and r["state"] in ("queued", "granted")
+                    and r is not previous
                     for r in ledger.requests.values()), "holder already has an open request")
-    ledger.requests[data["request_id"]] = {**data, "state": "queued", "seq": event["seq"], "requested_at": event["at"],
-                                          "reserved_repository": initiative["repository"],
-                                          "reserved_paths": list(initiative["touched_paths"])}
+    replacement = {**data, "state": "queued", "seq": previous["seq"] if previous is not None else event["seq"],
+                   "requested_at": event["at"], "reserved_repository": initiative["repository"],
+                   "reserved_paths": list(initiative["touched_paths"])}
+    if previous is not None:
+        previous.update(state="withdrawn", closed_at=event["at"], superseded_by=data["request_id"])
+    ledger.requests[data["request_id"]] = replacement
 
 
 def apply_withdraw(ledger, data, event):
@@ -291,7 +316,13 @@ class Store:
         finally:
             lock.unlink()
 
-    def load(self):
+    def load(self, *, for_report=False):
+        """Replay strictly; reports alone may represent damaged request-event times as null.
+
+        Reducers still validate every state transition. Null prevents an invalid
+        timestamp from leaking through a report's capacity view and makes the
+        affected request's timing unknown without rewriting the durable event.
+        """
         require(self.events.is_dir(), "workspace store is not initialized")
         ledger = Ledger()
         count = 0
@@ -309,8 +340,13 @@ class Store:
             try:
                 event = read_json(path)
                 fields(event, {"schema", "seq", "at", "kind", "data"})
-                require(event["schema"] == EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
-                parse_time(event["at"])
+                require(event["schema"] in REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
+                try:
+                    parse_time(event["at"])
+                except ValueError:
+                    if not (for_report and event["kind"] in ("request", "grant", "release", "withdraw")):
+                        raise
+                    event = {**event, "at": None}
                 ledger.apply(event)
             except (ValueError, TypeError, KeyError, UnicodeError) as exc:
                 raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
@@ -322,7 +358,8 @@ class Store:
         # Runs under the store lock. One event past the limit would make every later load fail,
         # including the release that frees capacity, so a full store refuses and stays readable.
         require(ledger.seq < MAX_RECORDS, "workspace event history limit reached")
-        event = {"schema": EVENT_SCHEMA, "seq": ledger.seq + 1, "at": timestamp(), "kind": kind, "data": data}
+        schema = SUPERSEDE_EVENT_SCHEMA if kind == "request" and "supersedes" in data else EVENT_SCHEMA
+        event = {"schema": schema, "seq": ledger.seq + 1, "at": timestamp(), "kind": kind, "data": data}
         ledger.apply(event)
         publish_file(self.events / ("%08d.json" % event["seq"]), encoded(event) + b"\n")
         return event
@@ -510,11 +547,59 @@ def mailbox_facts(initiative):
         return {"error": str(exc)[:512]}
 
 
+def queue_facts(ledger, now):
+    """Lifetime facts, with busy time summed in slot-seconds (including open grants).
+
+    An invalid, future or reversed timestamp makes that request's timing unknown;
+    its state still counts. Missing samples are null, not a claim of zero latency.
+    The report clock is shared by all rows and never written back to the ledger.
+    """
+    current = parse_time(now)
+    result = {}
+    for kind in KINDS:
+        rows = [r for r in ledger.requests.values() if r["kind"] == kind]
+        waits, ages, busy = [], [], []
+        unknown = 0
+        for row in rows:
+            try:
+                requested = parse_time(row["requested_at"])
+                granted = parse_time(row["granted_at"]) if "granted_at" in row else None
+                closed = parse_time(row["closed_at"]) if "closed_at" in row else None
+                points = [requested] + ([granted] if granted is not None else [])
+                points += ([closed] if closed is not None else []) + [current]
+                require(points == sorted(points), "invalid request timing")
+                require(row["state"] not in ("granted", "released") or granted is not None,
+                        "missing grant timing")
+                require(row["state"] not in ("released", "withdrawn") or closed is not None,
+                        "missing closure timing")
+            except (ValueError, TypeError, KeyError, OverflowError):
+                unknown += 1
+                continue
+            if row["state"] == "queued":
+                ages.append((current - requested).total_seconds())
+            if granted is not None:
+                waits.append((granted - requested).total_seconds())
+                busy.append(((closed if closed is not None else current) - granted).total_seconds())
+        result[kind] = {
+            "queued": sum(r["state"] == "queued" for r in rows),
+            "open": sum(r["state"] in ("queued", "granted") for r in rows),
+            "oldest_queued_seconds": max(ages) if ages else None,
+            "queue_wait_seconds": {"count": len(waits), "p50": median(waits) if waits else None,
+                                   "max": max(waits) if waits else None},
+            "busy_seconds": sum(busy) if busy else None,
+            "withdrawn_count": sum(r["state"] == "withdrawn" for r in rows),
+            "superseded_count": sum("superseded_by" in r for r in rows),
+            "timing_unknown": unknown}
+    return result
+
+
 def report(ledger):
     """One view across all initiatives, built by this script. It is a listing, not a judgment."""
     ordered = sorted(ledger.initiatives.values(), key=lambda i: (i["priority"], i["id"]))
     rows = [{**initiative_view(ledger, i["id"]), "mailbox": mailbox_facts(i)} for i in ordered]
-    return {"generated_by": "script", "generated_at": timestamp(), "capacity": capacity_view(ledger), "initiatives": rows}
+    now = timestamp()
+    return {"generated_by": "script", "generated_at": now, "capacity": capacity_view(ledger), "initiatives": rows,
+            "queue_facts": queue_facts(ledger, now)}
 
 
 def report_text(data):
@@ -536,6 +621,9 @@ def report_text(data):
         lines.append("%4d  %-24s %-10s %-7s writers %d heavy %d heavy-tests %d queued %d  %s" % (
             row["priority"], row["id"], row["project"], row["state"], row["holds"]["writer"], row["holds"]["heavy"],
             row["holds"]["heavy-tests"], sum(row["queued"].values()), "; ".join(notes)))
+    if "queue_facts" in data:
+        for kind in KINDS:
+            lines.append(kind + " queue facts: " + json.dumps(data["queue_facts"][kind], sort_keys=True))
     return "\n".join(lines)
 
 
@@ -554,7 +642,7 @@ def run(args):
     if command == "grant-next":
         return grant_next(store, args.kind)
     if command in {"status", "report", "check-delivery", "check-paths"}:
-        ledger = store.load()
+        ledger = store.load(for_report=True) if command == "report" else store.load()
         if command == "status":
             return 0, {"capacity": capacity_view(ledger), "initiatives": ledger.initiatives, "seq": ledger.seq}
         if command == "report":
