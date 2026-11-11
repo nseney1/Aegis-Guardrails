@@ -14,6 +14,7 @@ from datetime import datetime
 import math
 
 from aegis_core import team_profile
+from aegis_core.team_profile import NEXT_ACTION_TEMPLATES as NEXT_ACTION_TEMPLATES
 
 
 __all__ = [
@@ -28,10 +29,6 @@ __all__ = [
 
 
 EXIT_CODES = {"go": 0, "hold": 3, "fallback": 4, "skip": 5, "refused": 1, "usage": 2}
-NEXT_ACTION_TEMPLATES = {
-    "start": ("Start the job on ", "; capacity advice grants no execution authority."),
-    "check": ("Run aegis team hosts check ", " ", " --json; use that declared host if admitted."),
-}
 
 
 class UnconfiguredUsageAdapter:

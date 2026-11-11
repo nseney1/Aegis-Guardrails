@@ -378,22 +378,127 @@ def test_next_action_preserves_identifiers_and_redacts_free_text(tmp_path, monke
     assert code == 0 and host in direct["next_action"]
 
 
+def test_mcp_masks_capacity_identifier_while_cli_suggestion_keeps_it_runnable(tmp_path, monkeypatch, capsys):
+    from copy import deepcopy
+    from aegis_mcp.tools import execute_tool
+
+    host = "ghp_" + "A" * 20
+    resolved = profile.resolve(repo={"preset": "ci-only", "model_settings": {
+        "hosts": {"primary": {"kind": "codex-cli"}, host: {"kind": "claude-code"}},
+        "roles": {"writer": {"hosts": ["primary"]}},
+        "capacity": {"primary": {"usage_source": "credits", "fallback": {"writer": [host]}},
+                     host: {"usage_source": "credits"}}}})
+    monkeypatch.setattr(profile, "load", lambda root: resolved)
+    monkeypatch.setattr(hosts, "usage_adapter", lambda kind: hosts.FakeUsageAdapter({
+        "primary": {"credits_left": 0}, host: {"credits_left": 1}}))
+    code, decision = invoke(tmp_path, capsys, "hosts", "check", "primary", "writer")
+    assert code == 4 and decision["selected_host"] == host
+    assert decision["next_action"] == ("Run aegis team hosts check " + host +
+                                       " writer --json; use that declared host if admitted.")
+    code, config = invoke(tmp_path, capsys, "config", "show")
+    assert code == 0
+    assert config["profile"]["model_settings"]["capacity"]["primary"]["fallback"]["writer"] == [host]
+    actual = execute_tool("aegis_team_config", {"workspace": str(tmp_path)})
+    expected_profile, expected_values = deepcopy(config["profile"]), deepcopy(config["values"])
+    expected_profile["model_settings"]["capacity"]["primary"]["fallback"]["writer"] = ["ghp_REDACTED"]
+    expected_values["model_settings.capacity.primary.fallback.writer"]["value"] = ["ghp_REDACTED"]
+    assert actual["status"] == "done" and actual["profile"] == expected_profile
+    assert actual["values"] == expected_values
+
+
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("command", ("check", "status", "doctor"))
+@pytest.mark.parametrize("kind", (*profile.CAPACITY_KINDS, "audit-vote", "audit-flex"))
+def test_reserved_terminal_host_refuses_across_views(tmp_path, monkeypatch, capsys, terminal, command, kind):
+    from types import SimpleNamespace
+    canonical = {"review": "reviewer.correctness", "extra-review": "lens.extra"}.get(kind, kind)
+    lens = kind.startswith("audit-")
+    route = "review" if lens else kind
+    roles = {} if lens or kind == "doc" else {canonical: {"hosts": ["primary"]}}
+    document = {"preset": "ci-only", "model_settings": {
+        "hosts": {"primary": {"kind": "codex-cli"}, terminal: {"kind": "claude-code"}}, "roles": roles,
+        "capacity": {"primary": {"usage_source": "credits", "fallback": {route: [terminal]}},
+                     terminal: {"usage_source": "credits"}}}}
+    if lens:
+        document["policy"] = {"review": {"lenses": [
+            {"name": kind, "host_pref": ["primary"], "voting": kind == "audit-vote"}]}}
+    monkeypatch.setattr(profile, "load", lambda root: profile.resolve(repo=document))
+    monkeypatch.setattr(profile, "pathlookup", SimpleNamespace(which=lambda *args, **kwargs: "/installed/cli"))
+    monkeypatch.setattr(hosts, "usage_adapter", lambda kind: hosts.FakeUsageAdapter({
+        "primary": {"credits_left": 0}, terminal: {"credits_left": 1}}))
+    code, result = invoke(tmp_path, capsys, *(("hosts", "check", "primary", kind) if command == "check" else
+                                           ("doctor",) if command == "doctor" else ("hosts", "status")))
+    assert code == 1 and result["status"] == "refused"
+    assert result["reason"] == "host alias is reserved for a fallback terminal"
+    assert result["layer"] == "repo" and result["file"] and result["next_action"]
+
+
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("command", ("check", "status", "usage", "doctor"))
+def test_consumer_revalidation_refuses_reserved_host_aliases(tmp_path, monkeypatch, capsys, terminal, command):
+    from types import SimpleNamespace
+    snapshot = profile.resolve()
+    settings = snapshot["profile"]["model_settings"]
+    settings["hosts"][terminal] = {"kind": "claude-code"}
+    settings["capacity"]["primary"] = {"fallback": {"doc": [terminal]}}
+    monkeypatch.setattr(profile, "load", lambda root: snapshot)
+    monkeypatch.setattr(profile, "pathlookup", SimpleNamespace(which=lambda *args, **kwargs: "/installed/cli"))
+    code, result = invoke(tmp_path, capsys, *(("hosts", "check", "primary", "doc") if command == "check" else
+                                           ("doctor",) if command == "doctor" else ("hosts", command)))
+    assert code == 1 and result["status"] == "refused"
+    assert result["reason"] == "host alias is reserved for a fallback terminal"
+    assert result["layer"] == "repo" and result["file"] and result["next_action"]
+
+
+@pytest.mark.parametrize("command", ("check", "status", "doctor"))
+@pytest.mark.parametrize("start", ("primary", "other", "last"))
+@pytest.mark.parametrize("backward", (False, True))
+def test_arg1138_three_bound_hosts_preserve_declared_restart_order(tmp_path, monkeypatch, capsys, command, start, backward):
+    from types import SimpleNamespace
+    binding = ["primary", "other", "last"]
+    document = {"preset": "solo", "model_settings": {
+        "hosts": {name: {"kind": "codex-cli"} for name in binding},
+        "roles": {"writer": {"hosts": binding}},
+        "capacity": {name: {"usage_source": "credits"} for name in binding}}}
+    document["model_settings"]["capacity"]["primary"]["fallback"] = {"writer": ["last"]}
+    if backward:
+        document["model_settings"]["capacity"]["last"]["fallback"] = {"writer": ["other"]}
+    available = "last" if start == "other" else "other"
+    monkeypatch.setattr(profile, "load", lambda root: profile.resolve(repo=document))
+    monkeypatch.setattr(profile, "pathlookup", SimpleNamespace(which=lambda *args, **kwargs: "/installed/cli"))
+    monkeypatch.setattr(hosts, "usage_adapter", lambda kind: hosts.FakeUsageAdapter({
+        name: {"credits_left": int(name == available)} for name in binding}))
+    if command == "check":
+        code, decision = invoke(tmp_path, capsys, "hosts", "check", start, "writer")
+    else:
+        code, result = invoke(tmp_path, capsys, *(("doctor",) if command == "doctor" else ("hosts", "status")))
+        assert code == 0
+        row = next(row for row in result["hosts"] if row.get("host", row.get("name")) == start)
+        decision = next(item for item in row["decisions"] if item["kind"] == "writer")
+        code = decision["exit_code"]
+    if start == "last" and not backward:
+        assert code == 3 and decision["decision"] == "hold" and decision["selected_host"] == start
+    else:
+        assert code == 4 and decision["decision"] == "fallback:" + available
+        assert decision["selected_host"] == available
+
+
 def test_malformed_action_parts_do_not_exempt_free_text():
     doc = team.display_profile({"next_action": "token=private-action",
-                                "next_action_parts": [{"identifier": "token=private-fragment"}]})
+                                "next_action_parts": [{"identifier": "token=private-fragment"}]}, capacity=True)
     assert "private-action" not in json.dumps(doc) and "private-fragment" not in json.dumps(doc)
 
 
 def test_structured_action_free_fragment_is_redacted_after_canonicalization():
     host = "ghp_" + "A" * 20
     doc = team.display_profile({"next_action": "unused", "next_action_parts": [
-        "Use ", {"identifier": host}, {"text": " token=\x1b[31mprivate-fragment"}]})
+        "Use ", {"identifier": host}, {"text": " token=\x1b[31mprivate-fragment"}]}, capacity=True)
     assert host in doc["next_action"] and "REDACTED" in doc["next_action"]
     assert "private-fragment" not in json.dumps(doc) and "\\u001b" not in json.dumps(doc)
 
 
 def test_unrecognized_action_literal_is_free_text():
-    doc = team.display_profile({"next_action": "unused", "next_action_parts": ["token=private-fragment"]})
+    doc = team.display_profile({"next_action": "unused", "next_action_parts": ["token=private-fragment"]}, capacity=True)
     assert "private-fragment" not in json.dumps(doc) and "REDACTED" in doc["next_action"]
 
 

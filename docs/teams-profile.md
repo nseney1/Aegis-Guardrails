@@ -46,6 +46,10 @@ closed repository/flag JSON schema is `aegis_core.team_profile.JSON_SCHEMA`
 (`aegis.team.profile.user/v1`). Both describe partial override layers. Named host,
 capacity, runner and token-budget maps accept identifiers matching
 `[A-Za-z][A-Za-z0-9_.-]{0,63}`. Their entries have closed schemas too.
+The exact names `hold` and `skip` are reserved for fallback terminals and cannot
+be host aliases or capacity keys. Aliases use case-sensitive, JSON-decoded
+identities, so escaped spellings of those reserved names also refuse. Terminals
+are recognized before host lookup, including when a raw plan is inspected.
 
 Layers are applied in this order:
 
@@ -226,6 +230,11 @@ scope. Config verbs have distinct schemas `aegis.team.config.show/v1`,
 `schema_family: aegis.team.config/v1`. Doctor uses `aegis.team.doctor/v1`.
 Host verbs use `aegis.team.hosts.<verb>/v1`, with
 `schema_family: aegis.team.hosts/v1`.
+The read-only MCP tool `aegis_team_config` returns the same payload as CLI config
+JSON except that token-shaped identifiers in capacity and fallback fields are
+masked. The CLI preserves exact schema-valid identifiers so its suggested host
+commands remain runnable. Both views use the shared core formatter; credentials
+and free text retain canonicalize/redact/truncate handling in both views.
 Each result includes `status` and `next_action`. Refusals also include `reason`,
 `layer` and `file`, so an agent can identify the input to correct without finding
 repository-local documentation. Configuration and doctor exit codes are 0 done,
@@ -292,7 +301,10 @@ terminal ends traversal; later hosts are unreachable. `skip` is allowed only for
 non-voting jobs; an exhausted chain holds. A held pinned role or lens waits
 without falling back. Window holds name the reset in `next_action`.
 
-Checks from a later admitted host retain explicit fallbacks to earlier hosts.
+Checks from a bound host continue from that host's position in its declared
+binding. A fallback-only admitted host follows its own explicit routes. Neither
+inherits implicit earlier destinations from another host's expansion. Explicit
+fallbacks to earlier hosts remain available.
 Loading the profile validates the same plan from every bound or admitted host:
 each plan must respect family rules and pins, required votes, and destination
 admission. If restarting a plan exposes a forbidden terminal or a destination

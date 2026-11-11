@@ -278,6 +278,93 @@ def test_arg0942_hidden_bound_host_exposes_policy_with_correct_attribution(prese
     assert refused.value.path == "model_settings.capacity.other.fallback.review"
 
 
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("kind", (*profile.CAPACITY_KINDS, "audit-vote", "audit-flex"))
+def test_unvalidated_host_map_cannot_shadow_a_terminal(terminal, kind):
+    if kind.startswith("audit-"):
+        raw = profile.resolve(repo={"policy": {"review": {"lenses": [
+            {"name": kind, "host_pref": ["primary"], "voting": kind == "audit-vote"}]}}})["profile"]
+        key = "review"
+    else:
+        raw = resolved(kind)["profile"]
+        key = kind
+    settings = raw["model_settings"]
+    settings["hosts"][terminal] = {"kind": "claude-code"}
+    settings["capacity"].setdefault("primary", {}).setdefault("fallback", {})[key] = [terminal]
+    route = profile.plan(raw, kind, start_host="primary")
+    assert route["entries"] == [{"host": "primary", "path": route["path"]},
+                                 {"terminal": terminal, "path": "model_settings.capacity.primary.fallback." + key}]
+
+
+@pytest.mark.parametrize("terminal,code", (("hold", 3), ("skip", 5)))
+def test_terminal_precedes_host_lookup_after_consumer_validation(terminal, code):
+    snapshot = resolved(source="credits")
+    reader = hosts.FakeUsageAdapter({"primary": {"credits_left": 0}, terminal: {"credits_left": 1}})
+    service = hosts.HostCapacity(snapshot, adapter=reader)
+    settings = snapshot["profile"]["model_settings"]
+    settings["hosts"][terminal] = {"kind": "claude-code"}
+    settings["capacity"][terminal] = {"usage_source": "credits"}
+    settings["capacity"]["primary"]["fallback"]["doc"] = [terminal]
+    result = service.check("primary", "doc")
+    assert result["decision"] == terminal and result["exit_code"] == code
+    assert [name for name, _ in reader.calls] == ["primary"]
+
+
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("binding", ("role", "lens"))
+def test_unvalidated_binding_cannot_treat_a_terminal_as_a_host(terminal, binding):
+    raw = profile.resolve(repo={"policy": {"review": {"lenses": [
+        {"name": "audit", "host_pref": ["primary"], "voting": False}]}}})["profile"]
+    raw["model_settings"]["hosts"][terminal] = {"kind": "claude-code"}
+    if binding == "role":
+        raw["model_settings"]["roles"]["research"]["hosts"] = [terminal]
+        kind, path = "research", "model_settings.roles.research.hosts"
+    else:
+        raw["policy"]["review"]["lenses"][0]["host_pref"] = [terminal]
+        kind, path = "audit", "policy.review.lenses"
+    assert profile.plan(raw, kind)["entries"] == [{"terminal": terminal, "path": path}]
+
+
+@pytest.mark.parametrize("kind", (*[kind for kind in profile.CAPACITY_KINDS if kind != "doc"], "audit-vote", "audit-flex"))
+@pytest.mark.parametrize("start", ("primary", "other", "last"))
+@pytest.mark.parametrize("backward", (False, True))
+def test_arg1138_restart_uses_its_own_declared_binding_position(kind, start, backward):
+    canonical = {"review": "reviewer.correctness", "extra-review": "lens.extra"}.get(kind, kind)
+    lens = kind.startswith("audit-")
+    key = "review" if lens else kind
+    binding = ["primary", "other", "last"]
+    document = {"preset": "ci-only", "model_settings": {
+        "hosts": {name: {"kind": "codex-cli"} for name in binding},
+        "roles": {} if lens else {canonical: {"hosts": binding}},
+        "capacity": {"primary": {"fallback": {key: ["last"]}},
+                     "last": {"fallback": {key: ["other"]}} if backward else {}}}}
+    if lens:
+        document["policy"] = {"review": {"lenses": [
+            {"name": kind, "host_pref": binding, "voting": kind == "audit-vote"}]}}
+    raw = profile.resolve(repo=document)["profile"]
+    expected = {"primary": ["primary", "last", "other"], "other": ["other", "last"],
+                "last": ["last", "other"] if backward else ["last"]}
+    assert [entry["host"] for entry in profile.plan(raw, kind, start_host=start)["entries"]] == expected[start]
+
+
+@pytest.mark.parametrize("backward", (False, True))
+def test_arg1138_fallback_only_start_uses_only_its_explicit_routes(backward):
+    names = ("primary", "other", "last", "extra")
+    settings = {"hosts": {name: {"kind": "codex-cli"} for name in names},
+                "roles": {"writer": {"hosts": list(names[:3])}},
+                "capacity": {name: {"usage_source": "credits"} for name in names}}
+    settings["capacity"]["primary"]["fallback"] = {"writer": ["last"]}
+    settings["capacity"]["last"]["fallback"] = {"writer": ["extra"]}
+    if backward:
+        settings["capacity"]["extra"]["fallback"] = {"writer": ["other"]}
+    reader = hosts.FakeUsageAdapter({name: {"credits_left": int(name == "other")} for name in names})
+    result = hosts.HostCapacity(profile.resolve(preset="ci-only", repo={"model_settings": settings}),
+                                adapter=reader).check("extra", "writer")
+    assert result["decision"] == ("fallback:other" if backward else "hold")
+    assert result["exit_code"] == (4 if backward else 3)
+    assert [name for name, _ in reader.calls] == (["extra", "other"] if backward else ["extra"])
+
+
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("used,chain,other,expected", [
     (10, [], 10, "go"), (96, [], 10, "hold"),
