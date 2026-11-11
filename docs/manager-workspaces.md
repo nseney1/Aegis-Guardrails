@@ -33,7 +33,14 @@ AEGIS_MANAGER_BIN=/absolute/source-pinned-venv/bin/aegis
 `init` creates a draft external configuration and initial audit record, then prints
 a separately named `aegis-manager` registration proposal. It installs no host
 registration and activates no policy. It refuses ordinary repository locations
-for config/signers and implementation worktrees for audit storage. The control
+for config/signers and implementation worktrees for audit storage, as discovered
+under the operator's trusted Git environment. An operator-set
+`GIT_CEILING_DIRECTORIES` inside a worktree can admit an audit store below that
+ceiling: discovery from the store no longer reaches the enclosing worktree.
+This does not isolate the store from commands started at the worktree root;
+`git clean -fdx` from that root can still reach and delete it. Prefer an external
+store when it must be protected from worktree cleanup. Explicitly forbidden
+worktree roots remain refused regardless of the ceiling. The control
 repository is a distinct local Git repository; it must remain private if published.
 The workspace parent needs neither `.git` nor an ordinary `.aegis/` directory.
 
