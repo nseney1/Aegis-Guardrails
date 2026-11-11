@@ -200,7 +200,17 @@ def insight_workspace_id(workspace: Any) -> str:
             rel = "."
         canon = f"{Path(os.path.realpath(common)).as_posix()}\x00{rel}"
     else:
-        c_fb = gitsafe.common_dir(root)
+        # Explicit layouts bypass ceilings, retaining ancestor validation.
+        top_fb = gitsafe.toplevel(root)
+        if top_fb is not None:
+            try:
+                top_fb = top_fb.resolve()
+            except (OSError, RuntimeError, ValueError):
+                top_fb = None
+        explicit = "GIT_DIR" in os.environ or "GIT_WORK_TREE" in os.environ
+        permitted = (top_fb is not None and (top_fb == root or top_fb in root.parents)
+                     and (explicit or top_fb in git_discovery_paths(root)))
+        c_fb = gitsafe.common_dir(root) if permitted else None
         r_fb = workspace_relative(root) if c_fb is not None else None
         if c_fb and r_fb:
             canon = f"{Path(os.path.realpath(c_fb)).as_posix()}\x00{r_fb}"
