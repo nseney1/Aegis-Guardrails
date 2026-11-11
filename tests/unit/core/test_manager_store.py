@@ -2,24 +2,172 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from aegis_core.manager_policy import ManagerError
-from aegis_core.manager_store import MAX_AUDIT_BYTES, MAX_ROW_BYTES, ManagerStore
+from aegis_core.manager_store import MAX_AUDIT_BYTES, MAX_ROW_BYTES, ManagerStore, in_git_worktree, resolve_placement_path
 from tests.conftest import symlink_or_skip
+from tests.helpers_manager import manager_root as tmp_path
+from tests.helpers_manager import GIT_PLACEMENT_NAMES, missing_traversal_path, unsearchable_manager_alias
 
 REPO = Path(__file__).resolve().parents[3]
 
 
 def _encoded(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _absent_external_path():
+    anchor = Path(Path.cwd().anchor)
+    if os.path.lexists(anchor / ".git"):
+        pytest.skip("filesystem anchor already has a .git marker")
+    root = anchor / ("aegis-rf91-absent-" + uuid.uuid4().hex)
+    assert not root.exists()
+    return root
+
+
+@pytest.mark.parametrize("name", GIT_PLACEMENT_NAMES)
+@pytest.mark.parametrize("position", ["final", "intermediate"])
+def test_in_git_worktree_refuses_uncreated_git_components(name, position):
+    root = _absent_external_path()
+    parts = (name,) if position == "final" else (name, "file")
+    assert in_git_worktree(root.joinpath(*parts)) is True
+    assert not root.exists()
+
+
+def test_in_git_worktree_accepts_absent_external_path_without_manager_fixture():
+    assert in_git_worktree(_absent_external_path() / "missing" / "audit") is False
+
+
+def test_in_git_worktree_accepts_existing_external_directory_without_manager_fixture():
+    root = _absent_external_path().parent
+    assert in_git_worktree(root) is False
+
+
+@pytest.mark.parametrize("operation", [in_git_worktree, resolve_placement_path])
+@pytest.mark.parametrize("unsafe_code", ["unsafe_store", "unsafe_config"])
+def test_placement_refuses_missing_parent_traversal(missing_traversal_path, operation, unsafe_code):
+    with pytest.raises(ManagerError, match="^" + unsafe_code + "$") as refusal:
+        operation(missing_traversal_path, unsafe_code=unsafe_code)
+    assert refusal.value.path == missing_traversal_path
+
+
+@pytest.mark.parametrize("operation", [in_git_worktree, resolve_placement_path])
+@pytest.mark.parametrize("unsafe_code", ["unsafe_store", "unsafe_config"])
+def test_placement_refuses_dot_before_metadata(monkeypatch, operation, unsafe_code):
+    from aegis_core import manager_store
+
+    def unexpected_lstat(*args, **kwargs):
+        pytest.fail("dot placement inspected filesystem metadata")
+
+    monkeypatch.setattr(manager_store, "os", SimpleNamespace(**{**vars(manager_store.os), "lstat": unexpected_lstat}))
+    with pytest.raises(ManagerError, match="^" + unsafe_code + "$") as refusal:
+        operation(Path("."), unsafe_code=unsafe_code)
+    assert refusal.value.path == Path(".")
+
+
+@pytest.mark.parametrize("operation", ["read", "append", "transaction"])
+def test_store_refuses_missing_parent_traversal(missing_traversal_path, operation):
+    with pytest.raises(ManagerError, match="^unsafe_store$"):
+        store = ManagerStore(missing_traversal_path)
+        if operation == "read":
+            store.read()
+        elif operation == "append":
+            store.append({"kind": "scan"})
+        else:
+            store.transaction(lambda rows: pytest.fail("traversal invoked callback"))
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.ELOOP, errno.ENAMETOOLONG, errno.EIO])
+@pytest.mark.parametrize("stage", ["prefix", "marker"])
+def test_placement_metadata_errors_are_unsafe_store(monkeypatch, error, stage):
+    from aegis_core import manager_store
+
+    root = _absent_external_path() / "audit"
+    real_os = manager_store.os
+
+    def failing_lstat(path, *args, **kwargs):
+        if (stage == "prefix" and Path(path) == root) or (stage == "marker" and Path(path).name == ".git"):
+            raise OSError(error, "simulated placement metadata failure")
+        return real_os.lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(manager_store, "os", SimpleNamespace(**{**vars(real_os), "lstat": failing_lstat}))
+    with pytest.raises(ManagerError, match="^unsafe_store$"):
+        in_git_worktree(root)
+
+
+def test_store_symlink_loop_is_unsafe(tmp_path_factory):
+    root = tmp_path_factory.mktemp("loop-placement")
+    loop = root / "loop"
+    symlink_or_skip("loop", loop, target_is_directory=True)
+    with pytest.raises(ManagerError, match="^unsafe_store$"):
+        ManagerStore(loop / "audit").append({"kind": "scan"})
+    assert list(root.iterdir()) == [loop]
+    assert not (root / ".git").exists()
+
+
+@pytest.mark.parametrize("operation", ["helper", "append"])
+def test_unsearchable_prefix_is_unsafe_store(unsearchable_manager_alias, operation):
+    path = unsearchable_manager_alias / "audit"
+    with pytest.raises(ManagerError, match="^unsafe_store$"):
+        if operation == "helper":
+            in_git_worktree(path)
+        else:
+            ManagerStore(path).append({"kind": "scan"})
+    target = unsearchable_manager_alias.parent.parent / "repo" / "sub"
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("marker", ["directory", "gitfile"])
+def test_in_git_worktree_resolves_directory_alias(tmp_path, marker):
+    repo = tmp_path / "repo"
+    target = repo / "sub"
+    target.mkdir(parents=True)
+    if marker == "directory":
+        (repo / ".git").mkdir()
+    else:
+        (repo / ".git").write_text("gitdir: absent\n", encoding="utf-8")
+    alias = tmp_path / "alias"
+    symlink_or_skip(target, alias, target_is_directory=True)
+    assert in_git_worktree(alias / "missing" / "audit") is True
+
+
+def test_in_git_worktree_resolves_proc_cwd_alias(tmp_path_factory, monkeypatch):
+    alias = Path("/proc/self/cwd")
+    if os.name != "posix" or not alias.is_dir():
+        pytest.skip("requires /proc/self/cwd")
+    repo = tmp_path_factory.mktemp("physical-placement")
+    (repo / ".git").mkdir()
+    child = repo / "sub"
+    child.mkdir()
+    monkeypatch.chdir(child)
+    assert in_git_worktree(alias / "missing" / "audit") is True
+
+
+@pytest.mark.parametrize("name", GIT_PLACEMENT_NAMES)
+@pytest.mark.parametrize("position", ["final", "intermediate"])
+@pytest.mark.parametrize("operation", ["append", "transaction"])
+def test_store_refuses_git_components_before_creating_anything(tmp_path, name, position, operation):
+    root = tmp_path / "missing"
+    parts = (name,) if position == "final" else (name, "audit")
+    store = ManagerStore(root.joinpath(*parts))
+    with pytest.raises(ManagerError, match="^store_in_worktree$"):
+        if operation == "append":
+            store.append({"kind": "scan"})
+        else:
+            store.transaction(lambda rows: pytest.fail("reserved placement invoked callback"))
+    assert not root.exists()
+    assert not (root / ".git").exists()
 
 
 def test_reads_do_not_initialize_store(tmp_path):
