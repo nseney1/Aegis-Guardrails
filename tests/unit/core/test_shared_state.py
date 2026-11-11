@@ -258,6 +258,7 @@ def test_a_shared_lock_name_is_one_plain_file_name_ending_in_lock(tmp_path: Path
 
 
 @needs_git
+@pytest.mark.timing
 def test_a_shared_lock_held_from_another_worktree_times_out_with_exact_error(repo: Path, tmp_path: Path):
     linked = tmp_path / "linked"
     _git(repo, "worktree", "add", "-q", "-b", "lane/x", str(linked))
