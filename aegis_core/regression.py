@@ -65,7 +65,7 @@ _CONVENTIONAL_RE = re.compile(r"\A([a-zA-Z]+)(?:\(([^)]*)\))?(!)?:\s*(.*)\Z")
 
 
 class RegressionError(AegisError):
-    """The commit range or repository trees cannot be read."""
+    """The commit range, repository trees or test command cannot be used."""
 
 
 def is_test_file(path: str) -> bool:
@@ -707,7 +707,10 @@ def check_ci_regressions(
             if src and not any(is_test_file(p) for p in meta.changed_files):
                 untested.append(UntestedChange(meta.oid, meta.subject, src))
     # The user-authorized global command takes precedence and runs just once per snapshot.
-    command = testexec.user_test_command(workspace_path)
+    try:
+        command = testexec.user_test_command(workspace_path)
+    except ValueError:
+        raise RegressionError("invalid tests.command") from None
     judged = [p for m in fix_metas for p in m.present_files if is_python_test_file(p)]
     groups = {}
     for meta in fix_metas:
