@@ -7,8 +7,10 @@ and platform support. Windows filesystem-backed operations currently refuse.
 """
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -18,29 +20,21 @@ import uuid
 from typing import Any
 
 from aegis_core import pathlookup
-from aegis_core.primitives import sanitize_display
+from aegis_core.primitives import sanitize_display as sanitize_display
+from aegis_core.team_profile_display import (
+    NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
+    closed_object as _object, reject_terminal_hosts as _reject_terminal_hosts,
+    provenance_values as _display_values,
+    render_profile as _render_profile,
+)
 from aegis_core.workspace.layout import AEGIS_DIRNAME, UserLayout
 
 __all__ = [
-    "JSON_SCHEMA",
-    "MAX_BYTES",
-    "MAX_DEPTH",
-    "MAX_ITEMS",
-    "MAX_NODES",
-    "MAX_STRING",
-    "PRESET_DATA",
-    "PROFILE_SCHEMA",
-    "REPO_PATH",
-    "USER_PATH",
-    "USER_JSON_SCHEMA",
-    "ProfileError",
-    "descriptor_supported",
-    "display_profile",
-    "doctor",
-    "governance_status",
-    "initialize",
-    "load",
-    "resolve",
+    "CAPACITY_DEFAULTS", "CAPACITY_KINDS", "JSON_SCHEMA", "MAX_BYTES", "MAX_DEPTH", "MAX_ITEMS",
+    "MAX_NODES", "MAX_STRING", "MAX_HOSTS", "MAX_FALLBACK_CHAIN", "MAX_LENSES", "MAX_FALLBACK_EDGES",
+    "PRESET_DATA", "PROFILE_SCHEMA", "REPO_PATH", "USER_PATH", "USER_JSON_SCHEMA", "ProfileError",
+    "capacity_thresholds", "descriptor_supported", "doctor", "plan", "governance_status", "initialize",
+    "load", "resolve", "validate_resolved", "display_profile", "NEXT_ACTION_TEMPLATES",
 ]
 
 MAX_BYTES = 131072
@@ -48,6 +42,14 @@ MAX_DEPTH = 16
 MAX_NODES = 4096
 MAX_STRING = 4096
 MAX_ITEMS = 64
+MAX_HOSTS = 16
+MAX_FALLBACK_CHAIN = 8
+MAX_LENSES = 16
+MAX_FALLBACK_EDGES = 64
+CAPACITY_KINDS = ("writer", "review", "extra-review", "doc", "research",
+                  "reviewer.correctness", "reviewer.security", "lens.extra")
+CAPACITY_DEFAULTS = {"hold_pct": 99, "route_pct": 95, "flex_route_pct": 80}
+_CAPACITY_ALIASES = {"review": "reviewer.correctness", "extra-review": "lens.extra"}
 _IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
 PROFILE_SCHEMA = "aegis.team.profile/v1"
 REPO_PATH = (AEGIS_DIRNAME, "team", "profile.json")
@@ -120,17 +122,14 @@ class ProfileError(ValueError):
         self.exit_code = exit_code
 
 
-def _object(properties):
-    return {"type": "object", "properties": properties, "additionalProperties": False}
-
-
-def _map(items):
+def _map(items, limit=MAX_ITEMS, reserved=()):
     return {"type": "object", "patternProperties": {_IDENTIFIER_PATTERN: items},
-            "additionalProperties": False, "maxProperties": MAX_ITEMS}
+            "additionalProperties": False, "maxProperties": limit,
+            **({"propertyNames": {"not": {"enum": list(reserved)}}} if reserved else {})}
 
 
-def _array(items):
-    return {"type": "array", "items": items, "maxItems": MAX_ITEMS}
+def _array(items, limit=MAX_ITEMS):
+    return {"type": "array", "items": items, "maxItems": limit}
 
 
 _TEXT = {"type": "string", "maxLength": MAX_STRING}
@@ -140,12 +139,12 @@ _INT = {"type": "integer", "minimum": 1, "maximum": 1000000}
 _USER_TEXT = {**_TEXT, "user_layer_only": True}
 _HOST = _object({"kind": {"type": "string", "enum": list(PRESET_DATA["hosts"])},
                  "auth_mode": {"type": "string", "enum": ["sso", "api", "token"], "user_layer_only": True}})
-_ROLE = _object({"hosts": _array(_IDENTIFIER), "model": _TEXT, "effort": _TEXT,
+_ROLE = _object({"hosts": _array(_IDENTIFIER, MAX_HOSTS), "model": _TEXT, "effort": _TEXT,
                  "optional": _BOOL, "pinned_family": _BOOL})
 _CAPACITY = _object({"usage_source": {"type": "string", "enum": ["subscription-window", "credits", "none"]},
                      "thresholds": _object({name: {"type": "number", "minimum": 0, "maximum": 100}
                                             for name in ("hold_pct", "route_pct", "flex_route_pct")}),
-                     "fallback": _object({"review": _array(_IDENTIFIER), "doc": _array(_IDENTIFIER)})})
+                     "fallback": _object({kind: _array(_IDENTIFIER, MAX_FALLBACK_CHAIN) for kind in CAPACITY_KINDS})})
 _RUNNER = _object({"cpus": _INT, "image": _TEXT, "provider": _TEXT,
                    "pool": _USER_TEXT, "credentials": _USER_TEXT,
                    "budget_usd_month": {"type": "number", "minimum": 0, "maximum": 1000000,
@@ -159,8 +158,8 @@ JSON_SCHEMA = {
             "review": _object({"require_cross_family": _BOOL, "cap": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},
                                "mode": {"type": "string", "enum": ["full", "delta"]},
                                "extra_lens_blocks_on": {"type": "string", "enum": ["confirmed"]},
-                               "lenses": _array(_object({"name": _IDENTIFIER, "host_pref": _array(_IDENTIFIER),
-                                                         "voting": _BOOL, "pinned_family": _BOOL}))}),
+                               "lenses": _array(_object({"name": _IDENTIFIER, "host_pref": _array(_IDENTIFIER, MAX_HOSTS),
+                                                         "voting": _BOOL, "pinned_family": _BOOL}), MAX_LENSES)}),
             "gates": _array(_object({"name": _TEXT, "runner": _IDENTIFIER,
                                      "selector": {"type": "string", "enum": ["impacted", "whole", "list"]},
                                      "tests": _array(_TEXT), "python": _TEXT, "must_pass": _BOOL,
@@ -170,9 +169,9 @@ JSON_SCHEMA = {
                                 "batch_max": _INT, "signature_required_for": _array(_TEXT),
                                 "publish": _object({"remote": _TEXT, "app": _TEXT})}),
         }),
-        "model_settings": _object({"hosts": _map(_HOST), "roles": _object({
+        "model_settings": _object({"hosts": _map(_HOST, MAX_HOSTS, reserved=_TERMINALS), "roles": _object({
             name: _ROLE for name in ("writer", "reviewer.correctness", "reviewer.security", "lens.extra", "research")}),
-            "capacity": _map(_CAPACITY)}),
+            "capacity": _map(_CAPACITY, reserved=_TERMINALS)}),
         "run_config": _object({"runners": _map(_RUNNER),
             "autopilot": _object({"queue_full_on_ready": _BOOL, "claim_next": _BOOL, "resume_writer": _BOOL,
                                    "rulings": {"type": "string", "enum": ["owner", "coordinator"]}}),
@@ -248,6 +247,7 @@ def _validate_value(value, schema, path, layer):
     if actual == "object":
         if len(value) > schema.get("maxProperties", MAX_ITEMS):
             raise ProfileError("profile object size limit exceeded")
+        _reject_terminal_hosts(value, ProfileError, path)
         for key, child in value.items():
             if type(key) is not str:
                 raise ProfileError("profile keys must be strings")
@@ -291,9 +291,183 @@ def _leaves(value, prefix=()):
             yield path, child
 
 
+def capacity_thresholds(capacity):
+    """Defaults fit a lower explicit hold/route threshold without changing it."""
+    supplied = capacity.get("thresholds", {})
+    hold = supplied.get("hold_pct", CAPACITY_DEFAULTS["hold_pct"])
+    route = supplied.get("route_pct", min(hold, CAPACITY_DEFAULTS["route_pct"]))
+    flex = supplied.get("flex_route_pct", min(route, CAPACITY_DEFAULTS["flex_route_pct"]))
+    return {"hold_pct": hold, "route_pct": route, "flex_route_pct": flex}
+
+
+def _capacity_complete(settings):
+    hosts, edges = settings["hosts"], 0
+    for name, capacity in settings["capacity"].items():
+        path = "model_settings.capacity." + name
+        if name not in hosts:
+            raise ProfileError("capacity references undeclared host", path=path)
+        thresholds = capacity_thresholds(capacity)
+        if not thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
+            raise ProfileError("capacity thresholds must satisfy flex_route_pct <= route_pct <= hold_pct",
+                               path=path + ".thresholds")
+        for kind, chain in capacity.get("fallback", {}).items():
+            if len(chain) > MAX_FALLBACK_CHAIN:
+                raise ProfileError("profile fallback chain limit exceeded", path=path + ".fallback." + kind)
+            edges += len(chain)
+            if edges > MAX_FALLBACK_EDGES:
+                raise ProfileError("profile fallback edge limit exceeded", path="model_settings.capacity")
+            if any(target not in _TERMINALS and target not in hosts for target in chain):
+                raise ProfileError("capacity references undeclared host", path=path + ".fallback." + kind)
+
+
+def _capacity_job(profile, kind):
+    if type(kind) is not str or len(kind) > 64 or re.fullmatch(_IDENTIFIER_PATTERN, kind) is None:
+        raise ProfileError("unknown job kind; use aegis team hosts status --json", layer="flags",
+                           file="<command-line>", exit_code=2)
+    kind = _CAPACITY_ALIASES.get(kind, kind)
+    roles = profile["model_settings"]["roles"]
+    lens = next((item for item in profile["policy"]["review"]["lenses"] if item["name"] == kind), None)
+    generic = "review" if kind.startswith("reviewer.") or lens else kind
+    if kind == "lens.extra":
+        generic = "extra-review"
+    path = "policy.review.lenses" if lens else "model_settings.roles." + kind + ".hosts"
+    role = lens if lens else roles.get(kind)
+    if kind == "doc":
+        binding = list(profile["model_settings"]["hosts"])
+    elif role is None:
+        raise ProfileError("job role or lens is not declared; use aegis team hosts status --json", path=path)
+    else:
+        binding = role.get("host_pref" if lens else "hosts", [])
+    if not binding:
+        raise ProfileError("job is disabled: no declared host binding", path=path)
+    return {"kind": kind, "generic": generic, "binding": binding, "path": path,
+            "pinned": role.get("pinned_family", False) if role else False,
+            "voting": lens.get("voting", True) if lens else kind.startswith("reviewer.")}
+
+
+def plan(profile, kind, *, start_host=None):
+    """Plan from any bound or fallback-admitted host, retaining source paths.
+
+    Canonical keys override generic keys, including explicit empty lists.
+    Cycles terminate; the first terminal ends traversal. Bound restarts use
+    their remaining binding; other admitted starts use their explicit routes.
+    """
+    try:
+        job = _capacity_job(profile, kind)
+    except ProfileError as error:
+        raise _context(error, "repo") from None
+    settings = profile["model_settings"]
+
+    def traverse(roots):
+        entries, reached, pending = [], set(), deque(roots)
+        while pending:
+            name, source = pending.popleft()
+            if name in _TERMINALS or name not in settings["hosts"]:
+                entries.append({"terminal": name, "path": source})
+                break
+            if name in reached:
+                continue
+            reached.add(name)
+            entries.append({"host": name, "path": source})
+            fallbacks = settings["capacity"].get(name, {}).get("fallback", {})
+            keys = (job["kind"], job["generic"], "review") if job["kind"] == "lens.extra" else (job["kind"], job["generic"])
+            key = next((key for key in keys if key in fallbacks), None)
+            if key is not None:
+                path = "model_settings.capacity." + name + ".fallback." + key
+                pending.extendleft((target, path) for target in reversed(fallbacks[key]))
+        return entries
+
+    binding = [start_host] if job["kind"] == "doc" and start_host is not None else job["binding"]
+    entries = traverse([(name, job["path"]) for name in binding])
+    admitted = list(dict.fromkeys(binding + [entry["host"] for entry in entries if "host" in entry
+                                           and (not job["pinned"] or entry["host"] in job["binding"])]))
+    if start_host is not None:
+        if start_host not in admitted:
+            raise _context(ProfileError("host is not bound to this job; use its declared role hosts", path=job["path"]), "repo")
+        roots = ([{"host": name, "path": job["path"]} for name in binding[binding.index(start_host):]]
+                 if start_host in binding else [next(entry for entry in entries if entry.get("host") == start_host)])
+        entries = traverse([(entry["host"], entry["path"]) for entry in roots])
+    return {**job, "entries": entries, "admitted": admitted}
+
+
+def _lens_identities(profile):
+    lenses, names = profile["policy"]["review"]["lenses"], set()
+    if len(lenses) + bool(profile["model_settings"]["roles"].get("lens.extra", {}).get("hosts")) > MAX_LENSES:
+        raise ProfileError("profile lens limit exceeded", path="policy.review.lenses")
+    for index, lens in enumerate(lenses):
+        if not lens.get("name"):
+            raise ProfileError("incomplete review lens: name required", path="policy.review.lenses")
+        if lens["name"] in names:
+            raise ProfileError("duplicate review lens name", path="policy.review.lenses")
+        if lens["name"] in CAPACITY_KINDS:
+            raise ProfileError("review lens name is reserved for a built-in job kind", path="policy.review.lenses")
+        if not lens.get("host_pref"):
+            raise ProfileError("incomplete review lens: host_pref required", path="policy.review.lenses")
+        if len(lens["host_pref"]) > MAX_HOSTS:
+            raise ProfileError("profile host binding limit exceeded", path="policy.review.lenses." + str(index) + ".host_pref")
+        if any(host not in profile["model_settings"]["hosts"] for host in lens["host_pref"]):
+            raise ProfileError("review route references undeclared host", path="policy.review.lenses")
+        names.add(lens["name"])
+
+
+def _review_routes(profile, families):
+    roles, hosts = profile["model_settings"]["roles"], profile["model_settings"]["hosts"]
+    kinds = [kind for kind, role in roles.items() if role["hosts"]]
+    kinds += [lens["name"] for lens in profile["policy"]["review"]["lenses"]]
+    @lru_cache(maxsize=None)
+    def planned(kind, start=None):
+        return plan(profile, kind, start_host=start)
+
+    bindings = {kind: planned(kind) for kind in kinds}
+    starts = [(kind, host) for kind, binding in bindings.items()
+              for host in dict.fromkeys([*binding["binding"], *binding["admitted"]])]
+    starts += [("doc", host) for host in hosts]
+    # Cache every restarted plan before checking policy, preserving refusal order.
+    for kind, host in starts:
+        planned(kind, host)
+    writers = {entry["host"] for kind, host in starts if kind == "writer"
+               for route in (planned(kind, host),)
+               for entry in (route["entries"][:1] if route["pinned"] else route["entries"]) if "host" in entry}
+    writer_families = {families[host] for host in writers}
+    admitted = {kind: set(binding["admitted"]) for kind, binding in bindings.items()}
+    checked = {kind: set() for kind in kinds}
+    cross_family = profile["policy"]["review"]["require_cross_family"]
+    if cross_family and (not writers or not roles.get("reviewer.correctness", {}).get("hosts")):
+        raise ProfileError("cross-family review needs declared writer and reviewer hosts", path="policy.review.require_cross_family")
+
+    for kind, host in starts:
+        route = planned(kind, host)
+        # Role/lens facts apply across starts; doc admission is host-rooted.
+        destinations = set() if kind == "doc" else checked[kind]
+        allowed = set(route["admitted"]) if kind == "doc" else admitted[kind]
+        review = kind.startswith("reviewer.") or kind == "lens.extra" or kind not in roles
+        cross = cross_family and (kind not in roles or kind == "reviewer.correctness" or
+                                  (kind.startswith("reviewer.") and not route["pinned"]))
+        for entry in route["entries"]:
+            if "terminal" in entry:
+                if entry["terminal"] == "skip" and (route["voting"] or kind == "writer"):
+                    raise ProfileError("skip is allowed only for non-voting jobs", path=entry["path"])
+                continue
+            name = entry["host"]
+            if name in destinations:
+                continue
+            if review and route["pinned"] and families[name] != families[route["binding"][0]]:
+                raise ProfileError("pinned lens fallback changes family", path=entry["path"],
+                                   related_paths=("model_settings.hosts." + name + ".kind",))
+            if cross and route["voting"] and families[name] in writer_families:
+                raise ProfileError("cross-family review route reaches the writer family", path=entry["path"],
+                                   related_paths=("model_settings.roles.writer.hosts", "model_settings.hosts." + name + ".kind"))
+            if not route["pinned"] and name not in allowed:
+                raise ProfileError("fallback destination is not admitted for this job", path=entry["path"])
+            destinations.add(name)
+
+
 def _complete(profile):
     settings = profile["model_settings"]
     hosts, roles = settings["hosts"], settings["roles"]
+    if len(hosts) > MAX_HOSTS:
+        raise ProfileError("profile host limit exceeded", path="model_settings.hosts")
+    _reject_terminal_hosts(hosts, ProfileError, "model_settings.hosts")
     for name, host in hosts.items():
         if "kind" not in host:
             raise ProfileError("incomplete host: kind required", path="model_settings.hosts." + name)
@@ -305,71 +479,23 @@ def _complete(profile):
             raise ProfileError("optional is allowed only on lens.extra", path=path + ".optional")
         if "hosts" not in role or (not role["hosts"] and not role.get("optional", False)):
             raise ProfileError("incomplete role: declared hosts required", path=path + ".hosts")
+        if len(role["hosts"]) > MAX_HOSTS:
+            raise ProfileError("profile host binding limit exceeded", path=path + ".hosts")
         if any(host not in hosts for host in role["hosts"]):
             raise ProfileError("role references undeclared host", path=path + ".hosts")
-    for name, capacity in settings["capacity"].items():
-        if name not in hosts:
-            raise ProfileError("capacity references undeclared host", path="model_settings.capacity." + name)
-        for route_name, chain in capacity.get("fallback", {}).items():
-            if any(target not in hosts for target in chain):
-                raise ProfileError("capacity references undeclared host",
-                                   path="model_settings.capacity." + name + ".fallback." + route_name)
+    _capacity_complete(settings)
+    _lens_identities(profile)
 
-    def family(name):
-        return PRESET_DATA["hosts"][hosts[name]["kind"]]["family"]
+    families = {name: PRESET_DATA["hosts"][host["kind"]]["family"] for name, host in hosts.items()}
 
     for name, role in roles.items():
         chain = role["hosts"]
-        if role.get("pinned_family", False) and chain and any(family(host) != family(chain[0]) for host in chain):
+        if role.get("pinned_family", False) and chain and any(families[host] != families[chain[0]] for host in chain):
             raise ProfileError("pinned role chain changes family", path="model_settings.roles." + name + ".hosts",
                                related_paths=("model_settings.roles." + name + ".pinned_family",
                                               *("model_settings.hosts." + host + ".kind" for host in chain)))
 
-    cross_family = profile["policy"]["review"]["require_cross_family"]
-    writers = roles.get("writer", {}).get("hosts", [])
-    if cross_family and (not writers or not roles.get("reviewer.correctness", {}).get("hosts")):
-        raise ProfileError("cross-family review needs declared writer and reviewer hosts", path="policy.review.require_cross_family")
-    reviewed = set()
-
-    def route(chain, path, pinned=False, cross=False):
-        if any(name not in hosts for name in chain):
-            raise ProfileError("review route references undeclared host", path=path)
-        pending, reached = [(name, path) for name in chain], {}
-        while pending:
-            name, source = pending.pop()
-            if name in reached:
-                continue
-            reached[name] = source
-            pending.extend((target, "model_settings.capacity." + name + ".fallback.review")
-                           for target in settings["capacity"].get(name, {}).get("fallback", {}).get("review", []))
-        reviewed.update(reached)
-        for name, source in reached.items():
-            if pinned and chain and family(name) != family(chain[0]):
-                raise ProfileError("pinned lens fallback changes family", path=source,
-                                   related_paths=("model_settings.hosts." + name + ".kind",
-                                                  "model_settings.hosts." + chain[0] + ".kind"))
-            for writer in writers if cross else ():
-                if family(name) == family(writer):
-                    raise ProfileError("cross-family review route reaches the writer family", path=source,
-                                       related_paths=("model_settings.roles.writer.hosts",
-                                                      "model_settings.hosts." + name + ".kind",
-                                                      "model_settings.hosts." + writer + ".kind"))
-
-    for name, role in roles.items():
-        if name.startswith("reviewer.") or name == "lens.extra":
-            pinned = role.get("pinned_family", False)
-            # The preset security lens explicitly stays with its pinned family;
-            # correctness remains opposite the writer across every fallback.
-            cross = cross_family and (name == "reviewer.correctness" or (name != "lens.extra" and not pinned))
-            route(role["hosts"], "model_settings.roles." + name + ".hosts", pinned, cross)
-    for lens in profile["policy"]["review"]["lenses"]:
-        if not lens.get("host_pref"):
-            raise ProfileError("incomplete review lens: host_pref required", path="policy.review.lenses")
-        route(lens["host_pref"], "policy.review.lenses", lens.get("pinned_family", False),
-              cross_family and lens.get("voting", True))
-    for name, capacity in settings["capacity"].items():
-        if name not in reviewed and capacity.get("fallback", {}).get("review"):
-            route([name], "model_settings.capacity." + name + ".fallback.review", cross=cross_family)
+    _review_routes(profile, families)
     for gate in profile["policy"]["gates"]:
         if not {"name", "runner", "selector", "must_pass"} <= gate.keys():
             raise ProfileError("incomplete gate")
@@ -381,8 +507,14 @@ def _policy_layer(document, layer):
     if layer == "repo":
         return
     settings = document.get("model_settings", {})
+    if layer == "flags" and any(any(key in value for key in ("optional", "pinned_family"))
+                                for value in settings.get("roles", {}).values()):
+        raise _context(ProfileError("optional/pinned-family settings are repository-only; use the approval-before-merge path"), layer)
     governed = ("policy" in document or any(key in document.get("run_config", {}) for key in ("autopilot", "limits"))
-                or any("review" in value.get("fallback", {}) for value in settings.get("capacity", {}).values())
+                or any(any(kind in value.get("fallback", {}) for kind in
+                           (("review", "reviewer.correctness", "reviewer.security", "extra-review", "lens.extra")
+                            if layer == "user" else CAPACITY_KINDS))
+                       for value in settings.get("capacity", {}).values())
                 or any((name.startswith("reviewer.") or name == "lens.extra") and
                        any(key in value for key in ("hosts", "optional", "pinned_family"))
                        for name, value in settings.get("roles", {}).items())
@@ -408,6 +540,16 @@ def _set_leaf(document, path, value):
     document[path[-1]] = deepcopy(value)
 
 
+def _user_threshold_hosts(repository, names, entry):
+    compatible = []
+    for name in names:
+        prior = repository["model_settings"]["capacity"].get(name, {}).get("thresholds", {})
+        thresholds = capacity_thresholds({"thresholds": {**prior, **entry.get("thresholds", {})}})
+        if thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
+            compatible.append(name)
+    return compatible
+
+
 def _user_layer(document, repository):
     """Bind preferences by components; record repetitions without merging them."""
     result, records, applied = deepcopy(document), {}, {}
@@ -431,19 +573,24 @@ def _user_layer(document, repository):
     for section in ("hosts", "capacity"):
         for kind, entry in settings.get(section, {}).items():
             names = [name for name, host in hosts.items() if host.get("kind") == kind]
+            threshold_hosts = _user_threshold_hosts(repository, names, entry) if section == "capacity" else names
             for field, value in list(_leaves(entry)) or [((), {})]:
                 targets = [("model_settings", section, name, *field) for name in names if type(value) is not dict and
+                           (field[:1] != ("thresholds",) or name in threshold_hosts) and
                            (field[0] != "fallback" or _lookup(repository, ("model_settings", section, name, *field)) == value)]
                 reason = ("host kind is not declared by this repository" if not names else
                           "empty object has no effect" if type(value) is dict else
+                          "threshold preferences conflict with repository" if field[:1] == ("thresholds",) and not targets else
                           "routing is declared by the repository" if not targets else "bound by registered host kind")
                 record(("model_settings", section, kind, *field), value, targets, reason)
     for name, entry in settings.get("roles", {}).items():
         for field, value in list(_leaves(entry)) or [((), {})]:
             target = ("model_settings", "roles", name, *field)
-            applies = (name in roles and type(value) is not dict and
+            repository_only = field in (("optional",), ("pinned_family",))
+            applies = (not repository_only and name in roles and type(value) is not dict and
                        (field in (("model",), ("effort",)) or _lookup(repository, target) == value))
-            reason = ("role is not declared by this repository" if name not in roles else
+            reason = ("repository-only" if repository_only else
+                      "role is not declared by this repository" if name not in roles else
                       "empty object has no effect" if type(value) is dict else
                       "routing is declared by the repository" if not applies else "bound to declared repository role")
             record(target, value, [target] if applies else [], reason)
@@ -455,19 +602,6 @@ def _user_layer(document, repository):
         else:
             _set_leaf(applied, path, value)
     return applied, records
-
-
-def _display_values(records):
-    """Serialize component-keyed provenance; keep ambiguous labels lossless."""
-    labels = {}
-    for path in records:
-        labels.setdefault(".".join(path), []).append(path)
-    result = {}
-    for label, paths in labels.items():
-        for path in paths:
-            key = label if len(paths) == 1 else json.dumps(path, separators=(",", ":"))
-            result[key] = {**records[path], "path": list(path)}
-    return result
 
 
 def resolve(*, preset=None, repo=None, user=None, flags=None, live_run=False):
@@ -826,11 +960,16 @@ def initialize(root, preset, *, host=None, force=False):
     return document
 
 
-def doctor(resolved, root=None):
+def validate_resolved(resolved, root=None):
+    """Recheck route policy before consuming an already resolved profile."""
     try:
         _complete(resolved["profile"])
     except ProfileError as error:
         raise _context(error, "repo", str(Path(root).joinpath(*REPO_PATH)) if root is not None else None)
+
+
+def doctor(resolved, root=None):
+    validate_resolved(resolved, root)
     installed = {kind: pathlookup.which(data["cli"], outside=root) is not None for kind, data in PRESET_DATA["hosts"].items()}
     hosts = [{"name": name, "kind": host["kind"], "cli": PRESET_DATA["hosts"][host["kind"]]["cli"],
               "found": installed[host["kind"]]} for name, host in resolved["profile"]["model_settings"]["hosts"].items()]
@@ -854,55 +993,7 @@ def doctor(resolved, root=None):
             "write_scope": resolved["write_scope"]}
 
 
-def display_profile(value: Any) -> Any:
-    """Keep untrusted profile text on the canonicalize/redact/truncate path."""
-    from aegis_core.redaction import redact_command_secrets
-
-    def shown(text: str, identifier=False) -> str:
-        canonical = sanitize_display(text, max_len=None)
-        # Identifiers are schema references, not secret values. Pattern masking
-        # would change their meaning; credential positions are masked below.
-        redacted = canonical if identifier else redact_command_secrets(canonical)
-        return sanitize_display(redacted, max_len=512)
-
-    document = value.get("profile", value) if type(value) is dict else {}
-    prefix = ("profile",) if type(value) is dict and "profile" in value else ()
-    runners = document.get("run_config", {}).get("runners", {}) if type(document) is dict else {}
-    secrets = set()
-    for name, runner in runners.items():
-        if "credentials" in runner:
-            secrets.add((*prefix, "run_config", "runners", name, "credentials"))
-    values = value.get("values", {}) if type(value) is dict else {}
-    for label, record in values.items():
-        components = tuple(record["path"])
-        if len(components) == 4 and components[:2] == ("run_config", "runners") and components[-1] == "credentials":
-            secrets.add(("values", label, "value"))
-        if len(components) == 5 and components[:3] == ("user", "run_config", "runners") and components[-1] == "credentials":
-            secrets.add(("values", label, "value"))
-
-    def walk(item, path=(), identifier=False):
-        if path in secrets:
-            return "[REDACTED]"
-        if type(item) is dict:
-            result = {}
-            for key, child in item.items():
-                reference = key in {"runner", "hosts", "host_pref", "applied_to", "applied_paths", "path"}
-                if key == "name":
-                    # Doctor host aliases and review lens names are constrained
-                    # identifiers. Gate names are free text and must be redacted,
-                    # including the gate array copied into provenance values.
-                    reference = (len(path) == 2 and path[0] == "hosts")
-                    reference = reference or path[-4:-1] == ("policy", "review", "lenses")
-                    reference = reference or (len(path) == 4 and path[0] == "values" and path[2] == "value" and
-                                             tuple(values[path[1]]["path"]) == ("policy", "review", "lenses"))
-                reference = reference or (key in {"review", "doc"} and path[-1:] == ("fallback",))
-                if key == "value" and len(path) == 2 and path[0] == "values":
-                    components = tuple(values[path[1]]["path"])
-                    reference = components[-1:] in (("hosts",), ("host_pref",)) or components[-2:] in (("fallback", "review"), ("fallback", "doc"))
-                result[shown(key, identifier=True)] = walk(child, (*path, key), reference)
-            return result
-        if type(item) is list:
-            return [walk(child, (*path, index), identifier) for index, child in enumerate(item)]
-        return shown(item, identifier) if type(item) is str else item
-
-    return walk(value)
+def display_profile(value: Any, *, capacity=False) -> Any:
+    """Render through the shared policy; capacity views opt into typed actions."""
+    return _render_profile(value, capacity=capacity,
+                           identifier_pattern=_IDENTIFIER_PATTERN, max_string=MAX_STRING)
