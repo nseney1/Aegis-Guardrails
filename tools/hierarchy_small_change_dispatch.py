@@ -597,7 +597,7 @@ class _CapturedStore:
             try:
                 event = self.operation.json(path, private=False)
                 fields(event, {"schema", "seq", "at", "kind", "data"})
-                require(event["schema"] == workspace.EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
+                require(event["schema"] in workspace.REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
                 parse_time(event["at"])
                 declared = event["data"]
                 guarded = event
