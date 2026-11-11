@@ -1799,7 +1799,7 @@
                   "--fields"
                 ],
                 "help": "At most 16 selectors, depth 8: dotted paths, indices, one-level * and row projection findings.*.{id,severity,file,line}; comma separated; repeatable",
-                "kind": "append",
+                "kind": "BoundedSelections",
                 "metavar": "SEL",
                 "nargs": null,
                 "required": false
@@ -1810,8 +1810,8 @@
                 "flags": [
                   "--spans"
                 ],
-                "help": "Zero-based body span indices; at most 64 selections; repeatable",
-                "kind": "append",
+                "help": "Zero-based body span indices; at most 64 selections; comma separated; repeatable",
+                "kind": "BoundedSelections",
                 "metavar": "N",
                 "nargs": null,
                 "required": false
@@ -1847,8 +1847,8 @@
                 "flags": [
                   "--expand"
                 ],
-                "help": "Expand a named ref one level, charged to max-chars; repeatable",
-                "kind": "append",
+                "help": "Expand a named ref one level, charged to max-chars; comma separated; repeatable",
+                "kind": "BoundedSelections",
                 "metavar": "NAME",
                 "nargs": null,
                 "required": false
@@ -1859,7 +1859,7 @@
                 "flags": [
                   "--format"
                 ],
-                "help": "View format: json, md or tsv; MD fences data as untrusted, TSV uses JSON values",
+                "help": "View format: json, md or tsv; --json requires json; MD fences data as untrusted, TSV uses JSON values",
                 "kind": "store",
                 "metavar": "FORMAT",
                 "nargs": null,
