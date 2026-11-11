@@ -128,7 +128,7 @@ def _base_tree(rel_path: str, source: str | bytes | None, session: Any) -> tuple
 
     data = text.encode('utf-8')
     if len(data) > SOURCE_LIMIT_BYTES:
-        raise ASTDriverError('base source exceeds 2 MiB', reason='too_large')
+        raise ASTDriverError(f'base source exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB', reason='too_large', limit_bytes=SOURCE_LIMIT_BYTES)
     with TemporaryDirectory(prefix='aegis-security-base-') as temporary:
         path = Path(temporary) / 'base.go'
         atomic_write_bytes(path, data)
@@ -138,21 +138,23 @@ def _base_tree(rel_path: str, source: str | bytes | None, session: Any) -> tuple
 
 def evaluate_security_pack(
     workspace_root: Union[str, Path], changed_files: Iterable[str], base_sources: Mapping[str, Optional[Union[str, bytes]]],
-    *, session: Any = None,
+    *, session: Any = None, size_limits: Optional[Dict[str, Optional[int]]] = None,
 ) -> Dict[str, Any]:
     """Evaluate introduced security findings with a check-local shared AST session.
 
     Missing drivers are unverified; configured driver and source errors fail closed in
     Layer 1. Test paths remain visible as exemptions. An invalid base suppresses nothing.
     A caller checking an index snapshot supplies its repository-bound session.
+    ``size_limits`` receives refusal provenance for the caller's evidence without
+    adding fields to the public result document.
     """
-    from aegis_core.ast.runner import ASTDriverError, enforce_source_size
+    from aegis_core.ast.runner import ASTDriverError, enforce_source_size, source_limit_from_error
     from aegis_core.ast.session import ASTParseSession
 
     root = Path(workspace_root).resolve()
     if session is None:
         with ASTParseSession(str(root)) as owned_session:
-            return evaluate_security_pack(root, changed_files, base_sources, session=owned_session)
+            return evaluate_security_pack(root, changed_files, base_sources, session=owned_session, size_limits=size_limits)
     violations: List[Dict[str, Any]] = []
     exempted_test_findings: List[Dict[str, Any]] = []
     unverified_findings: List[Dict[str, Any]] = []
@@ -170,6 +172,8 @@ def evaluate_security_pack(
             head_ast = session.get(str(full_path))
         except (ASTExtractionError, ASTDriverError, OSError) as exc:
             reason = 'too_large' if is_size_limit_error(exc) else getattr(exc, 'reason', str(exc))
+            if reason == 'too_large' and size_limits is not None:
+                size_limits[rel_path] = source_limit_from_error(exc)
             unverified_findings.append(_unverified_file(rel_path, reason))
             continue
         if head_ast is None:

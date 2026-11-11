@@ -330,6 +330,18 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
                 detail = ("attachment" if isinstance(exc, OSError) else
                           "root" if isinstance(exc, WorkspaceNotFoundError) else "binding")
+                # _cli_path chains resolution errors before pin validation runs.
+                if detail == "root" and exc.__cause__ is None:
+                    from aegis_core.config import env_workspace
+                    from aegis_core.workspace.binding import resolve_binding
+
+                    pin = env_workspace()
+                    try:
+                        if pin and resolve_binding(pin=pin).reason == "pin_not_a_workspace":
+                            detail = "pin_not_a_workspace"
+                    except OSError:
+                        # A changing/unreadable pin cannot replace the original refusal.
+                        pass
                 return emit_error(CodecError("E_AUTH"), detail=detail)
             if not isinstance(exc, WorkspaceError):
                 raise
