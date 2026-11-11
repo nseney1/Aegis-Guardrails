@@ -129,8 +129,7 @@ def _layer1(root: str, targets: Sequence[str]) -> Tuple[Dict[str, Any], int, int
     for (path, evidence), found in zip(pairs, collected.by_evidence):
         if path is not None and not evidence.verdict and found is None:
             per_file[path] = per_file.get(path, 0) + 1  # a check that failed without a line is one finding
-    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL
-    from aegis_core.ast.runner import SOURCE_LIMIT_BYTES
+    from aegis_core.verification.ast_checks import AST_SIZE_NOTE_TOOL, size_limit_reason
 
     blocking_checks = {f"{e.tool}: {e.detail}" for path, e in pairs if path is None and not e.verdict}
     size_advisories = {f"{e.tool}: {e.detail}" for _path, e in pairs if e.tool == AST_SIZE_NOTE_TOOL and e.verdict}
@@ -139,10 +138,9 @@ def _layer1(root: str, targets: Sequence[str]) -> Tuple[Dict[str, Any], int, int
                               if (path is None and not e.verdict) or e.tool == AST_SIZE_NOTE_TOOL))
     # Several checks can emit the same size advisory. Coverage counts files,
     # independently of the compatible gate counts below.
-    size_reason = f"size limit (too_large; exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB)"
-    not_analyzed = [{"path": path, "reason": size_reason}
-                    for path in sorted({path for path, e in pairs
-                                        if path is not None and e.tool == AST_SIZE_NOTE_TOOL and e.verdict})]
+    size_reasons = {path: size_limit_reason(path, e.detail) for path, e in pairs
+                    if path is not None and e.tool == AST_SIZE_NOTE_TOOL and e.verdict}
+    not_analyzed = [{"path": path, "reason": size_reasons[path]} for path in sorted(size_reasons)]
     checked = len(targets)
     top = sorted(per_file.items(), key=lambda item: (-item[1], item[0]))[:TOP_FILES]
     return {

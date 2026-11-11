@@ -141,9 +141,11 @@ def extract_imports(filepath: str) -> list[ImportInfo]:
     guarded_modules: set[str] = set()
 
     # First pass: find importorskip calls via regex (not easily caught by AST)
+    previous_start, lineno = 0, 1
     for match in _IMPORTORSKIP_RE.finditer(source):
         module = match.group(1)
-        lineno = source[:match.start()].count('\n') + 1
+        lineno += source.count('\n', previous_start, match.start())
+        previous_start = match.start()
         _append_import(results, guarded_modules, ImportInfo(module=module, lineno=lineno, guarded=True))
 
     # Second pass: AST-based import extraction
@@ -200,10 +202,90 @@ def extract_imports(filepath: str) -> list[ImportInfo]:
     return results
 
 
+def _discover_project_packages(project_root: str) -> set[str]:
+    """Inventory traditional and namespace packages using the existing probes."""
+    local_packages: set[str] = set()
+    for entry in os.listdir(project_root):
+        if entry.startswith(('.', '_')):
+            continue
+        entry_path = os.path.join(project_root, entry)
+        if os.path.isdir(entry_path):
+            init_path = os.path.join(entry_path, '__init__.py')
+            if os.path.exists(init_path):
+                local_packages.add(entry)
+                # Also register individual .py basenames inside the
+                # package so bare `from jit_engine import X` is local
+                # when the package dir is on sys.path at test time.
+                try:
+                    for fname in os.listdir(entry_path):
+                        if fname.endswith('.py') and not fname.startswith('_'):
+                            local_packages.add(fname[:-3])
+                except PermissionError:
+                    pass
+            else:
+                # Check for namespace package: contains .py files or sub-packages
+                try:
+                    contents = os.listdir(entry_path)
+                except PermissionError:
+                    continue
+                has_python = any(f.endswith('.py') for f in contents)
+                has_subpkg = any(
+                    os.path.exists(os.path.join(entry_path, d, '__init__.py'))
+                    for d in contents
+                    if os.path.isdir(os.path.join(entry_path, d))
+                )
+                if has_python or has_subpkg:
+                    local_packages.add(entry)
+                    # Also register individual .py basenames inside
+                    # non-package directories (e.g. enzymes/jit_engine.py
+                    # → 'jit_engine') so bare `from jit_engine import X`
+                    # is recognised as local when enzymes/ is on sys.path.
+                    if not os.path.exists(init_path):
+                        for fname in contents:
+                            if fname.endswith('.py') and not fname.startswith('_'):
+                                local_packages.add(fname[:-3])
+    return local_packages
+
+
+def _discover_siblings(target_dir: str) -> set[str]:
+    """Sibling basenames come from the source directory, including snapshots."""
+    try:
+        return {name[:-3] for name in os.listdir(target_dir)
+                if name.endswith('.py') and not name.startswith('_')}
+    except PermissionError:
+        return set()
+
+
+class LocalPackageDiscovery:
+    """One verification run's inventories; never retain this across runs."""
+
+    def __init__(self) -> None:
+        self._projects: dict[str, set[str]] = {}
+        self._project_errors: dict[str, OSError] = {}
+        self._siblings: dict[str, set[str]] = {}
+
+    def for_file(self, filepath: str, project_root: str) -> set[str]:
+        """Keep project packages separate from each source directory's siblings."""
+        if project_root not in self._projects and project_root not in self._project_errors:
+            try:
+                self._projects[project_root] = _discover_project_packages(project_root)
+            except OSError as exc:
+                self._project_errors[project_root] = exc
+        if project_root in self._project_errors:
+            # Preserve per-file failures without repeating discovery or retaining
+            # an ever-growing traceback when the same refusal is reported again.
+            raise self._project_errors[project_root].with_traceback(None)
+        target_dir = os.path.dirname(os.path.abspath(filepath))
+        if target_dir not in self._siblings:
+            self._siblings[target_dir] = _discover_siblings(target_dir)
+        return self._projects[project_root] | self._siblings[target_dir]
+
+
 def check(
     filepath: str,
     allowed_deps: set[str] | None = None,
     project_root: str | None = None,
+    discovery: LocalPackageDiscovery | None = None,
 ) -> ToolEvidence:
     """Check a Python file for unguarded third-party imports.
 
@@ -215,6 +297,7 @@ def check(
         project_root: Root directory of the project. If provided,
             any top-level directory containing __init__.py is treated
             as a local package and not flagged.
+        discovery: Optional inventory shared only within this verification run.
 
     Returns:
         ToolEvidence with verdict=True if no unguarded third-party imports,
@@ -229,58 +312,9 @@ def check(
     if is_test_path(filepath):
         allowed_deps.add('pytest')
 
-    # Auto-detect local packages from project root
-    # Handles both traditional packages (__init__.py) and namespace packages
-    local_packages: set[str] = set()
+    local_packages = set()
     if project_root:
-        for entry in os.listdir(project_root):
-            if entry.startswith(('.', '_')):
-                continue
-            entry_path = os.path.join(project_root, entry)
-            if os.path.isdir(entry_path):
-                init_path = os.path.join(entry_path, '__init__.py')
-                if os.path.exists(init_path):
-                    local_packages.add(entry)
-                    # Also register individual .py basenames inside the
-                    # package so bare `from jit_engine import X` is local
-                    # when the package dir is on sys.path at test time.
-                    try:
-                        for fname in os.listdir(entry_path):
-                            if fname.endswith('.py') and not fname.startswith('_'):
-                                local_packages.add(fname[:-3])
-                    except PermissionError:
-                        pass
-                else:
-                    # Check for namespace package: contains .py files or sub-packages
-                    try:
-                        contents = os.listdir(entry_path)
-                    except PermissionError:
-                        continue
-                    has_python = any(f.endswith('.py') for f in contents)
-                    has_subpkg = any(
-                        os.path.exists(os.path.join(entry_path, d, '__init__.py'))
-                        for d in contents
-                        if os.path.isdir(os.path.join(entry_path, d))
-                    )
-                    if has_python or has_subpkg:
-                        local_packages.add(entry)
-                        # Also register individual .py basenames inside
-                        # non-package directories (e.g. enzymes/jit_engine.py
-                        # → 'jit_engine') so bare `from jit_engine import X`
-                        # is recognised as local when enzymes/ is on sys.path.
-                        if not os.path.exists(init_path):
-                            for fname in contents:
-                                if fname.endswith('.py') and not fname.startswith('_'):
-                                    local_packages.add(fname[:-3])
-
-        # Treat .py siblings of the target file as local (e.g. conftest.py)
-        target_dir = os.path.dirname(os.path.abspath(filepath))
-        try:
-            for sibling in os.listdir(target_dir):
-                if sibling.endswith('.py') and not sibling.startswith('_'):
-                    local_packages.add(sibling[:-3])
-        except PermissionError:
-            pass
+        local_packages = (discovery or LocalPackageDiscovery()).for_file(filepath, project_root)
 
     imports = extract_imports(filepath)
     violations: list[tuple[str, int]] = []

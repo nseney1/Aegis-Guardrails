@@ -330,7 +330,7 @@ def test_the_hook_names_the_index_cap_when_uncovered_native_content_was_not_chec
     assert token not in raw
     if size == 256:
         assert (code, _failed(payload)) == (1, [("secret_scan:github-pat", "src/app.ts")])
-        assert not any("not checked" in row["detail"] for row in payload["layer1"])
+        assert all(row["tool"] != "ast_unverified" for row in payload["layer1"])
         return
 
     assert (code, _failed(payload)) == (0, [])

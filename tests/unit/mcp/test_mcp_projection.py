@@ -66,7 +66,8 @@ def test_list_rules_summary_view_keeps_identity_type_and_fitness(workspace):
 
 def test_scan_ids_view_names_the_matched_rules(workspace):
     ids = execute_tool("aegis_scan", {"workspace": str(workspace), "files": ["src/app.py"], "view": "ids"})
-    assert ids == {"relevant_rules": ["trap-noid"], "invariant_warnings": [], "omitted_mandatory": [], "stale_rules": []}
+    assert ids == {"relevant_rules": ["trap-noid"], "invariant_warnings": [], "omitted_mandatory": [],
+                   "omitted_mandatory_count": 0, "omitted_mandatory_listed_count": 0, "stale_rules": []}
 
 
 def test_scan_summary_view_counts_and_names_rules_without_the_rendered_guidance(workspace):
@@ -332,3 +333,103 @@ def test_scan_summary_delivers_full_guidance_if_metadata_alone_cannot_fit():
 def test_scan_failure_is_never_compacted(view):
     payload = {**_scan_payload(), "status": "FAIL", "error": "Scan refused."}
     assert project_response(payload, view=view) is payload
+
+
+@pytest.mark.parametrize("listed", [0, 1, 10, 12])
+def test_scan_ids_preserves_exact_totals_for_core_trimmed_lists(listed):
+    payload = _scan_payload()
+    payload["omitted_mandatory"] *= listed
+    before = json.dumps(payload, sort_keys=True)
+    ids = project_response(payload, view="ids")
+    assert ids["omitted_mandatory_count"] == 12
+    assert ids["omitted_mandatory_listed_count"] == len(ids["omitted_mandatory"]) == listed
+    assert ids["unreviewed_rules_count"] == 27
+    assert ids["unreviewed_rules_listed_count"] == len(ids["unreviewed_rules"]) == 10
+    assert ids["relevant_rules"] == ["inv-a"]
+    assert "guidance" not in ids
+    assert json.dumps(payload, sort_keys=True) == before
+
+
+def test_scan_ids_keeps_unreviewed_total_when_core_trimmed_all_names():
+    payload = _scan_payload()
+    del payload["unreviewed_rules"]
+    ids = project_response(payload, view="ids")
+    assert ids["unreviewed_rules_count"] == 27
+    assert ids["unreviewed_rules_listed_count"] == 0
+    assert ids["unreviewed_rules"] == []
+
+
+@pytest.mark.parametrize("budget", [200, 600])
+def test_public_scan_ids_reports_more_omitted_mandatory_rules_than_names(tmp_path, monkeypatch, budget):
+    for index in range(40):
+        _rule(tmp_path, f"inv-{index:02d}", "type: invariant\nhypothesis: h\ntarget_paths: ['src/*.py']\n", "invariant")
+    monkeypatch.setenv("AEGIS_MAX_JIT_TOKENS", str(budget))
+    args = {"workspace": str(tmp_path), "files": ["src/app.py"]}
+    full = execute_tool("aegis_scan", args)
+    ids = execute_tool("aegis_scan", {**args, "view": "ids"})
+    assert ids["omitted_mandatory_count"] == full["stats"]["omitted_mandatory"]
+    assert ids["omitted_mandatory_listed_count"] == len(ids["omitted_mandatory"])
+    assert ids["omitted_mandatory_count"] > ids["omitted_mandatory_listed_count"]
+    assert ids["omitted_mandatory"] == [item["name"] for item in full["omitted_mandatory"]]
+
+
+@pytest.mark.parametrize("key", ["rules", "stale_rules", "ignored"])
+def test_ids_counts_items_dropped_for_lack_of_identity(key):
+    payload = {key: [{"name": "kept"}, {"hypothesis": "body without an identity"}]}
+    assert project_response(payload, view="ids") == {
+        key: ["kept"], f"{key}_count": 2, f"{key}_listed_count": 1,
+    }
+
+
+def test_scan_ids_displayed_counts_include_identity_filtering():
+    payload = _scan_payload()
+    payload["omitted_mandatory"].append({"reason": "token_budget"})
+    payload["unreviewed_rules"].append({"change": "changed"})
+    ids = project_response(payload, view="ids")
+    assert ids["omitted_mandatory_count"] == 12
+    assert ids["omitted_mandatory_listed_count"] == len(ids["omitted_mandatory"]) == 1
+    assert ids["unreviewed_rules_count"] == 27
+    assert ids["unreviewed_rules_listed_count"] == len(ids["unreviewed_rules"]) == 10
+
+
+def test_empty_workspace_list_rules_summary_returns_full_response(tmp_path):
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    args = {"workspace": str(tmp_path)}
+    full = execute_tool("aegis_list_rules", args)
+    assert full == {"rules": [], "stale_rules": [], "ignored": []}
+    summary = execute_tool("aegis_list_rules", {**args, "view": "summary"})
+    assert summary == full
+    assert estimate_tokens(json.dumps(summary)) == estimate_tokens(json.dumps(full))
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+@pytest.mark.parametrize("body_length", [0, 2000])
+def test_generic_summary_returns_the_less_expensive_shape(body_length, as_list):
+    rules = [{"_name": "rule", "hypothesis": "x" * body_length}]
+    payload = rules if as_list else {"rules": rules, "stale_rules": [], "ignored": []}
+    before = json.dumps(payload, sort_keys=True)
+    summary = project_response(payload, view="summary")
+    if as_list or body_length:
+        assert estimate_tokens(json.dumps(summary)) < estimate_tokens(json.dumps(payload))
+        assert "hypothesis" not in (summary[0] if as_list else summary["rules"][0])
+    else:
+        assert summary is payload
+    assert json.dumps(payload, sort_keys=True) == before
+
+
+def test_generic_summary_returns_full_when_the_shapes_cost_the_same():
+    payload = {"rules": [{"_name": "rule", "hypothesis": "x" * 2000}], "stale_rules": [], "ignored": []}
+    summary_tokens = estimate_tokens(json.dumps(project_response(payload, view="summary")))
+    candidates = ({**payload, "rules": [{"_name": "rule", "hypothesis": "x" * length}]}
+                  for length in range(400))
+    equal_cost = next(p for p in candidates if estimate_tokens(json.dumps(p)) == summary_tokens)
+    assert project_response(equal_cost, view="summary") is equal_cost
+
+
+@pytest.mark.parametrize("key", ["rules", "stale_rules", "ignored"])
+def test_generic_summary_reports_total_and_displayed_count_for_capped_lists(key):
+    payload = {key: [{"_name": f"rule-{index}", "hypothesis": "Full guidance. " * 40} for index in range(12)]}
+    summary = project_response(payload, view="summary")
+    assert summary[f"{key}_count"] == 12
+    assert summary[f"{key}_listed_count"] == len(summary[key]) == 10
+    assert estimate_tokens(json.dumps(summary)) < estimate_tokens(json.dumps(payload))
