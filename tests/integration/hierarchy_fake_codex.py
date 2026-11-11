@@ -41,6 +41,11 @@ import sys
 import time
 import uuid
 
+if __package__:
+    from .hierarchy_fake_wrapper import python_argv
+else:
+    from hierarchy_fake_wrapper import python_argv
+
 HOST = Path(__file__).resolve().with_name("hierarchy_fake_host.py")
 EROFS = "OSError: [Errno 30] Read-only file system: '%s'\n"
 HELPER = "native-probe-attempt.py"
@@ -53,9 +58,13 @@ CARVE_OUTS = (".git", ".agents", ".codex")
 def main():
     argv = sys.argv[1:]
     if os.environ.get("FAKE_CODEX_ROLLOUT"):
-        sys.exit(rollout_main(argv))
-    if "resume" in argv:
-        os.execv(sys.executable, [sys.executable, str(HOST), *argv])
+        if not os.environ.get("CODEX_HOME"):
+            sys.exit(rollout_main(argv))
+        command = python_argv("codex", __file__, Path(os.environ["CODEX_HOME"]).parent, "rollout_main")
+        os.execv(command[0], [*command, *argv])
+    if "resume" in argv and os.environ.get("FAKE_CODEX_MODE") != "hang":
+        command = python_argv("codex", HOST, Path(os.environ["FAKE_HOST_LOG"]).parent)
+        os.execv(command[0], [*command, *argv])
     log_call(argv)
     mode = os.environ.get("FAKE_CODEX_MODE", "")
     if mode == "no-thread":
