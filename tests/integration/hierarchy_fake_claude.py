@@ -51,6 +51,11 @@ import sys
 import time
 import uuid
 
+if __package__:
+    from .hierarchy_fake_wrapper import shell_exec
+else:
+    from hierarchy_fake_wrapper import shell_exec
+
 MARK = b"hierarchy_fake_claude.py"
 HERE = Path(__file__).resolve()
 HOST = HERE.with_name("hierarchy_fake_host.py")
@@ -522,7 +527,7 @@ def emit(event):
 def install(bin_dir):
     """Write an executable `claude` into bin_dir that runs this file, and return its path."""
     path = Path(bin_dir) / "claude"
-    path.write_text("#!/bin/sh\nexec %s %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(str(HERE))),
+    path.write_text("#!/bin/sh\n%s \"$@\"\n" % shell_exec("claude", HERE, Path(bin_dir).parent),
                     encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
