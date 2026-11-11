@@ -4,6 +4,7 @@ Generated connections are started through the real adapter here. Host CLIs are n
 tests show the profiles are well formed and match the flags that worked on real hosts, not that a
 host accepts them today.
 """
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import pytest
 
 from tests.integration.test_hierarchy_mailbox import HELPER, ROOT, git, invoke
 from tests.integration.test_hierarchy_workspace import Workspace
+from tests.conftest import symlink_or_skip
 
 
 # Generated profiles use POSIX paths and the wake tool needs POSIX process groups.
@@ -32,6 +34,9 @@ RB2_PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
 RB2_RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
                                   'restore it, or remove the unregistered base and run init again')
 _SOURCE_SEED = pytest.StashKey[Path]()
+LINK_FALLBACK = frozenset(getattr(errno, name) for name in
+                          ("EXDEV", "EPERM", "EACCES", "ENOSYS", "EOPNOTSUPP", "ENOTSUP", "EMLINK")
+                          if hasattr(errno, name))
 
 
 def provision(command, request, *, expect=0):
@@ -54,6 +59,56 @@ def build_source(source):
     git(source, "commit", "-qm", "pinned source")
 
 
+def copy_git_object(source, destination):
+    link = getattr(os, "link", None)
+    if link is not None:
+        try:
+            link(source, destination)
+        except NotImplementedError:
+            pass
+        except OSError as exc:
+            if exc.errno not in LINK_FALLBACK:
+                raise
+        else:
+            return destination
+    return shutil.copy2(source, destination)
+
+
+def copy_source(source, destination):
+    source = Path(source)
+
+    def copy_file(path, target):
+        parts = Path(path).relative_to(source).parts
+        loose = len(parts) == 4 and len(parts[2]) == 2 and all(c in "0123456789abcdef" for c in parts[2])
+        packed = len(parts) == 4 and parts[2] == "pack"
+        if parts[:2] == (".git", "objects") and (loose or packed):
+            return copy_git_object(path, target)
+        # Mutable Git metadata, including objects/info, and working files stay private.
+        return shutil.copy2(path, target)
+
+    return shutil.copytree(source, destination, symlinks=True, copy_function=copy_file)
+
+
+def source_object_snapshot(seed):
+    objects = {}
+    for path in sorted((seed / ".git" / "objects").rglob("*")):
+        if path.is_file():
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(65536), b""):
+                    digest.update(block)
+            objects[path.relative_to(seed).as_posix()] = (path.stat().st_size, digest.hexdigest())
+    return objects
+
+
+def check_source_seed(seed, commit, objects):
+    observed = source_object_snapshot(seed)
+    for name in sorted(objects.keys() | observed.keys()):
+        assert observed.get(name) == objects.get(name), "source seed object changed: " + name
+    assert git(seed, "status", "--porcelain") == ""
+    assert git(seed, "rev-parse", "HEAD") == commit
+
+
 def worker_source_seed(tmp_path_factory, request):
     # setup is also imported as a fixture by other modules. A session stash
     # keeps one seed per worker without requiring those modules to import it.
@@ -61,11 +116,13 @@ def worker_source_seed(tmp_path_factory, request):
     if _SOURCE_SEED not in session.stash:
         seed = tmp_path_factory.mktemp("provision-source-seed") / "source"
         build_source(seed)
+        # One pack per worker avoids copying loose-object directory metadata per case.
+        git(seed, "repack", "-ad")
         commit = git(seed, "rev-parse", "HEAD")
+        objects = source_object_snapshot(seed)
 
         def check_seed():
-            assert git(seed, "status", "--porcelain") == ""
-            assert git(seed, "rev-parse", "HEAD") == commit
+            check_source_seed(seed, commit, objects)
 
         session.addfinalizer(check_seed)
         session.stash[_SOURCE_SEED] = seed
@@ -88,9 +145,9 @@ class Setup:
             # Preserve direct callers in other test modules.
             build_source(self.source)
         else:
-            # Only immutable objects are shared. Files, index and refs are local;
-            # the seed outlives every clone, including clones made by imports.
-            git(tmp_path, "clone", "-q", "--shared", str(source_seed), str(self.source))
+            # Mutable files, index and refs stay private; immutable objects share
+            # the seed's storage without clone's remote or object alternates.
+            copy_source(source_seed, self.source)
 
     def request(self, **body):
         return {"_request_path": str(self.tmp / ("request-%s.json" % uuid.uuid4().hex)), **body}
@@ -115,6 +172,166 @@ def setup(tmp_path, tmp_path_factory, request):
     built = Setup(tmp_path, source_seed=worker_source_seed(tmp_path_factory, request))
     built.init()
     return built
+
+
+def test_rf42_seed_copy_is_a_standalone_checkout_with_a_verified_runtime(tmp_path, source_seed):
+    from tools.hierarchy_runtime_source import verify
+
+    built = Setup(tmp_path, source_seed=source_seed)
+    assert git(built.source, "remote") == ""
+    assert not (built.source / ".git" / "objects" / "info" / "alternates").exists()
+    assert git(built.source, "rev-parse", "HEAD") == git(source_seed, "rev-parse", "HEAD")
+    # Verify before status has a chance to refresh the copied index's stat cache.
+    pin = {"source": str(built.source), "source_commit": git(source_seed, "rev-parse", "HEAD"),
+           "source_tree": git(source_seed, "rev-parse", "HEAD^{tree}")}
+    bootstrap = (source_seed / "tools" / "hierarchy_runtime_source.py").read_bytes()
+    assert verify(pin) == bootstrap
+    record = built.init()
+    assert verify(record, built.base) == bootstrap
+    assert git(built.source, "status", "--porcelain") == ""
+
+
+def test_rf42_seed_copy_preserves_symlinks(tmp_path, source_seed):
+    seed = tmp_path / "seed"
+    copy_source(source_seed, seed)
+    (seed / "notes.txt").write_text("fixture note", encoding="utf-8")
+    symlink_or_skip("notes.txt", seed / "notes-link")
+    git(seed, "add", ".")
+    git(seed, "commit", "-qm", "fixture symlink")
+    folder = tmp_path / "case"
+    folder.mkdir()
+    built = Setup(folder, source_seed=seed)
+    assert (built.source / "notes-link").is_symlink()
+    assert os.readlink(built.source / "notes-link") == "notes.txt"
+    assert (built.source / "notes-link").read_bytes() == b"fixture note"
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["loose", "packed"])
+def test_rf42_seed_copies_share_immutable_git_objects(tmp_path, packed):
+    for name in ("base", "copy"):
+        (tmp_path / name).mkdir()
+    seed = tmp_path / "base" / "source"
+    build_source(seed)
+    if packed:
+        git(seed, "repack", "-ad")
+        objects = sorted((seed / ".git" / "objects" / "pack").iterdir())
+    else:
+        objects = sorted((seed / ".git" / "objects").glob("[0-9a-f][0-9a-f]/*"))
+    assert objects
+    link = getattr(os, "link", None)
+    if link is None:
+        pytest.skip("hard links are unavailable")
+    probe = tmp_path / "hardlink-probe"
+    try:
+        link(objects[0], probe)
+    except NotImplementedError:
+        pytest.skip("hard links are not implemented")
+    except OSError as exc:
+        if exc.errno not in LINK_FALLBACK:
+            raise
+        pytest.skip("hard links are unavailable on this filesystem (errno %s)" % exc.errno)
+    else:
+        probe.unlink()
+    built = Setup(tmp_path / "copy", source_seed=seed)
+    for original in objects:
+        copied = built.source / original.relative_to(seed)
+        assert copied.stat().st_dev == original.stat().st_dev
+        assert copied.stat().st_ino == original.stat().st_ino
+
+
+def test_rf42_seed_copy_keeps_mutable_git_state_private(tmp_path, source_seed):
+    names = ("index", "HEAD", "config", "refs/heads/develop")
+    original = {name: (source_seed / ".git" / name).read_bytes() for name in names}
+    built = Setup(tmp_path, source_seed=source_seed)
+    for name in names:
+        assert not os.path.samefile(source_seed / ".git" / name, built.source / ".git" / name)
+    path = "tools/hierarchy_templates/model-bindings.json"
+    (built.source / path).write_text("{}", encoding="utf-8")
+    git(built.source, "add", "--", path)
+    git(built.source, "commit", "-qm", "private mutable state")
+    git(built.source, "checkout", "-qb", "private-copy")
+    assert (built.source / ".git" / "index").read_bytes() != original["index"]
+    assert (built.source / ".git" / "refs/heads/develop").read_bytes() != original["refs/heads/develop"]
+    for name, raw in original.items():
+        assert (source_seed / ".git" / name).read_bytes() == raw
+    assert git(source_seed, "branch", "--list", "private-copy") == ""
+
+
+@pytest.mark.parametrize("failure", [
+    pytest.param(getattr(errno, name), id=name.lower())
+    for name in ("EXDEV", "EPERM", "EACCES", "ENOSYS", "EOPNOTSUPP", "ENOTSUP", "EMLINK")
+    if hasattr(errno, name)
+] + [pytest.param("unavailable", id="unavailable"), pytest.param("not-implemented", id="not-implemented")])
+def test_rf42_seed_copy_falls_back_when_hard_links_are_unavailable(tmp_path, source_seed, monkeypatch, failure):
+    module = sys.modules[Setup.__module__]
+    attempts = []
+
+    def refused(source, destination):
+        attempts.append(source)
+        if failure == "not-implemented":
+            raise NotImplementedError("hard links unavailable")
+        raise OSError(failure, "hard links unavailable")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(link=None if failure == "unavailable" else refused))
+    built = Setup(tmp_path, source_seed=source_seed)
+    if failure != "unavailable":
+        assert attempts
+    objects = source_seed / ".git" / "objects"
+    original = next(iter(sorted(objects.glob("[0-9a-f][0-9a-f]/*")) + sorted((objects / "pack").glob("*"))))
+    copied = built.source / original.relative_to(source_seed)
+    assert copied.read_bytes() == original.read_bytes()
+    assert not copied.samefile(original)
+    assert git(built.source, "status", "--porcelain") == ""
+
+
+def test_rf42_seed_copy_does_not_hide_unexpected_link_errors(tmp_path, source_seed, monkeypatch):
+    module = sys.modules[Setup.__module__]
+
+    def broken(source, destination):
+        raise OSError(errno.EIO, "unexpected object link failure")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(link=broken))
+    with pytest.raises(shutil.Error, match="unexpected object link failure"):
+        Setup(tmp_path, source_seed=source_seed)
+
+
+def test_rf42_seed_finalizer_names_a_shared_object_corrupted_in_place(tmp_path, tmp_path_factory):
+    checks = []
+    session = SimpleNamespace(stash=pytest.Stash(), addfinalizer=checks.append)
+    seed = worker_source_seed(tmp_path_factory, SimpleNamespace(session=session))
+    original = next((seed / ".git" / "objects" / "pack").glob("*.pack"))
+    probe = tmp_path / "link-probe"
+    link = getattr(os, "link", None)
+    if link is None:
+        pytest.skip("hard links are unavailable")
+    try:
+        link(original, probe)
+    except NotImplementedError:
+        pytest.skip("hard links are not implemented")
+    except OSError as exc:
+        if exc.errno not in LINK_FALLBACK:
+            raise
+        pytest.skip("hard links are unavailable on this filesystem (errno %s)" % exc.errno)
+    else:
+        probe.unlink()
+    copied = tmp_path / "copy"
+    copy_source(seed, copied)
+    relative = original.relative_to(seed)
+    changed = copied / relative
+    assert changed.samefile(original)
+    mode = changed.stat().st_mode & 0o777
+    try:
+        changed.chmod(mode | 0o200)
+        with changed.open("r+b") as stream:
+            first = stream.read(1)
+            stream.seek(0)
+            stream.write(bytes([first[0] ^ 0xff]))
+    finally:
+        changed.chmod(mode)
+    assert len(checks) == 1
+    with pytest.raises(AssertionError) as caught:
+        checks[0]()
+    assert str(caught.value).splitlines()[0] == "source seed object changed: " + relative.as_posix()
 
 
 def test_rf33_source_clones_keep_mutations_private(tmp_path, source_seed):
@@ -2774,7 +2991,7 @@ def test_mr1_r10_default_path_verifies_canonical_pin(mr1_r2_setup, mr1_cli, tmp_
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     copied = mr1_r4_copy_base(setup, tmp_path_factory)
     replacement = tmp_path_factory.mktemp("mr1-r10-source-" + uuid.uuid4().hex) / "source"
-    shutil.copytree(setup.source, replacement)
+    copy_source(setup.source, replacement)
     canonical_path = setup.base / "provision.json"
     canonical = json.loads(canonical_path.read_text())
     canonical["source"] = str(replacement)
