@@ -87,8 +87,8 @@
       "stmts": 709
     },
     "aegis_core/human_gate.py": {
-      "lines": 1211,
-      "stmts": 751
+      "lines": 1076,
+      "stmts": 640
     },
     "aegis_core/migrate.py": {
       "lines": 273,
