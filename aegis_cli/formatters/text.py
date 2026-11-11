@@ -28,7 +28,7 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
         lines.append(f"  files: {scope['files']} ({origin}). Sampled {scope['files_analyzed']} of {scope['files']} files "
                      "for Layer 1")
     else:
-        lines.append(f"  files: {scope['files']} ({origin}), all analyzed")
+        lines.append(f"  files: {scope['files']} ({origin}), all considered for Layer 1")
     if doc["languages"]:
         lines.append("  languages: " + ", ".join(f"{row['language']} {row['files']}" for row in doc["languages"]))
     else:
@@ -48,11 +48,20 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
                      "(served and targeting a file)")
     if not layer1["checked"]:
         lines.append("  Layer 1: no file to check")
+    elif layer1["pass_rate"] is None:
+        lines.append(f"  Layer 1: unavailable; {layer1['checked']} file(s) selected")
     else:
-        percent = int(layer1["pass_rate"] * 100) if layer1["pass_rate"] is not None else 0
-        lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files pass "
+        percent = int(layer1["pass_rate"] * 100)
+        lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files without blocking findings "
                      f"({layer1['passed']} of {layer1['checked']}); "
                      f"{layer1['findings']} finding(s) in {layer1['failed']} file(s)")
+    not_analyzed = layer1.get("not_analyzed", [])
+    if not_analyzed:
+        coverage = "Layer 1 coverage" if layer1["pass_rate"] is None else "AST coverage"
+        lines.append(f"  {coverage}: {len(not_analyzed)} file(s) not analyzed:")
+        lines.extend(f"    {item['path']}: {item['reason']}" for item in not_analyzed[:20])
+        if len(not_analyzed) > 20:
+            lines.append(f"    ... and {len(not_analyzed) - 20} more")
     if doc["top_files"]:
         lines.append("  files with the most findings:")
         lines.extend(f"    {row['findings']:>5}  {row['path']}" for row in doc["top_files"])

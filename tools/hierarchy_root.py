@@ -339,28 +339,33 @@ def find_transcript(projects_dir, session):
     return found[0] if len(found) == 1 else None
 
 
-def read_jsonl(path, tolerate_torn_tail=True):
-    """Return ([(line_number, record)], torn_tail).
+def read_jsonl(path, tolerate_torn_tail=True, *, reduce_rows=list):
+    """Return (reduce_rows((line_number, record) iterator), torn_tail).
 
     A live transcript's last line can be half written while the session runs, so an
     unparsable last line is skipped and reported (F1). An unparsable earlier line is
-    corruption and fails.
+    corruption and fails. The default retains the list API; a reducer must exhaust
+    the iterator to validate the complete stream, keeping only the state it needs.
     """
     with open(path, "rb") as stream:
-        lines = stream.read().split(b"\n")
-    last = max((index for index, line in enumerate(lines) if line.strip()), default=-1)
-    rows, torn = [], False
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            if index == last and tolerate_torn_tail:
-                torn = True
-                continue
-            raise Failure(EXIT_CRITICAL, "unparsable JSON at line %d of %s" % (index + 1, path)) from None
-        rows.append((index + 1, record))
+        torn = False
+
+        def records():
+            nonlocal torn
+            for number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line[:-1] if line.endswith(b"\n") else line)
+                except ValueError:
+                    if tolerate_torn_tail and (not line.endswith(b"\n")
+                                               or not any(tail.strip() for tail in stream)):
+                        torn = True
+                        return
+                    raise Failure(EXIT_CRITICAL, "unparsable JSON at line %d of %s" % (number, path)) from None
+                yield number, record
+
+        rows = reduce_rows(records())
     return rows, torn
 
 
@@ -858,11 +863,11 @@ def lane_health(session, label, agents, args, now):
         return entry
     entry["transcript"] = str(transcript)
     try:
-        rows, entry["torn_tail"] = read_jsonl(transcript)
+        activity, entry["torn_tail"] = read_jsonl(transcript, reduce_rows=transcript_activity)
     except (Failure, OSError) as exc:
         entry["error"] = str(exc)
         return entry
-    last_ts, request, answered, entry["enqueued_notices"] = transcript_activity(rows)
+    last_ts, request, answered, entry["enqueued_notices"] = activity
     if last_ts is not None:
         entry["last_record_ts"] = last_ts[1]
         entry["silent_s"] = round((now - last_ts[0]).total_seconds(), 3)

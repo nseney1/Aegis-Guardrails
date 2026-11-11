@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 from aegis_core import primitives
 from aegis_core import codeowners as _codeowners
-from aegis_core import ghcli, gitsafe, governance, pathlookup
+from aegis_core import approval_shape as _approval_shape, ghcli, gitsafe, governance, pathlookup
 from aegis_core.errors import AegisError
 from aegis_core.primitives import utc_stamp
 from aegis_core.storage import atomic_write_bytes
@@ -44,6 +44,7 @@ __all__ = [
     "find_review_approval",
     "is_branch_name",
     "find_test_exemption",
+    "exemption_finder",
     "governance_tree_hash",
     "insight_text_hash",
     "signed_empty_commit",
@@ -75,10 +76,10 @@ _STATEMENTS = {
     "C": "detection and audit only: nothing here is enforced against the agent",
 }
 _ACCEPT_LINE = re.compile(r"^[ \t]*aegis-accept[ \t]*:", re.IGNORECASE | re.MULTILINE)
-_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
-_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(\S*)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_LINE = re.compile(r"^[ \t]*aegis-approve[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
+_APPROVE_INSIGHT_LINE = re.compile(r"^[ \t]*aegis-approve-insight[ \t]*:[ \t]*(?:(\S+)[ \t]*)?$", re.IGNORECASE | re.MULTILINE)
 _EXEMPT_TEST_LINE = re.compile(
-    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*?)[ \t]*$",
+    r"^[ \t]*Aegis-Exempt-Test:[ \t]*([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)[ \t]+(\S[^\r\n]*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 _JOB_ID = re.compile(r"^  ([A-Za-z0-9_-]+):[ \t]*(?:#.*)?$")
@@ -710,13 +711,12 @@ def _verify_commit_sig(top: Path, oid: str, base: str, ok_reason: str) -> Approv
     status, fingerprint = _signature(top, oid, signers or b"")
     if status == "G":
         return Approval(True, "ok", ok_reason, oid, fingerprint)
-    if status == "N":
-        return _no("unsigned", "the commit is not signed", oid)
-    if status == "U":
-        return _no("untrusted_signature", "the signing key is not in the base allowed_signers", oid)
-    if status == "E":
-        return _no("unverifiable", "git could not check the signature", oid)
-    return _no("bad_signature", f"the signature does not verify (git reports {status!r})", oid)
+    refusals = {
+        "N": ("unsigned", "the commit is not signed"),
+        "U": ("untrusted_signature", "the signing key is not in the base allowed_signers"),
+        "E": ("unverifiable", "git could not check the signature"),
+    }
+    return _no(*refusals.get(status, ("bad_signature", f"the signature does not verify (git reports {status!r})")), oid)
 
 
 def _commit_message(top: Path, oid: str) -> Optional[str]:
@@ -726,11 +726,9 @@ def _commit_message(top: Path, oid: str) -> Optional[str]:
 
 def _read_message(top: Path, oid: str) -> Union[str, Approval]:
     message = _commit_message(top, oid)
-    if message is None:
-        return _no("unresolved", f"cannot read commit {oid}", oid)
-    if _ACCEPT_LINE.search(message):
-        return _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid)
-    return message
+    return (_no("unresolved", f"cannot read commit {oid}", oid) if message is None else
+            _no(*limit, oid) if (limit := _approval_shape.bounds_refusal(message)) else
+            _no("accept_reserved", "the message carries an Aegis-Accept line, which is reserved", oid) if _ACCEPT_LINE.search(message) else message)
 
 
 def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str, List[str]]]:
@@ -745,16 +743,8 @@ def _commits_in(top: Path, head: str, base_ref: str) -> Optional[Tuple[str, str,
     return tip, base, res.stdout.decode("ascii", "replace").split()
 
 
-def _verify_single_trailer(
-    root: Any,
-    commit: str,
-    base_ref: Optional[str],
-    rx: re.Pattern[str],
-    name: str,
-    expected: str,
-    mismatch_msg: str,
-    ok_msg: str,
-) -> Approval:
+def _verify_single_trailer(root: Any, commit: str, base_ref: Optional[str], rx: re.Pattern[str],
+                           name: str, expected: str, mismatch_msg: str, ok_msg: str) -> Approval:
     try:
         top = _top(root)
         base_target = base_ref or gitsafe.resolve_base_ref(top)
@@ -780,8 +770,8 @@ def _verify_candidate(top: Path, oid: str, base: str, rx: re.Pattern[str], name:
         values = rx.findall(message)
         if not values:
             return _no("no_trailer", f"no {name} trailer", oid)
-        if len(values) > 1:
-            return _no("multiple_trailers", f"more than one {name} trailer", oid)
+        if refusal := _approval_shape.refusal(message, rx, name):
+            return _no(*refusal, oid)
         if values[0].lower() != expected.lower():
             return _no("hash_mismatch", mismatch_msg, oid)
         return _verify_commit_sig(top, oid, base, ok_msg)
@@ -825,8 +815,7 @@ def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base
         top = _top(root)
         oid, fix_oid, base = (gitsafe.resolve_commit(top, rev) for rev in (approval_commit, fix_commit, base_ref))
         if not oid or not fix_oid or not base:
-            why = f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}"
-            return _no("unresolved", why, str(approval_commit))
+            return _no("unresolved", f"cannot resolve {approval_commit!r}, {fix_commit!r}, or the base {base_ref!r}", str(approval_commit))
         message = _read_message(top, oid)
         if isinstance(message, Approval):
             return message
@@ -836,8 +825,8 @@ def verify_test_exemption(root: Any, approval_commit: str, fix_commit: str, base
         reasons = [r.strip() for t, r in entries if t.lower() == fix_oid.lower()]
         if not reasons:
             return _no("commit_mismatch", f"Aegis-Exempt-Test does not name fix commit {fix_oid[:12]}", oid)
-        if len(reasons) > 1:
-            return _no("multiple_trailers", "more than one Aegis-Exempt-Test trailer for this commit", oid)
+        if refusal := _approval_shape.refusal(message, _EXEMPT_TEST_LINE, "Aegis-Exempt-Test"):
+            return _no(*refusal, oid)
         return _verify_commit_sig(top, oid, base, f"good test exemption for {fix_oid[:12]}: {reasons[0]}")
     except gitsafe.GitError as exc:
         return _no("unresolved", str(exc), str(approval_commit))
@@ -910,7 +899,7 @@ def find_approval(root: Any, head: str, base_ref: str, governance_hash: Optional
         return None
     for record in res.stdout.split(b"\0"):
         oid, _, message = record.decode("utf-8", "replace").lstrip("\n").partition("\n")
-        if not _FULL_OID.fullmatch(oid) or not _APPROVE_LINE.search(message):
+        if not _FULL_OID.fullmatch(oid) or _approval_shape.bounds_refusal(message) or not _APPROVE_LINE.search(message):
             continue
         verdict = _verify_candidate(top, oid, base_target, _APPROVE_LINE, "Aegis-Approve", digest,
                                     _APPROVE_MISMATCH, _APPROVE_OK)
@@ -997,27 +986,38 @@ def find_review_approval(root: Any, pull: PullRequest, base: str, paths: Sequenc
 
 
 @gitsafe.scrubbed()
-def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
-    """The first valid exemption of ``fix_commit`` in base..head; else the first rejected one whose
-    trailer names it (so a refusal can say why); else None."""
+def exemption_finder(root: Any, head: str, base_ref: str) -> Callable[[str], Optional[Approval]]:
+    """Index once, newest first: lookups return the first valid exemption, else first rejection, else None.
+    Read full commit messages individually; release each before reading the next object."""
     top = _top(root)
     scan = _commits_in(top, head, base_ref)
-    fix_oid = gitsafe.resolve_commit(top, fix_commit)
-    if scan is None or not fix_oid:
-        return None
-    rejected: Optional[Approval] = None
-    for oid in scan[2]:
-        if oid == fix_oid:  # a commit cannot carry its own full oid
-            continue
-        verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
-        if verdict.valid:
-            return verdict
-        # unresolved and accept_reserved come before the trailer is read: keep them only for a commit naming the fix
-        if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch") and any(
-            t.lower() == fix_oid.lower() for t, _why in _EXEMPT_TEST_LINE.findall(_commit_message(top, oid) or "")
-        ):
-            rejected = verdict
-    return rejected
+    candidates: Dict[str, List[str]] = {}
+    if scan is not None:
+        for oid in scan[2]:
+            message = _commit_message(top, oid)
+            if message is None:
+                candidates.clear()
+                break
+            for target in dict.fromkeys(t.lower() for t, _why in (
+                    () if _approval_shape.bounds_refusal(message) else _EXEMPT_TEST_LINE.findall(message)) if t.lower() != oid):
+                candidates.setdefault(target, []).append(oid)
+            del message  # Release the full message before reading the next raw object.
+    @gitsafe.scrubbed()
+    def find(fix_commit: str) -> Optional[Approval]:
+        fix_oid = gitsafe.resolve_commit(top, fix_commit)
+        rejected: Optional[Approval] = None
+        for oid in candidates.get(fix_oid or "", []):
+            verdict = verify_test_exemption(top, oid, fix_oid, base_ref)
+            if verdict.valid:
+                return verdict
+            if rejected is None and verdict.code not in ("no_exemption_trailer", "commit_mismatch"):
+                rejected = verdict
+        return rejected
+    return find
+
+
+def find_test_exemption(root: Any, head: str, base_ref: str, fix_commit: str) -> Optional[Approval]:
+    return exemption_finder(root, head, base_ref)(fix_commit)
 
 
 def signed_empty_commit(root: Any, message: str, *, interactive: bool = False) -> str:

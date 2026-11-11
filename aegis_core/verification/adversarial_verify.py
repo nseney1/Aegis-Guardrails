@@ -1,4 +1,4 @@
-"""Adversarial pair enzyme — builds prompts and parses structured output.
+"""Adversarial pair verifier — builds prompts and parses structured output.
 
 Provides the information-partitioned interface between the Spec Agent
 (sees plan + signatures only) and the Code Agent (sees implementation +

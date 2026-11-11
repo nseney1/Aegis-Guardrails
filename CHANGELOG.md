@@ -4,6 +4,27 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Breaking: `.soma/` workspaces are no longer recognized. Archive them or convert them with v4.x `aegis migrate` before upgrading. Supported `.aegis/` rule maintenance and worktree-ledger merging remain available; retired v3 state is never converted by this version.
+- Breaking: The newly refused retired v3 state paths are `.aegis/receipt_key`, `.aegis/evidence/fitness.jsonl`, `.aegis/evidence/sessions_processed.jsonl` and `.aegis/manifest.json`. Current v4 writers use protected `state/` paths instead.
+- Breaking: Checkpoint test discovery no longer strips a `soma_` prefix when pairing source modules with tests.
+- Breaking: Rule-type alias directories (such as `invariant/` or `Invariants/`) fail closed for any frontmatter; `aegis migrate` normalizes them. Other non-canonical rule directories fail closed for rule-like frontmatter (`id`, `enforcement`, `type`, `target_paths` or `forbid_ast`); title-only notes there remain ignored-file warnings.
+- Breaking: `aegis doctor` no longer reports or fixes `soma` MCP registrations, legacy hooks or `SOMA` blocks.
+- Breaking: `aegis uninstall` leaves `soma` registrations and hook blocks in place for manual removal.
+- Breaking: Cell-keyed ledger rows (`cell`, `cell_id`, `cells_used`) are no longer read; supported rows must identify rules with the v4 keys.
+- Breaking: `refuse_unmigrated_v3` and `unconverted_rule_files` are compatibility no-ops until STRIP-LEGACY-2 removes their remaining callers and public names.
+
+- Breaking: aegis_cli.hooks.management.SOMA_HOOK_FORMAT was removed with retired workspace support.
+- Breaking: aegis_cli.init.SOMA_HOOK_FORMAT was removed with retired workspace support.
+- Breaking: aegis_core.verification.checkpoint_checks.LEGACY_SOMA_DIRNAME was removed with retired workspace support.
+- Breaking: aegis_core.workspace.layout.LEGACY_PREDECESSOR_LEDGER was removed with retired workspace support.
+- Breaking: aegis_core.workspace.layout.LEGACY_RULE_DIRS was removed with retired workspace support.
+- Breaking: aegis_core.taxonomy.LEGACY_TYPE_NAMES was removed with retired workspace support.
+- Breaking: aegis_core.taxonomy.LEGACY_REVIEW_PRONG_ALIASES was removed with retired workspace support.
+- Breaking: aegis_cli.install_hosts.LEGACY_SERVER_NAME was removed with retired workspace support.
+- Breaking: aegis_core.workspace.discovery.LEGACY_SOMA_UPGRADE_MSG was removed with retired workspace support.
+
 ### Added
 
 - Isolated manager workspace audit prototype: explicit `aegis workspace` commands and a separately pinned manager MCP registration serve owner-approved management rules across Aegis worktrees. Signed activation, immutable decisions, confined audit replay and qualified evidence remain separate from repository fitness; every outcome earns zero credit. Native Teams enforcement and the 4.7 release gates remain open.
@@ -19,9 +40,12 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 - `tools/hierarchy_team.py` runs one team from setup to cleanup from one config (`team-run.json`, `aegis.team-run/v1`) with nine subcommands: `init`, `login`, `root`, `up`, `request`, `approve`, `turn`, `status` and `down`. `up` writes `<base>/team.json`, so roles run at its model and effort, and checks each role's rollout; `approve` is one ROOT turn that reads the hash through `team_pending`; `turn` gives a role one owner turn, for example to answer a `silent_role` hold; `down` collects the evidence with `SHA256SUMS` and releases what the run holds. See `docs/hierarchy-team.md`. The M1 runbook now uses it.
 
 - `aegis msg read / write / verify` exposes the `aegis.msg/1` codec through the CLI, with compact views, code-authored spans and metadata, and fixed JSON errors.
+- `aegis_msg_read` and `aegis_msg_write` expose the shared message codec over MCP, with workspace-bound stores, verbatim bounded views matching the CLI, code-authored metadata, and fixed JSON refusals.
 
 ### Fixed
 
+- Signed approval verifiers now require exactly one authority trailer and refuse continued values or unknown Aegis lines; Aegis-Check, Signed-off-by and other ordinary trailers remain allowed. Shared approval-message validation now refuses messages over 64 KiB as UTF-8 (each undecodable byte counts as 3) (`message_too_large`) or lines over 8,192 characters (`message_line_too_long`).
+- The prepare-commit-msg hook skips proven `#` comment lines and everything after Git's cut line, leaves authority messages without `Aegis-Check`, and prints a one-line notice when it cannot add the trailer to an ordinary message. Both `core.commentChar` and `core.commentString` are honored only when every listed value is `#`; unproved cut-line markers are refused. Without a passing check row it stays silent without querying comment configuration; with a passing row, unsupported markers get the notice even for authority text.
 - The native probe reads Codex code mode: one attempt per `tools.exec_command` or `tools.apply_patch` call in a `custom_tool_call` named `exec`, tied to its printed output only for known cell shapes. An untied call is `INCONCLUSIVE`, a call to a tool the session lacks is no attempt, and a typed `item_completed` record wins. Re-judging native probe run 1's rollouts now gives the hand-verified verdicts instead of `NOT_ATTEMPTED`. The probe's hold is one-shot: a per-hold nonce, a read-only wait of at most 600 s, and `.done` and `.release` marks the probe writes after the stop, so a resumed session no longer re-runs it.
 - Codex roles start with `multi_agent_v2` disabled as well as `multi_agent`, because the live M1 sessions were offered the v2 sub-agent tools. `hierarchy_native.py multi-agent` and a per-role `multi_agent` row in the native probe report whether sub-agent tools were offered, and an offer fails the probe. Whether Codex honours either flag under managed settings is unverified.
 - Restart maintenance now rejects a resumed turn without its matching profile context, bounds explicitly disposable provider subprocesses with retained cancellation evidence, and displays historical job results while unknown process scope keeps settlement held. The reviewed six-team cutover and rollback plan preserves native qualification and owner activation gates.

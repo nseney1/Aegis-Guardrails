@@ -6,6 +6,7 @@ from typing import Any, Optional
 from aegis_mcp.handlers.core import handle_scan
 from aegis_mcp.handlers.governance import handle_create_rule, handle_list_rules
 from aegis_mcp.handlers.telemetry import handle_capture_insight, handle_report_outcome
+from aegis_mcp.handlers.msg import handle_msg_read, handle_msg_write
 from aegis_mcp.projection import project_response
 from aegis_mcp.registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 
@@ -15,6 +16,8 @@ _TOOL_HANDLERS = {
     "aegis_create_rule": handle_create_rule,
     "aegis_list_rules": handle_list_rules,
     "aegis_capture_insight": handle_capture_insight,
+    "aegis_msg_read": handle_msg_read,
+    "aegis_msg_write": handle_msg_write,
 }
 
 # Set by the server (or passed by an in-process caller), never part of a tool schema.
@@ -65,6 +68,13 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
 
 def execute_tool(name: str, args: dict) -> Any:
     """Check the arguments against the schema, dispatch, and project the response if a view is asked for."""
+    if name in ("aegis_msg_read", "aegis_msg_write"):
+        # The codec owns fixed, non-echoing errors and bounds for this surface.
+        from aegis_core.message_codec import CodecError
+
+        if any(k not in TOOL_ARGUMENTS[name] and k not in SERVER_INJECTED for k in args):
+            return CodecError("E_FORMAT").as_dict()
+        return _TOOL_HANDLERS[name](args)
     unknown = sorted(k for k in args if k not in TOOL_ARGUMENTS[name] and k not in SERVER_INJECTED)
     if unknown:
         return {"status": "FAIL", "error": f"Unknown argument(s) for {name}: {unknown}"}

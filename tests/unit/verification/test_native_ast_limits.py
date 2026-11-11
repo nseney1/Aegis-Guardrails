@@ -51,12 +51,66 @@ def test_oversized_native_file_is_advisory_for_rules_structural_checks_and_t7(tm
     assert any(row.get('reason') == 'too_large' for row in pack['unverified_findings'])
 
 
-def test_card_exposes_the_advisory_instead_of_reporting_full_verification(tmp_path):
-    source(tmp_path, 2 * 1024 * 1024 + 1)
+@pytest.mark.parametrize('count', [1, 3])
+def test_card_exposes_the_advisory_instead_of_reporting_full_verification(tmp_path, capsys, count):
+    import json
+
+    from aegis_cli.cli import main
+
+    for number in range(count):
+        source(tmp_path, 2 * 1024 * 1024 + 1).rename(tmp_path / f'bundle{number}.ts')
     rule(tmp_path)
     data = card.build(tmp_path).as_dict()
-    assert data['layer1']['failed'] == 0
-    assert any('too_large' in detail for detail in data['layer1']['checks_that_could_not_run'])
+    layer1 = data['layer1']
+    assert (layer1['checked'], layer1['passed'], layer1['failed'], layer1['pass_rate']) == (count, count, 0, 1.0)
+    assert layer1['findings'] == 0
+    assert any('too_large' in detail for detail in layer1['checks_that_could_not_run'])
+    assert layer1['not_analyzed'] == [
+        {'path': f'bundle{number}.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'}
+        for number in range(count)
+    ]
+    assert not any('does not count them' in note for note in data['notes'])
+    assert data['notes'][-1] == f'{count} size advisory check(s): AST coverage is incomplete (aegis check shows why).'
+    assert not any('fail aegis check' in note for note in data['notes'])
+    assert main(['check', '--card', '--workspace', str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert f'100% of {count} files without blocking findings' in output
+    assert f'AST coverage: {count} file(s) not analyzed' in output
+    assert 'bundle0.ts: size limit' in output
+    assert 'all analyzed' not in output
+    assert main(['check', '--card', '--workspace', str(tmp_path), '--json']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['layer1'] == layer1
+
+
+def test_card_separates_coverage_from_findings_in_a_mixed_workspace(tmp_path):
+    source(tmp_path, 2 * 1024 * 1024 + 1)
+    rule(tmp_path)
+    (tmp_path / 'good.ts').write_text('export const x = 1;\n', encoding='utf-8')
+    (tmp_path / 'bad.ts').write_text('eval("1");\n', encoding='utf-8')
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert (layer1['checked'], layer1['passed'], layer1['failed'], layer1['pass_rate']) == (3, 2, 1, 0.6667)
+    assert layer1['findings'] == 1
+    assert layer1['not_analyzed'] == [
+        {'path': 'app.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'}
+    ]
+
+
+@pytest.mark.parametrize('limit_mib', [1, 2])
+def test_card_size_reason_tracks_the_native_source_limit(tmp_path, monkeypatch, limit_mib):
+    from aegis_core.ast import runner as ast_runner
+
+    source(tmp_path, 2 * 1024 * 1024 + 1)
+    rule(tmp_path)
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', limit_mib * 1024 * 1024)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert layer1['not_analyzed'] == [
+        {'path': 'app.ts', 'reason': f'size limit (too_large; exceeds {limit_mib} MiB)'}
+    ]
+    assert layer1['checks_that_could_not_run'] == [
+        f'ast_unverified: unverified too_large: app.ts exceeds {limit_mib} MiB; '
+        'use target_paths to exclude generated bundles (aegis doctor)'
+    ]
 
 
 def test_native_lexical_error_still_blocks(tmp_path):

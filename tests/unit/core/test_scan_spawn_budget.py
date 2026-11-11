@@ -188,11 +188,15 @@ def test_a_core_scan_opens_the_ledger_once(git_ws, monkeypatch):
 
 
 @pytest.mark.parametrize("portable", [False, True], ids=["native", "portable"])
-def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portable):
+@pytest.mark.parametrize("scan2_state", ["real", "settled", "unsettled"])
+def test_an_mcp_scan_counts_index_reads_and_memo_validation(git_ws, monkeypatch, portable, scan2_state):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from aegis_core import atomicio, credit, credit_memo, storage
     import aegis_mcp.server as server
 
     if portable:
-        monkeypatch.setattr(os, "supports_dir_fd", set())
+        monkeypatch.setattr(credit_memo, "_anchored_snapshot_supported", lambda: False)
     _seed_ledger(git_ws)
     monkeypatch.setattr(server, "_canonical_workspace", str(git_ws))
     server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -205,64 +209,103 @@ def test_an_mcp_scan_opens_the_ledger_at_most_twice(git_ws, monkeypatch, portabl
         assert json.loads(response["result"]["content"][0]["text"])["rules_staged"] > 0
 
     path = ledger.ledger_path(git_ws)
-    info = path.stat()
-    identity = (info.st_dev, info.st_ino)
-    real_open, real_read, real_seek = os.open, os.read, os.lseek
+    clock_info = storage.ledger_site(git_ws).lock.stat()
+    real_open, real_snapshot, real_before = os.open, credit_memo._snapshot, credit_memo.before_read
+    reads, snapshots, sample_reads, starts = [], [], [], []
+    generation, clock = [], [None]
 
-    def full_reads(req_id: int) -> int:
-        opened, active = [], {}
+    def reported(info):
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        if generation and (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) == generation[0]:
+            fields["st_ctime_ns"] = info.st_mtime_ns
+        if clock[0] is not None and (info.st_dev, info.st_ino) == (clock_info.st_dev, clock_info.st_ino):
+            fields["st_mtime_ns"] = clock[0]
+        return SimpleNamespace(**fields)
 
-        def opener(file, *args, **kwargs):
-            fd = real_open(file, *args, **kwargs)
-            active.pop(fd, None)
-            flags = args[0] if args else kwargs.get("flags", os.O_RDONLY)
-            if Path(file).name == path.name and not flags & (os.O_WRONLY | os.O_RDWR):
-                event = ([], [])
-                opened.append(event)
-                active[fd] = event
-            return fd
+    def pin_old_generation(age):
+        old = time.time_ns() - age
+        os.utime(path, ns=(old, old))
+        info = path.stat()
+        generation[:] = [(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)]
 
-        def event_for(fd):
-            event = active.get(fd)
-            if event is not None:
-                current = os.fstat(fd)
-                # fdopen closes full-read descriptors in C; their numbers may
-                # subsequently belong to a subprocess pipe rather than the ledger.
-                if (current.st_dev, current.st_ino) == identity:
-                    return event
-            return None
+    def opener(file, *args, **kwargs):
+        flags = args[0] if args else kwargs.get("flags", os.O_RDONLY)
+        if Path(file).name == path.name and not flags & (os.O_WRONLY | os.O_RDWR):
+            reads.append(file)
+        return real_open(file, *args, **kwargs)
 
-        def read(fd, size):
-            event = event_for(fd)
-            if event is not None:
-                event[0].append(size)
-            return real_read(fd, size)
+    def sample_read(fd, size):
+        sample_reads.append(size)
+        return os.read(fd, size)
 
-        def seek(fd, offset, whence):
-            event = event_for(fd)
-            if event is not None:
-                event[1].append((offset, whence))
-            return real_seek(fd, offset, whence)
+    def snapshot(*args, **kwargs):
+        result = real_snapshot(*args, **kwargs)
+        assert result is not None
+        info = io.stat(path)
+        assert result.identity == (info.st_dev, info.st_ino)
+        assert (result.size, result.mtime_ns, result.ctime_ns) == storage.file_generation(
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        snapshots.append(result)
+        return result
 
-        with monkeypatch.context() as patch:
-            patch.setattr(os, "open", opener)
-            patch.setattr(os, "read", read)
-            patch.setattr(os, "lseek", seek)
-            seen = _count(patch, lambda: call(req_id))
-        tails = [(reads, seeks) for reads, seeks in opened if reads]
-        assert len(tails) == 1, tails
-        for reads, seeks in tails:
-            assert len(reads) == len(seeks) == 2, (reads, seeks)
-            assert all(0 < size <= ledger._TAIL_CHECK_BYTES for size in reads), reads
-            assert seeks[0][0] >= 0 and seeks[0][1] == os.SEEK_SET, seeks
-            assert seeks[1] == (0, os.SEEK_SET), seeks
-        return _ledger_opens(git_ws, seen) - len(tails)
+    def before(*args, **kwargs):
+        result = real_before(*args, **kwargs)
+        starts.append(None if result is None else result.started_ns)
+        return result
 
-    counts = [full_reads(i) for i in (1, 2)]
-    # Keep full-read bounds: initial scans also read for locked exposure deduplication.
-    # RF-2 separately permits one open with two seek/reads of at most 256 bytes
-    # each for head/tail continuity; these bounded checks must not hide a full read.
-    assert counts[0] <= 2 and counts[1] == 1, counts
+    io = SimpleNamespace(**dict(vars(os), open=opener,
+        stat=lambda *a, **kw: reported(os.stat(*a, **kw)),
+        lstat=lambda *a, **kw: reported(os.lstat(*a, **kw)), fstat=lambda fd: reported(os.fstat(fd))))
+    for module in (atomicio, storage, ledger):
+        monkeypatch.setattr(module, "os", io)
+    monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(io), read=sample_read)))
+    monkeypatch.setattr(credit_memo, "_snapshot", snapshot)
+    monkeypatch.setattr(credit_memo, "before_read", before)
+    real_read, exposure_reports = credit.read_rows, []
+
+    def exposure_read(*args, **kwargs):
+        rows = real_read(*args, **kwargs)
+        exposure_reports.append(rows.report)
+        return rows
+
+    monkeypatch.setattr(credit, "read_rows", exposure_read)
+    supported = credit_memo.filesystem_clock_supported()
+    for request in (1, 2):
+        reads.clear()
+        snapshots.clear()
+        exposure_reports.clear()
+        starts.clear()
+        if request == 2 and scan2_state == "settled":
+            pin_old_generation(20_000_000_000)
+        elif request == 2 and scan2_state == "unsettled":
+            clock[0] = path.stat().st_mtime_ns
+        call(request)
+        assert len(exposure_reports) == len(starts) == 1
+        report = exposure_reports[0]
+        assert report is not None and report.started_ns is None
+        settled = credit_memo.settled(replace(report, started_ns=starts[0]))
+        fills = int(request == 2 and settled)
+        if request == 2 and scan2_state != "real":
+            assert fills == int(supported and scan2_state == "settled")
+        # The first exposure append also opens the keyed index; later duplicates do not.
+        assert len(reads) == 2 + fills + int(request == 1)
+        assert len(snapshots) == fills
+
+    filled = fills
+    pin_old_generation(10_000_000_000)
+    clock[0] = None
+    for request in (3, 4):
+        reads.clear()
+        snapshots.clear()
+        exposure_reports.clear()
+        starts.clear()
+        call(request)
+        validation = filled if request == 3 else 0
+        new_fill = int(supported)
+        assert len(exposure_reports) == (1 if request == 3 or not supported else 0)
+        assert len(reads) == (2 + validation + new_fill if request == 3 else 2)
+        assert len(snapshots) == validation + new_fill
+    assert sample_reads == []
 
 
 # ── (d): a scan that matches no rule does no fitness work (R-structure-7) ───

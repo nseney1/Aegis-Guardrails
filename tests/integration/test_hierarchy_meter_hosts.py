@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +30,41 @@ def test_host_sets_keep_the_existing_members():
     assert isinstance(hierarchy_meter.CODEX_HOSTS, set)
     assert hierarchy_meter.CLAUDE_HOSTS == {"claude-code"}
     assert hierarchy_meter.CODEX_HOSTS == {"codex", "codex-cli"}
+
+
+@pytest.mark.parametrize("host,variable,folder", HOSTS)
+@pytest.mark.parametrize("home_value", ["set", "unset", "empty"])
+def test_home_lookup_uses_the_registry_declaration(tmp_path, monkeypatch, host, variable, folder, home_value):
+    registry = hierarchy_meter.hierarchy_hosts
+
+    def entry(kind):
+        spec = registry.entry(kind)
+        spec["home"].update(variable="AEGIS_TEST_METER_HOME", owner_folder=".meter-host")
+        return spec
+
+    class MeterPath(type(tmp_path)):
+        @classmethod
+        def home(cls):
+            return tmp_path
+
+    monkeypatch.setattr(hierarchy_meter, "hierarchy_hosts", SimpleNamespace(**{**vars(registry), "entry": entry}))
+    monkeypatch.setattr(hierarchy_meter, "Path", MeterPath)
+    monkeypatch.setenv(variable, str(tmp_path / "old-home"))
+    if home_value == "set":
+        home = tmp_path / "configured-home"
+        monkeypatch.setenv("AEGIS_TEST_METER_HOME", str(home))
+    else:
+        home = tmp_path / ".meter-host"
+        if home_value == "empty":
+            monkeypatch.setenv("AEGIS_TEST_METER_HOME", "")
+        else:
+            monkeypatch.delenv("AEGIS_TEST_METER_HOME", raising=False)
+    relative = (Path("projects") / "slug" / (SESSION + ".jsonl") if host == "claude-code"
+                else Path("sessions") / ("rollout-" + SESSION + ".jsonl"))
+    transcript = touch(home / relative)
+    touch(tmp_path / "old-home" / relative)
+    touch(tmp_path / folder / relative)
+    assert hierarchy_meter.find_transcript(host, SESSION) == transcript
 
 
 @pytest.mark.parametrize("host", ["codex-cli", "codex"])

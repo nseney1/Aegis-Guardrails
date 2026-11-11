@@ -53,12 +53,15 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.hosts": 0,
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
+    "aegis_core.storage_shared": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # Operator command-string grammar shared by planners and process consumers.
+    "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
@@ -103,6 +106,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.governance": 1,
     "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
+    "aegis_core.approval_shape": 0,
     # v4.3 verified checks: the tree identity (gitsafe, pathlookup), the credit state machine over the ledger
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,

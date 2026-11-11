@@ -37,7 +37,7 @@ def _project_root(args: argparse.Namespace) -> Path:
 
 
 def _parse_frontmatter(filepath: str) -> dict:
-    """Extract YAML frontmatter from a cell file using the canonical parser.
+    """Extract YAML frontmatter from a rule file using the canonical parser.
 
     Falls back to empty dict on any error.
     """
@@ -48,49 +48,46 @@ def _parse_frontmatter(filepath: str) -> dict:
         return {}
 
 
+def _today() -> date:
+    """The calendar clock, kept separate from date parsing."""
+    return date.today()
+
+
 def _parse_created_date(created_val) -> date | None:
-    """Parse a created date from frontmatter."""
-    if created_val is None:
+    """Parse string date metadata; other YAML values are unparseable."""
+    if not isinstance(created_val, str):
         return None
-    if isinstance(created_val, datetime):
-        return created_val.date()
-    if isinstance(created_val, date):
-        return created_val
-    if isinstance(created_val, (int, float)):
-        try:
-            return datetime.fromtimestamp(created_val).date()
-        except Exception:
-            return None
-    if isinstance(created_val, str):
-        s = created_val.strip().rstrip("Z")
-        try:
-            return date.fromisoformat(s[:10])
-        except Exception:
-            pass
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d").date()
-        except Exception:
-            pass
+    s = created_val.strip().rstrip("Z")
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        pass
     return None
 
 
 def _format_adaptive_expiry(created_val, expiry_days_val) -> str:
-    """Calculate remaining days for an adaptive rule."""
+    """Format calendar metadata, not whether the rule service has retired a rule."""
     if expiry_days_val is None or created_val is None:
+        return "—"
+    if isinstance(expiry_days_val, bool) or not isinstance(expiry_days_val, (int, str)):
+        return "—"
+    if isinstance(expiry_days_val, str) and not expiry_days_val.isdecimal():
         return "—"
     try:
         expiry_days = int(expiry_days_val)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        return "—"
+    if expiry_days < 0:
         return "—"
 
     created_date = _parse_created_date(created_val)
     if created_date is None:
         return "—"
 
-    days_elapsed = (date.today() - created_date).days
+    days_elapsed = (_today() - created_date).days
     remaining_days = expiry_days - days_elapsed
     if remaining_days < 0:
-        return "expired"
+        return f"overdue ({-remaining_days}d)"
     return f"{remaining_days}d"
 
 
@@ -247,6 +244,8 @@ def _core_entries(core_files: List[Path], view: Any, proj_credits: Any) -> Tuple
             "triggers": triggers,
             "expiry": "∞ (core)",
             "is_core": True,
+            "service_state": "not_loaded",
+            "calendar_expiry": "∞ (core)",
         })
     return all_rules, total_chars
 
@@ -258,6 +257,13 @@ def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any]) -> Tuple[List[dic
     for rule in loaded:
         total_chars += len(rule.raw.decode("utf-8-sig", "replace"))
         fit = fits[rule.id]
+        if rule.expired:
+            service_state = "retired"
+        elif rule.target_paths:
+            service_state = "served"
+        else:
+            service_state = "untargeted"
+        calendar_expiry = _format_adaptive_expiry(rule.meta.get("created"), rule.meta.get("expiry_days"))
         all_rules.append({
             "name": sanitize_display(rule.id),
             "type": rule.type,
@@ -270,9 +276,11 @@ def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any]) -> Tuple[List[dic
             "override_rate": fit.override_rate,
             "flagged_for_review": fit.flagged_for_review,
             "triggers": fit.triggers,
-            "expiry": "expired" if rule.expired else _format_adaptive_expiry(
-                rule.meta.get("created"), rule.meta.get("expiry_days")),
+            # The existing key uses retirement wording only for retired rules.
+            "expiry": "expired" if service_state == "retired" else calendar_expiry,
             "is_core": False,
+            "service_state": service_state,
+            "calendar_expiry": calendar_expiry,
         })
     return all_rules, total_chars
 
@@ -323,7 +331,11 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
 
     header_title = "🛡️ Aegis Workspace Status" if ui.emoji_enabled else "Aegis Workspace Status"
     print(f"{ui.style(header_title, 'bold', 'cyan')}\n")
-    print(f"  {'Core rules:':<16}{len(core_files)} active")
+    if core_files:
+        core_summary = f"{len(core_files)} shipped (not_loaded: scan and check do not read them)"
+    else:
+        core_summary = "listed only in the Aegis checkout (scan and check do not read them)"
+    print(f"  {'Core rules:':<16}{core_summary}")
     print(f"  {'Adaptive rules:':<16}{len(loaded)} (traps/patterns)")
     print(f"  {'Context load:':<16}~{estimated_tokens:,} tokens (pre-JIT max)")
     print(f"  {'Token budget:':<16}{ui.format_budget_bar(estimated_tokens, max_budget)}")
@@ -350,7 +362,8 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
     tbl.add_column("Triggers", no_wrap=True)
     tbl.add_column("Type", no_wrap=True)
     tbl.add_column("Fitness", no_wrap=True)
-    tbl.add_column("Expiry", no_wrap=True)
+    tbl.add_column("Service state", no_wrap=True)
+    tbl.add_column("Calendar (meta)", no_wrap=True)
 
     last_type: str | None = None
     for r in all_rules:
@@ -373,7 +386,8 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
             str(r["triggers"]),
             type_str,
             score_str,
-            str(r["expiry"]),
+            str(r["service_state"]),
+            str(r["calendar_expiry"]),
         )
 
     for line in tbl.render(ui).splitlines():
@@ -489,4 +503,3 @@ class StatusCommand(AegisCommand):
         if getattr(args, "compliance", False):
             return run_compliance(args)
         return run_status(args)
-

@@ -18,20 +18,19 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import re
 import sys
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hierarchy_hosts  # noqa: E402
+from hierarchy_hosts import SESSION  # noqa: E402
 
 CLAUDE_HOSTS = {kind for kind in hierarchy_hosts.HOST_KINDS if hierarchy_hosts.family(kind) == "claude"}
 CODEX_HOSTS = {kind for kind in hierarchy_hosts.HOST_KINDS if hierarchy_hosts.family(kind) == "codex"}
 SESSION_LIMIT_SECONDS = 3600
 ROOT_LIMIT_SECONDS = 5400
 WARN_FRACTION = 0.8
-SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 CODEX_ENDS = {"task_complete", "turn_aborted"}
 
 
@@ -125,10 +124,8 @@ def find_transcript(host, session):
     if (not isinstance(host, str) or host not in CLAUDE_HOSTS | CODEX_HOSTS
             or not isinstance(session, str) or SESSION.fullmatch(session) is None):
         return None
-    if host in CLAUDE_HOSTS:
-        home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-    else:
-        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    spec = hierarchy_hosts.entry(host)["home"]
+    home = os.environ.get(spec["variable"]) or Path.home() / spec["owner_folder"]
     # Archived rollouts were invisible to the meter and evidence collection without the registry.
     found = hierarchy_hosts.transcripts(host, home, session)
     return max(found, key=lambda path: path.stat().st_mtime) if found else None

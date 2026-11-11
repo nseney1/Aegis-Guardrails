@@ -65,7 +65,7 @@ def test_the_card_prints_and_exits_0_even_with_findings(repo: Path, capsys):
     lines = out.splitlines()
     assert lines[0] == "Aegis day-0 card"
     assert "  languages: python 3" in lines
-    assert any(line.startswith("  Layer 1: ") and "% of 3 files pass" in line for line in lines)
+    assert any(line.startswith("  Layer 1: ") and "% of 3 files without blocking findings" in line for line in lines)
     assert any(line.endswith("legacy.py") for line in lines)
 
 

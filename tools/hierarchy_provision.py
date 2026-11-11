@@ -178,6 +178,7 @@ from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endp
 from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_hosts  # noqa: E402
+from hierarchy_hosts import SESSION  # noqa: E402
 import hierarchy_roles  # noqa: E402
 import hierarchy_runtime_source  # noqa: E402
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
@@ -200,8 +201,11 @@ OPTIONAL_ROLES = ("router", "decider")
 SUPPORTED_TOOLS = set(READ_TOOLS + WRITE_TOOLS)
 MAILBOX_TOOLS = ["mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self"]
 DEFAULT_TIMEOUT_SECONDS = 900
+PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
+                      'pass an absolute, executable "python" in the init request')
+RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
+                              'restore it, or remove the unregistered base and run init again')
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 # multi_agent_v2 as well: the live M1 sessions ran with multi_agent disabled and were still offered the v2 sub-agent
 # tools. Whether codex honours either flag under an account's managed settings is unverified; the native probe checks.
 CODEX_DISABLED = ["apps", "plugins", "remote_plugin", "multi_agent", "multi_agent_v2", "memories", "computer_use",
@@ -262,6 +266,16 @@ def pin_source(source):
     return source, commit, tree
 
 
+def require_interpreter(python, message=PYTHON_UNAVAILABLE):
+    available = False
+    if isinstance(python, str) and 0 < len(python) <= 4096 and "\x00" not in python:
+        try:
+            available = Path(python).is_absolute() and Path(python).is_file() and os.access(python, os.X_OK)
+        except (OSError, ValueError):
+            available = False
+    require(available, message)
+
+
 def init(request):
     fields(request, {"store", "base", "source", "initiative", "lanes"}, {"python", "board", "roles"})
     base = safe_path(text(request["base"], "base"))
@@ -277,8 +291,12 @@ def init(request):
     fields(initiative, {"id", "project", "repository", "priority", "target_branch"},
            {"touched_paths", "blocked_by", "checkouts", "lanes", "source"})
     validate_initiative(initiative)
-    python = text(request.get("python", "/usr/bin/python3"), "python")
+    python = request.get("python", sys.executable)
+    if "python" not in request:
+        require(isinstance(python, str) and bool(python), PYTHON_UNAVAILABLE)
+    python = text(python, "python")
     require(Path(python).is_absolute(), "python path must be absolute")
+    require_interpreter(python)
     source, commit, tree = pin_source(request["source"])
     board = request.get("board")
     if board is not None:
@@ -303,6 +321,8 @@ def init(request):
             delegated_read("runtime source", hierarchy_runtime_source.verify, record, base)
             require(record.get("initiative") == hierarchy and record.get("store") == str(store.path),
                     "initiative base already exists: " + str(base))
+            require_interpreter(record.get("python"), RECORDED_PYTHON_UNAVAILABLE)
+            require("python" not in request or python == record["python"], "python does not match provision.json")
         else:
             require(not base.exists(), "initiative base already exists: " + str(base))
             record = {"schema": SCHEMA, "created_at": timestamp(), "store": str(store.path), "source": str(source),
@@ -1111,6 +1131,7 @@ def add_role(request):
     setup = read_json(base / "provision.json")
     check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
+    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request.get("endpoint")
     mailbox.endpoint(endpoint)
@@ -1599,6 +1620,8 @@ def move(request):
             **({"roles": optional} if optional else {}),
             **{key: request[key] for key in ("board", "python") if key in request}})
     setup = read_json(base / "provision.json")
+    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
+    require("python" not in request or request["python"] == setup["python"], "python does not match provision.json")
     new = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     answers, needs_profile, tell = {}, [], {}
     for name in sorted(endpoints):

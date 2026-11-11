@@ -2,6 +2,7 @@
 import copy
 from datetime import datetime, timezone
 import io
+from itertools import combinations
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,16 @@ from tests.unit.core.test_message_codec import make_store
 
 
 GOLDENS = json.loads((Path(__file__).parents[1] / "core" / "message_codec_goldens.json").read_text(encoding="utf-8"))
+SELECTOR_MESSAGE = (
+    "invalid selector or cursor; fields (--fields): at most 16 selectors of 1-1024 characters, depth 8; "
+    "dotted names and zero-based indices, one-level *; final row projection "
+    "findings.*.{id,severity,file,line}; one selector per MCP array entry; "
+    "CLI entries may be comma-separated or repeated; no regex or recursive wildcard; "
+    "paths start in fields unless prefixed by schema,kind,meta,fields,body,spans,refs; "
+    "spans (--spans): at most 64 zero-based indices, each below 10000 and present in the body outline; "
+    "expand (--expand): at most 64 named refs, one level within max_chars (--max-chars); "
+    "since (--since): 0 starts log rows, otherwise n:sha256(canonical rows[:n]); re-read without since if stale"
+)
 
 
 @pytest.fixture
@@ -58,6 +69,8 @@ def assert_error(output, code, detail=None):
     expected = []
     for fixed_detail in details:
         error = codec.CodecError(code, detail=fixed_detail).as_dict()
+        if code == "E_SELECTOR":
+            error["error"]["message"] = SELECTOR_MESSAGE
         if fixed_detail in messages:
             error["error"]["message"] = messages[fixed_detail]
         expected.append(json.dumps(error, separators=(",", ":")) + "\n")
@@ -550,16 +563,13 @@ def test_msg_denied_workspace_has_distinct_fixed_error(target, workspace, tmp_pa
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
 def test_msg_unreadable_discovery_directory_is_fixed_json(workspace, capsys):
-    from aegis_core.workspace.layout import WorkspaceLayout
-
-    legacy = WorkspaceLayout(workspace).legacy_rule_dirs[0].parent
-    legacy.mkdir(mode=0o700)
-    legacy.chmod(0)
+    original_mode = workspace.stat().st_mode
+    workspace.chmod(0)
     try:
         assert main(["msg", "verify", "a" * 64]) == 2
         assert_error(capsys.readouterr(), "E_AUTH", "attachment")
     finally:
-        legacy.chmod(0o700)
+        workspace.chmod(original_mode)
 
 
 @pytest.mark.parametrize("reference", ["typo", "other-store", "prefix", "malformed"])
@@ -780,3 +790,94 @@ def test_argon_span_reproducer_round_trip(store, workspace, monkeypatch, capsys)
     assert invoke(store, "write", "--kind", "text", "--in", "-") == 0
     rid = json.loads(capsys.readouterr().out)["id"]
     assert store.read(rid)["spans"] == [[0, len(body), body[2:]]]
+
+
+INVALID_READ_OPTIONS = [
+    ({"format": "xml"}, "E_FORMAT"),
+    ({"spans": [10000]}, "E_SPAN"),
+    ({"spans": [0] * 65}, "E_SPAN"),
+    ({"max_chars": -1}, "E_LIMIT"),
+    ({"max_chars": 16777217}, "E_LIMIT"),
+    ({"fields": ["body."]}, "E_SELECTOR"),
+    ({"fields": ["body", "body"]}, "E_SELECTOR"),
+    ({"fields": ["rows", "fields.rows"]}, "E_SELECTOR"),
+    ({"fields": ["body"] * 17}, "E_SELECTOR"),
+    ({"fields": ["x" * 1025]}, "E_SELECTOR"),
+    ({"since": "HOSTILE_MARKER"}, "E_SELECTOR"),
+    ({"since": "1:" + "a" * 63}, "E_SELECTOR"),
+    ({"since": "1:" + "a" * 69}, "E_SELECTOR"),
+    ({"expand": ["HOSTILE_MARKER"]}, "E_REF"),
+    ({"expand": ["x" * 65]}, "E_REF"),
+    ({"expand": ["child"] * 65}, "E_REF"),
+]
+INVALID_READ_IDS = ["format", "span-range", "span-count", "negative-limit", "excess-limit", "selector-grammar",
+        "duplicate-selectors", "duplicate-aliases", "selector-count", "selector-length", "bad-cursor",
+        "cursor-hash", "cursor-length", "expand-grammar", "expand-length", "expand-count"]
+
+
+def invalid_read_cases():
+    rows = list(zip(INVALID_READ_IDS, INVALID_READ_OPTIONS))
+    cases = [pytest.param(state, options, {code}, id=label + "-" + state)
+             for label, (options, code) in rows
+             for state in ("absent-ref", "no-store", "corrupt-record")]
+    for (left_id, (left, left_code)), (right_id, (right, right_code)) in combinations(rows, 2):
+        options = dict(left)
+        for name, value in right.items():
+            options[name] = options[name] + value if name in options and type(value) is list else value
+        cases.append(pytest.param("absent-ref", options, {left_code, right_code}, id=left_id + "+" + right_id))
+    return cases
+
+
+@pytest.mark.parametrize("record_state,options,codes", invalid_read_cases())
+@pytest.mark.parametrize("field_form", ["entries", "commas"])
+def test_invalid_read_options_have_identical_frontend_refusals_before_io(
+        options, codes, record_state, field_form, workspace, monkeypatch, capsys):
+    from aegis_core import storage
+    from aegis_core.workspace.base import Workspace
+    from aegis_mcp import server
+
+    rid = "a" * 64
+    directory = workspace / ".aegis" / "state" / "messages"
+    if record_state != "no-store":
+        directory.mkdir(parents=True, mode=0o700)
+        probe = make_store(directory)
+        try:
+            if record_state == "corrupt-record":
+                rid = probe.write(GOLDENS[0]["record"])
+                (directory / (rid + ".json")).write_bytes(b"HOSTILE_MARKER")
+        finally:
+            probe.close()
+    for name, value in server.fresh_state().items():
+        monkeypatch.setattr(server, name, value)
+    monkeypatch.setattr(server, "_canonical_workspace", Workspace(workspace))
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+    opened, original = [], storage.message_store
+
+    def observed(*args, **kwargs):
+        opened.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "message_store", observed)
+    flags = []
+    for name, value in options.items():
+        if name == "fields" and field_form == "commas":
+            value = [",".join(value)]
+        for item in value if type(value) is list else [value]:
+            flags.extend(["--" + name.replace("_", "-"), str(item)])
+    cli_status = main(["msg", "read", rid, *flags])
+    output = capsys.readouterr()
+    response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": {"name": "aegis_msg_read", "arguments": dict(options, ref=rid)}})
+    assert cli_status == 2 and not output.err
+    result = response["result"]
+    assert result["isError"]
+    cli_error = json.loads(output.out)
+    mcp_error = json.loads(result["content"][0]["text"])
+    assert cli_error["error"]["code"] == mcp_error["error"]["code"]
+    assert cli_error["error"]["code"] in codes
+    assert cli_error == mcp_error
+    assert result["content"][0]["text"] + "\n" == output.out
+    assert "HOSTILE_MARKER" not in output.out + result["content"][0]["text"]
+    assert not opened
+    if record_state == "no-store":
+        assert not directory.parent.exists()

@@ -16,7 +16,7 @@ __all__ = [
     "MAX_WORK_BYTES", "MAX_REF_BYTES", "MAX_OUTPUT_CHARS", "MAX_SELECTION_VISITS",
     "REF_NAME", "NAME", "INDEX", "KEYS", "STRING", "INTEGER", "HANDLE", "SHA",
     "require", "object_schema", "array_schema", "KEY_MARKER", "CURSOR_PATTERN",
-    "json_chunks", "escape_char", "neutral_text",
+    "json_chunks", "escape_char", "neutral_text", "FRONTEND_MESSAGES", "frontend_error",
 ]
 
 
@@ -52,6 +52,15 @@ ERROR_MESSAGES = MappingProxyType({
     "E_SPAN": "invalid span selection",
     "E_AUTH": "store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory",
 })
+FRONTEND_MESSAGES = MappingProxyType({
+    "arguments": "invalid arguments; see aegis msg ACTION --help",
+    "workspace": "workspace is not initialized; run aegis init",
+    "binding": "workspace binding refused; check --workspace / AEGIS_WORKSPACE",
+    "root": "workspace root refused; choose a project directory",
+    "attachment": "workspace attachment unavailable; check permissions",
+    "input": "input file unreadable",
+    "write_ref": "write reference must be a full 64-hex id present in the target store",
+})
 _SPECIAL_MESSAGES = MappingProxyType({"operation":
     "store operation unavailable; check permissions, free space, write access and file descriptor limits",
     "format": "invalid format; choose json, md or tsv",
@@ -67,16 +76,38 @@ NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 INDEX = re.compile(r"0|[1-9][0-9]*")
 KEYS = frozenset(("schema", "kind", "meta", "fields", "body", "spans", "refs"))
 
+_SELECTOR_REFUSAL = (
+    "invalid selector or cursor; fields (--fields): at most 16 selectors of 1-1024 characters, depth 8; "
+    "dotted names and zero-based indices, one-level *; final row projection "
+    "findings.*.{id,severity,file,line}; one selector per MCP array entry; "
+    "CLI entries may be comma-separated or repeated; no regex or recursive wildcard; "
+    "paths start in fields unless prefixed by schema,kind,meta,fields,body,spans,refs; "
+    "spans (--spans): at most 64 zero-based indices, each below 10000 and present in the body outline; "
+    "expand (--expand): at most 64 named refs, one level within max_chars (--max-chars); "
+    "since (--since): 0 starts log rows, otherwise n:sha256(canonical rows[:n]); re-read without since if stale"
+)
+
 
 class CodecError(ValueError):
     """Fixed public error; callers serialize as_dict(), never exception context."""
 
     def __init__(self, code, *, detail=None):
         self.code = code if type(code) is str and code in ERROR_MESSAGES else "E_FORMAT"
-        super().__init__(_SPECIAL_MESSAGES.get(detail if type(detail) is str else "", ERROR_MESSAGES[self.code]))
+        self.detail = detail if type(detail) is str else ""
+        super().__init__(_SPECIAL_MESSAGES.get(self.detail, ERROR_MESSAGES[self.code]))
 
     def as_dict(self):
         return {"error": {"code": self.code, "message": str(self)}}
+
+
+def frontend_error(error, *, detail=None):
+    """Explicit front-end next actions, leaving codec failures host-neutral."""
+    value = error.as_dict()
+    if error.code == "E_SELECTOR":
+        value["error"]["message"] = _SELECTOR_REFUSAL
+    if type(detail) is str and detail in FRONTEND_MESSAGES:
+        value["error"]["message"] = FRONTEND_MESSAGES[detail]
+    return value
 
 
 def require(condition, code="E_FORMAT", *, detail=None):

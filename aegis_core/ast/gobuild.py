@@ -14,6 +14,7 @@ import sys
 import tempfile
 
 from aegis_core.atomicio import fsync_dir
+from aegis_core.ast.drivers import templates
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
 from aegis_core.pathlookup import which
 from aegis_core.primitives import is_within, key_within
@@ -21,7 +22,7 @@ from aegis_core.storage import atomic_write_bytes, file_lock
 
 __all__ = ["GoDriverStatus", "GoDriverUnavailableError", "inspect_go_driver", "prepare_go_driver"]
 
-_TEMPLATES = Path(__file__).resolve().parent / "drivers" / "templates"
+_TEMPLATES = Path(templates.__file__).resolve().parent
 _CONTROLS = {"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOWORK": "off", "GOFLAGS": "",
              "GOENV": "off", "GO111MODULE": "on", "CGO_ENABLED": "0"}
 _ENV_KEEP = frozenset({"HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",

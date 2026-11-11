@@ -111,6 +111,15 @@ _IMPORTORSKIP_RE = re.compile(
 )
 
 
+def _append_import(
+    results: list[ImportInfo], guarded_modules: set[str], record: ImportInfo,
+) -> None:
+    """Keep guarded membership in sync without changing record order."""
+    results.append(record)
+    if record.guarded:
+        guarded_modules.add(record.module)
+
+
 def extract_imports(filepath: str) -> list[ImportInfo]:
     """Extract all import statements from a Python source file.
 
@@ -129,12 +138,13 @@ def extract_imports(filepath: str) -> list[ImportInfo]:
     source = read_python_source(filepath)
 
     results: list[ImportInfo] = []
+    guarded_modules: set[str] = set()
 
     # First pass: find importorskip calls via regex (not easily caught by AST)
     for match in _IMPORTORSKIP_RE.finditer(source):
         module = match.group(1)
         lineno = source[:match.start()].count('\n') + 1
-        results.append(ImportInfo(module=module, lineno=lineno, guarded=True))
+        _append_import(results, guarded_modules, ImportInfo(module=module, lineno=lineno, guarded=True))
 
     # Second pass: AST-based import extraction
     try:
@@ -170,18 +180,18 @@ def extract_imports(filepath: str) -> list[ImportInfo]:
             for alias in node.names:
                 module = alias.name.split('.')[0]
                 # Skip if already found via importorskip
-                if any(r.module == module and r.guarded for r in results):
+                if module in guarded_modules:
                     continue
-                results.append(ImportInfo(
+                _append_import(results, guarded_modules, ImportInfo(
                     module=module,
                     lineno=node.lineno,
                     guarded=_is_in_try(node.lineno),
                 ))
         elif isinstance(node, ast.ImportFrom) and node.module:
             module = node.module.split('.')[0]
-            if any(r.module == module and r.guarded for r in results):
+            if module in guarded_modules:
                 continue
-            results.append(ImportInfo(
+            _append_import(results, guarded_modules, ImportInfo(
                 module=module,
                 lineno=node.lineno,
                 guarded=_is_in_try(node.lineno),

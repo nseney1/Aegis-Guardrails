@@ -1,313 +1,851 @@
-"""Legacy-vocabulary ratchet (ADR 0005 AD-6, defense #45).
+"""Whole-tree vocabulary ratchet (ADR 0005 AD-6).
 
-Aegis grew out of "Soma", whose biology metaphor (cells, genome, walls, membranes,
-enzymes...) still names some code. ``legacy_ratchet.json`` records how often each
-legacy word occurs, and the count may only go down:
+Count identifiers, text, comments, docstrings and file names in every Git-visible
+file. Explicit history, immutable evidence and technical English exemptions are
+recorded separately from per-file counts.
 
-- a word counts once per occurrence in an identifier (a name, attribute, function,
-  class, parameter, keyword or import) or in a string literal that is not a docstring
-  (output text, JSON keys, file names), across aegis_core, aegis_cli, aegis_mcp and
-  aegis_sdk; ``cell_id`` and ``"Soma Governance"`` each count once;
-- ``contract_snapshots`` counts the same words in the public contract snapshots
-  (tests/contract/cli_tree.json and mcp_tools.json);
-- three rows have a floor of 0 and stay there: imports of ``soma_*`` modules,
-  ``Soma*`` class or alias definitions (both across the packages, rules/, skills/ and
-  tests/), and v2 organelle rule-type words outside the one legacy table
-  (taxonomy.LEGACY_TYPE_NAMES, which aegis migrate converts with).
-
-A count above its record fails. A count below its record also fails, so the lower
-number is recorded with the change that earned it and cannot creep back:
+Threat model: accidental reintroduction. Deliberate obfuscation is outside scope.
+Exemption policies and deferred count ceilings require source review to expand.
 
     PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write
-
-The writer only lowers records; it refuses while any count is above its record.
 """
 from __future__ import annotations
 
 import ast
-import functools
+from collections import Counter
+import fnmatch
+import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
-from typing import Callable, Dict, Iterator, List
+import tokenize
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 RECORD = Path(__file__).with_name("legacy_ratchet.json")
-PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
-SNAPSHOTS = ("cli_tree.json", "mcp_tools.json")
-LEGACY_TABLE = "aegis_core/taxonomy.py"
-
-# Rows that must exist; the record may add words but never drop one of these.
 REQUIRED_WORDS = (
     "soma", "cell", "genome", "enzyme", "wall", "membrane", "vacuole", "organ", "organelle",
     "telomere", "chloroplast", "plasmodesmata", "immune", "phylogeny", "mitosis", "apoptosis",
     "spore", "mycelium", "thorn", "bedrock", "mulch", "nucleus", "cytoplasm", "ribosome",
     "symbiosis", "germline", "phenotype", "genotype", "organism", "metabolism", "homeostasis",
 )
-ZERO_ROWS = ("soma_imports", "soma_classes", "organelle_type_literals")
+ZERO_ROWS = (REQUIRED_WORDS[0] + "_imports", REQUIRED_WORDS[0] + "_classes", REQUIRED_WORDS[8] + "_type_literals")
 SNAPSHOT_ROW = "contract_snapshots"
-
 _PARTS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
-_ORGANELLE_TYPES = re.compile(r"\b(vacuoles?|chloroplasts?|plasmodesmata)\b", re.IGNORECASE)
 
 
-def word_parts(text: str) -> List[str]:
-    """``LEGACY_SOMA_DIRNAME`` -> legacy, soma, dirname; ``SomaCell`` -> soma, cell."""
-    return [p.lower() for p in _PARTS.findall(text)]
 
 
-def _python_files(dirs) -> Iterator[Path]:
-    for directory in dirs:
-        for path in sorted((REPO / directory).rglob("*.py")):
-            if "__pycache__" not in path.parts:
-                yield path
 
-
-def _docstrings(tree: ast.AST) -> set:
-    found = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
-            first = node.body[0]
-            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
-                found.add(id(first.value))
-    return found
-
-
-def _texts(tree: ast.AST) -> Iterator[str]:
-    """Every identifier and every non-docstring string literal of a module."""
-    docstrings = _docstrings(tree)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            yield node.id
-        elif isinstance(node, ast.Attribute):
-            yield node.attr
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            yield node.name
-        elif isinstance(node, ast.arg):
-            yield node.arg
-        elif isinstance(node, ast.keyword) and node.arg:
-            yield node.arg
-        elif isinstance(node, ast.alias):
-            yield node.name
-            if node.asname:
-                yield node.asname
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            yield node.module
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            yield from node.names
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            yield node.name
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
-            yield node.value
-
-
-def _json_texts(value) -> Iterator[str]:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            yield str(key)
-            yield from _json_texts(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _json_texts(item)
-    elif isinstance(value, str):
-        yield value
-
-
-def _word_counts(texts: Iterator[str], words) -> Dict[str, int]:
-    counts = {word: 0 for word in words}
-    matches = {}
-    for word in words:
-        # A record can contain both a word and its plural: retain both matches.
-        matches.setdefault(word, []).append(word)
-        matches.setdefault(word + "s", []).append(word)
-    for text in texts:
-        for part in word_parts(text):
-            for word in matches.get(part, ()):
-                counts[word] += 1
-    return counts
-
-
-def _soma_findings() -> Dict[str, List[str]]:
-    found = {"soma_imports": [], "soma_classes": []}
-    for path in _python_files((*PACKAGES, "rules", "skills", "tests")):
-        rel = path.relative_to(REPO).as_posix()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                names = [node.module]
-            found["soma_imports"].extend(f"{rel}:{node.lineno} {n}" for n in names if n.startswith("soma_"))
-            names = []
-            if isinstance(node, ast.ClassDef):
-                names = [node.name]
-            elif isinstance(node, ast.Assign):
-                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            found["soma_classes"].extend(f"{rel}:{node.lineno} {n}" for n in names if n.startswith("Soma"))
-    return found
-
-
-def _soma_imports() -> List[str]:
-    return _soma_findings()["soma_imports"]
-
-
-def _soma_classes() -> List[str]:
-    return _soma_findings()["soma_classes"]
-
-
-def _organelle_type_literals() -> List[str]:
-    found = []
-    for path in _python_files(PACKAGES):
-        rel = path.relative_to(REPO).as_posix()
-        if rel == LEGACY_TABLE:
-            continue
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if _ORGANELLE_TYPES.search(line):
-                found.append(f"{rel}:{lineno}: {line.strip()}")
-    return found
-
-
-_ZERO_ROW_FINDERS: Dict[str, Callable[[], List[str]]] = {
-    "soma_imports": _soma_imports,
-    "soma_classes": _soma_classes,
-    "organelle_type_literals": _organelle_type_literals,
+# Phrase rules are location independent and pinned here; the record may only shrink them.
+DEFAULT_ENGLISH_PATTERNS = frozenset({
+    rf"(?i:{REQUIRED_WORDS[4]}[ _-]?(?:clock|time))",
+    rf"(?i:{REQUIRED_WORDS[4]}[ _-]+of[ _-]+(?:text|prose))",
+    "CLAUDE_CODE_USE_" + REQUIRED_WORDS[19].upper(),
+    rf"(?i:(?:table|str|rendered|json|tsv)[ _-]+{REQUIRED_WORDS[1]}s?)",
+    rf"(?i:(?:javascript|code[ _-]mode|code|execution|exec)[ _-]+{REQUIRED_WORDS[1]}s?)",
+    rf"(?i:known[ _-]+{REQUIRED_WORDS[1]}[ _-]+shapes?)",
+})
+EXEMPT_FILE_KEYS = frozenset({
+    'docs/hierarchy-dogfood.md',
+    'tests/contract/legacy_ratchet.json',
+    'tests/contract/public_names_4_3_3.json',
+})
+DEFERRED_COUNTS = {
+    '.aegis/rules/boundaries/boundary-' + REQUIRED_WORDS[3] + 's.md': (0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    '.aegis/rules/contracts/contract-integrity-index-canonical-form.md': (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    '.gitignore': (19, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'MANIFEST.in': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'NOTICE': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_cli/cli.py': (7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_cli/migrate.py': (4, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_cli/commands_table.py': (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/rules.py': (0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/verification/import_guard.py': (0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/workspace/layout.py': (3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'docs/reference.md': (3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/conftest.py': (3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/contract/cli_tree.json': (3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/cli/test_hook_run.py': (2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/core/test_packs.py': (0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/core/test_supercell_' + REQUIRED_WORDS[1] + 's.py': (0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/core/test_v3_zero_legacy_invariants.py': (2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/mcp/test_mcp_argument_values.py': (0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'tests/unit/cli/test_cli_removed_commands.py': (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/ast/detect.py': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/metrics.py': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/verification/checkpoint_checks.py': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    'aegis_core/verification/call_graph.py': (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
 }
+ORDINARY_ENTRY_KEYS = frozenset({
+    '05bee4e181f5978dcd3c5360cf6a6968a5c225b370e7d13cc9399ad54d6d2d93',
+    '09af018d486302ef9ce9f48d54ecb2ce786215680459a819cff29569a512bd3c',
+    '0a99c26732ae0a1b3e594c6120b8ba6c39ee364d02cf535feeb2cefd2dd50612',
+    '0bb90f21e64fbf5f27e604b75a8f7f0231bdece288045280973f10d9cba44a9b',
+    '0c658d20d44058b6cc79504c45609629224241e7c12cea65bab95ccf3412f602',
+    '0eb315b4ace7a0132dea7210755e2d285210cef5f6d0c759a6ef6c3dfbced003',
+    '13b072dbd00946a109249c0ad8cefb8e8371d7fb3d4dce0d6758c5991113bbdd',
+    '14492b204cd39086cde3d43f09bcd330c97f7e8037dc61b58960b365d53967dd',
+    '162dfb9d460ce4d0a0cbeb7ab9a9eff400446dd21621f469838db7390a10e23b',
+    '1709a6db7b7ee052f0e3ecbba716344f9569dab165cb6ac2c0a6c3209e88c6e4',
+    '178ee309bfe92a52792e6e02389a3607c17fb8166f85e7773e96663a90bd0e6c',
+    '1a10e581938fa55326acbcd35802de4721ea8a758bdab868613878056a6373f0',
+    '1ba7def537ecdcd990f2b4130f6847d9e9ffa326ed1dcc6709d78b2edee66134',
+    '1c47467534dac00923ead3b416e5085960058440dc2fbede9dc5fb078f008f9b',
+    '226c042cf8b34358f12094257a3a85234fdac39e43f102198dc13266bb78f647',
+    '22a70fe5f9565fa148bcfd052e8fe548f23fd402ff1afde2fa0512fa598bcf45',
+    '28f6249d8dead08538e7da8a1496c33006dcb9ec44bbecbe3d8ffece9601b9f2',
+    '29ddb2e195d1c0e423bd48e1f81c6b86996aa55d81ff359c168829096fafeeb6',
+    '2a3b48e4e5034c27f6a66b426007b6fef4c3aab6a1cc86d71cd326a235ce25a0',
+    '2ce2d47c8270fb2d36ec9663b7417360f4b3b6a3782d8c3b27c5f109be8a5601',
+    '2f7694611c5ec1de5a1e66b3b460875fc2545c83dd700a5d66dff9644867b2b4',
+    '315b0a45abf710987dbfae8690912d8abe7256227805e1d46df93237e8e018ac',
+    '326d03dcf4a08db433f8a67fa66667446ec9f3fe16a1ff38628a04df80b10caf',
+    '33746d5bc67eb295eaf2055bdb9c8fd4a4dfe8e06bb822128af4bdc9dd0b8447',
+    '34f268053d481ce3ea53ae0275140ac3cfa591bf741dd622aaa9b449d95196c9',
+    '3e1b226f0edccfdcd2d543afab1b5a548d8b6eb394413c8371e6e27d7191f765',
+    '409bf89d24b7fb397498665c5b6ab7e5439bc73d697ea30507f199bb3463476f',
+    '415f101c217a5443710b7d5f5867ba6c9f47cc8455174b07090c09f12758e267',
+    '422ca353a91a286ab9420f5daf6c9f7cf6ad2bd44efb5dca6f0025b2fdb9cab4',
+    '4586f0e748d6db8eaeaf1e3b465f5c3d7d0ea86b4341a28350810836e542fbff',
+    '48643b8f97143533526290927880818145a9a518f1d966ba301f0b3bb3b3a0fc',
+    '488cfa19233f8d0bec1b6c52fb096e29e75610e563a8c3a54679a727fef75545',
+    '50ca722f41a88c389575bbe0afca9a9b8d962add8c63ffc79aef86973bbada5c',
+    '534c887a90526462a2cdf1fa2dfd7983bea5a8b2e32da3e6408974398a507339',
+    '540fd77e2db6db4daefd45bcd989f8229f2f5901d13045701a2cf1f5ba4d4142',
+    '57360b9a909223ea5b1708508815e79906edada1190e1fd4dc86fabadecb4a87',
+    '5a425c2c9c1e2f4354c51ca82a6f99df47f258a7b49da6e20d33fc45bf65ca4c',
+    '6109fc86457f06f39031119e455d75ca287889687b6e656cf9230579b739bfce',
+    '652716cf2d0a50138185bab4fcec5b6d39d53522c588e19e6b5ef91b67c3bd49',
+    '6e83c546cee059b8e8f5c359010f8a2bd143e31e8889db811537f2459c8c22d7',
+    '71778f7bd98f5fe9257d29937297391d198bfb9c5788b216fd668dc46394549d',
+    '74b50e566d7e871df6ba92e2065cefa85e6396a59f0d8cacd1081edfb296a587',
+    '7593795693244dc95152ae3a77778486055fbf52f377532e2d0c88bff23f08b7',
+    '7ade0ca0087bf6cc8f7d46ea451dc7e484c3154c9af1f28c4fabcc5240ad9934',
+    '7c1bf2f08b27dc7a7c64eae9ab3156153c62e2f9a15daf548dcd1558efbdf92f',
+    '7c543097576febfaa0170fd8ef87b88bdbfd5478a85d9f91db10b8e17f1f0b05',
+    '7e077f6982966da47c8e2214667b45981418dbb0386bbb908e38a8d4bbafe8c5',
+    '7f410396f932d29d45fd6a10f93beeddebe38dc3b9bb5981e0db98b914eaef38',
+    '83a1572a0aeb0c7d2203fdd9e47e02e5be19c56543e2d78e6fdc9209b3a29bad',
+    '84ee6701b66e8473149ae55572e0f294cb3468ba6679d4d65753b7e0506bd308',
+    '8c70312258b7ef18ec90025fb28509a04b54024cf2bac302a6f4216cf7d4e84c',
+    '8e8d1f9022ee51edef3a098a2ad3dc75cfb1c4f32cfc94ac1835eefc4e591765',
+    '8f47d3a2cd6d4675c17d0c710bf1ae7f42b9f7a62a9c6b57d412549506ed59d5',
+    '8fd309e0ae368d9434f991218499ec0d81f8201b8b6fef8d803a0917ebbd18b1',
+    '9156906c21b6d1b7dd91caf7423116c359c5df82b0b5e27ab09b48d01bc244a2',
+    '92f3ef7f1d88223fa57354fabb4a18842ac4728b5a5ef3ad253149c826fbf4a5',
+    '948eda1ad90ee6a9aec6c17e22da53515b70626e65139858d5f4a2f6ee1a207e',
+    '96304aaa4a0a4de5da536b960c6318f44a25904091d55bc6d070eda15b265b30',
+    '98af5e7069b04af0122655981db926e122e1655c4d704ab76134fca3e83bfaf0',
+    '98c2336b34f6a96ecbfed25a2da9e6f679334df021333b6808d125377c2ff74f',
+    '9ed6d76ea4ce738dfa64f64982ff0420168ea80602ae150cdec323b442716313',
+    '9f69f898b6c354b19a6e7de6923e18f9c35f2e395faa2646cba50a60fc768ab0',
+    'a2d70f6dcb445b9e3df3f164a5ce899545d5465617de3902837c5af6c0665005',
+    'a95cc65b11f322ee7b9232295d0d50f1642c43387a32b88bd418fddd46643d6e',
+    'a991fe033153f71d80210f69ecb5c873ab3789e90ad6ff6d4c8acbfa24f1bf41',
+    'aab82d1b157b1f05be1b641fb55f1b4a6080bc6a22f758b1ee3fb03d54af8f21',
+    'ab9f009c405e5a6b307558ddc79cbbf008d2e95e7cbf64c54aa7804db37a5cdb',
+    'b22494961696d4bfc386d7949a3b987b8195087ba6fcd2252dd30c2b2883ca2b',
+    'b53809bef3a1669f2399aaec37fd3bd5198f86b2ffad2e2ad2c6d3abd3c62ac6',
+    'bae276ea84d39fece89b4de7dfdac7b5ff87e5fd124744e80f60cb1f10301a02',
+    'be0f5caa3a2757e3d061a3f9332012019d2aec39d0b023810c18fe63b68f4ae5',
+    'bec8db55fd20b3f8e0b24df81df7c4ff6bf2f450048a0b7b4dd788a41350c3fe',
+    'beef40bd34645e9cb827affe95625eaec5ed3737372102039c0f2d4b2715375c',
+    'c36c6d99e32a1e433d5f8d644972579f8d0b1d739cb387d9ef04469ac256d19a',
+    'c8521106aa5e0ac5d1479c4e48e2a03ebad7207820de6d0688066798f0171812',
+    'c8698409f36303c673e3cca41113727c5e98bd6581f66ea9da951fa66e3a6f04',
+    'c904182fa76fc59ce8846593715a33b5af712fa85f3b55948ce23aaf2572dd0a',
+    'c94fe7f9f561435f32f1c98354223102251a6d9b1fd27933e312ad03422dcbe6',
+    'cdbc6b57dde8aeb54d54a4cbea7dce883f282206861aec75091a631c13ab71dc',
+    'ce3dc0aa68804d34242eac77939f2b3c6096e09de764fd2d9aef6158f7d837f7',
+    'd7549fc1cb2d36d4a6d0bb7c39c1d23d97a6217b2c55064091acb0b91e765472',
+    'd7f521f18987a5054601af021ba5b8e397a2fc75ecfc50ea1b11189b1ecd03d4',
+    'd929b337a68dec74adef56e08e99ad0d83a0eba0e87e8795d2fa2a3af14fff53',
+    'dd017cf622e7db45b715ef1a96a78ce2bf45de4b90d2d467baf024bd0620e935',
+    'de602bdc03cb6d04b2d9cf1b8875f4dbb2e0fb5ae752de48b9db54c4d309d49d',
+    'dedcb2d71ffd171a19ded842c099b7313917e7481392a43cbb74cdf40f4b01bb',
+    'e218d260b1573f09b09330347bb1b42599bb1abe57d5149eb071b8a2cf7c7ca5',
+    'e352975bf1436c34ce5c293e81e441bf9d9e71565d1809749a73ccb4f1af9829',
+    'e4cd9ba73d21ab5c3996afa0b801ede9c5fbe344ed62256aadf771471249dc78',
+    'e7786b626ae08170be02f23a8ec56a77e90884b055138a51cfe9fe970f6842c1',
+    'e961a2e4abb14da8e6b11c5f1d1e52269bb434a418963af9f600d4e615fbe76d',
+    'f012e59d9230077e13374263b666e7c34eeeaf08a9f68156d47d1f2ac2ec3fc4',
+    'f01a83b0367e38cbd5618e55162d7b2ad391e2c4c432f149c9adff8adff4d85d',
+    'f1c1270aab1c608cbf9af90acdfba9173b759bf7bf980a123acfa7423f0f7c28',
+    'f45543bf71dcf592dfad919a0508105645d6bf02f1c9c49052b93ac357b271ea',
+    'f5ebd86572053d9d94bd9fb6ee68ca5765fbaa18009a21ac8e94cd961a7702e9',
+    'f5ff610c9b2a4e1c501ef281aab6ece6fdf149807c9d2c69a556dd15705bdea0',
+    'f6d797f9da832da3bb42835525b6482f2909035f2789b87884362e3ffddc1bfb',
+    'f77dc6d787213951c6e73ae632688336d0ef48e308ad8b97c153e2d3e01cb8dd',
+    'f8e22b8823ffd10e950624369a8a2ed335adf26b6164875a6135bb658450e919',
+    'fd1dc8e5927b9c8a85ab7c7911e9be70dd01ce95b957f1fa8310a82277aa3bf8',
+    'fe20657b1f1ea826ebad074c0737276f26985d9192ab8bd1c815f95732e2a39c',
+    'ffa4fbe9975b6fb60c1b327762730c516ba5109dc9c4567706d5f7775363a484',
+})
+DOCUMENTED_REMOVAL_KEYS = frozenset({
+    '1a5beee1fdf0b00496c8e0fd3e0197d6d49d83b4702d6d6c7472a6e520f4ef75',
+    '4ffe366a5f4c510279f93f687887e10db29290f52e86dd672c95f557a5c83ae0',
+    '713681de1ff6b2732c47dc8f2aefb04fba618c9b08ea6f704129eed54bb796ed',
+    'a8dab479bf2a2f7d9dab291456ff5de03118dbe7a15e05b8e7c00b06fc9b922b',
+    '17aa8cfe3fcb5f1907496c6971c389b0946bede26f52ed1c1f15e2081140f871',
+    'b5599413b222c6c570197db50acf4ac4bcdd90bbc918a90340ffef4d0e688802',
+    '6abc808f788718304b4b01b89879a8bb15612a74c1c15f43491560cc10e68f29',
+    '9a487dd525741d9695be069a2b2b34e3e9c8578b00fad133098688bcd6299baf',
+    '9b32844ac55323953b7c66d92e51dc61bb9f8cde0820daf27852d3982623fc59',
+})
+RELEASE_HEADING_KEYS = frozenset({
+    '4568711dff3254c9cf7a6d64239b60f2c17b635a23392b2b3067ad1d382b1ebd',
+    '2b6df90926bbc01023998c7d31d4e66b926d77e997085317418de94cda46e47b',
+    '51fb84637e777346b4dac569ec87603c05951dd034b748421a4d309342d84ec7',
+    'addb8b2db2602da78fca1b6fb97db72ff9dd1a37dc2184faccd1d3fd0da78164',
+    '31e7781675c4bf8fc5b5637e62a7e294f2009983f8787fc0f24a086c80cb55f3',
+    '29e7aa327fc4a18983cacb61f7b644df3eeff5862012d84ca1e56c6c956db3b5',
+    '6d48ac86f1661adcf2b4cecd74808b987fc4fbdaff3b9b31b381edee94f2e142',
+    'cd443990fdc75c79f627e6accecd4b13b24d0fc3d7fe3c2a110761acc23c98e3',
+    'ee133b50af9f288077e03b9faa50c2bf83c84d470e15455f8ff7394d4f0f8246',
+    '9a0ae8613e9874e86a17d03db0e20805c0e956e1291a8c24e4730d22776943b0',
+    '4deff91536d27d7df4c25325dba584970a09500a23a2ed1ff288f5b9484f9a60',
+    '6a564bf266e9fcf0f155dbc1d8d10f5dc3deb1716423d749db2f1fdc4fe39052',
+    'eaf608689b33dec46328da4b816be5cd599d490a700ddbb89e3fd65ba7ab2afa',
+    '38b33fda32d83445f6261a012d055f780c6ccc20b6560d79ff1d7a24257075b2',
+    'b3fcb212dfe7ce87208cb3ea9ef5cfdabd5364a7e7c4a9e71118fafec68d936b',
+    'af39f02887e52f7e4c2cc913b9589c5f10cc38885c46b87d6ba3662a13f93938',
+    'b0fad5ca918f7666a9fa53a5c742bfc979db85bb0bb6e131f7a2eac443dff327',
+    '8d389f7c9a1bb553448a22e9ec29f6506b9452fdd64938bf7da477842c14fa75',
+    'd3f0c33229116f5011ffda0b1a77e88005883bc9733977b472b744167fa1ba12',
+    '73b07c2ce90372294449ccc78a78a0c64847749bcd380b4f5c5bbedb4fdd60d2',
+    'b5f97224ada943789f729cf3d619b53bf4c5c2e1399be74ab4d16b5c134415c8',
+    '6edc8fb16f3307598eeb5eb5f2d574875c537e28303e34065794b1392d88e2c7',
+    '31acb5bc8ade149669addc86d64dd644df470fdf3edf451f1692286616523e33',
+    '973921d1ca3a869dff45f43b2e396d1699587d37ef09793f6d666c61d9894ba6',
+    '3544922a8ceb9d39c400e40c90a75b064b51e83e0fbe66efc414706d3c1aef15',
+    '54f3db9dde49fcafd48e7bf844b559c2b485828451dc161c8c54d5cae58f3255',
+})
+
+HISTORICAL_RECORD_IDS = frozenset({
+    'DEBRIEF-001',
+    'DEBRIEF-002',
+    'DEBRIEF-003',
+    'DEBRIEF-004',
+    'DEBRIEF-005',
+    'DEBRIEF-006',
+    'DEBRIEF-007',
+    'DEBRIEF-008',
+})
 
 
-@functools.lru_cache(maxsize=None)
-def _cached_counts(words: tuple) -> Dict[str, int]:
-    return current_counts(words)
+def _filtered_counts(texts, words, patterns):
+    for pattern in sorted(patterns):
+        texts = [re.sub(pattern, " ", text) for text in texts]
+    return _word_counts(texts, words)
 
 
-def current_counts(words) -> Dict[str, int]:
-    words = list(words)
+def _ordinary_key(entry):
+    identity = {key: entry[key] for key in ("file", "text", "occurrence", "counts")}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
-    def code_texts() -> Iterator[str]:
-        for path in _python_files(PACKAGES):
-            yield from _texts(ast.parse(path.read_text(encoding="utf-8")))
 
-    def snapshot_texts() -> Iterator[str]:
-        for name in SNAPSHOTS:
-            yield from _json_texts(json.loads((RECORD.parent / name).read_text(encoding="utf-8")))
+def _mask_history(source, rel, history):
+    lines = source.split("\n")
+    for entry in history:
+        if entry["file"] != rel:
+            continue
+        if "release_headings" in entry:
+            released = False
+            for index, line in enumerate(lines):
+                if line.startswith("## "):
+                    released = line in entry["release_headings"]
+                if released:
+                    lines[index] = ""
+        elif "record_ids" in entry:
+            remaining = Counter(entry["record_ids"])
+            for index, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                key = record.get("id") if isinstance(record, dict) else None
+                if remaining[key]:
+                    remaining[key] -= 1
+                    lines[index] = ""
+        elif "lines" in entry:
+            remaining = Counter(entry["lines"])
+            for index, line in enumerate(lines):
+                if remaining[line]:
+                    remaining[line] -= 1
+                    lines[index] = ""
+        else:
+            start = lines.index(entry["start"])
+            end = lines.index(entry["end"], start + 1)
+            lines[start:end] = [""] * (end - start)
+    return "\n".join(lines)
 
-    counts = _word_counts(code_texts(), words)
-    counts[SNAPSHOT_ROW] = sum(_word_counts(snapshot_texts(), words).values())
-    counts.update({row: len(found) for row, found in _soma_findings().items()})
-    counts["organelle_type_literals"] = len(_organelle_type_literals())
+
+def _tracked_text(path, root):
+    import codecs
+
+    raw = path.read_bytes()
+    encoding = "utf-8-sig"
+    if raw.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    try:
+        source = raw.decode(encoding)
+    except UnicodeDecodeError:
+        raise ValueError(f"cannot decode tracked text file: {path.relative_to(root).as_posix()}") from None
+    if "\x00" in source:
+        raise ValueError(f"cannot decode tracked text file: {path.relative_to(root).as_posix()}")
+    return source.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def file_counts(path, root, words, ordinary=(), history=(), patterns=None):
+    rel = path.relative_to(root).as_posix()
+    patterns = DEFAULT_ENGLISH_PATTERNS if patterns is None else patterns
+    if path.is_symlink():
+        return _filtered_counts([rel, os.readlink(path)], words, patterns)
+    source = _tracked_text(path, root)
+    if rel == "tests/contract/test_legacy_ratchet.py":
+        source = _without_word_list(source)
+    source = _mask_history(source, rel, history)
+    lines = source.split("\n")
+    texts = _python_texts(source) if path.suffix == ".py" else lines
+    counts = _filtered_counts(texts, words, patterns)
+    if path.suffix in (".json", ".jsonl"):
+        values = [json.loads(source)] if path.suffix == ".json" else [json.loads(line) for line in lines if line.strip()]
+        decoded = _filtered_counts([text for value in values for text in _json_texts(value)], words, patterns)
+        counts = {word: max(counts[word], decoded[word]) for word in words}
+    names = _filtered_counts([rel], words, patterns)
+    counts = {word: counts[word] + names[word] for word in words}
+    for entry in ordinary:
+        if entry["file"] != rel or lines.count(entry["text"]) <= entry["occurrence"]:
+            continue
+        expected = {key: value for key, value in _filtered_counts([entry["text"]], REQUIRED_WORDS, patterns).items() if value}
+        assert expected == entry["counts"], f"English exemption changed: {rel}"
+        for word, count in expected.items():
+            if word in counts:
+                counts[word] -= count
+                assert counts[word] >= 0, f"English exemption exceeds decoded count: {rel}"
     return counts
 
 
-def _record() -> Dict[str, int]:
-    return json.loads(RECORD.read_text(encoding="utf-8"))["counts"]
+def _data():
+    return json.loads(RECORD.read_text(encoding="utf-8"))
 
 
-def _words(record: Dict[str, int]) -> List[str]:
-    return [row for row in record if row not in ZERO_ROWS and row != SNAPSHOT_ROW]
+def check_exclusion_keys(data):
+    assert set(data["exempt_files"]) <= EXEMPT_FILE_KEYS, "whole-file exemptions grew"
+    assert set(data["ordinary_patterns"]) <= DEFAULT_ENGLISH_PATTERNS, "English patterns grew"
+    ordinary = [_ordinary_key(entry) for entry in data["ordinary_english"]]
+    assert len(ordinary) == len(set(ordinary)) and set(ordinary) <= ORDINARY_ENTRY_KEYS, "English entries grew"
+    assert set(data["deferred"]) <= set(DEFERRED_COUNTS), "deferred keys grew"
+    for rel, entry in data["deferred"].items():
+        assert set(entry["counts"]) == set(REQUIRED_WORDS)
+        assert all(entry["counts"][word] <= maximum for word, maximum in zip(REQUIRED_WORDS, DEFERRED_COUNTS[rel])), f"deferred counts grew: {rel}"
+    files = [entry["file"] for entry in data["historical_sections"]]
+    assert len(files) == len(set(files))
+    assert set(files) <= {"CHANGELOG.md", "docs/why-aegis.md", "governance/debrief_queue.jsonl"}
+    for entry in data["historical_sections"]:
+        assert set(entry.get("record_ids", ())) <= HISTORICAL_RECORD_IDS, "historical ids grew"
+        if entry["file"] == "docs/why-aegis.md":
+            assert set(entry) <= {"file", "start", "end", "reason"}
+            assert (entry["start"], entry["end"]) == ("## Appendix B: Re-deriving the numbers", "## Planned, not shipped")
+        elif entry["file"] == "CHANGELOG.md":
+            assert set(entry) <= {"file", "release_headings", "reason"}
+            assert {hashlib.sha256(heading.encode()).hexdigest() for heading in entry["release_headings"]} <= RELEASE_HEADING_KEYS, "release headings grew"
+            assert len(entry["release_headings"]) == len(set(entry["release_headings"]))
+        else:
+            assert set(entry) <= {"file", "record_ids", "reason"}
+            assert len(entry["record_ids"]) == len(set(entry["record_ids"]))
+    files = [entry["file"] for entry in data["documented_removals"]]
+    assert len(files) == len(set(files)) and set(files) <= {"CHANGELOG.md"}
+    assert all(set(entry) <= {"file", "lines", "reason"} and len(entry["lines"]) == len(set(entry["lines"])) for entry in data["documented_removals"])
+    assert {hashlib.sha256(line.encode()).hexdigest() for entry in data["documented_removals"] for line in entry["lines"]} <= DOCUMENTED_REMOVAL_KEYS, "documented removals grew"
+
+
+
+def word_parts(text):
+    # Decode language literals in their parser; a literal path separator never
+    # consumes the first letter of the next component.
+    text = text.replace("\\", " ")
+    parts = [part.lower() for part in _PARTS.findall(text)]
+    brand = REQUIRED_WORDS[0]
+    return [piece for part in parts for piece in
+            ((brand, part[len(brand):]) if part.startswith(brand) and part != brand else (part,))]
+
+
+def _word_counts(texts, words):
+    parts = Counter(part for text in texts for part in word_parts(text))
+    return {word: parts[word] + parts[word + "s"] for word in words}
+
+
+def repository_files(root):
+    """Git's tracked and nonignored new files, including hidden configuration.
+
+    A deleted tracked path is absent from the working candidate. Never walk the
+    runtime state, a symlink target, or a sibling worktree.
+    """
+    done = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root, check=True, stdout=subprocess.PIPE,
+    )
+    return [root / name for name in sorted(set(done.stdout.decode("utf-8").split("\0")))
+            if name and ((root / name).is_symlink() or (root / name).is_file())]
+
+
+def _without_word_list(text):
+    lines = text.splitlines(keepends=True)
+    node = next(n for n in ast.parse(text).body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "REQUIRED_WORDS" for t in n.targets))
+    lines[node.lineno - 1:node.end_lineno] = ["\n"] * (node.end_lineno - node.lineno + 1)
+    return "".join(lines)
+
+
+def _python_texts(source):
+    # Invalid bytes remain visible to the text counter without preventing AST
+    # parsing when they appear in a comment or string.
+    source = source.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    class FoldText(ast.NodeTransformer):
+        def visit_BinOp(self, node):
+            node = self.generic_visit(node)
+            if (isinstance(node.op, ast.Add) and isinstance(node.left, ast.Constant)
+                    and isinstance(node.right, ast.Constant) and isinstance(node.left.value, (str, bytes))
+                    and type(node.left.value) is type(node.right.value)):
+                return ast.copy_location(ast.Constant(value=node.left.value + node.right.value), node)
+            return node
+
+    tree = FoldText().visit(ast.parse(source))
+    texts = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            texts.append(node.value if isinstance(node.value, str) else node.value.decode("utf-8", "surrogateescape"))
+        elif isinstance(node, ast.Name):
+            texts.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            texts.append(node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            texts.append(node.name)
+        elif isinstance(node, ast.arg):
+            texts.append(node.arg)
+        elif isinstance(node, ast.keyword) and node.arg:
+            texts.append(node.arg)
+        elif isinstance(node, ast.alias):
+            texts.extend([node.name, node.asname or ""])
+        elif isinstance(node, ast.ImportFrom):
+            texts.append(node.module or "")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            texts.extend(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            texts.append(node.name)
+    texts.extend(token.string for token in tokenize.generate_tokens(io.StringIO(source).readline)
+                 if token.type == tokenize.COMMENT)
+    return texts
+
+
+def _json_texts(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in [key, *_json_texts(item)]]
+    if isinstance(value, list):
+        return [text for item in value for text in _json_texts(item)]
+    return []
+
+
+def tree_counts(data=None, root=None):
+    data = _data() if data is None else data
+    root = REPO if root is None else root
+    total = dict.fromkeys(REQUIRED_WORDS, 0)
+    deferred = {rel: dict.fromkeys(REQUIRED_WORDS, 0) for rel in data.get("deferred", {})}
+    files = {}
+    all_paths = repository_files(root)
+    for path in all_paths:
+        rel = path.relative_to(root).as_posix()
+        if rel in data.get("exempt_files", {}) or any(fnmatch.fnmatchcase(rel, p) for p in data.get("exempt_patterns", {})):
+            continue
+        counts = file_counts(path, root, REQUIRED_WORDS, data.get("ordinary_english", ()),
+                             [*data.get("historical_sections", ()), *data.get("documented_removals", ())],
+                             data.get("ordinary_patterns", DEFAULT_ENGLISH_PATTERNS))
+        if rel in data.get("deferred", {}):
+            deferred[rel] = counts
+        else:
+            files[rel] = counts
+            for word, count in counts.items():
+                total[word] += count
+    total.update(dict.fromkeys(ZERO_ROWS, 0))
+    total[SNAPSHOT_ROW] = sum(sum(counts.values()) for rel, counts in files.items()
+                              if rel in ("tests/contract/cli_tree.json", "tests/contract/mcp_tools.json"))
+    for path in all_paths:
+        if path.suffix != ".py" or path.is_symlink():
+            continue
+        source = _tracked_text(path, root)
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+                total[ZERO_ROWS[0]] += sum(name.startswith(REQUIRED_WORDS[0] + "_") for name in names)
+            if isinstance(node, ast.ClassDef):
+                total[ZERO_ROWS[1]] += node.name.startswith(REQUIRED_WORDS[0].capitalize())
+            elif isinstance(node, ast.Assign):
+                total[ZERO_ROWS[1]] += sum(isinstance(t, ast.Name) and t.id.startswith(REQUIRED_WORDS[0].capitalize())
+                                         for t in node.targets)
+    total[ZERO_ROWS[2]] = sum(total[word] for word in (REQUIRED_WORDS[6], REQUIRED_WORDS[10], REQUIRED_WORDS[11]))
+    return total, deferred, files
+
+
+def current_counts(words):
+    counts, _, _ = tree_counts()
+    return {word: counts[word] for word in words}
+
+
+def lowered(record, current):
+    rose = {row: (record.get(row, 0), value) for row, value in current.items() if value > record.get(row, 0)}
+    if rose:
+        raise ValueError(f"refusing to raise records: {rose}")
+    return {row: current.get(row, 0) for row in record}
+
+
+
+def test_evidence_exemptions_record_paths_and_reasons():
+    data = _data()
+    check_exclusion_keys(data)
+    assert all(reason and (REPO / rel).is_file() for rel, reason in data["exempt_files"].items())
+    assert "HISTORY_DIGESTS" not in globals()
+    assert all("line" not in entry and entry["occurrence"] >= 0 for entry in data["ordinary_english"])
+
+
+@pytest.mark.parametrize("category", ["exempt_files", "deferred"])
+def test_exclusion_keys_can_only_shrink(category):
+    data = _data()
+    data[category] = {}
+    check_exclusion_keys(data)
+    data[category]["new-unreviewed-file.txt"] = {}
+    with pytest.raises(AssertionError, match="grew"):
+        check_exclusion_keys(data)
+
+
+def test_exemption_rules_and_deferred_counts_cannot_grow_in_json():
+    for mutation in ("pattern", "entry", "count"):
+        data = _data()
+        if mutation == "pattern":
+            data["ordinary_patterns"].append("new phrase")
+        elif mutation == "entry":
+            data["ordinary_english"].append(dict(file="new.py", text=REQUIRED_WORDS[0], occurrence=0, counts={REQUIRED_WORDS[0]: 1}, reason="Unreviewed."))
+        else:
+            rel = next(iter(data["deferred"]))
+            data["deferred"][rel]["counts"][REQUIRED_WORDS[0]] += 1
+        with pytest.raises(AssertionError, match="grew"):
+            check_exclusion_keys(data)
+
+
+@pytest.mark.parametrize("mutation", ["section", "duplicate-history", "duplicate-note", "duplicate-English"])
+def test_exemption_scopes_and_multiplicity_cannot_grow(mutation):
+    data = _data()
+    if mutation == "section":
+        data["historical_sections"][0]["start"] = "# Whole document"
+    elif mutation == "duplicate-history":
+        data["historical_sections"].append(data["historical_sections"][-1])
+    elif mutation == "duplicate-note":
+        data["documented_removals"].append(data["documented_removals"][0])
+    else:
+        data["ordinary_english"].append(data["ordinary_english"][0])
+    with pytest.raises(AssertionError):
+        check_exclusion_keys(data)
+
+
+def test_unrelated_breaking_lines_are_counted_without_an_exemption(tmp_path):
+    data = _data()
+    path = tmp_path / "CHANGELOG.md"
+    source = (REPO / path.name).read_text(encoding="utf-8")
+    source = source.replace("## [Unreleased]\n", "## [Unreleased]\n\n- Breaking: unrelated.api was removed.\n", 1)
+    path.write_text(source, encoding="utf-8")
+    assert not any(file_counts(path, tmp_path, REQUIRED_WORDS, data["ordinary_english"], [*data["historical_sections"], *data["documented_removals"]], data["ordinary_patterns"]).values())
+
+
+def test_documented_removals_contain_required_words_only():
+    data = _data()
+    source = (REPO / "CHANGELOG.md").read_text(encoding="utf-8").split("## [4.5.0]", 1)[0]
+    for entry in data["documented_removals"]:
+        for line in entry["lines"]:
+            assert line in source.splitlines() and line.startswith("- Breaking:")
+            assert any(_word_counts([line], REQUIRED_WORDS).values())
+
+
+def test_section_history_and_new_audit_ids(tmp_path):
+    word = REQUIRED_WORDS[0]
+    path = tmp_path / "notes.md"
+    history = [dict(file=path.name, start="## History", end="## Current")]
+    path.write_text("## History\n" + word + "\n" + word + "\n## Current\n")
+    assert file_counts(path, tmp_path, (word,), history=history)[word] == 0
+    path.write_text(path.read_text() + word)
+    assert file_counts(path, tmp_path, (word,), history=history)[word] == 1
+    path = tmp_path / "queue.jsonl"
+    history = [dict(file=path.name, record_ids=["old"])]
+    old = json.dumps(dict(id="old", text=word)) + "\n"
+    path.write_text(old)
+    assert file_counts(path, tmp_path, (word,), history=history)[word] == 0
+    path.write_text(old + json.dumps(dict(id="new", text=word)) + "\n")
+    assert file_counts(path, tmp_path, (word,), history=history)[word] == 1
+    path.write_text(old + old)
+    assert file_counts(path, tmp_path, (word,), history=history)[word] == 1
+
+
+def test_exact_text_exemptions_do_not_cover_edited_lines(tmp_path):
+    word = REQUIRED_WORDS[1]
+    path = tmp_path / "notes.txt"
+    text = "one " + word
+    entry = dict(file=path.name, text=text, occurrence=0, counts={word: 1})
+    path.write_text("\n" + text)
+    assert file_counts(path, tmp_path, (word,), ordinary=[entry])[word] == 0
+    path.write_text("\n" + text + " " + REQUIRED_WORDS[0])
+    assert file_counts(path, tmp_path, REQUIRED_WORDS, ordinary=[entry])[REQUIRED_WORDS[0]] == 1
+
 
 
 def test_the_record_keeps_every_required_row():
-    record = _record()
-    missing = [row for row in (*REQUIRED_WORDS, *ZERO_ROWS, SNAPSHOT_ROW) if row not in record]
-    assert missing == [], f"legacy_ratchet.json dropped rows: {missing}"
-    assert all(record[row] == 0 for row in ZERO_ROWS), "the soma import/class and organelle rows stay at 0"
+    data = _data()
+    assert set(data["counts"]) == set((*REQUIRED_WORDS, *ZERO_ROWS, SNAPSHOT_ROW))
+    assert all(value == 0 for value in data["counts"].values())
+    assert "CHANGELOG.md" not in data["exempt_files"]
+    assert "governance/debrief_queue.jsonl" not in data["exempt_files"]
+    assert data["exempt_patterns"] == {"tests/fixtures/**": "Immutable fixture evidence; requires an owner successor pin."}
+    assert all(entry["reason"] and entry["counts"] for entry in data["ordinary_english"])
 
 
-def test_no_legacy_count_rose():
-    record = _record()
-    counts = _cached_counts(tuple(_words(record)))
-    rose = {row: f"{record[row]} -> {counts[row]}" for row in record if counts[row] > record[row]}
-    detail = "\n".join(
-        f"  {row}: " + "; ".join(_ZERO_ROW_FINDERS[row]()[:10]) for row in rose if row in _ZERO_ROW_FINDERS
-    )
-    assert rose == {}, (
-        "legacy vocabulary grew; use the rule vocabulary (rule, rule type, ledger, gate...) instead:\n"
-        f"{rose}\n{detail}"
-    )
+def test_all_counts_match_their_nonincreasing_records():
+    data = _data()
+    counts, deferred, files = tree_counts(data)
+    offenders = {rel: {k: v for k, v in count.items() if v} for rel, count in files.items() if any(count.values())}
+    assert counts == data["counts"], offenders
+    assert deferred == {rel: entry["counts"] for rel, entry in data["deferred"].items()}
 
 
-def test_every_lowered_count_is_recorded():
-    record = _record()
-    counts = _cached_counts(tuple(_words(record)))
-    fell = {row: f"{record[row]} -> {counts[row]}" for row in record if counts[row] < record[row]}
-    assert fell == {}, (
-        f"legacy counts fell {fell}: record them so they cannot rise again:\n"
-        "    PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write"
-    )
+def test_repository_rules_load_after_file_renames():
+    from aegis_core.rules import load_rules
+
+    assert load_rules(REPO).errors == ()
 
 
-# The counter itself.
-def test_word_parts_split_snake_camel_and_text():
-    assert word_parts("LEGACY_SOMA_DIRNAME") == ["legacy", "soma", "dirname"]
-    assert word_parts("SomaCellRegistry") == ["soma", "cell", "registry"]
-    assert word_parts("<!-- SOMA:START -->") == ["soma", "start"]
-    assert word_parts("prune_cells") == ["prune", "cells"]
-
-
-def test_counting_sees_identifiers_and_strings_but_not_docstrings():
-    tree = ast.parse(
-        '"""A soma docstring."""\n'
-        "import soma_x as cell_y\n"
-        "def promote_cell(cell_id, *, genome=None):\n"
-        '    """Cell docs."""\n'
-        '    return {"cell": f"{cell_id} wall", "firewall": cancel}\n'
-    )
-    counts = _word_counts(_texts(tree), ("soma", "cell", "genome", "wall"))
-    # soma: the import name; cell: alias, function, parameter twice, key; genome: keyword-only param;
-    # wall: the f-string text (not "firewall").
-    assert counts == {"soma": 1, "cell": 5, "genome": 1, "wall": 1}
-
-
-def test_counting_keeps_plural_overlap_and_ignores_substrings():
-    assert _word_counts(iter(["cell cells cellss firewall walls"]), ("cell", "cells", "wall")) == {
-        "cell": 2, "cells": 2, "wall": 1,
-    }
-
-
-def test_zero_rows_keep_import_class_and_alias_diagnostics(tmp_path, monkeypatch):
-    package = tmp_path / "sample"
+def test_the_tree_counter_covers_comments_docs_root_config_and_names(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for folder in ("tools", "tests", "docs", ".aegis", "skills", "governance"):
+        target = tmp_path / folder / "sample.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(REQUIRED_WORDS[0], encoding="utf-8")
+    (tmp_path / "settings.ini").write_text(REQUIRED_WORDS[0], encoding="utf-8")
+    package = tmp_path / "aegis_core"
     package.mkdir()
-    (package / "example.py").write_text(
-        "import soma_one, os, soma_two as other\n"
-        "from soma_three import value\n"
-        "class SomaThing: pass\n"
-        "SomaAlias = Other = object\n"
-        "class Somatic: pass\n"
-        "from unrelated import soma_four\n",
-        encoding="utf-8",
+    (package / (REQUIRED_WORDS[0] + ".py")).write_text(
+        '"""' + REQUIRED_WORDS[0] + '"""\n# ' + REQUIRED_WORDS[0] + '\n', encoding="utf-8",
     )
-    for name in SNAPSHOTS:
-        (tmp_path / name).write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
-    monkeypatch.setattr(sys.modules[__name__], "RECORD", tmp_path / "record.json")
-    monkeypatch.setattr(sys.modules[__name__], "PACKAGES", ("sample",))
-    counts = current_counts(REQUIRED_WORDS)
-    assert {row: counts[row] for row in ZERO_ROWS} == {
-        "soma_imports": 3, "soma_classes": 3, "organelle_type_literals": 0,
-    }
-    assert _ZERO_ROW_FINDERS["soma_imports"]() == [
-        "sample/example.py:1 soma_one", "sample/example.py:1 soma_two", "sample/example.py:2 soma_three",
-    ]
-    assert _ZERO_ROW_FINDERS["soma_classes"]() == [
-        "sample/example.py:3 SomaThing", "sample/example.py:4 SomaAlias", "sample/example.py:5 Somatic",
-    ]
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 10
 
 
-def write_record() -> int:
-    data = json.loads(RECORD.read_text(encoding="utf-8"))
-    record = data["counts"]
-    counts = current_counts(_words(record))
-    rose = {row: (record[row], counts[row]) for row in record if counts[row] > record[row]}
-    if rose:
-        print(f"refusing to raise records: {rose}", file=sys.stderr)
-        return 1
-    data["counts"] = {row: min(record[row], counts[row]) for row in record}
+def test_plural_camel_case_names_and_substrings():
+    word = REQUIRED_WORDS[1]
+    assert _word_counts([word + " " + word + "s " + word.capitalize() + "Registry cancel firewall"], (word,)) == {word: 3}
+
+
+def test_escaped_line_breaks_do_not_hide_string_vocabulary(tmp_path):
+    word = REQUIRED_WORDS[0]
+    path = tmp_path / "sample.py"
+    path.write_text("LABEL = " + repr("\n" + word + "\t" + word), encoding="utf-8")
+    assert file_counts(path, tmp_path, (word,)) == {word: 2}
+
+
+def test_brand_prefix_in_compound_file_and_symbol_names_is_counted():
+    word = REQUIRED_WORDS[0]
+    assert _word_counts(["test_" + word + "yaml.py"], (word,)) == {word: 1}
+
+
+@pytest.mark.parametrize("encoding", ["adjacent", "escaped"])
+def test_decoded_python_literals_cannot_hide_vocabulary(tmp_path, encoding):
+    word = REQUIRED_WORDS[0]
+    literal = ('"' + word[:2] + '" "' + word[2:] + '"' if encoding == "adjacent"
+               else '"\\x' + format(ord(word[0]), '02x') + word[1:] + '"')
+    path = tmp_path / "sample.py"
+    path.write_text("LABEL = " + literal + "\n", encoding="utf-8")
+    assert file_counts(path, tmp_path, (word,))[word] == 1
+
+
+def test_an_undecodable_tracked_file_is_refused_with_a_stable_message(tmp_path):
+    word = REQUIRED_WORDS[0]
+    path = tmp_path / "sample.sh"
+    path.write_bytes(b"printf " + word.encode() + b"\n# \xff\n")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "add", "sample.sh"], cwd=tmp_path, check=True)
+    with pytest.raises(ValueError, match="^cannot decode tracked text file: sample.sh$"):
+        tree_counts({}, tmp_path)
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32", "utf-16-be", "utf-32-be"])
+def test_bom_encoded_tracked_markdown_is_counted(tmp_path, encoding):
+    import codecs
+
+    path = tmp_path / "docs/notes.md"
+    path.parent.mkdir()
+    raw = (REQUIRED_WORDS[0] + "\n").encode(encoding)
+    if encoding == "utf-16-be":
+        raw = codecs.BOM_UTF16_BE + raw
+    elif encoding == "utf-32-be":
+        raw = codecs.BOM_UTF32_BE + raw
+    path.write_bytes(raw)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "add", "docs/notes.md"], cwd=tmp_path, check=True)
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+def test_bomless_unicode_tracked_markdown_is_refused(tmp_path, encoding):
+    path = tmp_path / "docs/notes.md"
+    path.parent.mkdir()
+    path.write_bytes((REQUIRED_WORDS[0] + "\n").encode(encoding))
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "add", "docs/notes.md"], cwd=tmp_path, check=True)
+    with pytest.raises(ValueError, match="^cannot decode tracked text file: docs/notes.md$"):
+        tree_counts({}, tmp_path)
+
+
+def test_documented_removals_still_pass_when_unreleased_becomes_a_release(tmp_path):
+    data = _data()
+    source = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    path = tmp_path / "CHANGELOG.md"
+    path.write_text(source.replace("## [Unreleased]", "## [5.0.0] - 2026-12-01", 1), encoding="utf-8")
+    assert not any(file_counts(path, tmp_path, REQUIRED_WORDS,
+                              history=[*data["historical_sections"], *data["documented_removals"]]).values())
+
+
+def test_symlink_target_text_is_counted_without_following_it(tmp_path):
+    from tests.conftest import symlink_or_skip
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    link = tmp_path / "legacy-dir"
+    symlink_or_skip("." + REQUIRED_WORDS[0], link, target_is_directory=True)
+    subprocess.run(["git", "add", "legacy-dir"], cwd=tmp_path, check=True)
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+    assert not link.exists()
+
+
+def test_timing_phrases_are_location_independent(tmp_path):
+    path = tmp_path / "timing.py"
+    phrase = REQUIRED_WORDS[4] + "_clock"
+    path.write_text("\n" * 20 + phrase + " = 0\n")
+    assert file_counts(path, tmp_path, REQUIRED_WORDS)[REQUIRED_WORDS[4]] == 0
+
+
+def test_a_new_release_section_is_not_implicitly_historical(tmp_path):
+    path = tmp_path / "CHANGELOG.md"
+    word = REQUIRED_WORDS[0]
+    path.write_text("## [Unreleased]\n\n## [5.0.0]\n" + word + "\n\n## [4.5.0] - 2026-11-02\n" + word, encoding="utf-8")
+    assert file_counts(path, tmp_path, (word,), history=_data()["historical_sections"])[word] == 1
+
+
+@pytest.mark.parametrize("word_index,plural,prefix", [(19, "", "aws"), (6, "s", ".aegis\\rules")])
+def test_backslashes_preserve_the_following_letters(word_index, plural, prefix):
+    word = REQUIRED_WORDS[word_index]
+    assert _word_counts([prefix + "\\" + word + plural + "\\x.md"], (word,))[word] == 1
+
+
+@pytest.mark.parametrize("category", ["deferred", "exempt_files"])
+@pytest.mark.parametrize("kind,row", [("import", ZERO_ROWS[0]), ("class", ZERO_ROWS[1])])
+def test_zero_floors_include_deferred_and_exempt_python(tmp_path, category, kind, row):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    rel = "aegis_cli/cli.py"
+    path = tmp_path / rel
+    path.parent.mkdir()
+    word = REQUIRED_WORDS[0]
+    statement = "import " + word + "_x\n" if kind == "import" else "class " + word.capitalize() + "X: pass\n"
+    path.write_text(statement, encoding="utf-8")
+    assert tree_counts({category: {rel: {}}}, tmp_path)[0][row] == 1
+
+
+def test_a_blank_line_in_another_file_keeps_the_tree_at_zero(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    rel = "aegis_cli/ui/table.py"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    source = (REPO / rel).read_text(encoding="utf-8")
+    path.write_text(source, encoding="utf-8")
+    assert not any(tree_counts(_data(), tmp_path)[0].values())
+    path.write_text("\n" + source, encoding="utf-8")
+    assert not any(tree_counts(_data(), tmp_path)[0].values())
+
+
+@pytest.mark.parametrize("expression", ['"{a}" + "{b}"', '("{a}" + "{b}") + ""', 'b"{a}" + b"{b}"'])
+def test_constant_additions_cannot_hide_vocabulary(tmp_path, expression):
+    word = REQUIRED_WORDS[0]
+    path = tmp_path / "sample.py"
+    path.write_text("LABEL = " + expression.format(a=word[:2], b=word[2:]) + "\n")
+    assert file_counts(path, tmp_path, (word,))[word] == 1
+
+
+@pytest.mark.parametrize("position", ["key", "value"])
+def test_json_escapes_cannot_hide_vocabulary(tmp_path, position):
+    word = REQUIRED_WORDS[0]
+    encoded = "\\u" + format(ord(word[0]), "04x") + word[1:]
+    path = tmp_path / "sample.json"
+    path.write_text('{"' + (encoded if position == "key" else "name") + '":"' + (encoded if position == "value" else "name") + '"}')
+    assert file_counts(path, tmp_path, (word,))[word] == 1
+
+
+def test_writer_can_lower_but_never_raise_or_add_a_positive_record():
+    assert lowered({"old": 2}, {"old": 1}) == {"old": 1}
+    for current in ({"old": 3}, {"old": 2, "new": 1}):
+        with pytest.raises(ValueError, match="^refusing to raise records:"):
+            lowered({"old": 2}, current)
+
+
+def test_removed_and_ignored_files_are_not_counted(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    target = tmp_path / "old.txt"
+    target.write_text(REQUIRED_WORDS[0], encoding="utf-8")
+    subprocess.run(["git", "add", "old.txt"], cwd=tmp_path, check=True)
+    target.unlink()
+    (tmp_path / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    ignored = tmp_path / "generated" / "output.txt"
+    ignored.parent.mkdir()
+    ignored.write_text(REQUIRED_WORDS[0], encoding="utf-8")
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 0
+
+
+def test_retired_type_words_are_not_normalized():
+    from aegis_core.taxonomy import legacy_rule_type
+    assert {word: legacy_rule_type(word) for word in REQUIRED_WORDS if legacy_rule_type(word)} == {}
+
+
+def test_retired_layout_is_refused_generically(tmp_path):
+    from aegis_core.errors import WorkspaceError
+    from aegis_core.workspace.base import Workspace
+    (tmp_path / ("." + REQUIRED_WORDS[0]) / (REQUIRED_WORDS[1] + "s")).mkdir(parents=True)
+    with pytest.raises(WorkspaceError, match=r"^not a valid Aegis workspace \(missing \.aegis/rules\): "):
+        Workspace.confine(tmp_path)
+
+
+def test_retired_ledger_keys_are_unusable():
+    from aegis_core.telemetry_engine import ledger
+    for key in (REQUIRED_WORDS[1], REQUIRED_WORDS[1] + "_id", REQUIRED_WORDS[1] + "s_used"):
+        value = ["trap-x"] if key.endswith("_used") else "trap-x"
+        assert ledger.normalize_rows([{key: value, "signal": "tp"}]) == ([], 1)
+
+
+def write_record():
+    data = _data()
+    check_exclusion_keys(data)
+    counts, deferred, _ = tree_counts(data)
+    data["counts"] = lowered(data["counts"], counts)
+    for rel, entry in data["deferred"].items():
+        entry["counts"] = lowered(entry["counts"], deferred.get(rel, {}))
     RECORD.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"wrote {RECORD}")
     return 0
 
 
 if __name__ == "__main__":
     if sys.argv[1:] != ["--write"]:
         sys.exit("usage: PYTHONPATH=. python3 tests/contract/test_legacy_ratchet.py --write")
-    sys.exit(write_record())
+    try:
+        sys.exit(write_record())
+    except ValueError as exc:
+        sys.exit(str(exc))
