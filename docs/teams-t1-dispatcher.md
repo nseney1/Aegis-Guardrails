@@ -424,6 +424,21 @@ exception or Hold leaves no proof. Only finalize_writer_release writes the relea
 writer publication and route receipt. Recovery may recheck stable metadata and draft owner reconciliation, but cannot create proof or release
 custody. A fresh full pass is required; absence of a recorded failure never suffices. This proof is internal, operation-local and authoritative
 dispatcher-only; it adds no public gate or durable record. Artifact budgets before open and dependency-failure propagation remain unchanged.
+DISP-LATCH-2 computes planning exclusions from immutable internal custody facts returned only by finalization, including verified mailbox
+absence and the proof-gated release decision. Presentation rows and their public release flags cannot grant release. The custody facts
+stay inside the projection; lock-exit recovery replaces already-collected facts with a conservative hold. Missing custody is conservative,
+including a delivered writer whose next disposition closed routing without releasing custody. Verified complete/blocked closure retains its
+existing release rules. Custody carries its verified lifecycle journal head. Planning consumes only facts from its final captured head;
+an advanced head clears earlier release flags and active rows report small_change_snapshot_changed (or small_change_revoked after denial).
+One invalidation policy applies to head/capture changes, verification failures and lock-exit recovery: retain only owner HOLD/blocked
+drafts and their unchanged evidence. Discard all completion drafts, including FINAL/complete, delivery and resolve/complete, and hold
+the row with the invalidation reason. A held/owned_hold presentation state alone never preserves a success draft. Existing refusal
+diagnostics survive when no completion draft was discarded. Newly routed requests without matching custody remain excluded. Rerun dispatch
+against the stable head to reconcile this conservative hold; an unrelated journal append can also cause it. The primary regression barrier is a generated real-dispatcher
+outcome table covering request state, verification evidence and mailbox-lock entry/exit failures in read and mutation modes, with runtime
+RED controls for reviewer mutations. Secondary
+structural allowlists pin release-field writers and ban finalizer rebinding, external custody replacement and collection reinitialization;
+they do not prove Python control flow, binding identity or absence of side effects.
 Writer custody releases only when target_generation still names the current acknowledged recipient binding, in addition to its historical
 existence at publication. An unacknowledged target, or a superseded target without verified original completion, holds without replay. Valid
 completion recorded before handoff may feed subsequent checks, preserving historical semantics, but cannot establish either writer release flag.
