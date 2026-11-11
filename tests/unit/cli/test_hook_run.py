@@ -445,6 +445,7 @@ def test_a_failed_event_write_never_changes_the_decision(ws, capsys, monkeypatch
     assert _run(capsys, "claude-code", claude(ws, "Bash", {"command": "git merge x"})) == (0, "", "")
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="the deadline uses SIGALRM (POSIX)")
 def test_the_deadline_fails_open(ws, capsys, monkeypatch):
     monkeypatch.setattr(pretool, "DEADLINE_SECONDS", 0.2)
@@ -455,6 +456,7 @@ def test_the_deadline_fails_open(ws, capsys, monkeypatch):
     assert _events(ws) == []
 
 
+@pytest.mark.timing
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="the deadline uses SIGALRM (POSIX)")
 def test_the_deadline_leaves_the_callers_timer_and_handler_as_they_were(ws, capsys):
     def mine(signum, frame):
