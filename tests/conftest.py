@@ -119,7 +119,17 @@ def _validate_ceiling_path(candidate, child=None):
 
 
 def pytest_configure(config):
-    """Refuse unsafe derived spellings before pytest initializes basetemp."""
+    """Refuse unsafe derived spellings before pytest initializes basetemp.
+
+    Recursive collection from an enclosing directory may not load this conftest
+    in the controller. From the checkout, use this launcher for that case::
+
+        python tests/conftest.py /outer -n 2 --basetemp /safe/run
+
+    It registers this check before pytest starts, then forwards all pytest
+    arguments and its exit code. Workers still discover fixtures normally.
+    Plain ``python -m pytest /outer`` does not provide this early check.
+    """
     candidate = config.option.basetemp
     if candidate is None:
         # _pytest/tmpdir.py: 8.3.4 lines 156-167; 9.1.1 lines 161-172.
@@ -131,6 +141,16 @@ def pytest_configure(config):
             _validate_ceiling_path(temproot, child=child)
     else:
         _validate_ceiling_path(candidate)
+
+
+class _BasetempControllerGuard:
+    pytest_configure = staticmethod(pytest_configure)
+
+
+if __name__ == "__main__":
+    # Prefer this checkout over an editable install pointing at another tree.
+    sys.path.insert(0, REPO_ROOT)
+    raise SystemExit(pytest.main(sys.argv[1:], plugins=[_BasetempControllerGuard()]))
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -20,6 +20,7 @@ from aegis_core import testexec
 from aegis_core.ast.schema import MutationPoint, NormalizedAST
 from aegis_core.primitives import key_within, real_key
 from aegis_core.storage import atomic_write_text
+from aegis_core.workspace.binding import git_discovery_ceiling, git_discovery_paths
 from . import ToolEvidence
 
 __all__ = ["check"]
@@ -371,19 +372,39 @@ class TestRunResult:
     loaded: bool = False  # the run imported the staged source for the target module
 
 
+class _TestSelectionBoundaryError(ValueError):
+    """No common root satisfies every test selection's discovery ceiling."""
+
+
+_CEILING_REFUSAL = "test selections have no shared discovery boundary; check the selections separately"
+
+
 def _resolve_test_rootdir(test_files: Sequence[str]) -> Optional[str]:
-    """Return a bounded pytest rootdir/confcutdir for *test_files*, or None if none exist on disk."""
-    dirs = [os.path.dirname(os.path.abspath(f)) for f in test_files if f and os.path.exists(f)]
+    """Return a bounded physical pytest root, or None if no selection exists.
+
+    Raise _TestSelectionBoundaryError when the selections have no permitted common root.
+    """
+    dirs = [os.path.dirname(os.path.abspath(f)) for f in test_files if f]
+    boundaries = [git_discovery_ceiling(Path(directory)) for directory in dirs]
     if not dirs:
         return None
     try:
         common = os.path.commonpath(dirs)
     except ValueError:
+        raise _TestSelectionBoundaryError from None
+    common_path = Path(common)
+    if any(boundary is not None and common_path != boundary and boundary not in common_path.parents
+           for boundary in boundaries):
+        raise _TestSelectionBoundaryError
+    if not any(f and os.path.exists(f) for f in test_files):
         return None
     temp_root = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
-    cur = common
     conftest_root: Optional[str] = None
-    while True:
+    for directory in git_discovery_paths(Path(common)):
+        if any(boundary is not None and directory != boundary and boundary not in directory.parents
+               for boundary in boundaries):
+            break
+        cur = str(directory)
         cur_norm = os.path.normcase(os.path.realpath(cur))
         base = os.path.basename(cur)
         if cur_norm == temp_root or base.startswith("pytest-of-"):
@@ -392,10 +413,6 @@ def _resolve_test_rootdir(test_files: Sequence[str]) -> Optional[str]:
             return cur
         if conftest_root is None and os.path.exists(os.path.join(cur, "conftest.py")):
             conftest_root = cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
     return conftest_root or common
 
 
@@ -432,8 +449,17 @@ def _check_tests(
             status="missing_runner",
             detail="pytest executable could not be resolved in active environment",
         )
+    # Pytest compares conftest ancestors lexically; use one physical namespace.
+    try:
+        if not all(test_files):
+            raise ValueError("empty test path")
+        test_files = [str(Path(path).resolve()) for path in test_files]
+        rootdir = _resolve_test_rootdir(test_files)
+    except _TestSelectionBoundaryError:
+        return TestRunResult(passed=False, status="error", detail=_CEILING_REFUSAL)
+    except (OSError, RuntimeError, ValueError):
+        return TestRunResult(passed=False, status="error", detail="cannot resolve test paths")
     cmd = pytest_cmd + ["-x", "-q", "--no-header", "--tb=short", "-p", "no:cacheprovider"]
-    rootdir = _resolve_test_rootdir(test_files)
     if rootdir is not None:
         cmd += [f"--rootdir={rootdir}", f"--confcutdir={rootdir}"]
     env_root = swap.workdir if swap is not None else tempfile.gettempdir()

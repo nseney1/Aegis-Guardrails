@@ -40,6 +40,45 @@ def test_refusals(layer, document, message):
         profile.resolve(**{layer: document})
 
 
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("section", ("hosts", "capacity"))
+@pytest.mark.parametrize("layer,file", (("repo", ".aegis/team/profile.json"),
+                                      ("user", "~/.config/aegis/team.json"), ("flags", "<command-line>")))
+def test_terminal_host_alias_declarations_refuse_in_every_layer(terminal, section, layer, file):
+    value = {} if section == "capacity" else {"auth_mode": "sso"} if layer == "user" else {"kind": "claude-code"}
+    with pytest.raises(profile.ProfileError, match="host alias is reserved for a fallback terminal") as refused:
+        profile.resolve(**{layer: {"model_settings": {section: {terminal: value}}}})
+    assert refused.value.exit_code == 1 and refused.value.layer == layer and refused.value.file == file
+    assert refused.value.path == "model_settings." + section + "." + terminal
+
+
+@pytest.mark.parametrize("terminal", ("hold", "skip"))
+@pytest.mark.parametrize("layer", ("repo", "user"))
+@pytest.mark.parametrize("escaped", (False, True))
+def test_terminal_host_aliases_refuse_at_load_after_json_decoding(tmp_path, terminal, layer, escaped):
+    root = make_store(tmp_path)
+    value = {"kind": "claude-code"} if layer == "repo" else {"auth_mode": "sso"}
+    text = json.dumps({"version": 1, "model_settings": {"hosts": {terminal: value}}})
+    if escaped:
+        spelling = r"\u0068old" if terminal == "hold" else r"\u0073kip"
+        text = text.replace('"' + terminal + '":', '"' + spelling + '":')
+    target = root.joinpath(*(profile.REPO_PATH if layer == "repo" else profile.USER_PATH))
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_text(text, encoding="utf-8")
+    with pytest.raises(profile.ProfileError, match="host alias is reserved for a fallback terminal") as refused:
+        profile.load(root, user_root=root)
+    assert refused.value.exit_code == 1 and refused.value.layer == layer and refused.value.file == str(target)
+    assert refused.value.path == "model_settings.hosts." + terminal
+
+
+@pytest.mark.parametrize("alias", ("Hold", "SKIP", "hold.worker", "skip.worker"))
+def test_distinct_host_aliases_keep_exact_identity(alias):
+    result = profile.resolve(repo={"model_settings": {"hosts": {alias: {"kind": "claude-code"}},
+        "capacity": {"primary": {"fallback": {"doc": [alias]}}}}})
+    route = profile.plan(result["profile"], "doc", start_host="primary")
+    assert route["entries"][1]["host"] == alias
+
+
 def test_provenance_and_frozen_flags():
     result = profile.resolve(repo={"run_config": {"limits": {"writers_max": 2}}},
                              user={"run_config": {"runners": {"local": {"image": "test-image"}}}},
@@ -128,6 +167,48 @@ def test_fallback_must_be_declared_and_respect_pinned_family():
     with pytest.raises(profile.ProfileError, match="pinned"):
         profile.resolve(preset="mixed", repo={"model_settings": {
             "capacity": {"primary": {"fallback": {"review": ["review"]}}}}})
+
+
+@pytest.mark.parametrize("name", (
+    "CAPACITY_DEFAULTS", "CAPACITY_KINDS", "JSON_SCHEMA", "MAX_BYTES", "MAX_DEPTH", "MAX_ITEMS",
+    "MAX_NODES", "MAX_STRING", "MAX_HOSTS", "MAX_FALLBACK_CHAIN", "MAX_LENSES", "MAX_FALLBACK_EDGES",
+    "PRESET_DATA", "PROFILE_SCHEMA", "REPO_PATH", "USER_PATH", "USER_JSON_SCHEMA", "ProfileError",
+    "capacity_thresholds", "descriptor_supported", "doctor", "plan", "governance_status", "initialize",
+    "load", "resolve", "validate_resolved", "display_profile", "NEXT_ACTION_TEMPLATES",
+))
+def test_shared_display_extraction_preserves_profile_exports(name):
+    assert name in profile.__all__
+    assert getattr(profile, name) is not None
+
+
+def test_shared_display_defaults_preserve_mcp_redaction(tmp_path, monkeypatch):
+    from aegis_cli import team
+    from aegis_mcp.tools import execute_tool
+
+    declared, ignored = "ghp_" + "A" * 20, "ghp_" + "B" * 20
+    resolved = profile.resolve(repo={"model_settings": {
+        "hosts": {declared: {"kind": "claude-code"}},
+        "capacity": {"primary": {"fallback": {"writer": [declared]}}}}},
+        user={"model_settings": {"capacity": {"codex-cli": {"fallback": {"writer": [ignored]}}}},
+              "run_config": {"runners": {"local": {"credentials": "private-credential"}}}})
+    monkeypatch.setattr(profile, "load", lambda root: resolved)
+    assert team.display_profile is profile.display_profile
+    assert "display_profile" in profile.__all__
+    payload = execute_tool("aegis_team_config", {"workspace": str(tmp_path)})
+    assert payload["status"] == "done"
+    assert declared not in payload["profile"]["model_settings"]["capacity"]["primary"]["fallback"]["writer"]
+    record = "user.model_settings.capacity.codex-cli.fallback.writer"
+    assert ignored not in payload["values"][record]["value"]
+    assert "private-credential" not in json.dumps(payload)
+
+
+def test_shared_display_capacity_formatting_is_explicit():
+    host = "ghp_" + "A" * 20
+    value = {"host": host, "next_action": "unused", "next_action_parts": [
+        "Start the job on ", {"identifier": host}, "; capacity advice grants no execution authority."]}
+    rendered = profile.display_profile(value, capacity=True)
+    assert rendered["host"] == host and host in rendered["next_action"]
+    assert host not in profile.display_profile(value)["host"]
 
 
 def test_redaction_after_canonicalization_before_truncation():
@@ -246,6 +327,61 @@ def test_limits_before_json_parse(tmp_path, monkeypatch, content, message):
     monkeypatch.setattr(profile, "json", SimpleNamespace(loads=forbidden))
     with pytest.raises(profile.ProfileError, match=message):
         profile.load(root, user_root=root)
+
+
+@pytest.mark.parametrize("limit,path", [
+    ("hosts", "model_settings.hosts"), ("chain", "model_settings.capacity.h00.fallback.review"),
+    ("lenses", "policy.review.lenses"), ("extra-lens", "policy.review.lenses"),
+    ("edges", "model_settings.capacity"), ("reviewer-profile", "model_settings.hosts"),
+])
+def test_routing_limits_refuse_at_load_before_traversal(tmp_path, monkeypatch, limit, path):
+    root = make_store(tmp_path)
+    settings = {"hosts": {f"h{i:02d}": {"kind": "codex-cli"} for i in range(16)}}
+    document = {"version": 1, "preset": "ci-only", "model_settings": settings}
+    if limit == "reviewer-profile":
+        names = [f"h{i:02d}" for i in range(64)]
+        settings["hosts"] = {name: {"kind": "codex-cli"} for name in names}
+        settings["roles"] = {kind: {"hosts": names[:1]} for kind in ("writer", "reviewer.correctness")}
+        settings["capacity"] = {name: {"fallback": {"review": [names[(i + offset) % 64]
+                                for offset in range(1, 41)]}} for i, name in enumerate(names)}
+        document["policy"] = {"review": {"require_cross_family": False, "lenses": [
+            {"name": f"audit{i:02d}", "host_pref": names[:1], "voting": True} for i in range(64)]}}
+    elif limit == "hosts":
+        settings["hosts"]["overflow"] = {"kind": "codex-cli"}
+    elif limit == "chain":
+        settings["capacity"] = {"h00": {"fallback": {"review": ["h00"] * 9}}}
+    elif limit == "edges":
+        settings["capacity"] = {"h00": {"fallback": {kind: ["h00"] * 8 for kind in profile.CAPACITY_KINDS}},
+                                "h01": {"fallback": {"writer": ["h00"]}}}
+    else:
+        document["policy"] = {"review": {"lenses": [
+            {"name": f"audit{i:02d}", "host_pref": ["h00"]} for i in range(17 if limit == "lenses" else 16)]}}
+        if limit == "extra-lens":
+            settings["roles"] = {"lens.extra": {"hosts": ["h00"], "optional": True}}
+    target = root.joinpath(*profile.REPO_PATH)
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(document), encoding="utf-8")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("traversal started before refusing an oversized routing graph")
+
+    monkeypatch.setattr(profile, "plan", forbidden)
+    with pytest.raises(profile.ProfileError, match="limit exceeded") as refused:
+        profile.load(root, user_root=root)
+    assert refused.value.exit_code == 1 and refused.value.layer == "repo"
+    assert refused.value.file == str(target) and refused.value.path == path
+
+
+def test_routing_host_limit_includes_preset_aliases(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("traversal started before counting the preset host")
+
+    monkeypatch.setattr(profile, "plan", forbidden)
+    with pytest.raises(profile.ProfileError, match="profile host limit exceeded") as refused:
+        profile.resolve(repo={"model_settings": {"hosts": {
+            f"h{i:02d}": {"kind": "codex-cli"} for i in range(16)}}})
+    assert refused.value.exit_code == 1 and refused.value.layer == "repo"
+    assert refused.value.file == "/".join(profile.REPO_PATH) and refused.value.path == "model_settings.hosts"
 
 
 @pytest.mark.parametrize("parts,component", [
@@ -824,7 +960,7 @@ def test_counterfactual_attribution_includes_user_parse_failures(tmp_path, repo_
 @pytest.mark.parametrize("repo,flags,message", [
     ({"model_settings": {"hosts": {"alternate": {"kind": "claude-code"}},
                          "roles": {"writer": {"hosts": ["primary", "alternate"]}}}},
-     {"model_settings": {"roles": {"writer": {"pinned_family": True}}}}, "pinned role chain changes family"),
+     {"model_settings": {"roles": {"writer": {"pinned_family": True}}}}, "optional/pinned-family settings are repository-only; use the approval-before-merge path"),
     ({"preset": "ci-only"}, {"model_settings": {"roles": {"writer": {"model": "m"}}}}, "incomplete role: declared hosts required"),
     ({}, {"model_settings": {"roles": {"lens.extra": {"model": "m"}}}}, "incomplete role: declared hosts required"),
     ({}, {"model_settings": {"roles": {"lens.extra": {}}}}, "incomplete role: declared hosts required"),

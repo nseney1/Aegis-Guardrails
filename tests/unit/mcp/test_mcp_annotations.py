@@ -20,7 +20,7 @@ from aegis_mcp.server import handle_request
 _HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule",
-        "aegis_msg_read": "Read Message"}
+        "aegis_msg_read": "Read Message", "aegis_team_config": "Team Config"}
 WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight",
          "aegis_msg_write": "Write Message"}
 
@@ -101,6 +101,9 @@ def test_read_only_tools_are_never_destructive(tools):
 
 def test_every_input_schema_property_has_a_short_description(tools):
     for name, tool in tools.items():
+        if name == "aegis_team_config":
+            assert tool["inputSchema"] == {"type": "object", "properties": {}, "additionalProperties": False}
+            continue
         props = tool.get("inputSchema", {}).get("properties", {})
         assert props, f"{name}: empty inputSchema properties"
         for prop_name, prop_schema in props.items():
@@ -193,22 +196,24 @@ SIBLINGS = {
     "aegis_capture_insight": ("aegis_report_outcome",),
     "aegis_msg_read": ("aegis_msg_write",),
     "aegis_msg_write": ("aegis_msg_read",),
+    "aegis_team_config": (),
 }
 
 
 def _description_errors(tools: Dict[str, dict]) -> List[str]:
-    """One line per tool whose description is not 2 to 4 sentences or omits a sibling tool."""
+    """Config has one short sentence; other tools have 2 to 4 and name their siblings."""
     errors = []
     for name in sorted(tools):
         text = tools[name]["description"]
         sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-        if not 2 <= len(sentences) <= 4:
+        minimum, maximum = (1, 1) if name == "aegis_team_config" else (2, 4)
+        if not minimum <= len(sentences) <= maximum:
             errors.append(f"{name}: {len(sentences)} sentences")
         errors += [f"{name}: names no {sibling}" for sibling in SIBLINGS.get(name, ()) if sibling not in text]
     return errors
 
 
-def test_every_description_is_two_to_four_sentences_naming_its_siblings(tools):
+def test_every_description_has_its_admitted_sentence_count_and_names_its_siblings(tools):
     assert set(SIBLINGS) == set(tools)
     assert _description_errors(tools) == []
 
@@ -223,9 +228,9 @@ def test_the_report_description_states_the_limits_the_code_enforces(tools):
 def test_tools_list_fits_the_handshake_budget(tools):
     # MC-3: codec ADR D2 puts trust notices and grammar in the cached prefix.
     # Round 2 requires kind fields too: their compact lists exceed 8,500;
-    # the ruling admits the measured total with a hard ceiling of 9,000.
-    budget = 8_880  # Measured with json.dumps(list(tools.values())).
-    assert budget <= 9_000
+    # TP-1b adds an eighth tool (coordinator ruling 2026-11-11T07:33Z)
+    budget = 9_214  # Measured with json.dumps(list(tools.values())).
+    assert budget <= 9_500
     assert len(json.dumps(list(tools.values()))) <= budget
 
 
@@ -233,7 +238,8 @@ def test_tools_list_fits_the_handshake_budget(tools):
     ("aegis_list_rules", "One. Two. Three. Four. Five; see aegis_scan.", "aegis_list_rules: 5 sentences"),
     ("aegis_create_rule", "Drafts a rule. It writes nothing.", "aegis_create_rule: names no aegis_list_rules"),
     ("aegis_scan", "Call aegis_report_outcome and aegis_list_rules.", "aegis_scan: 1 sentences"),
-], ids=["five-sentences", "no-sibling", "one-sentence"])
+    ("aegis_team_config", "Read config. Return provenance.", "aegis_team_config: 2 sentences"),
+], ids=["five-sentences", "no-sibling", "one-sentence", "config-two-sentences"])
 def test_the_description_guard_names_the_tool(tools, name, description, error):
     broken = copy.deepcopy(tools)
     broken[name]["description"] = description

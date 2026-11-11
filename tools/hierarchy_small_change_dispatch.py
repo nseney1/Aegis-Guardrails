@@ -597,7 +597,7 @@ class _CapturedStore:
             try:
                 event = self.operation.json(path, private=False)
                 fields(event, {"schema", "seq", "at", "kind", "data"})
-                require(event["schema"] == workspace.EVENT_SCHEMA and event["seq"] == count, "wrong event schema or sequence")
+                require(event["schema"] in workspace.REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
                 parse_time(event["at"])
                 declared = event["data"]
                 guarded = event
@@ -1640,12 +1640,14 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
             mailbox_root, reason = router.team_mailbox(ledger, row["request"]["team"])
             if reason is None:
                 current = None
+                appended = False
                 try:
                     with writer_lock(checked_path(mailbox_root)):
                         current = context()
                         actual, refusal = router.team_mailbox(current.ledger, row["request"]["team"])
                         check(refusal is None and actual == mailbox_root, "small_change_configuration", "team mailbox changed before lock")
                         rows.append(current.run(True))
+                        appended = True
                     continue
                 except (ValueError, OSError) as exc:
                     if current is None:
@@ -1653,7 +1655,8 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
                                       fresh._Operation(reference_cache=reference_cache))
                     current.clear_writer_release()
                     current.view.update(state="held", reason="small_change_configuration", detail=str(exc))
-                    rows.append(current.view)
+                    if not appended:
+                        rows.append(current.view)
                     continue
         rows.append(context().run(False))
     final = fresh._Operation(reference_cache=reference_cache)

@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -271,6 +271,18 @@ Check profile completeness and host CLIs on PATH
 Delete expired leases
 
 Delete every expired lease by compare-and-swap; unreadable leases are kept.
+
+### `aegis team hosts`
+
+Read host capacity and per-host usage
+
+Read capacity advice: status \| usage \| check HOST KIND. KIND: writer, review, extra-review, doc, research, a declared role or lens. check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. Real usage readers are adapter extension points; credentials are never read.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `hosts_action` | `[VERB]` |  | status, check or usage |
+| `host` | `[HOST]` |  | Declared host alias (see status --json) |
+| `kind` | `[KIND]` |  | Job kind or declared role/lens |
 
 ### `aegis team list`
 
@@ -717,6 +729,7 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 
 | Tool | Title |
 | --- | --- |
+| `aegis_team_config` | Team Config |
 | `aegis_scan` | Scan JIT Rules |
 | `aegis_report_outcome` | Report Outcome |
 | `aegis_create_rule` | Create Rule |
@@ -724,6 +737,24 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 | `aegis_capture_insight` | Capture Insight |
 | `aegis_msg_read` | Read Message |
 | `aegis_msg_write` | Write Message |
+
+### `aegis_team_config`
+
+**Team Config** (read-only, idempotent)
+
+Read the resolved team profile with per-value layer provenance.
+
+It takes no parameters.
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
+```
 
 ### `aegis_scan`
 
