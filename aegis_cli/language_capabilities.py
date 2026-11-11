@@ -80,9 +80,13 @@ def capability_data(root: Path, languages=None):
         if language == 'python':
             from aegis_core.testexec import pytest_args, user_test_command
 
-            command = user_test_command(root)
-            if command and pytest_args(command) is None:
-                coverage = 'unavailable (tests.command is not pytest-based)'
+            try:
+                command = user_test_command(root)
+            except ValueError:
+                coverage = 'unavailable (invalid tests.command)'
+            else:
+                if command and pytest_args(command) is None:
+                    coverage = 'unavailable (tests.command is not pytest-based)'
         capabilities.append({
             'language': language, 'parser': _parser_label(root, language),
             'security_rules': len(SECURITY_RULES_BY_LANGUAGE[language]),
