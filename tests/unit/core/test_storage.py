@@ -381,10 +381,10 @@ def test_jsonl_reports_the_descriptor_identity_and_end_offset(tmp_path, monkeypa
 
     monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fsync=fsync)))
     row = {"note": "café", "padding": "x" * 512}
-    written = append_jsonl(path, [row])
+    written = storage.append_jsonl_with_report(path, [row])
     data = path.read_bytes()
 
-    assert isinstance(written, int) and written == 1
+    assert written.count == 1 and not isinstance(written, int)
     assert written.report.identity == written_through[0][0]
     assert written.report.size == written_through[0][1] == len(data)
     assert written.report.added == len(data) - len(prefix or b"")
@@ -417,7 +417,7 @@ def test_jsonl_reports_generation_without_process_clock_or_extra_append_reads(tm
     # Replace only storage's reference, leaving pytest's own OS operations alone.
     monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), read=read)))
     monkeypatch.setattr(storage, "_open_regular", open_file)
-    written = append_jsonl(path, [{"rule": "a"}])
+    written = storage.append_jsonl_with_report(path, [{"rule": "a"}])
     after = path.stat()
     assert reads == [1]
     assert written.report.size == after.st_size
@@ -907,3 +907,61 @@ def test_create_private_file_removes_a_partial_file_when_the_write_fails(tmp_pat
     with pytest.raises(OSError, match="No space"):
         storage.create_private_file(tmp_path / "link.key", b"k" * 32)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_append_jsonl_evidence_is_opt_in(tmp_path, monkeypatch, reported):
+    path = tmp_path / "rows.jsonl"
+    calls, real_report = [], storage.file_report
+
+    def report(*args, **kwargs):
+        calls.append(True)
+        return real_report(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "file_report", report)
+    append = storage.append_jsonl_with_report if reported else storage.append_jsonl
+    result = append(path, [{"a": 1}])
+    assert calls == ([True] if reported else [])
+    assert read_jsonl(path).rows == [{"a": 1}]
+    if reported:
+        assert result.count == 1 and result.report.size == path.stat().st_size
+    else:
+        assert type(result) is int and result == 1
+
+
+def test_append_jsonl_explicit_empty_result_creates_nothing(tmp_path):
+    path = tmp_path / "absent" / "rows.jsonl"
+    result = storage.append_jsonl_with_report(path, [])
+    assert result.count == 0 and result.report is None
+    assert not path.parent.exists()
+
+
+def test_append_jsonl_missing_optional_evidence_still_succeeds(tmp_path, monkeypatch):
+    path = tmp_path / "rows.jsonl"
+    real_fstat, calls = os.fstat, []
+
+    def fstat(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError("injected evidence failure")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(storage, "os", SimpleNamespace(**dict(vars(os), fstat=fstat)))
+    result = storage.append_jsonl_with_report(path, [{"a": 1}])
+    assert result.count == 1 and result.report is None
+    assert read_jsonl(path).rows == [{"a": 1}]
+    with pytest.raises(OSError) as error:
+        real_fstat(calls[0])
+    assert error.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("bad, error, message", [
+    ([{"bad": object()}], TypeError, "Object of type object is not JSON serializable"),
+    ([["not an object"]], ValueError, "a JSONL row must be a JSON object, got list"),
+])
+def test_append_jsonl_explicit_result_serializes_before_writing(tmp_path, bad, error, message):
+    path = tmp_path / "rows.jsonl"
+    path.write_bytes(b'{"a":1}\n')
+    with pytest.raises(error, match="^" + message + "$"):
+        storage.append_jsonl_with_report(path, bad)
+    assert path.read_bytes() == b'{"a":1}\n'

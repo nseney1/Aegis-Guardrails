@@ -23,6 +23,9 @@ from aegis_core.verification.language_tests import GoTest, LanguageTestPlan, pre
 from aegis_core.verification.test_outcomes import RustTarget, TestId
 
 
+_GO_METADATA_WHITESPACE = re.compile(r"\s*")
+
+
 def test_language(path: str) -> str | None:
     """Recognize supported tests; Rust source candidates need Cargo ownership before selection."""
     path = path.replace("\\", "/")
@@ -94,9 +97,9 @@ def _go(workspace, snapshot, files, runtime, scratch, deadline):
                     workspace, snapshot, scratch, deadline)
     rows, decoder, offset = [], json.JSONDecoder(), 0
     while offset < len(raw):
-        if not raw[offset:].strip():
+        offset = _GO_METADATA_WHITESPACE.match(raw, offset).end()
+        if offset == len(raw):
             break
-        offset += len(raw[offset:]) - len(raw[offset:].lstrip())
         row, end = decoder.raw_decode(raw, offset)
         if (not isinstance(row, dict) or not _metadata_strings([row.get("Dir"), row.get("ImportPath")])
                 or not all(_metadata_strings(row.get(key, [])) for key in ("TestGoFiles", "XTestGoFiles"))):

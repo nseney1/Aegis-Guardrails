@@ -1,16 +1,20 @@
-"""L0 shared-state implementations with storage's injected live namespace.
+"""L0 storage I/O results and shared-state implementations.
 
-Every implementation receives ``deps`` from storage at call time. Collaborators,
+Every shared-state implementation receives ``deps`` from storage at call time. Collaborators,
 including calls between helpers, are resolved through that namespace; this module
 never imports storage. Patch aegis_core.storage.<name> to affect the moved code.
 Explicit callbacks expose private helper wiring to the call-graph checker.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, NamedTuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 __all__ = [
+    "AppendResult",
+    "FileReport",
+    "RowsResult",
     "SHARED_DIR_MODE",
     "StateModes",
     "confined",
@@ -155,3 +159,30 @@ def shared_lock_name(deps: Any, name: object) -> str:
         raise ValueError(f"a shared lock is one file name ending in .lock, got {name!r}")
     return name  # type: ignore[return-value]
 
+
+@dataclass(frozen=True)
+class FileReport:
+    """Descriptor identity, size and generation; optional filesystem read-start evidence."""
+
+    identity: Tuple[int, int]
+    size: int
+    added: int = 0
+    mtime_ns: int = 0
+    ctime_ns: int = 0
+    started_ns: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class AppendResult:
+    """An appended-row count and optional evidence from its write descriptor."""
+
+    count: int
+    report: Optional[FileReport] = None
+
+
+@dataclass(frozen=True)
+class RowsResult:
+    """Rows and optional evidence from the descriptor that read or wrote them."""
+
+    rows: List[Dict[str, Any]]
+    report: Optional[FileReport] = None

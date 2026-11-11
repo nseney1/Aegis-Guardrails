@@ -509,8 +509,7 @@ def check_assertion_density(root: Path) -> list[dict]:
     Judged per function by AST (#1): text such as "assert " in a comment, a
     docstring or a neighbouring test no longer passes a file.
     """
-    from aegis_core.verification.quality_gate import check_assertion_density as density
-    from aegis_core.verification.quality_gate import check_no_bare_pass as bare_pass
+    from aegis_core.verification.quality_gate import check_test_quality
 
     issues = []  # type: List[dict]
     try:
@@ -524,7 +523,7 @@ def check_assertion_density(root: Path) -> list[dict]:
         if not _is_regular_file("assertion_density", root, test_file, issues):
             continue
         try:
-            found = [density(str(test_file)), bare_pass(str(test_file))]
+            found = check_test_quality(str(test_file))
         except (OSError, SyntaxError, UnicodeError, ValueError) as exc:
             issues.append(_failure("assertion_density", root, test_file, "parse", exc))
             continue
