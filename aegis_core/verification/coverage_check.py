@@ -136,7 +136,10 @@ def _result(status: str, reason: str, covered: int = 0, total: int = 0, ranges: 
 
 def _python_coverage(root: Path, changed: dict[str, set[int]]) -> dict[str, Any]:
     """Measure the changed lines of ``base..head`` (see the module docstring)."""
-    command = testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND)
+    try:
+        command = testexec.user_test_command(root) or list(testexec.DEFAULT_COMMAND)
+    except ValueError:
+        return _result("unverified", "invalid tests.command")
     args = testexec.pytest_args(command)
     if args is None:
         return _result("unverified", "tests.command is not pytest-based")

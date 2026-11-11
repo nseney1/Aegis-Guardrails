@@ -1712,10 +1712,10 @@ def test_r18_shadow_oracle_error_keeps_prior_hash_observation(mailbox, monkeypat
 def test_r19_thousand_malformed_alternations_are_bounded(mailbox, monkeypatch, record_property, ceiling):
     module = index_module()
     if ceiling == "entries":
-        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1, raising=False)
+        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
     elif ceiling == "bytes":
         monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
-                            getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
+                            module.EVIDENCE_SUMMARY_BYTES)
     mailbox.publish(request("second"))
     index = module.MailboxIndex(mailbox, mode="indexed")
     seed = index.messages()["seed"]
@@ -1864,12 +1864,12 @@ def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, monkeypatch, 
 def test_r19_global_overflow_has_bounded_paths_hashes_and_counters(mailbox, monkeypatch, ceiling):
     module = index_module()
     if ceiling == "entries":
-        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1, raising=False)
+        monkeypatch.setattr(module, "MAX_EVIDENCE_ENTRIES", 1)
     else:
         monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
-                            getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
-    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 2, raising=False)
-    monkeypatch.setattr(module, "MAX_EVIDENCE_COUNT", 3, raising=False)
+                            module.EVIDENCE_SUMMARY_BYTES)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATHS", 2)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_COUNT", 3)
     for number in range(5):
         mailbox.publish(request("other-%d" % number))
     index = module.MailboxIndex(mailbox, mode="indexed")
@@ -1921,8 +1921,8 @@ def test_r19_shadow_verify_retry_coalesces_latest_hash(mailbox, monkeypatch):
 def test_r19_summary_path_is_byte_bounded_and_identifiable(mailbox, monkeypatch, name):
     module = index_module()
     monkeypatch.setattr(module, "MAX_EVIDENCE_BYTES",
-                        getattr(module, "EVIDENCE_SUMMARY_BYTES", 32768), raising=False)
-    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATH_BYTES", 24, raising=False)
+                        module.EVIDENCE_SUMMARY_BYTES)
+    monkeypatch.setattr(module, "MAX_EVIDENCE_SAMPLE_PATH_BYTES", 24)
     source = Path(mailbox.messages()["seed"]["path"])
     source = source.rename(source.with_name(name))
     index = module.MailboxIndex(mailbox, mode="indexed")

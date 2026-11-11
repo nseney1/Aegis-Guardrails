@@ -367,6 +367,7 @@ def test_patches_record_file_change_items_and_write_only_where_the_sandbox_allow
     assert not outside.exists() and not mismatch.exists() and not (fake.work / "skipped").exists()
 
 
+@pytest.mark.timing
 def test_turn_keys_delay_the_context_change_the_recorded_sandbox_and_drop_the_completion(fake):
     fake.write_script({"commands": [], "context_delay": 0.3, "record_sandbox": "read-only", "incomplete": True})
     started = time.monotonic()

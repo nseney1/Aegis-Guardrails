@@ -329,6 +329,7 @@ def test_a_launch_whose_start_cannot_be_recorded_stops_the_session_it_started(ba
     assert result["state"] == "failed_to_start" and result["background"]["stop_confirmed"] is True
 
 
+@pytest.mark.timing
 def test_a_failed_launch_whose_leftover_cannot_be_stopped_keeps_the_lock(background):
     background.pilot.publish()
     (background.state / "hide-after-launch").write_text("")
@@ -426,6 +427,7 @@ def test_a_row_in_the_real_host_shape_drives_the_idle_stop_and_the_owner_wait(ba
         assert result["background"]["id"] == session[:8] and result["background"]["ended"] == "idle"
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("stop_clock_scale", [1, 8], ids=["real-stop-deadline", "scaled-stop-deadline"])
 def test_an_unconfirmed_stop_keeps_the_wake_lock(background, stop_clock_scale):
     background.pilot.publish()
@@ -495,6 +497,7 @@ def test_a_session_that_really_ends_is_reported_exited_after_repeated_absence(ba
     assert len(looks) >= 4, "one missing look is not an end"
 
 
+@pytest.mark.timing
 def test_one_missing_look_after_stop_does_not_confirm_the_stop(background):
     background.pilot.publish()
     (background.state / "ignore-stop").write_text("")
