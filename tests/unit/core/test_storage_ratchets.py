@@ -248,11 +248,6 @@ REVIEWED_DESCRIPTOR_OPERATIONS = {
     ("aegis_core/model_select.py", "_publish", "os.rename"): (1, "publish the decision log within the same bound directory"),
     ("aegis_core/rule_inventory.py", "_read_stable_file", "os.open"): (1, "read-only stable rule snapshot"),
     ("aegis_core/team.py", "load_team", "os.open"): (1, "read-only team metadata inspection"),
-    ("aegis_core/team_profile.py", "_directory", "os.open"): (2, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "_read_at", "os.open"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.open"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.replace"): (1, "feature-owned until STORE-API-1"),
-    ("aegis_core/team_profile.py", "initialize", "os.link"): (1, "feature-owned until STORE-API-1"),
     ("aegis_core/testexec.py", "_inspect_junit", "os.open"): (1, "read-only bounded test report inspection"),
     ("aegis_core/verification/runner.py", "_identical_work_file", "os.open"): (1, "read-only working file comparison"),
     ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): (1, "read-only SARIF root directory descriptor"),
@@ -1104,7 +1099,7 @@ def test_state_and_rule_writes_go_through_storage():
         capability_sites.extend(visitor.references)
         scopes.update({(rel, name[len(visitor.module) + 1:]): line for name, line in visitor.definitions.items()})
         forwarding.update({name: (rel, line) for name, line in visitor.forwarding.items()})
-        if rel == "aegis_core/storage.py":
+        if rel in {"aegis_core/storage.py", "aegis_core/storage_confined.py"}:
             continue
         for scope, lineno, what in visitor.found:
             if _reviewed_operation(what):
