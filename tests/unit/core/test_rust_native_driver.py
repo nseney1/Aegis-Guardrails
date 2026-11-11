@@ -5,7 +5,7 @@ import pytest
 
 from aegis_core.ast.driver_errors import ASTDriverError
 from aegis_core.ast.drivers.rust import CAPABILITIES, parse
-from aegis_core.ast.schema import NormalizedAST
+from aegis_core.ast.schema import DefinitionNode, NormalizedAST
 
 
 def calls(source):
@@ -109,6 +109,63 @@ static FLAG: bool = true;
     assert tree.metadata['decorators'] == ['allow', 'inline', 'cfg', 'test']
     assert not any(c.target in ('allow', 'cfg', 'inline') for c in tree.call_sites)
     assert 'shadowed' not in CAPABILITIES
+
+
+@pytest.mark.parametrize('count', [100, 200, 400])
+def test_distinct_attribute_membership_work_is_linear(monkeypatch, count):
+    from aegis_core.ast.drivers.rust import extractor
+
+    work = 0
+
+    class CountedDecorators(list):
+        def __contains__(self, name):
+            nonlocal work
+            for existing in self:
+                work += 1
+                if existing == name:
+                    return True
+            return False
+
+    class CountedExtractor(extractor.Extractor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.decorators = CountedDecorators(self.decorators)
+
+    # Count list-entry inspections locally while exercising the public parser.
+    monkeypatch.setattr(extractor, 'Extractor', CountedExtractor)
+    names = ['attr%d' % index for index in reversed(range(count))]
+    attributes = names + names[::-1] + names[:1]
+    source = ''.join('#[%s]\n' % name for name in attributes) + 'fn run() {}'
+    expected = NormalizedAST('src/lib.rs', 'rust', definitions=[
+        DefinitionNode('run', 'function', len(attributes) + 1, decorators=tuple(attributes)),
+    ], metadata={
+        'capabilities': list(CAPABILITIES),
+        'allow_comments': {},
+        'decorators': names,
+        'test_module': False,
+        'test_functions': [],
+    })
+    assert parse(source, 'src/lib.rs').to_json() == expected.to_json()
+    assert work <= 4 * len(attributes)
+
+
+def test_repeated_attributes_keep_first_seen_order_and_definition_occurrences():
+    source = '''#![allow(dead_code)]
+#[ns::checked] #[inline] #[ns::checked] fn first() {}
+mod nested { #[inline] #[allow(unused)] fn second() {} }
+#[ns::checked] fn third() {}
+'''
+    tree = parse(source, 'src/lib.rs')
+    assert tree.metadata['decorators'] == ['allow', 'ns::checked', 'inline']
+    assert [(d.name, d.decorators) for d in tree.definitions] == [
+        ('first', ('ns::checked', 'inline', 'ns::checked')),
+        ('nested', ()),
+        ('second', ('inline', 'allow')),
+        ('third', ('ns::checked',)),
+    ]
+    # A later parse has its own index, including names seen in earlier sources.
+    assert parse('#[inline] fn other() {}', 'src/lib.rs').metadata['decorators'] == ['inline']
+    assert parse('fn plain() {}', 'src/lib.rs').metadata['decorators'] == []
 
 
 @pytest.mark.parametrize('module,inline', [
