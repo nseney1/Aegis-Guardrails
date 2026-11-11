@@ -425,9 +425,15 @@ def _index_report(box, store):
     def bound(name):
         return MethodType(_clone(getattr(type(index), name), namespace), index)
     index._read_message = bound("_read_message")
+    index._read_raw = bound("_read_raw")
     index._parse_message = bound("_parse_message")
     index._open_checked = bound("_open_checked")
     index._admit_returned = bound("_admit_returned")
+    index._list_folders = bound("_list_folders")
+    index._list_folder = bound("_list_folder")
+    index._observe_entry = bound("_observe_entry")
+    index._validate_entry = bound("_validate_entry")
+    index._confirm_entry = bound("_confirm_entry")
     index._scan = bound("_scan")
     differences = index_module.compare(box, index)
     if failures:
