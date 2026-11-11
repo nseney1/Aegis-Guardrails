@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import stat
-from time import time_ns
 from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 
 from aegis_core import atomicio, storage
 from aegis_core.errors import PathTraversalError
 
-__all__ = ["before_read", "contains", "reconcile", "remember", "reset", "root_key"]
+__all__ = ["before_read", "contains", "reconcile", "remember", "reset", "root_key", "settled",
+           "filesystem_clock_supported", "filesystem_now"]
 
 _Key = Tuple[str, str, str, str, Optional[str]]
 _Ancestors = Tuple[Tuple[Path, Tuple[int, int]], ...]
@@ -21,7 +21,37 @@ _MAX_PERSISTED = 50_000
 _RACY_WINDOW_NS = 2_000_000_000
 
 
-def _settled(evidence: storage.FileReport) -> bool:
+def filesystem_clock_supported() -> bool:
+    return (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+            and "open" in {fn.__name__ for fn in os.supports_dir_fd}
+            and "utime" in {fn.__name__ for fn in os.supports_fd})
+
+
+def filesystem_now(path: Path, device: int) -> Optional[int]:
+    """Sample the held lock's filesystem clock; unavailable evidence means a miss."""
+    if not path.is_absolute() or not filesystem_clock_supported():
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        with ExitStack() as owned:
+            parent = os.open(path.anchor, flags | os.O_DIRECTORY)
+            owned.callback(os.close, parent)
+            for component in path.parts[1:-1]:
+                parent = os.open(component, flags | os.O_DIRECTORY, dir_fd=parent)
+                owned.callback(os.close, parent)
+            fd = os.open(path.name, flags | getattr(os, "O_NONBLOCK", 0), dir_fd=parent)
+            owned.callback(os.close, fd)
+            info = os.fstat(fd)
+            if info.st_dev != device or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return None
+            # Assumes filesystem-clock utime(fd, None): local/NFS; sshfs/Linux CIFS send client time.
+            os.utime(fd, None)
+            return os.fstat(fd).st_mtime_ns
+    except (OSError, NotImplementedError):
+        return None
+
+
+def settled(evidence: storage.FileReport) -> bool:
     """Racy I/O evidence cannot become eligible by aging before a later fill."""
     _, mtime_ns, ctime_ns = storage.file_generation(evidence.size, evidence.mtime_ns, evidence.ctime_ns)
     return (evidence.started_ns is not None
@@ -48,6 +78,7 @@ class _ReadGeneration:
     ancestors: Optional[_Ancestors]
     mtime_ns: int = 0
     ctime_ns: int = 0
+    started_ns: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +139,12 @@ def _forget(root: str) -> None:
     _PERSISTED_IDENTITY.pop(root, None)
 
 
+def _anchored_snapshot_supported() -> bool:
+    return (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+            and {"open", "stat"} <= {f.__name__ for f in os.supports_dir_fd}
+            and "stat" in {f.__name__ for f in os.supports_follow_symlinks})
+
+
 def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_PersistedLedger]:
     """Optional stat evidence from one anchored regular-file descriptor, without reads.
 
@@ -116,10 +153,7 @@ def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_P
     """
     if not path.is_absolute():
         return None
-    captured_ns = time_ns()
-    anchored = (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
-                and {"open", "stat"} <= {f.__name__ for f in os.supports_dir_fd}
-                and "stat" in {f.__name__ for f in os.supports_follow_symlinks})
+    anchored = _anchored_snapshot_supported()
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     try:
         with ExitStack() as opened:
@@ -145,8 +179,7 @@ def _snapshot(path: Path, ancestors: Optional[_Ancestors] = None) -> Optional[_P
                 return None
             if not anchored and not _same_ancestors(ancestors):
                 return None
-            if (not stat.S_ISREG(info.st_mode) or info.st_size <= 0
-                    or captured_ns - info.st_mtime_ns <= _RACY_WINDOW_NS):
+            if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
                 return None
             # Descriptors pin every ancestor. Reject a rename or link substitution
             # as well, so a detached old ledger cannot validate the current site.
@@ -199,7 +232,8 @@ def before_read(root: str, site: storage.LedgerSite) -> Optional[_ReadGeneration
                                    or stamps
                                    != (cached.size, cached.mtime_ns, cached.ctime_ns)):
             _forget(root)
-        return _ReadGeneration((current.st_dev, current.st_ino), stamps[0], ancestors, *stamps[1:])
+        return _ReadGeneration((current.st_dev, current.st_ino), stamps[0], ancestors, *stamps[1:],
+                               filesystem_now(site.lock, current.st_dev))
 
 
 def reconcile(root: str, seen: Set[Tuple[str, str, Optional[str]]]) -> None:
@@ -216,8 +250,8 @@ def remember(root: str, keys: Sequence[_Key], path: Path, before: Optional[_Read
     if len(_PERSISTED) + len(keys) > _MAX_PERSISTED:
         reset()
     if len(keys) <= _MAX_PERSISTED:
-        evidence = read
-        if (before is None or evidence is None or not _settled(evidence)
+        evidence = replace(read, started_ns=before.started_ns) if before is not None and read is not None else None
+        if (before is None or evidence is None or not settled(evidence)
                 or evidence.identity != before.identity):
             _forget(root)
             return

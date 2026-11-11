@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import stat
 import subprocess
@@ -285,7 +286,8 @@ def test_insight_add_prints_the_approval_trailer_for_the_typed_text(tmp_path: Pa
 
     rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py")
     assert rc == 0, err
-    assert f"  {line}\n" in out and "--commit SHA" in out
+    assert f'git -c core.hooksPath={os.devnull} commit -S --allow-empty --only -m "chore: approve insight" -m "{line}"' in out
+    assert "--commit SHA" in out
 
     rc, out, err = _invoke_rule(ws, "insight", "add", text, "--paths", "src/main.py", "--json")
     assert rc == 0, err
@@ -342,8 +344,14 @@ def test_the_documented_h_recipe_counts_one_correction_once(tmp_path: Path, monk
 
     rc, out, err = _invoke_rule(repo.root, *argv)
     assert rc == 0, err
-    trailer = out.splitlines()[-1].strip()
-    sha = repo.commit(f"chore: approve insight\n\n{trailer}\n", sign_key=human_key, allow_empty=True)
+    command = shlex.split(out.splitlines()[-1].strip())
+    repo.home.sign_with(str(human_key))
+    repo.write("staged.txt", "keep this staged for the work commit\n")
+    repo.git("add", "staged.txt")
+    repo.git(*command[1:])
+    sha = repo.head()
+    assert repo.git("rev-parse", "HEAD^{tree}") == repo.git("rev-parse", "HEAD~1^{tree}")
+    assert repo.git("diff", "--cached", "--name-only") == "staged.txt"
     rc, out, err = _invoke_rule(repo.root, *argv, "--commit", sha, "--base-ref", "main", "--json")
     assert rc == 0, err
     signed = json.loads(out)
