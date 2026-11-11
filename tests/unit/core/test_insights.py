@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -429,6 +430,107 @@ def test_an_ungoverned_repository_under_home_keeps_the_cwds_own_id(hook_home: Pa
     record_hook_prompt("claude-code", {"prompt": "No, wrong file", "cwd": str(proj / "sub")}, home=hook_home)
     assert insight_workspace_id(proj / "sub") != insight_workspace_id(hook_home)
     assert _insight_texts(proj / "sub", hook_home) == ["No, wrong file"]
+
+
+@pytest.mark.parametrize("marker", ["directory", "gitfile"])
+def test_insight_workspace_id_at_ceiling_ignores_enclosing_repository(tmp_path: Path, monkeypatch, marker):
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(checkout, "init", "-q")
+    if marker == "gitfile":
+        metadata = tmp_path / "checkout.git"
+        (checkout / ".git").rename(metadata)
+        (checkout / ".git").write_text("gitdir: " + str(metadata) + "\n", encoding="utf-8")
+    start = checkout / "basetemp"
+    start.mkdir()
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    assert insight_workspace_id(start) != standalone
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+
+    assert insight_workspace_id(start) == standalone
+
+
+@pytest.mark.parametrize("boundary", ["start", "inside-ceiling", "above-ceiling"])
+def test_insight_workspace_id_honours_explicit_git_layout(tmp_path: Path, monkeypatch, boundary):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    ceiling = tmp_path / "ceiling"
+    top = ceiling / "worktree"
+    start = top / "sub"
+    start.mkdir(parents=True)
+    reported_top = {"start": start, "inside-ceiling": top, "above-ceiling": tmp_path}[boundary]
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reported_top))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
+    relative = start.resolve().relative_to(reported_top.resolve()).as_posix()
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00{relative}"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+def test_single_explicit_git_layout_above_ceiling_keeps_boundary_and_identity(
+    tmp_path: Path, monkeypatch, layout_variable
+):
+    from aegis_core.workspace.binding import git_boundary
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "core.worktree", str(repository.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else repository
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00basetemp"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert git_boundary(start) == repository.resolve()
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+@pytest.mark.parametrize("git_answer", ["off-path", "query-failure", "unresolvable"])
+def test_unusable_explicit_git_layout_does_not_supply_insights_identity(
+    tmp_path: Path, monkeypatch, layout_variable, git_answer
+):
+    from aegis_core import gitsafe
+    from aegis_core.insights import keys
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    off_path = tmp_path / "off-path"
+    off_path.mkdir()
+    _git(repository, "config", "core.worktree", str(off_path.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else off_path
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    assert gitsafe.toplevel(start) == off_path.resolve()
+    if git_answer != "off-path":
+        class UnresolvablePath(type(Path())):
+            def resolve(self, *args, **kwargs):
+                raise OSError("Git top cannot be resolved")
+
+        reported = UnresolvablePath(off_path) if git_answer == "unresolvable" else None
+        git_api = SimpleNamespace(**vars(gitsafe))
+        git_api.toplevel = lambda cwd: reported
+        monkeypatch.setattr(keys, "gitsafe", git_api)
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == standalone
 
 
 def test_claude_project_dir_wins_over_the_payload_cwd(tmp_path: Path, hook_home: Path, monkeypatch):
@@ -1274,6 +1376,7 @@ with file_lock(Path(sys.argv[2])):
 """
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_a_prompt_waits_out_a_lock_held_past_5s_and_keeps_its_row(tmp_path: Path, hb_home: Path, newline):
     """Sad path, deterministic stand-in for the two-process race above (which once lost a row to
