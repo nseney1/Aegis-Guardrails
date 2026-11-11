@@ -217,3 +217,33 @@ def test_native_coverage_ignores_unsupported_global_coverage_command(project):
     user.parent.mkdir(parents=True, exist_ok=True)
     user.write_text(json.dumps({'v': 1, 'coverage': {'command': 'ignored global'}}))
     assert 'coverage not configured' in '\n'.join(capability_lines(project))
+
+
+@pytest.mark.parametrize('component', [
+    'ghp_' + 'a' * 24,
+    'ghp_' + 'a' * 12 + '\x1b[31m' + 'a' * 12,
+    'line\nbreak',
+    'x' * 5000,
+    'x' * 4000 + '/ghp_' + 'a' * 24,
+], ids=['secret', 'ansi-secret', 'newline', 'oversized', 'late-secret'])
+def test_runner_data_refuses_paths_that_cannot_be_safely_displayed(monkeypatch, component):
+    from aegis_cli import language_capabilities
+
+    # No filesystem operation: these spellings include unsupported Windows names.
+    monkeypatch.setattr(language_capabilities, '_package',
+                        lambda root: ({'devDependencies': {'vitest': '1'}}, None))
+    data = language_capabilities.runner_suggestion(Path(component), structured=True)
+    assert data == {
+        'status': 'unavailable', 'runner': None, 'configuration': None,
+        'messages': ['  Runner suggestion unavailable: workspace path cannot be safely displayed'],
+    }
+    assert component not in json.dumps(data)
+
+
+def test_init_json_oversized_package_is_a_bounded_diagnostic(project, capsys):
+    (project / 'package.json').write_bytes(b' ' * ((1 << 20) + 1))
+    data = json.loads(_init(project, capsys, '--dry-run', '--json'))
+    assert data['runner_suggestion'] == {
+        'status': 'unavailable', 'runner': None, 'configuration': None,
+        'messages': ['  Runner suggestion unavailable: package.json exceeds 1 MiB'],
+    }
