@@ -1351,7 +1351,7 @@ class TestGovernanceHint:
         assert main(["--json", "init", "--workspace", str(project), "--yes", "--no-hooks", "--rules", "minimal"]) == 0
         out = capsys.readouterr().out
         assert set(json.loads(out)) == {"source", "aegis_version", "checked_at", "scope", "dry_run", "status",
-                                        "actions", "errors", "warnings"}
+                                        "actions", "errors", "warnings", "language_capabilities", "runner_suggestion"}
         assert "doctor --github" not in out
         self._no_codeowners(project)
 
@@ -1570,7 +1570,7 @@ class TestRunInitPins:
         assert run_init(_args(project, "--host", "codex-cli", "--json")) == 1
         captured = capsys.readouterr()
         doc = _one_document(captured.out)
-        assert list(doc) == INIT_KEYS
+        assert list(doc) == INIT_KEYS + ["language_capabilities", "runner_suggestion"]
         add = ["codex", *failing_codex[-1][1:]]
         assert add[:-1] == ["codex", "mcp", "add", "aegis", "--env", "AEGIS_CLIENT=codex-cli", "--"]
         assert (doc["status"], doc["dry_run"], doc["warnings"]) == ("failed", False, [])
