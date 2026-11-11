@@ -137,6 +137,15 @@ def test_tier_a_needs_reviews_code_owners_checks_codeowners_coverage_and_a_non_a
     assert report.evidence["codeowners"]["uncovered"] == []
 
 
+def test_full_fixture_owns_team_profile_at_root_and_nested_workspaces():
+    paths = {".aegis/team/profile.json", "svc/.aegis/team/profile.json"}
+    covered, uncovered = ownership.codeowners_coverage(hg.CODEOWNERS_FULL)
+    assert paths <= set(covered)
+    assert uncovered == []
+    without_profile = hg.CODEOWNERS_FULL.replace("**/.aegis/team/profile.json @octo\n", "")
+    assert set(ownership.codeowners_coverage(without_profile)[1]) == paths
+
+
 @needs_git
 def test_an_admin_identity_cannot_be_tier_a(tmp_path):
     repo = _repo_with_governance(tmp_path)
@@ -582,100 +591,100 @@ def _tier_case(tmp_path: Path, name: str):
     return doc["tier"], doc["reasons"], hashlib.sha256(json.dumps(rest, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-# Recorded at lane/w9-A c12e70cb (after R-trust-36, before the table), admin wording updated.
+# Recorded at lane/w9-A c12e70cb; admin wording and TP-1 profile coverage updated.
 GOLDEN_TIERS = {
     'a-full': ('A', [
-    ], 'ca1674679f2070d4'),
+    ], 'b3afe6f0e04282a7'),
     'admin': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the gh identity doctor used is an admin: re-run with the token the agent would hold',
-    ], '710e23b64c1a057d'),
+    ], '7f9c82ec2d08b27c'),
     'admin-unknown': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], '1fed4721f978a121'),
+    ], 'eb1679f9b7274d74'),
     'approvals-0': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require an approving review',
-    ], 'f74ddb2d5fa91d75'),
+    ], '5efaa5ec4ffc62e0'),
     'b-hardware': ('B', [
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '1bbf09668d3c52cd'),
+    ], '2626a9d5a80df62d'),
     'b-passphrase': ('B', [
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '159f0c1b3c7187db'),
+    ], 'f25deb641c9b517d'),
     'b-plain-custody': ('C', [
         'the signing key human is a plain file with no passphrase, readable by this user: an agent running as you can sign with it, so a signature proves nothing',
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], 'b3e430ffe88fa5b6'),
+    ], 'a5520a911a214919'),
     'bare-org': ('C', [
         'allowed_signers on the base branch lists no signing key',
-        'not tier A: CODEOWNERS leaves 83 governance path(s) without an owner',
+        'not tier A: CODEOWNERS leaves 85 governance path(s) without an owner',
         'not tier A: CODEOWNERS names @acme, the organization that owns this repository, which GitHub ignores as a code owner: name a team (@acme/<team>) or people',
-    ], '6ae200fb88ec7f12'),
+    ], 'bc6acbd5958faa0a'),
     'co-absent': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '9224938590e8abd8'),
+    ], 'e3e4328334cee821'),
     'co-partial': ('C', [
         'allowed_signers on the base branch lists no signing key',
-        'not tier A: CODEOWNERS leaves 82 governance path(s) without an owner',
-    ], '6e109a481cb4f40b'),
+        'not tier A: CODEOWNERS leaves 84 governance path(s) without an owner',
+    ], '78b630c81d390705'),
     'gh-missing': ('C', [
         'GitHub settings could not be read: gh is not installed',
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], '231bdf4bdc7ee1f1'),
+    ], '9ef2e7322fbed7fd'),
     'no-checks': ('C', [
         'the default branch has no required status checks',
         'allowed_signers on the base branch lists no signing key',
-    ], '894cb0e48ca45fa4'),
+    ], 'e7715def9cfdf445'),
     'no-owners-review': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require code-owner review',
-    ], '39a9e50b21121dde'),
+    ], '61f1a36e214ef2f3'),
     'no-workflow': ('C', [
         'the required checks do not include the Aegis job: no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix',
         'allowed_signers on the base branch lists no signing key',
-    ], '02d5e277c56e1b95'),
+    ], '34be250a44a53d13'),
     'not-aegis-check': ('C', [
         'the required checks do not include the Aegis job: require aegis-check',
         'allowed_signers on the base branch lists no signing key',
-    ], 'b4cd1dff7bfd621b'),
+    ], '45f75111267abdeb'),
     'repo-unreadable': ('C', [
         'GitHub settings could not be read: gh api repos/{owner}/{repo} failed: HTTP 404: Not Found',
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], 'c2778e2375913655'),
+    ], 'd88aed3124ff8020'),
     'rules-unreadable': ('C', [
         "the default branch's rules could not be read: gh api repos/{owner}/{repo}/rules/branches/main failed: HTTP 403: Forbidden",
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
-    ], 'b15ccacdb770aaaf'),
+    ], 'dbe1eb389efb5c81'),
     'signers-0': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], 'cb94876a7c0d25f2'),
+    ], 'c6b3874bbf0f21e7'),
     'stale-kept': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
-    ], '9d739a9cb376c5da'),
+    ], '83bfaab99e0c4cf4'),
     'unpinned-a': ('A', [
-    ], '92a6c557f1847a65'),
+    ], '190b0abbd015fef1'),
     'unpinned-c': ('C', [
         "the required check(s) aegis-check have no pinned source (integration_id): anyone with write access, including the agent's gh token, can post a passing status; set each check's source to GitHub Actions (app 15368) in the ruleset",
         'allowed_signers on the base branch lists no signing key',
@@ -683,7 +692,7 @@ GOLDEN_TIERS = {
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '63ccbfdd88627974'),
+    ], 'a75985d7fdd6bf4f'),
 }
 
 
@@ -692,7 +701,7 @@ GOLDEN_TIERS = {
 def test_the_tier_grid_is_the_one_recorded_before_the_table(tmp_path, name):
     """Given a FakeGh configuration recorded before detect_tier was rebuilt from one table, When the tier
     is detected, Then the tier, the reasons in order and the rest of the report are the recorded ones
-    (only the admin reason's wording changed)."""
+    (admin wording and TP-1 profile coverage fixtures updated)."""
     if name in KEYGEN_CASES and not hg.signing_ok():
         pytest.skip("needs git >= 2.34 and ssh-keygen")
     assert _tier_case(tmp_path, name) == GOLDEN_TIERS[name]
