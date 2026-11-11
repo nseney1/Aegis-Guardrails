@@ -1720,3 +1720,45 @@ def test_valid_merge_packet_composes_without_admitting_or_executing_it(tmp_path)
     after = files(tmp_path)
     after.pop(str(Path(answer["brief"]["path"]).relative_to(tmp_path)))
     assert after == before
+
+
+@secure_publication
+@pytest.mark.parametrize("notes", [12, 24])
+def test_consumed_reference_rechecks_do_not_enumerate_shared_cache(pilot, monkeypatch, capsys, notes):  # noqa: F811
+    from tools import hierarchy_fresh_brief as fresh
+
+    root, reference = pilot
+    for number in range(notes):
+        note = root.parent / ("cache-note-%d.md" % number)
+        note.write_text("typed note %d\n" % number, encoding="utf-8")
+        invoke(root, "publish", message(identifier="cache-note-%d" % number, kind="brief",
+            brief={"path": str(note), "sha256": hashlib.sha256(note.read_bytes()).hexdigest()}))
+    # Repeated declarations exercise already-cached paths as well as cache misses.
+    for number in range(2):
+        invoke(root, "publish", message(identifier="shared-cache-note-%d" % number, kind="brief", brief=reference))
+    expected = compose(root, as_of=AS_OF)
+    visits = []
+    caches = []
+
+    class CountedCache(dict):
+        def __iter__(self):
+            for key in super().__iter__():
+                visits.append(key)
+                yield key
+
+    original = fresh._Operation.__init__
+
+    def initialized(self, **kwargs):
+        if kwargs.get("reference_cache") is None:
+            kwargs["reference_cache"] = CountedCache()
+            caches.append(kwargs["reference_cache"])
+        original(self, **kwargs)
+
+    monkeypatch.setattr(fresh._Operation, "__init__", initialized)
+    code = fresh.main(["compose", "--root", str(root), "--initiative", "a", "--endpoint", ENDPOINT,
+                       "--as-of", AS_OF])
+    output = capsys.readouterr()
+    assert code == 0 and output.err == "", output
+    assert json.loads(output.out) == expected
+    assert max(map(len, caches)) >= notes
+    assert len(visits) == 0, "cached-path membership must not enumerate identity entries"
