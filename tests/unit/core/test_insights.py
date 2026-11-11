@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,36 @@ def test_link_key_refuses_symlinks_and_corrupt_sizes(tmp_path: Path):
     with pytest.raises(ValueError, match="corrupt"):
         create_link_key(home)
     assert read_link_key(home) is None
+
+
+def test_read_link_key_closes_descriptor_when_fdopen_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core.insights import keys
+
+    home = tmp_path / "home"
+    create_link_key(home)
+    descriptors = []
+
+    def fail_fdopen(fd, mode):
+        assert mode == "rb"
+        descriptors.append(fd)
+        raise OSError("fdopen failed")
+
+    local_os = SimpleNamespace(**vars(os))
+    local_os.fdopen = fail_fdopen
+    monkeypatch.setattr(keys, "os", local_os)
+
+    try:
+        assert read_link_key(home) is None
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(descriptors[0])
+        assert exc_info.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
 
 
 def test_session_hs_rejects_invalid_inputs(tmp_path: Path):

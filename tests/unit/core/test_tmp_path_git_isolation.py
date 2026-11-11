@@ -225,6 +225,53 @@ def test_separator_in_basetemp_refuses_before_test_body(tmp_path, repo_root, sep
     assert not (suite / "body-ran").exists()
 
 
+@pytest.mark.parametrize("mode", ["serial", "parallel", "collect"])
+@pytest.mark.parametrize("unsafe", [True, False], ids=["separator", "benign"])
+def test_recursive_launcher_checks_basetemp_in_controller(tmp_path, repo_root, mode, unsafe):
+    outer = tmp_path / "outer"
+    checkout = outer / "checkout"
+    suite = checkout / "tests"
+    suite.mkdir(parents=True)
+    launcher = suite / "conftest.py"
+    shutil.copyfile(Path(repo_root) / "tests" / "conftest.py", launcher)
+    (suite / "test_probe.py").write_text(
+        "from pathlib import Path\n"
+        "def test_body(tmp_path):\n"
+        "    Path(__file__).with_name('body-ran').write_text('ran', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    basetemp = tmp_path / ("run" + os.pathsep + "root" if unsafe else "run")
+    basetemp.mkdir()
+    sentinel = basetemp / "sentinel.txt"
+    sentinel.write_text("keep existing artifacts", encoding="utf-8")
+    options = ["-n", "2"] if mode == "parallel" else ["-n", "0"]
+    if mode == "collect":
+        options.append("--collect-only")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(checkout), repo_root, env.get("PYTHONPATH"))))
+    result = subprocess.run(
+        [sys.executable, "-B", str(launcher), str(outer), "-q", *options,
+         "-p", "no:cacheprovider", "--rootdir", str(outer), "--confcutdir", str(outer),
+         "--basetemp", str(basetemp)],
+        cwd=str(outer), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=_HANG_CEILING,
+    )
+
+    output = result.stdout + result.stderr
+    if unsafe:
+        assert result.returncode == pytest.ExitCode.USAGE_ERROR, output
+        assert output.count("choose --basetemp outside paths containing the path separator") == 1, output
+        assert str(basetemp) in output
+        assert set(basetemp.iterdir()) == {sentinel}, output
+    else:
+        assert result.returncode == pytest.ExitCode.OK, output
+        assert "choose --basetemp" not in output
+        assert ("1 test collected" if mode == "collect" else "1 passed") in output
+    if unsafe or mode == "collect":
+        assert sentinel.read_text(encoding="utf-8") == "keep existing artifacts"
+    assert (suite / "body-ran").exists() == (not unsafe and mode != "collect")
+
+
 @pytest.mark.parametrize("marker", ["directory", "file"])
 def test_workspace_discovery_respects_ceiling_but_store_placement_does_not(tmp_path, monkeypatch, marker):
     from aegis_core.manager_policy import ManagerError
