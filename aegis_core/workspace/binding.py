@@ -59,6 +59,7 @@ __all__ = [
     "denial",
     "denial_message",
     "git_boundary",
+    "git_discovery_paths",
     "home_message",
     "read_registry",
     "resolve_binding",
@@ -202,23 +203,82 @@ def denial_message(path: Path) -> Optional[str]:
     return None
 
 
+def _git_ceiling_entries() -> Iterable[str]:
+    """Git setup.c canonicalize_ceiling_entry: an empty entry ends resolution.
+
+    After that marker keep spelling intact, including slash direction on Windows;
+    Git's longest_ancestor_length compares it literally against its physical cwd.
+    No filesystem operation is performed on those later entries.
+    """
+    resolve = True
+    for entry in os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep):
+        if not entry:
+            resolve = False
+            continue
+        if not os.path.isabs(entry):
+            continue
+        if resolve:
+            path = Path(entry)
+            try:
+                try:
+                    path = path.resolve(strict=True)
+                except FileNotFoundError:
+                    # Git permits a missing final component, not missing parents.
+                    path = path.parent.resolve(strict=True) / path.name
+                entry = path.as_posix()
+            except (OSError, RuntimeError, ValueError):
+                continue
+        yield entry
+
+
+def git_discovery_paths(start: Path) -> Iterable[Path]:
+    """Walk physical ancestors, stopping before Git's longest proper ceiling.
+
+    The starting directory is always inspected, even if listed as a ceiling.
+    This limits discovery only; explicit workspace pins keep their authority.
+    """
+    try:
+        start = start.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return
+    physical = start.as_posix()
+    limit = -1
+    for entry in _git_ceiling_entries():
+        prefix = entry[:-1] if entry.endswith("/") else entry
+        length = len(prefix)
+        if (physical.startswith(prefix) and physical[length:length + 1] == "/"
+                and physical[length + 1:]):
+            limit = max(limit, length)
+    yield start
+    for parent in start.parents:
+        if len(parent.as_posix().rstrip("/")) <= limit:
+            break
+        yield parent
+
+
 def git_boundary(start: Path) -> Optional[Path]:
     """The innermost repository root around ``start``: the nearer of the closest
     ancestor holding a ``.git`` entry and git's own toplevel (asked through gitsafe).
 
     The ``.git`` marker needs no subprocess and also bounds a broken or unreadable
     repository; git's answer covers worktrees and ``GIT_DIR`` layouts. The deeper of
-    the two wins, so the bound is never looser than either.
+    the two wins, so the bound is never looser than either. The marker walk obeys
+    GIT_CEILING_DIRECTORIES; explicit Git layouts can bypass discovery.
     """
     from aegis_core import gitsafe
 
-    marker = next((d for d in (start, *start.parents) if os.path.lexists(d / ".git")), None)
+    directories = tuple(git_discovery_paths(start))
+    if not directories:
+        return None
+    start = directories[0]
+    marker = next((d for d in directories if os.path.lexists(d / ".git")), None)
     top = gitsafe.toplevel(start)
     if top is not None:
         try:
             top = _resolve(top)
         except OSError:
             top = None
+    # An explicit Git directory/worktree bypasses ceiling discovery, as Git does.
     found = [p for p in (marker, top) if p is not None and (p == start or p in start.parents)]
     return max(found, key=lambda p: len(p.parts)) if found else None
 
@@ -228,7 +288,8 @@ def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = 
     upwards, or None.
 
     The walk includes ``start``, stops at its git boundary (``git_boundary``) and
-    never reaches ``$HOME`` or the filesystem root, so a v3.3 ``~/.aegis/rules`` or a
+    never enters a GIT_CEILING_DIRECTORIES ancestor, ``$HOME`` or the filesystem root,
+    so a v3.3 ``~/.aegis/rules`` or a
     workspace that encloses the home directory is never chosen. Reads only.
     """
     accept = accept or is_aegis_workspace
@@ -243,9 +304,10 @@ def bounded_walk_up(start: PathLike, accept: Optional[Callable[[Path], bool]] = 
     if accept(current):
         return current
     bound = git_boundary(current)
-    while current != bound:
-        parent = current.parent
-        if parent == current or denial(parent):
+    parents = iter(git_discovery_paths(current))
+    next(parents)  # The starting directory was already checked.
+    for parent in parents:
+        if current == bound or denial(parent):
             return None
         current = parent
         if accept(current):
