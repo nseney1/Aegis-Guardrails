@@ -74,7 +74,7 @@ from aegis_core.atomicio import (
 from aegis_core.errors import AegisError, LockTimeoutError, PathTraversalError
 from aegis_core.primitives import is_within, real_path
 # Shared implementations use this module's live bindings; all original patch targets remain here.
-from aegis_core.storage_shared import StateModes
+from aegis_core.storage_shared import AppendResult, FileReport, RowsResult, StateModes
 from aegis_core.taxonomy import (
     LOCK_MAX_BACKOFF_SECONDS,
     LOCK_RETRY_INTERVAL_SECONDS,
@@ -96,13 +96,14 @@ _DEPS = sys.modules[__name__]
 
 __all__ = [
     "FileReport",
-    "JsonlAppend",
+    "AppendResult",
     "JsonlRead",
-    "ReportedRows",
+    "RowsResult",
     "LedgerSite",
     "LockOrderError",
     "LockTimeoutError",
     "append_jsonl",
+    "append_jsonl_with_report",
     "atomic_write_and_unlink",
     "atomic_write_bytes",
     "atomic_write_text",
@@ -733,35 +734,6 @@ def file_generation(size: int, mtime_ns: int, ctime_ns: int) -> Tuple[int, int, 
     return size, mtime_ns, ctime_ns if _COMPARE_CTIME else 0
 
 
-@dataclass(frozen=True)
-class FileReport:
-    """Descriptor identity, size and generation; optional filesystem read-start evidence."""
-
-    identity: Tuple[int, int]
-    size: int
-    added: int = 0
-    mtime_ns: int = 0
-    ctime_ns: int = 0
-    started_ns: Optional[int] = None
-
-
-class JsonlAppend(int):
-    """The usual appended-row count, plus optional descriptor evidence."""
-
-    def __new__(cls, count: int, report: Optional[FileReport] = None):
-        result = super().__new__(cls, count)
-        result.report = report
-        return result
-
-
-class ReportedRows(list):
-    """Ordinary rows with optional evidence carried from their I/O descriptor."""
-
-    def __init__(self, rows: Iterable[Dict[str, Any]] = (), report: Optional[FileReport] = None):
-        super().__init__(rows)
-        self.report = report
-
-
 def file_report(fd: int, data: bytes, *, appended: bool = False,
                  started_ns: Optional[int] = None) -> Optional[FileReport]:
     try:
@@ -794,13 +766,25 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
     or not, raises PathTraversalError and nothing is written. If the file ends in a torn line
     (no trailing newline, as a crash mid-write leaves it), a newline is written first:
     the torn bytes stay as one unreadable line and the new rows stay intact. Callers that
-    need ordering or deduplication hold ``locked()``. Returns the number of rows written,
-    with optional ``report`` evidence captured from the descriptor after the write.
+    need ordering or deduplication hold ``locked()``. Returns a plain row count;
+    ``append_jsonl_with_report`` also returns optional write-descriptor evidence.
     """
+    return _append_jsonl(path, rows, mode=mode, evidence=False).count
+
+
+def append_jsonl_with_report(path: Path | str, rows: Iterable[Dict[str, Any]], *,
+                             mode: Optional[int] = None) -> AppendResult:
+    """Append JSONL rows and return count plus optional write-descriptor evidence."""
+    return _append_jsonl(path, rows, mode=mode, evidence=True)
+
+
+def _append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *,
+                  mode: Optional[int], evidence: bool) -> AppendResult:
+    """Shared append implementation; collect descriptor evidence only when requested."""
     rows = list(rows)
     payload = _encode_rows(rows)
     if not rows:
-        return 0
+        return AppendResult(0)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     created = not os.path.lexists(target)
@@ -813,12 +797,12 @@ def append_jsonl(path: Path | str, rows: Iterable[Dict[str, Any]], *, mode: Opti
                 payload = b"\n" + payload
         _write_all(fd, payload)
         os.fsync(fd)
-        report = file_report(fd, payload, appended=True)
+        report = file_report(fd, payload, appended=True) if evidence else None
     finally:
         os.close(fd)
     if created:
         fsync_dir(target.parent)
-    return JsonlAppend(len(rows), report)
+    return AppendResult(len(rows), report)
 
 
 @dataclass(frozen=True)

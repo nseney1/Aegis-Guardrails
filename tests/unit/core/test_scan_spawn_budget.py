@@ -261,14 +261,14 @@ def test_an_mcp_scan_counts_index_reads_and_memo_validation(git_ws, monkeypatch,
     monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(vars(io), read=sample_read)))
     monkeypatch.setattr(credit_memo, "_snapshot", snapshot)
     monkeypatch.setattr(credit_memo, "before_read", before)
-    real_read, exposure_reports = credit.read_rows, []
+    real_read, exposure_reports = credit.read_rows_with_report, []
 
     def exposure_read(*args, **kwargs):
         rows = real_read(*args, **kwargs)
         exposure_reports.append(rows.report)
         return rows
 
-    monkeypatch.setattr(credit, "read_rows", exposure_read)
+    monkeypatch.setattr(credit, "read_rows_with_report", exposure_read)
     supported = credit_memo.filesystem_clock_supported()
     for request in (1, 2):
         reads.clear()

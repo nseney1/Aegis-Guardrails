@@ -99,7 +99,7 @@ def test_no_post_commit_index_read_can_turn_append_into_failure(tmp_path, monkey
     event = {"rule": "rule-a", "outcome": "tp", "source": "manual", "key": "key-a"}
     ledger.append(tmp_path, [event])
     path = ledger.ledger_path(tmp_path)
-    committed, real_append = [], ledger.append_jsonl
+    committed, real_append = [], ledger.append_jsonl_with_report
 
     def append(*args, **kwargs):
         result = real_append(*args, **kwargs)
@@ -111,7 +111,7 @@ def test_no_post_commit_index_read_can_turn_append_into_failure(tmp_path, monkey
             raise PermissionError(errno.EACCES, "injected post-commit refusal")
         return os.stat(value, *args, **kwargs)
 
-    monkeypatch.setattr(ledger, "append_jsonl", append)
+    monkeypatch.setattr(ledger, "append_jsonl_with_report", append)
     monkeypatch.setattr(ledger, "os", SimpleNamespace(**dict(vars(os), stat=stat_file)))
     assert ledger.append(tmp_path, [dict(event, key="key-b")])[0]["seq"] == 2
     assert len(ledger.read(tmp_path).rows) == 2
@@ -484,13 +484,13 @@ def test_windows_creation_time_and_descriptor_change_time_share_generation(tmp_p
             fields["st_ctime_ns"] = 1
         return SimpleNamespace(**fields)
 
-    calls, real_read = [], credit.read_rows
+    calls, real_read = [], credit.read_rows_with_report
 
     def read(root):
         calls.append(root)
         return real_read(root)
 
-    monkeypatch.setattr(credit, "read_rows", read)
+    monkeypatch.setattr(credit, "read_rows_with_report", read)
     with _settle_ledger(tmp_path, monkeypatch):
         assert credit.record_exposure(tmp_path, "host", "session", ["rule-a"]) == []
         calls.clear()
@@ -545,7 +545,7 @@ def test_delayed_fill_with_coarse_unchanged_stamps_stays_ineligible(tmp_path, mo
     tick = time_ns() - 500_000_000
     clock_info = storage.ledger_site(tmp_path).lock.stat()
     clock = [tick + 500_000_000]
-    real_read = credit.read_rows
+    real_read = credit.read_rows_with_report
 
     def coarse(info):
         if (info.st_dev, info.st_ino) == (clock_info.st_dev, clock_info.st_ino):
@@ -575,7 +575,7 @@ def test_delayed_fill_with_coarse_unchanged_stamps_stays_ineligible(tmp_path, mo
     monkeypatch.setattr(credit_memo, "time_ns", lambda: tick + 10_000_000_000, raising=False)
     with monkeypatch.context() as patch:
         patch.setattr(storage, "time", SimpleNamespace(**dict(vars(time), time_ns=lambda: tick + 500_000_000)))
-        patch.setattr(credit, "read_rows", read)
+        patch.setattr(credit, "read_rows_with_report", read)
         rules = ["rule-a"] if operation == "read" else ["rule-a", "rule-e"]
         credit.record_exposure(tmp_path, "other-host", "session", rules)
     clock[0] = tick + 10_000_000_000
@@ -624,7 +624,7 @@ def test_multirow_reset_during_fill_cannot_certify_removed_rule(tmp_path, monkey
     paths = ["src/package/module_%02d.py" % i for i in range(20)]
     stamp = "2026-11-10T12:00:00Z"
     credit.record_exposure(tmp_path, "host", "session", ["rule-c", "rule-a", "rule-d"], paths=paths, ts=stamp)
-    real_read, real_append = credit.read_rows, ledger.append_rows
+    real_read, real_append = credit.read_rows_with_report, ledger.append_rows
 
     def reset():
         path = ledger.ledger_path(tmp_path)
@@ -646,7 +646,7 @@ def test_multirow_reset_during_fill_cannot_certify_removed_rule(tmp_path, monkey
 
     with monkeypatch.context() as patch:
         patch.setattr(credit if phase != "append" else ledger,
-                      "read_rows" if phase != "append" else "append_rows",
+                      "read_rows_with_report" if phase != "append" else "append_rows",
                       read if phase != "append" else append)
         rules = ["rule-a"] if phase == "read" else ["rule-a", "rule-e"]
         written = credit.record_exposure(tmp_path, "other-host", "session", rules, paths=paths, ts=stamp)
@@ -654,7 +654,7 @@ def test_multirow_reset_during_fill_cannot_certify_removed_rule(tmp_path, monkey
 
     assert [row["rule"] for row in credit.record_exposure(
         tmp_path, "other-host", "session", ["rule-a"], paths=paths, ts=stamp)] == ["rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == (
+    assert [row["rule"] for row in real_read(tmp_path).rows] == (
         ["rule-c", "rule-b", "rule-d"] + ([] if phase == "read" else ["rule-e"]) + ["rule-a"])
 
 
@@ -688,13 +688,13 @@ def test_racy_timestamp_refuses_memo_until_settled(tmp_path, monkeypatch, age_ns
     rule = "rule-a" if operation == "read" else "rule-b"
     written = credit.record_exposure(tmp_path, "host", "session", [rule])
     assert [row["rule"] for row in written] == ([] if operation == "read" else [rule])
-    calls, real_read = [], credit.read_rows
+    calls, real_read = [], credit.read_rows_with_report
 
     def read(root):
         calls.append(root)
         return real_read(root)
 
-    monkeypatch.setattr(credit, "read_rows", read)
+    monkeypatch.setattr(credit, "read_rows_with_report", read)
     assert credit.record_exposure(tmp_path, "host", "session", [rule]) == []
     supported = credit_memo.filesystem_clock_supported()
     read_eligible = supported and (age_ns > 2_000_000_000 or (racy_field == "ctime" and not storage._COMPARE_CTIME))
@@ -782,7 +782,7 @@ def test_rescan_checks_generation_without_reads_and_any_append_misses(tmp_path, 
     calls = []
     opened, reads, seeks = [], [], []
     descriptors = set()
-    real_lock, real_read = credit.ledger_locked, credit.read_rows
+    real_lock, real_read = credit.ledger_locked, credit.read_rows_with_report
     real_open, real_fd_read, real_seek = os.open, os.read, os.lseek
 
     def open_file(file, *args, **kwargs):
@@ -811,7 +811,7 @@ def test_rescan_checks_generation_without_reads_and_any_append_misses(tmp_path, 
         return real_read(root)
 
     monkeypatch.setattr(credit, "ledger_locked", lock)
-    monkeypatch.setattr(credit, "read_rows", read)
+    monkeypatch.setattr(credit, "read_rows_with_report", read)
     monkeypatch.setattr(credit_memo, "os", SimpleNamespace(**dict(
         vars(credit_memo.os), open=open_file, read=fd_read, lseek=seek)))
     monkeypatch.setattr(credit_memo.atomicio, "os", SimpleNamespace(**dict(vars(credit_memo.os), open=open_file)))
@@ -830,7 +830,7 @@ def test_rescan_checks_generation_without_reads_and_any_append_misses(tmp_path, 
     assert len(opened) == 1
     assert reads == seeks == []
     expected = ["rule-a", "rule-b"] if append_other_row else ["rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == expected
+    assert [row["rule"] for row in real_read(tmp_path).rows] == expected
 
 
 def test_equal_length_reset_with_matching_tail_from_another_process_restores_exposure(tmp_path):
@@ -872,7 +872,7 @@ def test_fill_preserves_the_head_used_by_its_locked_read_when_it_also_appends(tm
     original = path.read_bytes()
     assert original.count(b'"rule":"rule-a"') == 1
     replacement = original.replace(b'"rule":"rule-a"', b'"rule":"rule-b"')
-    real_read = credit.read_rows
+    real_read = credit.read_rows_with_report
 
     def read(root):
         rows = real_read(root)
@@ -880,15 +880,15 @@ def test_fill_preserves_the_head_used_by_its_locked_read_when_it_also_appends(tm
         return rows
 
     with monkeypatch.context() as patch:
-        patch.setattr(credit, "read_rows", read)
+        patch.setattr(credit, "read_rows_with_report", read)
         written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a", "rule-c"], paths=paths, ts=stamp)
     assert [row["rule"] for row in written] == ["rule-c"]
-    assert [row["rule"] for row in real_read(tmp_path)] == ["rule-b", "rule-c"]
+    assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-b", "rule-c"]
 
     written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"], paths=paths, ts=stamp)
 
     assert [row["rule"] for row in written] == ["rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == ["rule-b", "rule-c", "rule-a"]
+    assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-b", "rule-c", "rule-a"]
 
 
 def test_new_exposure_after_replacement_does_not_revalidate_old_memo(tmp_path):
@@ -1213,7 +1213,7 @@ def test_reset_between_append_and_memo_fill_restores_exposure(tmp_path, monkeypa
 def test_reset_between_locked_read_and_fill_without_append_restores_exposure(tmp_path, monkeypatch):
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     path = ledger.ledger_path(tmp_path)
-    real_read = credit.read_rows
+    real_read = credit.read_rows_with_report
 
     def read(root):
         result = real_read(root)
@@ -1221,12 +1221,12 @@ def test_reset_between_locked_read_and_fill_without_append_restores_exposure(tmp
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(credit, "read_rows", read)
+        patch.setattr(credit, "read_rows_with_report", read)
         assert credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"]) == []
 
     written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == ["rule-a"]
+    assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-a"]
 
 
 @pytest.mark.parametrize("initially_missing", [False, True])
@@ -1253,7 +1253,7 @@ def test_blank_regrowth_after_append_does_not_certify_missing_exposure(tmp_path,
 def test_blank_regrowth_after_no_append_read_does_not_certify_missing_exposure(tmp_path, monkeypatch):
     credit.record_exposure(tmp_path, "host", "session", ["rule-a"])
     path = ledger.ledger_path(tmp_path)
-    real_read = credit.read_rows
+    real_read = credit.read_rows_with_report
 
     def read(root, **kwargs):
         rows = real_read(root, **kwargs)
@@ -1261,12 +1261,12 @@ def test_blank_regrowth_after_no_append_read_does_not_certify_missing_exposure(t
         return rows
 
     with monkeypatch.context() as patch:
-        patch.setattr(credit, "read_rows", read)
+        patch.setattr(credit, "read_rows_with_report", read)
         assert credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"]) == []
 
     written = credit.record_exposure(tmp_path, "other-host", "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == ["rule-a"]
+    assert [row["rule"] for row in real_read(tmp_path).rows] == ["rule-a"]
 
 
 def test_replacement_of_initially_missing_ledger_cannot_certify_its_matching_tail(tmp_path, monkeypatch):
@@ -1301,7 +1301,7 @@ def test_argon_0735_reset_traces_restore_exposure(tmp_path, monkeypatch, trace):
     if trace != "first-replace":
         credit.record_exposure(tmp_path, "host", "session", ["rule-a" if trace == "read-detection" else "rule-b"])
     path = ledger.ledger_path(tmp_path)
-    real_append, real_read = ledger.append_rows, credit.read_rows
+    real_append, real_read = ledger.append_rows, credit.read_rows_with_report
 
     def reset():
         before = path.stat()
@@ -1330,7 +1330,7 @@ def test_argon_0735_reset_traces_restore_exposure(tmp_path, monkeypatch, trace):
     host = "other-host" if trace == "read-detection" else "host"
     with monkeypatch.context() as patch:
         if trace == "read-detection":
-            patch.setattr(credit, "read_rows", read)
+            patch.setattr(credit, "read_rows_with_report", read)
         else:
             patch.setattr(ledger, "append_rows", append)
         written = credit.record_exposure(tmp_path, host, "session", ["rule-a"])
@@ -1339,7 +1339,7 @@ def test_argon_0735_reset_traces_restore_exposure(tmp_path, monkeypatch, trace):
     written = credit.record_exposure(tmp_path, host, "session", ["rule-a"])
     assert [row["rule"] for row in written] == ["rule-a"]
     expected = ["rule-a"] if trace == "first-replace" else ["rule-d", "rule-a"]
-    assert [row["rule"] for row in real_read(tmp_path)] == expected
+    assert [row["rule"] for row in real_read(tmp_path).rows] == expected
 
 
 @pytest.mark.parametrize("ancestor", ["state", "aegis"])
@@ -1492,3 +1492,24 @@ def test_shared_workspace_and_session_record_scan_rows_in_each_test(shared_scan_
         ("scan", "shared-session", ["src/app.py"]),
     ]
     path.unlink()
+
+
+def test_explicit_ledger_results_keep_rows_and_evidence_together(tmp_path):
+    row = {"v": ledger.LEDGER_VERSION, "event": "detection", "rule": "rule-a",
+           "outcome": "trigger", "source": "manual", "key": "a", "for_rule": "rule-a"}
+    written = ledger.append_rows_with_report(tmp_path, [row])
+    assert type(written.rows) is list and written.rows[0]["seq"] == 1
+    assert written.report.size == ledger.ledger_path(tmp_path).stat().st_size
+    duplicate = ledger.append_rows_with_report(tmp_path, [row])
+    assert duplicate.rows == [] and duplicate.report is None
+    read = credit.read_rows_with_report(tmp_path)
+    assert type(read.rows) is list and read.rows == written.rows
+    assert read.report.identity == written.report.identity
+    assert read.report.size == written.report.size
+    assert type(credit.read_rows(tmp_path)) is list
+    assert type(ledger.append_rows(tmp_path, [row])) is list
+
+
+def test_explicit_credit_read_missing_file_has_no_evidence(tmp_path):
+    read = credit.read_rows_with_report(tmp_path)
+    assert read.rows == [] and read.report is None
