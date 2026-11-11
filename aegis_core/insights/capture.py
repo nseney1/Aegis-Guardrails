@@ -113,19 +113,22 @@ def _known_inventory_revs(path: Path, inv: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def _has_human_approval(workspace: Any, commit: Optional[str], base_ref: Optional[str], text: str = "") -> bool:
-    if workspace is None or not commit or not text:
-        return False
-    top = gitsafe.toplevel(Path(os.fspath(workspace)).resolve())
-    if top is None:
-        return False
+def _human_approval(workspace: Any, commit: Optional[str], base_ref: Optional[str],
+                    text: str = "") -> Tuple[bool, Optional[str]]:
+    """Keep the verifier's refusal code, never its message or commit prose."""
+    if commit is None:
+        return False, None
+    if workspace is None or not text:
+        return False, "invalid_input"
     try:
         from aegis_core import human_gate
 
-        base = base_ref or gitsafe.resolve_base_ref(top)
-        return bool(base and human_gate.verify_insight_approval(top, commit, text, base).ok)
+        verdict = human_gate.verify_insight_approval(workspace, commit, text, base_ref)
+        return verdict.ok, None if verdict.ok else verdict.code
+    except gitsafe.GitError:
+        return False, "unresolved"
     except Exception:
-        return False
+        return False, "unverifiable"
 
 
 def _confine_paths(root: Any, paths: Sequence[str]) -> List[str]:
@@ -248,9 +251,11 @@ def add_insight(
     clean = redact_insight_text(text)
     norm_paths, psrc = _resolve_paths(workspace, paths)
     # The human signs the hash of what they typed; only the redacted text is stored.
-    level = "H" if _has_human_approval(workspace, commit, base_ref, text) else "cli"
+    approved, approval_code = _human_approval(workspace, commit, base_ref, text)
+    level = "H" if approved else "cli"
     row = _build_insight_row(
         workspace, level, clean, norm_paths, psrc, "cli", None, source="cli", kind=str(kind) if kind else None,
+        approval_code=approval_code,
     )
     _append_user_insights(insights_path(workspace, home=home), [row])
     return row
