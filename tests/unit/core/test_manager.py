@@ -6,12 +6,12 @@ import pytest
 
 from aegis_core.manager import ManagerService
 from aegis_core.manager_policy import ManagerError
-from tests.helpers_manager import active, approve, git, prepare
+from tests.helpers_manager import active, approve, git, manager_root, prepare
 
 
 @pytest.fixture
-def env(tmp_path):
-    return prepare(tmp_path)
+def env(manager_root):
+    return prepare(manager_root)
 
 
 @pytest.mark.parametrize("operation", ["report", "status"])

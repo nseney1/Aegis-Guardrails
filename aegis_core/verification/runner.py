@@ -424,7 +424,7 @@ def _tool_failure(tool: str, target: str, exc: Exception) -> ToolEvidence:
     from aegis_core.ast.policy import is_size_limit_error
 
     if is_size_limit_error(exc):
-        return ast_checks.too_large_note(target, ast_checks.source_language(target))
+        return ast_checks.too_large_note(target, ast_checks.source_language(target), limit_bytes=ast_checks.source_limit_from_error(exc))
     return ToolEvidence(
         tool=tool,
         target=target,
@@ -925,8 +925,8 @@ def _layer1_on_snapshot(
     ``entries`` is the index listing: the snapshot holds only some of its files.
 
     A file in ``too_large`` was not read: a forbid_ast gate rule that covers it fails
-    closed; otherwise the call_graph and import_guard checks it would get are skipped,
-    and passing INDEX_NOTE_TOOL evidence says so."""
+    closed; otherwise pack extensions report via ast_unverified, while other skipped
+    structural checks report via passing INDEX_NOTE_TOOL evidence."""
     from aegis_core.ast.session import ASTParseSession
 
     paths = [(rel, _snapshot_file(snapshot, rel)) for rel in files]

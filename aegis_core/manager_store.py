@@ -23,15 +23,69 @@ from aegis_core.config import read_capped
 from aegis_core.errors import LockTimeoutError, PathTraversalError
 from aegis_core.manager_policy import ManagerError, canonical
 from aegis_core.primitives import strict_loads
-from aegis_core.workspace.binding import git_discovery_paths
 
-__all__ = ["MAX_AUDIT_BYTES", "MAX_ROW_BYTES", "ManagerStore"]
+__all__ = ["MAX_AUDIT_BYTES", "MAX_ROW_BYTES", "ManagerStore", "in_git_worktree", "resolve_placement_path"]
 
 MAX_AUDIT_BYTES = 16 * 1024 * 1024
 MAX_ROW_BYTES = 1024 * 1024
 _RESERVED = frozenset({"seq", "prev", "hash"})
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+
+
+def _placement_error(root, code):
+    error = ManagerError(code)
+    error.path = root  # Diagnostic data only; the fixed refusal text never echoes it.
+    return error
+
+
+def resolve_placement_path(root: Path, *, unsafe_code="unsafe_store") -> Path:
+    """Strictly resolve the longest existing prefix, preserving only missing tails."""
+    if os.fspath(root) == "." or any(part in (".", "..") for part in root.parts):
+        raise _placement_error(root, unsafe_code)
+    prefix = root
+    missing = []
+    while True:
+        try:
+            os.lstat(prefix)
+            break
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            if prefix.parent == prefix:
+                raise _placement_error(root, unsafe_code) from exc
+            missing.append(prefix.name)
+            prefix = prefix.parent
+        except (OSError, ValueError) as exc:
+            raise _placement_error(root, unsafe_code) from exc
+    try:
+        physical = prefix.resolve(strict=True)
+        directory = not missing or stat.S_ISDIR(os.stat(physical).st_mode)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _placement_error(root, unsafe_code) from exc
+    if not directory:
+        raise _placement_error(root, unsafe_code)
+    return physical.joinpath(*reversed(missing))
+
+
+def _git_component(part):
+    return part.split(":")[0].rstrip(". ").casefold() == ".git"
+
+
+def in_git_worktree(root: Path, *, unsafe_code="unsafe_store") -> bool:
+    """Check reserved components and physical ancestors; uncertainty raises unsafe_code."""
+    if any(_git_component(part) for part in root.parts):
+        return True
+    physical = resolve_placement_path(root, unsafe_code=unsafe_code)
+    if any(_git_component(part) for part in physical.parts):
+        return True
+    for ancestor in (physical, *physical.parents):
+        try:
+            os.lstat(ancestor / ".git")
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError) as exc:
+            raise _placement_error(root, unsafe_code) from exc
+        return True
+    return False
 
 
 
@@ -66,9 +120,10 @@ class ManagerStore:
         for forbidden in self.forbidden_roots:
             if self.root == forbidden or forbidden in self.root.parents or self.root in forbidden.parents:
                 raise ManagerError("store_in_worktree")
-        for ancestor in git_discovery_paths(self.root):
-            if os.path.lexists(ancestor / ".git"):
-                raise ManagerError("store_in_worktree")
+        # Placement protects audit history from worktree cleanup, regardless of
+        # the operator's ceiling for workspace discovery.
+        if in_git_worktree(self.root):
+            raise ManagerError("store_in_worktree")
 
     def _check(self, create=False):
         self._placement()

@@ -4,10 +4,13 @@ These run a real ``git commit`` in a temporary repository with the hook installe
 """
 from __future__ import annotations
 
+from functools import lru_cache
+from itertools import product
 import os
 import stat
 import io
 import json
+import re
 import shlex
 import sys
 
@@ -156,10 +159,11 @@ def test_hook_missing_or_oversized_message_stays_unchanged(tmp_path, monkeypatch
 
 
 @pytest.mark.skipif(not hg.git_ok(), reason="needs git")
-def test_hook_closes_a_failed_bounded_read_without_echoing_input(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("phase", ["candidate", "below-cut"])
+def test_hook_closes_a_failed_bounded_read_without_echoing_input(tmp_path, monkeypatch, capsys, phase):
     repo = hg.make_repo(tmp_path)
     message = repo.root / ".git" / "COMMIT_EDITMSG"
-    original = b"work\n"
+    original = b"work\n" if phase == "candidate" else b"work\n\n" + CUT_LINE + b"\n"
     message.write_bytes(original)
     opened, counts = [], []
 
@@ -171,9 +175,13 @@ def test_hook_closes_a_failed_bounded_read_without_echoing_input(tmp_path, monke
 
         def readline(self, count):
             counts.append(count)
+            if phase == "below-cut":
+                return self.stream.readline(count)
             raise OSError("private untrusted detail")
 
-        read = readline
+        def read(self, count):
+            counts.append(count)
+            raise OSError("private untrusted detail")
 
         def __exit__(self, *_args):
             self.stream.close()
@@ -182,16 +190,141 @@ def test_hook_closes_a_failed_bounded_read_without_echoing_input(tmp_path, monke
     monkeypatch.chdir(repo.root)
     monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
     assert commitmsg.main([str(message)]) == 0
-    assert counts and all(0 < count <= 4096 for count in counts) and all(stream.closed for stream in opened)
+    assert counts and all(0 < count <= commitmsg.MAX_MESSAGE_SCAN_BYTES for count in counts)
+    if phase == "below-cut":
+        assert counts[-1] == commitmsg.MAX_MESSAGE_SCAN_BYTES - len(original)
+    else:
+        assert max(counts) <= 4096
+    assert all(stream.closed for stream in opened)
     assert message.read_bytes() == original
     assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (unreadable)\n"
 
 
 CUT_LINE = b"# ------------------------ >8 ------------------------"
+AUTHORITY_NAMES = ("Aegis-Approve", "Aegis-Approve-Insight", "Aegis-Exempt-Test", "Aegis-Manager-Approve")
+AUTHORITY_NOTICE = "aegis prepare-commit-msg: Aegis-Check not added (authority below cut)\n"
+
+
+@lru_cache(maxsize=1)
+def _unicode_case_equivalents():
+    """Compute every non-ASCII re.I equivalent of letters used in the names."""
+    letters = sorted({char.lower() for name in AUTHORITY_NAMES for char in name if char.isalpha()})
+    any_letter = re.compile("[" + "".join(letters) + "]", re.I)
+    # The class prefilter searches every non-ASCII code point once. The individual
+    # fullmatches below assign each result using the verifiers' engine semantics.
+    folded = [chr(point) for point in range(128, sys.maxunicode + 1) if any_letter.fullmatch(chr(point))]
+    return {letter: tuple(char for char in folded if re.fullmatch(letter, char, re.I)) for letter in letters}
+
+
+def _authority_spellings(name):
+    equivalents = _unicode_case_equivalents()
+    for case, spelling in (("exact", name), ("lower", name.lower()), ("mixed", name.swapcase())):
+        yield case, spelling
+        positions = [(index, equivalents[char.lower()]) for index, char in enumerate(spelling)
+                     if equivalents.get(char.lower())]
+        for index, alternatives in positions:
+            for char in alternatives:
+                yield f"{case}-position-{index}-U+{ord(char):04X}", spelling[:index] + char + spelling[index + 1:]
+        for replacements in product(*(alternatives for _, alternatives in positions)):
+            chars = list(spelling)
+            for (index, _), char in zip(positions, replacements):
+                chars[index] = char
+            codepoints = "-".join(f"U+{ord(char):04X}" for char in replacements)
+            yield f"{case}-all-{codepoints}", "".join(chars)
+
+
+def _authority_value(name):
+    return "b" * 40 + " reason" if name == "Aegis-Exempt-Test" else "b" * 64
+
+
+def _authority_variants():
+    for name in AUTHORITY_NAMES:
+        for case, spelling in _authority_spellings(name):
+            indents = [("column-zero", "")]
+            if name != "Aegis-Manager-Approve":
+                indents += [("space-indent", " "), ("tab-indent", "\t"), ("mixed-indent", " \t")]
+            for indent_id, indent in indents:
+                for pad_id, padding in (("no-pad", ""), ("space", " "), ("tab", "\t"),
+                                        ("mixed-pad", " \t"), ("4096-spaces", " " * 4096),
+                                        ("4096-tabs", "\t" * 4096)):
+                    yield (f"{name}-{case}-{indent_id}-{pad_id}", name,
+                           (indent + spelling + padding + ": " + _authority_value(name) + "\n").encode("utf-8"))
+
+
+def _authority_verifiers():
+    from aegis_core import human_gate, manager_config
+
+    return dict(zip(AUTHORITY_NAMES, (human_gate._APPROVE_LINE, human_gate._APPROVE_INSIGHT_LINE,
+                                     human_gate._EXEMPT_TEST_LINE, manager_config._OWNER_LINE)))
+
+
+def _assert_no_mixed_authority(body):
+    authority = any(pattern.search(body) is not None for pattern in _authority_verifiers().values())
+    assert not (authority and "Aegis-Check:" in body)
+
+
+def test_below_cut_predicate_covers_the_verifiers_authority_syntax():
+    patterns = _authority_verifiers()
+    accepted = set()
+    for case_id, name, line in _authority_variants():
+        if patterns[name].search(line.decode("utf-8", "surrogateescape")) is not None:
+            accepted.add(name)
+            with io.BytesIO(b"work\n\n" + CUT_LINE + b"\n" + line) as stream:
+                assert commitmsg._candidate_message(stream) == (b"work\n\n", None, True), case_id
+    assert accepted == set(AUTHORITY_NAMES)
+
+
+@pytest.mark.parametrize("line", ["aegis-approve: X", " \tAeGiS-aPpRoVe: X",
+                                  "Aegis-Approve-Insight \t: X", "\taegis-exempt-test: " + "b" * 40 + " reason",
+                                  "Aegis-Manager-Approve: " + "b" * 64],
+                         ids=["lower", "indented-mixed", "padded", "indented-exempt", "manager"])
+def test_mixed_authority_oracle_checks_the_full_body(line):
+    with pytest.raises(AssertionError):
+        _assert_no_mixed_authority("work\n\n" + CUT_LINE.decode("ascii") + "\n" + line + "\nAegis-Check: tree=X exit=0\n")
+
+
+@pytest.mark.parametrize("name,spelling", [pytest.param(name, spelling, id=name + "-" + case_id)
+                                         for name in AUTHORITY_NAMES
+                                         for case_id, spelling in _authority_spellings(name)])
+def test_mixed_authority_oracle_uses_the_verifiers_for_computed_spellings(name, spelling):
+    body = "work\n\n" + CUT_LINE.decode("ascii") + "\n" + spelling + ": " + _authority_value(name) + "\n"
+    assert "Aegis-Check:" not in body
+    if _authority_verifiers()[name].search(body) is not None:
+        with pytest.raises(AssertionError):
+            _assert_no_mixed_authority(body + "Aegis-Check: tree=X exit=0\n")
+    else:
+        _assert_no_mixed_authority(body + "Aegis-Check: tree=X exit=0\n")
+
+
+def test_candidate_refuses_every_authority_variant_below_the_cut():
+    patterns = _authority_verifiers()
+    for case_id, name, authority in _authority_variants():
+        original = b"work\n\n" + CUT_LINE + b"\n+\xffdiff\n" + authority
+        with io.BytesIO(original) as stream:
+            candidate, refusal, detected = commitmsg._candidate_message(stream)
+        verifier_accepts = patterns[name].search(authority.decode("utf-8", "surrogateescape")) is not None
+        assert not verifier_accepts or detected, case_id
+        assert (candidate, refusal, detected) == (b"work\n\n", None, True), case_id
 
 
 @pytest.mark.skipif(not hg.git_ok(), reason="needs git")
-@pytest.mark.parametrize("kind", ["status", "long-comment", "cut-diff", "diff-authority"])
+@pytest.mark.parametrize("name", AUTHORITY_NAMES)
+def test_hook_notices_each_authority_name_below_the_cut(tmp_path, monkeypatch, capsys, name):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    authority = (name + ": " + _authority_value(name) + "\n").encode("utf-8")
+    original = b"work\n\n" + CUT_LINE + b"\n+\xffdiff\n" + authority
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    _assert_no_mixed_authority(message.read_bytes().decode("utf-8", "surrogateescape"))
+    assert capsys.readouterr().err == AUTHORITY_NOTICE
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("kind", ["status", "long-comment", "cut-diff", "diff-authority", "authority"])
 def test_hook_judges_only_the_candidate_message(tmp_path, monkeypatch, capsys, kind):
     repo = hg.make_repo(tmp_path)
     message = repo.root / ".git" / "COMMIT_EDITMSG"
@@ -204,17 +337,22 @@ def test_hook_judges_only_the_candidate_message(tmp_path, monkeypatch, capsys, k
         original = b"#" + b"x" * 90000 + b"\nwork\n"
     else:
         original = b"work\n\n" + CUT_LINE + b"\n"
-        original += b"  Aegis-Approve: X\n" if kind == "diff-authority" else b"+diff\n" * 20000
+        original += (b"  Aegis-Approve: X\n" if kind == "diff-authority" else
+                     b"Aegis-Approve: X\n" if kind == "authority" else b"+diff\n" * 20000)
     message.write_bytes(original)
-    if kind != "diff-authority":
+    if kind not in ("diff-authority", "authority"):
         assert len(original) > 65536
     monkeypatch.chdir(repo.root)
     line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
     monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
     assert commitmsg.main([str(message)]) == 0
     result = message.read_bytes()
-    assert line.encode("ascii") in result.split(CUT_LINE)[0]
-    assert capsys.readouterr().err == ""
+    if kind in ("diff-authority", "authority"):
+        assert result == original
+    else:
+        assert line.encode("ascii") in result.split(CUT_LINE)[0]
+    _assert_no_mixed_authority(result.decode("ascii"))
+    assert capsys.readouterr().err == (AUTHORITY_NOTICE if kind in ("diff-authority", "authority") else "")
 
 
 @pytest.mark.skipif(not hg.git_ok(), reason="needs git")
@@ -303,13 +441,12 @@ def test_hook_scan_cap_stops_reads_and_closes_the_stream(tmp_path, monkeypatch, 
 
 
 @pytest.mark.skipif(not hg.git_ok(), reason="needs git")
-@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["LF", "CRLF"])
-def test_hook_stops_the_scan_at_the_cut_line(tmp_path, monkeypatch, capsys, ending):
+def test_hook_scans_only_for_authority_after_the_cut_line(tmp_path, monkeypatch, capsys):
     from aegis_core import gitsafe
 
     repo = hg.make_repo(tmp_path)
     message = repo.root / ".git" / "COMMIT_EDITMSG"
-    prefix = b"work\n\n" + CUT_LINE + ending
+    prefix = b"work\n\n" + CUT_LINE + b"\n"
     original = prefix + b"  Aegis-Manager-Approve: X\n" + b"+diff\n" * 20000
     message.write_bytes(original)
     positions = []
@@ -331,11 +468,214 @@ def test_hook_stops_the_scan_at_the_cut_line(tmp_path, monkeypatch, capsys, endi
     line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
     monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
     calls = []
-    # Real LF publication is covered above; Git's CRLF publication limitation is a handoff finding.
+    # Real publication is covered by the commit tests below.
     monkeypatch.setattr(gitsafe, "add_trailer", lambda path, trailer: calls.append((path, trailer)) or True)
     assert commitmsg.main([str(message)]) == 0
     assert calls == [(str(message), line)]
-    assert positions[-1] == len(prefix) and max(positions) <= len(prefix) and stream.closed
+    assert positions[-1] == len(original) and max(positions) <= len(original) and stream.closed
+    assert capsys.readouterr().err == ""
+
+
+@needs_git
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["LF", "CRLF"])
+@pytest.mark.parametrize("source", ["file", "template"])
+@pytest.mark.parametrize("authority", [False, True], ids=["ordinary", "authority"])
+def test_real_git_cut_line_requires_a_proven_marker(tmp_path, ending, source, authority):
+    repo = _project(tmp_path)
+    repo.git("add", "-A")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    message = tmp_path / "message"
+    below = b"Aegis-Approve: X\n" if authority else b"text below the cut\n"
+    message.write_bytes(b"work\n\n" + CUT_LINE + ending + below)
+    # Verbatim keeps the literal CRLF intact until the hook reads a -F message.
+    args = (["-F", str(message), "--cleanup=verbatim"] if source == "file"
+            else ["-t", str(message), "--cleanup=scissors"])
+    # A template must gain message text, not just comments, for Git to accept it.
+    editor, seen = tmp_path / "editor.py", tmp_path / "editor-seen"
+    editor.write_text("import sys\nfrom pathlib import Path\n"
+                      f"Path({str(seen)!r}).write_bytes(Path(sys.argv[1]).read_bytes())\n"
+                      "p = Path(sys.argv[1])\np.write_bytes(b'edited work\\n\\n' + p.read_bytes())\n",
+                      encoding="utf-8")
+    result = hg.run_git(repo.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", *args,
+                        env={**repo.home.env, "GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))},
+                        check=False)
+    assert result.returncode == 0, result.stderr
+    body = repo.git("log", "-1", "--format=%B")
+    _assert_no_mixed_authority(body)
+    if ending == b"\r\n":
+        assert "Aegis-Check:" not in body
+        if source == "template":
+            assert b"Aegis-Check:" not in seen.read_bytes()
+        assert result.stderr == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+        if source == "file" and authority:
+            assert "Aegis-Approve: X" in body
+    else:
+        assert result.stderr == (AUTHORITY_NOTICE if authority else "")
+        if authority:
+            assert "Aegis-Check:" not in body
+        else:
+            assert credit.format_trailer(row["tree"], 0) in body
+        if source == "template":
+            if authority:
+                assert b"Aegis-Check:" not in seen.read_bytes()
+            else:
+                assert credit.format_trailer(row["tree"], 0).encode("ascii") in seen.read_bytes().split(CUT_LINE)[0]
+            assert "Aegis-Approve:" not in body
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("ending", [b"\r\n", b"\r", b"", b" \n", b"\t\n", b" \r\n", b"\r\r\n",
+                                    b" " * 4200 + b"\n", b" " * (4096 - len(CUT_LINE))],
+                         ids=["CRLF", "CR-EOF", "EOF", "space", "tab", "space-CRLF", "CR-CRLF",
+                              "split-padding", "full-fragment-EOF"])
+def test_hook_refuses_unproved_hash_cut_lines_without_changing_bytes(tmp_path, monkeypatch, capsys, ending):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    original = b"work\n\n" + CUT_LINE + ending
+    if ending == b"\r\n":
+        original += b"Aegis-Approve: X\n"
+    message.write_bytes(original)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    assert capsys.readouterr().err == "aegis prepare-commit-msg: Aegis-Check not added (comment character)\n"
+
+
+@needs_git
+@pytest.mark.parametrize("source", ["file", "message", "template"])
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["LF", "CRLF"])
+@pytest.mark.parametrize("name", AUTHORITY_NAMES)
+def test_real_default_cleanup_keeps_authority_without_check(tmp_path, source, ending, name):
+    repo = _project(tmp_path)
+    repo.git("add", "-A")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    raw = b"work\n\n" + CUT_LINE + ending + name.encode("ascii") + b": X\n"
+    message = tmp_path / "message"
+    message.write_bytes(raw)
+    args = (["-F", str(message)] if source == "file" else ["-m", raw.decode("ascii")]
+            if source == "message" else ["-t", str(message)])
+    editor = tmp_path / "editor.py"
+    editor.write_text("import sys\nfrom pathlib import Path\np=Path(sys.argv[1])\n"
+                      "p.write_bytes(b'edited work\\n\\n' + p.read_bytes())\n", encoding="utf-8")
+    repo.git("commit", "-q", *args,
+             env={"GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))})
+    body = repo.git("log", "-1", "--format=%B")
+    assert name + ": X" in body
+    assert "Aegis-Check:" not in body
+    _assert_no_mixed_authority(body)
+
+
+@needs_git
+@pytest.mark.parametrize("source", ["file", "message", "template"])
+@pytest.mark.parametrize("name,style", [(name, style) for name in AUTHORITY_NAMES
+                                       for style in ("indented", "4096-padded")
+                                       if name != "Aegis-Manager-Approve" or style != "indented"])
+def test_real_default_cleanup_keeps_indented_or_padded_authority_without_check(tmp_path, source, name, style):
+    repo = _project(tmp_path)
+    repo.git("add", "-A")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    line = (" \t" if style == "indented" else "") + name.swapcase()
+    line += (" " * 4096 if style == "4096-padded" else "") + ": "
+    line += "b" * 40 + " reason" if name == "Aegis-Exempt-Test" else "b" * 64
+    raw = "work\n\n" + CUT_LINE.decode("ascii") + "\n" + line + "\n"
+    message = tmp_path / "message"
+    message.write_bytes(raw.encode("ascii"))
+    args = (["-F", str(message)] if source == "file" else ["-m", raw]
+            if source == "message" else ["-t", str(message)])
+    editor = tmp_path / "editor.py"
+    editor.write_text("import sys\nfrom pathlib import Path\np = Path(sys.argv[1])\n"
+                      "p.write_bytes(b'edited work\\n\\n' + p.read_bytes())\n", encoding="utf-8")
+    result = hg.run_git(repo.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", *args,
+                        env={**repo.home.env, "GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))},
+                        check=False)
+    assert result.returncode == 0, result.stderr
+    body = repo.git("log", "-1", "--format=%B")
+    assert line in body and "Aegis-Check:" not in body
+    _assert_no_mixed_authority(body)
+    assert result.stderr == AUTHORITY_NOTICE
+
+
+@needs_git
+def test_real_default_file_cleanup_keeps_unicode_authority_without_check(tmp_path):
+    repo = _project(tmp_path)
+    repo.git("add", "-A")
+    row = checkrun.record(repo.root, tests=True, base="main").row
+    assert commitmsg.trailer_for_staged(repo.root) == credit.format_trailer(row["tree"], 0)
+    authority = "  Aegiſ-Approve: " + "b" * 64
+    message = tmp_path / "message"
+    message.write_bytes(b"work\n\n" + CUT_LINE + b"\n" + authority.encode("utf-8") + b"\n")
+    result = hg.run_git(repo.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "-F", str(message),
+                        env=repo.home.env, check=False)
+    assert result.returncode == 0, result.stderr
+    body = repo.git("log", "-1", "--format=%B")
+    assert authority in body
+    _assert_no_mixed_authority(body)
+    assert "Aegis-Check:" not in body
+    assert result.stderr == AUTHORITY_NOTICE
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+@pytest.mark.parametrize("kind", ["authority", "exact-cap", "beyond-cap"])
+def test_hook_bounds_the_authority_scan_after_the_cut(tmp_path, monkeypatch, capsys, kind):
+    repo = hg.make_repo(tmp_path)
+    limit = commitmsg.MAX_MESSAGE_SCAN_BYTES
+    prefix = b"work\n\n" + CUT_LINE + b"\n"
+    authority = b"Aegis-Approve: X\n"
+    if kind == "authority":
+        original = prefix + b"+diff\n" * 12000 + authority
+    else:
+        original = prefix + b"+" * (limit - len(prefix))
+        if kind == "beyond-cap":
+            original += b"\n" + authority
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    message.write_bytes(original)
+    positions, sizes = [], []
+
+    class CountedStream(io.BytesIO):
+        def readline(self, count=-1):
+            sizes.append(count)
+            result = super().readline(count)
+            positions.append(self.tell())
+            return result
+
+        def read(self, count=-1):
+            sizes.append(count)
+            result = super().read(count)
+            positions.append(self.tell())
+            return result
+
+    stream = CountedStream(original)
+    monkeypatch.setattr(commitmsg, "open", lambda *_args: stream, raising=False)
+    monkeypatch.chdir(repo.root)
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: "Aegis-Check: tree=" + "a" * 40 + " exit=0")
+    assert commitmsg.main([str(message)]) == 0
+    assert message.read_bytes() == original
+    assert stream.closed and max(positions) <= limit and all(0 < size <= 4096 for size in sizes[:-1])
+    assert sizes[-1] == limit - len(prefix)
+    expected = AUTHORITY_NOTICE if kind == "authority" else "aegis prepare-commit-msg: Aegis-Check not added (scan limit)\n"
+    assert capsys.readouterr().err == expected
+    if kind != "authority":
+        assert positions[-1] == limit
+
+
+@pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+def test_hook_does_not_mistake_a_line_fragment_for_column_zero_authority(tmp_path, monkeypatch, capsys):
+    repo = hg.make_repo(tmp_path)
+    message = repo.root / ".git" / "COMMIT_EDITMSG"
+    # The second read of this long line starts with an authority-like key.
+    message.write_bytes(b"work\n\n" + CUT_LINE + b"\n" + b"+" * 4096 + b"Aegis-Approve: X\n")
+    monkeypatch.chdir(repo.root)
+    line = "Aegis-Check: tree=" + "a" * 40 + " exit=0"
+    monkeypatch.setattr(commitmsg, "trailer_for_staged", lambda root: line)
+    assert commitmsg.main([str(message)]) == 0
+    assert line.encode("ascii") in message.read_bytes().split(CUT_LINE)[0]
     assert capsys.readouterr().err == ""
 
 
@@ -516,11 +856,13 @@ def test_real_git_c_comment_string_reaches_the_hook_and_refuses_publication(tmp_
 
 
 @needs_git
-def test_real_verbose_editor_commit_retains_the_trailer_before_a_large_diff(tmp_path):
+@pytest.mark.parametrize("name", AUTHORITY_NAMES)
+def test_real_verbose_editor_commit_retains_the_trailer_before_a_large_diff(tmp_path, name):
     repo = _project(tmp_path)
-    repo.write("docs/verbose.txt", "before\n Aegis-Manager-Approve: X\nstable\n")
+    context = "before\n " + name + ": X\nstable\n"
+    repo.write("docs/verbose.txt", context)
     repo.commit("base for verbose diff")
-    repo.write("docs/verbose.txt", "before\n Aegis-Manager-Approve: X\nstable\n" + "new line " * 10 + "\n" + "x" * 80 + "\n")
+    repo.write("docs/verbose.txt", context + "new line " * 10 + "\n" + "x" * 80 + "\n")
     with (repo.root / "docs/verbose.txt").open("a", encoding="utf-8") as stream:
         stream.write(("new line " * 10 + "\n") * 1000)
     repo.git("add", "-A")
@@ -532,13 +874,19 @@ def test_real_verbose_editor_commit_retains_the_trailer_before_a_large_diff(tmp_
         f"Path({str(seen)!r}).write_text(json.dumps({{'bytes': len(raw), 'before_cut': "
         "b'Aegis-Check:' in raw.split(b'# ------------------------ >8 ------------------------')[0]}))\n"
         "p.write_bytes(b'work from editor\\n\\n' + raw)\n", encoding="utf-8")
-    repo.git("commit", "-q", "-v", env={"GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))})
+    result = hg.run_git(repo.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "-v",
+                        env={**repo.home.env, "GIT_EDITOR": shlex.quote(sys.executable) + " " + shlex.quote(str(editor))},
+                        check=False)
+    assert result.returncode == 0, result.stderr
     observed = json.loads(seen.read_text(encoding="utf-8"))
-    assert observed["bytes"] > 65536 and observed["before_cut"]
+    keep_check = name == "Aegis-Manager-Approve"
+    assert observed["bytes"] > 65536 and observed["before_cut"] == keep_check
     body = repo.git("log", "-1", "--format=%B")
-    assert body.startswith("work from editor\n")
-    assert f"Aegis-Check: tree={row['tree']} exit=0" in body
-    assert "Aegis-Manager-Approve:" not in body
+    assert body.splitlines()[0] == "work from editor"
+    assert (f"Aegis-Check: tree={row['tree']} exit=0" in body) == keep_check
+    assert name + ":" not in body
+    assert result.stderr == ("" if keep_check else AUTHORITY_NOTICE)
 
 
 @needs_git

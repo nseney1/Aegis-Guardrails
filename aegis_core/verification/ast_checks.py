@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Tuple
 
 from aegis_core.ast import policy
 from aegis_core.ast.detect import LANGUAGE_DEFINITIONS
+from aegis_core.ast.runner import source_limit_from_error
 from aegis_core.ast.schema import canonical_spelling
 from aegis_core.match import is_test_path
 from aegis_core.verification import ToolEvidence
@@ -14,13 +16,14 @@ from aegis_core.workspace.layout import RULES_RELDIR
 
 NO_DRIVER_NOTE_TOOL = 'forbid_ast_no_driver'
 AST_SIZE_NOTE_TOOL = 'ast_unverified'
+_SIZE_DETAIL = re.compile(r'exceeds ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?) MiB(?:;|$)')
 
 
-def too_large_note(path: str, language: str = 'unknown', *, reason: str | None = None) -> ToolEvidence:
+def too_large_note(path: str, language: str = 'unknown', *, reason: str | None = None,
+                   limit_bytes: int | None = None) -> ToolEvidence:
     if reason is None:
-        from aegis_core.ast.runner import SOURCE_LIMIT_BYTES
-
-        detail = f'{path} exceeds {SOURCE_LIMIT_BYTES / (1024 * 1024):g} MiB'
+        size = f'{limit_bytes / (1024 * 1024):g} MiB' if limit_bytes is not None else 'source size limit'
+        detail = f'{path} exceeds {size}'
     else:
         detail = f'{path} not read or checked: {reason}'
 
@@ -28,6 +31,17 @@ def too_large_note(path: str, language: str = 'unknown', *, reason: str | None =
         f'unverified too_large: {detail}; '
         'use target_paths to exclude generated bundles (aegis doctor)',
         language=language)
+
+
+def size_limit_reason(path: str, detail: str) -> str:
+    """Read the applied limit from the existing advisory field, without guessing.
+
+    Match only the numeric suffix after the exact target, so path text cannot
+    supply a fake limit. A legacy or unquantified refusal stays unquantified.
+    """
+    prefix = f'unverified too_large: {path} '
+    match = _SIZE_DETAIL.match(detail[len(prefix):len(prefix) + 64]) if detail.startswith(prefix) else None
+    return f'size limit (too_large; exceeds {match[1]} MiB)' if match else 'size limit (too_large)'
 
 
 def site_key(path: str, line: int, pattern: str) -> tuple[str, int, str]:
@@ -168,10 +182,11 @@ def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_bas
     ``present`` says which paths the checked tree holds (_base_sources)."""
     from aegis_core.verification import scanners, security_pack
 
+    size_limits: dict[str, int | None] = {}
     try:
         base_sources = read_base(git_root, rels, work_root, diff_base, contents, present)
         typed = [rel for rel in rels if Path(rel).suffix.lower() in PACK_EXTENSIONS]
-        pack = security_pack.evaluate_security_pack(work_root, typed, base_sources, session=session) if typed else {}
+        pack = security_pack.evaluate_security_pack(work_root, typed, base_sources, session=session, size_limits=size_limits) if typed else {}
         secrets = scanners.scan_secrets_delta(work_root, rels, {p: b.decode("utf-8", "replace") for p, b in base_sources.items()}, contents)
     except Exception as exc:
         return [failure("security_pack", "changed files", exc)]
@@ -183,7 +198,7 @@ def run_security_checks(git_root: str, rels: list[str], work_root: str, diff_bas
             hits.setdefault((f"security_pack:{hit['rule_id']}", hit["file"]), []).append(hit)
     for hit in pack.get("unverified_findings", ()):
         if hit.get('reason') == 'too_large':
-            advisory.append(too_large_note(hit['file'], source_language(hit['file'])))
+            advisory.append(too_large_note(hit['file'], source_language(hit['file']), limit_bytes=size_limits.get(hit['file'])))
         elif hit.get('reason', '').startswith('no_driver:'):
             advisory.append(ToolEvidence(NO_DRIVER_NOTE_TOOL, hit['file'], True,
                 f"unverified {hit['reason']}: {hit['file']} has a security pack; no AST driver configured",

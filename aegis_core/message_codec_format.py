@@ -57,6 +57,10 @@ FRONTEND_MESSAGES = MappingProxyType({
     "workspace": "workspace is not initialized; run aegis init",
     "binding": "workspace binding refused; check --workspace / AEGIS_WORKSPACE",
     "root": "workspace root refused; choose a project directory",
+    "pin_not_a_workspace": (
+        "pinned directory is not an Aegis workspace; run aegis init in that directory "
+        "(aegis init --pin also pins the hosts)"
+    ),
     "attachment": "workspace attachment unavailable; check permissions",
     "input": "input file unreadable",
     "write_ref": "write reference must be a full 64-hex id present in the target store",

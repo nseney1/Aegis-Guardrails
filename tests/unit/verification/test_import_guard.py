@@ -7,6 +7,8 @@ and flag them as risks when they aren't in the project's dependency manifest.
 import os
 import sys
 import textwrap
+from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 from pathlib import Path
@@ -179,6 +181,189 @@ class TestImportExtraction:
         with pytest.raises(FileNotFoundError) as exc:
             extract_imports(str(missing))
         assert exc.value.filename == str(missing)
+
+
+@pytest.mark.parametrize("broken", [False, True], ids=["valid", "syntax-error"])
+def test_importorskip_line_scanning_is_linear(monkeypatch, broken):
+    from aegis_core.verification import import_guard
+
+    slices = []
+    scanned = []
+
+    class CountedSource(str):
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                slices.append(key)
+            return super().__getitem__(key)
+
+        def count(self, sub, start=0, end=None):
+            end = len(self) if end is None else end
+            scanned.append(end - start)
+            return super().count(sub, start, end)
+
+    block = ('# pytest.importorskip("comment")\n'
+             'text = \'importorskip("string")\'\n'
+             'pytest.importorskip(\n  "multiline"\n)\n'
+             'importorskip("after")\n')
+    source = CountedSource(block * 64 + ("def broken(\n" if broken else ""))
+    monkeypatch.setattr(import_guard, "read_python_source", lambda path: source)
+
+    imports = import_guard.extract_imports("virtual.py")
+
+    assert [(i.module, i.lineno, i.guarded) for i in imports] == [
+        (module, n * 6 + line, True) for n in range(64)
+        for module, line in [("comment", 1), ("string", 2), ("multiline", 3), ("after", 6)]
+    ]
+    assert slices == []
+    assert scanned
+    assert sum(scanned) <= len(source)
+
+
+@pytest.fixture
+def discovery_fs(monkeypatch):
+    """Replace only import_guard's OS reference, leaving pytest's OS intact."""
+    from aegis_core.verification import import_guard
+
+    calls = Counter()
+    denied = set()
+
+    def listdir(path):
+        calls[("listdir", os.fspath(path))] += 1
+        if os.fspath(path) in denied:
+            raise PermissionError("discovery denied")
+        return os.listdir(path)
+
+    def probe(name):
+        def counted(path):
+            calls[(name, os.fspath(path))] += 1
+            return getattr(os.path, name)(path)
+        return counted
+
+    path = SimpleNamespace(**{name: getattr(os.path, name) for name in
+                              ("join", "dirname", "abspath", "basename")},
+                           isdir=probe("isdir"), exists=probe("exists"))
+    monkeypatch.setattr(import_guard, "os", SimpleNamespace(path=path, listdir=listdir))
+    return calls, denied
+
+
+def _run_import_checks(root, sources, not_in_commit=None):
+    from aegis_core.verification import structural_checks
+
+    def failure(tool, rel, exc):
+        return ToolEvidence(tool, rel, False, f"{type(exc).__name__}: {exc}")
+
+    results = structural_checks.run_checks(
+        [(source.name, str(source)) for source in sources], str(root), None,
+        fast_mode=True, failure=failure, not_in_commit=not_in_commit,
+    )
+    return [result for result in results if result.tool == "import_guard"]
+
+
+def test_discovery_filesystem_work_is_once_per_run(tmp_path, discovery_fs):
+    calls, _ = discovery_fs
+    package = tmp_path / "localpkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "barehelper.py").write_text("", encoding="utf-8")
+    namespace = tmp_path / "namespace"
+    namespace.mkdir()
+    (namespace / "nested").mkdir()
+    (namespace / "nested" / "__init__.py").write_text("", encoding="utf-8")
+    sources = [tmp_path / f"app{n}.py" for n in range(8)]
+    for source in sources:
+        source.write_text("import localpkg\nimport barehelper\nimport namespace\nimport missingdep\n",
+                          encoding="utf-8")
+
+    single = _run_import_checks(tmp_path, sources[:1])
+    single_calls = calls.copy()
+    calls.clear()
+    batch = _run_import_checks(tmp_path, sources)
+
+    assert batch == [ToolEvidence("import_guard", source.name, False,
+                                 "Unguarded third-party imports: missingdep", [4])
+                     for source in sources]
+    assert single == batch[:1]
+    assert calls == single_calls
+
+
+def test_discovery_inventories_expire_between_runs(tmp_path, discovery_fs):
+    root = tmp_path / "project"
+    root.mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    source = snapshot / "app.py"
+    source.write_text("import freshpkg\nimport freshsibling\n", encoding="utf-8")
+
+    before = _run_import_checks(root, [source])[0]
+    package = root / "freshpkg"
+    package.mkdir()
+    init = package / "__init__.py"
+    init.write_text("", encoding="utf-8")
+    sibling = snapshot / "freshsibling.py"
+    sibling.write_text("", encoding="utf-8")
+    during = _run_import_checks(root, [source])[0]
+    init.unlink()
+    sibling.unlink()
+    after = _run_import_checks(root, [source])[0]
+
+    assert before == after == ToolEvidence("import_guard", "app.py", False,
+                                          "Unguarded third-party imports: freshpkg, freshsibling", [1, 2])
+    assert during.verdict is True
+
+
+def test_snapshot_sibling_inventory_stays_separate(tmp_path, discovery_fs):
+    root = tmp_path / "project"
+    root.mkdir()
+    sources = []
+    for name in ("first", "second"):
+        directory = tmp_path / name
+        directory.mkdir()
+        source = directory / f"{name}.py"
+        source.write_text("import snapshot_helper\n", encoding="utf-8")
+        sources.append(source)
+    (sources[0].parent / "snapshot_helper.py").write_text("", encoding="utf-8")
+
+    results = _run_import_checks(root, sources, lambda *args: ["snapshot_helper"])
+
+    assert results == [
+        ToolEvidence("import_guard", "first.py", True, "All imports are stdlib, allowed, or guarded"),
+        ToolEvidence("import_guard", "second.py", False,
+                     "Unguarded third-party imports: snapshot_helper; snapshot_helper is not staged or "
+                     "tracked, so the commit would not include it", [1]),
+    ]
+
+
+@pytest.mark.parametrize("denied_site", ["root", "package", "namespace", "siblings"])
+def test_discovery_permission_behavior(tmp_path, discovery_fs, denied_site):
+    calls, denied = discovery_fs
+    root = tmp_path / "project"
+    root.mkdir()
+    for name in ("package", "namespace"):
+        directory = root / name
+        directory.mkdir()
+        (directory / "barehelper.py").write_text("", encoding="utf-8")
+    (root / "package" / "__init__.py").write_text("", encoding="utf-8")
+    siblings = tmp_path / "snapshot"
+    siblings.mkdir()
+    (siblings / "sibling.py").write_text("", encoding="utf-8")
+    sources = [siblings / f"app{n}.py" for n in range(2)]
+    for source in sources:
+        source.write_text("import package\nimport namespace\nimport sibling\n", encoding="utf-8")
+    denied.add(str({"root": root, "package": root / "package",
+                    "namespace": root / "namespace", "siblings": siblings}[denied_site]))
+
+    results = _run_import_checks(root, sources)
+
+    if denied_site == "root":
+        assert all(result.detail == "PermissionError: discovery denied" and not result.verdict
+                   for result in results)
+    elif denied_site == "package":
+        assert all(result.verdict for result in results)
+    else:
+        module, line = ("namespace", 2) if denied_site == "namespace" else ("sibling", 3)
+        assert all(result.detail == f"Unguarded third-party imports: {module}"
+                   and result.lines == [line] and not result.verdict for result in results)
+    assert all(calls[("listdir", path)] == 1 for path in denied)
 
 
 class TestStdlibClassification:

@@ -17,7 +17,7 @@ from aegis_core import approval_shape as _approval_shape, gitsafe, pathlookup
 from aegis_core.atomicio import create_private_file
 from aegis_core.config import manager_registration_env
 from aegis_core.manager_policy import ManagerError, canonical, digest
-from aegis_core.manager_store import ManagerStore
+from aegis_core.manager_store import ManagerStore, in_git_worktree, resolve_placement_path
 from aegis_core.primitives import strict_loads
 
 __all__ = ["initialize", "load_config", "public_file", "verify_owner"]
@@ -27,16 +27,26 @@ _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _OWNER_LINE = re.compile(r"^Aegis-Manager-Approve: ([0-9a-f]{64})$", re.MULTILINE)
 
 
-def _path(value):
+def _path(value, *, unsafe_code="unsafe_config", repository_code=None):
     if not isinstance(value, (str, os.PathLike)):
-        raise ManagerError("unsafe_config")
+        raise ManagerError(unsafe_code)
     raw = os.fspath(value)
     if not isinstance(raw, str) or not os.path.isabs(raw) or os.path.normpath(raw) != raw:
-        raise ManagerError("unsafe_config")
+        raise ManagerError(unsafe_code)
     path = Path(raw)
-    if any(p.is_symlink() for p in (path, *path.parents)) or path.resolve() != path:
-        raise ManagerError("unsafe_config")
-    return path
+    if repository_code is not None and in_git_worktree(path, unsafe_code=unsafe_code):
+        raise ManagerError(repository_code)
+    physical = resolve_placement_path(path, unsafe_code=unsafe_code)
+    try:
+        info = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except (OSError, ValueError) as exc:
+        raise ManagerError(unsafe_code) from exc
+    else:
+        if stat.S_ISLNK(info.st_mode):
+            raise ManagerError(unsafe_code)
+    return physical
 
 
 def public_file(value, *, private=False):
@@ -57,6 +67,7 @@ def public_file(value, *, private=False):
 
 @gitsafe.scrubbed()
 def load_config(path, expected_digest=None):
+    path = _path(path, repository_code="config_in_repository")
     raw = public_file(path, private=True)
     fingerprint = hashlib.sha256(raw).hexdigest()
     if expected_digest is not None and fingerprint != expected_digest:
@@ -69,29 +80,27 @@ def load_config(path, expected_digest=None):
         raise ManagerError("invalid_config")
     if type(config["workspace_id"]) is not str or not _TOKEN.fullmatch(config["workspace_id"]):
         raise ManagerError("invalid_config")
-    for name in ("control_root", "store_root", "trusted_signers"):
-        _path(config[name])
-    if gitsafe.toplevel(Path(path).parent) is not None:
-        raise ManagerError("config_in_repository")
+    config["control_root"] = str(_path(config["control_root"]))
+    config["store_root"] = str(_path(config["store_root"], unsafe_code="unsafe_store",
+                                     repository_code="store_in_worktree"))
+    config["trusted_signers"] = str(_path(config["trusted_signers"], repository_code="trust_root_in_repository"))
     signers = public_file(config["trusted_signers"])
     if hashlib.sha256(signers).hexdigest() != config["trusted_signers_digest"]:
         raise ManagerError("trust_root_changed")
-    if gitsafe.toplevel(Path(config["trusted_signers"]).parent) is not None:
-        raise ManagerError("trust_root_in_repository")
     return config, fingerprint
 
 
 @gitsafe.scrubbed()
 def initialize(config_path, *, workspace_id, control_root, store_root, trusted_signers):
     """Prepare one draft manager registration; this neither approves nor activates it."""
-    path, control, store, signers = map(_path, (config_path, control_root, store_root, trusted_signers))
+    path = _path(config_path, repository_code="config_in_repository")
+    control = _path(control_root)
+    store = _path(store_root, unsafe_code="unsafe_store", repository_code="store_in_worktree")
+    signers = _path(trusted_signers, repository_code="trust_root_in_repository")
     if type(workspace_id) is not str or not _TOKEN.fullmatch(workspace_id):
         raise ManagerError("invalid_workspace_id")
     if gitsafe.toplevel(control) != control or gitsafe.common_dir(control) is None:
         raise ManagerError("invalid_control_repository")
-    existing_parent = next(parent for parent in path.parents if parent.is_dir())
-    if gitsafe.toplevel(existing_parent) is not None or gitsafe.toplevel(signers.parent) is not None:
-        raise ManagerError("config_in_repository")
     raw_signers = public_file(signers)
     if not raw_signers.strip():
         raise ManagerError("invalid_trust_root")

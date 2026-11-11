@@ -211,6 +211,129 @@ _HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
 }
 
 
+def display_profile(value: Any) -> Any:
+    """Keep untrusted profile text on the canonicalize/redact/truncate path."""
+    from aegis_core.redaction import redact_command_secrets
+
+    def shown(text: str, identifier=False) -> str:
+        canonical = sanitize_display(text, max_len=None)
+        # Identifiers are schema references, not secret values. Pattern masking
+        # would change their meaning; credential positions are masked below.
+        redacted = canonical if identifier else redact_command_secrets(canonical)
+        return sanitize_display(redacted, max_len=512)
+
+    document = value.get("profile", value) if type(value) is dict else {}
+    prefix = ("profile",) if type(value) is dict and "profile" in value else ()
+    runners = document.get("run_config", {}).get("runners", {}) if type(document) is dict else {}
+    secrets = set()
+    for name, runner in runners.items():
+        if "credentials" in runner:
+            secrets.add((*prefix, "run_config", "runners", name, "credentials"))
+    values = value.get("values", {}) if type(value) is dict else {}
+    for label, record in values.items():
+        components = tuple(record["path"])
+        if len(components) == 4 and components[:2] == ("run_config", "runners") and components[-1] == "credentials":
+            secrets.add(("values", label, "value"))
+        if len(components) == 5 and components[:3] == ("user", "run_config", "runners") and components[-1] == "credentials":
+            secrets.add(("values", label, "value"))
+
+    def walk(item, path=(), identifier=False):
+        if path in secrets:
+            return "[REDACTED]"
+        if type(item) is dict:
+            result = {}
+            for key, child in item.items():
+                reference = key in {"runner", "hosts", "host_pref", "applied_to", "applied_paths", "path"}
+                if key == "name":
+                    # Doctor host aliases and review lens names are constrained
+                    # identifiers. Gate names are free text and must be redacted,
+                    # including the gate array copied into provenance values.
+                    reference = (len(path) == 2 and path[0] == "hosts")
+                    reference = reference or path[-4:-1] == ("policy", "review", "lenses")
+                    reference = reference or (len(path) == 4 and path[0] == "values" and path[2] == "value" and
+                                             tuple(values[path[1]]["path"]) == ("policy", "review", "lenses"))
+                reference = reference or (key in {"review", "doc"} and path[-1:] == ("fallback",))
+                if key == "value" and len(path) == 2 and path[0] == "values":
+                    components = tuple(values[path[1]]["path"])
+                    reference = components[-1:] in (("hosts",), ("host_pref",)) or components[-2:] in (("fallback", "review"), ("fallback", "doc"))
+                result[shown(key, identifier=True)] = walk(child, (*path, key), reference)
+            return result
+        if type(item) is list:
+            return [walk(child, (*path, index), identifier) for index, child in enumerate(item)]
+        return shown(item, identifier) if type(item) is str else item
+
+    return walk(value)
+
+
+def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
+    """Configuration has its own envelope; lease payloads remain unchanged."""
+    from aegis_core import team_profile
+
+    noun = args.team_action
+    verb = getattr(args, "config_action", None) if noun == "config" else None
+    command = noun + (" " + verb if verb else "")
+    schema = "aegis.team." + command.replace(" ", ".") + "/v1"
+    payload = primitives.envelope("aegis team " + command, {"workspace": str(root)}, now=now)
+    payload.update(schema=schema, schema_family="aegis.team." + noun + "/v1",
+                   governance=team_profile.governance_status())
+    code = EXIT_OK
+    try:
+        if noun == "config" and verb is None:
+            payload.update(status="refused", reason="a config verb is required", layer="flags", file="<command-line>",
+                           next_action="Run aegis team config show|presets|init --help.")
+            code = EXIT_USAGE
+        elif verb == "presets":
+            payload.update(status="done", presets=list(team_profile.PRESET_DATA["presets"]),
+                           host_kinds=team_profile.PRESET_DATA["hosts"],
+                           next_action="Run aegis team config init --preset NAME --json.")
+        elif verb == "init":
+            document = team_profile.initialize(root, args.preset, host=args.host, force=args.force)
+            payload.update(status="done", profile=team_profile.resolve(repo=document)["profile"],
+                           next_action="Review the profile diff and use aegis approve; hosted aegis-governance gates approval before merge. Run aegis team doctor --json.")
+        else:
+            resolved = team_profile.load(root)
+            if noun == "doctor":
+                found = team_profile.doctor(resolved, root=root)
+                payload.update(found)
+                if found["healthy"]:
+                    payload.update(status="done", next_action="Review the resolved profile with aegis team config show --json.")
+                else:
+                    current = resolved["profile"]["preset"]
+                    binding = next((item for item in found["runnable_bindings"] if item["preset"] == current), None)
+                    missing = sorted({host["cli"] for host in found["hosts"] if not host["found"]})
+                    action = "Install the missing declared CLI: " + ", ".join(missing) + "; rerun aegis team doctor --json."
+                    if binding is not None and resolved.get("repository_profile_exists") is False:
+                        command = "aegis team config init --preset " + current
+                        if binding["host"] is not None:
+                            command += " --host " + binding["host"]
+                        action += " An available binding of the current preset is " + command + "; review any repository change through aegis approve before merge."
+                    payload.update(status="refused", reason="a declared host CLI is missing from PATH",
+                                   layer="repo", file=str(root.joinpath(*team_profile.REPO_PATH)),
+                                   next_action=action)
+                    code = EXIT_REFUSED
+            else:
+                payload.update(status="done", **resolved,
+                               next_action="Run aegis team doctor --json before starting a run.")
+    except team_profile.ProfileError as exc:
+        payload.update(status="refused", reason=str(exc), layer=exc.layer, file=exc.file,
+                       next_action="Correct the indicated file or command-line layer, then retry. Run aegis team config presets --json for preset and host choices; repository policy changes need aegis approve before merge.")
+        code = exc.exit_code
+    except (OSError, ValueError, RuntimeError):
+        payload.update(status="refused", reason="profile operation unavailable", layer="filesystem",
+                       file=str(root.joinpath(*team_profile.REPO_PATH)),
+                       next_action="Check the trusted workspace and home directories and retry on a platform with anchored file operations.")
+        code = EXIT_REFUSED
+    payload = display_profile(payload)
+    if args.json:
+        _emit(payload)
+    elif payload["status"] == "refused":
+        print("refused: " + payload["reason"] + "\nnext_action: " + payload["next_action"], file=sys.stderr)
+    else:
+        # Preserve provenance and actionable instructions in the human view too.
+        print(json.dumps(payload, indent=2))
+    return code
+
+
 # ── Failures ─────────────────────────────────────────────────────────────────
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
@@ -247,6 +370,9 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action in ("config", "doctor"):
+        root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
+        return _profile_command(args, root, int(time.time()))
     if action not in _HANDLERS:
         print(f"usage: aegis team {{{','.join(ACTIONS)}}} ...", file=sys.stderr)
         print("aegis team --help describes each action.", file=sys.stderr)
@@ -284,6 +410,15 @@ class TeamCommand(AegisCommand):
                             help="Strip ANSI styling and emoji")
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
+        config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
+        config_sub = config.add_subparsers(dest="config_action")
+        config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
+        config_sub.add_parser("presets", parents=[common], help="List built-in team presets")
+        config_init = config_sub.add_parser("init", parents=[common], help="Write the repository team profile")
+        config_init.add_argument("--preset", required=True, help="Preset name from config presets")
+        config_init.add_argument("--host", default=None, metavar="KIND", help="Bind the preset host kind at initialization; see config presets --json")
+        config_init.add_argument("--force", action="store_true", help="Replace an existing valid profile")
+        sub.add_parser("doctor", parents=[common], help="Check profile completeness and host CLIs on PATH")
         lane_help = f"Lane name: {team.LANE_GRAMMAR}"
         expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
 
