@@ -375,7 +375,8 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
               skipped=(), scanner_results=None) -> list:
     """Print the ``check --ci`` result in ``fmt`` and append the step summary; return the blocking causes."""
     from aegis_cli import sanitize_display
-    from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, governance_note, perf_line
+    from aegis_cli.formatters.report import (coverage_explanation, coverage_omitted_count, coverage_reason, format_sarif_report,
+                                             github_annotation_lines, governance_note, perf_line)
     from aegis_cli.verify import _append_step_summary
     from aegis_core import regression
 
@@ -462,9 +463,11 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         ratio = cov_report.get("ratio")
         print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
                                f"{cov_report.get('executable_lines', 0)} changed executable lines "
-                               f"({len(cov_report.get('unmeasured') or ())} file(s) not measured)", 400))
+                               f"({coverage_omitted_count(cov_report)} file(s) not measured)", 400))
     elif cov_report is not None:
-        print(sanitize_display(f"  coverage: UNVERIFIED ({cov_report.get('reason', '')})", 400))
+        print(f"  coverage: UNVERIFIED ({coverage_reason(cov_report)})")
+    if cov_report is not None:
+        print(f"  {coverage_explanation(cov_report)}")
     if skipped:
         print("  note: --no-exec: the regression and Aegis-Check trailer checks were not run")
     return blocking
