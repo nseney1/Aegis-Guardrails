@@ -23,6 +23,7 @@ from aegis_core.config import read_capped
 from aegis_core.errors import LockTimeoutError, PathTraversalError
 from aegis_core.manager_policy import ManagerError, canonical
 from aegis_core.primitives import strict_loads
+from aegis_core.workspace.binding import git_discovery_paths
 
 __all__ = ["MAX_AUDIT_BYTES", "MAX_ROW_BYTES", "ManagerStore"]
 
@@ -65,7 +66,7 @@ class ManagerStore:
         for forbidden in self.forbidden_roots:
             if self.root == forbidden or forbidden in self.root.parents or self.root in forbidden.parents:
                 raise ManagerError("store_in_worktree")
-        for ancestor in (self.root, *self.root.parents):
+        for ancestor in git_discovery_paths(self.root):
             if os.path.lexists(ancestor / ".git"):
                 raise ManagerError("store_in_worktree")
 

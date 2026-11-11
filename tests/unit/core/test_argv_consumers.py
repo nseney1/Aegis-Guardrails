@@ -180,3 +180,11 @@ def test_driver_never_rejoins_a_repository_relative_program_path(commands, platf
     plan = read("driver", "my tool --json")
     assert plan.argv == ()
     assert plan.unavailable == "the driver registered for '.rf17' needs 'my', which was not found on PATH"
+
+
+@pytest.mark.parametrize("platform", ["nt"], indirect=True)
+@pytest.mark.parametrize("quoting", ["single", "double", "unquoted"])
+def test_public_driver_decoder_retains_runner_path_fallback(commands, platform, quoting):
+    _read, program, _root, _calls = commands
+    first = {"single": shlex.quote(str(program)), "double": f'"{program}"', "unquoted": str(program)}[quoting]
+    assert runner.split_driver_command(first + " --json") == [str(program), "--json"]

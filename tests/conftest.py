@@ -2,14 +2,22 @@
 
 The suite deliberately avoids requiring pyyaml: several invariants under test
 exist precisely because `soma_mcp/` must work on a bare interpreter.
+
+The temporary-directory guard refuses before initialization if any spelling it
+can derive contains the path separator. This deliberately includes false refusals
+when an alternative symlink interpretation is unsafe but pytest would use a safe
+path. A path changing between the check and pytest's initialization is outside
+this guard's scope; RF-88 covers the controller entry point.
 """
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import pytest
+from _pytest.tmpdir import get_user
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,15 +81,63 @@ def repo_root():
     return REPO_ROOT
 
 
+def _ceiling_path_spellings(candidate, child=None):
+    """Yield the union of supplied, absolute and physical interpretations."""
+    def variants(path):
+        yield path
+        absolute = Path(os.path.abspath(str(path)))
+        yield absolute
+        yield path.resolve(strict=False)
+        yield absolute.resolve(strict=False)
+
+    supplied = Path(candidate)
+    yield from variants(supplied if child is None else supplied / child)
+    if child is not None:
+        for root in variants(supplied):
+            yield root
+            joined = root / child
+            yield joined
+            yield joined.resolve(strict=False)
+
+
+def _validate_ceiling_path(candidate, child=None):
+    """Refuse any derived spelling that cannot form a Git ceiling."""
+    try:
+        for path in _ceiling_path_spellings(candidate, child):
+            if os.pathsep not in str(path):
+                continue
+            from aegis_cli import sanitize_display
+            from aegis_core.redaction import redact_command_secrets
+
+            displayed = redact_command_secrets(sanitize_display(path, max_len=None))[:512]
+            raise pytest.UsageError(
+                "choose --basetemp outside paths containing the path separator "
+                + repr(os.pathsep) + ": " + displayed
+            )
+    except (OSError, RuntimeError, ValueError):
+        raise pytest.UsageError("cannot resolve pytest temporary directory") from None
+
+
+def pytest_configure(config):
+    """Refuse unsafe derived spellings before pytest initializes basetemp."""
+    candidate = config.option.basetemp
+    if candidate is None:
+        # _pytest/tmpdir.py: 8.3.4 lines 156-167; 9.1.1 lines 161-172.
+        # Numbered children use the fixed pytest- prefix and digits only.
+        temproot = os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()
+        # Check both the named user directory and pytest's OSError fallback.
+        children = dict.fromkeys(("pytest-of-" + (get_user() or "unknown"), "pytest-of-unknown"))
+        for child in children:
+            _validate_ceiling_path(temproot, child=child)
+    else:
+        _validate_ceiling_path(candidate)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _tmp_path_git_ceiling(tmp_path_factory):
     """Stop Git discovery above temporary workspaces before per-test env snapshots."""
     basetemp = tmp_path_factory.getbasetemp().resolve()
-    # Per-test ceilings extend basetemp, so its name must also be representable.
-    if os.pathsep in str(basetemp):
-        raise pytest.UsageError(
-            "choose --basetemp outside paths containing the path separator " + repr(os.pathsep)
-        )
+    _validate_ceiling_path(basetemp)
     # A ceiling inside the source tree would also hide Git from sibling directories.
     ceiling_path = basetemp if Path(REPO_ROOT).resolve() in basetemp.parents else basetemp.parent
     ceiling = str(ceiling_path)
