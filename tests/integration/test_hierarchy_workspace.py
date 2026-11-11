@@ -3,6 +3,7 @@
 Git repositories and Aegis leases here are real. Initiative labels are fixtures: nothing
 in this file observes a host session, and a simulated run proves no host behavior.
 """
+import errno
 import hashlib
 import json
 import os
@@ -12,10 +13,12 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 import venv
 
 import pytest
 
+from tools import hierarchy_workspace as controller
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, message
 from tests.integration.test_hierarchy_scenario import aegis
 
@@ -23,6 +26,45 @@ from tests.integration.test_hierarchy_scenario import aegis
 CONTROLLER = ROOT / "tools" / "hierarchy_workspace.py"
 COMMIT = "a" * 40
 LATER_COMMIT = "b" * 40
+
+
+@pytest.mark.parametrize("kind", controller.KINDS)
+def test_request_replay_has_linear_request_visits(kind):
+    class CountedRequests(dict):
+        visits = 0
+
+        def values(self):
+            for row in super().values():
+                self.visits += 1
+                yield row
+
+    ledger = controller.Ledger()
+    ledger.requests = CountedRequests()
+
+    def apply(kind, data, schema=controller.EVENT_SCHEMA):
+        ledger.apply({"schema": schema, "seq": ledger.seq + 1, "at": "2026-11-10T00:00:00Z",
+                      "kind": kind, "data": data})
+
+    apply("init", {"writer_limit": 3, "heavy_limit": 1})
+    apply("register", {"id": "a1", "project": "aegis", "repository": "aegis", "priority": 1,
+                       "target_branch": "develop"})
+    for index in range(40):
+        old, new = "req-%08d" % (index * 2), "req-%08d" % (index * 2 + 1)
+        body = {"initiative": "a1", "kind": kind, "holder": "same"}
+        apply("request", {**body, "request_id": old})
+        with pytest.raises(ValueError, match="^holder already has an open request$"):
+            apply("request", {**body, "request_id": new})
+        apply("request", {**body, "request_id": new, "supersedes": old}, controller.SUPERSEDE_EVENT_SCHEMA)
+        if index % 2:
+            apply("withdraw", {"request_id": new, "source": "fixture"})
+        else:
+            apply("grant", {"request_id": new})
+            with pytest.raises(ValueError, match="^holder already has an open request$"):
+                apply("request", {**body, "request_id": "refused"})
+            apply("release", {"request_id": new, "evidence": {"path": str(CONTROLLER), "sha256": "a" * 64}})
+        apply("set_limits", {"source": "fixture", "heavy_limit": 1})
+    assert ledger.requests.visits <= ledger.seq
+    assert controller.capacity_view(ledger)[kind]["used"] == 0
 
 
 class Workspace:
@@ -72,6 +114,198 @@ def workspace(tmp_path):
     space = Workspace(tmp_path)
     space.run("init", {"writer_limit": 3, "heavy_limit": 1})
     return space
+
+
+def memo_store(space):
+    if not controller._memo_supported():
+        pytest.skip("workspace memo needs checked POSIX descriptor reads")
+    return controller.Store(space.store)
+
+
+def test_store_replays_only_new_events_and_rebuilds_changed_or_missing_keys(workspace, monkeypatch):
+    workspace.register("a1")
+    old = workspace.ask("a1")
+    store = memo_store(workspace)
+    applied = []
+    original = controller.Ledger.apply
+
+    def apply(ledger, event):
+        applied.append(event["seq"])
+        return original(ledger, event)
+
+    monkeypatch.setattr(controller.Ledger, "apply", apply)
+    first = store.load()
+    assert applied == [1, 2, 3]
+    applied.clear()
+    assert store.load().requests == first.requests
+    assert applied == []
+    workspace.run("request", {"initiative": "a1", "kind": "writer", "holder": "a1/lane", "supersedes": old})
+    assert store.load().requests[old]["state"] == "withdrawn"
+    assert applied == [4]
+    applied.clear()
+    path = event_files(workspace)[1]
+    event = json.loads(path.read_text())
+    event["data"]["priority"] = 20
+    metadata = path.stat()
+    path.write_bytes(controller.encoded(event) + b"\n")
+    assert path.stat().st_size == metadata.st_size
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    assert store.load().initiatives["a1"]["priority"] == 20
+    assert applied == [1, 2, 3, 4]
+    applied.clear()
+    event_files(workspace)[-1].unlink()
+    assert store.load().requests[old]["state"] == "queued"
+    assert applied == [1, 2, 3]
+
+
+def test_store_memo_isolated_from_callers_and_failed_publication(workspace, monkeypatch):
+    workspace.register("a1")
+    store = memo_store(workspace)
+    ledger = store.load()
+    ledger.initiatives["a1"]["priority"] = 999
+    assert store.load().initiatives["a1"]["priority"] == 10
+
+    def refuse(*args):
+        raise OSError("fixture publication failure")
+
+    monkeypatch.setattr(controller, "publish_file", refuse)
+    with pytest.raises(OSError, match="^fixture publication failure$"):
+        store.append(ledger, "request", {"request_id": "req-00000003", "initiative": "a1",
+                                         "kind": "writer", "holder": "same"})
+    assert store.load().requests == {}
+
+
+@pytest.mark.parametrize("report_first", [False, True])
+def test_store_memo_keeps_report_timestamp_leniency_separate(workspace, report_first):
+    workspace.register("a1")
+    identifier = workspace.ask("a1")
+    store = memo_store(workspace)
+    store.load()
+    path = event_files(workspace)[-1]
+    event = json.loads(path.read_text())
+    event["at"] = "invalid fixture timestamp"
+    path.write_text(json.dumps(event))
+
+    def strict():
+        with pytest.raises(ValueError, match="malformed workspace event:"):
+            store.load()
+
+    if not report_first:
+        strict()
+    assert store.load(for_report=True).requests[identifier]["requested_at"] is None
+    strict()
+
+
+def test_store_without_descriptor_support_replays_without_a_memo(workspace, monkeypatch):
+    monkeypatch.setattr(controller, "_memo_supported", lambda: False)
+    store = controller.Store(workspace.store)
+    assert store.load().seq == 1
+    workspace.register("a1")
+    assert store.load().seq == 2
+
+
+@pytest.mark.parametrize("damage,error", [
+    ("gap", "nonconsecutive workspace event:"),
+    ("malformed", "malformed workspace event:"),
+    ("unexpected", "unexpected workspace store entry:"),
+    ("oversized", "input exceeds 262144 bytes"),
+])
+def test_warm_store_still_refuses_damaged_history(workspace, damage, error):
+    workspace.register("a1")
+    workspace.ask("a1")
+    store = memo_store(workspace)
+    store.load()
+    paths = event_files(workspace)
+    if damage == "gap":
+        paths[1].unlink()
+    elif damage == "malformed":
+        paths[-1].write_bytes(b"{")
+    elif damage == "unexpected":
+        (workspace.store / "events" / "surprise").write_bytes(b"{}")
+    else:
+        paths[-1].write_bytes(b" " * (controller.MAX_BYTES + 1))
+    with pytest.raises(ValueError, match=error):
+        store.load()
+
+
+def test_warm_store_replays_after_directory_replacement_with_unchanged_file_keys(workspace, monkeypatch):
+    workspace.register("a1")
+    store = memo_store(workspace)
+    replacement = workspace.store / "replacement-events"
+    replacement.mkdir()
+    for path in store.events.iterdir():
+        os.link(path, replacement / path.name)
+    store.load()
+    before = [(path.name, path.stat()) for path in sorted(store.events.iterdir())]
+    store.events.rename(workspace.store / "old-events")
+    replacement.rename(store.events)
+    assert [(path.name, path.stat()) for path in sorted(store.events.iterdir())] == before
+    applied = []
+    original = controller.Ledger.apply
+
+    def apply(ledger, event):
+        applied.append(event["seq"])
+        return original(ledger, event)
+
+    monkeypatch.setattr(controller.Ledger, "apply", apply)
+    assert store.load().seq == 2
+    assert applied == [1, 2]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_warm_store_refuses_symlinks(workspace, pending):
+    store = memo_store(workspace)
+    store.load()
+    target = workspace.tmp / "target.json"
+    target.write_bytes(event_files(workspace)[0].read_bytes())
+    link = store.events / (".pending-fixture" if pending else "00000001.json")
+    if not pending:
+        link.unlink()
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ValueError, match="symlink paths are not supported:"):
+        store.load()
+
+
+@pytest.mark.parametrize("component", ["store", "events", "00000001.json"])
+def test_store_never_follows_a_concurrent_symlink_swap_and_closes_descriptors(workspace, monkeypatch, component):
+    store = memo_store(workspace)
+    original_open, original_close = os.open, os.close
+    opened = set()
+    swapped = []
+    victim = store.path if component == "store" else store.events if component == "events" else event_files(workspace)[0]
+    replacement = workspace.tmp / "replacement"
+    if victim.is_dir():
+        replacement.mkdir()
+    else:
+        replacement.write_text("{}")
+    # Probe before injecting the race, so platforms that prohibit links skip cleanly.
+    probe = workspace.tmp / "symlink-probe"
+    try:
+        probe.symlink_to(replacement, target_is_directory=replacement.is_dir())
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    probe.unlink()
+
+    def open_path(path, flags, *args, **kwargs):
+        if str(path) == component and not swapped:
+            victim.rename(victim.with_name(victim.name + "-old"))
+            victim.symlink_to(replacement, target_is_directory=replacement.is_dir())
+            swapped.append(True)
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.add(descriptor)
+        return descriptor
+
+    def close(descriptor):
+        opened.remove(descriptor)
+        return original_close(descriptor)
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_path, "close": close}))
+    with pytest.raises(ValueError, match="workspace event (directory )?is unavailable"):
+        store.load()
+    assert swapped and not opened
 
 
 @pytest.mark.parametrize("request_body,error", [
@@ -821,7 +1055,15 @@ def test_status_is_read_only(workspace):
     assert {path: path.read_bytes() for path in workspace.store.rglob("*") if path.is_file()} == before
 
 
-def test_five_initiatives_across_two_projects_keep_the_caps_and_the_priority_order(workspace):
+def test_five_initiatives_across_two_projects_keep_the_caps_and_the_priority_order(workspace, capsys, monkeypatch):
+    def run(command, request=None, *, expect=0, raw=False, **flags):
+        code = controller.main(workspace.argv(command, request, **flags)[3:])
+        captured = capsys.readouterr()
+        assert not captured.err, captured.err
+        assert code == expect, captured.out
+        return captured.out if raw else json.loads(captured.out)
+
+    monkeypatch.setattr(workspace, "run", run)
     plan = {"a-45": ("aegis", 1), "a-47": ("aegis", 2), "a-docs": ("aegis", 40), "s-settings": ("stormheir", 3),
             "s-audio": ("stormheir", 30)}
     for name, (project, priority) in plan.items():
@@ -855,3 +1097,65 @@ def test_five_initiatives_across_two_projects_keep_the_caps_and_the_priority_ord
         assert capacity["writer"]["used"] == sum(1 for r in granted if r["kind"] == "writer")
         assert capacity["heavy"]["used"] == sum(1 for r in granted if r["kind"] == "heavy")
     assert Path(workspace.store).is_dir()
+
+
+def test_store_can_replay_through_a_search_only_ancestor(workspace):
+    store = memo_store(workspace)
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory read permissions")
+    mode = workspace.tmp.stat().st_mode & 0o7777
+    try:
+        workspace.tmp.chmod(0o111)
+        assert store.load().seq == 1
+        assert store.load().seq == 1
+    finally:
+        workspace.tmp.chmod(mode)
+
+
+@pytest.mark.parametrize("damage", [None, "growth", "shrink", "growth-past-limit"],
+                         ids=["unchanged", "growth", "shrink", "growth-past-limit"])
+def test_store_load_completes_short_reads_and_retries_eintr(workspace, monkeypatch, damage):
+    workspace.register("a1")
+    workspace.ask("a1")
+    workspace.grant()
+    store = memo_store(workspace)
+    expected = controller.Store(workspace.store).load()
+    event = event_files(workspace)[0]
+    original_bytes = event.read_bytes()
+    delivered, descriptors, interrupted, changed = {}, set(), [], []
+    chunks = []
+
+    def read(descriptor, size):
+        descriptors.add(descriptor)
+        identity = os.fstat(descriptor).st_ino
+        used = delivered.get(identity, 0)
+        assert 0 < size <= controller.MAX_BYTES + 1 - used
+        if chunks and not interrupted:
+            interrupted.append(True)
+            raise InterruptedError(errno.EINTR, "fixture interrupted read")
+        chunk = os.read(descriptor, min(size, 17 if len(chunks) < 4 else 4096))
+        chunks.append(chunk)
+        delivered[identity] = used + len(chunk)
+        if damage is not None and not changed:
+            changed.append(True)
+            if damage == "shrink":
+                event.write_bytes(original_bytes[:-5])
+            else:
+                growth = 5 if damage == "growth" else controller.MAX_BYTES + 1
+                event.write_bytes(original_bytes + b" " * growth)
+        return chunk
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "read": read}))
+    if damage is None:
+        assert vars(store.load()) == vars(expected)
+    else:
+        with pytest.raises(ValueError, match="^malformed workspace event: .*: workspace event changed while reading$"):
+            store.load()
+        assert changed == [True]
+    assert interrupted == [True]
+    assert len(chunks) > 1
+    assert all(size <= controller.MAX_BYTES + 1 for size in delivered.values())
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
