@@ -33,6 +33,9 @@ RB2_PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
                           'pass an absolute, executable "python" in the init request')
 RB2_RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
                                   'restore it, or remove the unregistered base and run init again')
+RB2D_REGISTERED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
+                                    'inspect the "python" field in this base\'s provision.json, '
+                                    'restore that exact interpreter, then retry')
 _SOURCE_SEED = pytest.StashKey[Path]()
 LINK_FALLBACK = frozenset(getattr(errno, name) for name in
                           ("EXDEV", "EPERM", "EACCES", "ENOSYS", "EOPNOTSUPP", "ENOTSUP", "EMLINK")
@@ -586,7 +589,7 @@ def test_rb2c_add_role_refuses_an_unavailable_recorded_interpreter(setup, host, 
     path.write_text(json.dumps(record), encoding="utf-8")
     before = {p.relative_to(setup.base): p.read_bytes() for p in setup.base.rglob("*") if p.is_file()}
     assert setup.add_role("pilot/orchestrator", host, session="01a19a8e-3073-7af2-b5c0-d0c41fe82ada", cwd=str(setup.source),
-                          expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+                          expect=2) == {"error": RB2D_REGISTERED_PYTHON_UNAVAILABLE}
     assert {p.relative_to(setup.base): p.read_bytes() for p in setup.base.rglob("*") if p.is_file()} == before
 
 
@@ -600,7 +603,7 @@ def test_rb2c_add_role_interpreter_probe_failure_is_a_fixed_refusal(setup, mr1_c
 
     monkeypatch.setattr(module, "os", SimpleNamespace(X_OK=os.X_OK, access=unavailable))
     assert call("add-role", setup.request(base=str(setup.base), endpoint="pilot/orchestrator", host="claude-code"),
-                expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+                expect=2) == {"error": RB2D_REGISTERED_PYTHON_UNAVAILABLE}
     assert invoke(setup.root, "status")["bindings"] == before
 
 
@@ -609,9 +612,12 @@ def rb2c_registered_move(setup):
     old = setup.tmp / "old" / "mailbox"
     old.parent.mkdir()
     invoke(old, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {
-        "pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/root": {}}, "writer_limit": 3, "counterparts": []})
+        "pilot/front-door": {}, "pilot/orchestrator": {}, "pilot/root": {}, "pilot/lane/f2": {"kind": "implementer"}},
+                         "writer_limit": 3, "counterparts": []})
     invoke(old, "bind", {"endpoint": "pilot/orchestrator", "host": "codex", "session": "native-orchestrator",
                          "expected_generation": 0})
+    invoke(old, "bind", {"endpoint": "pilot/front-door", "host": "claude-code",
+                         "session": "01a19a8e-3073-7af2-b5c0-d0c41fe82adb", "expected_generation": 0})
     body = {"store": str(setup.workspace.store), "base": str(setup.base), "source": str(setup.source),
             "old_root": str(old), "hierarchy": "pilot", "note": "The owner approved this move.",
             "root": {"host": "codex", "session": "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"},
@@ -636,7 +642,50 @@ def test_rb2c_registered_move_refuses_an_unavailable_recorded_python(rb2c_regist
     record["python"] = str(built.tmp / "deleted-python")
     path.write_text(json.dumps(record), encoding="utf-8")
     before = {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()}
-    assert provision("move", built.request(**body), expect=2) == {"error": RB2_RECORDED_PYTHON_UNAVAILABLE}
+    result = provision("move", built.request(**body), expect=2)
+    assert {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()} == before
+    assert result == {"error": RB2D_REGISTERED_PYTHON_UNAVAILABLE}
+
+
+@pytest.mark.parametrize("python", ["", 5, None, "\x00", "x" * 4097],
+                         ids=["empty", "integer", "null", "nul", "oversized"])
+@pytest.mark.parametrize("registered", [False, True])
+def test_rb2d_move_validates_explicit_python_before_registration(rb2c_registered_move, python, registered):
+    built, body = rb2c_registered_move
+    if not registered:
+        folder = built.tmp / "unregistered"
+        folder.mkdir()
+        workspace = Workspace(folder)
+        workspace.run("init", {"writer_limit": 3, "heavy_limit": 3})
+        body["store"] = str(workspace.store)
+    before = {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()}
+    assert provision("move", built.request(**body, python=python), expect=2) == {"error": "invalid python"}
+    assert {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("command", ["add-role", "move"])
+@pytest.mark.parametrize("recorded", [
+    "/missing/x\nghp_" + "a" * 30,
+    "/missing/\uff50\uff59\uff54\uff48\uff4f\uff4e  with\tspace/bin/python",
+    "/missing/python  with\tspace/bin/python",
+    "/missing/ghp_" + "a" * 30 + "/python",
+    "/missing/\uff47\uff48\uff50_" + "a" * 30 + "/python",
+    "/missing/" + "a" * 300,
+], ids=["boundary-loss", "fullwidth-whitespace", "whitespace", "token", "fullwidth-token", "long"])
+def test_rb2d_registered_python_refusal_never_echoes_recorded_value(rb2c_registered_move, command, recorded):
+    built, body = rb2c_registered_move
+    path = built.base / "provision.json"
+    record = json.loads(path.read_text())
+    record["python"] = recorded
+    path.write_text(json.dumps(record), encoding="utf-8")
+    before = {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()}
+    request = body if command == "move" else {"base": str(built.base), "endpoint": "pilot/front-door", "host": "claude-code"}
+    result = provision(command, built.request(**request), expect=2)
+    assert result == {"error": RB2D_REGISTERED_PYTHON_UNAVAILABLE}
+    refusal = result["error"]
+    assert recorded not in refusal
+    assert "/missing/" not in refusal and "ghp_" not in refusal and "a" * 30 not in refusal
+    assert '"python" field' in refusal and "this base's provision.json" in refusal
     assert {p.relative_to(built.base): p.read_bytes() for p in built.base.rglob("*") if p.is_file()} == before
 
 
