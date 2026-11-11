@@ -367,6 +367,41 @@ def spec_for(roots, **changes):
             "outgoing_stopped": True, "entries": entries, **changes}
 
 
+def test_unmanaged_handoff_does_not_require_the_posix_stop_writer_module(tmp_path, roots):
+    # MODELLED OS module availability, not Windows/native-host qualification. Run the real public CLI.
+    path = tmp_path / "handoff-spec.json"
+    path.write_text(json.dumps(spec_for(roots)), encoding="utf-8")
+    bootstrap = '''import builtins, json, pathlib, subprocess, sys, types
+importing = builtins.__import__
+target, spec = sys.argv[1:]
+def without_writer(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "fcntl":
+        raise ModuleNotFoundError("modelled POSIX writer module unavailable")
+    if name == "hierarchy_launcher" and level == 0:
+        path = pathlib.Path(target).with_name("hierarchy_launcher.py")
+        module = types.ModuleType("isolated_handoff_launcher")
+        module.__dict__.update(__file__=str(path), __package__="",
+            __builtins__={**vars(builtins), "__import__": without_writer})
+        exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+        return module
+    return importing(name, globals, locals, fromlist, level)
+sys.argv = [target, "--spec", spec]
+namespace = {"__file__": target, "__name__": "__main__", "__package__": "",
+             "__builtins__": {**vars(builtins), "__import__": without_writer}}
+exec(compile(pathlib.Path(target).read_bytes(), target, "exec"), namespace)
+'''
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ("CLAUDECODE", "CLAUDE_PID") and not key.startswith("CLAUDE_CODE_")}
+    environment.update(HOME=str(home), PYTHONDONTWRITEBYTECODE="1")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", bootstrap, str(HANDOFF), str(path)],
+                            cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0 and result.stderr == "", result.stdout + result.stderr
+    answer = json.loads(result.stdout)
+    assert answer["ok"] and [entry["generation"] for entry in answer["entries"]] == [2, 2, 2]
+
+
 def test_one_command_rotates_every_endpoint_and_acknowledgment_stays_separate(tmp_path, roots):
     result = handoff(tmp_path, spec_for(roots), 0)
     assert [row["ok"] for row in result["entries"]] == [True, True, True]

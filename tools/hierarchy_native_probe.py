@@ -20,6 +20,8 @@ the role with the launcher. ROOT is read for its settings only, from a rollout t
 starts or stops it. ~/.codex is hashed before and after, the worktree is removed with `git worktree remove`
 (never prune or repair), and the disposable login is deleted. SIGTERM, SIGHUP or SIGINT runs that cleanup too and
 leaves a report with state "interrupted"; after a SIGKILL, `cleanup --probe-root` does it from the launch records.
+Unresolved endpoint custody or an unreadable process census keeps the worktree and fails cleanup explicitly;
+the disposable login is still removed, and the remaining roles are still checked.
 
 Verdicts come from evidence, never model text: ALLOWED means the nonce is in the target file; REFUSED means the
 nonce is absent and the rollout records the exact planned command (the whole command string, its argv, or a host
@@ -41,6 +43,7 @@ Results prove this host and Codex version only, and a run against the fake prove
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -54,13 +57,14 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hierarchy_mailbox import fields, integer, read_json, require, safe_path, text  # noqa: E402
+from hierarchy_mailbox import fields, integer, read_json, require, safe_path, text, writer_lock  # noqa: E402
 import hierarchy_native as native  # noqa: E402
 import hierarchy_roles  # noqa: E402
 import hierarchy_probe_evidence as evidence_analysis  # noqa: E402
@@ -983,6 +987,46 @@ def settings_check(rollout, session, profile, reviewer, turn_id):
 
 # ---------------------------------------------------------------- run
 
+class CleanupFences:
+    """Explicit launch scopes and their retained namespace witnesses, including writer roots."""
+    def __init__(self, scopes, fences):
+        self._scopes, self._fences = scopes, tuple(fences)
+
+    def __getitem__(self, key):
+        return self._scopes[key]
+
+    def check(self):
+        for fence in self._fences:
+            fence.check()
+
+
+@contextmanager
+def cleanup_locks(planned_roles):
+    """Fence deletion against bind/handoff and stop, in their writer-then-endpoint lock order.
+
+    Create the same inert endpoint directory as start even before the first binding. The mailbox writer
+    fence alone cannot exclude a start, which spawns before add-role takes that fence.
+    """
+    import hierarchy_launcher
+
+    require(isinstance(planned_roles, (tuple, list)) and len(planned_roles) <= hierarchy_launcher.MAX_RECORDS,
+            "cleanup endpoint limit exceeded")
+    scopes = {(role["base"], role["endpoint"]): hierarchy_launcher.Launches(role["base"])
+              for role in planned_roles}
+    with ExitStack() as locks:
+        fences = []
+        for root in sorted({launch.mailbox.root for launch in scopes.values()}, key=str):
+            fences.append(locks.enter_context(hierarchy_launcher.directory_fence(root)))
+            locks.enter_context(writer_lock(root))
+            fences[-1].check()
+        for (_, endpoint), launch in sorted(scopes.items()):
+            launch.mailbox.endpoint(endpoint)
+            fences.append(locks.enter_context(hierarchy_launcher.stop_endpoint_lock(launch.mailbox.root, endpoint, create=True)))
+        result = CleanupFences(scopes, fences)
+        result.check()
+        yield result
+
+
 class Runner:
     def __init__(self, state, cap, key_name, codex, fake, auth="api-key", auth_sha=None):
         self.state, self.cap, self.key_name, self.codex, self.fake = state, cap, key_name, codex, fake
@@ -1244,8 +1288,32 @@ class Runner:
                     time.sleep(POLL_SECONDS)
             finally:
                 # The launcher's stop runs even when a read fails, so a reader error never leaves the turn running.
-                code, answer = self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"],
-                                             "--grace-seconds", str(grace))
+                # Stop now requires kernel group absence. Reap our own child alongside the synchronous
+                # stop, so our zombie cannot keep its group alive while we wait for that same stop.
+                settled, wait_errors = threading.Event(), []
+                def reap_owned_child():
+                    while not settled.is_set():
+                        try:
+                            process.wait(timeout=POLL_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            continue
+                        except (OSError, ValueError) as exc:
+                            wait_errors.append(exc)
+                        return
+                waiter = threading.Thread(target=reap_owned_child, name="aegis-probe-hold-reap")
+                try:
+                    try:
+                        waiter.start()
+                    except RuntimeError:
+                        wait_errors.append(ValueError("hold child exit observer unavailable"))
+                    code, answer = self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"],
+                                                 "--grace-seconds", str(grace))
+                finally:
+                    settled.set()
+                    if waiter.ident is not None:
+                        waiter.join()
+                if wait_errors:
+                    raise wait_errors[0]
                 try:
                     process.wait(timeout=grace + 5)
                 except subprocess.TimeoutExpired:
@@ -1259,7 +1327,8 @@ class Runner:
         found = next((r for r in rows if r["turn_id"] == turn), None)
         return {"state": answer.get("state", "refused"),
                 "turn_context": None if found is None else found["context"],
-                "stop": {key: answer.get(key) for key in ("state", "pids", "wake_marker_present", "grace_seconds", "error")
+                "stop": {key: answer.get(key) for key in ("state", "pids", "wake_marker_present", "grace_seconds", "error",
+                                                         "unresolved_groups")
                          if key in answer} | {"launcher_exit": code},
                 "exit_code": process.returncode, "turn_id": turn,
                 "turn_completed": None if found is None else found["completed"],
@@ -1304,17 +1373,28 @@ class Runner:
             self.failures.append("ROOT multi-agent: " + "; ".join(answer["multi_agent"]["reasons"]))
         return answer
 
-    def recorded_sessions(self):
+    def recorded_sessions(self, unavailable=None):
         """(planned role, session) from this run and from every role's launch records, so a run killed before
         it learned a session (or the cleanup command after a SIGKILL) still finds it."""
         import hierarchy_launcher
         found = list(self.sessions)
         for planned in self.state["roles"]:
             folder = Path(planned["base"]) / "launches" / hierarchy_launcher.quoted(planned["endpoint"])
-            for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+            try:
+                paths = hierarchy_launcher.launch_record_paths(planned["base"], planned["endpoint"])
+            except (ValueError, OSError) as exc:
+                if unavailable is None:
+                    raise ValueError("launch directory unreadable: " + str(folder)) from exc
+                unavailable(planned, "launch directory unreadable: %s: %s" % (folder, exc))
+                continue
+            for path in paths:
                 try:
-                    session = read_json(path).get("session")
-                except (ValueError, OSError, AttributeError):
+                    raw = hierarchy_launcher.read_launch_record(planned["base"], planned["endpoint"], path.name)
+                    session = hierarchy_launcher.metadata_json(raw, "launch record").get("session")
+                except (ValueError, OSError, AttributeError, UnicodeError, RecursionError) as exc:
+                    if unavailable is None:
+                        raise ValueError("launch record unreadable: " + str(path)) from exc
+                    unavailable(planned, "launch record unreadable: %s: %s" % (path, exc))
                     continue
                 if isinstance(session, str) and session and (planned, session) not in found:
                     found.append((planned, session))
@@ -1322,31 +1402,131 @@ class Runner:
 
     def cleanup(self):
         import hierarchy_launcher
-        leftover, running = [], []
-        for planned, session in self.recorded_sessions():
-            try:
-                if hierarchy_launcher.session_processes(session, {os.getpid()}):
-                    # A turn the run stops itself is gone by now; one listed here escaped the run's own stop.
-                    running.append(session)
-                    self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"], "--grace-seconds", "2")
-                leftover += [pid for pid, _ in hierarchy_launcher.session_processes(session, {os.getpid()})]
-            except (ValueError, OSError, subprocess.SubprocessError):
-                leftover.append(None)
+        leftover, running, pending, blocked = [], [], [], set()
+        # TypeError includes CensusUnavailable and malformed observation results. It is a visible failed
+        # cleanup obligation, never an empty census or permission to delete.
+        failures = (ValueError, OSError, TypeError, KeyError, subprocess.SubprocessError)
+
+        def hold(planned, reason):
+            entry = {"base": planned.get("base"), "endpoint": planned.get("endpoint"), "reason": str(reason)}
+            if entry not in pending:
+                pending.append(entry)
+
         # git worktree remove only (never prune or repair), and only for the worktree git still lists.
         command = ["git", "-C", self.state["source"], "worktree", "remove", "--force", self.state["worktree"]]
-        listed = git("-C", self.state["source"], "worktree", "list", "--porcelain")
-        registered = listed.returncode != 0 or any(
-            os.path.realpath(line[9:]) == os.path.realpath(self.state["worktree"])
-            for line in listed.stdout.splitlines() if line.startswith("worktree "))
         removed = None
-        if registered or os.path.lexists(self.state["worktree"]):
-            removed = subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         login_left = []
-        auth_removed, auth_error = remove_login(self.state["codex_home"], guarded_homes(self.fake), login_left)
+        inspected = {}
+
+        def inspect_binding(planned):
+            key = planned["base"], planned["endpoint"]
+            with cleanup_locks([planned]) as scopes:
+                scopes.check()
+                binding = scopes[key].binding(planned["endpoint"])
+                inspected[key] = hierarchy_launcher.binding_identity(binding)
+                if binding is not None and (planned, binding["session"]) not in sessions:
+                    sessions.append((planned, binding["session"]))
+                # Active custody is provisional until this endpoint's fenced stop. Validate its
+                # structure now; only the final fenced check decides whether it remains unresolved.
+                hierarchy_launcher.unresolved_stop_custody(*key)
+
+        try:
+            sessions = self.recorded_sessions(hold)
+            # Check every planned endpoint, even one with no immutable launch record or named live host.
+            for planned in self.state["roles"]:
+                key = planned["base"], planned["endpoint"]
+                try:
+                    inspect_binding(planned)
+                except failures as exc:
+                    hold(planned, exc)
+                    blocked.add(key)
+            # This diagnostic describes what cleanup found, before any stop can change the observation.
+            # Failed observation still holds deletion and never skips a planned role's fenced stop.
+            for planned, session in sessions:
+                try:
+                    if hierarchy_launcher.session_processes(session, {os.getpid()}):
+                        running.append(session)
+                except failures as exc:
+                    hold(planned, exc)
+            for planned in self.state["roles"]:
+                # An unreadable precheck holds deletion. A later successful inspection can still grant
+                # this role's fenced stop; no stop may silently select a replacement binding.
+                try:
+                    key = planned["base"], planned["endpoint"]
+                    if key not in inspected:
+                        inspect_binding(planned)
+                    code, result = self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"],
+                                                 "--grace-seconds", "2", "--expected-binding",
+                                                 json.dumps(inspected[key], sort_keys=True))
+                    if code and not (code == 2 and result.get("state") == "refused" and
+                                     result.get("session") is None and result.get("error") == "endpoint has no binding"):
+                        hold(planned, result.get("error", "session stop failed"))
+                except failures as exc:
+                    hold(planned, exc)
+            for planned, session in sessions:
+                try:
+                    leftover += [pid for pid, _ in hierarchy_launcher.session_processes(session, {os.getpid()})]
+                except failures as exc:
+                    leftover.append(None)
+                    hold(planned, exc)
+            def final_census(scopes=None):
+                # Failure to acquire all fences forbids deletion, never observation of the remaining roles.
+                for planned in self.state["roles"]:
+                    try:
+                        with cleanup_locks([planned]) if scopes is None else nullcontext(scopes) as role_scopes:
+                            role_scopes.check()
+                            # A successor found at the deletion fence is a hold, never permission to stop it.
+                            key = planned["base"], planned["endpoint"]
+                            binding = role_scopes[key].binding(planned["endpoint"])
+                            require(key in inspected and hierarchy_launcher.binding_identity(binding) == inspected[key],
+                                    hierarchy_launcher.CLEANUP_BINDING_CHANGED)
+                            hierarchy_launcher.require_resolved_custody(*key)
+                            require(hierarchy_launcher.read_running_wake(*key) is None,
+                                    "cleanup wake still pending; preserve the worktree and run stop for this endpoint "
+                                    "before rerunning cleanup")
+                            require(not hierarchy_launcher.mailbox_wake_pending(role_scopes[key].mailbox, key[1]),
+                                    hierarchy_launcher.MAILBOX_WAKE_PENDING)
+                        if binding is not None and (planned, binding["session"]) not in sessions:
+                            sessions.append((planned, binding["session"]))
+                    except failures as exc:
+                        hold(planned, exc)
+                for planned, session in sessions:
+                    try:
+                        current = hierarchy_launcher.session_processes(session, {os.getpid()})
+                        leftover.extend(pid for pid, _ in current)
+                        if current:
+                            hold(planned, "live processes still select session " + session)
+                    except failures as exc:
+                        hold(planned, exc)
+            # All fences remain held through deletion; an earlier failure cannot be erased by this check.
+            try:
+                with cleanup_locks(self.state["roles"]) as scopes:
+                    final_census(scopes)
+                    if not pending and not leftover:
+                        listed = git("-C", self.state["source"], "worktree", "list", "--porcelain")
+                        registered = listed.returncode != 0 or any(
+                            os.path.realpath(line[9:]) == os.path.realpath(self.state["worktree"])
+                            for line in listed.stdout.splitlines() if line.startswith("worktree "))
+                        if registered or os.path.lexists(self.state["worktree"]):
+                            scopes.check()
+                            removed = subprocess.run(command, capture_output=True, text=True, timeout=60,
+                                                     stdin=subprocess.DEVNULL)
+            except failures as exc:
+                hold({}, exc)
+                final_census()
+        except failures as exc:
+            hold({}, exc)
+        finally:
+            # Credentials are disposable even when custody or discovery is unreadable. remove_login keeps
+            # its descriptor/symlink protections; uncertainty must never redirect this to an owner's home.
+            auth_removed, auth_error = remove_login(self.state["codex_home"], guarded_homes(self.fake), login_left)
         answer = {"worktree_removed": (removed is None or removed.returncode == 0)
                   and not os.path.lexists(self.state["worktree"]),
                   "auth_removed": auth_removed, "leftover_processes": sorted(leftover, key=str),
                   "found_running": running, "command": command}
+        if pending:
+            answer["unresolved_custody"] = pending
+            self.failures.append("cleanup: unresolved endpoint custody")
         if removed is not None and removed.returncode != 0:
             answer["error"] = removed.stderr.strip()[:500]
         if auth_error:
@@ -1653,26 +1833,29 @@ def cleanup_command(args):
     # The guarded homes follow the codex on PATH, as in the preflight: under the test fake the stand-in counts.
     codex = shutil.which("codex", path=os.environ.get("PATH", ""))
     runner = Runner(state, 0, None, codex, codex is not None and is_fake(codex))
-    answer = {"schema": CLEANUP_SCHEMA, "probe_root": str(root), "at": now(), "cleanup": runner.cleanup()}
-    answer["failures"] = runner.failures
-    if not os.path.lexists(root / "report.json"):
-        write_private(root / "report.json", {
-            "schema": REPORT_SCHEMA, "probe_root": str(root), "probe_id": state["probe_id"], "state": "interrupted",
-            "finished_at": now(), "codex": {"path": None, "fake": None}, "enforcement_claim": None,
-            "turn_cap": None, "turns_used": None, "login": None, "roles": [], "root": None,
-            "cleanup": answer["cleanup"], "home_codex": {"state": "unknown", "folders": []},
-            "summary": {"passed": False, "unexpected": [], "inconclusive": [],
-                        "failures": ["the run ended without its own report; the cleanup command cleaned up after it"]
-                        + runner.failures}})
-        answer["report"] = "written"
-    else:
-        answer["report"] = "kept"
     try:
-        lock.unlink()
-    except FileNotFoundError:
-        pass
-    write_private(root / "cleanup.json", answer)
-    return (0 if not runner.failures else 3), answer
+        answer = {"schema": CLEANUP_SCHEMA, "probe_root": str(root), "at": now(), "cleanup": runner.cleanup()}
+        answer["failures"] = runner.failures
+        if not os.path.lexists(root / "report.json"):
+            write_private(root / "report.json", {
+                "schema": REPORT_SCHEMA, "probe_root": str(root), "probe_id": state["probe_id"], "state": "interrupted",
+                "finished_at": now(), "codex": {"path": None, "fake": None}, "enforcement_claim": None,
+                "turn_cap": None, "turns_used": None, "login": None, "roles": [], "root": None,
+                "cleanup": answer["cleanup"], "home_codex": {"state": "unknown", "folders": []},
+                "summary": {"passed": False, "unexpected": [], "inconclusive": [],
+                            "failures": ["the run ended without its own report; the cleanup command cleaned up after it"]
+                            + runner.failures}})
+            answer["report"] = "written"
+        else:
+            answer["report"] = "kept"
+        write_private(root / "cleanup.json", answer)
+        return (0 if not runner.failures else 3), answer
+    finally:
+        # A report I/O failure is still a failed cleanup, but it must not strand the stale run lock.
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ---------------------------------------------------------------- report
