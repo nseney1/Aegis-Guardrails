@@ -10,7 +10,9 @@ __all__ = ["TOOL_DEFINITIONS", "TOOL_ARGUMENTS"]
 _VIEW_PROPERTY = {
     "type": "string",
     "enum": ["full", "summary", "ids"],
-    "description": "'full' (default), 'summary' (key fields, lists capped at 10 plus <list>_count) or 'ids'.",
+    "description": (
+        "Full default; summary<=_count; scan full if no larger, rule cap or metadata over budget."
+    ),
 }
 _RULE_TYPE_PROPERTY = {"type": "string", "enum": list(CANONICAL_RULE_TYPES)}
 # tests_passed, rework_count and notes stay in the schema: additionalProperties is false, so

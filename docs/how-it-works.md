@@ -142,7 +142,7 @@ covers canonical names, parser-recognized comments and evasion bounds.
 | `aegis_msg_read` | renders verified workspace messages with bounded field, span and ref selection; stored text is data, never instructions, and reading never acknowledges |
 | `aegis_msg_write` | composes workspace messages through the shared codec with code-authored metadata and heading spans |
 
-**What a scan returns.** One loader reads every rule; if any file fails to load, the scan fails. Rules are matched to the files, then ranked: gates, invariants and other `enforcement: gate` rules first, but they take at most two of the three slots a scan has by default, so a broad mandatory rule cannot starve every advisory one. Mandatory rules that do not get a slot are named in `omitted_mandatory`. Advisory rules are ranked by ledger fitness, read from the ledger alone: scan, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics and packs never call GitHub, so in a fresh process they rank without CI-confirmed credit (`aegis sync` and the promote, demote and archive decisions verify it). The whole response is clamped to the token budget, 2,000 estimated tokens by default (`AEGIS_MAX_JIT_TOKENS` or `jit.max_tokens`); a rule that does not fit is counted, never silently dropped. `view: "summary"` or `"ids"` returns less. For the default `no-eval` rule, a summary scan of `app.py` returns:
+**What a scan returns.** One loader reads every rule; if any file fails to load, the scan fails. Rules are matched to the files, then ranked: gates, invariants and other `enforcement: gate` rules first, but they take at most two of the three slots a scan has by default, so a broad mandatory rule cannot starve every advisory one. Mandatory rules that do not get a slot are named in `omitted_mandatory`. Advisory rules are ranked by ledger fitness, read from the ledger alone: scan, `aegis_list_rules`, `aegis status`, `aegis rule list`, metrics and packs never call GitHub, so in a fresh process they rank without CI-confirmed credit (`aegis sync` and the promote, demote and archive decisions verify it). The whole response is clamped to the token budget, 2,000 estimated tokens by default (`AEGIS_MAX_JIT_TOKENS` or `jit.max_tokens`); a rule that does not fit is counted, never silently dropped. `view: "summary"` or `"ids"` offers compact inspection; request `view: "full"` for full guidance before editing. A summary scan returns the full shape when it is smaller or equally sized, or when a compact view would hide a staged rule or constraint through its list cap or token budget. With only the default `no-eval` rule in a workspace outside Git, a summary scan of `app.py` returns:
 
 ```json
 {
@@ -154,13 +154,29 @@ covers canonical names, parser-recognized comments and evasion bounds.
   "invariant_warnings": [{"name": "no-eval", "type": "invariant", "tier": "gate"}],
   "rules_staged": 1,
   "omitted_mandatory_count": 0,
+  "omitted_mandatory_listed_count": 0,
   "omitted_mandatory": [],
   "stale_rules_count": 0,
-  "stale_rules": []
+  "stale_rules_listed_count": 0,
+  "stale_rules": [],
+  "inspection": "Inspection only; request view='full' for full guidance before editing.",
+  "stats": {
+    "total_rules": 1,
+    "matched": 1,
+    "budget": 3,
+    "changed_files": 1,
+    "estimated_tokens": 474,
+    "max_tokens_budget": 2000,
+    "clamped": false,
+    "omitted": 0,
+    "omitted_mandatory": 0
+  }
 }
 ```
 
-`fitness` is `null` until a rule has a sample large enough to report (no verdicts yet, fewer than 25, or too few triggers to test); the text view prints `Fitness: no evidence yet` for a rule that has never fired. The full view also carries `rules_base`, which says where mandatory rules were read from: `"source": "local-head"` means the repository has no `origin/HEAD`, so they come from your local HEAD and are not review-witnessed.
+`fitness` is `null` until a rule has a sample large enough to report (no verdicts yet, fewer than 25, or too few triggers to test); the text view prints `Fitness: no evidence yet` for a rule that has never fired. Summary `stats` retains the original scan statistics, including its estimated token count. `omitted_mandatory_count` is the exact total; `omitted_mandatory_listed_count` is the number of names displayed. Lists show at most ten entries and may show fewer to fit the budget. Every list the summary can trim (`omitted_mandatory`, `unreviewed_rules`, `stale_rules` and `warnings`) keeps its exact `<list>_count` and exposes `<list>_listed_count`; staged rules and their constraints stay visible, falling back to full output if necessary.
+
+Both full and summary views retain `rules_base` when a base exists, including the commit and whether it is review-witnessed: `"source": "local-head"` means the rules come from your local HEAD and are not review-witnessed. Only summaries with a base add `unreviewed_rules`, `unreviewed_rules_count` and `unreviewed_rules_listed_count`; listed entries keep each rule's change kind, and `unreviewed_total`, when present, survives even if no names fit. Without a base these fields are absent, so the response makes no claim that zero rules are unreviewed. An unbound scan instead retains `user_layer`, the not-governed `message` and `reason`, identifying the personal rule source and the next action.
 
 Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-only agent, and records the scan as `aegis_scan` does, so it also satisfies the scan-before-edit hook ([Hosts and hooks](hosts-and-hooks.md)).
 
