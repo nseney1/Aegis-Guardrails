@@ -656,11 +656,11 @@ No selectors: pass through records up to 4000 canonical chars; otherwise show ou
 | `--store` | `DIR` |  | Existing private store directory; default: workspace .aegis/state/messages/ |
 | `ref` | `REF` |  | 64-hex id or unambiguous 16-64 lowercase hex prefix (required) |
 | `--fields` | `SEL` | `[]` | At most 16 selectors, depth 8: dotted paths, indices, one-level * and row projection findings.*.{id,severity,file,line}; comma separated; repeatable |
-| `--spans` | `N` | `[]` | Zero-based body span indices; at most 64 selections; repeatable |
+| `--spans` | `N` | `[]` | Zero-based body span indices; at most 64 selections; comma separated; repeatable |
 | `--outline` |  |  | Include outline; alone emits only the envelope and outline |
 | `--since` | `CURSOR` |  | Log rows after cursor; 0 starts a new cursor |
-| `--expand` | `NAME` | `[]` | Expand a named ref one level, charged to max-chars; repeatable |
-| `--format` | `FORMAT` | `"json"` | View format: json, md or tsv; MD fences data as untrusted, TSV uses JSON values |
+| `--expand` | `NAME` | `[]` | Expand a named ref one level, charged to max-chars; comma separated; repeatable |
+| `--format` | `FORMAT` | `"json"` | View format: json, md or tsv; --json requires json; MD fences data as untrusted, TSV uses JSON values |
 | `--max-chars` | `N` | `"60000"` | Output character limit; excess refuses with E_LIMIT: narrow the selectors |
 
 ### `aegis msg verify`

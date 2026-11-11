@@ -61,6 +61,8 @@ def assert_error(output, code, detail=None):
         "workspace": "workspace is not initialized; run aegis init",
         "binding": "workspace binding refused; check --workspace / AEGIS_WORKSPACE",
         "root": "workspace root refused; choose a project directory",
+        "pin": "workspace pin refused; check or unset AEGIS_WORKSPACE",
+        "workspace_store": "workspace is not initialized; pass --workspace PROJECT",
         "pin_not_a_workspace": (
             "pinned directory is not an Aegis workspace; run aegis init in that directory "
             "(aegis init --pin also pins the hosts)"
@@ -83,6 +85,150 @@ def assert_error(output, code, detail=None):
 
 def content(record):
     return {key: record[key] for key in ("fields", "body", "refs")}
+
+
+@pytest.mark.parametrize("command,flag", [
+    ("init", "--platform"), ("init", "--mcp"), ("init", "--local"),
+    ("uninstall", "--platform"), ("uninstall", "-p"),
+    ("uninstall", "--local"), ("uninstall", "--purge"),
+])
+def test_mc2b_removed_options_follow_msg_policy(command, flag, capsys):
+    assert main([command, flag, "msg"]) == 2
+    assert_error(capsys.readouterr(), "E_FORMAT", "arguments")
+
+
+@pytest.mark.parametrize("flag,limit,code", [
+    ("--fields", 16, "E_SELECTOR"), ("--spans", 64, "E_SPAN"), ("--expand", 64, "E_REF"),
+])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_mc2b_selector_limits_refuse_before_store_io(flag, limit, code, grouped, workspace, capsys):
+    tokens = [flag, ",".join(["0"] * (limit + 1))] if grouped else [flag, "0"] * 2000
+    assert main(["msg", "read", "a" * 64, *tokens]) == 2
+    assert_error(capsys.readouterr(), code)
+
+
+@pytest.mark.parametrize("flag,token,limit,code", [
+    ("--fields", "body", codec.MAX_SELECTORS, "E_SELECTOR"),
+    ("--spans", "0", codec.MAX_SPANS, "E_SPAN"),
+    ("--expand", "child", codec.MAX_REFS, "E_REF"),
+])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_mc2b_namespace_retains_only_cap_plus_one(flag, token, limit, code, grouped, workspace, capsys):
+    from aegis_cli.cli import _build_parser
+
+    tokens = [flag, ",".join([token] * 2000)] if grouped else [flag, token] * 2000
+    namespace = _build_parser().parse_args(["msg", "read", "a" * 64, *tokens])
+    stored = getattr(namespace, flag[2:])
+    assert len(stored) == limit + 1
+    assert stored == [token] * (limit + 1)
+    assert main(["msg", "read", "a" * 64, *tokens]) == 2
+    assert_error(capsys.readouterr(), code)
+
+
+@pytest.mark.parametrize("flag,token,limit,code", [
+    ("--fields", "body", codec.MAX_SELECTORS, "E_SELECTOR"),
+    ("--spans", "0", codec.MAX_SPANS, "E_SPAN"),
+    ("--expand", "child", codec.MAX_REFS, "E_REF"),
+])
+def test_mc2b_invalid_entry_after_cap_keeps_family_refusal(flag, token, limit, code, workspace, capsys):
+    from aegis_cli.cli import _build_parser
+
+    tokens = [flag, token] * (limit + 1) + [flag, "HOSTILE_MARKER\x00"]
+    namespace = _build_parser().parse_args(["msg", "read", "a" * 64, *tokens])
+    assert getattr(namespace, flag[2:]) == [token] * (limit + 1)
+    assert main(["msg", "read", "a" * 64, *tokens]) == 2
+    assert_error(capsys.readouterr(), code)
+
+
+@pytest.mark.parametrize("earlier,later,code", [
+    ("expand", "spans", "E_REF"), ("expand", "fields", "E_REF"),
+    ("fields", "spans", "E_SELECTOR"),
+])
+@pytest.mark.parametrize("overflow_first", [False, True])
+def test_mc2b_overflow_and_invalid_earlier_family_match_mcp(
+        earlier, later, code, overflow_first, workspace, monkeypatch, capsys):
+    from aegis_core.workspace.base import Workspace
+    from aegis_mcp import server
+
+    limit = codec.MAX_SPANS if later == "spans" else codec.MAX_SELECTORS
+    invalid_entry = "x" * 1025 if earlier == "fields" else "HOSTILE_MARKER"
+    options = {earlier: [invalid_entry], later: ["0"] * (limit + 1), "ref": "a" * 64}
+    invalid = ["--" + earlier, invalid_entry]
+    overflow = ["--" + later, "0"] * (limit + 1)
+    flags = overflow + invalid if overflow_first else invalid + overflow
+    assert main(["msg", "read", options["ref"], *flags]) == 2
+    output = capsys.readouterr()
+    assert_error(output, code)
+    for name, value in server.fresh_state().items():
+        monkeypatch.setattr(server, name, value)
+    monkeypatch.setattr(server, "_canonical_workspace", Workspace(workspace))
+    server.handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+    response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": {"name": "aegis_msg_read", "arguments": options}})
+    assert response["result"]["isError"]
+    assert response["result"]["content"][0]["text"] + "\n" == output.out
+
+
+@pytest.mark.parametrize("format", ["md", "tsv"])
+@pytest.mark.parametrize("position", ["global", "group", "action"])
+def test_mc2b_json_conflicts_with_text_format(format, position, store, workspace, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    argv = ["msg", "--store", str(store.root), "read", rid, "--format", format]
+    argv.insert({"global": 0, "group": 1, "action": 4}[position], "--json")
+    assert main(argv) == 2
+    assert_error(capsys.readouterr(), "E_FORMAT", "format")
+
+
+def test_mc2b_comma_spans_equal_core(store, workspace, capsys):
+    value = copy.deepcopy(GOLDENS[0]["record"])
+    value.update(body="first\nsecond", spans=[[0, 5, "first"], [6, 12, "second"]])
+    rid = store.write(value)
+    assert invoke(store, "read", rid, "--spans", "0,1") == 0
+    output = capsys.readouterr()
+    assert not output.err
+    assert output.out == codec.read_view(value, spans=[0, 1], store=store)
+
+
+@pytest.mark.parametrize("stage", ["write", "flush"])
+@pytest.mark.parametrize("error_type", [BrokenPipeError, OSError])
+def test_mc2b_output_failure_never_appends_json(stage, error_type, store, workspace, monkeypatch):
+    rid = store.write(GOLDENS[0]["record"])
+    attempts = []
+    class FailingOutput:
+        def write(self, value):
+            attempts.append(value)
+            if stage == "write":
+                raise error_type("HOSTILE_MARKER")
+            return len(value)
+        def flush(self):
+            if stage == "flush":
+                raise error_type("HOSTILE_MARKER")
+    monkeypatch.setattr(sys, "stdout", FailingOutput())
+    assert invoke(store, "read", rid) == 2
+    assert attempts == [codec.read_view(store.read(rid), store=store)]
+
+
+def test_mc2b_entrypoint_broken_pipe_exits_two(store, workspace):
+    rid = store.write(GOLDENS[0]["record"])
+    source = str(Path(__file__).resolve().parents[3])
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        result = subprocess.run([sys.executable, "-m", "aegis_cli.cli", "msg", "--store", str(store.root),
+                                 "read", rid], stdout=writer, stderr=subprocess.PIPE,
+                                env=dict(os.environ, PYTHONPATH=source), timeout=15)
+    finally:
+        os.close(writer)
+    assert result.returncode == 2
+    assert result.stderr == b""
+
+
+def test_mc2b_detached_stdout_keeps_exit_two(store, workspace, monkeypatch, capsys):
+    rid = store.write(GOLDENS[0]["record"])
+    monkeypatch.setattr(sys, "stdout", None)
+    assert invoke(store, "read", rid) == 2
+    assert invoke(store, "read", rid, "--format", "HOSTILE_MARKER") == 2
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("action,flags", [
@@ -177,16 +323,26 @@ def test_round6_successful_non_msg_parse_with_msg_value_is_unchanged(capsys):
             assert output.out == expected
 
 
-def test_round6_missing_anchored_capabilities_refuse_fixed_json(tmp_path, workspace, monkeypatch, capsys):
+@pytest.mark.parametrize("action", ["read", "verify", "write"])
+@pytest.mark.parametrize("override_store", [False, True])
+def test_round6_missing_anchored_capabilities_refuse_fixed_json(
+        action, override_store, tmp_path, workspace, monkeypatch, capsys):
+    from aegis_cli import msg
+
     directory = tmp_path / "unsupported-store"
     directory.mkdir(mode=0o700)
-    monkeypatch.setattr(os, "supports_dir_fd", set())
-    assert main(["msg", "--store", str(directory), "verify", "a" * 64]) == 2
+    monkeypatch.setattr(msg, "_anchored_operations_supported", lambda: False)
+    monkeypatch.setattr(sys, "stdin", None)  # Unsupported writes refuse before input is read.
+    flags = ["--store", str(directory)] if override_store else []
+    argv = (["write", "--kind", "text", "--in", "-"] if action == "write" else [action, "a" * 64])
+    assert main(["msg", *flags, *argv]) == 2
     output = capsys.readouterr()
     assert output.err == ""
     assert output.out == json.dumps({"error": {"code": "E_AUTH", "message":
-        "store access refused: unsafe directory or platform lacks anchored file operations; use a supported real directory"}},
+        "platform unsupported; message stores require anchored file operations"}},
         separators=(",", ":")) + "\n"
+    assert list(directory.iterdir()) == []
+    assert not (workspace / ".aegis" / "state").exists()
 
 
 @pytest.mark.parametrize("token", [
@@ -537,6 +693,7 @@ def test_override_store_refuses_unsafe_root(case, workspace, tmp_path, capsys):
         assert not path.exists()
 
 
+@pytest.mark.usefixtures("store")
 def test_default_store_refuses_linked_state(workspace, tmp_path, capsys):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -585,7 +742,7 @@ def test_msg_pin_refusals_have_fixed_guidance(action, pin_state, workspace, tmp_
             else [action, "a" * 64])
     assert main(["msg", *argv]) == 2
     output = capsys.readouterr()
-    assert_error(output, "E_AUTH", "pin_not_a_workspace" if pin_state == "uninitialized" else "root")
+    assert_error(output, "E_AUTH", "pin_not_a_workspace" if pin_state == "uninitialized" else "pin")
     assert "HOSTILE_MARKER" not in output.out + output.err
     assert "sk-private-customer" not in output.out + output.err
     assert not (workspace / ".aegis" / "state").exists()
@@ -736,6 +893,7 @@ def test_selection_options_before_reference_preserve_it(flags, options, store, w
 
 @pytest.mark.parametrize("action", ["read", "verify"])
 @pytest.mark.parametrize("existing_state", [False, True])
+@pytest.mark.usefixtures("store")
 def test_missing_default_store_read_never_creates_state(action, existing_state, workspace, capsys):
     if existing_state:
         state = workspace / ".aegis" / "state"
@@ -805,7 +963,7 @@ def test_argon_uninitialized_repository_is_unchanged(action, override_store, exp
     if explicit_workspace:
         argv = ["--workspace", str(inner), *argv]
     assert main(argv) == 2
-    assert_error(capsys.readouterr(), "E_AUTH", "workspace")
+    assert_error(capsys.readouterr(), "E_AUTH", "workspace_store" if override_store else "workspace")
     assert snapshot() == before
     assert list(store.root.iterdir()) == []
 
@@ -830,6 +988,7 @@ def test_argon_unavailable_stdin_is_fixed_json(case, store, workspace, monkeypat
 
 
 @pytest.mark.parametrize("malformed_global", [False, True])
+@pytest.mark.usefixtures("store")
 def test_argon_removed_name_as_workspace_is_not_a_command(malformed_global, workspace, capsys):
     (workspace / "verify" / ".aegis").mkdir(parents=True)
     flags = ["--json=sk-private-HOSTILE_MARKER"] if malformed_global else []
