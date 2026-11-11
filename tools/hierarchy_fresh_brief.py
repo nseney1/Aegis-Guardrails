@@ -236,8 +236,7 @@ def _read_reference(path, *, limit=MAX_EVIDENCE_BYTES, capture=False, _witness=N
         require(stat.S_ISREG(before.st_mode) and not _reparse(before), "reference must be a regular file: " + str(path))
         require(limit is None or before.st_size <= limit, budget_error or "input exceeds " + str(limit) + " bytes")
         mark = _reference_mark(before)
-        key = (path, mark)
-        cached = _cache.get(key) if _cache is not None and not capture else None
+        cached = _cache.get(path, {}).get(mark) if _cache is not None and not capture else None
         chunks = []
         if cached is not None:
             sha, previous_ancestors = cached
@@ -270,7 +269,7 @@ def _read_reference(path, *, limit=MAX_EVIDENCE_BYTES, capture=False, _witness=N
         if _witness is not None:
             _witness.update(path=path, mark=mark, ancestors=ancestors, anchored=anchored)
         if _cache is not None:
-            _cache[key] = sha, ancestors
+            _cache.setdefault(path, {})[mark] = sha, ancestors
         return {"path": str(path), "sha256": sha}, b"".join(chunks) if capture else None
     finally:
         if directory is not None:
@@ -348,7 +347,7 @@ def _recheck_consumed_reference(operation, path):
     with operation.capture():
         if path in operation.files:
             _recheck_reference(operation.files[path][2])
-        elif any(key[0] == path for key in operation.reference_cache):
+        elif path in operation.reference_cache:
             operation.reference(path)
 
 
