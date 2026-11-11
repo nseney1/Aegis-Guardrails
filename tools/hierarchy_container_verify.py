@@ -17,7 +17,8 @@ from fractions import Fraction
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from hierarchy_mailbox import require, strict_json, text  # noqa: E402
+from hierarchy_mailbox import require, strict_json  # noqa: E402
+from hierarchy_absolute import _absolute  # noqa: E402
 import hierarchy_hosts  # noqa: E402
 
 
@@ -62,16 +63,6 @@ def _image(image):
     require(isinstance(image, str) and DIGEST_IMAGE.fullmatch(image) is not None,
             "isolation.image must carry @sha256:<64 hex>")
     return image
-
-
-def _absolute(value, label):
-    # Preserve hierarchy_team.absolute's lexical contract without importing orchestration.
-    value = os.fspath(value) if isinstance(value, os.PathLike) else value
-    text(value, label)
-    path = Path(value)
-    require(path.is_absolute() and ".." not in path.parts,
-            "%s must be an absolute path without ..: %s" % (label, value))
-    return path
 
 
 def _canonical_path(value):

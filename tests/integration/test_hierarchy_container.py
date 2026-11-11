@@ -176,19 +176,19 @@ def test_container_identity_needs_no_orchestrator(module):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_team_import_loads_only_container_verification_leaf():
+def test_team_import_loads_no_container_modules():
     code = ("import sys; sys.path.insert(0, %r); " % str(SCRIPT.parent)
             + "import hierarchy_team; "
               "assert sorted(name for name in sys.modules if name.startswith('hierarchy_container')) "
-              "== ['hierarchy_container_verify']")
+              "== []")
     result = subprocess.run([sys.executable, "-I", "-B", "-c", code],
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_team_absolute_delegates_to_verification_leaf(adapter, monkeypatch):
+def test_team_absolute_delegates_to_absolute_leaf(adapter, monkeypatch):
     team = importlib.import_module("hierarchy_team")
-    verifier = importlib.import_module("hierarchy_container_verify")
+    verifier = importlib.import_module("hierarchy_absolute")
     calls = []
     expected = Path("/fixture/run")
 
@@ -258,10 +258,20 @@ def test_facade_exposes_every_name_used_by_suite(adapter):
     assert sorted(name for name in names if not hasattr(adapter, name)) == []
 
 
-@pytest.mark.parametrize("value", ["/fixture/run", "relative", "/fixture/../run", "/fixture/\x00run", "",
-                                   "/" + "x" * 4096, Path("/fixture/run"), b"/fixture/run"],
-                         ids=["absolute", "relative", "parent", "nul", "empty", "too-long", "pathlike", "bytes"])
-def test_path_contract_matches_team(adapter, value):
+@pytest.mark.parametrize("value,expected", [
+    ("/fixture/run", Path("/fixture/run")),
+    ("relative", (ValueError, "fixture path must be an absolute path without ..: relative")),
+    ("/fixture/../run", (ValueError, "fixture path must be an absolute path without ..: /fixture/../run")),
+    ("/fixture/\x00run", (ValueError, "invalid fixture path")),
+    ("", (ValueError, "invalid fixture path")),
+    ("/" + "x" * 4096, (ValueError, "invalid fixture path")),
+    (Path("/fixture/run"), Path("/fixture/run")),
+    (b"/fixture/run", (ValueError, "invalid fixture path")),
+    ("/" + "x" * 4095, Path("/" + "x" * 4095)),
+    ("/fixture/./run/", Path("/fixture/run")),
+], ids=["absolute", "relative", "parent", "nul", "empty", "too-long", "pathlike", "bytes",
+        "length-limit", "lexical-normalization"])
+def test_path_contract_matches_independent_oracle(adapter, value, expected):
     team = importlib.import_module("hierarchy_team")
     verifier = importlib.import_module("hierarchy_container_verify")
 
@@ -273,7 +283,8 @@ def test_path_contract_matches_team(adapter, value):
 
     # This conversion was the adapter boundary before extraction; team.absolute itself takes strings.
     original_argument = os.fspath(value) if isinstance(value, os.PathLike) else value
-    assert result(verifier._absolute, value) == result(team.absolute, original_argument)
+    assert result(verifier._absolute, value) == expected
+    assert result(team.absolute, original_argument) == expected
 
 
 def test_owner_capture_missing_file_has_documented_diagnostic(adapter, layout, monkeypatch):
@@ -4215,3 +4226,20 @@ def test_symlink_memo_hit_still_checks_link_metadata(adapter, layout, monkeypatc
             with pytest.raises(ValueError, match="^" + re.escape("mount overlaps protected home: " + path) + "$"):
                 getattr(adapter, surface)(isolation, run=layout.run, mounts=rows, **kwargs)
         assert len(visits) == 2
+
+
+def test_absolute_leaf_imports_only_mailbox():
+    code = ("import sys; sys.path.insert(0, %r); " % str(SCRIPT.parent)
+            + "import hierarchy_absolute; "
+              "assert sorted(name for name in sys.modules if name.startswith('hierarchy_')) "
+              "== ['hierarchy_absolute', 'hierarchy_mailbox']")
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_verifier_and_facade_reexport_absolute_leaf(adapter):
+    leaf = importlib.import_module("hierarchy_absolute")
+    verifier = importlib.import_module("hierarchy_container_verify")
+    assert verifier._absolute is leaf._absolute
+    assert adapter._absolute is leaf._absolute

@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -237,6 +237,34 @@ Refuse when a live lease of another lane may overlap the paths; otherwise create
 | `--owner` | `OWNER` |  | Display label (default: <user>@<hostname>) |
 | `--ttl` | `SECONDS` | `3600` | Seconds until the lease expires, at most 86400 |
 | `--branch` | `BRANCH` |  | The lane's branch, recorded for display |
+
+### `aegis team config`
+
+Inspect or initialize a layered team profile
+
+Subcommands: `init`, `presets`, `show`.
+
+### `aegis team config init`
+
+Write the repository team profile
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--preset` | `PRESET` |  | Preset name from config presets |
+| `--host` | `KIND` |  | Bind the preset host kind at initialization; see config presets --json |
+| `--force` |  |  | Replace an existing valid profile |
+
+### `aegis team config presets`
+
+List built-in team presets
+
+### `aegis team config show`
+
+Show every resolved value and its layer
+
+### `aegis team doctor`
+
+Check profile completeness and host CLIs on PATH
 
 ### `aegis team gc`
 

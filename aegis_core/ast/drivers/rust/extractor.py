@@ -583,9 +583,9 @@ class Extractor:
 def parse(source: str, path: str) -> NormalizedAST:
     """Extract supported Rust syntax; unresolved values never become definite literals."""
     try:
-        size = len(source.encode('utf-8'))
+        size = len(source) if len(source) > MAX_SOURCE_BYTES else len(source.encode('utf-8'))
     except UnicodeError as exc:
         raise ASTDriverError('invalid Unicode source', reason='syntax') from exc
     if size > MAX_SOURCE_BYTES:
-        raise ASTDriverError('Rust source exceeds 2 MiB; exclude this path in the rule (aegis doctor)', reason='too_large')
+        raise ASTDriverError(f'Rust source exceeds {MAX_SOURCE_BYTES / (1024 * 1024):g} MiB; exclude this path in the rule (aegis doctor)', reason='too_large', limit_bytes=MAX_SOURCE_BYTES)
     return Extractor(source, path).parse()

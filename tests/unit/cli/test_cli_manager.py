@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from tests.helpers_manager import manager_root
+
 REPO = Path(__file__).resolve().parents[3]
 
 
@@ -69,9 +71,10 @@ def test_activation_has_no_self_approval_flag(tmp_path):
     assert "--approved" in result.stderr
 
 
-def test_manager_init_and_status_work_without_parent_repository(tmp_path):
+def test_manager_init_and_status_work_without_parent_repository(manager_root):
     from tests.helpers_manager import prepare
 
+    tmp_path = manager_root
     prepared = prepare(tmp_path)
     control = prepared["control"]
     config = tmp_path / "manager.json"
@@ -99,9 +102,10 @@ def test_manager_report_refuses_invalid_evidence_before_config_read(tmp_path, ev
     assert "config_unavailable" not in result.stderr
 
 
-def test_owner_reviews_and_activates_exact_policy_through_cli(tmp_path):
+def test_owner_reviews_and_activates_exact_policy_through_cli(manager_root):
     from tests.helpers_manager import approve, prepare
 
+    tmp_path = manager_root
     prepared = prepare(tmp_path)
     result = invoke(tmp_path, "activate", "--config", str(prepared["config"]),
                     "--revision", prepared["revision"], "--expect", "none", "--json")

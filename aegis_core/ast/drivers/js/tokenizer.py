@@ -69,7 +69,7 @@ def line_breaks(text):
 class JSLexError(ASTDriverError):
     def __init__(self, reason, line, offset):
         self.reason, self.line, self.offset = reason, line, offset
-        super().__init__(f'{reason} at line {line}, offset {offset}')
+        super().__init__(f'{reason} at line {line}, offset {offset}', limit_bytes=MAX_SOURCE_BYTES if reason == 'too_large' else None)
 
 
 class Token(NamedTuple):
@@ -124,7 +124,7 @@ class Lexer:
     def run(self):
         source = self.source
         size = len(source)
-        if len(source.encode('utf-8')) > MAX_SOURCE_BYTES:
+        if size > MAX_SOURCE_BYTES or len(source.encode('utf-8')) > MAX_SOURCE_BYTES:
             self.error('too_large')
         while self.i < size:
             if self.mode == 'code':

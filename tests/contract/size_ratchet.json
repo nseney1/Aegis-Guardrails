@@ -57,8 +57,8 @@
       "stmts": 113
     },
     "aegis_core/verification/import_guard.py:check": {
-      "lines": 113,
-      "stmts": 56
+      "lines": 66,
+      "stmts": 27
     },
     "aegis_core/verification/mutation_tester.py:check": {
       "lines": 134,
@@ -83,12 +83,12 @@
       "stmts": 630
     },
     "aegis_core/gitsafe.py": {
-      "lines": 1250,
-      "stmts": 709
+      "lines": 1225,
+      "stmts": 682
     },
     "aegis_core/human_gate.py": {
-      "lines": 1076,
-      "stmts": 640
+      "lines": 1073,
+      "stmts": 637
     },
     "aegis_core/migrate.py": {
       "lines": 273,

@@ -63,6 +63,8 @@ def test_a_sampled_walked_card_whose_rules_cannot_be_read_says_each_note():
         "  languages: none recognized (rules are language-agnostic)",
         "  rules: cannot be read (see the note below)",
         "  Layer 1: no file to check",
+        "  checks that could not run:",
+        "    Layer 1 could not run: OSError: boom",
         "  note: No active rule targets any file: aegis check enforces no rule until one names files.",
         "  note: The rules could not be read (unsafe tree), so no rule is counted.",
         "  note: Not a git work tree: the files were found by walking the directory, leaving out build and vendor "
@@ -140,6 +142,39 @@ def test_a_card_with_unavailable_layer1_does_not_report_a_zero_percent_pass_rate
     assert '    b.py: Layer 1 unavailable' in lines
     assert not any('AST coverage' in line for line in lines)
     assert not any('%' in line for line in lines)
+
+
+def test_card_could_not_run_details_are_bounded_canonicalized_and_redacted():
+    token = 'ghp_' + 'a' * 36
+    # Canonicalization must expose the token before redaction; truncation must
+    # happen after redaction even when the token straddles the display limit.
+    detail = 'x' * 270 + ' gh\x1b[31mp_' + 'a' * 36 + '\nend' + 'y' * 400
+    doc = _card().as_dict()
+    doc['layer1']['checks_that_could_not_run'] = [detail] * 22
+    lines = text.render_card(doc)
+    start = lines.index('  checks that could not run:')
+    assert lines[start + 1:start + 21] == ['    ' + 'x' * 270 + ' ghp_REDACTED end' + 'y' * 10 + '...'] * 20
+    assert lines[start + 21] == '    ... and 2 more'
+    assert token not in '\n'.join(lines)
+    assert '\x1b' not in '\n'.join(lines)
+
+
+def test_card_text_prints_whole_run_error_without_changing_json(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+
+    (tmp_path / 'app.py').write_text('x = 1\n', encoding='utf-8')
+
+    def unavailable(*args, **kwargs):
+        raise OSError('fixture unavailable')
+
+    monkeypatch.setattr(card.baseline, 'run_fast', unavailable)
+    assert main(['check', '--card', '--workspace', str(tmp_path), '--json']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['layer1']['checks_that_could_not_run'] == [
+        'Layer 1 could not run: OSError: fixture unavailable'
+    ]
+    assert main(['check', '--card', '--workspace', str(tmp_path)]) == 0
+    assert '    Layer 1 could not run: OSError: fixture unavailable' in capsys.readouterr().out
 
 
 def test_the_partition_report_groups_edges_and_caps_the_files_not_analyzed():

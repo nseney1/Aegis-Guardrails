@@ -137,6 +137,15 @@ def test_tier_a_needs_reviews_code_owners_checks_codeowners_coverage_and_a_non_a
     assert report.evidence["codeowners"]["uncovered"] == []
 
 
+def test_full_fixture_owns_team_profile_at_root_and_nested_workspaces():
+    paths = {".aegis/team/profile.json", "svc/.aegis/team/profile.json"}
+    covered, uncovered = ownership.codeowners_coverage(hg.CODEOWNERS_FULL)
+    assert paths <= set(covered)
+    assert uncovered == []
+    without_profile = hg.CODEOWNERS_FULL.replace("**/.aegis/team/profile.json @octo\n", "")
+    assert set(ownership.codeowners_coverage(without_profile)[1]) == paths
+
+
 @needs_git
 def test_an_admin_identity_cannot_be_tier_a(tmp_path):
     repo = _repo_with_governance(tmp_path)
@@ -582,100 +591,100 @@ def _tier_case(tmp_path: Path, name: str):
     return doc["tier"], doc["reasons"], hashlib.sha256(json.dumps(rest, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-# Recorded at lane/w9-A c12e70cb (after R-trust-36, before the table), admin wording updated.
+# Recorded at lane/w9-A c12e70cb; admin wording and TP-1 profile coverage updated.
 GOLDEN_TIERS = {
     'a-full': ('A', [
-    ], 'ca1674679f2070d4'),
+    ], 'b3afe6f0e04282a7'),
     'admin': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the gh identity doctor used is an admin: re-run with the token the agent would hold',
-    ], '710e23b64c1a057d'),
+    ], '7f9c82ec2d08b27c'),
     'admin-unknown': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], '1fed4721f978a121'),
+    ], 'eb1679f9b7274d74'),
     'approvals-0': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require an approving review',
-    ], 'f74ddb2d5fa91d75'),
+    ], '5efaa5ec4ffc62e0'),
     'b-hardware': ('B', [
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '1bbf09668d3c52cd'),
+    ], '2626a9d5a80df62d'),
     'b-passphrase': ('B', [
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '159f0c1b3c7187db'),
+    ], 'f25deb641c9b517d'),
     'b-plain-custody': ('C', [
         'the signing key human is a plain file with no passphrase, readable by this user: an agent running as you can sign with it, so a signature proves nothing',
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], 'b3e430ffe88fa5b6'),
+    ], 'a5520a911a214919'),
     'bare-org': ('C', [
         'allowed_signers on the base branch lists no signing key',
-        'not tier A: CODEOWNERS leaves 83 governance path(s) without an owner',
+        'not tier A: CODEOWNERS leaves 85 governance path(s) without an owner',
         'not tier A: CODEOWNERS names @acme, the organization that owns this repository, which GitHub ignores as a code owner: name a team (@acme/<team>) or people',
-    ], '6ae200fb88ec7f12'),
+    ], 'bc6acbd5958faa0a'),
     'co-absent': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '9224938590e8abd8'),
+    ], 'e3e4328334cee821'),
     'co-partial': ('C', [
         'allowed_signers on the base branch lists no signing key',
-        'not tier A: CODEOWNERS leaves 82 governance path(s) without an owner',
-    ], '6e109a481cb4f40b'),
+        'not tier A: CODEOWNERS leaves 84 governance path(s) without an owner',
+    ], '78b630c81d390705'),
     'gh-missing': ('C', [
         'GitHub settings could not be read: gh is not installed',
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], '231bdf4bdc7ee1f1'),
+    ], '9ef2e7322fbed7fd'),
     'no-checks': ('C', [
         'the default branch has no required status checks',
         'allowed_signers on the base branch lists no signing key',
-    ], '894cb0e48ca45fa4'),
+    ], 'e7715def9cfdf445'),
     'no-owners-review': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require code-owner review',
-    ], '39a9e50b21121dde'),
+    ], '61f1a36e214ef2f3'),
     'no-workflow': ('C', [
         'the required checks do not include the Aegis job: no workflow on the base branch has a job that runs aegis check --ci under a literal name, outside a matrix',
         'allowed_signers on the base branch lists no signing key',
-    ], '02d5e277c56e1b95'),
+    ], '34be250a44a53d13'),
     'not-aegis-check': ('C', [
         'the required checks do not include the Aegis job: require aegis-check',
         'allowed_signers on the base branch lists no signing key',
-    ], 'b4cd1dff7bfd621b'),
+    ], '45f75111267abdeb'),
     'repo-unreadable': ('C', [
         'GitHub settings could not be read: gh api repos/{owner}/{repo} failed: HTTP 404: Not Found',
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
         'not tier A: whether the gh identity is an admin is unknown',
-    ], 'c2778e2375913655'),
+    ], 'd88aed3124ff8020'),
     'rules-unreadable': ('C', [
         "the default branch's rules could not be read: gh api repos/{owner}/{repo}/rules/branches/main failed: HTTP 403: Forbidden",
         "the default branch's ruleset was not read",
         'allowed_signers on the base branch lists no signing key',
-    ], 'b15ccacdb770aaaf'),
+    ], 'dbe1eb389efb5c81'),
     'signers-0': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch does not require an approving review',
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], 'cb94876a7c0d25f2'),
+    ], 'c6b3874bbf0f21e7'),
     'stale-kept': ('C', [
         'allowed_signers on the base branch lists no signing key',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
-    ], '9d739a9cb376c5da'),
+    ], '83bfaab99e0c4cf4'),
     'unpinned-a': ('A', [
-    ], '92a6c557f1847a65'),
+    ], '190b0abbd015fef1'),
     'unpinned-c': ('C', [
         "the required check(s) aegis-check have no pinned source (integration_id): anyone with write access, including the agent's gh token, can post a passing status; set each check's source to GitHub Actions (app 15368) in the ruleset",
         'allowed_signers on the base branch lists no signing key',
@@ -683,7 +692,7 @@ GOLDEN_TIERS = {
         'not tier A: the default branch does not require code-owner review',
         'not tier A: the default branch keeps an approval after new commits are pushed, so a pull request can change after its review and still merge (set dismiss_stale_reviews_on_push)',
         'not tier A: no CODEOWNERS file on the base branch',
-    ], '63ccbfdd88627974'),
+    ], 'a75985d7fdd6bf4f'),
 }
 
 
@@ -692,7 +701,7 @@ GOLDEN_TIERS = {
 def test_the_tier_grid_is_the_one_recorded_before_the_table(tmp_path, name):
     """Given a FakeGh configuration recorded before detect_tier was rebuilt from one table, When the tier
     is detected, Then the tier, the reasons in order and the rest of the report are the recorded ones
-    (only the admin reason's wording changed)."""
+    (admin wording and TP-1 profile coverage fixtures updated)."""
     if name in KEYGEN_CASES and not hg.signing_ok():
         pytest.skip("needs git >= 2.34 and ssh-keygen")
     assert _tier_case(tmp_path, name) == GOLDEN_TIERS[name]
@@ -1117,16 +1126,22 @@ def test_exemption_discovery_does_not_verify_unrelated_commits(tmp_path, monkeyp
     for i in range(8):
         repo.commit(f"chore: unrelated {i}", allow_empty=True)
     calls = []
+    requested = []
     real = gitsafe.run
 
     def spy(args, *a, **kw):
         calls.append(list(args))
+        if args[:2] == ["cat-file", "--batch"]:
+            requested.extend(kw["stdin"].decode("ascii").splitlines())
         return real(args, *a, **kw)
 
     monkeypatch.setattr(gitsafe, "run", spy)
     assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
     expected = repo.git("rev-list", "main..HEAD").splitlines()
-    assert [c[2] for c in calls if c[:2] == ["cat-file", "commit"]] == expected
+    assert requested == expected
+    assert sum(c[:2] == ["cat-file", "--batch-check"] for c in calls) == 1
+    assert sum(c[:2] == ["cat-file", "--batch"] for c in calls) == 1
+    assert not any(c[:2] == ["cat-file", "commit"] for c in calls)
     assert sum(c[0] == "rev-list" for c in calls) == 1
 
 
@@ -1180,6 +1195,7 @@ def test_large_commit_headers_are_read_one_at_a_time_and_released(tmp_path, monk
         approvals.append(parent)
     repo.git("update-ref", "HEAD", parent)
     held, captures = [0], []
+    discovering = True
     real = gitsafe.run
 
     class Capture(bytes):
@@ -1192,19 +1208,22 @@ def test_large_commit_headers_are_read_one_at_a_time_and_released(tmp_path, monk
             held[0] -= len(self)
 
     def counted(args, *a, **kw):
-        if args[0] == "cat-file":
-            assert args[:2] == ["cat-file", "commit"] and len(args) == 3, "discovery must read individual commit objects"
-            assert held[0] == 0, "previous commit object still retained at the next capture"
+        if discovering and args[0] == "cat-file":
+            assert args[1] in ("--batch-check", "--batch")
+            assert held[0] == 0, "previous chunk still retained at the next capture"
         result = real(args, *a, **kw)
-        if args[:2] == ["cat-file", "commit"]:
-            captures.append((args[2], len(result.stdout)))
+        if args[:2] == ["cat-file", "--batch"]:
+            requested = kw["stdin"].decode("ascii").splitlines()
+            captures.append((requested, len(result.stdout)))
             result.stdout = Capture(result.stdout)
         return result
 
     monkeypatch.setattr(gitsafe, "run", counted)
     find = human_gate.exemption_finder(repo.root, "HEAD", "main")
-    assert [oid for oid, _size in captures] == repo.git("rev-list", "main..HEAD").splitlines()
-    assert sum(size > 4 * 1024 * 1024 for _oid, size in captures) == len(approvals)
+    discovering = False
+    assert [oid for chunk, _size in captures for oid in chunk] == repo.git("rev-list", "main..HEAD").splitlines()
+    assert len(captures) == 3
+    assert all(size <= 16 * 1024 * 1024 for _chunk, size in captures)
     assert held[0] == 0
     outcomes = [find(fix) for fix in fixes]
     assert [(verdict.code, verdict.commit) for verdict in outcomes] == [
@@ -1248,10 +1267,13 @@ def test_exemption_byte_limit_refuses_oversize_and_accepts_exact_bound(tmp_path,
 
     def counted(args, *a, **kw):
         if discovering and args[0] == "cat-file":
-            assert args[:2] == ["cat-file", "commit"] and len(args) == 3
+            assert args[1] in ("--batch-check", "--batch")
         result = real(args, *a, **kw)
         if args[:2] == ["cat-file", "commit"]:
             captures.append((args[2], len(result.stdout)))
+        elif args[:2] == ["cat-file", "--batch"]:
+            captures.extend((oid, int(repo.git("cat-file", "-s", oid)))
+                            for oid in kw["stdin"].decode("ascii").splitlines())
         return result
 
     monkeypatch.setattr(gitsafe, "run", counted)
@@ -1278,15 +1300,12 @@ def test_failed_exemption_object_read_returns_no_candidate(tmp_path, monkeypatch
 
     repo = hg.make_repo(tmp_path)
     fix = repo.commit("fix: no tests", allow_empty=True)
-    real = gitsafe.run
+    def failed(*a, **kw):
+        raise gitsafe.GitError("unreadable")
 
-    def failed(args, *a, **kw):
-        if args[:2] == ["cat-file", "commit"]:
-            return subprocess.CompletedProcess(args, 1, b"", b"unreadable")
-        return real(args, *a, **kw)
-
-    monkeypatch.setattr(gitsafe, "run", failed)
-    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    monkeypatch.setattr(gitsafe, "read_blobs", failed)
+    with pytest.raises(gitsafe.GitError, match="^unreadable$"):
+        human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
 
 
 @needs_git
@@ -1299,17 +1318,22 @@ def test_failed_object_read_discards_partial_exemption_candidates(tmp_path, monk
     for i in range(8):
         repo.commit(human_gate.exemption_message(fix, f"reviewed {i}") + "\nAegis-Accept: reserved\n", allow_empty=True)
     calls = []
-    real = gitsafe.run
+    real = gitsafe.read_blobs
+    real_iter = gitsafe.iter_objects
 
-    def failed(args, *a, **kw):
-        if args[:2] == ["cat-file", "commit"]:
-            calls.append(args)
-            if len(calls) == failed_read:
-                return subprocess.CompletedProcess(args, 1, b"", b"untrusted diagnostics")
-        return real(args, *a, **kw)
+    def one_per_chunk(cwd, oids, **kw):
+        return real_iter(cwd, oids, byte_budget=1, **kw)
 
-    monkeypatch.setattr(gitsafe, "run", failed)
-    assert human_gate.find_test_exemption(repo.root, "HEAD", "main", fix) is None
+    def failed(cwd, oids, **kw):
+        calls.append(list(oids))
+        if len(calls) == failed_read:
+            raise gitsafe.GitError("untrusted diagnostics")
+        return real(cwd, oids, **kw)
+
+    monkeypatch.setattr(gitsafe, "iter_objects", one_per_chunk)
+    monkeypatch.setattr(gitsafe, "read_blobs", failed)
+    with pytest.raises(gitsafe.GitError, match="^untrusted diagnostics$"):
+        human_gate.find_test_exemption(repo.root, "HEAD", "main", fix)
     assert len(calls) == failed_read
 
 
@@ -1629,3 +1653,33 @@ def test_without_a_terminal_neither_flow_runs_the_signing_program(tmp_path, monk
     rc, doc = _approve_on_a_pty(repo, monkeypatch, exempt, tty=False)
     assert rc == 1 and doc["code"] == "no_terminal"
     assert not seen.exists() and repo.head() == before
+
+
+@needs_git
+@pytest.mark.parametrize("failure", ["wrong-kind", "timeout", "nonzero"])
+def test_batched_exemption_preflight_failure_has_no_candidates_or_diagnostics(tmp_path, monkeypatch, capsys, failure):
+    from aegis_core import gitsafe
+
+    repo = hg.make_repo(tmp_path)
+    fix = repo.commit("fix: no tests", allow_empty=True)
+    repo.commit(human_gate.exemption_message(fix, "reviewed") + "\nAegis-Accept: reserved\n", allow_empty=True)
+    real = gitsafe.run
+    preflights = []
+
+    def failed(args, *a, **kw):
+        if args[:2] == ["cat-file", "--batch-check"]:
+            preflights.append(args)
+            if failure == "timeout":
+                raise gitsafe.GitError("private preflight diagnostic")
+            requested = kw["stdin"].decode("ascii").splitlines()
+            reply = b"".join(f"{oid} blob 3\n".encode("ascii") for oid in requested)
+            return subprocess.CompletedProcess(args, int(failure == "nonzero"), reply, b"private diagnostic")
+        assert args[:2] != ["cat-file", "--batch"], "content was captured after a failed size preflight"
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(gitsafe, "run", failed)
+    with pytest.raises(gitsafe.GitError):
+        human_gate.exemption_finder(repo.root, "HEAD", "main")
+    assert len(preflights) == 1
+    output = capsys.readouterr()
+    assert "private" not in output.out + output.err

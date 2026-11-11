@@ -42,7 +42,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -83,6 +82,7 @@ __all__ = [
     "git_version",
     "head_commit",
     "in_memo",
+    "iter_objects",
     "layout",
     "list_files",
     "list_refs",
@@ -496,9 +496,8 @@ def _head_or_empty_tree(cwd: Path | str) -> Optional[str]:
 
 def blob_id(data: bytes, oid_length: int = 40) -> str:
     """The git blob object id of ``data`` (40-char SHA-1 or 64-char SHA-256)."""
-    header = b"blob %d\0" % len(data)
-    digest = hashlib.sha256 if oid_length == 64 else hashlib.sha1
-    return digest(header + data).hexdigest()
+    from aegis_core.workspace import git_objects
+    return git_objects.object_id(data, oid_length)
 
 
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
@@ -557,24 +556,12 @@ def _work_tree_bytes(path: Path, mode: str) -> Tuple[Optional[bytes], bool]:
     return None, False
 
 
-def _c_quoted(path: str) -> bytes:
-    """``path`` as one C-quoted line, which ``hash-object --stdin-paths`` unquotes."""
-    quoted = bytearray(b'"')
-    for byte in os.fsencode(path):
-        if byte in b'"\\':
-            quoted += b"\\" + bytes([byte])
-        elif byte < 0x20 or byte == 0x7F:
-            quoted += b"\\%03o" % byte
-        else:
-            quoted.append(byte)
-    return bytes(quoted + b'"')
-
-
 def _clean_blob_ids(root: Path, paths: Sequence[str], hardening: Sequence[str]) -> Optional[List[str]]:
     """The blob ids ``git add`` would store for these work-tree files, after git's clean
     conversion (core.autocrlf and core.eol, the text, eol, ident and
     working-tree-encoding attributes); None when git cannot say. Writes nothing."""
-    stdin = b"".join(_c_quoted(path) + b"\n" for path in paths)
+    from aegis_core.workspace.git_objects import c_quoted
+    stdin = b"".join(c_quoted(path) + b"\n" for path in paths)
     out = _out(["hash-object", "--stdin-paths"], root, stdin=stdin, _hardening=hardening)
     ids = None if out is None else out.decode("ascii", "replace").split()
     return ids if ids is not None and len(ids) == len(paths) else None
@@ -733,52 +720,56 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
     fields = header.split()
     if len(fields) != 3 or fields[1] != b"blob":
         return None
-    size = _blob_size(header, entry.oid)  # a size that is not a number is git's error, not a ValueError
+    from aegis_core.workspace import git_objects
+    size = git_objects.object_size(header, entry.oid, "blob", GitError)  # Malformed sizes raise GitError.
     data = rest[:size]
     if len(data) != size or blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
     return data
 
 
-def _blob_size(header: bytes, oid: str) -> int:
-    """The size a ``cat-file --batch``/``--batch-check`` header line gives blob ``oid``, else GitError."""
-    fields = header.split()
-    if len(fields) != 3 or fields[0].decode("ascii", "replace") != oid or fields[1] != b"blob" or not fields[2].isdigit():
-        raise GitError(f"git cannot read object {oid}")
-    return int(fields[2])
-
-
-def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]:
-    blobs: Dict[str, bytes] = {}
-    position = 0
-    for oid in wanted:
-        end = out.find(b"\n", position)
-        size = _blob_size(out[position:end] if end >= 0 else b"", oid)
-        data = out[end + 1 : end + 1 + size]
-        if len(data) != size or blob_id(data, len(oid)) != oid:
-            raise GitError(f"git returned content for {oid} that does not match the object id")
-        blobs[oid] = data
-        position = end + 1 + size + 1
-    return blobs
-
-
-def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, bytes]:
-    """Batch-read git blob objects via ``cat-file --batch``, verifying each object's type, size, and hash."""
-    wanted = list(dict.fromkeys(oids))
+def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0,
+               kind: str = "blob") -> Dict[str, bytes]:
+    """Read declared blob or commit objects via ``cat-file --batch``; verify type, size and hash."""
+    from aegis_core.workspace import git_objects
+    wanted = git_objects.requests(oids, kind, GitError)
     if not wanted:
         return {}
     res = run_checked(["cat-file", "--batch"], cwd, timeout=timeout, stdin=("\n".join(wanted) + "\n").encode("ascii"))
-    return _parse_cat_file_batch(res.stdout, wanted)
+    return git_objects.parse_objects(res.stdout, wanted, kind, GitError)
 
 
-def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, int]:
-    """The size of each blob from ``cat-file --batch-check`` (no content is read); GitError as ``read_blobs``."""
-    wanted = list(dict.fromkeys(oids))
+def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0,
+               kind: str = "blob") -> Dict[str, int]:
+    """Sizes from ``cat-file --batch-check``, with the same declared kind and GitError as ``read_blobs``."""
+    from aegis_core.workspace import git_objects
+    wanted = git_objects.requests(oids, kind, GitError)
     if not wanted:
         return {}
-    lines = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
-                        stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout.split(b"\n")
-    return {oid: _blob_size(lines[i] if i < len(lines) else b"", oid) for i, oid in enumerate(wanted)}
+    out = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
+                      stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout
+    return git_objects.object_sizes(out, wanted, kind, GitError)
+
+
+def iter_objects(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, kind: str = "blob",
+                 byte_budget: int = 16 * 1024 * 1024, timeout: float = 60.0) -> Iterator[Tuple[str, bytes]]:
+    """Yield checked objects in request order, sizing all objects before capturing any content.
+
+    Each capture holds at most ``byte_budget`` payload bytes, or one larger object, plus
+    framing. Release each yielded value before advancing to keep retained content bounded.
+    Raises GitError for invalid requests or unavailable, mistyped or corrupt objects.
+    """
+    if not isinstance(byte_budget, int) or isinstance(byte_budget, bool) or byte_budget <= 0:
+        raise GitError("byte budget must be a positive integer")
+    from aegis_core.workspace import git_objects
+    sizes = blob_sizes(cwd, oids, kind=kind, timeout=timeout)
+    for chunk in git_objects.object_chunks(sizes, byte_budget):
+        objects = read_blobs(cwd, chunk, kind=kind, timeout=timeout)
+        for oid in chunk:
+            if len(objects[oid]) != sizes[oid]:
+                raise GitError(f"git cannot read object {oid}")
+            yield oid, objects.pop(oid)
+        del objects
 
 
 def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[str] = (), include_symlinks: bool = False,
@@ -808,25 +799,9 @@ def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[s
 
 
 def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
-    """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
-    ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
-    """
-    fields = raw.split(b"\0")
-    records: List[Tuple[str, str, Optional[str]]] = []
-    index = 0
-    while index < len(fields):
-        parts = fields[index].split()
-        if not parts:
-            index += 1
-            continue
-        status = parts[-1].decode("ascii", "replace")
-        width = 3 if status[:1] in ("R", "C") else 2  # a rename or copy names two paths
-        paths = fields[index + 1:index + width]
-        if len(paths) < width - 1 or not all(paths):
-            break
-        records.append((status, os.fsdecode(paths[0]), os.fsdecode(paths[1]) if width == 3 else None))
-        index += width
-    return records
+    """Parse Git name-status records, including rename and copy destinations."""
+    from aegis_core.workspace.git_objects import parse_name_status_z as parse
+    return parse(raw)
 
 
 def _on_windows() -> bool:
