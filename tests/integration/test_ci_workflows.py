@@ -736,7 +736,7 @@ def test_the_governance_workflow_never_checks_out_or_runs_pull_request_code():
 # --- R-trust-17: check --ci runs on every event its job runs on ------------------------------
 # A condition on the step (say, pull requests only) would let a push or dispatch run of the same
 # job name pass on the pull request's head commit without comparing anything, and doctor no longer
-# counts such a job as the required Aegis check (human_gate._skip_why). A run with nothing to compare
+# counts such a job as the required Aegis check (workflow_jobs.skip_why). A run with nothing to compare
 # says so instead of PASSED (aegis_cli.check).
 
 @pytest.mark.parametrize("text", [lambda: _read("validate.yml"),
