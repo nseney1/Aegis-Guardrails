@@ -5,7 +5,8 @@ The dispatcher runs these; there is no MCP tool for them. ``claim``, ``renew`` a
 the next ``--expect``. With ``--json`` stdout carries one document with ``source``,
 ``aegis_version``, ``checked_at`` (UTC) and ``scope``, refusals and errors included.
 
-Exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
+Host capacity check exits: 0 go, 3 hold, 4 fallback, 5 skip; 1 refused, 2 usage.
+Other exit codes: 0 done; 1 refused (taken, overlap, stale, absent, expired, unreadable) or
 git failed; 2 usage (an invalid lane name, glob, ttl, label or ``--expect``, a base
 that names no commit, no git repository). ``list`` and ``metrics`` change nothing.
 """
@@ -217,7 +218,9 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
     from aegis_core import team_profile
 
     noun = args.team_action
-    verb = getattr(args, "config_action", None) if noun == "config" else None
+    verb = getattr(args, "config_action", None) if noun == "config" else getattr(args, "hosts_action", None)
+    if noun == "hosts" and verb not in ("status", "check", "usage"):
+        verb = None
     command = noun + (" " + verb if verb else "")
     schema = "aegis.team." + command.replace(" ", ".") + "/v1"
     payload = primitives.envelope("aegis team " + command, {"workspace": str(root)}, now=now)
@@ -239,8 +242,11 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
                            next_action="Review the profile diff and use aegis approve; hosted aegis-governance gates approval before merge. Run aegis team doctor --json.")
         else:
             resolved = team_profile.load(root)
-            if noun == "doctor":
+            if noun == "hosts":
+                code = _hosts_result(args, resolved, payload)
+            elif noun == "doctor":
                 found = team_profile.doctor(resolved, root=root)
+                _doctor_capacity(resolved, found)
                 payload.update(found)
                 if found["healthy"]:
                     payload.update(status="done", next_action="Review the resolved profile with aegis team config show --json.")
@@ -270,7 +276,7 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
                        file=str(root.joinpath(*team_profile.REPO_PATH)),
                        next_action="Check the trusted workspace and home directories and retry on a platform with anchored file operations.")
         code = EXIT_REFUSED
-    payload = display_profile(payload)
+    payload = display_profile(payload, capacity=True)
     if args.json:
         _emit(payload)
     elif payload["status"] == "refused":
@@ -279,6 +285,46 @@ def _profile_command(args: argparse.Namespace, root: Path, now: int) -> int:
         # Preserve provenance and actionable instructions in the human view too.
         print(json.dumps(payload, indent=2))
     return code
+
+
+def _doctor_capacity(resolved, found):
+    """Compose health and capacity views without a profile/service cycle."""
+    from aegis_core.team_hosts import HostCapacity
+
+    capacity = {row["host"]: row for row in HostCapacity(resolved).status()}
+    found["hosts"] = [{**host, **{key: value for key, value in capacity[host["name"]].items() if key != "host"}}
+                      for host in found["hosts"]]
+    found["write_scope"] = _capacity_write_scope(found["hosts"])
+
+
+def _capacity_write_scope(rows):
+    return list(dict.fromkeys(scope for row in rows for decision in row["decisions"]
+                              for scope in decision.get("write_scope", [])))
+
+
+def _hosts_result(args, resolved, payload):
+    """Thin host view; all policy and advice live in the shared service."""
+    from aegis_core import team_hosts, team_profile
+
+    verb = args.hosts_action
+    host, kind = args.host, args.kind
+    if (verb not in ("status", "check", "usage") or
+            (verb == "check" and (host is None or kind is None)) or
+            (verb != "check" and (host is not None or kind is not None))):
+        raise team_profile.ProfileError("use hosts status|usage or hosts check HOST KIND", layer="flags",
+                                        file="<command-line>", exit_code=2)
+    service = team_hosts.HostCapacity(resolved)
+    payload.update(status="done", exit_codes=team_hosts.EXIT_CODES,
+                   write_scope=resolved["write_scope"],
+                   next_action="Run aegis team hosts status --json to choose a declared host and kind, then aegis team hosts check HOST KIND --json.")
+    if verb == "check":
+        result = service.check(host, kind)
+        payload.update(result)
+        return result["exit_code"]
+    payload["hosts"] = service.status() if verb == "status" else service.usage()
+    if verb == "status":
+        payload["write_scope"] = _capacity_write_scope(payload["hosts"])
+    return EXIT_OK
 
 
 # ── Failures ─────────────────────────────────────────────────────────────────
@@ -317,7 +363,7 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
 
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
-    if action in ("config", "doctor"):
+    if action in ("config", "doctor", "hosts"):
         root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
         return _profile_command(args, root, int(time.time()))
     if action not in _HANDLERS:
@@ -366,6 +412,14 @@ class TeamCommand(AegisCommand):
         config_init.add_argument("--host", default=None, metavar="KIND", help="Bind the preset host kind at initialization; see config presets --json")
         config_init.add_argument("--force", action="store_true", help="Replace an existing valid profile")
         sub.add_parser("doctor", parents=[common], help="Check profile completeness and host CLIs on PATH")
+        hosts = sub.add_parser("hosts", parents=[common], help="Read host capacity and per-host usage",
+                               description="Read capacity advice: status | usage | check HOST KIND. "
+                               "KIND: writer, review, extra-review, doc, research, a declared role or lens. "
+                               "check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. "
+                               "Real usage readers are adapter extension points; credentials are never read.")
+        hosts.add_argument("hosts_action", nargs="?", metavar="VERB", help="status, check or usage")
+        hosts.add_argument("host", nargs="?", metavar="HOST", help="Declared host alias (see status --json)")
+        hosts.add_argument("kind", nargs="?", metavar="KIND", help="Job kind or declared role/lens")
         lane_help = f"Lane name: {team.LANE_GRAMMAR}"
         expect_help = "The lease oid the lane must hold now (printed by claim, renew, transfer and list)"
 
