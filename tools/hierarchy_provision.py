@@ -205,6 +205,9 @@ PYTHON_UNAVAILABLE = ('python interpreter is unavailable; '
                       'pass an absolute, executable "python" in the init request')
 RECORDED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
                               'restore it, or remove the unregistered base and run init again')
+REGISTERED_PYTHON_UNAVAILABLE = ('the interpreter recorded in provision.json is unavailable; '
+                                'inspect the "python" field in this base\'s provision.json, '
+                                'restore that exact interpreter, then retry')
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # multi_agent_v2 as well: the live M1 sessions ran with multi_agent disabled and were still offered the v2 sub-agent
 # tools. Whether codex honours either flag under an account's managed settings is unverified; the native probe checks.
@@ -266,13 +269,15 @@ def pin_source(source):
     return source, commit, tree
 
 
-def require_interpreter(python, message=PYTHON_UNAVAILABLE):
+def require_interpreter(python, message=PYTHON_UNAVAILABLE, *, registered=False):
     available = False
     if isinstance(python, str) and 0 < len(python) <= 4096 and "\x00" not in python:
         try:
             available = Path(python).is_absolute() and Path(python).is_file() and os.access(python, os.X_OK)
         except (OSError, ValueError):
             available = False
+    if not available and registered:
+        message = REGISTERED_PYTHON_UNAVAILABLE
     require(available, message)
 
 
@@ -1131,7 +1136,7 @@ def add_role(request):
     setup = read_json(base / "provision.json")
     check_governing_pin(setup, base)
     delegated_read("runtime source", hierarchy_runtime_source.verify, setup, base)
-    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
+    require_interpreter(setup.get("python"), registered=True)
     mailbox = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     endpoint = request.get("endpoint")
     mailbox.endpoint(endpoint)
@@ -1580,6 +1585,8 @@ def carry(request):
 def move(request):
     """One idempotent command per hierarchy, so a rotating root repeats exactly what was rehearsed."""
     fields(request, {"store", "base", "source", "old_root", "hierarchy", "note", "root", "initiative"}, {"board", "python", "roles", "replaced"})
+    if "python" in request:
+        text(request["python"], "python")
     hierarchy, note = request["hierarchy"], request["note"]
     text(note, "note")
     fields(request["root"], {"host", "session"})
@@ -1620,7 +1627,7 @@ def move(request):
             **({"roles": optional} if optional else {}),
             **{key: request[key] for key in ("board", "python") if key in request}})
     setup = read_json(base / "provision.json")
-    require_interpreter(setup.get("python"), RECORDED_PYTHON_UNAVAILABLE)
+    require_interpreter(setup.get("python"), registered=True)
     require("python" not in request or request["python"] == setup["python"], "python does not match provision.json")
     new = delegated_read("mailbox manifest", Mailbox, setup["mailbox_root"])
     answers, needs_profile, tell = {}, [], {}
