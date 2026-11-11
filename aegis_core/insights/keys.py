@@ -16,7 +16,7 @@ from aegis_core import gitsafe, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import real_key
 from aegis_core.storage import append_jsonl, read_jsonl, workspace_relative
-from aegis_core.workspace.binding import bounded_walk_up
+from aegis_core.workspace.binding import bounded_walk_up, git_discovery_paths
 from aegis_core.workspace.layout import UserLayout
 
 __all__ = [
@@ -153,7 +153,7 @@ def _ensure_hs(host: str, session: Optional[str], home: Optional[Path] = None) -
 
 def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
     cur = Path(os.path.realpath(root))
-    for cand in (cur, *cur.parents):
+    for cand in git_discovery_paths(cur):
         dot_git = cand / ".git"
         st = _lstat_or_none(dot_git)
         if not st:
@@ -180,6 +180,7 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
 
 
 def insight_workspace_id(workspace: Any) -> str:
+    # The identity follows Git discovery, including the operator's ceiling environment.
     # Keyed to the governed root (the nearest .aegis inside the git boundary), so a hook
     # running in a subdirectory and `review` at the root share one file.
     root = Path(os.fspath(workspace)).resolve()
