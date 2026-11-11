@@ -46,7 +46,8 @@ from aegis_core import atomicio, credit_memo, gitsafe, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import is_within, utc_stamp
 from aegis_core.storage import (
-    FileReport, ReportedRows, append_jsonl, ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label,
+    FileReport, RowsResult, append_jsonl, append_jsonl_with_report,
+    ledger_locked, ledger_site, read_jsonl, workspace_relative, worktree_label,
 )
 from aegis_core.workspace.layout import WorkspaceLayout
 
@@ -65,6 +66,7 @@ __all__ = [
     "append",
     "append_epoch",
     "append_rows",
+    "append_rows_with_report",
     "incomplete",
     "is_ambient_session_row",
     "ledger_path",
@@ -426,11 +428,11 @@ def _current_index(path: Path, clock_path: Path) -> _Index:
 def _write(path: Path, rows: List[Dict[str, Any]]) -> Optional[FileReport]:
     """Append rows and invalidate the index. Call with the workspace lock held."""
     try:
-        written = append_jsonl(path, rows)
+        written = append_jsonl_with_report(path, rows)
     finally:
         with _INDEX_GUARD:
             _INDEXES.pop(str(path), None)  # A failed write may also have changed the file.
-    return getattr(written, "report", None)
+    return written.report
 
 
 def _validated(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -539,10 +541,15 @@ def append_epoch(workspace: Any, note: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append v2 rows, skipping duplicates; return the plain list of rows written."""
+    return append_rows_with_report(workspace, rows).rows
+
+
+def append_rows_with_report(workspace: Any, rows: List[Dict[str, Any]]) -> RowsResult:
     """Append already-formed v2 outcome rows (``aegis migrate``), renumbering their seq.
 
     Rows whose ``(key, rule)`` is already in the ledger are skipped, so a re-run adds
-    nothing. Returns the rows written.
+    nothing. Returns the rows written and optional write-descriptor evidence.
     """
     with ledger_locked(workspace) as site:
         path = site.path
@@ -563,7 +570,7 @@ def append_rows(workspace: Any, rows: List[Dict[str, Any]]) -> List[Dict[str, An
             if identity is not None:
                 seen.add(identity)
         report = _write(path, new_rows) if new_rows else None
-        return ReportedRows(new_rows, report)
+        return RowsResult(new_rows, report)
 
 
 # ── Merging the ledgers of several worktrees (v4.2 #7) ───────────────────────
