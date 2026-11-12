@@ -17,7 +17,15 @@ import tempfile
 import time
 import uuid
 
+from contextlib import ExitStack
+from unittest.mock import patch as jobs2_patch
+
 import pytest
+
+import tools as jobs2_tools
+from tools import hierarchy_jobs as jobs2_module
+import hierarchy_mailbox as jobs2_mailbox
+import hierarchy_fresh_brief as jobs2_fresh_brief
 
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration import test_hierarchy_provision as provision_fixtures
@@ -1821,7 +1829,9 @@ def test_a_derived_publication_loser_reports_pending_settlement(kind_shop, monke
         return original_flock(fd, operation)
 
     def link(source, target, *args, **kwargs):
-        if Path(target) == folder / "execution.json" and Path(target).exists():
+        execution_target = (Path(target) == folder / "execution.json"
+                            or (str(target) == "execution.json" and "dst_dir_fd" in kwargs))
+        if execution_target and (folder / "execution.json").exists():
             lost.append("existing execution claim")
         answer = original_link(source, target, *args, **kwargs)
         if Path(target) == folder / "result.json":
@@ -1897,7 +1907,7 @@ def test_unknown_existing_claim_preserves_legacy_reporting(kind_shop, planned, c
                 "reason": "runner visibility is unknown; retain the original claim and reservation"}
     if planned:
         action = json.loads(output)["rows"][0]["next_action"]
-        assert "Root" in action and "Do not remove the fence" in action
+        assert action == JOBS2_UNVERIFIED_ACTION
         expected["next_action"] = action
     assert output == json.dumps({"rows": [expected]}, sort_keys=True) + "\n"
     assert_did_not_run(shop)
@@ -2067,8 +2077,11 @@ def test_a_retained_heavy_claim_cannot_exempt_the_runners_next_heavy_tests_job(k
                     pass
 
 
+@pytest.mark.usefixtures("jobs2_fresh_cache")
 @pytest.mark.parametrize("publication", ["claim.json", "packet.md"])
 def test_a_failed_derived_admission_preserves_its_partial_claim_custody(kind_shop, monkeypatch, capsys, publication):
+    from types import SimpleNamespace
+
     from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
 
     shop = kind_shop
@@ -2092,18 +2105,20 @@ def test_a_failed_derived_admission_preserves_its_partial_claim_custody(kind_sho
             raise OSError(errno.ENOSPC, "fixture derived admission publication full")
         return original_link(source, target, *args, **kwargs)
 
-    jobs = load_jobs_module()
-    with monkeypatch.context() as patch:
-        patch.setattr(os, "link", link)
-        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
-        report = json.loads(capsys.readouterr().out)
+    jobs = jobs2_module
+    with jobs2_patch.object(jobs2_mailbox, "os", SimpleNamespace(**{**vars(os)})):
+        with monkeypatch.context() as patch:
+            patch.setattr(jobs2_mailbox.os, "link", link)
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
     row = job_row(report)
     assert injected == [publication]
     assert row == {"job": "pilot/job-1", "state": "abandoned", "process_group": None, "process_alive": None,
                    "reason": "execution_custody_unknown", "next_action":
                    "Root: preserve the original execution fence and reservation; inspect recovery-status, "
                    "the original claim and process scope. Establish custody and stopped-process evidence "
-                   "before recovery or settlement. Do not remove the fence or retry execution."}
+                   "before recovery or settlement. Do not remove the fence or retry execution."
+                   if publication == "packet.md" else JOBS2_UNVERIFIED_ACTION}
     assert folder.is_dir() and not (folder / "execution.json").exists() and not (folder / "result.json").exists()
     assert (folder / "claim.json").exists() is (publication == "packet.md")
     assert shop.receipts("job-1") == [] and ledger_rows(shop)[request]["state"] == "granted"
@@ -2223,9 +2238,12 @@ def test_a_preclaim_mailbox_error_does_not_adopt_another_runners_fence(kind_shop
         assert finished(child)
 
 
+@pytest.mark.usefixtures("jobs2_fresh_cache")
 @pytest.mark.parametrize("next_kind_job", [False, True], ids=["empty-next-kind", "waiting-next-kind"])
 def test_a_postcompletion_fault_appends_its_own_hold_without_changing_an_unknown_job(
         kind_shop, monkeypatch, capsys, next_kind_job):
+    from contextlib import contextmanager
+    from tests.conftest import symlink_or_skip
     from tests.integration.test_hierarchy_jobs_derive import host_plan
 
     shop = kind_shop
@@ -2234,29 +2252,29 @@ def test_a_postcompletion_fault_appends_its_own_hold_without_changing_an_unknown
     shop.request_job("job-u", "touch")
     unknown.mkdir(parents=True)
     original_row = job_row(shop.run_open(expect=3), "job-u")
-    assert original_row["state"] == "abandoned" and "Do not remove the fence" in original_row["next_action"]
+    assert original_row["state"] == "abandoned" and original_row["next_action"] == JOBS2_UNVERIFIED_ACTION
     request_kind_job(shop, "heavy")
     if next_kind_job:
         add_recipe_of_kind(shop, "later", "heavy-tests")
         shop.request_job("job-tail", "later")
     store, backup = shop.workspace.store, shop.tmp / "critical-retained-store"
-    lock = store / ".write.lock"
     result = store / "jobs/pilot/job-1/result.json"
-    original_unlink = Path.unlink
+    jobs = jobs2_module
+    original_lock = jobs.Store.lock
     injected = []
 
-    def unlink(path, *args, **kwargs):
-        answer = original_unlink(path, *args, **kwargs)
-        if path == lock and result.exists() and not injected and list(requests_of(shop, "heavy").values()) == ["released"]:
+    @contextmanager
+    def locked(current):
+        with original_lock(current):
+            yield
+        if current.path == store and result.exists() and not injected and list(requests_of(shop, "heavy").values()) == ["released"]:
             store.rename(backup)
-            store.symlink_to(backup, target_is_directory=True)
+            symlink_or_skip(backup, store, target_is_directory=True)
             injected.append(True)
-        return answer
 
-    jobs = load_jobs_module()
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(Path, "unlink", unlink)
+            patch.setattr(jobs2_module.Store, "lock", locked)
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
     finally:
@@ -4372,6 +4390,13 @@ def test_expects_tests_needs_a_step_that_writes_the_junit_report(shop):
     assert shop.states("job-1") == []
 
 
+
+@pytest.fixture
+def jobs2_fresh_cache(monkeypatch):
+    """Preserve a fresh runner's per-test interpreter probe cache."""
+    monkeypatch.setattr(jobs2_module, "PYTHON_INFO", {})
+
+
 def load_jobs_module():
     import importlib.util
     spec = importlib.util.spec_from_file_location("hierarchy_jobs_probe_test", JOBS)
@@ -5019,3 +5044,3332 @@ def test_an_admitted_derivation_with_a_busy_execution_lock_stays_retryable(kind_
     assert job_row(shop.run_open())["state"] == "completed"
     assert shop.head()["commit"] != before["commit"]
     assert shop.run_open()["rows"] == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("completed_prior", [False, True])
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-byte-compatible", "host-plan"])
+def test_jobs2_released_unexecuted_grant_is_not_recovered_after_a_replay_fault(
+        kind_shop, monkeypatch, capsys, kind, completed_prior, planned):
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    if completed_prior:
+        add_recipe_of_kind(shop, "prior", kind)
+        shop.request_job("job-0", "prior")
+    request_kind_job(shop, kind)
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    first_event = sorted((shop.workspace.store / "events").iterdir())[0]
+    original_bytes = first_event.read_bytes()
+    released, post_reads = [], []
+
+    def grant(store, granted_kind, **kwargs):
+        answer = original_grant(store, granted_kind, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["holder"] == JOB_HOLDER:
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[-1])
+        return answer
+
+    def load(store):
+        if released:
+            post_reads.append(True)
+            if len(post_reads) == 2:
+                first_event.write_bytes(b"{}")
+        return original_load(store)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            report = json.loads(output)
+    finally:
+        first_event.write_bytes(original_bytes)
+    assert len(released) == 1 and len(post_reads) == 2
+    own = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    waiting = {"job": "pilot/job-1", "state": "waiting", "kind": kind,
+               "reason": "post_grant_ledger_unreadable"}
+    if planned:
+        waiting_rows = [row for row in own if row["state"] == "waiting"]
+        assert waiting_rows == [{key: value for key, value in waiting.items() if key != "reason"}], report
+        faults = [row for row in report["rows"] if row.get("reason") == "post_grant_ledger_unreadable"]
+        assert len(faults) == 1 and faults[0]["state"] == "settle_pending"
+        assert "request_id" not in faults[0]
+        if not completed_prior:
+            assert len(own) == 2 and "has not started" in faults[0]["next_action"]
+    else:
+        # Literal base recovery rows: no repository history is needed in a full-suite snapshot.
+        legacy = [waiting, {"job": "pilot/job-1", "state": "settle_pending",
+                           "reason": "post_grant_ledger_unreadable", "next_action":
+                           "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."}]
+        terminal = report["rows"][:1] if completed_prior else []
+        expected = json.dumps({"rows": terminal + legacy}, sort_keys=True) + "\n"
+        assert output.encode("utf-8") == expected.encode("utf-8")
+    if completed_prior and planned:
+        assert [row["state"] for row in report["rows"] if row.get("job") == "pilot/job-0"] == [
+            "completed", "settle_pending"]
+    elif completed_prior:
+        assert [row["state"] for row in report["rows"] if row.get("job") == "pilot/job-0"] == ["completed"]
+    assert requests_of(shop, kind) == {released[0]: "released"}
+    assert_did_not_run(shop)
+    assert job_row(shop.run_open())["state"] == "completed"
+    assert shop.sentinel.read_text() == "ran\n"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["own-publication-cleanup", "peer-before-enospc", "before-publication",
+                                 "claim-read-error", "oversized-claim", "malformed-claim", "non-object-claim",
+                                 "peer-search-only-ancestor", "descriptor-support-unavailable",
+                                 "cleanup-missing-claim", "cleanup-renamed-ancestor", "cleanup-denied-missing-claim",
+                                 "cleanup-collision-missing-claim", "cleanup-runtime-error", "publication-directory-denied"])
+def test_jobs2_derived_publication_failure_tracks_only_this_attempts_fence(
+        kind_shop, monkeypatch, capsys, fault):
+    from types import SimpleNamespace
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    search_only = fault == "peer-search-only-ancestor"
+    ancestor_mode = shop.tmp.stat().st_mode & 0o7777
+    if search_only:
+        if os.name != "posix" or not hasattr(os, "O_PATH"):
+            pytest.skip("search-only ancestor requires POSIX modes and Linux O_PATH")
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses search-only ancestor read permissions")
+        try:
+            shop.tmp.chmod(0o111)
+            try:
+                with os.scandir(shop.tmp):
+                    pass
+            except PermissionError:
+                pass
+            else:
+                pytest.skip("chmod is ineffective: search-only ancestor remains listable")
+        finally:
+            shop.tmp.chmod(ancestor_mode)
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    request_derive(shop)
+    jobs = jobs2_module
+    mailbox = jobs2_mailbox
+    original_open = jobs.os.open
+    original_execution_publish = jobs.Job.publish_execution_claim
+    original_run_job = jobs.run_job
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    execution = folder / "execution.json"
+    retained = shop.tmp / "retained-execution-folder"
+    injected, peer_bytes, descriptors = [], {}, []
+    peer_completed = fault in ("peer-before-enospc", "peer-search-only-ancestor")
+    unsupported = []
+
+    def refuse_descriptors():
+        unsupported.append(True)
+        injected.append("unsupported-descriptors")
+        raise ValueError("secure brief publication requires directory descriptor support")
+
+    def fdopen(descriptor, *args, **kwargs):
+        descriptors.append(descriptor)
+        if fault == "oversized-claim":
+            pytest.fail("oversized execution claim must be refused before reading")
+        raise OSError(errno.EIO, "fixture execution claim read failed")
+
+    def open_pending(path, flags, *args, **kwargs):
+        if Path(path).name.startswith(".pending-") and flags & os.O_CREAT:
+            injected.append("pending-enospc")
+            raise OSError(errno.ENOSPC, "fixture execution publication full")
+        return original_open(path, flags, *args, **kwargs)
+
+    def publish(job, raw):
+        if fault == "publication-directory-denied":
+            import hierarchy_fresh_brief
+
+            def denied(path):
+                injected.append("directory-denied")
+                raise hierarchy_fresh_brief.PublicationRefused("permission denied: private-input-must-not-echo")
+
+            patch.enter_context(jobs2_patch.object(jobs2_fresh_brief, "open_directory", denied))
+            return original_execution_publish(job, raw)
+        if fault == "descriptor-support-unavailable":
+            import hierarchy_fresh_brief
+            patch.enter_context(jobs2_patch.object(jobs2_fresh_brief, "require_secure_publication", refuse_descriptors))
+            return original_execution_publish(job, raw)
+        if peer_completed or fault == "before-publication":
+            if search_only:
+                shop.tmp.chmod(0o111)
+                assert execution.read_bytes() == peer_bytes["execution.json"], "claim is readable by pathname"
+            with ExitStack() as pending_patch:
+                pending_patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_pending})))
+                return original_execution_publish(job, raw)
+        if fault.startswith("cleanup-"):
+            def unlink_pending(name, *args, **kwargs):
+                assert str(name).startswith(".pending-") and "dir_fd" in kwargs
+                assert job.execution_published, "publication must be recorded before cleanup starts"
+                injected.append(fault)
+                if fault == "cleanup-renamed-ancestor":
+                    folder.rename(retained)
+                elif fault != "cleanup-runtime-error":
+                    execution.unlink()
+                error = {"cleanup-missing-claim": FileNotFoundError, "cleanup-renamed-ancestor": FileNotFoundError,
+                         "cleanup-denied-missing-claim": PermissionError,
+                         "cleanup-collision-missing-claim": FileExistsError,
+                         "cleanup-runtime-error": RuntimeError}[fault]
+                raise error("fixture cleanup failed after execution publication")
+
+            with ExitStack() as cleanup_patch:
+                cleanup_patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "unlink": unlink_pending})))
+                return original_execution_publish(job, raw)
+        original_execution_publish(job, raw)
+        if fault in ("malformed-claim", "non-object-claim"):
+            execution.write_bytes(b"{" if fault == "malformed-claim" else b"null")
+        if fault in ("claim-read-error", "oversized-claim"):
+            if fault == "oversized-claim":
+                execution.write_bytes(b"x" * (mailbox.MAX_BYTES + 1))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "fdopen": fdopen})))
+        injected.append("published-cleanup-error")
+        raise OSError(errno.ENOSPC, "fixture execution publication cleanup full")
+
+    def run_job(*args, **kwargs):
+        if peer_completed:
+            # Both attempts are admitted; let the peer finish before this attempt takes disposition exclusion.
+            assert job_row(shop.run_open())["state"] == "completed"
+            peer_bytes.update({name: (folder / name).read_bytes() for name in ("execution.json", "result.json")})
+        return original_run_job(*args, **kwargs)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "publish_execution_claim", publish))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if search_only:
+            shop.tmp.chmod(ancestor_mode)
+        if retained.exists():
+            retained.rename(folder)
+    row = job_row(report)
+    missing = fault in ("before-publication", "cleanup-missing-claim", "cleanup-denied-missing-claim",
+                        "cleanup-collision-missing-claim", "descriptor-support-unavailable", "publication-directory-denied")
+    assert len(injected) == 1 and execution.exists() is not missing
+    if peer_completed:
+        assert row["state"] == "settle_pending", row
+        assert row["error"] == "[Errno 28] fixture execution publication full"
+        assert "Run run-open again" in row["next_action"]
+        assert {name: (folder / name).read_bytes() for name in peer_bytes} == peer_bytes
+        assert shop.states("job-1") == ["started", "completed"]
+        assert shop.run_open()["rows"] == []
+    elif fault in ("before-publication", "descriptor-support-unavailable", "publication-directory-denied"):
+        assert row["state"] == "settle_pending", row
+        expected = {"before-publication": "[Errno 28] fixture execution publication full",
+                    "descriptor-support-unavailable": "secure brief publication requires directory descriptor support",
+                    "publication-directory-denied": "execution claim directory unavailable"}[fault]
+        assert row["error"] == expected
+        assert "private-input-must-not-echo" not in json.dumps(report)
+        assert "Run run-open again" in row["next_action"]
+        assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+        assert job_row(shop.run_open())["state"] == "completed"
+    else:
+        assert row["state"] == "abandoned", row
+        assert (row["state"], row["reason"], row["process_alive"]) == (
+            "abandoned", "execution_custody_unknown", None)
+        assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+    if fault == "claim-read-error":
+        assert descriptors == [], "known publication does not depend on reading the pathname again"
+    if fault == "descriptor-support-unavailable":
+        assert unsupported == [True]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("replacement", [False, True], ids=["waiting-queue-empty", "replacement-completed"])
+def test_jobs2_retired_grant_does_not_swallow_a_later_store_fault(kind_shop, monkeypatch, capsys, replacement):
+    from tools import hierarchy_loop as loop
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    request_kind_job(shop, "heavy")
+    jobs = jobs2_module
+    original_grant, original_safe_path = jobs.grant_next, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "retained-fault-store"
+    released, replacements, swapped = [], [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and not released:
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[0])
+            if replacement:
+                replacements.append(shop.workspace.ask("pilot", "heavy", JOB_HOLDER))
+                assert shop.workspace.grant("heavy")["request_id"] == replacements[0]
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and released and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe_path(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert swapped == [True] and len(released) == 1
+    own = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    if replacement:
+        assert [row["state"] for row in own] == ["completed", "settle_pending"], report
+        assert own[1]["reason"] == "post_grant_step_failed" and "request_id" not in own[1]
+        assert "do not rerun completed work" in own[1]["next_action"]
+        assert requests_of(shop, "heavy") == {released[0]: "released", replacements[0]: "released"}
+        assert shop.sentinel.read_text() == "ran\n" and shop.states("job-1") == ["started", "completed"]
+    else:
+        assert [row["state"] for row in own] == ["waiting", "settle_pending"]
+        assert own[0]["reason"] == "queue_empty", report
+        assert own[1]["reason"] == "post_grant_step_failed"
+        assert "has not started" in own[1]["next_action"]
+        assert requests_of(shop, "heavy") == {released[0]: "released"}
+        assert_did_not_run(shop)
+    original_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if str(JOBS) in [str(word) for word in argv]:
+            return subprocess.CompletedProcess(argv, 3, json.dumps(report) + "\n", "")
+        return original_run(argv, *args, **kwargs)
+
+    current = loop.Pass(SimpleNamespace(store=store, recipes=shop.recipes_path, max_jobs=None))
+    with ExitStack() as patch:
+        patch.enter_context(jobs2_patch.object(jobs2_tools.hierarchy_loop, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run})))
+        current.run_open()
+    assert current.steps[0]["state"] == "hold" and any(row["act"] == "root" for row in current.holds)
+
+
+@pytest.mark.parametrize("occupied", [False, True], ids=["normal", "no-replace"])
+def test_jobs2_execution_publisher_is_equivalent_to_pinned_publish_file(tmp_path, occupied):
+    jobs = load_jobs_module()
+    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "publication"})
+    job.folder.mkdir(parents=True)
+    baseline = tmp_path / "pinned" / "execution.json"
+    claim = {"job": job.id, "pid": os.getpid(), "start": jobs.process_start(os.getpid()), "at": jobs.timestamp(),
+             "process_scope": jobs.process_scope(), "recipes_sha256": "a" * 64}
+    raw = jobs.encoded(claim) + b"\n"
+    if occupied:
+        jobs.publish_file(baseline, b"earlier claim\n")
+        jobs.publish_file(job.execution_path, b"earlier claim\n")
+        with pytest.raises(FileExistsError):
+            jobs.publish_file(baseline, raw)
+        with pytest.raises(FileExistsError):
+            job.publish_execution_claim(raw)
+        assert not job.execution_published
+    else:
+        jobs.publish_file(baseline, raw)
+        job.publish_execution_claim(raw)
+        assert job.execution_published and job.execution_fence == job.execution_path
+        assert job.execution_path.read_bytes() == raw
+    assert job.execution_path.read_bytes() == baseline.read_bytes()
+    assert (job.execution_path.stat().st_mode & 0o777) == (baseline.stat().st_mode & 0o777)
+    assert sorted(p.name for p in baseline.parent.iterdir()) == ["execution.json"]
+    assert sorted(p.name for p in job.folder.iterdir()) == ["execution.json"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_jobs2_execution_publisher_closes_handles_when_fdopen_raises(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_fresh_brief
+
+    jobs = jobs2_module
+    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "publication"})
+    job.folder.mkdir(parents=True)
+    original_directory = hierarchy_fresh_brief.open_directory
+    descriptors = []
+
+    def directory(path):
+        descriptor = original_directory(path)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def fdopen(descriptor, *args, **kwargs):
+        descriptors.append(descriptor)
+        raise OSError(errno.EIO, "fixture execution fdopen failed")
+
+    with ExitStack() as patch:
+        patch.enter_context(jobs2_patch.object(jobs2_fresh_brief, "open_directory", directory))
+        patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "fdopen": fdopen})))
+        with pytest.raises(OSError, match="fixture execution fdopen failed"):
+            job.publish_execution_claim(b"claim\n")
+    assert len(descriptors) == 2 and not job.execution_published and not job.execution_path.exists()
+    for descriptor in descriptors:
+        try:
+            os.fstat(descriptor)
+        except OSError as exc:
+            assert exc.errno == errno.EBADF
+        else:
+            os.close(descriptor)
+            pytest.fail("execution publisher leaked a descriptor when fdopen failed")
+    assert list(job.folder.iterdir()) == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_jobs2_execution_publisher_refuses_size_before_opening(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    jobs = jobs2_module
+    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "publication"})
+
+    def refuse_open(*args, **kwargs):
+        pytest.fail("oversized execution claim must be refused before opening")
+
+    with ExitStack() as patch:
+        patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": refuse_open})))
+        with pytest.raises(ValueError, match="^record exceeds 262144 bytes$"):
+            job.publish_execution_claim(b"x" * (jobs.MAX_BYTES + 1))
+    assert not job.folder.exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["fdopen", "oversized"])
+def test_jobs2_bounded_claim_reader_closes_or_refuses_before_reading(tmp_path, monkeypatch, fault):
+    from types import SimpleNamespace
+
+    jobs = jobs2_module
+    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "publication"})
+    job.folder.mkdir(parents=True)
+    job.execution_path.write_bytes(b"x" * (jobs.MAX_BYTES + 1) if fault == "oversized" else b"claim\n")
+    descriptors = []
+
+    def fdopen(descriptor, *args, **kwargs):
+        descriptors.append(descriptor)
+        if fault == "oversized":
+            pytest.fail("oversized claim must be refused before reading")
+        raise OSError(errno.EIO, "fixture claim read fdopen failed")
+
+    with ExitStack() as patch:
+        patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "fdopen": fdopen})))
+        assert job.execution_publication_matches({}) is None
+    assert len(descriptors) == (1 if fault == "fdopen" else 0)
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptor)
+        assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("prior_completed", [False, True], ids=["single-outcome", "prior-completed"])
+@pytest.mark.parametrize("outcome", ["completed", "running", "dependency-waiting", "stale-grant",
+                                     "abandoned", "settle-pending"])
+def test_jobs2_replacement_replay_reports_one_pass_fault(
+        kind_shop, monkeypatch, capsys, planned, kind, prior_completed, outcome):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    add_recipe_of_kind(shop, "replacement", kind)
+    dependent = outcome in ("dependency-waiting", "settle-pending")
+    if dependent:
+        parent = shop.request_job("first-check", "ok")
+        assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+    if prior_completed:
+        shop.request_job("job-0", "replacement")
+    if dependent:
+        request_dependent(shop, parent, "job-1", recipe="replacement")
+    else:
+        shop.request_job("job-1", "replacement")
+    if outcome == "dependency-waiting":
+        shop.workspace.register(FOREIGN)
+    jobs = jobs2_module
+    original_grant, original_safe_path, original_open = jobs.grant_next, jobs.safe_path, os.open
+    store, retained = shop.workspace.store, shop.tmp / "replay-retained-store"
+    folder, lock = store / "jobs/pilot/job-1", shop.root / ".write.lock"
+    released, replacements, injected, swapped = [], [], [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["holder"] == JOB_HOLDER and not released:
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[0])
+            replacement_kind = ("heavy-tests" if kind == "heavy" else "heavy") if outcome == "stale-grant" else kind
+            replacements.append(shop.workspace.ask("pilot", replacement_kind, JOB_HOLDER))
+            assert shop.workspace.grant(replacement_kind)["request_id"] == replacements[0]
+            if outcome == "running":
+                folder.mkdir(parents=True)
+                (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-1")))
+            elif outcome == "dependency-waiting":
+                shop.workspace.ask(FOREIGN, "writer", "job:pilot/first-check")
+            elif outcome == "settle-pending":
+                lock.write_text("fixture concurrent mailbox writer")
+        return answer
+
+    def open_claim(path, flags, *args, **kwargs):
+        if outcome == "abandoned" and Path(path).parent == folder and flags & os.O_CREAT:
+            injected.append("claim-publication-full")
+            raise OSError(errno.ENOSPC, "fixture claim publication full")
+        return original_open(path, flags, *args, **kwargs)
+
+    def safe_path(path):
+        # This is run_open's final boundary check, after run_kind has recorded the real outcome.
+        if Path(path) == store and released and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe_path(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            patch.enter_context(jobs2_patch.object(jobs2_mailbox, "os", SimpleNamespace(**{**vars(os), "open": open_claim})))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            report = json.loads(output)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if lock.exists():
+            lock.unlink()
+    assert swapped == [True] and len(released) == len(replacements) == 1
+    state = {"dependency-waiting": "waiting", "stale-grant": "waiting",
+             "settle-pending": "settle_pending"}.get(outcome, outcome)
+    prior = report["rows"][:1] if prior_completed else []
+    if prior_completed:
+        assert (prior[0]["job"], prior[0]["state"]) == ("pilot/job-0", "completed")
+    original = report["rows"][len(prior)]
+    assert (original["job"], original["state"]) == ("pilot/job-1", state)
+    if outcome == "stale-grant":
+        assert original["reason"] == "stale_grant" and original["request_id"] == replacements[0]
+    elif outcome == "dependency-waiting":
+        assert original["reason"] == "foreign_reservation"
+        if planned:
+            assert replacements[0] in original["next_action"]
+    elif outcome == "abandoned":
+        assert injected == ["claim-publication-full"]
+        assert (original["reason"], original["process_alive"]) == ("execution_custody_unknown", None)
+    elif outcome == "settle-pending":
+        assert original["error"] == "mailbox writer is busy; inspect an abandoned lock before retrying"
+    elif outcome == "running":
+        assert original == {"job": "pilot/job-1", "state": "running", "process_group": None}
+    if planned:
+        faults = [row for row in report["rows"] if row.get("reason") == "post_grant_step_failed"
+                  or row.get("failure_reason") == "post_grant_step_failed"]
+        assert len(faults) == 1, report
+        diagnostics = report["rows"][len(prior) + 1:]
+        expected_jobs = {"pilot/job-0", "pilot/job-1"} if prior_completed else {"pilot/job-1"}
+        assert {row["job"] for row in diagnostics} == expected_jobs and len(diagnostics) == len(expected_jobs), report
+        assert all(row["state"] == "settle_pending" and "request_id" not in row
+                   and "Root:" in row["next_action"] for row in diagnostics)
+        fault = next(row for row in diagnostics if row["job"] == "pilot/job-1")
+        if prior_completed:
+            assert "do not rerun completed work" in next(row for row in diagnostics if row["job"] == "pilot/job-0")["next_action"]
+        guidance = {"completed": "do not rerun completed work", "running": "running",
+                    "dependency-waiting": "has not started", "stale-grant": "reservation",
+                    "abandoned": "custody", "settle-pending": "has not started"}[outcome]
+        assert guidance in fault["next_action"]
+        if outcome == "settle-pending":
+            assert "Run run-open again" in fault["next_action"]
+            assert "original fence" not in fault["next_action"] and "stopped-process" not in fault["next_action"]
+        assert "post_grant_" not in json.dumps(original)
+    else:
+        # The unchanged legacy recovery appends this literal diagnostic for every outcome.
+        diagnostic = {"job": "pilot/job-1", "state": "settle_pending", "reason": "post_grant_step_failed",
+                      "next_action": "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."}
+        assert output.encode() == (json.dumps({"rows": prior + [original, diagnostic]}, sort_keys=True) + "\n").encode()
+    assert requests_of(shop, kind)[released[0]] == "released"
+    assert not shop.sentinel.exists()
+    if outcome != "completed":
+        assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("holder", ["manual-holder", "job:pilot/outside-candidates"])
+@pytest.mark.parametrize("retire", [False, True], ids=["active", "retired"])
+def test_jobs2_ownerless_grant_preserves_every_jobs_obligation(
+        kind_shop, monkeypatch, capsys, planned, kind, holder, retire):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        plan = host_plan(shop)
+    add_recipe_of_kind(shop, "ownerless", kind)
+    shop.request_job("job-1", "ownerless")
+    shop.workspace.ask("pilot", kind, JOB_HOLDER)
+    ownerless = shop.workspace.ask("pilot", kind, holder)
+    shop.request_job("job-tail", "ownerless")
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "ownerless-retained-store"
+    acknowledged, post_reads, swapped = [], [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == ownerless:
+            assert (store / "jobs/pilot/job-1/result.json").is_file()
+            if retire:
+                shop.workspace.release(ownerless)
+            acknowledged.append(ownerless)
+        return answer
+
+    def load(current):
+        if acknowledged:
+            post_reads.append(True)
+            if len(post_reads) == 2:
+                # The first post-grant snapshot observed the holder's disposition; a later replay loses its path.
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+                if planned:
+                    plan.unlink()  # Reporting must use the grant's remembered plan status, not re-probe it.
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            report = json.loads(output)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert acknowledged == [ownerless] and len(post_reads) == 2 and swapped == [True]
+    completed = report["rows"][0]
+    assert (completed["job"], completed["state"]) == ("pilot/job-1", "completed")
+    if planned:
+        faults = [r for r in report["rows"] if r.get("reason") == "post_grant_ledger_unreadable"]
+        assert len(faults) == 1, report
+        assert (faults[0].get("job"), faults[0]["state"]) == ("pilot/job-1", "settle_pending")
+        assert "do not rerun completed work" in faults[0]["next_action"]
+        reservations = [r for r in report["rows"] if r.get("request_id") == ownerless]
+        if retire:
+            assert reservations == [] and not any(r.get("holder") == holder for r in report["rows"])
+        else:
+            # Additional diagnostics use the validated request reference, never another copy of holder text.
+            assert len(reservations) == 2, report
+            original, diagnostic = reservations
+            assert original["holder"] == holder and original["state"] == "granted_elsewhere"
+            assert "holder" not in diagnostic and diagnostic["state"] == "granted_elsewhere"
+            assert "reservation" in diagnostic["next_action"]
+    else:
+        held = [] if retire else [{"state": "granted_elsewhere", "holder": holder, "request_id": ownerless}]
+        legacy = [completed] + held + [{"job": "pilot/job-tail", "state": "waiting", "kind": kind,
+                              "reason": "post_grant_ledger_unreadable"},
+                  {"state": "granted_elsewhere", "holder": holder, "reason": "post_grant_ledger_unreadable",
+                   "next_action": "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."}]
+        assert output.encode() == (json.dumps({"rows": legacy}, sort_keys=True) + "\n").encode()
+    assert requests_of(shop, kind, holder=holder) == {ownerless: "released" if retire else "granted"}
+    assert shop.states("job-1") == ["started", "completed"] and shop.receipts("job-tail") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+def test_jobs2_stale_kind_outcome_cannot_hide_a_completed_replacement(
+        kind_shop, monkeypatch, capsys, planned):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    add_recipe_of_kind(shop, "other-kind", "heavy-tests")
+    add_recipe_of_kind(shop, "replacement", "heavy")
+    shop.request_job("job-0", "other-kind")
+    shop.request_job("job-1", "replacement")
+    jobs = jobs2_module
+    original_enqueue, original_grant, original_safe_path = jobs.enqueue, jobs.grant_next, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "multi-outcome-retained-store"
+    stale, released, replacements, swapped = [], [], [], []
+
+    def enqueue(current, job, kind, wait):
+        answer = original_enqueue(current, job, kind, wait)
+        if job.id == "pilot/job-0" and not stale:
+            # The older runner files R0 after this attempt has reconciled job-0's current kind.
+            stale.append(shop.workspace.ask("pilot", "heavy", job.holder))
+        return answer
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["holder"] == JOB_HOLDER and not released:
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[0])
+            replacements.append(shop.workspace.ask("pilot", "heavy", JOB_HOLDER))
+            assert shop.workspace.grant("heavy")["request_id"] == replacements[0]
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and replacements and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe_path(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "enqueue", enqueue))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            report = json.loads(output)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert swapped == [True] and len(stale) == len(released) == len(replacements) == 1
+    original = report["rows"][:3]
+    assert (original[0]["state"], original[0]["reason"], original[0]["stale_job"], original[0]["request_id"]) == (
+        "granted_elsewhere", "stale_kind", "pilot/job-0", stale[0])
+    assert (original[1]["job"], original[1]["state"]) == ("pilot/job-1", "completed")
+    assert (original[2]["job"], original[2]["state"], original[2]["reason"], original[2]["request_id"]) == (
+        "pilot/job-0", "waiting", "stale_grant", stale[0])
+    if planned:
+        diagnostics = report["rows"][3:]
+        assert {row.get("job") for row in diagnostics} == {"pilot/job-0", "pilot/job-1"}, report
+        assert len(diagnostics) == 2 and all(row["state"] == "settle_pending" for row in diagnostics)
+        assert sum(row.get("reason") == "post_grant_step_failed" for row in report["rows"]) == 1
+        completed = next(row for row in diagnostics if row["job"] == "pilot/job-1")
+        assert "do not rerun completed work" in completed["next_action"] and "request_id" not in completed
+        waiting = next(row for row in diagnostics if row["job"] == "pilot/job-0")
+        assert "has not started" in waiting["next_action"] and "reservation" in waiting["next_action"]
+    else:
+        legacy = {"job": "pilot/job-1", "state": "settle_pending", "reason": "post_grant_step_failed",
+                  "next_action": "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."}
+        assert output.encode() == (json.dumps({"rows": original + [legacy]}, sort_keys=True) + "\n").encode()
+    assert requests_of(shop, "heavy", holder="job:pilot/job-0") == {stale[0]: "granted"}
+    assert requests_of(shop, "heavy") == {released[0]: "released", replacements[0]: "released"}
+    assert shop.states("job-1") == ["started", "completed"] and shop.receipts("job-0") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned_p", [False, True], ids=["legacy-p-planned-u", "planned-p-legacy-u"])
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("holder", ["manual-holder", "job:unrelated/outside-candidates"])
+@pytest.mark.parametrize("retire", [False, True], ids=["held", "retired"])
+@pytest.mark.parametrize("preexisting", [False, True], ids=["acknowledged-p", "preexisting-p"])
+def test_jobs2_shared_store_recovery_keeps_each_initiatives_mode(
+        kind_shop, monkeypatch, capsys, planned_p, kind, holder, retire, preexisting):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    other_root, _ = add_initiative(shop, "unrelated", 1)
+    idle_root, _ = add_initiative(shop, "idle", 20)
+    (idle_root.parent / "host-plan.json").write_text(json.dumps({
+        "schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "idle", "root": "codex-cli",
+        "team": "claude-code", "stand_ins": {}, "config_sha256": "a" * 64}))
+    plans = []
+    if planned_p:
+        plans.append(host_plan(shop))
+    else:
+        plan = other_root.parent / "host-plan.json"
+        plan.write_text(json.dumps({"schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "unrelated",
+                                    "root": "codex-cli", "team": "claude-code", "stand_ins": {},
+                                    "config_sha256": "a" * 64}))
+        plans.append(plan)
+    add_recipe_of_kind(shop, "shared-recovery", kind)
+    shop.request_job("job-a", "shared-recovery")
+    shop.request_job("job-b", "shared-recovery")
+    if preexisting:
+        first = shop.workspace.ask("pilot", kind, "job:pilot/job-a")
+        assert shop.workspace.grant(kind)["request_id"] == first
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "mixed-mode-retained-store"
+    requested, acknowledged, post_reads, swapped = [], [], [], []
+
+    def ask_unrelated():
+        requested.append(shop.workspace.ask("unrelated", kind, holder))
+
+    if preexisting:
+        ask_unrelated()
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if request["holder"] == "job:pilot/job-a" and not requested:
+                ask_unrelated()
+            elif request["holder"] == holder:
+                assert (store / "jobs/pilot/job-a/result.json").exists()
+                if retire:
+                    shop.workspace.release(request["request_id"])
+                acknowledged.append(request["request_id"])
+        return answer
+
+    def load(current):
+        if acknowledged:
+            post_reads.append(True)
+            if len(post_reads) == 2:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+                for plan in plans:
+                    plan.unlink()  # Both participating jobs and ownerless grants must retain their observed mode.
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert requested == acknowledged and len(acknowledged) == 1 and swapped == [True] and len(post_reads) == 2
+    assert not any(row.get("initiative") == "idle" for row in report["rows"]), report
+    reason = "post_grant_ledger_unreadable"
+    p_rows = [row for row in report["rows"] if row.get("job", "").startswith("pilot/")]
+    completed = p_rows[0]
+    assert (completed["job"], completed["state"]) == ("pilot/job-a", "completed")
+    assert "next_action" not in completed and "failure_reason" not in completed
+    if planned_p:
+        assert [row["state"] for row in p_rows if row["job"] == "pilot/job-a"] == ["completed", "settle_pending"], report
+        assert sum(row.get("reason") == reason for row in p_rows) == 1
+        reconcile_a = next(row for row in p_rows if row["job"] == "pilot/job-a" and row["state"] == "settle_pending")
+        assert "do not rerun completed work" in reconcile_a["next_action"]
+        waiting_b = next(row for row in p_rows if row["job"] == "pilot/job-b" and row["state"] == "waiting")
+        assert waiting_b == {"job": "pilot/job-b", "state": "waiting", "kind": kind}
+        reconcile_b = next(row for row in p_rows if row["job"] == "pilot/job-b" and row["state"] == "settle_pending")
+        assert "has not started" in reconcile_b["next_action"]
+    else:
+        legacy_p = [completed, {"job": "pilot/job-b", "state": "waiting", "kind": kind, "reason": reason}]
+        assert json.dumps(p_rows, sort_keys=True).encode() == json.dumps(legacy_p, sort_keys=True).encode(), report
+    u_rows = [row for row in report["rows"] if row not in p_rows]
+    legacy_action = "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."
+    if planned_p:
+        original = [] if retire else [{"state": "granted_elsewhere", "holder": holder, "request_id": acknowledged[0]}]
+        legacy_u = original + [{"state": "granted_elsewhere", "holder": holder, "reason": reason,
+                                "next_action": legacy_action}]
+        assert json.dumps(u_rows, sort_keys=True).encode() == json.dumps(legacy_u, sort_keys=True).encode(), report
+    elif retire:
+        assert len(u_rows) == 1 and u_rows[0]["state"] == "mailbox_error", report
+        assert u_rows[0]["initiative"] == "unrelated" and u_rows[0]["reason"] == reason
+        assert "holder" not in u_rows[0] and "request_id" not in u_rows[0]
+    else:
+        assert len(u_rows) == 2, report
+        original, fault = u_rows
+        assert original["holder"] == holder and original["request_id"] == acknowledged[0]
+        assert fault["state"] == "granted_elsewhere" and fault["request_id"] == acknowledged[0]
+        assert "holder" not in fault and fault["reason"] == reason and "reservation" in fault["next_action"]
+    unrelated_requests = {identifier: row["state"] for identifier, row in
+                          ledger_rows(shop, holder=holder, initiative="unrelated").items() if row["kind"] == kind}
+    assert unrelated_requests == {acknowledged[0]: "released" if retire else "granted"}
+    assert shop.states("job-a") == ["started", "completed"] and shop.receipts("job-b") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_terminal_settlement_failure_keeps_its_terminal_guidance(kind_shop, monkeypatch, capsys, kind):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    request_kind_job(shop, kind)
+    jobs = jobs2_module
+    original_link, original_safe_path = os.link, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "terminal-settlement-retained-store"
+    result, lock = store / "jobs/pilot/job-1/result.json", store / ".write.lock"
+    blocked, swapped = [], []
+
+    def link(source, target, *args, **kwargs):
+        answer = original_link(source, target, *args, **kwargs)
+        if Path(target) == result:
+            lock.write_text("fixture concurrent store writer after terminal publication")
+            blocked.append(True)
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and blocked and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe_path(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_mailbox, "os", SimpleNamespace(**{**vars(os), "link": link})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if lock.exists():
+            lock.unlink()
+    assert blocked == [True] and swapped == [True]
+    original, fault = report["rows"]
+    assert original["state"] == "settle_pending" and "workspace store is busy" in original["error"]
+    assert fault["reason"] == "post_grant_step_failed"
+    assert "retain terminal evidence" in fault["next_action"] and "retry settlement" in fault["next_action"]
+    assert "do not rerun completed work" in fault["next_action"] and "has not started" not in fault["next_action"]
+    assert json.loads(result.read_text())["state"] == "completed" and shop.sentinel.read_text() == "ran\n"
+    assert job_row(shop.run_open())["state"] == "completed" and shop.sentinel.read_text() == "ran\n"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("holder", ["manual-holder", "job:foreign/outside-candidates"])
+def test_jobs2_argon_light_completion_survives_a_foreign_retired_grant(
+        kind_shop, monkeypatch, capsys, kind, holder):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    plan = host_plan(shop)
+    shop.workspace.run("update", {"initiative": "pilot", "source": "owner", "priority": 10})
+    shop.workspace.register("foreign", project="foreign", priority=1)
+    foreign = shop.workspace.ask("foreign", kind, holder)
+    shop.request_job("job-0", "ok")
+    request_kind_job(shop, kind)
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "light-completion-retained-store"
+    released, post_reads, swapped = [], [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == foreign:
+            assert (store / "jobs/pilot/job-0/result.json").is_file()
+            shop.workspace.release(foreign)
+            released.append(foreign)
+        return answer
+
+    def load(current):
+        if released:
+            post_reads.append(True)
+            if len(post_reads) == 2:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+                plan.unlink()
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert released == [foreign] and swapped == [True] and len(post_reads) == 2
+    completed = [row for row in report["rows"] if row.get("job") == "pilot/job-0"]
+    assert [row["state"] for row in completed] == ["completed", "settle_pending"], report
+    assert "do not rerun completed work" in completed[1]["next_action"]
+    waiting = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert [row["state"] for row in waiting] == ["waiting", "settle_pending"]
+    assert "has not started" in waiting[1]["next_action"]
+    foreign_rows = [row for row in report["rows"] if row.get("holder") == holder]
+    assert len(foreign_rows) == 1 and foreign_rows[0]["reason"] == "post_grant_ledger_unreadable"
+    assert "request_id" not in foreign_rows[0]
+    assert shop.states("job-0") == ["started", "completed"]
+    assert_did_not_run(shop)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_jobs2_argon_later_stale_kind_cannot_replace_a_jobs_waiting_context(kind_shop, monkeypatch, capsys):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    add_recipe_of_kind(shop, "first-kind", "heavy")
+    add_recipe_of_kind(shop, "second-kind", "heavy-tests")
+    shop.request_job("job-0", "first-kind")
+    shop.request_job("job-1", "second-kind")
+    jobs = jobs2_module
+    original_enqueue, original_grant, original_safe_path = jobs.enqueue, jobs.grant_next, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "late-stale-kind-retained-store"
+    stale, released, stale_granted, swapped = [], [], [], []
+
+    def enqueue(current, job, kind, wait):
+        answer = original_enqueue(current, job, kind, wait)
+        if job.id == "pilot/job-0" and not stale:
+            stale.append(shop.workspace.ask("pilot", "heavy-tests", job.holder))
+        return answer
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if request["holder"] == "job:pilot/job-0" and request["kind"] == "heavy":
+                shop.workspace.release(request["request_id"])
+                released.append(request["request_id"])
+            elif request["request_id"] == stale[0]:
+                stale_granted.append(request["request_id"])
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and stale_granted and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe_path(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "enqueue", enqueue))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert swapped == [True] and len(released) == 1 and stale_granted == stale
+    rows = report["rows"]
+    waiting_index = next(index for index, row in enumerate(rows) if row.get("job") == "pilot/job-0")
+    stale_index = next(index for index, row in enumerate(rows) if row.get("stale_job") == "pilot/job-0")
+    assert waiting_index < stale_index and rows[waiting_index]["reason"] == "queue_empty"
+    assert rows[stale_index]["reason"] == "stale_kind" and rows[stale_index]["request_id"] == stale[0]
+    fault = next(row for row in rows if row.get("job") == "pilot/job-0" and row["state"] == "settle_pending")
+    assert "has not started" in fault["next_action"]
+    assert "original fence" not in fault["next_action"] and "stopped-process" not in fault["next_action"]
+    assert requests_of(shop, "heavy", holder="job:pilot/job-0") == {released[0]: "released"}
+    assert requests_of(shop, "heavy-tests", holder="job:pilot/job-0") == {stale[0]: "granted"}
+    assert shop.receipts("job-0") == shop.receipts("job-1") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("outcome", ["settle_pending", "running", "abandoned"])
+def test_jobs2_argon_attempted_owner_survives_later_kind_arbitration(
+        kind_shop, monkeypatch, capsys, kind, outcome):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    other = "heavy-tests" if kind == "heavy" else "heavy"
+    add_recipe_of_kind(shop, "owner-kind", kind)
+    add_recipe_of_kind(shop, "other-kind", other)
+    parent = shop.request_job("first-check", "ok")
+    assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+    request_dependent(shop, parent, "job-0", recipe="owner-kind")
+    shop.request_job("job-1", "other-kind")
+    if kind == "heavy-tests":
+        # The reverse ordering also covers an alias before the actual attempt, using an existing matching grant.
+        matching = shop.workspace.ask("pilot", kind, "job:pilot/job-0")
+        assert shop.workspace.grant(kind)["request_id"] == matching
+    jobs = jobs2_module
+    original_enqueue, original_grant = jobs.enqueue, jobs.grant_next
+    original_run, original_safe, original_open = jobs.run_job, jobs.safe_path, os.open
+    store, retained = shop.workspace.store, shop.tmp / "attempted-owner-retained-store"
+    folder, lock = store / "jobs/pilot/job-0", shop.root / ".write.lock"
+    stale, granted, attempted, injected, swapped = [], [], [], [], []
+
+    def enqueue(current, job, row_kind, wait):
+        answer = original_enqueue(current, job, row_kind, wait)
+        if job.id == "pilot/job-0" and not stale:
+            stale.append(shop.workspace.ask("pilot", other, job.holder))
+        return answer
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if request["request_id"] == stale[0]:
+                granted.append(stale[0])
+            if request["holder"] == "job:pilot/job-0" and not injected:
+                injected.append(outcome)
+                if outcome == "settle_pending":
+                    lock.write_text("fixture concurrent dependency mailbox writer")
+                elif outcome == "running":
+                    folder.mkdir(parents=True)
+                    (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-0")))
+        return answer
+
+    def open_claim(path, flags, *args, **kwargs):
+        if outcome == "abandoned" and Path(path).parent == folder and flags & os.O_CREAT:
+            raise OSError(errno.ENOSPC, "fixture claim publication full")
+        return original_open(path, flags, *args, **kwargs)
+
+    def run_job(current, job, *args, **kwargs):
+        try:
+            return original_run(current, job, *args, **kwargs)
+        finally:
+            if job.id == "pilot/job-0":
+                attempted.append(job.id)
+
+    def safe_path(path):
+        if Path(path) == store and granted and attempted and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "enqueue", enqueue))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            patch.enter_context(jobs2_patch.object(jobs2_mailbox, "os", SimpleNamespace(**{**vars(os), "open": open_claim})))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if lock.exists():
+            lock.unlink()
+    assert swapped == [True] and attempted == ["pilot/job-0"] and granted == stale
+    rows = report["rows"]
+    original = next(row for row in rows if row.get("job") == "pilot/job-0")
+    assert original["state"] == outcome
+    reservation = next(row for row in rows if row.get("request_id") == stale[0])
+    assert reservation.get("stale_job") == "pilot/job-0" and reservation.get("reason") == "stale_kind", report
+    assert kind in reservation["next_action"]
+    fault_index = next(index for index, row in enumerate(rows) if row.get("reason") == "post_grant_step_failed")
+    diagnostics = rows[fault_index:]
+    assert len(diagnostics) == 2 and {row.get("job") for row in diagnostics} == {"pilot/job-0", "pilot/job-1"}, report
+    fault = next(row for row in diagnostics if row.get("job") == "pilot/job-0")
+    guidance = {"settle_pending": "has not started execution", "running": "preserve the running job",
+                "abandoned": "preserve any candidate claim"}[outcome]
+    assert guidance in fault["next_action"]
+    assert sum(row.get("reason") == "post_grant_step_failed" for row in rows) == 1
+    assert ledger_rows(shop, holder="job:pilot/job-0")[stale[0]]["state"] == "granted"
+    assert not (folder / "result.json").exists() and shop.receipts("job-0") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-worker", "planned-worker"])
+def test_jobs2_argon_mailbox_only_error_does_not_participate_in_another_owners_fault(
+        kind_shop, monkeypatch, capsys, kind, planned):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    plan = host_plan(shop)
+    empty, _ = add_initiative(shop, "empty", 1)
+    (empty.parent / "host-plan.json").write_text(json.dumps({**json.loads(plan.read_text()), "hierarchy": "empty"}))
+    if not planned:
+        plan.unlink()
+    request_kind_job(shop, kind)
+    jobs = jobs2_module
+    original_safe, original_mailbox = jobs.safe_path, jobs.Mailbox
+    store, retained = shop.workspace.store, shop.tmp / "mailbox-only-retained-store"
+    enumerated, swapped = [], []
+
+    class Mailbox(original_mailbox):
+        def messages(self):
+            if self.root == empty:
+                enumerated.append(True)
+                raise PermissionError("fixture mailbox enumeration denied")
+            return super().messages()
+
+    def safe_path(path):
+        if Path(path) == store and (store / "jobs/pilot/job-1/result.json").is_file() and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "Mailbox", Mailbox))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert enumerated == swapped == [True]
+    assert [row for row in report["rows"] if row.get("initiative") == "empty"] == [
+        {"initiative": "empty", "state": "mailbox_error", "error": "fixture mailbox enumeration denied"}]
+    assert sum(row.get("reason") == "post_grant_step_failed" for row in report["rows"]) == 1
+    assert shop.sentinel.read_text() == "ran\n"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_argon_unverified_absent_publication_keeps_prefence_retry_guidance(
+        kind_shop, monkeypatch, capsys, kind):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    request_derive(shop)
+    add_recipe_of_kind(shop, "acknowledged-heavy", kind)
+    shop.request_job("job-2", "acknowledged-heavy", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_open, original_safe = os.open, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "emfile-retained-store"
+    folder = store / "jobs/pilot/job-1"
+    injected, swapped = [], []
+
+    def open_claim(path, flags, *args, **kwargs):
+        if Path(path).name.startswith(".pending-") and flags & os.O_CREAT:
+            assert (folder / "admitted.json").is_file() and not (folder / "execution.json").exists()
+            injected.append("pending-open")
+            raise OSError(errno.EMFILE, "fixture execution descriptors exhausted")
+        if Path(path).name == "execution.json":
+            injected.append("verification-open")
+            raise OSError(errno.EMFILE, "fixture verification descriptors exhausted")
+        return original_open(path, flags, *args, **kwargs)
+
+    def safe_path(path):
+        if Path(path) == store and injected and (store / "jobs/pilot/job-2/result.json").is_file() and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert injected == ["pending-open"] and swapped == [True], report  # Metadata proves absence before a leaf open.
+    original, diagnostic = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert original["state"] == diagnostic["state"] == "settle_pending"
+    assert original["error"] == "[Errno 24] fixture execution descriptors exhausted"
+    assert "has not started execution" in diagnostic["next_action"]
+    assert "Run run-open again" in diagnostic["next_action"]
+    assert "original fence" not in diagnostic["next_action"] and "stopped-process" not in diagnostic["next_action"]
+    assert sum(row.get("reason") == "post_grant_step_failed" for row in report["rows"]) == 1
+    assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+    assert shop.receipts("job-1") == []
+    assert list(requests_of(shop, kind, holder="job:pilot/job-2").values()) == ["released"]
+    assert job_row(shop.run_open())["state"] == "completed"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("state", ["running", "abandoned"])
+def test_jobs2_considered_owner_survives_an_existing_claim(kind_shop, monkeypatch, capsys, kind, state):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    add_recipe_of_kind(shop, "old-owner", "heavy-tests" if kind == "heavy" else "heavy")
+    add_recipe_of_kind(shop, "new-owner", kind)
+    shop.request_job("job-0", "old-owner")
+    shop.request_job("job-1", "new-owner")
+    old = shop.workspace.ask("pilot", kind, "job:pilot/job-0")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "considered-owner-retained-store"
+    folder = store / "jobs/pilot/job-0"
+    folder.mkdir(parents=True)
+    claim = live_claim(jobs, os.getpid(), "pilot/job-0")
+    if state == "abandoned":
+        boot = claim["process_scope"]["boot_id"]
+        claim["process_scope"]["boot_id"] = ("0" if boot[0] != "0" else "1") + boot[1:]
+    (folder / "claim.json").write_text(json.dumps(claim))
+    original_grant, original_safe = jobs.grant_next, jobs.safe_path
+    granted, swapped = [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == old:
+            granted.append(old)
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and granted and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert granted == [old] and swapped == [True]
+    rows = report["rows"]
+    assert rows[0]["job"] == "pilot/job-0" and rows[0]["state"] == state
+    fault_index = next(index for index, row in enumerate(rows) if row.get("reason") == "post_grant_step_failed")
+    diagnostics = rows[fault_index:]
+    assert len(diagnostics) == 2 and {row.get("job") for row in diagnostics} == {"pilot/job-0", "pilot/job-1"}, report
+    assert "request_id" not in json.dumps(diagnostics)
+    owner = next(row for row in diagnostics if row["job"] == "pilot/job-0")
+    assert ("preserve the running job" if state == "running" else "original fence") in owner["next_action"]
+    assert requests_of(shop, kind, holder="job:pilot/job-0") == {old: "granted"}
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind, owner_type", [
+    ("heavy", "attempted-heavy"), ("heavy-tests", "attempted-heavy"),
+    ("heavy", "completed-light"), ("heavy-tests", "completed-light"),
+    ("heavy-tests", "different-kind-heavy"),
+])
+@pytest.mark.parametrize("fault_at", [1, 2], ids=["before-reservation-row", "after-reservation-row"])
+def test_jobs2_legacy_owner_views_preserve_literal_rows(kind_shop, monkeypatch, capsys, kind, owner_type, fault_at):
+    from tests.conftest import symlink_or_skip
+
+    shop = kind_shop
+    owner_kind = "heavy" if owner_type == "different-kind-heavy" else kind
+    add_recipe_of_kind(shop, "pending-kind", kind)
+    if owner_type != "completed-light":
+        add_recipe_of_kind(shop, "owner-kind", owner_kind)
+    if owner_type == "completed-light":
+        shop.request_job("job-0", "ok")
+    else:
+        parent = shop.request_job("first-check", "ok")
+        assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+        request_dependent(shop, parent, "job-0", recipe="owner-kind")
+    if owner_type == "attempted-heavy":
+        # A later same-kind request wins by initiative priority even though it was filed after the attempt.
+        root, checkout = add_initiative(shop, "later", 20)
+        shop.request_job("job-1", "pending-kind", root=root, prefix="later", checkout=checkout)
+        pending = "later/job-1"
+    else:
+        shop.request_job("job-1", "pending-kind")
+        pending = "pilot/job-1"
+    jobs = jobs2_module
+    original_enqueue, original_grant = jobs.enqueue, jobs.grant_next
+    original_run, original_load = jobs.run_job, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "legacy-owner-retained-store"
+    folder, lock = store / "jobs/pilot/job-0", shop.root / ".write.lock"
+    old, matching, acknowledged, post_reads, swapped = [], [], [], [], []
+
+    def enqueue(current, job, row_kind, wait):
+        if owner_type == "completed-light" and job.id == pending and not old:
+            assert (folder / "result.json").is_file()
+            old.append(shop.workspace.ask("pilot", kind, "job:pilot/job-0"))
+        answer = original_enqueue(current, job, row_kind, wait)
+        if owner_type == "different-kind-heavy" and job.id == "pilot/job-0" and not old:
+            old.append(shop.workspace.ask("pilot", kind, job.holder))
+        return answer
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if old and request["request_id"] == old[0]:
+                acknowledged.append(old[0])
+            elif request["holder"] == "job:pilot/job-0":
+                matching.append(request["request_id"])
+                lock.write_text("fixture concurrent dependency mailbox writer")
+        return answer
+
+    def run_job(current, job, *args, **kwargs):
+        try:
+            return original_run(current, job, *args, **kwargs)
+        finally:
+            if owner_type == "attempted-heavy" and job.id == "pilot/job-0":
+                shop.workspace.release(matching[0])
+                old.append(shop.workspace.ask("pilot", kind, job.holder))
+
+    def load(current):
+        if acknowledged:
+            post_reads.append(True)
+            if len(post_reads) == fault_at:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "enqueue", enqueue))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if lock.exists():
+            lock.unlink()
+    assert acknowledged == old and len(old) == 1 and swapped == [True] and len(post_reads) == fault_at, output
+    reason = "post_grant_ledger_unreadable"
+    if owner_type == "completed-light":
+        initial = {"job": "pilot/job-0", "state": "completed", "exit_code": 0,
+                   "result": str(folder / "result.json"),
+                   "removed": ["scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis"]}
+    else:
+        initial = {"job": "pilot/job-0", "state": "settle_pending",
+                   "error": "mailbox writer is busy; inspect an abandoned lock before retrying"}
+    waiting = {"job": pending, "state": "waiting", "kind": kind, "reason": reason}
+    if fault_at == 1:
+        reservation = {"state": "granted_elsewhere", "kind": kind, "holder": "job:pilot/job-0",
+                       "request_id": old[0], "reason": reason,
+                       "next_action": "Root: preserve the reservation; repair store or audit access, then reconcile and "
+                                      "settle with correlated terminal evidence."}
+        expected = [initial, reservation, waiting]
+    else:
+        reservation = {"state": "granted_elsewhere", "holder": "job:pilot/job-0", "request_id": old[0]}
+        fallback = {"state": "granted_elsewhere", "holder": "job:pilot/job-0", "reason": reason,
+                    "next_action": "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."}
+        expected = [initial, reservation, waiting, fallback]
+    # Literal public rows: the test needs no reference module, checkout revision, or git history.
+    assert output.encode() == (json.dumps({"rows": expected}, sort_keys=True) + "\n").encode()
+    assert requests_of(shop, kind, holder="job:pilot/job-0")[old[0]] == "granted"
+    assert not (store / "jobs" / pending / "result.json").exists()
+
+
+JOBS2_PREFENCE_ACTION = ("Root: repair store or audit access; this attempt has not started execution. Run run-open again "
+                         "after repairing the reported error; existing claims are rechecked and never executed twice.")
+JOBS2_WAITING_ACTION = ("Root: repair store or audit access; this job has not started. Preserve any reservation and "
+                        "reconcile its blockers before run-open.")
+JOBS2_RESERVATION_ACTION = ("Root: preserve the reservation; repair store or audit access, then reconcile and "
+                            "settle with correlated terminal evidence.")
+JOBS2_LEGACY_FALLBACK_ACTION = "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."
+JOBS2_READMIT_ACTION = ("Root: re-admit the owning job through run-open for its initiative and clear its dependency or "
+                        "reservation blockers; a grant alone does not authorize job execution.")
+JOBS2_BLOCKED_ACTION = ("Run run-open again after repairing the reported mailbox, storage or settlement error; "
+                        "an existing claim is never executed twice.")
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+@pytest.mark.parametrize("owner_kind", ["none", "heavy", "heavy-tests"])
+@pytest.mark.parametrize("grant_kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("fault_at", [1, 2], ids=["before-reservation-row", "after-reservation-row"])
+def test_jobs2_argon2128_owner_kind_table_preserves_literal_rows(
+        kind_shop, monkeypatch, capsys, planned, owner_kind, grant_kind, fault_at):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", grant_kind)
+    if owner_kind == "none":
+        owner_recipe = "ok"
+    else:
+        owner_recipe = "owner-kind"
+        add_recipe_of_kind(shop, owner_recipe, owner_kind)
+    parent = shop.request_job("first-check", "ok")
+    assert job_row(shop.run_open(), "first-check")["state"] == "completed"
+    request_dependent(shop, parent, "job-0", recipe=owner_recipe)
+    shop.request_job("job-1", "driving-kind")
+    old = []
+    if owner_kind == "none":
+        # Argon's exact light input: R0 already exists, and the execution budget is two.
+        old.append(shop.workspace.ask("pilot", grant_kind, "job:pilot/job-0"))
+    reverse = owner_kind == "heavy-tests" and grant_kind == "heavy"
+    if reverse:
+        matching = shop.workspace.ask("pilot", owner_kind, "job:pilot/job-0")
+        assert shop.workspace.grant(owner_kind)["request_id"] == matching
+    jobs = jobs2_module
+    original_enqueue, original_grant = jobs.enqueue, jobs.grant_next
+    original_run, original_load = jobs.run_job, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "argon2128-owner-retained-store"
+    folder, lock = store / "jobs/pilot/job-0", shop.root / ".write.lock"
+    acknowledged, attempted, post_reads, swapped = [], [], [], []
+
+    def enqueue(current, job, kind, wait):
+        answer = original_enqueue(current, job, kind, wait)
+        if job.id == "pilot/job-0" and not old:
+            if owner_kind == grant_kind:
+                (identifier,) = requests_of(shop, grant_kind, holder=job.holder)
+                old.append(identifier)  # The existing matching request; no duplicate open request is filed.
+            else:
+                old.append(shop.workspace.ask("pilot", grant_kind, job.holder))
+        return answer
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == old[0]:
+            acknowledged.append(old[0])
+        return answer
+
+    def run_job(current, job, *args, **kwargs):
+        if job.id == "pilot/job-0":
+            # Admission has finished; a real concurrent mailbox writer now prevents the dependency lock.
+            attempted.append(True)
+            lock.write_text("fixture concurrent dependency mailbox writer")
+        return original_run(current, job, *args, **kwargs)
+
+    def load(current):
+        if acknowledged:
+            post_reads.append(True)
+            if len(post_reads) == fault_at:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "enqueue", enqueue))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", "--max-jobs", "2", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if lock.exists():
+            lock.unlink()
+    matching_kind = owner_kind == grant_kind
+    had_attempt = owner_kind == "none" or (owner_kind == "heavy" and grant_kind == "heavy-tests") or (matching_kind and fault_at == 2)
+    assert attempted == ([True] if had_attempt else [])
+    assert acknowledged == old and len(old) == 1 and swapped == [True] and len(post_reads) == fault_at
+    reason = "post_grant_ledger_unreadable"
+    originals = []
+    if had_attempt:
+        initial = {"job": "pilot/job-0", "state": "settle_pending",
+                   "error": "mailbox writer is busy; inspect an abandoned lock before retrying"}
+        if planned:
+            initial["next_action"] = JOBS2_BLOCKED_ACTION
+        originals.append(initial)
+    # Both heavy kinds can be stale; a light owner and a matching kind cannot.
+    stale = owner_kind in ("heavy", "heavy-tests") and not matching_kind and (planned or reverse)
+    reserve = {"state": "waiting" if matching_kind and fault_at == 1 else "granted_elsewhere",
+               "request_id": old[0]}
+    if fault_at == 1:
+        reserve.update(kind=grant_kind, next_action=JOBS2_RESERVATION_ACTION)
+        reserve.update({"job": "pilot/job-0"} if matching_kind else {"holder": "job:pilot/job-0"})
+        if not planned:
+            reserve["reason"] = reason
+    else:
+        reserve["holder"] = "job:pilot/job-0"
+        if planned:
+            reserve["next_action"] = JOBS2_READMIT_ACTION
+    if stale:
+        reserve.update(stale_job="pilot/job-0", reason="stale_kind")
+        if fault_at == 1 and not planned:
+            reserve["failure_reason"] = reason
+        if fault_at == 2:
+            reserve["next_action"] = (
+                "Job pilot/job-0 now needs %s; this %s grant is additional capacity, not its execution grant. It runs "
+                "only on a matching grant; otherwise it waits for root to reconcile and settle this reservation. "
+                "Settlement releases additional grants with the job's result as evidence." % (owner_kind, grant_kind))
+    if fault_at == 2 and not matching_kind:
+        originals.append(reserve)
+    additions = [reserve] if fault_at == 1 else []
+    if reverse:
+        additions.append({"job": "pilot/job-0", "state": "waiting", "kind": owner_kind})
+    additions.append({"job": "pilot/job-1", "state": "waiting", "kind": grant_kind})
+    if not planned:
+        for row in additions:
+            if row["state"] == "waiting" and "request_id" not in row:
+                row["reason"] = reason
+        if fault_at == 2:
+            fallback = {"state": "settle_pending" if matching_kind or reverse else "granted_elsewhere",
+                        "reason": reason, "next_action": JOBS2_LEGACY_FALLBACK_ACTION}
+            fallback.update({"job": "pilot/job-0"} if matching_kind or reverse else {"holder": "job:pilot/job-0"})
+            additions.append(fallback)
+        expected = originals + additions
+    else:
+        diagnostic = {"job": "pilot/job-0", "state": "settle_pending", "reason": reason,
+                      "next_action": JOBS2_PREFENCE_ACTION if had_attempt else JOBS2_WAITING_ACTION}
+        expected = originals + [diagnostic] + additions + [
+            {"job": "pilot/job-1", "state": "settle_pending", "next_action": JOBS2_WAITING_ACTION}]
+    assert output.encode() == (json.dumps({"rows": expected}, sort_keys=True) + "\n").encode()
+    assert not (folder / "claim.json").exists() and not (folder / "result.json").exists()
+    assert requests_of(shop, grant_kind, holder="job:pilot/job-0")[old[0]] == "granted"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("fault_at", [1, 2], ids=["before-reservation-row", "after-reservation-row"])
+def test_jobs2_argon2128_refused_receipt_without_execution_preserves_literal_rows(
+        kind_shop, monkeypatch, capsys, planned, kind, fault_at):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    shop.request_job("job-0", "ok")
+    shop.publish("job-0-root-refusal", "job_receipt", "Root refused without execution.",
+                 sender="pilot/root", to="pilot/orchestrator", in_reply_to="job-0",
+                 receipt={"state": "refused", "reason": "root refused without execution"})
+    old = shop.workspace.ask("pilot", kind, "job:pilot/job-0")
+    other, checkout = add_initiative(shop, "later", 20)
+    shop.request_job("job-1", "driving-kind", root=other, prefix="later", checkout=checkout)
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "argon2128-refusal-retained-store"
+    acknowledged, post_reads, swapped = [], [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == old:
+            acknowledged.append(old)
+        return answer
+
+    def load(current):
+        if acknowledged:
+            post_reads.append(True)
+            if len(post_reads) == fault_at:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", "--max-jobs", "2", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert acknowledged == [old] and swapped == [True] and len(post_reads) == fault_at
+    reason = "post_grant_ledger_unreadable"
+    pending = {"job": "later/job-1", "state": "waiting", "kind": kind, "reason": reason}
+    reserve = {"state": "granted_elsewhere", "holder": "job:pilot/job-0", "request_id": old}
+    if fault_at == 1:
+        reserve.update(kind=kind, next_action=JOBS2_RESERVATION_ACTION)
+        if not planned:
+            reserve["reason"] = reason
+    elif planned:
+        reserve["next_action"] = JOBS2_READMIT_ACTION
+    if planned:
+        diagnostic = {"job": "pilot/job-0", "state": "settle_pending", "reason": reason,
+                      "next_action": JOBS2_PREFENCE_ACTION}
+        expected = [diagnostic, reserve, pending] if fault_at == 1 else [reserve, diagnostic, pending]
+    else:
+        fallback = {"state": "granted_elsewhere", "holder": "job:pilot/job-0", "reason": reason,
+                    "next_action": JOBS2_LEGACY_FALLBACK_ACTION}
+        expected = [reserve, pending] if fault_at == 1 else [reserve, pending, fallback]
+    assert output.encode() == (json.dumps({"rows": expected}, sort_keys=True) + "\n").encode()
+    assert not (store / "jobs/pilot/job-0").exists()
+    assert shop.states("job-0") == ["refused"] and requests_of(shop, kind, holder="job:pilot/job-0") == {old: "granted"}
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_argon2128_unobservable_publication_does_not_claim_a_verified_fence(
+        kind_shop, monkeypatch, capsys, kind):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    if os.name != "posix" or not hasattr(os, "O_PATH"):
+        pytest.skip("unobservable publication requires POSIX modes and O_PATH")
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses the candidate-directory permission check")
+    shop = kind_shop
+    probe = shop.tmp / "unobservable-candidate-probe"
+    probe.mkdir()
+    try:
+        probe.chmod(0)
+        try:
+            (probe / "candidate").lstat()
+        except PermissionError:
+            pass
+        except FileNotFoundError:
+            pytest.skip("chmod is ineffective for the candidate-path capability check")
+        else:
+            pytest.skip("chmod is ineffective for the candidate-path capability check")
+    finally:
+        probe.chmod(0o700)
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    edit_source(shop)
+    request_derive(shop)
+    shop.request_job("job-2", "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_open, original_stat, original_safe = os.open, os.stat, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "unobservable-publication-retained-store"
+    folder = store / "jobs/pilot/job-1"
+    injected, swapped, denied = [], [], []
+
+    def open_claim(path, flags, *args, **kwargs):
+        if Path(path).name.startswith(".pending-") and flags & os.O_CREAT:
+            injected.append("pending-open")
+            folder.chmod(0)
+            raise OSError(errno.EMFILE, "fixture publication descriptors exhausted")
+        if Path(path).name == "execution.json":
+            injected.append("verification-open")
+            raise OSError(errno.EMFILE, "fixture verification descriptors exhausted")
+        return original_open(path, flags, *args, **kwargs)
+
+    def stat_claim(path, *args, **kwargs):
+        try:
+            return original_stat(path, *args, **kwargs)
+        except PermissionError:
+            if Path(path).name == "execution.json" and "dir_fd" in kwargs:
+                denied.append(True)
+            raise
+
+    def safe_path(path):
+        if Path(path) == store and injected and (store / "jobs/pilot/job-2/result.json").is_file() and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim, "stat": stat_claim})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if folder.exists():
+            folder.chmod(0o700)
+    assert injected == ["pending-open"] and denied and swapped == [True], report
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert [row["state"] for row in owned] == ["abandoned", "settle_pending"]
+    action = ("Root: preserve any candidate claim and reservation; inspect recovery-status and establish execution "
+              "custody before settlement or retry. Do not retry execution while custody is unknown.")
+    assert all(row["next_action"] == action for row in owned)
+    assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+    assert job_row(shop.run_open())["state"] == "completed"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_argon2128_peer_execution_link_records_its_observed_fence(kind_shop, monkeypatch, capsys, kind):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    edit_source(shop)
+    request_derive(shop)
+    shop.request_job("job-2", "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_run, original_safe = jobs.run_job, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "peer-link-retained-store"
+    folder = store / "jobs/pilot/job-1"
+    peer, swapped = [], []
+
+    def run_job(current, job, *args, **kwargs):
+        if job.id == "pilot/job-1":
+            assert (folder / "admitted.json").is_file()
+            raw = json.dumps(live_claim(jobs, os.getpid(), job.id)).encode()
+            (folder / "execution.json").write_bytes(raw)
+            peer.append(raw)
+        return original_run(current, job, *args, **kwargs)
+
+    def safe_path(path):
+        if Path(path) == store and (store / "jobs/pilot/job-2/result.json").is_file() and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert len(peer) == 1 and swapped == [True]
+    original, diagnostic = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    group = json.loads((folder / "process.json").read_text())["group"]
+    assert type(group) is int and group > 0
+    assert original == {"job": "pilot/job-1", "state": "running", "process_group": group}
+    assert diagnostic == {"job": "pilot/job-1", "state": "settle_pending",
+                          "next_action": "Root: repair store or audit access; preserve the running job's custody and "
+                                         "reservation; inspect recovery-status before settlement. Do not rerun it."}
+    assert (folder / "execution.json").read_bytes() == peer[0] and not (folder / "result.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_argon2128_released_peer_grant_records_its_observed_fence(kind_shop, monkeypatch, capsys, kind):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    request_kind_job(shop, kind)
+    other = "heavy-tests" if kind == "heavy" else "heavy"
+    add_recipe_of_kind(shop, "driving-kind", other)
+    shop.request_job("job-2", "driving-kind")
+    jobs = jobs2_module
+    original_grant, original_safe = jobs.grant_next, jobs.safe_path
+    store, retained = shop.workspace.store, shop.tmp / "released-peer-retained-store"
+    folder = store / "jobs/pilot/job-1"
+    released, swapped = [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["kind"] == kind and not released:
+            folder.mkdir(parents=True)
+            (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-1")))
+            released.append(answer[1]["granted"]["request_id"])
+            shop.workspace.release(released[0])
+        return answer
+
+    def safe_path(path):
+        if Path(path) == store and (store / "jobs/pilot/job-2/result.json").is_file() and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_safe(path)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "safe_path", safe_path))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert len(released) == 1 and swapped == [True]
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    diagnostic = {"job": "pilot/job-1", "state": "settle_pending",
+                  "next_action": "Root: repair store or audit access; preserve the running job's custody and "
+                                 "reservation; inspect recovery-status before settlement. Do not rerun it."}
+    if kind == "heavy":
+        diagnostic["reason"] = "post_grant_step_failed"
+    assert owned == [
+        {"job": "pilot/job-1", "state": "running", "process_group": None},
+        diagnostic]
+    assert requests_of(shop, kind, holder=JOB_HOLDER) == {released[0]: "released"}
+    assert not (folder / "result.json").exists() and not shop.sentinel.exists()
+
+
+JOBS2_UNVERIFIED_ACTION = ("Root: preserve any candidate claim and reservation; inspect recovery-status and establish "
+                            "execution custody before settlement or retry. Do not retry execution while custody is unknown.")
+JOBS2_FENCED_ACTION = ("Root: repair store or audit access; preserve execution custody, the original fence and any "
+                       "reservation; inspect recovery-status and establish stopped-process evidence before settlement or retry.")
+JOBS2_OBSERVED_RESULT_ACTION = ("Root: repair store or audit access; retain the observed result and any reservation. Inspect "
+                                "recovery-status and validate terminal evidence before settlement; do not rerun execution.")
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("failure", ["open", "fdopen", "oversized", "symlink"])
+def test_jobs2_argon0057_retained_publication_path_does_not_verify_its_contents(
+        kind_shop, monkeypatch, capsys, kind, failure):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    edit_source(shop)
+    request_derive(shop)
+    shop.request_job("job-2", "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_run, original_open, original_fdopen, original_close = jobs.run_job, os.open, os.fdopen, os.close
+    original_grant, original_load, original_stat = jobs.grant_next, jobs.Store.load, os.stat
+    store, retained = shop.workspace.store, shop.tmp / "argon0057-unverified-store"
+    folder = store / "jobs/pilot/job-1"
+    execution = folder / "execution.json"
+    injected, acknowledged, swapped, descriptors, closed, directories, closed_directories = [], [], [], set(), [], set(), []
+
+    def run_job(current, job, *args, **kwargs):
+        if job.id == "pilot/job-1":
+            assert (folder / "admitted.json").is_file()
+            raw = json.dumps(live_claim(jobs, os.getpid(), job.id)).encode()
+            if failure == "symlink":
+                target = shop.tmp / "unverified-peer-claim"
+                target.write_bytes(raw)
+                symlink_or_skip(target, execution)
+            else:
+                execution.write_bytes(b"x" * (jobs.MAX_BYTES + 1) if failure == "oversized" else raw)
+        return original_run(current, job, *args, **kwargs)
+
+    def open_claim(path, flags, *args, **kwargs):
+        if Path(path).name == "execution.json":
+            directories.add(kwargs["dir_fd"])
+        if Path(path).name.startswith(".pending-") and flags & os.O_CREAT:
+            injected.append("pending-open")
+            raise OSError(errno.EMFILE, "fixture pending descriptors exhausted")
+        if Path(path).name == "execution.json" and failure == "open":
+            injected.append("verification-open")
+            raise OSError(errno.EMFILE, "fixture verification descriptors exhausted")
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path).name == "execution.json":
+            descriptors.add(descriptor)
+        return descriptor
+
+    def stat_claim(path, *args, **kwargs):
+        if Path(path).name == "execution.json" and "dir_fd" in kwargs:
+            directories.add(kwargs["dir_fd"])
+        return original_stat(path, *args, **kwargs)
+
+    def fdopen(descriptor, *args, **kwargs):
+        if descriptor in descriptors:
+            if failure == "oversized":
+                pytest.fail("oversized publication must be refused before reading")
+            if failure == "fdopen":
+                injected.append("verification-fdopen")
+                raise OSError(errno.EMFILE, "fixture stream descriptors exhausted")
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    def close(descriptor):
+        original_close(descriptor)
+        if descriptor in descriptors:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+            closed.append(descriptor)
+            descriptors.remove(descriptor)
+        if descriptor in directories:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+            closed_directories.append(descriptor)
+            directories.remove(descriptor)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["holder"] == "job:pilot/job-2":
+            acknowledged.append(True)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim, "stat": stat_claim, "fdopen": fdopen, "close": close})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert swapped == [True] and injected[0] == "pending-open" and not descriptors and not directories
+    assert closed_directories
+    if failure == "fdopen":
+        assert closed, "the bounded publication descriptor must close even when fdopen fails"
+    if failure == "oversized":
+        assert not closed, "reject an oversized claim from metadata before opening it"
+    assert execution.lstat(), "the retained candidate is observable by lstat, even when verification failed"
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert owned == [
+        {"job": "pilot/job-1", "state": "abandoned", "process_group": None, "process_alive": None,
+         "reason": "execution_custody_unknown", "next_action": JOBS2_UNVERIFIED_ACTION},
+        {"job": "pilot/job-1", "state": "settle_pending", "next_action": JOBS2_UNVERIFIED_ACTION}]
+    assert not (folder / "result.json").exists()
+
+
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy-bytes", "planned"])
+@pytest.mark.parametrize("evidence", ["malformed-result", "execution-directory", "derived-publication",
+                                      "unsupported-observation", "result-vanishes", "admission-marker"])
+def test_jobs2_argon0057_closed_job_retains_observed_execution_evidence(
+        kind_shop, monkeypatch, capsys, kind, planned, evidence):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    shop.request_job("job-0", "ok")
+    shop.publish("job-0-root-refusal", "job_receipt", "Root closed this job.", sender="pilot/root",
+                 to="pilot/orchestrator", in_reply_to="job-0", receipt={"state": "refused", "reason": "root refused"})
+    old = shop.workspace.ask("pilot", kind, "job:pilot/job-0")
+    shop.request_job("job-1", "driving-kind")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "argon0057-closed-store"
+    folder = store / "jobs/pilot/job-0"
+    folder.mkdir(parents=True)
+    (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-0")))
+    if evidence in ("malformed-result", "result-vanishes"):
+        (folder / "result.json").write_text("{}")
+    elif evidence in ("derived-publication", "admission-marker"):
+        (folder / "admitted.json").write_text("{}")
+        if evidence == "derived-publication":
+            (folder / "execution.json").write_text("{")
+    original_grant, original_load, original_settle = jobs.grant_next, jobs.Store.load, jobs.settle
+    original_observe = jobs.Job.observe_existing_fence
+    acknowledged, swapped, unsupported = [], [], []
+
+    def unavailable():
+        unsupported.append(True)
+        raise ValueError("secure brief publication requires directory descriptor support")
+
+    def observe(job):
+        if evidence == "unsupported-observation" and job.id == "pilot/job-0":
+            with ExitStack() as local:
+                local.enter_context(jobs2_patch.object(jobs2_fresh_brief, "require_secure_publication", unavailable))
+                return original_observe(job)
+        return original_observe(job)
+
+    def settle(current, job, wait):
+        if evidence == "result-vanishes" and job.id == "pilot/job-0":
+            (folder / "result.json").unlink()
+        return original_settle(current, job, wait)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0 and answer[1]["granted"]["request_id"] == old:
+            acknowledged.append(old)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_existing_fence", observe))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "settle", settle))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert acknowledged == [old] and swapped == [True]
+    reason = "post_grant_ledger_unreadable"
+    originals = []
+    if evidence in ("malformed-result", "result-vanishes"):
+        blocked = {"job": "pilot/job-0", "state": "settle_pending",
+                   "error": "'NoneType' object is not subscriptable" if evidence == "result-vanishes" else "invalid job result schema"}
+        if planned:
+            blocked["next_action"] = JOBS2_BLOCKED_ACTION
+        originals.append(blocked)
+    reserve = {"state": "granted_elsewhere", "kind": kind, "request_id": old,
+               "holder": "job:pilot/job-0", "next_action": JOBS2_RESERVATION_ACTION}
+    pending = {"job": "pilot/job-1", "state": "waiting", "kind": kind}
+    if planned:
+        diagnostic = {"job": "pilot/job-0", "state": "settle_pending", "reason": reason,
+                      "next_action": JOBS2_FENCED_ACTION if evidence in ("malformed-result", "execution-directory", "result-vanishes")
+                                     else JOBS2_UNVERIFIED_ACTION}
+        expected = originals + [diagnostic, reserve, pending,
+            {"job": "pilot/job-1", "state": "settle_pending", "next_action": JOBS2_WAITING_ACTION}]
+    else:
+        reserve["reason"] = pending["reason"] = reason
+        expected = originals + [reserve, pending]
+    assert output.encode() == (json.dumps({"rows": expected}, sort_keys=True) + "\n").encode()
+    if planned and evidence == "unsupported-observation":
+        assert unsupported, "exercise the unsupported-platform probe, rather than relying on the host platform"
+    assert requests_of(shop, kind, holder="job:pilot/job-0") == {old: "granted"}
+    assert (folder / "result.json").exists() is (evidence == "malformed-result")
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("site", ["visit-existing", "link-loss"])
+@pytest.mark.parametrize("evidence", ["malformed", "oversized", "symlink", "fdopen"])
+def test_jobs2_argon0057_peer_publication_observations_preserve_uncertainty(
+        kind_shop, monkeypatch, capsys, kind, site, evidence):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    edit_source(shop)
+    if site == "visit-existing":
+        shop.request_job("first-check", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    request_derive(shop)
+    if site == "visit-existing":
+        assert job_row(shop.run_open("--max-jobs", "1", expect=3), "first-check")["state"] == "completed"
+    shop.request_job("job-2", "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "argon0057-peer-store"
+    folder = store / "jobs/pilot/job-1"
+    execution = folder / "execution.json"
+    original_run, original_grant, original_load = jobs.run_job, jobs.grant_next, jobs.Store.load
+    original_open, original_fdopen, original_close = os.open, os.fdopen, os.close
+    created, acknowledged, swapped, reads, descriptors, closed, directories, closed_directories = [], [], [], [], set(), [], set(), []
+
+    def create_peer():
+        assert (folder / "admitted.json").is_file()
+        raw = json.dumps(live_claim(jobs, os.getpid(), "pilot/job-1")).encode()
+        if evidence == "symlink":
+            target = shop.tmp / "peer-candidate-target"
+            target.write_bytes(raw)
+            symlink_or_skip(target, execution)
+        else:
+            execution.write_bytes(b"{" if evidence == "malformed" else b"x" * (jobs.MAX_BYTES + 1) if evidence == "oversized" else raw)
+        created.append(True)
+
+    if site == "visit-existing":
+        create_peer()
+
+    def run_job(current, job, *args, **kwargs):
+        if site == "link-loss" and job.id == "pilot/job-1":
+            create_peer()
+        return original_run(current, job, *args, **kwargs)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if request["holder"] == "job:pilot/job-2":
+                acknowledged.append(request["request_id"])
+        return answer
+
+    def load(current):
+        if acknowledged:
+            reads.append(True)
+            if len(reads) == 1:
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    def open_claim(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path).name == "execution.json":
+            descriptors.add(descriptor)
+            directories.add(kwargs["dir_fd"])
+        return descriptor
+
+    def fdopen(descriptor, *args, **kwargs):
+        if descriptor in descriptors:
+            raise OSError(errno.EMFILE, "fixture candidate stream unavailable")
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    def close(descriptor):
+        original_close(descriptor)
+        if descriptor in descriptors:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+            closed.append(descriptor)
+            descriptors.remove(descriptor)
+        if descriptor in directories:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+            closed_directories.append(descriptor)
+            directories.remove(descriptor)
+
+    try:
+        with ExitStack() as patch:
+            if evidence == "fdopen":
+                patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim, "fdopen": fdopen, "close": close})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert created == [True] and swapped == [True] and len(acknowledged) == 1
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert len(owned) == 2, report
+    assert owned[-1]["state"] == "settle_pending" and owned[-1]["next_action"] == JOBS2_UNVERIFIED_ACTION
+    assert owned[0]["state"] == "abandoned" and owned[0]["next_action"] == JOBS2_UNVERIFIED_ACTION
+    if evidence == "fdopen":
+        assert closed and closed_directories and not descriptors and not directories
+    assert not (folder / "result.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_argon0057_unvalidated_admission_marker_is_not_unstarted_work(kind_shop, monkeypatch, capsys, kind):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    shop.request_job("job-0", "ok")
+    shop.request_job("job-1", "driving-kind")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "argon0057-open-marker-store"
+    folder = store / "jobs/pilot/job-0"
+    folder.mkdir(parents=True)
+    (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-0")))
+    (folder / "admitted.json").write_text("{}")
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    acknowledged, swapped = [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            acknowledged.append(True)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert acknowledged == [True] and swapped == [True]
+    original, diagnostic = [row for row in report["rows"] if row.get("job") == "pilot/job-0"]
+    assert original["state"] == diagnostic["state"] == "settle_pending"
+    assert diagnostic["next_action"] == JOBS2_UNVERIFIED_ACTION
+    assert not (folder / "result.json").exists() and not (folder / "execution.json").exists()
+
+
+JOBS2_2I_FIELDS = ("job", "pid", "start", "at", "process_scope", "recipes_sha256")
+JOBS2_2I_BAD_VALUES = {"null": None, "object": {}, "array": [], "bool": True, "number": 3.5}
+JOBS2_2I_VARIANTS = (
+    ["valid", "valid-null-recipes"]
+    + ["missing-" + field for field in JOBS2_2I_FIELDS]
+    + ["bad-" + field + "-" + kind for field in JOBS2_2I_FIELDS for kind in JOBS2_2I_BAD_VALUES
+       if not (field == "recipes_sha256" and kind == "null")]
+    + ["bad-job-value", "bad-pid-zero", "bad-pid-negative", "bad-start-text", "bad-at-date", "bad-at-multiline",
+       "scope-missing-boot", "scope-missing-namespace", "scope-extra", "scope-boot-type", "scope-boot-format",
+       "scope-namespace-type", "scope-namespace-format", "recipe-not-hex", "extra-field", "doc-object", "doc-null",
+       "doc-array", "json-invalid", "json-nested", "dangling", "symlink", "directory", "unreadable", "oversized"])
+
+
+def jobs2_2i_nested_json():
+    from hierarchy_mailbox import MAX_BYTES
+
+    # The native JSON decoder can accept nesting beyond Python's recursion limit.
+    depth = max(10000, sys.getrecursionlimit() + 200)
+    assert depth * 2 + 1 <= MAX_BYTES, "the depth fixture must fit the claim byte limit"
+    return b"[" * depth + b"0" + b"]" * depth
+
+
+def jobs2_2i_claim_payload(claim, variant):
+    claim = {**claim, "process_scope": dict(claim["process_scope"])}
+    if variant == "valid-null-recipes":
+        claim["recipes_sha256"] = None  # This is an explicitly supported legacy writer value.
+    elif variant.startswith("missing-"):
+        claim.pop(variant[len("missing-"):])
+    elif variant.startswith("bad-"):
+        field, kind = variant[len("bad-"):].rsplit("-", 1)
+        if kind in JOBS2_2I_BAD_VALUES:
+            claim[field] = JOBS2_2I_BAD_VALUES[kind]
+        else:
+            field, value = {"bad-job-value": ("job", "pilot/different"), "bad-pid-zero": ("pid", 0),
+                            "bad-pid-negative": ("pid", -1), "bad-start-text": ("start", "not-a-tick"),
+                            "bad-at-date": ("at", "2026-99-99T00:00:00Z"),
+                            "bad-at-multiline": ("at", "2026-11-12T00:00:00Z\nsecond line")}[variant]
+            claim[field] = value
+    elif variant == "scope-missing-boot":
+        claim["process_scope"].pop("boot_id")
+    elif variant == "scope-missing-namespace":
+        claim["process_scope"].pop("pid_namespace")
+    elif variant == "scope-extra":
+        claim["process_scope"]["extra"] = "not writer metadata"
+    elif variant.startswith("scope-"):
+        field = "boot_id" if "boot" in variant else "pid_namespace"
+        claim["process_scope"][field] = [] if variant.endswith("type") else "invalid-scope"
+    elif variant == "recipe-not-hex":
+        claim["recipes_sha256"] = "z" * 64
+    elif variant == "extra-field":
+        claim["extra"] = "not writer metadata"
+    if variant == "doc-object":
+        return b"{}"
+    if variant == "doc-null":
+        return b"null"
+    if variant == "doc-array":
+        return b"[]"
+    if variant == "json-invalid":
+        return b"{"
+    if variant == "json-nested":
+        return jobs2_2i_nested_json()
+    return json.dumps(claim).encode()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("entry", ["existing", "closed-execution", "closed-claim", "taken", "lost-link", "own-publication", "released", "refusal"])
+@pytest.mark.parametrize("variant", JOBS2_2I_VARIANTS)
+def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monkeypatch, capsys, kind, entry, variant):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    derived = entry in ("existing", "lost-link", "own-publication")
+    target = "pilot/job-1" if derived else "pilot/job-0"
+    driving = "job-2" if derived else "job-1"
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    if derived:
+        shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+        shop.save_recipes()
+        edit_source(shop)
+        if entry == "existing":
+            shop.request_job("first-check", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+        request_derive(shop)
+        if entry == "existing":
+            assert job_row(shop.run_open("--max-jobs", "1", expect=3), "first-check")["state"] == "completed"
+    else:
+        shop.request_job("job-0", "refusal-only-unknown-recipe" if entry == "refusal" else
+                         "driving-kind" if entry == "released" else "ok")
+        if entry.startswith("closed-"):
+            shop.publish("root-closed-job-0", "job_receipt", "Root refused this job.", sender="pilot/root",
+                         to="pilot/orchestrator", in_reply_to="job-0", receipt={"state": "refused", "reason": "root refused"})
+            shop.workspace.ask("pilot", kind, "job:pilot/job-0")
+    shop.request_job(driving, "driving-kind", **(
+        {"dirty_content_sha256": source_digest(shop)["dirty_content_sha256"]} if derived else {}))
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "jobs2-2i-matrix-store"
+    folder = store / "jobs" / target
+    filename = "execution.json" if derived or entry == "closed-execution" else "claim.json"
+    candidate = folder / filename
+    original_run, original_grant, original_load = jobs.run_job, jobs.grant_next, jobs.Store.load
+    original_refuse = jobs.refuse
+    original_open, original_link, original_unlink = os.open, os.link, os.unlink
+    created, acknowledged, reads, swapped = [], [], [], []
+
+    def put_candidate(claim=None):
+        folder.mkdir(parents=True, exist_ok=True)
+        if entry == "closed-execution":
+            (folder / "admitted.json").write_text("{}")
+        if claim is None:
+            claim = live_claim(jobs, os.getpid(), target)
+            claim["recipes_sha256"] = hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
+        if candidate.exists() or candidate.is_symlink():
+            candidate.unlink()
+        if variant == "directory":
+            candidate.mkdir()
+        elif variant in ("dangling", "symlink"):
+            other = shop.tmp / "matrix-link-target"
+            if variant == "symlink":
+                other.write_bytes(jobs2_2i_claim_payload(claim, "valid"))
+            symlink_or_skip(other, candidate)
+        else:
+            candidate.write_bytes(b"x" * (jobs.MAX_BYTES + 1) if variant == "oversized"
+                                  else jobs2_2i_claim_payload(claim, variant))
+        created.append(True)
+
+    if entry == "existing" or entry.startswith("closed-"):
+        put_candidate()
+
+    def run_job(current, job, *args, **kwargs):
+        if job.id == target and entry in ("taken", "lost-link"):
+            put_candidate()
+        return original_run(current, job, *args, **kwargs)
+
+    def refuse(current, job, *args, **kwargs):
+        if job.id == target and entry == "refusal":
+            put_candidate()
+        return original_refuse(current, job, *args, **kwargs)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            request = answer[1]["granted"]
+            if entry == "released" and request["holder"] == "job:" + target:
+                put_candidate()
+                shop.workspace.release(request["request_id"])
+                acknowledged.append(request["request_id"])
+            elif entry != "released":
+                acknowledged.append(request["request_id"])
+        return answer
+
+    def load(current):
+        if acknowledged:
+            reads.append(True)
+            if len(reads) == (2 if entry == "released" else 1):
+                store.rename(retained)
+                swapped.append(True)
+                symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    def open_claim(path, flags, *args, **kwargs):
+        if variant == "unreadable" and created and Path(path).name == filename:
+            raise PermissionError(errno.EACCES, "fixture claim unreadable")
+        return original_open(path, flags, *args, **kwargs)
+
+    def link(source, destination, *args, **kwargs):
+        answer = original_link(source, destination, *args, **kwargs)
+        if entry == "own-publication" and Path(destination).name == "execution.json":
+            if variant == "valid":
+                created.append(True)
+            else:
+                put_candidate(json.loads(candidate.read_bytes()))
+        return answer
+
+    def unlink(path, *args, **kwargs):
+        if entry == "own-publication" and created and str(path).startswith(".pending-"):
+            raise OSError(errno.EIO, "fixture cleanup after publication")
+        return original_unlink(path, *args, **kwargs)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim, "link": link, "unlink": unlink})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "refuse", refuse))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert created == [True] and swapped == [True] and len(acknowledged) == 1, report
+    owned = [row for row in report["rows"] if row.get("job") == target]
+    assert owned and owned[-1]["state"] == "settle_pending", report
+    if variant.startswith("valid"):
+        assert "original fence" in owned[-1]["next_action"] or "preserve the running job" in owned[-1]["next_action"]
+    else:
+        assert owned[-1]["next_action"] == JOBS2_UNVERIFIED_ACTION
+        if not entry.startswith("closed-"):
+            assert owned[0]["state"] == "abandoned" and owned[0]["next_action"] == JOBS2_UNVERIFIED_ACTION
+    assert not (folder / "result.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("entry", ["closed", "taken"])
+@pytest.mark.parametrize("result_change", ["malformed", "vanishing"])
+def test_jobs2_2i_regular_result_survives_an_independent_observer_failure(
+        kind_shop, monkeypatch, capsys, kind, entry, result_change):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    if entry == "taken":
+        shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+        shop.save_recipes()
+        edit_source(shop)
+        request_derive(shop)
+        target, driving = "pilot/job-1", "job-2"
+        shop.request_job(driving, "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    else:
+        target, driving = "pilot/job-0", "job-1"
+        shop.request_job("job-0", "ok")
+        shop.publish("closed-job-0", "job_receipt", "Root closed it.", sender="pilot/root", to="pilot/orchestrator",
+                     in_reply_to="job-0", receipt={"state": "refused", "reason": "root refused"})
+        shop.workspace.ask("pilot", kind, "job:" + target)
+        shop.request_job(driving, "driving-kind")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "result-observation-retained-store"
+    folder = store / "jobs" / target
+    original_run, original_settle, original_grant, original_load = jobs.run_job, jobs.settle, jobs.grant_next, jobs.Store.load
+    original_stat = os.stat
+    failed, acknowledged, swapped, settled = [], [], [], []
+
+    def evidence():
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / ("execution.json" if entry == "taken" else "claim.json")).write_text("{}")
+        (folder / "result.json").write_text("{}")
+
+    if entry == "closed":
+        evidence()
+
+    def run_job(current, job, *args, **kwargs):
+        if entry == "taken" and job.id == target:
+            evidence()
+        return original_run(current, job, *args, **kwargs)
+
+    def stat_result(path, *args, **kwargs):
+        if Path(path).name == "result.json" and kwargs.get("dir_fd") is not None and not failed:
+            failed.append(True)
+            raise PermissionError(errno.EACCES, "fixture first observation unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    def settle(current, job, wait):
+        if job.id == target:
+            settled.append(True)
+            if result_change == "vanishing":
+                (folder / "result.json").unlink()
+        return original_settle(current, job, wait)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            acknowledged.append(True)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "stat": stat_result})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "settle", settle))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert failed == [True] and swapped == [True] and settled == [True], report
+    owned = [row for row in report["rows"] if row.get("job") == target]
+    assert owned[-1]["state"] == "settle_pending"
+    assert owned[-1]["next_action"] == JOBS2_OBSERVED_RESULT_ACTION
+    assert "original fence" not in owned[-1]["next_action"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("failure", ["disposition", "pending-file"])
+def test_jobs2_2i_successful_admission_validation_clears_only_admission_uncertainty(
+        kind_shop, monkeypatch, capsys, kind, failure):
+    import fcntl
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    edit_source(shop)
+    shop.request_job("first-check", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    request_derive(shop)
+    assert job_row(shop.run_open("--max-jobs", "1", expect=3), "first-check")["state"] == "completed"
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    assert (folder / "admitted.json").is_file() and not (folder / "execution.json").exists()
+    (shop.checkout / "src/app.py").write_text("value = 300\n")  # A later check refuses after persisted admission validates.
+    shop.request_job("job-2", "driving-kind", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_open, original_grant, original_load = os.open, jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "admission-clear-retained-store"
+    acknowledged, swapped, blocked = [], [], []
+    lock = (folder / "disposition.lock").open("a+b")
+    if failure == "disposition":
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def open_pending(path, flags, *args, **kwargs):
+        if failure == "pending-file" and str(path).startswith(".pending-") and flags & os.O_CREAT:
+            blocked.append(True)
+            raise OSError(errno.EMFILE, "fixture pending-file descriptors unavailable")
+        return original_open(path, flags, *args, **kwargs)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            acknowledged.append(True)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_pending})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        lock.close()
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    assert swapped == [True] and (failure == "disposition" or blocked)
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert owned[-1]["state"] == "settle_pending" and owned[-1]["next_action"] == JOBS2_PREFENCE_ACTION
+    assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+@pytest.mark.parametrize("node, shape", [(node, shape) for node in ("execution", "result", "admitted")
+                                        for shape in ("dangling", "symlink", "directory")]
+                         + [("folder", "dangling"), ("folder", "symlink")])
+def test_jobs2_2i_metadata_nodes_use_no_follow_classification(kind_shop, monkeypatch, capsys, kind, node, shape):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    shop = kind_shop
+    host_plan(shop)
+    add_recipe_of_kind(shop, "driving-kind", kind)
+    shop.request_job("job-0", "ok")
+    shop.request_job("job-1", "driving-kind")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "metadata-node-retained-store"
+    folder = store / "jobs/pilot/job-0"
+    folder.mkdir(parents=True)
+    (folder / "claim.json").write_text(json.dumps(live_claim(jobs, os.getpid(), "pilot/job-0")))
+    moved_folder = shop.tmp / "metadata-node-original-folder"
+    target = shop.tmp / "metadata-link-target"
+    if node in ("execution", "result"):
+        (folder / "admitted.json").write_text("{}")
+    if node != "folder":
+        path = folder / (node + ".json")
+        if shape == "directory":
+            path.mkdir()
+        else:
+            if shape == "symlink":
+                target.write_text("{}")
+            symlink_or_skip(target, path)
+    original_visit, original_grant, original_load = jobs.visit_existing, jobs.grant_next, jobs.Store.load
+    injected, acknowledged, swapped = [], [], []
+
+    def visit(current, job, wait):
+        if node == "folder" and job.id == "pilot/job-0" and not injected:
+            folder.rename(moved_folder)
+            if shape == "symlink":
+                target.mkdir()
+            symlink_or_skip(target, folder, target_is_directory=True)
+            injected.append(True)
+        return original_visit(current, job, wait)
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            acknowledged.append(True)
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "visit_existing", visit))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+        if moved_folder.exists():
+            if folder.is_symlink():
+                folder.unlink()
+            moved_folder.rename(folder)
+    assert swapped == [True]
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-0"]
+    if node == "admitted":
+        assert owned[0]["state"] == "running" and "preserve the running job" in owned[-1]["next_action"]
+    elif node == "result":
+        assert owned[0]["state"] == "settle_pending"
+        assert owned[0]["error"] == "result is not a readable file within its limit"
+        assert owned[-1]["next_action"] == JOBS2_UNVERIFIED_ACTION
+    else:
+        assert owned[0]["state"] == "abandoned" and owned[-1]["next_action"] == JOBS2_UNVERIFIED_ACTION
+    assert not (folder / "execution.json").is_file() or node == "execution"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("variant", ["valid", "missing-at", "bad-at-array", "bad-process_scope-object",
+                                     "bad-recipes_sha256-array", "doc-object", "doc-null", "json-nested", "dangling", "symlink", "directory"])
+@pytest.mark.parametrize("entry", ["existing", "refusal"])
+def test_jobs2_2i_no_plan_claim_rows_remain_literal_bytes(kind_shop, monkeypatch, capsys, entry, variant):
+    from tests.conftest import symlink_or_skip
+
+    shop = kind_shop
+    shop.request_job("job-0", "refusal-only-unknown-recipe" if entry == "refusal" else "ok")
+    shop.request_job("job-1", "heavy")
+    jobs = jobs2_module
+    store, retained = shop.workspace.store, shop.tmp / "legacy-claim-retained-store"
+    folder = store / "jobs/pilot/job-0"
+    def put_candidate():
+        folder.mkdir(parents=True)
+        claim = live_claim(jobs, os.getpid(), "pilot/job-0")
+        path = folder / "claim.json"
+        if variant == "directory":
+            path.mkdir()
+        elif variant in ("dangling", "symlink"):
+            target = shop.tmp / "legacy-claim-target"
+            if variant == "symlink":
+                target.write_bytes(jobs2_2i_claim_payload(claim, "valid"))
+            symlink_or_skip(target, path)
+        else:
+            path.write_bytes(jobs2_2i_claim_payload(claim, variant))
+
+    if entry == "existing":
+        put_candidate()
+    original_refuse = jobs.refuse
+
+    def refuse(current, job, *args, **kwargs):
+        if entry == "refusal" and job.id == "pilot/job-0":
+            put_candidate()
+        return original_refuse(current, job, *args, **kwargs)
+
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    acknowledged, swapped = [], []
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            acknowledged.append(answer[1]["granted"]["request_id"])
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    fatal = entry == "existing" and variant in ("doc-object", "doc-null", "json-nested")
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "refuse", refuse))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == (2 if fatal else 3)
+            output = capsys.readouterr().out
+    finally:
+        if store.is_symlink():
+            store.unlink()
+        if retained.exists():
+            retained.rename(store)
+    if fatal:
+        expected = {"error": "claim does not belong to job: pilot/job-0"}
+        if variant == "json-nested":
+            try:
+                json.loads(jobs2_2i_nested_json())
+            except RecursionError as exc:
+                expected = {"error": str(exc)}
+            else:
+                pytest.fail("the nested fixture must exceed the JSON parser's depth")
+        assert not acknowledged
+    else:
+        assert len(acknowledged) == 1 and swapped == [True]
+        unknown = entry == "existing" and variant in ("bad-process_scope-object", "dangling", "symlink", "directory")
+        first = ({"job": "pilot/job-0", "state": "abandoned", "process_group": None, "process_alive": None,
+                  "reason": "runner visibility is unknown; retain the original claim and reservation"}
+                 if unknown else {"job": "pilot/job-0", "state": "running", "process_group": None})
+        expected = {"rows": [first, {"job": "pilot/job-1", "state": "waiting", "kind": "heavy",
+                                    "request_id": acknowledged[0], "reason": "post_grant_ledger_unreadable",
+                                    "next_action": JOBS2_RESERVATION_ACTION}]}
+    assert output.encode() == (json.dumps(expected, sort_keys=True) + "\n").encode()
+
+
+@pytest.mark.parametrize("surface", ["resolve", "recovery-status"])
+@pytest.mark.parametrize("variant", ["valid", "missing-at", "doc-null", "dangling"])
+def test_jobs2_2i_fresh_liveness_selects_execution_after_admission(kind_shop, capsys, surface, variant):
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    shop.request_job("first-check", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    request_derive(shop)
+    assert job_row(shop.run_open("--max-jobs", "1", expect=3), "first-check")["state"] == "completed"
+    jobs = load_jobs_module()
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    execution = folder / "execution.json"
+    claim = live_claim(jobs, os.getpid(), "pilot/job-1")
+    if variant == "dangling":
+        symlink_or_skip(shop.tmp / "missing-execution-claim", execution)
+    else:
+        execution.write_bytes(jobs2_2i_claim_payload(claim, variant))
+    before = shop.head()
+    flags = ("--job", "pilot/job-1", "--reason", "must not resolve a live or unverified execution") if surface == "resolve" else ()
+    code = jobs.main(shop.argv(surface, *flags, census=[], lock_wait=0)[3:])
+    report = json.loads(capsys.readouterr().out)
+    if surface == "resolve":
+        assert code == 2, report
+        assert report == {"error": ("its runner is still running: pilot/job-1" if variant == "valid"
+                                     else "runner visibility is unknown: pilot/job-1")}
+    else:
+        assert code == 3, report
+        row = next(row for row in report["jobs"] if row.get("job") == "pilot/job-1")
+        assert row["runner_alive"] is (True if variant == "valid" else None), row
+        if variant == "valid":
+            assert row["state"] == "running"
+    assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+    assert shop.head() == before
+
+
+def jobs2_2j_stopped_derived_admission(shop):
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    shop.request_job("first-check", "ok", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    request_derive(shop)
+    assert job_row(shop.run_open("--max-jobs", "1", expect=3), "first-check")["state"] == "completed"
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    status = shop.jobs("recovery-status", census=[], expect=3)
+    row = next(row for row in status["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "admitted" and row["runner_alive"] is False
+    assert (folder / "admitted.json").is_file()
+    assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+    return folder
+
+
+@pytest.mark.parametrize("claim", ["empty-object", "live-without-at"])
+def test_jobs2_2j_argon0305_claim1_invalid_execution_remains_unknown(kind_shop, capsys, claim):
+    shop = kind_shop
+    folder = jobs2_2j_stopped_derived_admission(shop)
+    jobs = load_jobs_module()
+    execution = folder / "execution.json"
+    payload = {}
+    if claim == "live-without-at":
+        payload = live_claim(jobs, os.getpid(), "pilot/job-1")
+        del payload["at"]
+    execution.write_text(json.dumps(payload))
+    before = {name: (folder / name).read_bytes()
+              for name in ("admitted.json", "claim.json", "packet.md", "derivation.json", "execution.json")}
+    head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        report = json.loads(capsys.readouterr().out)
+        row = job_row(report)
+        assert row["state"] == "abandoned" and row["process_alive"] is None, report
+        assert row["next_action"] == JOBS2_UNVERIFIED_ACTION
+        assert {name: (folder / name).read_bytes() for name in before} == before
+        assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+        assert shop.head() == head and (shop.checkout / ".git/index").read_bytes() == index
+
+
+def test_jobs2_2j_argon0305_claim2_dangling_execution_is_not_readmitted(kind_shop, capsys):
+    from tests.conftest import symlink_or_skip
+
+    shop = kind_shop
+    folder = jobs2_2j_stopped_derived_admission(shop)
+    execution, target = folder / "execution.json", shop.tmp / "argon0305-missing-execution"
+    symlink_or_skip(target, execution)
+    assert execution.is_symlink() and not execution.exists()
+    before = {name: (folder / name).read_bytes()
+              for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
+    head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
+    jobs = load_jobs_module()
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        report = json.loads(capsys.readouterr().out)
+        row = job_row(report)
+        assert row["state"] == "abandoned" and row["process_alive"] is None, report
+        assert row["next_action"] == JOBS2_UNVERIFIED_ACTION
+        assert execution.is_symlink() and execution.readlink() == target and not target.exists()
+        assert {name: (folder / name).read_bytes() for name in before} == before
+        assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+        assert shop.head() == head and (shop.checkout / ".git/index").read_bytes() == index
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
+def test_jobs2_2j_argon0305_claim3_busy_refusal_keeps_prefence_guidance(kind_shop, monkeypatch, capsys, kind):
+    import fcntl
+    from tests.conftest import symlink_or_skip
+
+    shop = kind_shop
+    add_recipe_of_kind(shop, "post-admission-driver", kind)
+    folder = jobs2_2j_stopped_derived_admission(shop)
+    source = shop.checkout / "src/app.py"
+    original = source.read_bytes()
+    changed = original.replace(b"2", b"3", 1)
+    assert len(changed) == len(original) and sum(a != b for a, b in zip(original, changed)) == 1
+    source.write_bytes(changed)
+    shop.request_job("job-2", "post-admission-driver", dirty_content_sha256=source_digest(shop)["dirty_content_sha256"])
+    jobs = jobs2_module
+    original_grant, original_load = jobs.grant_next, jobs.Store.load
+    store, retained = shop.workspace.store, shop.tmp / "argon0305-claim3-retained-store"
+    acknowledged, swapped = [], []
+    before = {name: (folder / name).read_bytes()
+              for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
+    index = (shop.checkout / ".git/index").read_bytes()
+
+    def grant(*args, **kwargs):
+        answer = original_grant(*args, **kwargs)
+        if answer[0] == 0:
+            assert answer[1]["granted"]["holder"] == "job:pilot/job-2"
+            acknowledged.append(answer[1]["granted"]["request_id"])
+        return answer
+
+    def load(current):
+        if acknowledged and not swapped:
+            store.rename(retained)
+            swapped.append(True)
+            symlink_or_skip(retained, store, target_is_directory=True)
+        return original_load(current)
+
+    with (folder / "disposition.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with ExitStack() as patch:
+                patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
+                patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
+                assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+                report = json.loads(capsys.readouterr().out)
+        finally:
+            if store.is_symlink():
+                store.unlink()
+            if retained.exists():
+                retained.rename(store)
+    assert len(acknowledged) == 1 and swapped == [True], report
+    owned = [row for row in report["rows"] if row.get("job") == "pilot/job-1"]
+    assert len(owned) == 2, report
+    assert owned[0]["state"] == "settle_pending" and owned[0]["error"] == "job disposition is busy: pilot/job-1"
+    assert owned[1]["state"] == "settle_pending" and owned[1]["next_action"] == JOBS2_PREFENCE_ACTION
+    assert sum(row.get("reason") == "post_grant_ledger_unreadable" for row in report["rows"]) == 1
+    assert {name: (folder / name).read_bytes() for name in before} == before
+    assert source.read_bytes() == changed and (shop.checkout / ".git/index").read_bytes() == index
+    assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+    assert shop.receipts("job-1") == [] and ledger_rows(shop, holder="job:pilot/job-2")[acknowledged[0]]["state"] == "granted"
+
+
+# These literal row oracles were replayed against df8232ec during authoring.
+# They use only fresh fixture repositories and do not load historical source at test time.
+JOBS2_2L_RESULT_NODES = ["directory", "fifo", "symlink", "dangling", "unreadable"]
+JOBS2_2L_RESULT_ERROR = "result is not a readable file within its limit"
+JOBS2_2L_RETRY = ("Run run-open again after repairing the reported mailbox, storage or "
+                  "settlement error; an existing claim is never executed twice.")
+
+
+def jobs2_2l_result_node(shop, result, node):
+    from tests.conftest import symlink_or_skip
+
+    if node == "directory":
+        result.mkdir()
+    elif node == "fifo":
+        if os.name != "posix" or not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO result needs POSIX mkfifo")
+        os.mkfifo(result)
+    elif node in ("symlink", "dangling"):
+        target = shop.tmp / "result-target.json"
+        if node == "symlink":
+            target.write_bytes(b"{}")
+        symlink_or_skip(target, result)
+    else:
+        if os.name != "posix" or os.geteuid() == 0:
+            pytest.skip("unreadable result needs effective POSIX file permissions")
+        result.write_bytes(b"{}")
+        result.chmod(0)
+        try:
+            result.read_bytes()
+        except PermissionError:
+            pass
+        else:
+            result.chmod(0o600)
+            pytest.skip("file mode does not refuse result reads")
+
+
+def jobs2_2l_result_setup(shop, entry, node, planned):
+    from tests.integration.test_hierarchy_jobs_derive import host_plan
+
+    if planned:
+        host_plan(shop)
+    identifier = "first-check" if entry == "dependency" else "job-0"
+    parent = shop.request_job(identifier, "ok")
+    if entry in ("closed", "dependency"):
+        shop.publish(identifier + "-closed", "job_receipt", "Root closed this request.", sender="pilot/root",
+                     to="pilot/orchestrator", in_reply_to=identifier, receipt={"state": "refused", "reason": "root closed"})
+    reservation = None
+    if entry == "closed":
+        reservation = shop.workspace.ask("pilot", "heavy", "job:pilot/" + identifier)
+        assert shop.workspace.grant("heavy")["request_id"] == reservation
+    if entry == "dependency":
+        request_dependent(shop, parent, "job-1")
+    folder = shop.workspace.store / "jobs/pilot" / identifier
+    folder.mkdir(parents=True)
+    claim = live_claim(jobs2_module, os.getpid(), "pilot/" + identifier)
+    (folder / "claim.json").write_text(json.dumps(claim))
+    jobs2_2l_result_node(shop, folder / "result.json", node)
+    return identifier, folder, claim, reservation
+
+
+def jobs2_2l_expected_result_row(shop, entry, node, planned, identifier, claim):
+    error = JOBS2_2L_RESULT_ERROR
+    if not planned and node == "unreadable":
+        error = str(PermissionError(errno.EACCES, os.strerror(errno.EACCES),
+                                    str(shop.workspace.store / "jobs/pilot" / identifier / "result.json")))
+    if entry == "closed" and node == "dangling" and not planned:
+        return None
+    if entry == "existing" and node == "dangling" and not planned:
+        return {"job": "pilot/job-0", "state": "running", "process_group": None}
+    if entry == "dependency":
+        pending = not planned and node == "dangling"
+        return {"job": "pilot/job-1", "state": "waiting",
+                "reason": "dependency_pending" if pending else "dependency_held",
+                "detail": "predecessor has no validated terminal result" if pending else error}
+    if entry == "recovery":
+        row = {"job": "pilot/job-0", "owner": "pilot/orchestrator", "reservations": [], "claim": claim,
+               "runner_alive": None, "process_alive": None, "receipt": "not_published",
+               "source": {"state": "unavailable"},
+               "next_action": "Preserve all evidence and capacity; reconcile the unavailable or inconsistent record.",
+               "state": "evidence_error", "error": error}
+        if node == "dangling" and not planned:
+            head = shop.head()
+            empty = hashlib.sha256(b"").hexdigest()
+            expected = {"source_revision": head["commit"], "source_tree": head["tree"], "dirty_content_sha256": empty}
+            observed = {**expected, "worktree": str(shop.checkout), "dirty_state_sha256": empty, "dirty_entries": 0}
+            row.update(runner_alive=True, process_group=None, state="running",
+                       source={"state": "match", "expected": expected, "observed": observed},
+                       next_action="Retain the original reservation; a qualified operator must reconcile process effects.")
+            del row["error"]
+        return row
+    row = {"job": "pilot/" + identifier, "state": "settle_pending", "error": error}
+    if planned:
+        row["next_action"] = JOBS2_2L_RETRY
+    return row
+
+
+def jobs2_2l_check_result_row(shop, capsys, entry, node, planned):
+    identifier, folder, claim, reservation = jobs2_2l_result_setup(shop, entry, node, planned)
+    claim_bytes = (folder / "claim.json").read_bytes()
+    result = folder / "result.json"
+    mode = result.lstat().st_mode
+    try:
+        command = "recovery-status" if entry == "recovery" else "run-open"
+        code = jobs2_module.main(shop.argv(command, census=[], lock_wait=0)[3:])
+        output = capsys.readouterr().out
+        expected = jobs2_2l_expected_result_row(shop, entry, node, planned, identifier, claim)
+        if entry == "recovery":
+            report = json.loads(output)
+            row = next(row for row in report["jobs"] if row["job"] == "pilot/" + identifier)
+            assert json.dumps(row, sort_keys=True).encode() == json.dumps(expected, sort_keys=True).encode()
+            assert code == 3
+        else:
+            expected_report = {"rows": [] if expected is None else [expected]}
+            assert output.encode() == (json.dumps(expected_report, sort_keys=True) + "\n").encode()
+            assert code == (0 if expected is None else 3)
+        assert (folder / "claim.json").read_bytes() == claim_bytes
+        assert result.lstat().st_mode == mode
+        if reservation is not None:
+            assert ledger_rows(shop, holder="job:pilot/" + identifier)[reservation]["state"] == "granted"
+        assert not shop.sentinel.exists()
+    finally:
+        if node == "unreadable":
+            result.chmod(0o600)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("entry", ["closed", "existing", "dependency", "recovery"])
+@pytest.mark.parametrize("node", JOBS2_2L_RESULT_NODES)
+def test_jobs2_2l_no_plan_result_rows_match_df8232ec(kind_shop, capsys, entry, node):
+    """Includes Argon #1's closed job, granted reservation and directory result exactly."""
+    jobs2_2l_check_result_row(kind_shop, capsys, entry, node, False)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("entry", ["closed", "existing", "dependency", "recovery"])
+@pytest.mark.parametrize("node", JOBS2_2L_RESULT_NODES)
+def test_jobs2_2l_planned_nonabsent_results_report_their_error(kind_shop, capsys, entry, node):
+    jobs2_2l_check_result_row(kind_shop, capsys, entry, node, True)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("node", JOBS2_2L_RESULT_NODES)
+def test_jobs2_2l_argon2_publication_loser_settles_retained_result(kind_shop, capsys, node):
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    request_derive(shop)
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    original_run = jobs2_module.run_job
+    peers, losers = [], []
+
+    def run_job(store, job, *args, **kwargs):
+        assert job.id == "pilot/job-1" and not peers
+        assert job_row(shop.run_open())["state"] == "completed"
+        execution = (folder / "execution.json").read_bytes()
+        result = folder / "result.json"
+        terminal = result.read_bytes()
+        result.unlink()
+        jobs2_2l_result_node(shop, result, node)
+        peers.append((execution, terminal, shop.head(), (shop.checkout / ".git/index").read_bytes()))
+        losers.append(job)
+        return original_run(store, job, *args, **kwargs)
+
+    try:
+        with jobs2_patch.object(jobs2_module, "run_job", run_job):
+            assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+        assert report == {"rows": [{"job": "pilot/job-1", "state": "settle_pending",
+                                    "error": JOBS2_2L_RESULT_ERROR, "next_action": JOBS2_2L_RETRY}]}
+        assert len(peers) == len(losers) == 1
+        assert losers[0].recorded_execution_fence() is True
+        assert losers[0].settlement_attempted and not losers[0].execution_owned
+        assert (folder / "execution.json").read_bytes() == peers[0][0]
+        assert shop.head() == peers[0][2] and (shop.checkout / ".git/index").read_bytes() == peers[0][3]
+        assert shop.states("job-1") == ["started", "completed"]
+    finally:
+        if node == "unreadable" and peers:
+            (folder / "result.json").chmod(0o600)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("number", [errno.EIO, errno.ENOENT, errno.EACCES])
+def test_jobs2_2l_no_plan_result_read_error_after_probe_keeps_os_bytes(kind_shop, capsys, number):
+    from types import SimpleNamespace
+
+    shop = kind_shop
+    identifier, folder, claim, _ = jobs2_2l_result_setup(shop, "existing", "directory", False)
+    result = folder / "result.json"
+    result.rmdir()
+    result.write_bytes(b"{}")
+    original_open = os.open
+    injected = []
+
+    def open_result(path, *args, **kwargs):
+        if str(path) == "result.json" and "dir_fd" in kwargs:
+            injected.append(number)
+            raise OSError(number, os.strerror(number), "result.json")
+        return original_open(path, *args, **kwargs)
+
+    with jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_result})):
+        assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+    error = str(OSError(number, os.strerror(number), str(result)))
+    assert output.encode() == (json.dumps({"rows": [{"job": "pilot/" + identifier,
+                                                   "state": "settle_pending", "error": error}]},
+                                          sort_keys=True) + "\n").encode()
+    assert injected == [number] and result.read_bytes() == b"{}"
+
+
+
+JOBS2_2M_FENCED_UNKNOWN_ACTION = (
+    "Root: preserve the original execution fence and reservation; inspect recovery-status, "
+    "the original claim and process scope. Establish custody and stopped-process evidence "
+    "before recovery or settlement. Do not remove the fence or retry execution.")
+
+
+def jobs2_2m_unknown_report(identifier, action):
+    return {"rows": [{"job": "pilot/" + identifier, "state": "abandoned", "process_group": None,
+                      "process_alive": None, "reason": "execution_custody_unknown", "next_action": action}]}
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("entry", ["closed", "existing"])
+@pytest.mark.parametrize("fault", ["symlink", "descriptor-refusal"])
+def test_jobs2_2m_uncertain_result_probe_never_attempts_settlement(kind_shop, capsys, entry, fault):
+    from tests.conftest import symlink_or_skip
+
+    shop = kind_shop
+    identifier, folder, _, reservation = jobs2_2l_result_setup(shop, entry, "directory", True)
+    (folder / "result.json").rmdir()
+    saved, missing = shop.tmp / "uncertain-original-job", shop.tmp / "missing-job"
+    original_existing, original_result = jobs2_module.Job.observe_existing_fence, jobs2_module.Job.observe_result
+    captured, changed, first, refused = [], [], [], []
+
+    def unavailable():
+        refused.append(True)
+        raise ValueError("secure brief publication requires directory descriptor support")
+
+    def change(job):
+        captured.append(job)
+        assert job.id == "pilot/job-0" and not changed
+        changed.append(True)
+        if fault == "symlink":
+            folder.rename(saved)
+            symlink_or_skip(missing, folder, target_is_directory=True)
+        else:
+            patch.enter_context(jobs2_patch.object(jobs2_fresh_brief, "require_secure_publication", unavailable))
+
+    def existing(job):
+        # finish_closed_jobs constructs Job before it reaches this filesystem boundary.
+        if entry == "closed" and job.id == "pilot/job-0":
+            change(job)
+        return original_existing(job)
+
+    def result(job, directory=None):
+        if entry == "existing" and job.id == "pilot/job-0" and directory is None:
+            assert first == ["absent"]
+            change(job)
+        observed = original_result(job, directory)
+        if entry == "existing" and job.id == "pilot/job-0" and directory is not None:
+            first.append(observed)
+        return observed
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_existing_fence", existing))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_result", result))
+            assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+        action = JOBS2_UNVERIFIED_ACTION if entry == "closed" else JOBS2_2M_FENCED_UNKNOWN_ACTION
+        assert report == jobs2_2m_unknown_report(identifier, action)
+        assert changed == [True] and len(captured) == 1
+        assert captured[0].settlement_attempted is False
+        assert captured[0].result_observed is False and captured[0].execution_owned is False
+        assert "Run run-open again" not in report["rows"][0]["next_action"]
+        if reservation is not None:
+            assert ledger_rows(shop, holder="job:pilot/" + identifier)[reservation]["state"] == "granted"
+        if fault == "descriptor-refusal":
+            assert refused, "exercise the unsupported descriptor probe explicitly"
+    finally:
+        if folder.is_symlink():
+            folder.unlink()
+        if saved.exists():
+            saved.rename(folder)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["symlink", "observed-nonregular"])
+def test_jobs2_2m_publication_loser_distinguishes_uncertainty_from_an_observed_node(kind_shop, capsys, fault):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    request_derive(shop)
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    saved, missing = shop.tmp / "publication-original-job", shop.tmp / "missing-peer-job"
+    original_run, original_link = jobs2_module.run_job, os.link
+    peers, captured, changed = [], [], []
+
+    def run_job(store, job, *args, **kwargs):
+        assert job.id == "pilot/job-1" and not captured
+        captured.append(job)
+        assert job_row(shop.run_open())["state"] == "completed"
+        peers.append((folder / "execution.json").read_bytes())
+        if fault == "observed-nonregular":
+            (folder / "result.json").unlink()
+            (folder / "result.json").mkdir()
+        return original_run(store, job, *args, **kwargs)
+
+    def link(source, target, *args, **kwargs):
+        try:
+            return original_link(source, target, *args, **kwargs)
+        except FileExistsError:
+            if str(target) == "execution.json" and "dst_dir_fd" in kwargs and fault == "symlink":
+                assert peers and not changed
+                folder.rename(saved)
+                symlink_or_skip(missing, folder, target_is_directory=True)
+                changed.append(True)
+            raise
+
+    try:
+        with ExitStack() as patch:
+            patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "link": link})))
+            assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+        assert len(captured) == len(peers) == 1
+        assert captured[0].recorded_execution_fence() is True, "retain the peer's historical verified fence"
+        assert captured[0].execution_owned is False
+        if fault == "symlink":
+            assert changed == [True]
+            assert report == jobs2_2m_unknown_report("job-1", JOBS2_2M_FENCED_UNKNOWN_ACTION)
+            assert captured[0].settlement_attempted is False and captured[0].result_observed is False
+            assert "Run run-open again" not in report["rows"][0]["next_action"]
+        else:
+            assert report == {"rows": [{"job": "pilot/job-1", "state": "settle_pending",
+                                        "error": JOBS2_2L_RESULT_ERROR, "next_action": JOBS2_2L_RETRY}]}
+            assert captured[0].settlement_attempted is True
+    finally:
+        if folder.is_symlink():
+            folder.unlink()
+        if saved.exists():
+            saved.rename(folder)
+    assert (folder / "execution.json").read_bytes() == peers[0]
+    assert shop.states("job-1") == ["started", "completed"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("entry", ["closed", "existing"])
+def test_jobs2_2m_observed_nonregular_result_still_attempts_settlement(kind_shop, capsys, entry):
+    jobs2_2l_check_result_row(kind_shop, capsys, entry, "directory", True)

@@ -881,6 +881,67 @@ def test_a_start_without_a_thread_is_recorded_as_failed_to_start(launch):
     assert launch.binding() is None and [row["state"] for row in launch.records()] == ["failed_to_start"]
 
 
+@pytest.mark.parametrize("reported,exit_code,reason", [
+    (None, 0, "the start exited without reporting a session"),
+    (None, 1, "the start process exited unsuccessfully"),
+    ("fixture-session", 1, "the start process exited unsuccessfully"),
+    ("invalid session\nprivate-input", 0, "the start reported an invalid session"),
+])
+def test_snapshot4e_launcher_failure_always_records_a_fixed_reason(launch, reported, exit_code, reason):
+    # Port the transferred cases to this checkout's public launcher harness, without Git history.
+    assert not (launch.base / "host-plan.json").exists()
+    script = launch.tmp / "start-failure.py"
+    script.write_text("import json\n"
+                      "def main():\n"
+                      "    reported = %r\n"
+                      "    if reported is not None:\n"
+                      "        print(json.dumps({'type': 'thread.started', 'thread_id': reported}), flush=True)\n"
+                      "    raise SystemExit(%d)\n"
+                      "main()\n" % (reported, exit_code), encoding="utf-8")
+    codex = launch.bin / "codex"
+    original = codex.read_text(encoding="utf-8")
+    codex.write_text('#!/bin/sh\n%s "$@"\n' % shell_exec("codex", script, launch.tmp), encoding="utf-8")
+    answer = launch.start(expect=3)
+    assert answer["exit_code"] == exit_code and answer["timed_out"] is False
+    assert answer["state"] == ("start_incomplete" if reported == "fixture-session" else "failed_to_start")
+    assert answer.get("error") == reason
+    [saved] = launch.records()
+    assert saved["error"] == reason and launch.binding() is None
+    # A refusal releases the start lock, and a later successful start keeps the failure evidence.
+    codex.write_text(original, encoding="utf-8")
+    assert launch.start()["state"] == "bound"
+    assert launch.records()[0] == saved
+
+
+@pytest.mark.parametrize("reported", [None, "fixture-session"])
+def test_snapshot4e_launcher_timeout_records_a_fixed_reason(launch, reported):
+    assert not (launch.base / "host-plan.json").exists()
+    mode = "silent-hang" if reported is None else "hang"
+    running = launch.started(mode=mode, thread=reported, start_timeout_seconds=3)
+    logs = launch.base / "launches" / "pilot%2Flane%2Freview" / "logs"
+    try:
+        wait_until(lambda: any(reported is None or '"thread.started"' in path.read_text()
+                               for path in logs.glob("*.stdout")))
+        # A concurrent refusal must not steal the first start's lock or replace its reason.
+        refused = launch.start(expect=2)
+        assert refused["state"] == "refused"
+        assert refused["error"] == "stop custody endpoint is busy: " + REVIEW
+        out, err = running.communicate(timeout=20)
+        assert running.returncode == 3 and not err, out + err
+    finally:
+        if running.poll() is None:
+            running.kill()
+            running.wait(timeout=5)
+    answer = json.loads(out)
+    assert answer["timed_out"] is True
+    assert answer["state"] == ("failed_to_start" if reported is None else "start_incomplete")
+    assert answer.get("error") == "the start timed out"
+    [saved] = [row for row in launch.records() if row["state"] != "refused"]
+    assert saved["error"] == "the start timed out" and launch.binding() is None
+    assert launch.start()["state"] == "bound"
+    assert saved in launch.records()
+
+
 def test_a_hung_start_is_stopped_at_its_timeout_and_left_unbound(launch):
     thread = "hung-" + uuid.uuid4().hex
     began = time.monotonic()
