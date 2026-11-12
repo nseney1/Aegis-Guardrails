@@ -45,7 +45,7 @@
           },
           "intent": {
             "type": "string",
-            "description": "Semantic light, standard, deep, extended or max; defaults to policy/role band."
+            "description": "Semantic light|standard|deep|extended|max|ultra; defaults to policy/role band."
           },
           "author_family": {
             "type": "string",
