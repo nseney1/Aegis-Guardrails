@@ -157,6 +157,7 @@ AUDIT_WRITERS = {
     ("tools/hierarchy_jobs.py", "job_environment"): "existing , mkdir; source lines 1789, 1791, 1802",
     ("tools/hierarchy_jobs.py", "Job.claim"): "existing mkdir; source lines 1416, 1418",
     ("tools/hierarchy_jobs.py", "Job.disposition"): "existing open; source lines 1449",
+    ("tools/hierarchy_jobs.py", "Job.publish_execution_claim"): "JOBS-2 descriptor-anchored execution-claim publication: bounded private open, no-replace link and pending-file cleanup",
     ("tools/hierarchy_jobs.py", "keep_evidence"): "existing unlink; source lines 1716",
     ("tools/hierarchy_jobs.py", "merge_steps"): "existing mkdir, write_text; source lines 1963, 1964",
     ("tools/hierarchy_jobs.py", "python_info"): "existing subprocess DEVNULL; source lines 321",
