@@ -136,7 +136,7 @@ def _expected_facts(channel, value):
     result += " json=" + types[type(decoded)]
     if isinstance(decoded, dict):
         expected = {"aegis_capture_insight", "aegis_create_rule", "aegis_list_rules", "aegis_msg_read", "aegis_msg_write",
-            "aegis_report_outcome", "aegis_scan", "aegis_team_config",
+            "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model",
             "result", "error", "tools", "name", "content", "text", "rules", "_name", "schema", "lanes", "check",
             "status", "tip", "hosts", "source", "dry_run", "aegis_version", "checked_at", "scope", "actions",
             "rule", "type", "triggers", "tp", "fp", "score"}
@@ -448,7 +448,7 @@ stdout-json non-json mapping scalar json-key identifier rule-name dry-run seeded
 """.split()
 _EXPECTED_FACT_WORDS = ("aegis.team.claim/v1", "aegis.team.status/v1", "aegis.doctor/v1", "aegis init", "ok", "pass",
     "aegis_capture_insight", "aegis_create_rule", "aegis_list_rules", "aegis_msg_read", "aegis_msg_write",
-    "aegis_report_outcome", "aegis_scan", "aegis_team_config", "[A-Za-z0-9_.-]{1,128}", "True", "False")
+    "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model", "[A-Za-z0-9_.-]{1,128}", "True", "False")
 _FACT_TOKEN = "(?:" + "|".join(re.escape(word) for word in sorted(set(_FACT_WORDS + list(_EXPECTED_FACT_WORDS)), key=len, reverse=True)) + r"|[0-9a-f]{12}|[0-9]+|aegis(?:\.[a-z]{1,24}){1,4}/v[0-9]{1,3})"
 FACT_LINE = re.compile(_FACT_TOKEN + r"(?:[ ,;:=\[\]'().-]+" + _FACT_TOKEN + r")*[ ,;:=\[\]'().-]*", re.ASCII)
 

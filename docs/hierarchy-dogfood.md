@@ -176,7 +176,6 @@ per kind: pytest-family roots against `heavy`, cargo build/test and `rustc` root
   "base": "/absolute/path/to/trial-folder/initiatives/aegis-47",
   "source": "/absolute/path/to/trial-folder/tools-clone",
   "board": "/absolute/path/to/trial-folder/board",
-  "python": "/usr/bin/python3",
   "lanes": {"build-1": "implementer", "review-1": "reviewer"},
   "initiative": {"id": "aegis-47", "project": "aegis", "repository": "aegis", "priority": 5,
                  "target_branch": "feature/manager-workspace-prototype",
