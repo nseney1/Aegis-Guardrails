@@ -44,6 +44,8 @@ LEASED_SITES = {}
 # Exact computed calls: (file, scope, kind, syntax, occurrence) -> (shared, reason).
 # A newly permissive flag changes the key and requires its own explicit review.
 UNRESOLVED_TARGETS = {
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_guard_sentinel_is_local', 'patch', "monkeypatch.setattr(module, '_MISSING', mode)", 0):
+        (False, 'MB-MODE-1 imports tools.hierarchy_mailbox_index as module and changes only its existing _MISSING binding to prove the guard uses its own sentinel; shared process modules and builtins stay untouched.'),
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'patch', "monkeypatch.setitem(globals(), '_tracked_names', observed_tracked_names)", 0):
         (False, 'The contract replaces its own _tracked_names helper to count Git prefilter queries while the observed subprocess and AST boundaries check clean Git environment and single-pass parsing.'),
     ('tests/integration/test_hierarchy_mailbox_doctor.py', 'test_limits_refuse_before_parsing', 'patch', 'monkeypatch.setattr(module, limit, 1)', 0):
@@ -145,6 +147,8 @@ MOCK_CALLABLES = MOCK_PATCH | {factory + "." + method for factory in MOCK_PATCH
 # (file, lexical scope, source owner) -> (may be shared, reviewed reason).
 # These are identities the static import/binding resolver cannot prove.
 OWNER_REGISTRATIONS = {
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_dict_snapshot_keeps_inspection_copy_and_mock_usable', 'index'):
+        (False, 'MB-MODE-1 patches only its test-owned MailboxIndex instance to verify mock.patch.object remains compatible with the dictionary snapshot; no shared module is patched.'),
     ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'sys.modules[__name__]'):
         (False, 'sys.modules[__name__] is this test module; replaces its owned fixture reference only.'),
     ('tests/integration/test_hierarchy_hosts.py', 'test_r13_unknown_grammar_family_refuses', 'grammar'):
@@ -970,6 +974,50 @@ AST_DIGEST_PREFIX = "ast-sha256:"
 # Namespace rows store canonical AST fingerprints, not copies of another file's
 # source syntax. Other ban rows retain the existing source-syntax representation.
 BAN_REGISTRATIONS = {
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___setattr__', 'ast-sha256:c14318d11a5f42a5304e3e4b5c6b0c94d67314fad49a3c7fd8e9d0a361ab91bc', 0):
+        'MB-MODE-1 attempts a backing-slot write on the test-owned index to verify the captured descriptor cannot be reached by name.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___delattr__', 'ast-sha256:0b91ff65a0ad33dd7b003bdbe2c1e0e77f608ca79e41d1cdd5bc8fb610ae3818', 0):
+        'MB-MODE-1 attempts backing-slot deletion on the test-owned index to verify refusal and permanent reinitialization protection.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_dict_snapshot_keeps_inspection_copy_and_mock_usable', 'namespace_vars', 'ast-sha256:4b1627671d2750190f0442d83b77a41c90be878ea94a1217bcafb532e09c134b', 0):
+        'MB-MODE-1 reads the test-owned index dictionary snapshot to verify fixed mutator refusals and ordinary inspection compatibility.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_dict_snapshot_keeps_inspection_copy_and_mock_usable', 'namespace___dict__', 'ast-sha256:97874dd365a6ddb12d5a1c73d999aed10b177a4a5c212dcc46e60e175867c868', 0):
+        'MB-MODE-1 compares independent read-only snapshots of the test-owned index; no shared namespace is mutated.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_dict_snapshot_keeps_inspection_copy_and_mock_usable', 'namespace___dict__', 'ast-sha256:97874dd365a6ddb12d5a1c73d999aed10b177a4a5c212dcc46e60e175867c868', 1):
+        'MB-MODE-1 compares independent read-only snapshots of the test-owned index; no shared namespace is mutated.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', 'test_mode_dict_snapshot_mutators_have_fixed_refusal', 'namespace_vars', 'ast-sha256:4b1627671d2750190f0442d83b77a41c90be878ea94a1217bcafb532e09c134b', 0):
+        'MB-MODE-1 reads the test-owned index dictionary snapshot to verify fixed mutator refusals and ordinary inspection compatibility.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_builtin_import', 'ast-sha256:64309fb3f719f6c4f635f8a7ab66177555ebbbc67ca57981c40577726e31c5c9', 0):
+        'MB-MODE-1 imports only a builtin accessor for a refusal regression on the test-owned index; shared builtins remain untouched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___setattr__', 'ast-sha256:1fb8c4991296d5b1bf7ceee18e106a3f48ec45d80f9189e6b0ba4e52b255525e', 0):
+        'MB-MODE-1 captures a bound or object setter to verify fixed mode refusal on the test-owned index; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_setattr', 'ast-sha256:e3ab1fa4089f3c7523b7abd2c9e7c72bb71f680fd864d2ce736517eddeb48f3c', 0):
+        'MB-MODE-1 calls the captured setter on the test-owned index to verify fixed mode refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___setattr__', 'ast-sha256:364d53c17e736f0565fa9ffd3bacd80500bf354534e8dd558a129bbe6cb9c2e8', 0):
+        'MB-MODE-1 captures a bound or object setter to verify fixed mode refusal on the test-owned index; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___delattr__', 'ast-sha256:2e26006cea9a775be3c6558dbe368207d8038cd3ccca98f750d0c76762cd9e25', 0):
+        'MB-MODE-1 attempts object-level mode deletion on the test-owned index to verify refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___dict__', 'ast-sha256:23bd3ac64018753e29707da1f23618b0654df4e7f2ec78fff344abeb9419b0d5', 0):
+        'MB-MODE-1 attempts dictionary mutation on the test-owned index to verify fixed dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___dict__', 'ast-sha256:1b897084f40335eeea69e208a345fc404915a957cb5bd79681eccdc7269a14f3', 0):
+        'MB-MODE-1 attempts dictionary mutation on the test-owned index to verify fixed dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace___dict__', 'ast-sha256:a6bdd2cbd638eba06b585c4d2535ed943f5a4338b4cb3968c5770ca2ed757e56', 0):
+        'MB-MODE-1 attempts dictionary mutation on the test-owned index to verify fixed dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'module_write', 'vars(index).update(mode=target)', 0):
+        'MB-MODE-1 attempts a vars or alias update on the test-owned index to verify dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_vars', 'ast-sha256:71ace9decde840e285dc8ab710e93ea4d00b66df4fe98574561ea36b709a348a', 0):
+        'MB-MODE-1 captures or calls vars for a dictionary-refusal regression on the test-owned index; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_vars', 'ast-sha256:17c94c2b02bffade7c8ba7368d223562b6e3aa4dbc081084d8884be12e760e5a', 0):
+        'MB-MODE-1 captures or calls vars for a dictionary-refusal regression on the test-owned index; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'module_write', 'state(index).update(mode=target)', 0):
+        'MB-MODE-1 attempts a vars or alias update on the test-owned index to verify dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_vars', 'ast-sha256:37d6c9c9e29d5c42298fbf879062f4f518bb10717175cd689c60a4c118934648', 0):
+        'MB-MODE-1 captures or calls vars for a dictionary-refusal regression on the test-owned index; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_builtin_import', 'ast-sha256:56f9058734544691121cdc48ffb077a93a5a72540ab48c78b9ebbb62f7358658', 0):
+        'MB-MODE-1 imports only a builtin accessor for a refusal regression on the test-owned index; shared builtins remain untouched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'module_write', 'state(index).update(mode=target)', 1):
+        'MB-MODE-1 attempts a vars or alias update on the test-owned index to verify dictionary refusal; no shared namespace is patched.',
+    ('tests/integration/test_hierarchy_mailbox_index.py', '_attempt_mode_change', 'namespace_vars', 'ast-sha256:37d6c9c9e29d5c42298fbf879062f4f518bb10717175cd689c60a4c118934648', 1):
+        'MB-MODE-1 captures or calls vars for a dictionary-refusal regression on the test-owned index; no shared namespace is patched.',
     ('tests/conftest.py', '_TestCodeIndex._namespace', 'namespace___dict__', 'ast-sha256:f2f0c1b1deb846ea8cb0b7056a662e5094525ee8e43c2b4a757ab569846e240e', 0):
         'Reads the builtin ModuleType dictionary descriptor to inspect test-module provenance without invoking module hooks; no namespace mutation.',
     ('tests/conftest.py', '_TestCodeIndex._class_namespace', 'namespace___dict__', 'ast-sha256:e220644f06bd09bd9b4c3a2bf42ded744b2b23d01d09bc4ad9ae76e882d56b7e', 0):
@@ -1687,7 +1735,7 @@ BAN_REGISTRATIONS = {
     ('tests/unit/verification/test_scanners.py', 'descriptor_count', 'namespace_vars', 'ast-sha256:7753147a4a668b8a91f3b2cdb69544cb32cd1138f1fee1be01a8d8d866faf689', 0):
         'Reads vars(os) to copy os into an owned capability/AST namespace for descriptor_count; overrides are installed on the copy rather than the original namespace.',
 }
-BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 39, 'namespace___class__': 3, 'namespace___delattr__': 0, 'namespace___dict__': 17, 'namespace___getattribute__': 1, 'namespace___setattr__': 10, 'namespace_builtin_import': 12, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 9, 'namespace_sys_modules': 51, 'namespace_vars': 59}
+BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 42, 'namespace___class__': 3, 'namespace___delattr__': 2, 'namespace___dict__': 22, 'namespace___getattribute__': 1, 'namespace___setattr__': 13, 'namespace_builtin_import': 14, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 10, 'namespace_sys_modules': 51, 'namespace_vars': 65}
 
 # Formal 0715 example disposition (dynamic examples intentionally unasserted):
 # security 1 / correctness 2: global/nonlocal import/from-import rebindings,
@@ -7450,7 +7498,7 @@ def test_r14_registration_cannot_raise_an_unused_class_ceiling(kind, source):
     registrations = {key: 'Owned positive source operation; the count ceiling is independent.' for key in observed.bans}
     rows = patch_sites(source, path, bans=registrations)
     assert raising_errors(rows, path) == []
-    limits = {name: limit for name, limit in BAN_LIMITS.items() if name == kind}
+    limits = {kind: 0}
     assert any(kind + ' ban count 1 exceeds 0' in error
                for error in ban_allowance_errors({path: rows}, registrations, limits))
 

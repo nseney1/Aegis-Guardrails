@@ -1,8 +1,6 @@
-"""Evidence-only small-change progression. D4/D5 activation and D7 early release remain unqualified.
-
-Only mailbox publication borrows the ready Orchestrator binding. The sole journal
-mutation is route under the current router; participant and coordinator events
-are never recorded here. All state is reconstructed from existing public records.
+"""Evidence-only small changes; D4/D5 activation and D7 early release remain unqualified.
+Only publication borrows the ready Orchestrator; only route mutates the journal under its router.
+Participant/coordinator events are never recorded here; state comes from existing public records.
 """
 from __future__ import annotations
 
@@ -89,18 +87,15 @@ def _git_read(checkout, environment, arguments, *, clean_status=False):
         process.stderr.close()
 
 
-def _clean_source(checkout):
+def _clean_source(checkout, *, planned=None):
     """Fixed-v1 checks require clean source; never fingerprint a dirty worktree entry."""
-    checkout = checked_path(checkout)
-    environment = jobs.object_read_env(inherit_config=True)
-    for host in hierarchy_hosts.describe()["hosts"].values():
-        for name in host["billing_variables"]:
-            environment.pop(name, None)
-        environment.pop(host["session_variable"]["name"], None)
-
+    checkout, environment = checked_path(checkout), jobs.object_read_env(inherit_config=True)
+    legacy_names = {name for host in hierarchy_hosts.describe()["hosts"].values()
+                    for name in (*host["billing_variables"], host["session_variable"]["name"])}
+    environment = (hierarchy_hosts.child_environment(environment, "no-host") if planned is not False else
+                   {key: value for key, value in environment.items() if key not in legacy_names})
     def read(*arguments):
         return _git_read(checkout, environment, arguments, clean_status=arguments[0] == "status")
-
     status = ("status", "--porcelain=v1", "-z", "--untracked-files=all")
     require(not read(*status), "source does not match packet")
     listed = read("ls-files", "--stage", "-z")
@@ -1318,10 +1313,10 @@ class Row:
                    "sha256": hashlib.sha256(raw).hexdigest()}
             request = self.publication(msg_id, self.team + "/root", "job_request", self.metadata("check", **self.job_extra(admission)), ref, staged=True)
             if prior is None:
-                # Public runner validation is read-only; the attached packet must first exist.
-                # Validate equivalent source/recipe constraints before staging any packet.
+                # Validate source and recipe before staging the packet for the public runner.
                 require(packet["checkout"] in self.initiative["checkouts"], "checkout is not registered")
-                require(_clean_source(packet["checkout"]) == (packet["commit"], packet["tree"]),
+                planned = self.operation.exists(self.mailbox.root.parent / hierarchy_hosts.PLAN_FILE)
+                require(_clean_source(packet["checkout"], planned=planned) == (packet["commit"], packet["tree"]),
                         "source does not match packet")
                 staged.append((admission, raw, ref, request))
         if not mutate:

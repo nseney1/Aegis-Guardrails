@@ -2,9 +2,13 @@
 
 Unadmitted tracked runtime files may not mention either index needle, even in
 comments. Deliberately obfuscated code (exec, computed import names, getattr with
-strings) is out of scope; code review covers it. Runtime mode immutability is
-follow-up MB-MODE-1, after MB-7 and MB-1-PLAT. MB-MODE-1 must change this
-contract deliberately when it changes the index shape.
+strings) is out of scope; code review covers it. MB-MODE-1 now enforces existing
+instance mode immutability through a captured member descriptor and a read-only
+dictionary snapshot. Deliberate introspection can still reach the descriptor via
+type(idx).mode.fget.__self__ or MailboxIndex.__init__.__closure__; this is outside
+the honest-code model. Reinitialization refuses at runtime. The exact guard is
+pinned below; ordinary construction/default/hook escapes refuse here.
+Fresh explicit construction remains legitimate outside this rollout contract.
 RECEIVER_ATTR_ALLOW pins classmethod receiver attribute reads; MB lanes must
 extend it deliberately. Allowed reads never expose mode or construction/state
 dunders, and attribute stores/deletes still refuse.
@@ -25,6 +29,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import symtable
 import tempfile
 
 import pytest
@@ -104,10 +109,6 @@ def _name(node, value):
     return isinstance(node, ast.Name) and node.id == value
 
 
-def _self_attribute(node, value):
-    return isinstance(node, ast.Attribute) and _name(node.value, "self") and node.attr == value
-
-
 def _shadow_call(call, signature, *, allow_default=False):
     position, positional_count = signature
     if (any(isinstance(arg, ast.Starred) for arg in call.args)
@@ -129,43 +130,38 @@ def _reference(node, names):
 
 def _mode_write(node, names):
     if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
-        return node.attr == "mode"
+        return node.attr in {"mode", "__mode", "_MailboxIndex__mode"}
     if (isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del))
             and _literal(node.slice, "mode") and isinstance(node.value, ast.Attribute)
             and node.value.attr == "__dict__"):
         return True
     if not isinstance(node, ast.Call):
         return False
-    setter = (_name(node.func, "setattr") or "builtins.setattr" in names.resolve(node.func)
-              or (isinstance(node.func, ast.Attribute) and node.func.attr == "__setattr__"))
+    setter = (_name(node.func, "setattr") or _name(node.func, "delattr")
+              or names.resolve(node.func).intersection({"builtins.setattr", "builtins.delattr"})
+              or isinstance(node.func, ast.Attribute) and node.func.attr in {"__setattr__", "__delattr__"})
     if not setter:
         return False
-    offset = 0 if isinstance(node.func, ast.Attribute) and len(node.args) == 2 else 1
+    bound = (isinstance(node.func, ast.Attribute)
+             and (node.func.attr == "__setattr__" and len(node.args) == 2
+                  or node.func.attr == "__delattr__" and len(node.args) == 1))
+    offset = 0 if bound else 1
     return len(node.args) <= offset or not (
-        isinstance(node.args[offset], ast.Constant) and node.args[offset].value != "mode"
+        isinstance(node.args[offset], ast.Constant)
+        and node.args[offset].value not in {"mode", "__mode", "_MailboxIndex__mode"}
     )
 
 
-def _parameter_store(target, value):
-    """Pair tuple targets with their actual values, including the tip's tuple store."""
-    if _self_attribute(target, "mode") and _name(value, "mode"):
-        yield target
-    elif (isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
-          and len(target.elts) == len(value.elts)):
-        for left, right in zip(target.elts, value.elts):
-            yield from _parameter_store(left, right)
-
-
-def _binds_mode(node, parameter=None):
+def _binds_name(node, protected, parameter=None):
     return (
-        isinstance(node, ast.Name) and node.id == "mode" and isinstance(node.ctx, (ast.Store, ast.Del))
-        or isinstance(node, ast.arg) and node.arg == "mode" and node is not parameter
-        or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "mode"
-        or isinstance(node, ast.ExceptHandler) and node.name == "mode"
-        or isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == "mode"
-        or isinstance(node, (ast.Global, ast.Nonlocal)) and "mode" in node.names
-        or type(node).__name__ in ("MatchAs", "MatchStar") and node.name == "mode"
-        or type(node).__name__ == "MatchMapping" and node.rest == "mode"
+        isinstance(node, ast.Name) and node.id in protected and isinstance(node.ctx, (ast.Store, ast.Del))
+        or isinstance(node, ast.arg) and node.arg in protected and node is not parameter
+        or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler))
+        and node.name in protected
+        or isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) in protected
+        or isinstance(node, (ast.Global, ast.Nonlocal)) and bool(protected.intersection(node.names))
+        or type(node).__name__ in ("MatchAs", "MatchStar") and node.name in protected
+        or type(node).__name__ == "MatchMapping" and node.rest in protected
     )
 
 
@@ -225,6 +221,104 @@ def _classmethod_shape(method, signature, names, parents):
     return found
 
 
+_MODE_GUARD_SOURCE = '''\
+_MODE_READ_ONLY = "mailbox index mode is read-only; changing mode requires the ADR phase-0 exit"
+
+class _ModeSnapshot(dict):
+    def _refuse(*args, **kwargs):
+        raise AttributeError(_MODE_READ_ONLY)
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _refuse
+
+class _IndexStorage:
+    """Keep native instance state and the doctor's bound method overrides."""
+
+def _guard_mode(cls):
+    slot, state, original, missing = cls.__dict__["_MailboxIndex__mode"], _IndexStorage.__dict__["__dict__"], cls.__init__, object()
+    del cls._MailboxIndex__mode
+    def initialize(self, mailbox, *, mode="shadow"):
+        if getattr(self, "mode", missing) is not missing:
+            _ModeSnapshot._refuse()
+        hm.require(mode in ("shadow", "indexed"), "unknown mailbox index mode; valid modes: shadow, indexed")
+        slot.__set__(self, mode)
+        return original(self, mailbox, mode=mode)
+    def clone(self):
+        other = cls(self.mailbox, mode=self.mode)
+        state.__get__(other).update(state.__get__(self))
+        return other
+    cls.__init__, cls.__copy__ = initialize, clone
+    cls.mode = cls._MailboxIndex__mode = property(slot.__get__, _ModeSnapshot._refuse, _ModeSnapshot._refuse)
+    return cls
+
+@_guard_mode
+class MailboxIndex(_IndexStorage):
+    __slots__ = ("__mode",)
+    __dict__ = property(lambda self: _ModeSnapshot(_IndexStorage.__dict__["__dict__"].__get__(self)), _ModeSnapshot._refuse, _ModeSnapshot._refuse)
+
+    def __init__(self, mailbox, *, mode="shadow"):
+        self.mailbox = mailbox
+'''
+_MODE_GUARD_TREE = ast.parse(_MODE_GUARD_SOURCE)
+_GUARD_SUPPORT = frozenset({"_MODE_READ_ONLY", "_ModeSnapshot", "_IndexStorage", "_guard_mode"})
+# The sentinel is still used elsewhere in the reader. Pin its sole definition,
+# along with the guard's existing module import, without forbidding normal reads.
+_GUARD_CONTEXT_SOURCE = '''\
+if __package__:
+    from . import hierarchy_mailbox as hm
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import hierarchy_mailbox as hm
+_MISSING = object()
+'''
+_GUARD_CONTEXT_TREE = ast.parse(_GUARD_CONTEXT_SOURCE)
+
+
+def _guard_free_names(tree):
+    """Use Python's scope analysis on the pinned AST, including nested scopes."""
+    pending = [symtable.symtable(ast.unparse(tree), INDEX, "exec")]
+    free = set()
+    while pending:
+        scope = pending.pop()
+        free.update(symbol.get_name() for symbol in scope.get_symbols()
+                    if symbol.is_referenced() and symbol.is_global())
+        pending.extend(scope.get_children())
+    return frozenset(free)
+
+
+_GUARD_NAMES = _GUARD_SUPPORT | _guard_free_names(_MODE_GUARD_TREE) | frozenset({"_MISSING"})
+
+
+def _mode_guard_shape(tree, cls, init):
+    """Exempt only exact reviewed guard nodes from the existing token checks."""
+    expected = _MODE_GUARD_TREE
+    reviewed = expected.body[-1]
+    members = [node for node in cls.body if (
+        isinstance(node, ast.FunctionDef) and node.name in {"mode", "__dict__"}
+        or isinstance(node, (ast.Assign, ast.AnnAssign)) and any(isinstance(target, ast.Name)
+            and target.id in {"__slots__", "__dict__"}
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])))]
+    pinned = reviewed.body[:-1]
+    support = [node for node in tree.body
+               if any(_binds_name(binding, _GUARD_SUPPORT) for binding in ast.walk(node))]
+    context = [node for node in tree.body if (
+        isinstance(node, ast.If) and _name(node.test, "__package__")
+        or isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(_binds_name(binding, {"_MISSING"}) for binding in ast.walk(node)))]
+    if ([ast.dump(node) for node in context] != [ast.dump(node) for node in _GUARD_CONTEXT_TREE.body]
+            or ast.dump(ast.Module(body=support, type_ignores=[]))
+            != ast.dump(ast.Module(body=expected.body[:-1], type_ignores=[]))
+            or [ast.dump(node) for node in members] != [ast.dump(node) for node in pinned]
+            or [ast.dump(node) for node in cls.bases] != [ast.dump(node) for node in reviewed.bases]
+            or cls.keywords
+            or [ast.dump(node) for node in cls.decorator_list]
+            != [ast.dump(node) for node in reviewed.decorator_list]):
+        return set(), {init.lineno}
+    prefix = reviewed.body[-1].body
+    found = ({init.lineno} if [ast.dump(node) for node in init.body[:len(prefix)]]
+             != [ast.dump(node) for node in prefix] else set())
+    return {node for member in [*context, *support, *members, *cls.bases, *cls.decorator_list]
+            for node in ast.walk(member)}, found
+
+
 def _index_shape(tree, names, parents):
     # Signature validation precedes extraction, so missing/duplicate definitions refuse.
     signature = _mode_signature(tree)
@@ -232,37 +326,59 @@ def _index_shape(tree, names, parents):
     init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
     args = init.args.posonlyargs + init.args.args + init.args.kwonlyargs
     parameter = next(arg for arg in args if arg.arg == "mode")
-    allowed, statements = set(), 0
-    found = set()
-    for statement in init.body:
-        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-            stores = {node for target in targets for node in _parameter_store(target, statement.value)}
-            allowed.update(stores)
-            statements += bool(stores)
-    if init.decorator_list or statements != 1 or len(allowed) != 1:
+    guard_nodes, found = _mode_guard_shape(tree, cls, init)
+    if init.decorator_list:
         found.add(init.lineno)
     for node in ast.walk(init):
-        if _binds_mode(node, parameter):
+        if _binds_name(node, {"mode"}, parameter):
             found.add(getattr(node, "lineno", init.lineno))
+    decorators = {decorator for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  for decorator in node.decorator_list}
+    for node in ast.walk(cls):
+        if _binds_name(node, {"__getattribute__", "__getattr__"}):
+            found.add(getattr(node, "lineno", getattr(parents.get(node), "lineno", init.lineno)))
     for node in ast.walk(tree):
+        if node in guard_nodes:
+            continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             found.update(_classmethod_shape(node, signature, names, parents))
         if isinstance(node, ast.ClassDef):
             for binding in _class_body_nodes(node):
-                if _binds_mode(binding):
+                if _binds_name(binding, {"mode"}) and binding not in guard_nodes:
                     found.add(getattr(binding, "lineno", node.lineno))
         identifier = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
-        if identifier in ("__dict__", "__class__"):
+        if identifier in _GUARD_SUPPORT or _binds_name(node, _GUARD_NAMES):
+            found.add(getattr(node, "lineno", getattr(parents.get(node), "lineno", init.lineno)))
+        if identifier in {"__kwdefaults__", "__defaults__", "partialmethod", "__init__"}:
+            found.add(node.lineno)
+        if (isinstance(node, ast.alias) and node.name in {"type", "classmethod", "partialmethod"}
+                and isinstance(parents.get(node), ast.ImportFrom)):
+            found.add(getattr(node, "lineno", parents[node].lineno))
+        if (_name(node, "type") or "builtins.type" in names.resolve(node)):
+            call = parents.get(node)
+            outer = parents.get(call)
+            if (not isinstance(call, ast.Call) or call.func is not node
+                    or len(call.args) == 1 and not (not call.keywords
+                        and isinstance(outer, ast.Attribute) and outer.value is call
+                        and isinstance(outer.ctx, ast.Load)
+                        and outer.attr in {"__name__", "__qualname__", "__module__"})):
+                found.add(node.lineno)
+        if ((_name(node, "classmethod") or "builtins.classmethod" in names.resolve(node))
+                and node not in decorators):
+            found.add(node.lineno)
+        if identifier in ("__dict__", "__class__") and node not in guard_nodes:
+            found.add(node.lineno)
+        if (isinstance(node, ast.Attribute) and node.attr in {"__mode", "_MailboxIndex__mode"}
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                or _literal(node, "_MailboxIndex__mode")):
             found.add(node.lineno)
         if isinstance(node, ast.Call):
             func = node.func
             callee = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
             if (callee in ("vars", "setattr", "delattr")
-                    or isinstance(func, ast.Attribute) and func.attr == "__init__"
-                    or callee == "type" and len(node.args) == 1 and _name(node.args[0], "self")):
+                    or isinstance(func, ast.Attribute) and func.attr == "__init__"):
                 found.add(node.lineno)
-        if _mode_write(node, names) and node not in allowed:
+        if _mode_write(node, names):
             found.add(node.lineno)
         if _reference(node, names):
             parent = parents.get(node)
@@ -270,6 +386,24 @@ def _index_shape(tree, names, parents):
                     or not _shadow_call(parent, signature, allow_default=True)):
                 found.add(node.lineno)
     return [(line, "RF24_SIGNATURE") for line in sorted(found)]
+
+
+def _importer_state_access(node):
+    if isinstance(node, ast.Attribute):
+        if (isinstance(node.ctx, (ast.Store, ast.Del))
+                and node.attr in {"__class__", "__getattribute__", "__getattr__", "__init__", "__new__"}):
+            return True
+        if node.attr == "__init__":
+            call = node.value
+            return not (isinstance(call, ast.Call) and _name(call.func, "super")
+                        and not call.args and not call.keywords)
+    if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        target = node.value
+        while isinstance(target, ast.Subscript):
+            target = target.value
+        if isinstance(target, ast.Attribute) and target.attr in {"__kwdefaults__", "__defaults__"}:
+            return True
+    return _literal(node, "_MailboxIndex__mode")
 
 
 def _violations(tree, name, signature):
@@ -289,7 +423,7 @@ def _violations(tree, name, signature):
                     callee = isinstance(parent, ast.Call) and parent.func is node
                     if not callee or not _shadow_call(parent, signature):
                         found.add((node.lineno, "RF24_MODE" if callee else "RF24_REFERENCE"))
-                if _mode_write(node, names):
+                if _mode_write(node, names) or _importer_state_access(node):
                     found.add((node.lineno, "RF24_MODE_WRITE"))
         return [_message(name, line, code) for line, code in sorted(found)]
     except (RecursionError, MemoryError):
@@ -669,9 +803,10 @@ def test_positional_mode_is_checked_against_the_signature():
 @pytest.mark.parametrize("body", [
     "self.mode = mode", "self.mailbox, self.mode = mailbox, mode",
     ])
-def test_index_unmodified_parameter_stores_are_allowed(body, shadow_signature):
+def test_index_old_mutable_parameter_stores_refuse(body, shadow_signature):
     tree = ast.parse('class MailboxIndex:\n    def __init__(self, mailbox, *, mode="shadow"):\n        ' + body)
-    assert _violations(tree, INDEX, shadow_signature) == []
+    findings = _violations(tree, INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
 
 
 @pytest.mark.parametrize("locationless", [False, True], ids=["native-alias", "locationless-alias"])
@@ -687,12 +822,12 @@ def test_initializer_alias_without_location_refuses(shadow_signature, monkeypatc
             return parsed
 
         monkeypatch.setattr(ast, "parse", parse_without_alias_locations)
-    tree = ast.parse('class MailboxIndex:\n    def __init__(self, mailbox, *, mode="shadow"):\n'
-                     '        import settings as mode\n        self.mode = mode')
-    alias = next(node for node in ast.walk(tree) if isinstance(node, ast.alias))
+    tree = ast.parse(_index_source(initializer='import settings as mode\nself.mailbox = mailbox'))
+    init = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    alias = next(node for node in ast.walk(init) if isinstance(node, ast.alias))
     if hasattr(alias, "lineno"):
         del alias.lineno  # Python 3.9 aliases already lack this attribute.
-    assert _violations(tree, INDEX, shadow_signature) == [_message(INDEX, 2, "RF24_SIGNATURE")]
+    assert _violations(tree, INDEX, shadow_signature) == [_message(INDEX, init.lineno, "RF24_SIGNATURE")]
 
 
 @pytest.mark.parametrize("raw,code", [
@@ -809,15 +944,206 @@ def test_git_inventory_includes_shipped_rules_skills_and_non_python_files(tmp_pa
     assert _tracked_names(tmp_path) == sorted(names)
     assert len(calls) == 1 and calls[0][-4:] == ["tools", "aegis_*", "rules", "skills"]
 
-def _index_source(body="", initializer="self.mailbox, self.mode = mailbox, mode", decorator=""):
-    return ("class MailboxIndex:\n"
-            + ("    " + decorator + "\n" if decorator else "")
-            + '    def __init__(self, mailbox, *, mode="shadow"):\n'
-            + "\n".join("        " + line for line in initializer.splitlines()) + "\n" + body)
+def _index_source(body="", initializer="self.mailbox = mailbox", decorator=""):
+    source = _GUARD_CONTEXT_SOURCE + _MODE_GUARD_SOURCE.replace(
+        "        self.mailbox = mailbox\n",
+        "\n".join("        " + line for line in initializer.splitlines()) + "\n")
+    if decorator:
+        source = source.replace("    def __init__", "    " + decorator + "\n    def __init__")
+    return source + body
+
+
+def test_index_reviewed_runtime_guard_is_allowed(shadow_signature):
+    assert _violations(ast.parse(_index_source()), INDEX, shadow_signature) == []
+
+
+@pytest.mark.parametrize("hook", ["__getattribute__", "__getattr__"])
+@pytest.mark.parametrize("renamed", [False, True], ids=["unrenamed", "renamed"])
+@pytest.mark.parametrize("locationless", [False, True], ids=["native-alias", "py39-alias"])
+def test_imported_lookup_hooks_refuse(hook, renamed, locationless, shadow_signature):
+    binding = "lookup as " + hook if renamed else hook
+    source = _index_source("    from helper import " + binding + "\n")
+    tree = ast.parse(source)
+    if locationless:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "helper":
+                node.names[:] = [ast.alias(name=alias.name, asname=alias.asname) for alias in node.names]
+    findings = _violations(tree, INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+def test_imported_delegating_getter_refuses(shadow_signature):
+    source = _index_source("    from helper import lookup as __getattribute__\n") + '''
+def lookup(self, name):
+    value = object.__getattribute__(self, name)
+    return "indexed" if name == "mode" else value
+'''
+    findings = _violations(ast.parse(source), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("identifier", ["__getattribute__", "__getattr__", "_ModeSnapshot"])
+@pytest.mark.parametrize("statement", [
+    "NAME = replacement", "del NAME", "from helper import NAME",
+    "from helper import lookup as NAME", "import helper as NAME",
+    "def NAME(): pass", "async def NAME(): pass", "class NAME: pass",
+    "try:\n    pass\nexcept E as NAME:\n    pass",
+    "global NAME", "nonlocal NAME", "def other(NAME): pass",
+])
+def test_protected_binding_forms_refuse(identifier, statement, shadow_signature):
+    body = "\n".join("    " + line for line in statement.replace("NAME", identifier).splitlines()) + "\n"
+    findings = _violations(ast.parse(_index_source(body)), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("statement", [
+    '_MISSING = "shadow"', 'getattr = lambda *args: "shadow"',
+    'property = lambda *args: "indexed"', 'dict = replacement',
+    'object = replacement', 'AttributeError = replacement', 'hm = replacement',
+    'from helper import lookup as getattr', 'from helper import property',
+])
+def test_guard_global_rebindings_refuse(statement, shadow_signature):
+    source = _index_source() + "\n" + statement + "\n"
+    findings = _violations(ast.parse(source), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("statement", [
+    'idx.__init__.__kwdefaults__["mode"] = "indexed"',
+    'type(idx).__getattribute__ = lambda s, n: "indexed" if n == "mode" else object.__getattribute__(s, n)',
+    'class Swap(index_module._IndexStorage):\n    __slots__ = ("_MailboxIndex__mode",)\n    mode = "indexed"\nidx.__class__ = Swap',
+    'idx.__init__(mailbox, mode="indexed")', 'initialize = idx.__init__',
+    'super(other).__init__()', 'idx.__defaults__[0] = "indexed"',
+    'del idx.__kwdefaults__["mode"]', 'name = "_MailboxIndex__mode"',
+])
+def test_importer_construction_escapes_refuse(statement, shadow_signature):
+    source = 'from tools import hierarchy_mailbox_index as index_module\n' + statement + "\n"
+    findings = _importer_violations(source.encode(), "tools/hierarchy_mailbox_doctor.py", shadow_signature)
+    assert findings and all("RF24_MODE_WRITE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("attribute", ["__class__", "__getattribute__", "__getattr__", "__init__", "__new__"])
+@pytest.mark.parametrize("operation", ["store", "delete"])
+@pytest.mark.parametrize("receiver", ["idx", "type(idx)", "other"])
+def test_importer_class_attribute_mutations_refuse(attribute, operation, receiver, shadow_signature):
+    target = receiver + "." + attribute
+    statement = target + " = replacement" if operation == "store" else "del " + target
+    findings = _violations(ast.parse(statement), "tools/hierarchy_mailbox_doctor.py", shadow_signature)
+    assert findings and all("RF24_MODE_WRITE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("statement", [
+    'class Refusal(Exception):\n    def __init__(self, code):\n        super().__init__(code)',
+    'clone.__kwdefaults__ = function.__kwdefaults__',
+    'clone.__defaults__ = function.__defaults__',
+])
+def test_doctor_initializer_and_whole_defaults_remain_allowed(statement, shadow_signature):
+    assert _violations(ast.parse(statement), "tools/hierarchy_mailbox_doctor.py", shadow_signature) == []
+    doctor = "tools/hierarchy_mailbox_doctor.py"
+    assert _importer_violations(_read_source(REPO, doctor), doctor, shadow_signature) == []
+
+
+@pytest.mark.parametrize("body", [
+    '    def promote(self): self._MailboxIndex__mode = "indexed"\n',
+    '    def promote(self, other): other.__mode = "indexed"\n',
+    '\ndef promote(index): index._MailboxIndex__mode = "indexed"\n',
+    '    def promote(self): del self._MailboxIndex__mode\n',
+    '    def promote(self, other): del other.__mode\n',
+    '\ndef promote(index): del index._MailboxIndex__mode\n',
+    '    def promote(self): object.__setattr__(self, "_MailboxIndex__mode", "indexed")\n',
+    '    def promote(self): object.__delattr__(self, "_MailboxIndex__mode")\n',
+    '    def inspect(self): return "_MailboxIndex__mode"\n',
+])
+def test_backing_slot_spellings_refuse_on_every_receiver(body, shadow_signature):
+    findings = _violations(ast.parse(_index_source(body)), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("body", [
+    '    __init__ = functools.partialmethod(__init__, mode="indexed")\n',
+    '    def promote(self): self.__init__.__kwdefaults__["mode"] = "indexed"\n',
+    '    def promote(self): return self.__init__.__defaults__\n',
+    '\ndef promote(index): return type(index)(index.mailbox, mode="indexed")\n',
+    '    def promote(self, other): return type(other)(self.mailbox, mode="indexed")\n',
+    '    def promote(self):\n        me = self\n        return type(me)(self.mailbox, mode="indexed")\n',
+    '    def promote(self):\n        build = type\n        return build(self)(self.mailbox, mode="indexed")\n',
+    '    def promote(self):\n        from builtins import type as build\n        return build(self)(self.mailbox, mode="indexed")\n',
+    '    def promote(cls, mailbox): return cls(mailbox, mode="indexed")\n    promote = classmethod(promote)\n',
+    '    wrap = classmethod\n    def promote(cls, mailbox): return cls(mailbox, mode="indexed")\n    promote = wrap(promote)\n',
+    '    def __getattribute__(self, name): return "indexed" if name == "mode" else object.__getattribute__(self, name)\n',
+    '    def __getattr__(self, name): return "indexed"\n',
+])
+def test_construction_escape_idioms_refuse(body, shadow_signature):
+    findings = _violations(ast.parse(_index_source(body)), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+@pytest.mark.parametrize("attribute", ["__name__", "__qualname__", "__module__"])
+def test_type_metadata_reads_remain_allowed(attribute, shadow_signature):
+    body = "    def inspect(self, error): return type(error)." + attribute + "\n"
+    assert _violations(ast.parse(_index_source(body)), INDEX, shadow_signature) == []
+
+
+@pytest.mark.parametrize("statement", [
+    '_MODE_READ_ONLY: str = "x"',
+    '_ModeSnapshot: object = replacement',
+    '_IndexStorage: object = replacement',
+    '_guard_mode: object = replacement',
+    '_ModeSnapshot._refuse = replacement',
+    'snapshot = _ModeSnapshot',
+    'from config import value as _MODE_READ_ONLY',
+    'def replace(_MODE_READ_ONLY): return _MODE_READ_ONLY',
+    '_MODE_READ_ONLY += "x"',
+])
+def test_guard_support_rebindings_refuse(statement, shadow_signature):
+    source = _index_source() + "\n" + statement + "\n"
+    findings = _violations(ast.parse(source), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+def test_guard_member_annotation_refuses(shadow_signature):
+    source = _index_source('    __slots__: tuple = ()\n')
+    findings = _violations(ast.parse(source), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
+
+
+def test_unrelated_slot_annotation_is_allowed(shadow_signature):
+    source = _index_source() + '\nclass Other:\n    __slots__: tuple = ()\n'
+    assert _violations(ast.parse(source), INDEX, shadow_signature) == []
+
+
+@pytest.mark.parametrize("statement", [
+    'delattr(idx, "mode")',
+    'idx.__delattr__("mode")',
+    'object.__delattr__(idx, "_MailboxIndex__mode")',
+    'from builtins import delattr as remove\nremove(idx, "mode")',
+])
+def test_admitted_deletion_spelling_refuses(statement, shadow_signature):
+    findings = _violations(ast.parse(statement), "tools/probe.py", shadow_signature)
+    assert findings and all("RF24_MODE_WRITE:" in message for message in findings)
+
+
+def test_admitted_unrelated_deletion_remains_allowed(shadow_signature):
+    assert _violations(ast.parse('delattr(idx, "other")'), "tools/probe.py", shadow_signature) == []
+
+
+@pytest.mark.parametrize("before,after", [
+    ('slot.__set__(self, mode)', 'slot.__set__(self, "indexed")'),
+    ('slot.__get__', 'lambda self: "indexed"'),
+    ('raise AttributeError(_MODE_READ_ONLY)', 'pass'),
+    ('del cls._MailboxIndex__mode', 'pass'),
+    ('__slots__ = ("__mode",)', '__slots__ = ()'),
+    ('class MailboxIndex(_IndexStorage)', 'class MailboxIndex'),
+    ('if getattr(self, "mode", missing) is not missing:', 'if False:'),
+])
+def test_index_runtime_guard_mutations_refuse(before, after, shadow_signature):
+    assert before in _index_source()
+    findings = _violations(ast.parse(_index_source().replace(before, after)), INDEX, shadow_signature)
+    assert findings and all("RF24_SIGNATURE:" in message for message in findings)
 
 
 @pytest.mark.parametrize("source", [
-    _index_source(initializer="self.mailbox = mailbox"),
+    _index_source(initializer="pass"),
     _index_source(initializer='if mode != "shadow":\n    self.mode = mode'),
     _index_source(decorator="@decorate"),
     _index_source(initializer="self.mode = mode\nself.mode = mode"),

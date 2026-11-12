@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 import pytest
 
-from aegis_core import events, gitsafe, team
+from aegis_core import events, gitsafe, team, team_paths
 from tests import helpers_teamrace
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -134,6 +134,232 @@ def test_defaults_are_the_implementer_role_an_hour_no_branch_and_user_at_host(re
 def test_paths_are_stored_workspace_relative_posix_once_each(repo: Path):
     change = team.claim(repo, "docs", ["./docs/**", "docs\\**", "/README.md"], owner="o@h", now=NOW)
     assert change.lease.paths == ("docs/**", "README.md")
+
+
+def test_whitespace_lease_paths_are_refused_without_echo_or_effects(repo: Path):
+    recovery = "give each path as its own entry (use ? for a space inside a name)"
+    for space in (" ", "\t", "\n", "\r", "\v", "\f", "\x85", "\xa0", "\u1680",
+                  "\u2003", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000"):
+        for raw in (space + "docs/**", "docs/" + space + "token=secret", "docs/**" + space):
+            reason = "has a control character" if ord(space) < 32 or ord(space) == 133 else "has whitespace"
+            for _ in range(2):
+                with pytest.raises(team.TeamUsageError) as caught:
+                    team.claim(repo, "docs", [raw], owner="o@h", now=NOW)
+                assert str(caught.value) == "paths: glob 1 " + reason + "; " + recovery
+                assert caught.value.code == "VALIDATION_ERROR"
+    assert _refs(repo) == {}
+    assert _events(repo, "lease_claimed") == _events(repo, "lease_denied") == []
+
+
+@pytest.mark.parametrize("paths", [["docs/reference.md src/**"], ["docs/**", "src/\xa0**"],
+                                   ["docs/reference.md\tREADME.md"]])
+def test_legacy_whitespace_lease_paths_are_read_without_changing_their_spelling(paths):
+    raw = json.dumps(_valid_blob(paths=paths)).encode()
+    lease = team.parse_lease(raw, "docs", "a" * 40)
+    assert lease.paths == tuple(paths)
+    assert lease.path_set.legacy
+    assert lease.path_set.matching == tuple(dict.fromkeys(g for raw in paths for g in (raw, *raw.split())))
+
+
+def test_live_legacy_whitespace_leases_block_parts_and_raw_but_not_disjoint_paths(repo: Path):
+    raw = json.dumps(_valid_blob(paths=["docs/reference.md src/file.py"])).encode()
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    found = team.read_leases(repo)
+    assert found.unreadable == ()
+    assert found.get("docs").paths == ("docs/reference.md src/file.py",)
+    assert team.live_lease(repo, "docs", now=NOW).oid == oid
+    recovery = f"release docs --expect {oid}, then claim each path as its own entry"
+    for wanted in ("docs/reference.md", "src/file.py", "docs/reference.md?src/file.py"):
+        for _ in range(2):
+            with pytest.raises(team.LeaseRefused) as caught:
+                team.claim(repo, "new", [wanted], owner="o@h", now=NOW)
+            assert (caught.value.reason, caught.value.lanes) == ("overlap", ("docs",))
+            assert str(caught.value).endswith(recovery)
+            assert "docs/reference.md src/file.py" not in str(caught.value)
+    with pytest.raises(team.LeaseRefused) as caught:
+        team.claim(repo, "docs", ["docs/**"], owner="o@h", now=NOW)
+    assert (caught.value.reason, caught.value.current) == ("taken", oid)
+    assert str(caught.value).endswith(recovery)
+    assert team.claim(repo, "new", ["unrelated/**"], owner="o@h", now=NOW).action == "claimed"
+    _plant(repo, "refs/aegis/lanes/peer", json.dumps(_valid_blob(lane="peer", paths=["src/file.py"])).encode())
+    views = {view["lane"]: view for view in team.describe(repo, now=NOW)["leases"]}
+    assert views["docs"]["overlaps"] == ["peer"]
+    assert views["peer"]["overlaps"] == ["docs"]
+    assert gitsafe.read_object(repo, oid, team.MAX_LEASE_BYTES) == raw
+
+
+def test_expired_legacy_whitespace_leases_do_not_block_and_gc_collects_them(repo: Path):
+    raw = json.dumps(_valid_blob(paths=["docs/reference.md src/**"])).encode()
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    assert team.live_lease(repo, "docs", now=NOW + 3600) is None
+    assert team.claim(repo, "new", ["src/file.py"], owner="o@h", now=NOW + 3600).action == "claimed"
+    views = {view["lane"]: view for view in team.describe(repo, now=NOW + 3600)["leases"]}
+    assert views["new"]["overlaps"] == []
+    result = team.gc(repo, now=NOW + 3600)
+    assert [(change.lane, change.previous) for change in result.collected] == [("docs", oid)]
+    assert _ref(repo, "docs") is None
+    assert gitsafe.read_object(repo, oid, team.MAX_LEASE_BYTES) == raw
+
+
+def test_overlap_refusal_carries_recovery_for_the_requested_legacy_lane(repo: Path):
+    raw = json.dumps(_valid_blob(paths=["docs/a.py docs/b.py"])).encode()
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    _plant(repo, "refs/aegis/lanes/api", json.dumps(_valid_blob(lane="api", paths=["src/**"])).encode())
+    with pytest.raises(team.LeaseRefused) as caught:
+        team.claim(repo, "docs", ["src/file.py"], owner="o@h", now=NOW)
+    assert (caught.value.reason, caught.value.lanes) == ("overlap", ("api",))
+    assert str(caught.value).endswith(f"release docs --expect {oid}, then claim each path as its own entry")
+    assert _ref(repo, "docs") == oid
+
+
+@pytest.mark.parametrize("age", [0, 3600])
+def test_legacy_whitespace_renew_and_transfer_refuse_with_recovery(repo: Path, age):
+    raw = json.dumps(_valid_blob(paths=["docs/reference.md src/**"])).encode()
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    recovery = f"release docs --expect {oid}, then claim each path as its own entry"
+    for operation in (lambda: team.renew(repo, "docs", oid, now=NOW + age),
+                      lambda: team.transfer(repo, "docs", oid, "new@h", now=NOW + age)):
+        for _ in range(2):
+            with pytest.raises(team.LeaseRefused) as caught:
+                operation()
+            assert (caught.value.reason, caught.value.current) == ("legacy_paths", oid)
+            assert caught.value.code == "LEASE_REFUSED"
+            assert str(caught.value).endswith(recovery)
+    with pytest.raises(team.LeaseRefused) as caught:
+        team.renew(repo, "docs", "f" * 40, now=NOW + age)
+    assert caught.value.reason == "stale"
+    assert str(caught.value).endswith(recovery)
+    import pickle
+    copied = pickle.loads(pickle.dumps(caught.value))
+    assert str(copied) == str(caught.value)
+    assert copied.lease.path_set == caught.value.lease.path_set
+    assert _refs(repo) == {"refs/aegis/lanes/docs": oid}
+    assert gitsafe.read_object(repo, oid, team.MAX_LEASE_BYTES) == raw
+    assert _events(repo, "lease_claimed") == []
+    assert team.release(repo, "docs", oid).action == "released"
+    assert team.claim(repo, "new", ["docs/reference.md"], owner="o@h", now=NOW + age).action == "claimed"
+
+
+@pytest.mark.parametrize("legacy_lane,reason", [("api", "overlap"), ("docs", "taken")])
+def test_claim_retry_rechecks_concurrently_installed_legacy_paths(repo: Path, monkeypatch,
+                                                                legacy_lane, reason):
+    old = team.claim(repo, "docs", ["docs/**"], owner="old@h", ttl_s=1, now=NOW)
+    real = gitsafe.update_ref
+    installed = []
+
+    def replaced_meanwhile(cwd, ref, new, old_value):
+        monkeypatch.setattr(gitsafe, "update_ref", real)
+        real(cwd, ref, None, old.oid)
+        raw = json.dumps(_valid_blob(lane=legacy_lane, paths=["docs/reference.md src/**"])).encode()
+        installed.append(_plant(repo, "refs/aegis/lanes/" + legacy_lane, raw))
+        return real(cwd, ref, new, old_value)
+
+    monkeypatch.setattr(gitsafe, "update_ref", replaced_meanwhile)
+    with pytest.raises(team.LeaseRefused) as caught:
+        team.claim(repo, "docs", ["src/file.py"], owner="new@h", now=NOW + 1)
+    assert caught.value.reason == reason
+    assert str(caught.value).endswith(
+        f"release {legacy_lane} --expect {installed[0]}, then claim each path as its own entry")
+    assert _refs(repo) == {"refs/aegis/lanes/" + legacy_lane: installed[0]}
+    assert len(_events(repo, "lease_claimed")) == 1
+
+
+def test_concurrent_claims_from_worktrees_refuse_legacy_paths(repo: Path, worktree: Path):
+    raw = json.dumps(_valid_blob(lane="api", paths=["docs/reference.md src/**"], ts=int(time.time()))).encode()
+    oid = _plant(repo, "refs/aegis/lanes/api", raw)
+    outcomes = _race(repo, worktree, "docs", racers=3)
+    assert sorted(result[1] for result in outcomes) == ["refused:overlap"] * 3
+    assert _refs(repo) == {"refs/aegis/lanes/api": oid}
+    assert gitsafe.read_object(repo, oid, team.MAX_LEASE_BYTES) == raw
+    assert _events(repo, "lease_claimed") == []
+
+
+def test_whitespace_lease_cli_exit_codes_and_safe_messages(repo: Path, capsys):
+    from aegis_cli.cli import main
+
+    argv = ["--workspace", str(repo), "team", "claim", "docs", "--paths"]
+    for space in (" ", "\t", "\n", "\xa0"):
+        assert main(argv + ["docs/token=secret" + space + "src/**", "--json"]) == 2
+        captured = capsys.readouterr()
+        reason = "has a control character" if space in ("\t", "\n") else "has whitespace"
+        assert json.loads(captured.out)["error"] == (
+            "paths: glob 1 " + reason + "; give each path as its own entry (use ? for a space inside a name)")
+        assert "secret" not in captured.out + captured.err
+    raw = json.dumps(_valid_blob(lane="api", paths=["docs/reference.md src/**"], ts=int(time.time()))).encode()
+    oid = _plant(repo, "refs/aegis/lanes/api", raw)
+    assert main(argv + ["docs/reference.md", "--json"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["reason"] == "overlap"
+    assert json.loads(captured.out)["message"].endswith(
+        f"release api --expect {oid}, then claim each path as its own entry")
+    for action in ("renew", "transfer"):
+        args = ["--workspace", str(repo), "team", action, "api", "--expect", oid, "--json"]
+        if action == "transfer":
+            args += ["--owner", "new@h"]
+        assert main(args) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["reason"] == "legacy_paths"
+        assert payload["message"].endswith(f"release api --expect {oid}, then claim each path as its own entry")
+    assert _refs(repo) == {"refs/aegis/lanes/api": oid}
+
+
+def test_overlap_uses_boundary_parsed_values_without_revalidating_them():
+    class OnceParsed(str):
+        parsed = False
+
+        def __iter__(self):
+            assert not self.parsed, "overlap revalidated a parsed path"
+            return super().__iter__()
+
+    raw = OnceParsed("docs/a.py src/b.py")
+    held = team_paths.stored_paths([raw])
+    wanted = team_paths.claim_paths(["src/b.py"])
+    disjoint = team_paths.claim_paths(["other/**"])
+    raw.parsed = True
+    for _ in range(3):
+        assert team_paths.overlap(held, wanted)
+        assert not team_paths.overlap(held, disjoint)
+
+
+@pytest.mark.parametrize("paths", [["docs/a.py\x1bb.py"], ["docs/a.py\ud800"], [7], "docs/a.py src/b.py"])
+def test_malformed_legacy_paths_remain_unreadable(paths):
+    with pytest.raises(team.LeaseFormatError) as caught:
+        team.parse_lease(json.dumps(_valid_blob(paths=paths)).encode(), "docs", "a" * 40)
+    assert str(caught.value) == "paths is not a non-empty list of globs"
+
+
+def test_gc_retains_a_legacy_lease_replaced_after_reading(repo: Path, monkeypatch):
+    raw = json.dumps(_valid_blob(paths=["docs/a.py src/b.py"])).encode()
+    _plant(repo, "refs/aegis/lanes/docs", raw)
+    real = gitsafe.update_ref
+    replacement = []
+
+    def replaced_meanwhile(cwd, ref, new, old):
+        monkeypatch.setattr(gitsafe, "update_ref", real)
+        replacement.append(_plant(repo, ref, json.dumps(_valid_blob(
+            paths=["docs/a.py src/b.py"], ts=NOW + 3600)).encode()))
+        return real(cwd, ref, new, old)
+
+    monkeypatch.setattr(gitsafe, "update_ref", replaced_meanwhile)
+    result = team.gc(repo, now=NOW + 3600)
+    assert result.collected == ()
+    assert result.kept == (("docs", "changed after it was read"),)
+    assert _ref(repo, "docs") == replacement[0]
+    assert team.live_lease(repo, "docs", now=NOW + 3600).oid == replacement[0]
+
+
+def test_lease_path_bounds_and_invalid_utf8_refuse_before_git(repo: Path):
+    for paths, message in ((["x" * (team.MAX_LEASE_BYTES + 1)],
+                            "paths: the lease would be larger than 64 KiB"),
+                           (["docs/\ud800"], "paths: glob 1 is not UTF-8 text")):
+        with pytest.raises(team.TeamUsageError) as caught:
+            team.claim(repo, "docs", paths, owner="o@h", now=NOW)
+        assert str(caught.value) == message
+    assert _refs(repo) == {}
+
+
+def test_nonlease_glob_validation_keeps_whitespace_compatibility():
+    assert team.glob_problem("docs/my file.md") is None
 
 
 def test_a_reclaim_after_release_never_reproduces_the_blob(repo: Path):

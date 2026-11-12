@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from dataclasses import is_dataclass, replace
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -27,8 +28,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.integration.hierarchy_fake_wrapper import shell_exec
+from tests.conftest import symlink_or_skip
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration.test_hierarchy_provision import Setup, provision, worker_source_seed
+from tools import hierarchy_launcher as bootstrap_launcher
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
@@ -45,6 +48,445 @@ START_FOOTER = "Reply READY. Act only when woken."
 ROOT_SESSION = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
 # Bounded outer wait for the complete stop operation, including durable checkpoints and grace.
 R2_STOP_TIMEOUT_SECONDS = 60
+
+MR1D_PIN_ERROR = "runtime source pin differs from governing provision; use the governing base or reprovision"
+MR1D_CHECK_ERROR = "governing source pin check failed; use the governing base or reprovision"
+
+# Captured verbatim from the integration-tip bootstrap at 0d4808f9. The tests run this
+# boundary, not Git history, to obtain the old diagnostics on their own interpreter/OS.
+MR1D_R2_LEGACY_BOOTSTRAP = '''import argparse
+import json
+from pathlib import Path
+import sys
+
+# Provisioned CLI actions must enter through the retained verifier before importing any peer module.
+# A process-local marker prevents recursion; an environment variable cannot bypass verification.
+if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None) != str(Path(__file__).resolve()):
+    import runpy
+    early = argparse.ArgumentParser(add_help=False)
+    guarded = False
+    try:
+        early.add_argument("--base")
+        early.add_argument("command", nargs="?")
+        parsed, _ = early.parse_known_args()
+        if parsed.command in ("start", "resume", "_resume-wake") and parsed.base:
+            base = Path(parsed.base)
+            guarded = True
+        if guarded:
+            provision = base / "provision.json"
+            setup = json.loads(provision.read_text(encoding="utf-8"))
+            verifier = base / "runtime-source.py"
+            if not verifier.is_file():
+                raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+            loaded = runpy.run_path(str(verifier))
+            loaded["run"](provision, Path(setup["source"]) / "tools" / Path(__file__).name, sys.argv[1:])
+            sys.exit(0)
+    except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+        print(json.dumps({"error": str(exc)}, sort_keys=True))
+        sys.exit(2)
+'''
+
+MR1D_R2_UNSUPPORTED_ENTRY = '''import importlib.util
+import json
+import sys
+
+entry, arguments, probe = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("mr1d_r2_entry", entry)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+# This child owns its module; no global OS/builtins function is patched.
+if probe == "unsupported":
+    module.bootstrap_descriptor_capable = lambda: False
+elif probe == "probe-error":
+    class MetadataRefusalPath(type(module.Path())):
+        def lstat(self, *args, **kwargs):
+            if self.name == "host-plan.json":
+                raise PermissionError("metadata probe refused")
+            return super().lstat(*args, **kwargs)
+    module.Path = MetadataRefusalPath
+try:
+    assert module.bootstrap_runtime(json.loads(arguments))
+except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+    print(json.dumps({"error": str(exc)}, sort_keys=True))
+    sys.exit(2)
+'''
+
+MR1D_R3_LOOKUP_ENTRY = '''import errno
+import importlib.util
+import json
+import sys
+
+entry, arguments, folder, failure = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("mr1d_r3_entry", entry)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+target = module.Path(json.loads(folder)) / "host-plan.json"
+failures = {
+    "permission": PermissionError(errno.EACCES, "secret\\ninput"),
+    "eio": OSError(errno.EIO, "secret\\ninput"),
+    "eloop": OSError(errno.ELOOP, "secret\\ninput"),
+    "long": OSError(errno.ENAMETOOLONG, "secret\\ninput"),
+    "value": ValueError("secret\\ninput"),
+    "type": TypeError("secret\\ninput"),
+    "runtime": RuntimeError("secret\\ninput"),
+    "unexpected": LookupError("secret\\ninput"),
+    "missing": FileNotFoundError(errno.ENOENT, "secret\\ninput"),
+    "not-directory": NotADirectoryError(errno.ENOTDIR, "secret\\ninput"),
+}
+# Replace only the owned launcher's Path reference; pytest/stdlib keep their own paths.
+class LookupPath(type(module.Path())):
+    def lstat(self, *args, **kwargs):
+        if self == target and failure != "native":
+            raise failures[failure]
+        return super().lstat(*args, **kwargs)
+module.Path = LookupPath
+try:
+    assert module.bootstrap_runtime(json.loads(arguments))
+except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
+    print(json.dumps({"error": str(exc)}, sort_keys=True))
+    sys.exit(2)
+'''
+
+MR1D_R3_DISPATCH_SPY = '''from pathlib import Path
+import runpy
+
+Path(__file__).with_name("verifier-called").write_text("called", encoding="utf-8")
+def run(provision, entry, arguments):
+    Path(__file__).with_name("launcher-called").write_text("called", encoding="utf-8")
+    runpy.run_path(str(entry), run_name="__main__")
+'''
+
+MR1D_R3_LEGACY_ENTRY = '''import json
+import runpy
+import sys
+
+entry, arguments = sys.argv[1:]
+sys.argv = [entry, *json.loads(arguments)]
+runpy.run_path(entry, run_name="__main__")
+'''
+
+
+@pytest.fixture
+def bootstrap_base(tmp_path):
+    # A clean permissive old runtime, built without looking up any repository history.
+    source = tmp_path / "old-source"
+    tools = source / "tools"
+    tools.mkdir(parents=True)
+    (tools / "hierarchy_launcher.py").write_text(
+        'print(\'{"accepted_effort": "ultra"}\')\n', encoding="utf-8")
+    shutil.copyfile(ROOT / "tools/hierarchy_runtime_source.py", tools / "hierarchy_runtime_source.py")
+    git(source, "init", "-q", "-b", "develop")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "synthetic permissive older runtime")
+    base, home = tmp_path / "copied", tmp_path / "governing"
+    base.mkdir()
+    home.mkdir()
+    record = {"schema": "aegis.hierarchy-provision/v1", "initiative": "pilot",
+              "mailbox_root": str(home / "mailbox"), "source": str(source),
+              "source_commit": git(source, "rev-parse", "HEAD"),
+              "source_tree": git(source, "rev-parse", "HEAD^{tree}")}
+    for directory in (base, home):
+        (directory / "provision.json").write_text(json.dumps(record), encoding="utf-8")
+    shutil.copyfile(tools / "hierarchy_runtime_source.py", base / "runtime-source.py")
+    request = tmp_path / "start.json"
+    request.write_text(json.dumps({"endpoint": REVIEW, "effort": "ultra"}), encoding="utf-8")
+    return SimpleNamespace(base=base, home=home, record=record, request=request)
+
+
+def bootstrap_words(built, command):
+    return ["--base", str(built.base), command, *(
+        ["--request", str(built.request)] if command == "start" else ["--endpoint", REVIEW])]
+
+
+def bootstrap_call(built, command, expect):
+    result = subprocess.run([sys.executable, "-I", str(LAUNCHER), *bootstrap_words(built, command)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.stderr == ""
+    assert result.returncode == expect, result.stdout
+    if expect == 0:
+        assert result.stdout == '{"accepted_effort": "ultra"}\n'
+    return json.loads(result.stdout)
+
+
+def bootstrap_legacy(tmp_path, words):
+    legacy = tmp_path / "integration-tip" / "hierarchy_launcher.py"
+    legacy.parent.mkdir(exist_ok=True)
+    legacy.write_text(MR1D_R2_LEGACY_BOOTSTRAP, encoding="utf-8")
+    # JSON transport also permits testing the API's NUL-path refusal before OS argv encoding.
+    return subprocess.run([sys.executable, "-I", "-c", MR1D_R3_LEGACY_ENTRY, str(legacy), json.dumps(words)],
+                          capture_output=True, text=True, timeout=30)
+
+
+def bootstrap_lookup_call(built, command, folder, failure):
+    return subprocess.run([sys.executable, "-I", "-c", MR1D_R3_LOOKUP_ENTRY,
+                           str(LAUNCHER), json.dumps(bootstrap_words(built, command)), json.dumps(str(folder)), failure],
+                          capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("site", ["base", "home"])
+@pytest.mark.parametrize("failure", ["permission", "eio", "eloop", "long", "value", "type", "runtime", "unexpected"])
+def test_mr1d_r3_indeterminate_lookup_refuses_before_dispatch(bootstrap_base, command, site, failure):
+    built = bootstrap_base
+    folder = {"base": built.base, "home": built.home}[site]
+    (folder / "host-plan.json").write_text("{}", encoding="utf-8")
+    (built.home / "provision.json").write_text(
+        json.dumps({**built.record, "source_commit": "a" * 40}), encoding="utf-8")
+    (built.base / "runtime-source.py").write_text(MR1D_R3_DISPATCH_SPY, encoding="utf-8")
+    for _ in range(2):
+        current = bootstrap_lookup_call(built, command, folder, failure)
+        assert (current.returncode, current.stdout, current.stderr) == (
+            2, json.dumps({"error": MR1D_CHECK_ERROR}, sort_keys=True) + "\n", "")
+        assert not (built.base / "verifier-called").exists()
+        assert not (built.base / "launcher-called").exists()
+    # A fresh lookup after recovery must enforce the governing pin too.
+    assert bootstrap_call(built, command, 2) == {"error": MR1D_PIN_ERROR}
+    assert not (built.base / "verifier-called").exists()
+    assert not (built.base / "launcher-called").exists()
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("site", ["base", "home"])
+@pytest.mark.parametrize("failure", ["missing", "not-directory", "native-nul"])
+def test_mr1d_r3_absent_lookup_matches_integration_tip(bootstrap_base, tmp_path, command, site, failure):
+    built = bootstrap_base
+    folder = {"base": built.base, "home": built.home}[site]
+    if failure == "native-nul":
+        folder = Path(str(folder) + "\0")
+        if site == "base":
+            built.base = folder
+        else:
+            (built.base / "provision.json").write_text(
+                json.dumps({**built.record, "mailbox_root": str(folder / "mailbox")}), encoding="utf-8")
+    baseline = bootstrap_legacy(tmp_path, bootstrap_words(built, command))
+    assert baseline.returncode == (2 if failure == "native-nul" and site == "base" else 0)
+    for _ in range(2):
+        current = bootstrap_lookup_call(built, command, folder, "native" if failure == "native-nul" else failure)
+        assert (current.returncode, current.stdout, current.stderr) == (
+            baseline.returncode, baseline.stdout, baseline.stderr)
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("failure", ["permission", "eio"])
+@pytest.mark.parametrize("record", ["missing", "malformed", "unsearchable-base"])
+def test_mr1d_r3_legacy_read_failure_precedes_indeterminate_lookup(
+        bootstrap_base, tmp_path, command, failure, record):
+    built = bootstrap_base
+    if record == "missing":
+        (built.base / "provision.json").unlink()
+    elif record == "malformed":
+        (built.base / "provision.json").write_text("{", encoding="utf-8")
+    elif not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("unsearchable directory requires POSIX modes and a non-root user")
+    mode = built.base.stat().st_mode
+    try:
+        if record == "unsearchable-base":
+            built.base.chmod(0)
+        baseline = bootstrap_legacy(tmp_path, bootstrap_words(built, command))
+        assert baseline.returncode == 2
+        current = bootstrap_lookup_call(built, command, built.base, failure)
+        assert (current.returncode, current.stdout, current.stderr) == (
+            baseline.returncode, baseline.stdout, baseline.stderr)
+    finally:
+        built.base.chmod(mode)
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("case", ["missing", "malformed", "unsupported", "probe-error", "duplicate", "oversize",
+                                 "base-symlink", "missing-home"])
+def test_mr1d_r2_no_plan_matches_integration_tip(bootstrap_base, tmp_path, command, case):
+    built = bootstrap_base
+    path = built.base / "provision.json"
+    if case == "missing":
+        path.unlink()
+    elif case == "malformed":
+        path.write_text("{", encoding="utf-8")
+    elif case == "duplicate":
+        raw = json.dumps(built.record)
+        path.write_text(raw[:-1] + ', "source_commit": ' + json.dumps(built.record["source_commit"]) + '}',
+                        encoding="utf-8")
+    elif case == "oversize":
+        path.write_text(json.dumps({**built.record, "padding": "x" * 262145}), encoding="utf-8")
+    elif case == "base-symlink":
+        linked = built.base.with_name("linked-base")
+        symlink_or_skip(built.base, linked, target_is_directory=True)
+        built.base = linked
+    elif case == "missing-home":
+        (built.home / "provision.json").unlink()
+        built.home.rmdir()
+    words = bootstrap_words(built, command)
+    baseline = bootstrap_legacy(tmp_path, words)
+    assert baseline.returncode == (2 if case in ("missing", "malformed") else 0), baseline
+    argv = ([sys.executable, "-I", "-c", MR1D_R2_UNSUPPORTED_ENTRY, str(LAUNCHER), json.dumps(words), case]
+            if case in ("unsupported", "probe-error") else [sys.executable, "-I", str(LAUNCHER), *words])
+    for _ in range(2):
+        current = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        if case == "probe-error":
+            # Round 3 explicitly changes this legacy success to a fail-closed refusal.
+            assert (current.returncode, current.stdout, current.stderr) == (
+                2, json.dumps({"error": MR1D_CHECK_ERROR}, sort_keys=True) + "\n", "")
+        else:
+            assert (current.returncode, current.stdout, current.stderr) == (
+                baseline.returncode, baseline.stdout, baseline.stderr)
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+def test_mr1d_r2_planned_malformed_governing_record_still_refuses(bootstrap_base, command):
+    built = bootstrap_base
+    plan = built.home / "host-plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    (built.home / "provision.json").write_text("{", encoding="utf-8")
+    assert bootstrap_call(built, command, 2) == {"error": MR1D_CHECK_ERROR}
+    # A retry discovers the current plan state instead of caching the prior refusal.
+    plan.unlink()
+    assert bootstrap_call(built, command, 0) == {"accepted_effort": "ultra"}
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("component", ["source_commit", "source_tree"])
+def test_mr1d_bootstrap_refuses_an_older_pin_before_dispatch(bootstrap_base, command, component):
+    built = bootstrap_base
+    (built.home / "host-plan.json").write_text("{}", encoding="utf-8")
+    governing = {**built.record, component: "a" * 40}
+    (built.home / "provision.json").write_text(json.dumps(governing), encoding="utf-8")
+    # Retrying the rejected ultra request must never reach the permissive old launcher.
+    for _ in range(2):
+        assert bootstrap_call(built, command, 2) == {"error": MR1D_PIN_ERROR}
+
+
+@pytest.mark.parametrize("command", ["start", "resume", "_resume-wake"])
+@pytest.mark.parametrize("plan", ["base", "home", None])
+def test_mr1d_equal_pin_and_no_plan_keep_retained_dispatch(bootstrap_base, command, plan):
+    built = bootstrap_base
+    if plan is not None:
+        folder = {"base": built.base, "home": built.home}[plan]
+        (folder / "host-plan.json").write_text("{}", encoding="utf-8")
+    else:
+        # No plan: a different governing record has no effect on the old runtime's exact output.
+        (built.home / "provision.json").write_text("{}", encoding="utf-8")
+    assert bootstrap_call(built, command, 0) == {"accepted_effort": "ultra"}
+
+
+@pytest.mark.parametrize("case,error", [
+    ("missing", MR1D_CHECK_ERROR), ("malformed", MR1D_CHECK_ERROR),
+    ("oversize", MR1D_CHECK_ERROR), ("duplicate", MR1D_CHECK_ERROR),
+    ("deep", MR1D_CHECK_ERROR), ("integer", MR1D_CHECK_ERROR),
+    ("nonfinite", MR1D_CHECK_ERROR), ("utf8", MR1D_CHECK_ERROR),
+    ("list", "governing provision record does not match this run; reprovision the base"),
+    ("initiative", "governing provision record does not match this run; reprovision the base"),
+    ("multiline-pin", "governing provision record has an invalid source pin; reprovision the base"),
+])
+def test_mr1d_governing_record_failures_refuse_without_echoing(bootstrap_base, case, error):
+    built = bootstrap_base
+    (built.home / "host-plan.json").write_text("{}", encoding="utf-8")
+    path = built.home / "provision.json"
+    payloads = {"malformed": b'{"secret\\ninput":', "oversize": b"!" * 262145,
+                "duplicate": b'{"secret\\ninput":1,"secret\\ninput":2}',
+                "deep": b"[" * 10000 + b"]" * 10000, "integer": b"1" * 129,
+                "nonfinite": b"1e9999", "utf8": b"\xff", "list": b"[]",
+                "initiative": json.dumps({**built.record, "initiative": "secret\ninput"}).encode(),
+                "multiline-pin": json.dumps({**built.record, "source_commit": "a" * 40 + "\n"}).encode()}
+    if case == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(payloads[case])
+    assert bootstrap_call(built, "start", 2) == {"error": error}
+    path.write_text(json.dumps({**built.record, "source_commit": "a" * 40}), encoding="utf-8")
+    assert bootstrap_call(built, "start", 2) == {"error": MR1D_PIN_ERROR}
+
+
+def test_mr1d_unsupported_bootstrap_probe_opens_nothing(bootstrap_base, monkeypatch):
+    module = bootstrap_launcher
+    (bootstrap_base.home / "host-plan.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bootstrap_launcher, "bootstrap_descriptor_capable", lambda: False)
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported bootstrap opened a descriptor")
+    monkeypatch.setattr(bootstrap_launcher, "os", R2Facade(module.os, open=forbidden))
+    with pytest.raises(ValueError) as refusal:
+        module.bootstrap_runtime(bootstrap_words(bootstrap_base, "start"))
+    assert str(refusal.value) == MR1D_CHECK_ERROR
+
+
+@pytest.mark.parametrize("case", ["leaf-symlink", "parent-symlink", "fifo"])
+def test_mr1d_bootstrap_does_not_follow_untrusted_paths(bootstrap_base, case):
+    built = bootstrap_base
+    (built.home / "host-plan.json").write_text("{}", encoding="utf-8")
+    if case == "leaf-symlink":
+        target = built.home / "retained.json"
+        (built.home / "provision.json").rename(target)
+        symlink_or_skip(target, built.home / "provision.json")
+    elif case == "parent-symlink":
+        target = built.home.with_name("retained-home")
+        built.home.rename(target)
+        symlink_or_skip(target, built.home, target_is_directory=True)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO requires POSIX")
+        (built.home / "provision.json").unlink()
+        os.mkfifo(built.home / "provision.json")
+    assert bootstrap_call(built, "resume", 2) == {"error": MR1D_CHECK_ERROR}
+
+
+@pytest.mark.parametrize("case", ["parent-rename", "leaf-rename", "leaf-overwrite", "read-error", "oversize"])
+def test_mr1d_bootstrap_races_and_read_failures_close_every_descriptor(bootstrap_base, monkeypatch, case):
+    built, module = bootstrap_base, bootstrap_launcher
+    if not module.bootstrap_descriptor_capable():
+        pytest.skip("bootstrap requires directory descriptors")
+    (built.home / "host-plan.json").write_text("{}", encoding="utf-8")
+    if case == "oversize":
+        (built.home / "provision.json").write_bytes(b"!" * 262145)
+    real_os = module.os
+    home_info = real_os.stat(built.home)
+    home_identity = home_info.st_dev, home_info.st_ino
+    opened, closed, governing, triggered = [], [], set(), []
+
+    def opening(name, flags, *args, **kwargs):
+        fd = real_os.open(name, flags, *args, **kwargs)
+        opened.append(fd)
+        parent = kwargs.get("dir_fd")
+        if name == "provision.json" and parent is not None:
+            info = real_os.fstat(parent)
+            if (info.st_dev, info.st_ino) == home_identity:
+                governing.add(fd)
+        return fd
+
+    def reading(fd, count):
+        if fd in governing and not triggered:
+            triggered.append(True)
+            if case == "oversize":
+                pytest.fail("oversize record reached read before refusal")
+            if case == "read-error":
+                raise OSError("secret\ninput")
+            if case == "parent-rename":
+                built.home.rename(built.home.with_name("moved-home"))
+                built.home.mkdir()
+            elif case == "leaf-rename":
+                (built.home / "provision.json").rename(built.home / "moved.json")
+            (built.home / "provision.json").write_text(
+                json.dumps({**built.record, "source_commit": "a" * 40}), encoding="utf-8")
+        return real_os.read(fd, count)
+
+    def closing(fd):
+        governing.discard(fd)
+        closed.append(fd)
+        return real_os.close(fd)
+
+    monkeypatch.setattr(bootstrap_launcher, "os", R2Facade(real_os, open=opening, read=reading, close=closing))
+    with pytest.raises(ValueError) as refusal:
+        module.bootstrap_runtime(bootstrap_words(built, "resume"))
+    assert str(refusal.value) == MR1D_CHECK_ERROR
+    assert sorted(opened) == sorted(closed)
+    assert bool(triggered) == (case != "oversize")
+    # Restore the owned namespace, then retry through the actual CLI rather than retaining a stale decision.
+    if case == "parent-rename":
+        (built.home / "provision.json").unlink()
+        built.home.rmdir()
+        built.home.with_name("moved-home").rename(built.home)
+    (built.home / "provision.json").write_text(
+        json.dumps({**built.record, "source_commit": "a" * 40}), encoding="utf-8")
+    assert bootstrap_call(built, "resume", 2) == {"error": MR1D_PIN_ERROR}
 
 
 class Launch(Setup):
@@ -762,17 +1204,28 @@ def owned_pids(session, host="codex-cli", projection=None):
 
 
 @LINUX_HOST_PROGRAMS
-def test_stop_spares_a_caller_that_names_the_session(launch):
+@pytest.mark.parametrize("observe_after_stop", [False, True], ids=["concurrent", "completed"])
+def test_stop_spares_a_caller_that_names_the_session(launch, observe_after_stop):
     session = launch.start()["session"]
     from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
 
     context = R2Case(launch)
-    hung = context.spawn(["codex", "exec", "--json", "resume", session])
-    wait_until(lambda: owned_pids(session, projection=context.projection) == [hung.pid])
-    caller, _ = context.runner(session=session, echo_exit=True,
-                               stop_words=("stop", "--endpoint", REVIEW, "--grace-seconds", "2"))
     try:
-        wait_until(lambda: hung.pid in owned_pids(session, projection=context.projection))
+        hung = context.spawn(["codex", "exec", "--json", "resume", session])
+        wait_until(lambda: owned_pids(session, projection=context.projection) == [hung.pid])
+
+        def before_stop(caller, runner):
+            assert owned_pids(session, projection=context.projection) == sorted([hung.pid, caller.pid])
+
+        caller, _ = context.runner(session=session, echo_exit=True, before_stop=before_stop,
+                                   stop_words=("stop", "--endpoint", REVIEW, "--grace-seconds", "2"))
+        if observe_after_stop:
+            # Exercise a scheduler that completes stop before the test observes its result.
+            # Reap our own child while the runner independently proves its physical exit.
+            def completed():
+                hung.poll()
+                return caller.poll() is not None
+            wait_until(completed, seconds=R2_STOP_TIMEOUT_SECONDS)
         out, err = caller.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert caller.returncode == 0 and err == "", out + err
         answer, last = out.splitlines()

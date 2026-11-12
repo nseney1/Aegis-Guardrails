@@ -48,7 +48,7 @@ TOOL_DEFINITIONS = [
                 "subject": {"type": "string", "description": "Single-line lane/endpoint/generation identifier."},
                 "host_kinds": {"type": "array", "items": {"type": "string"}, "maxItems": 256, "minItems": 1,
                                "description": "Explicit host registry kinds; at most 256."},
-                "intent": {"type": "string", "description": "Semantic light, standard, deep, extended or max; defaults to policy/role band."},
+                "intent": {"type": "string", "description": "Semantic light|standard|deep|extended|max|ultra; defaults to policy/role band."},
                 "author_family": {"type": "string", "description": "Known author family required for reviews; T7 binds its chosen family."},
                 "lane_family": {"type": "string", "description": "Required for T3; writer lane family must match team_family."},
                 "review_stage": {"type": "string", "default": "primary", "description": "Primary, correctness, security, whole or second as allowed by the task."},

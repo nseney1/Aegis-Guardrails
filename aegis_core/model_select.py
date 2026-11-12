@@ -28,7 +28,8 @@ _MAX_PATH_SEPARATORS = 256
 _LOCK_TIMEOUT_SECONDS = 60.0  # cap-sized validation/publication, including a queued peer
 _HISTORY_LIMIT = "history_limit_exceeded: archive_or_rotate_decision_log"
 _CHAIN_ERROR = "invalid_history:decision_chain: restore_complete_decision_log"
-_INTENTS = ("light", "standard", "deep", "extended", "max")
+_INTENTS = ("light", "standard", "deep", "extended", "max", "ultra")
+_NATIVE_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _CLASSES = ("coding", "frontier", "scout", "mechanical")
 _ROLES = ("orchestrator", "decider", "implementer", "integrator", "reviewer")
 _TASK_ROLES = {
@@ -126,7 +127,8 @@ def validate_bindings(value, *, host_kinds=None):
     """Return (role rows by kind, binding rows by (host, class)); refuse invalid_bindings.
 
     host_kinds supplies the caller's host registry. Otherwise hosts are inferred
-    from data; every such host still needs every role class and band endpoint.
+    from data; every selectable host still needs every role class and band endpoint.
+    Planned rows describe capabilities only, including hosts outside the registry.
     """
     error = "invalid_bindings"
     data = _input(value, error)
@@ -137,7 +139,7 @@ def validate_bindings(value, *, host_kinds=None):
     _keys(data, ("schema", "roles", "hosts"), error)
     _require(data["schema"] == "aegis.model-bindings/v1", error)
     _require(type(data["roles"]) is list and type(data["hosts"]) is list and data["hosts"], error)
-    roles, hosts, models = {}, {}, set()
+    roles, hosts, models, statuses, identities = {}, {}, set(), {}, set()
     for row in data["roles"]:
         _keys(row, ("kind", "model_class", "band"), error)
         kind, band = row["kind"], row["band"]
@@ -151,30 +153,53 @@ def validate_bindings(value, *, host_kinds=None):
         roles[kind] = row
     _require(set(roles) == set(_ROLES), error)
     for row in data["hosts"]:
-        _keys(row, ("host", "class", "model", "levels", "admission"), error)
+        required = {"host", "class", "model", "levels", "admission"}
+        _require(type(row) is dict and required <= set(row) and
+                 set(row) <= required | {"effort_encoding", "served_aliases", "host_status"}, error)
         host, model_class = row["host"], row["class"]
         _require(_token(host) and _member(model_class, _CLASSES) and
                  type(row["model"]) is str and _IDENTIFIER.fullmatch(row["model"]) is not None, error)
-        _require(registry is None or host in registry, error)
+        status = row.get("host_status", "selectable")
+        _require(_member(status, ("selectable", "planned")), error)
+        _require(host not in statuses or statuses[host] == status, error)
+        statuses[host] = status
+        _require(status == "planned" or registry is None or host in registry, error)
+        _require(_member(row.get("effort_encoding", "flag"), ("flag", "model_suffix")), error)
+        aliases = row.get("served_aliases", [])
+        _require(type(aliases) is list and len(aliases) <= 256 and
+                 all(type(alias) is str and _IDENTIFIER.fullmatch(alias) is not None for alias in aliases), error)
+        _require(len(set(aliases)) == len(aliases) and row["model"] not in aliases, error)
         _require((host, model_class) not in hosts and (host, row["model"]) not in models, error)
         levels, admission = row["levels"], row["admission"]
         _require(type(levels) is dict and bool(levels) and set(levels) <= set(_INTENTS), error)
-        _require(all(_member(v, ("low", "medium", "high", "xhigh", "max")) for v in levels.values()), error)
-        _require(len(set(levels.values())) == len(levels), error)
+        _require(all(v is None or _member(v, _NATIVE_LEVELS) for v in levels.values()), error)
+        offered = [v for v in levels.values() if v is not None]
+        _require(len(set(offered)) == len(offered), error)
+        if row.get("effort_encoding", "flag") == "model_suffix":
+            _require(all(len(row["model"]) + 1 + len(v) <= 128 for v in offered), error)
         _keys(admission, levels, error)
         _require(all(_member(v, ("unprobed", "admitted", "rejected")) for v in admission.values()), error)
+        names = {row["model"], *aliases}
+        if row.get("effort_encoding", "flag") == "model_suffix":
+            names.update(row["model"] + "-" + level for level in offered)
+        keys = {(host, name) for name in names}
+        _require(not identities.intersection(keys), error)
+        identities.update(keys)
         hosts[host, model_class] = row
         models.add((host, row["model"]))
     if registry is None:
         registry = {h for h, _ in hosts}
-    _require(bool(registry) and all(_token(h) for h in registry) and all(h in registry for h, _ in hosts), error)
+    _require(bool(registry) and all(_token(h) for h in registry), error)
     for role in roles.values():
         for host in registry:
+            if statuses.get(host) == "planned":
+                continue
             binding = hosts.get((host, role["model_class"]))
             _require(binding is not None, error)
             for edge in ("default", "ceiling"):
                 intent = role["band"][edge]
-                _require(intent in binding["levels"] and binding["admission"][intent] != "rejected", error)
+                _require(binding["levels"].get(intent) is not None and
+                         binding["admission"][intent] != "rejected", error)
     return roles, hosts
 
 
@@ -330,7 +355,7 @@ def _record(record, error):
     _keys(choice, _CHOICE_KEYS, error)
     _require(all(_token(v) for k, v in choice.items() if k != "model") and
              type(choice["model"]) is str and _IDENTIFIER.fullmatch(choice["model"]) is not None and
-             choice["class"] in _CLASSES and choice["level"] in ("low", "medium", "high", "xhigh", "max"), error)
+             choice["class"] in _CLASSES and choice["level"] in _NATIVE_LEVELS, error)
     _require(_member(record["admission"], ("unprobed", "admitted")) and
              choice["admission"] == record["admission"], error)
     shares = record["target_shares"]
@@ -486,7 +511,7 @@ def select_model(bindings, policy, task_kind, role_kind, prior_decisions, *, hos
                  author_family=None, lane_family=None, review_stage="primary"):
     """Return a choice with admission provenance and a deterministic decision record.
 
-    intent is semantic (light..max), never native effort or ultra. subject is
+    intent is semantic (light..ultra), never a native effort spelling. subject is
     required; host_kinds supplies the registry; lane_family is required for T3.
     File inputs have semantic errors.
     Changed family sets require a new team history; T8 second is explicitly opted
@@ -521,9 +546,13 @@ def select_model(bindings, policy, task_kind, role_kind, prior_decisions, *, hos
     model_class = roles[role_kind]["model_class"]
     host = data["family_hosts"][family][0]
     binding = hosts.get((host, model_class))
-    _require(binding is not None and chosen_intent in binding["levels"] and
+    _require(binding is not None and binding.get("host_status", "selectable") != "planned" and
+             binding["levels"].get(chosen_intent) is not None and
              binding["admission"][chosen_intent] != "rejected", "binding_unavailable:" + host + ":" + chosen_intent)
-    choice = {"host": host, "class": model_class, "model": binding["model"],
+    model = binding["model"]
+    if binding.get("effort_encoding", "flag") == "model_suffix":
+        model += "-" + binding["levels"][chosen_intent]
+    choice = {"host": host, "class": model_class, "model": model,
               "level": binding["levels"][chosen_intent], "family": family, "reason": reason,
               "admission": binding["admission"][chosen_intent]}
     record = {"schema": "aegis.model-decision/v1", "team_id": data["team_id"],

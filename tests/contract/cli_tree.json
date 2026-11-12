@@ -4902,7 +4902,7 @@
                 "flags": [
                   "--intent"
                 ],
-                "help": "Semantic intent: light, standard, deep, extended or max; default from policy/role band",
+                "help": "Semantic intent: light, standard, deep, extended, max or ultra; default from policy/role band",
                 "kind": "store",
                 "metavar": null,
                 "nargs": null,

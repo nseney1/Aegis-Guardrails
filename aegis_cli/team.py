@@ -647,7 +647,7 @@ def _configure_model_parser(sub, common):
         model.add_argument("--" + flag, required=True, help=help_text)
     model.add_argument("--host-kind", dest="host_kinds", action=ModelHostKinds, required=True,
                        help="Host registry kind; repeat for each host (at most 256)")
-    model.add_argument("--intent", help="Semantic intent: light, standard, deep, extended or max; default from policy/role band")
+    model.add_argument("--intent", help="Semantic intent: light, standard, deep, extended, max or ultra; default from policy/role band")
     model.add_argument("--author-family", help="Author family required for reviews; T7 binds it to its chosen family")
     model.add_argument("--lane-family", help="Lane family required for T3; writer lanes must match team_family")
     model.add_argument("--review-stage", default="primary", help="Review stage: primary, correctness, security, whole or second as allowed by the task")

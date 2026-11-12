@@ -8528,7 +8528,7 @@ class R2Case:
         del self.projection.receipts[str(process.pid)]
         self.projection.save()
 
-    def admit(self, slot, process, argv, sidecars=()):
+    def admit(self, slot, process, argv, sidecars=(), before_release=None):
         self.children.append(process)
         self.custody.await_event(slot, "hello")
         self.projection.pending(process)
@@ -8539,11 +8539,14 @@ class R2Case:
                     self.custody.slots[slot]["kind"] != "H" or self.custody.slots[child]["child"] is not None):
                 raise RuntimeError("R2 fixture: invalid reserved sibling")
             self.custody.slots[child]["permitted"] = True
+        if before_release is not None:
+            before_release()
         self.custody.release(slot)
         self.custody.await_event(slot, "running")
         return process
 
-    def runner(self, session=None, action="stop", timeout=R2_STOP_TIMEOUT_SECONDS, stop_words=None, echo_exit=False):
+    def runner(self, session=None, action="stop", timeout=R2_STOP_TIMEOUT_SECONDS, stop_words=None, echo_exit=False,
+               before_stop=None):
         from tests.integration.test_hierarchy_launcher import R2OwnedChild
         from tests.integration.hierarchy_fake_wrapper import python_argv
         tag = "actor%d-" % len(self.configs)
@@ -8564,11 +8567,15 @@ class R2Case:
             root.capture_event("captured")
             root.start_capture()
             root.wait_observer = lambda: [child.poll() for child in self.children if child is not root]
-            self.admit(root_slot, root, ["codex", "exec", "resume", session] if session else None)
+            # Observe live actors only after READY is saved and before R can execute public stop.
+            # The caller C must run first to create R, but R keeps its own admission gate closed.
+            self.admit(root_slot, root, ["codex", "exec", "resume", session] if session else None,
+                       before_release=(lambda: before_stop(root, root)) if before_stop is not None and not session else None)
             if session:
                 self.custody.await_event(tag + "R", "hello")
                 child = R2OwnedChild(self.custody, tag + "R")
-                self.admit(tag + "R", child, None)
+                self.admit(tag + "R", child, None,
+                           before_release=(lambda: before_stop(root, child)) if before_stop is not None else None)
             else:
                 child = root
             return root, child
@@ -9661,14 +9668,57 @@ def test_r11_crash_cuts_observe_exit_before_asserting_dead(r2_case, capsys, monk
     assert held.wait(timeout=5) == -signal.SIGTERM
 
 
+@pytest.mark.parametrize("caller", [False, True], ids=["direct", "through-caller"])
+@pytest.mark.parametrize("refuse", [False, True], ids=["release", "refuse"])
+def test_r5_runner_observes_ready_actors_before_releasing_stop(r2_case, caller, refuse):
+    session = str(uuid.uuid4())
+    r2_case.bind("codex-cli", session)
+    held = r2_case.spawn(["codex", "exec", "resume", session])
+    observed = []
+
+    def before_stop(root, runner):
+        r2_case.projection.check_ready()
+        assert root.poll() is None and runner.poll() is None and held.poll() is None
+        module = r2_case.module(False)
+        owned = {pid for pid, _ in module.session_processes(session, set(), "codex-cli")}
+        assert owned == ({held.pid, root.pid} if caller else {held.pid})
+        slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == runner.pid)
+        assert not r2_case.custody.slots[slot]["released"]
+        assert r2_case.projection.events == []
+        observed.append(runner.pid)
+        if refuse:
+            raise RuntimeError("modelled pre-stop observation refusal")
+
+    if refuse:
+        with pytest.raises(RuntimeError, match="^modelled pre-stop observation refusal$"):
+            r2_case.runner(session=session if caller else None, before_stop=before_stop)
+        report = r2_case.custody.report
+        assert report["state"] == "CLOSED" and not report["unresolved_slots"]
+        assert all(row["exit"] for row in report["entries"].values())
+        assert r2_case.projection.events == []
+        with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
+            r2_case.runner()
+    else:
+        root, runner = r2_case.runner(session=session if caller else None, before_stop=before_stop)
+        out, err = root.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
+        assert root.returncode == 0 and err == "", out + err
+        answer = json.loads(out)
+        assert answer["state"] == "stopped" and answer["pids"] == [held.pid]
+        assert held.wait(timeout=5) == -signal.SIGTERM
+        retry = r2_case.launch.run("stop", "--endpoint", REVIEW, "--grace-seconds", "0")
+        assert retry["state"] == "not_running" and retry["pids"] == []
+    assert len(observed) == 1
+
+
 def test_r2_ancestor_exclusion_spares_a_ready_host_named_caller(r2_case):
     session = str(uuid.uuid4())
     r2_case.bind("codex-cli", session)
     held = r2_case.spawn(["codex", "exec", "resume", session])
-    caller, runner = r2_case.runner(session=session)
-    assert r2_kernel_process(runner.pid)["ppid"] == caller.pid
-    assert session.encode() in r2_kernel_process(caller.pid)["raw"].split(b"\0")
-    assert Path(os.fsdecode(r2_kernel_process(caller.pid)["raw"].split(b"\0")[0])).name == "codex"
+    def before_stop(caller, runner):
+        assert r2_kernel_process(runner.pid)["ppid"] == caller.pid
+        assert session.encode() in r2_kernel_process(caller.pid)["raw"].split(b"\0")
+        assert Path(os.fsdecode(r2_kernel_process(caller.pid)["raw"].split(b"\0")[0])).name == "codex"
+    caller, runner = r2_case.runner(session=session, before_stop=before_stop)
     out, err = caller.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
     assert caller.returncode == 0 and err == "", out + err
     answer = json.loads(out)

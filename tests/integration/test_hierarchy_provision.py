@@ -1337,7 +1337,7 @@ def mr1_bindings():
                            ("integrator", ("standard", "deep", "max")),
                            ("reviewer", ("deep", "deep", "max"))]], "hosts": [
         {"host": host, "class": cls, "model": model, "levels": dict(levels),
-         "admission": {intent: "unprobed" for intent in levels}}
+         "admission": {intent: "admitted" if cls == "coding" else "unprobed" for intent in levels}}
         for host, models in [("claude-code", ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"]),
                              ("codex-cli", ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"])]
         for cls, model in zip(("coding", "frontier", "scout", "mechanical"), models)]}
@@ -1347,8 +1347,8 @@ def mr1_bindings():
     ("missing", "cannot read file"), ("json", "invalid JSON"), ("duplicate-key", "duplicate JSON key 'schema'"),
     ("schema", "unsupported schema"), ("top-key", "unexpected top-level keys"),
     ("kind", "unknown role kind 'wizard'"), ("class", "unknown model class 'wizard'"),
-    ("intent", "unknown intent 'ultra'"), ("order", "band must satisfy floor <= default <= ceiling"),
-    ("native", "unknown native level 'ultra'"), ("duplicate-host", "duplicate host/class row"),
+    ("intent", "unknown intent 'beyond'"), ("order", "band must satisfy floor <= default <= ceiling"),
+    ("native", "unknown native level 'beyond'"), ("duplicate-host", "duplicate host/class row"),
     ("missing-intent", "binding claude-code/coding lacks band ceiling max for implementer"),
     ("role-key", "unexpected role keys"), ("host-key", "unexpected host keys"),
     ("duplicate-role", "duplicate role row"), ("band-key", "unexpected band keys"),
@@ -1382,11 +1382,11 @@ def test_mr1_broken_bindings_refuse_before_binding(setup, mr1_cli, monkeypatch, 
     elif case == "class":
         data["hosts"][0]["class"] = "wizard"
     elif case == "intent":
-        data["roles"][0]["band"]["floor"] = "ultra"
+        data["roles"][0]["band"]["floor"] = "beyond"
     elif case == "order":
         data["roles"][0]["band"]["floor"] = "deep"
     elif case == "native":
-        data["hosts"][0]["levels"]["max"] = "ultra"
+        data["hosts"][0]["levels"]["max"] = "beyond"
     elif case == "duplicate-host":
         data["hosts"].append(data["hosts"][0])
     elif case == "missing-intent":
@@ -1484,7 +1484,7 @@ def test_mr1_in_band_requests_record_provenance(setup, host, model, endpoint, ef
                               "effort_from": "request", "reasoning_from": "request", "model_class": "coding",
                               "intent": intent, "band": dict(zip(("floor", "default", "ceiling"), band)),
                               "bindings_sha256": hashlib.sha256((ROOT / "tools/hierarchy_templates/model-bindings.json").read_bytes()).hexdigest(),
-                              "admission": "unprobed"}
+                              "admission": "admitted"}
 
 
 @pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
@@ -1939,7 +1939,7 @@ def test_mr1_r4_copied_base_uses_canonical_resolution_and_provenance(setup, mr1_
     answer = call(command, mr1_r4_request(setup, copied, command, host))
     assert answer["team"]["model"] == model and answer["team"]["effort"] == "medium"
     assert answer["team"]["reasoning_from"] == "kind" and answer["team"]["intent"] == "standard"
-    assert answer["team"]["admission"] == "unprobed"
+    assert answer["team"]["admission"] == "admitted"
     argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
     if host == "codex-cli":
         assert codex_config(argv)["model"] == model and codex_config(argv)["model_reasoning_effort"] == "medium"
@@ -2169,12 +2169,12 @@ def test_mr1_r5_launcher_records_deep_team_parse_refusal(tmp_path_factory, host)
     ("extra-admission", "admission must map exactly supported intents"),
     ("unknown-admission", "unknown admission value 'allowed'"),
     ("typed-admission", "unknown admission value 7"),
-    ("empty-levels", "levels must map a nonempty subset of light, standard, deep, extended, max"),
-    ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max"),
+    ("empty-levels", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
+    ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
     ("missing-default", "binding claude-code/coding lacks band default standard for orchestrator"),
     ("missing-ceiling", "binding claude-code/coding lacks band ceiling max for implementer"),
-    ("rejected-default", "binding claude-code/coding has rejected band default standard for orchestrator"),
-    ("rejected-ceiling", "binding claude-code/coding has rejected band ceiling max for implementer"),
+    ("rejected-default", "band default and ceiling levels must be admitted"),
+    ("rejected-ceiling", "band default and ceiling levels must be admitted"),
 ])
 def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeypatch, case, problem):
     module, call = mr1_cli
@@ -2206,31 +2206,62 @@ def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeyp
     path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
                                             model="claude-opus-5-5", effort="medium"), expect=2)
-    assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
+    action = ("probe the level or repair model-bindings.json" if case.startswith("rejected-") else
+              "repair model-bindings.json")
+    assert refused == {"error": "invalid model bindings %s: %s; %s" % (path, problem, action)}
     assert unbound(setup, "pilot/orchestrator")
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
-@pytest.mark.parametrize("state", ["unprobed", "admitted", "rejected"])
+@pytest.mark.parametrize("intent", ["standard", "max"])
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+def test_mr1c_band_admission_refuses_before_binding_and_allows_repair(setup, mr1_cli, command, host, intent, state):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == (host, "coding"))
+    row["admission"][intent] = state
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
+                             model=row["model"], effort="high")
+    for _ in range(2):
+        assert call(command, dict(request), expect=2) == {
+            "error": "invalid model bindings %s: band default and ceiling levels must be admitted; "
+                     "probe the level or repair model-bindings.json" % path}
+        assert unbound(setup, "pilot/lane/f2")
+    row["admission"][intent] = "admitted"
+    mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    assert call(command, dict(request))["team"]["admission"] == "admitted"
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("state", ["unprobed", "admitted", "rejected", "null"])
 def test_mr1_r5_selected_admission_is_recorded_or_refused(setup, mr1_cli, monkeypatch, command, host, state):
     module, call = mr1_cli
     mr1_plan(setup, host)
     data = mr1_bindings()
     row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
-    row["admission"]["extended"] = state
+    row["admission"]["extended"] = "admitted" if state == "null" else state
+    if state == "null":
+        row["levels"]["extended"] = None
     row["admission"]["light"] = "rejected"  # Neither a required default nor ceiling.
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
     path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
                              model=row["model"], effort="xhigh")
-    answer = call(command, request, expect=2 if state == "rejected" else 0)
-    if state == "rejected":
-        assert answer == {"error": "%s intent extended (effort xhigh) is rejected for %s; choose a different supported level" %
-                          (row["model"], host)}
-        assert unbound(setup, "pilot/lane/f2")
-    else:
-        assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
+    for _ in range(2):
+        answer = call(command, dict(request), expect=0 if state == "admitted" else 2)
+        if state == "null":
+            assert answer == {"error": "implementer effort xhigh has no supported intent; supported intents: "
+                                      "light, standard, deep, max; choose a supported effort"}
+        elif state != "admitted":
+            assert answer == {"error": "%s intent extended (effort xhigh) is not admitted for %s; "
+                                      "choose an admitted supported level" % (row["model"], host)}
+        else:
+            assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
+        if state != "admitted":
+            assert unbound(setup, "pilot/lane/f2")
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
@@ -2243,7 +2274,7 @@ def test_mr1_r5_partial_binding_accepts_supported_levels_and_names_unsupported_o
     for row in data["hosts"]:
         intents = ("standard", "deep", "max") if row["class"] == "coding" else ("deep",)
         row["levels"] = {key: row["levels"][key] for key in intents}
-        row["admission"] = {key: "unprobed" for key in intents}
+        row["admission"] = {key: "admitted" if row["class"] == "coding" else "unprobed" for key in intents}
     row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -2862,7 +2893,8 @@ def test_mr1_r9_unbound_effort_never_bypasses_supported_levels(mr1_r2_setup, mr1
         row["levels"] = {"standard": "low", "deep": "high", "max": "max"}
     else:
         del row["levels"]["extended"]
-    row["admission"] = {intent: "unprobed" for intent in row["levels"]}
+    # Valid band endpoints let this case reach its unsupported-effort check.
+    row["admission"] = {intent: "admitted" for intent in row["levels"]}
     mr1_r9_publish_bindings(setup, json.dumps(data).encode("utf-8"))
     options = {} if endpoint.endswith("router") else {"effort": effort}
     refused = call(command, mr1_request(setup, command, endpoint, host, **options), expect=2)
@@ -3494,3 +3526,101 @@ def test_mr1_r14a_direct_fixed_roles_record_registry_provenance(mr1_r2_setup, mr
     assert record["effort_from"] == record["reasoning_from"] == "registry"
     assert record["model_from"] == ("request" if model_present else "model-bindings.json")
     assert not (setup.base / "profiles").exists()
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("endpoint", ["pilot/lane/f2", "pilot/root"])
+@pytest.mark.parametrize("configuration", ["defaults", "explicit", "team"])
+def test_mr4_2h_planned_registered_hosts_refuse_every_public_path(setup, mr1_cli, command, host,
+                                                               endpoint, configuration):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["root"] = host
+    plan_path.write_text(json.dumps(plan))
+    data = json.loads((setup.source / "tools/hierarchy_templates/model-bindings.json").read_text())
+    for row in data["hosts"]:
+        if row["host"] == host:
+            row["host_status"] = "planned"
+    mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    model = "gpt-6.1-sol" if host == "codex-cli" else "claude-opus-5-5"
+    options = {"model": model, "effort": "high"} if configuration == "explicit" else {}
+    if configuration == "team":
+        write_team(setup, model=model, reasoning="high")
+    for _ in range(2):
+        refused = call(command, mr1_request(setup, command, endpoint, host, **options), expect=2)
+        assert refused == {"error": "host is planned; Teams support is not qualified"}
+        assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("command", ["codex-start", "add-role"])
+def test_mr4_2h_withheld_native_ultra_refuses_public_profile_and_binding(setup, mr1_cli, command):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    data = json.loads((setup.source / "tools/hierarchy_templates/model-bindings.json").read_text())
+    assert all(row["levels"]["ultra"] is None for row in data["hosts"])
+    refused = call(command, mr1_request(setup, command, "pilot/lane/f2", "codex-cli",
+                                      model="gpt-6.1-sol", effort="ultra"), expect=2)
+    assert refused == {"error": "request effort 'ultra' is a deprecated alias accepted only in team.json; "
+                     "ask for max, or set team.json reasoning to ultra; allowed request efforts: "
+                     "low, medium, high, xhigh, max"}
+    assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mr4_2h_rendered_collision_refuses_public_provision_in_every_order(setup, mr1_cli, command,
+                                                                       host, reverse):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    coding = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    other = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "frontier"))
+    coding.update(model="m", effort_encoding="model_suffix")
+    coding["admission"]["deep"] = "admitted"
+    other["model"] = "m-high"
+    other["admission"]["deep"] = "rejected"
+    if reverse:
+        data["hosts"].reverse()
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    for _ in range(2):
+        refused = call(command, mr1_request(setup, command, "pilot/lane/f2", host,
+                                          model="m-high", effort="high"), expect=2)
+        assert refused == {"error": "invalid model bindings %s: ambiguous effective model identity; "
+                         "repair model-bindings.json" % path}
+        assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("edge,intent", [("default", "deep"), ("ceiling", "max")])
+@pytest.mark.parametrize("shape", ["missing", "null"])
+def test_mr4_2h_null_endpoint_uses_the_missing_key_refusal_envelope(setup, mr1_cli, command, host,
+                                                                edge, intent, shape):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    if shape == "null":
+        row["levels"][intent] = None
+    else:
+        del row["levels"][intent]
+        del row["admission"][intent]
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    refused = call(command, mr1_request(setup, command, "pilot/lane/f2", host,
+                                      model=row["model"], effort="high"), expect=2)
+    assert refused == {"error": "invalid model bindings %s: binding %s/coding lacks band %s %s "
+                     "for implementer; repair model-bindings.json" % (path, host, edge, intent)}
+    assert unbound(setup, "pilot/lane/f2")
+
+
+def test_mr4_2h_grok_registered_but_still_planned_refuses_host_defaults(setup, mr1_cli, monkeypatch):
+    module, _ = mr1_cli
+    # Model the future Teams host registration without implementing a Grok launcher.
+    monkeypatch.setattr("hierarchy_provision.hierarchy_hosts.TEAM_HOSTS",
+                        module.hierarchy_hosts.TEAM_HOSTS + ("grok",))
+    mr1_plan(setup, "grok")
+    for _ in range(2):
+        with pytest.raises(ValueError, match="^host is planned; Teams support is not qualified$"):
+            module.team_settings(setup.base, "grok", {}, "implementer")
+    assert unbound(setup, "pilot/lane/f2")

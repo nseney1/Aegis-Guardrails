@@ -4,6 +4,11 @@ Host-neutral policy selection with bounded, atomically published JSONL history.
 
 select_model returns (choice, record); subject identifies a lane/endpoint/generation.
 host_kinds is required registry data supplied by the caller, never inferred here.
+Semantic intents, in ascending order, are light, standard, deep, extended, max,
+and ultra. The ultra slot is reserved but maps to null on every host until native
+provisioning support is qualified. Native ultra is not accepted in binding rows.
+The legacy team.json ultra alias still resolves to max and is not a native ultra
+capability. Existing role bands stop at max.
 Policy requires team_id, team_family, manager_family, family_hosts (ordered host
 lists), family_order (two families), target_shares, flexible_tasks and review_families
 (task -> stage -> family, including primary). Optional task_intents maps task ->
@@ -28,9 +33,25 @@ T7 records set author_family to the chosen family and refuse a contradictory
 author, providing the binding for a subsequent T8 check. No Router seat, launch
 or effort update is added.
 
-MR-1c exception: unprobed bindings remain usable until probes exist. Every choice
-and record carries admission (unprobed or admitted); rejected refuses. Validation
-matches MR-1's band/coverage/model-token rules with the caller's required registry.
+MR-1c exception: supported, selectable unprobed bindings remain usable until probes
+exist. Every choice and record carries admission (unprobed or admitted); rejected
+levels refuse. A null selected capability refuses binding_unavailable:<host>:<intent>.
+Planned hosts describe
+capabilities only and never select, even if policy names them. The Gemini and Grok
+rows remain planned and unprobed; this registry change grants no routing admission.
+Selectable hosts need concrete non-null band defaults and ceilings; a null endpoint
+is refused at load just like a missing key. Planned-host refusal applies before
+host-default and ROOT waivers as well as explicit model resolution.
+Validation matches MR-1's band/coverage/model-token rules for selectable hosts in
+the caller's required registry; planned rows may name hosts outside that registry.
+The v1 schema accepts effort_encoding (flag by default, or model_suffix),
+served_aliases, and host_status (selectable by default, or planned). model_suffix
+renders the base model plus '-' and the native effort, such as
+gemini-4-carbon-high. Served aliases describe usage identity only; they do not
+change selection or provide alternative provision model names.
+Base model names, rendered suffix ids and usage aliases share a unique per-host
+identity namespace across rows, regardless of class or admission state. Collisions
+refuse at load, and provision refuses ambiguous matches without choosing a row.
 Standalone validate_bindings may infer hosts when inspecting a document only.
 Deferred to MR-1c/MR-3b: T6 whole-change on a non-coding model, and "Opus gating"
 for Claude-authored docs. These require further binding/admission policy data.
@@ -99,7 +120,7 @@ Before hashing/encoding, records have 64-level, 1024-node, 256-item collection,
 425-bit integer and aggregate byte budgets; encoding stops at the line limit.
 Config input node and collection budgets scale with MAX_INPUT_BYTES; the byte cap
 also bounds nodes because each JSON node consumes at least one byte. A registry of
-65 hosts with four bindings each (260 rows, 68,542 canonical bytes with the tracked
+65 hosts with four bindings each (260 rows, 76,862 canonical bytes with the tracked
 binding templates) validates in both the core and MR-1. Record budgets stay fixed.
 History rows have one canonical form: sorted-key compact ASCII JSON plus one LF.
 Append, disk validation and replay measure those exact bytes including the LF;

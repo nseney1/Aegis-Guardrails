@@ -350,10 +350,40 @@ class _InboxView:
         return self._read()
 
 
-class MailboxIndex:
-    def __init__(self, mailbox, *, mode="shadow"):
+_MODE_READ_ONLY = "mailbox index mode is read-only; changing mode requires the ADR phase-0 exit"
+
+class _ModeSnapshot(dict):
+    def _refuse(*args, **kwargs):
+        raise AttributeError(_MODE_READ_ONLY)
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _refuse
+
+class _IndexStorage:
+    """Keep native instance state and the doctor's bound method overrides."""
+
+def _guard_mode(cls):
+    slot, state, original, missing = cls.__dict__["_MailboxIndex__mode"], _IndexStorage.__dict__["__dict__"], cls.__init__, object()
+    del cls._MailboxIndex__mode
+    def initialize(self, mailbox, *, mode="shadow"):
+        if getattr(self, "mode", missing) is not missing:
+            _ModeSnapshot._refuse()
         hm.require(mode in ("shadow", "indexed"), "unknown mailbox index mode; valid modes: shadow, indexed")
-        self.mailbox, self.mode = mailbox, mode
+        slot.__set__(self, mode)
+        return original(self, mailbox, mode=mode)
+    def clone(self):
+        other = cls(self.mailbox, mode=self.mode)
+        state.__get__(other).update(state.__get__(self))
+        return other
+    cls.__init__, cls.__copy__ = initialize, clone
+    cls.mode = cls._MailboxIndex__mode = property(slot.__get__, _ModeSnapshot._refuse, _ModeSnapshot._refuse)
+    return cls
+
+@_guard_mode
+class MailboxIndex(_IndexStorage):
+    __slots__ = ("__mode",)
+    __dict__ = property(lambda self: _ModeSnapshot(_IndexStorage.__dict__["__dict__"].__get__(self)), _ModeSnapshot._refuse, _ModeSnapshot._refuse)
+
+    def __init__(self, mailbox, *, mode="shadow"):
+        self.mailbox = mailbox
         self._evidence = _Evidence()
         self._keep_changes = False
         self._baseline_gap = False
