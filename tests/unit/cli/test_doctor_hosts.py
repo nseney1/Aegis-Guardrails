@@ -1816,7 +1816,7 @@ def test_unmigrated_v3_state_names_the_files_and_manual_archive_action(env, monk
         seen.append(Path(root))
         return list(V3_STATE)
 
-    monkeypatch.setattr(discovery, "unmigrated_state", pending, raising=False)
+    monkeypatch.setattr(discovery, "unmigrated_state", pending)
     payload = env.doctor()
     assert [p.resolve() for p in seen] == [env.ws.resolve()]
     (finding,) = [f for f in payload["findings"] if f["code"] == "unmigrated_v3_state"]
@@ -1848,8 +1848,7 @@ def test_the_home_directory_is_never_checked_for_unmigrated_state(env, monkeypat
 
     env.all_ok()
     seen = []
-    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: seen.append(root) or list(V3_STATE),
-                        raising=False)
+    monkeypatch.setattr(discovery, "unmigrated_state", lambda root: seen.append(root) or list(V3_STATE))
     payload = env.doctor(workspace=str(env.home))
     assert seen == [] and "unmigrated_v3_state" not in finding_codes(payload)
 
