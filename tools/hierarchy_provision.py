@@ -236,7 +236,7 @@ MODEL_BINDINGS = Path(__file__).resolve().parent / "hierarchy_templates" / "mode
 BINDINGS_FILE = "tools/hierarchy_templates/model-bindings.json"
 MODEL_CLASSES = ("frontier", "coding", "scout", "mechanical")
 PRODUCT_MODEL_CLASS = "coding"
-EFFORT_INTENTS = ("light", "standard", "deep", "extended", "max")
+EFFORT_INTENTS = ("light", "standard", "deep", "extended", "max", "ultra")
 ADMISSION_STATES = ("unprobed", "admitted", "rejected")
 # ROOT is owner-chosen. The other unbanded seats still require host membership under a plan.
 MODEL_POLICY_EXEMPT_ROLES = ("root",)
@@ -573,7 +573,7 @@ def load_model_bindings(setup, base):
         require(data["schema"] == "aegis.model-bindings/v1", "unsupported schema")
         require(isinstance(data["roles"], list), "roles must be a list")
         require(isinstance(data["hosts"], list), "hosts must be a list")
-        roles, hosts, host_models = {}, {}, set()
+        roles, hosts, host_models, statuses, identities = {}, {}, set(), {}, set()
         for row in data["roles"]:
             binding_keys(row, ("kind", "model_class", "band"), "role")
             kind, model_class, band = row["kind"], row["model_class"], row["band"]
@@ -590,41 +590,72 @@ def load_model_bindings(setup, base):
         missing_kinds = sorted(set(TEAM_KINDS) - roles.keys())
         require(not missing_kinds, "missing role kinds: " + ", ".join(missing_kinds))
         for row in data["hosts"]:
-            binding_keys(row, ("host", "class", "model", "levels", "admission"), "host")
+            required = {"host", "class", "model", "levels", "admission"}
+            require(isinstance(row, dict), "host must be an object")
+            require(set(row) <= required | {"effort_encoding", "served_aliases", "host_status"},
+                    "unexpected host keys")
+            require(required <= set(row), "missing host keys")
             host, model_class, levels = row["host"], row["class"], row["levels"]
-            require(isinstance(host, str) and host in hierarchy_hosts.TEAM_HOSTS, "unknown host " + safe_value(host))
+            require(isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host) is not None,
+                    "invalid host identifier")
+            status = row.get("host_status", "selectable")
+            require(isinstance(status, str) and status in ("selectable", "planned"), "unknown host status")
+            require(host not in statuses or statuses[host] == status, "inconsistent host status")
+            statuses[host] = status
+            require(status == "planned" or host in hierarchy_hosts.TEAM_HOSTS, "unknown host " + safe_value(host))
+            encoding = row.get("effort_encoding", "flag")
+            require(isinstance(encoding, str) and encoding in ("flag", "model_suffix"), "unknown effort encoding")
             require(isinstance(model_class, str) and model_class in MODEL_CLASSES,
                     "unknown model class " + safe_value(model_class))
             require((host, model_class) not in hosts, "duplicate host/class row")
             binding_identifier(row["model"], "model")
+            aliases = row.get("served_aliases", [])
+            require(isinstance(aliases, list) and len(aliases) <= 256, "invalid served aliases")
+            require(all(isinstance(alias, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", alias) is not None
+                        for alias in aliases), "invalid served aliases")
+            require(len(set(aliases)) == len(aliases) and row["model"] not in aliases, "invalid served aliases")
             require((host, row["model"]) not in host_models,
                     "duplicate host/model row: %s/%s" % (host, row["model"]))
             host_models.add((host, row["model"]))
             require(isinstance(levels, dict) and bool(levels) and set(levels) <= set(EFFORT_INTENTS),
                     "levels must map a nonempty subset of " + ", ".join(EFFORT_INTENTS))
             for level in levels.values():
-                require(isinstance(level, str) and level in NATIVE_LEVELS, "unknown native level " + safe_value(level))
-            require(len(set(levels.values())) == len(levels), "levels must map to distinct native levels")
+                require(level is None or isinstance(level, str) and level in NATIVE_LEVELS,
+                        "unknown native level " + safe_value(level))
+            offered = [level for level in levels.values() if level is not None]
+            require(len(set(offered)) == len(offered), "levels must map to distinct native levels")
+            if encoding == "model_suffix":
+                require(all(len(row["model"]) + 1 + len(level) <= 128 for level in offered),
+                        "effective model exceeds identifier limit")
             admission = row["admission"]
             require(isinstance(admission, dict) and set(admission) == set(levels),
                     "admission must map exactly supported intents")
             for state in admission.values():
                 require(isinstance(state, str) and state in ADMISSION_STATES,
                         "unknown admission value " + safe_value(state))
+            names = {row["model"], *aliases}
+            if encoding == "model_suffix":
+                names.update(row["model"] + "-" + level for level in offered)
+            keys = {(host, name) for name in names}
+            require(not identities.intersection(keys), "ambiguous effective model identity")
+            identities.update(keys)
             # Unprobed levels remain runnable in MR-1; only known rejected levels refuse.
             hosts[host, model_class] = row
         required_classes = {row["model_class"] for row in roles.values()}
         missing_bindings = sorted("%s/%s" % (host, model_class)
                                   for host in hierarchy_hosts.TEAM_HOSTS for model_class in required_classes
+                                  if statuses.get(host) != "planned"
                                   if (host, model_class) not in hosts)
         require(not missing_bindings, "missing host/class rows: " + ", ".join(missing_bindings))
         for kind, policy in roles.items():
             check_role_model_class(kind, policy["model_class"])
             for host in hierarchy_hosts.TEAM_HOSTS:
+                if statuses.get(host) == "planned":
+                    continue
                 binding = hosts[host, policy["model_class"]]
                 for edge in ("default", "ceiling"):
                     intent = policy["band"][edge]
-                    require(intent in binding["levels"], "binding %s/%s lacks band %s %s for %s" %
+                    require(binding["levels"].get(intent) is not None, "binding %s/%s lacks band %s %s for %s" %
                             (host, policy["model_class"], edge, intent, kind))
                     require(binding["admission"][intent] != "rejected",
                             "binding %s/%s has rejected band %s %s for %s" %
@@ -634,7 +665,24 @@ def load_model_bindings(setup, base):
         raise bindings_error(str(exc), path) from exc
 
 
+def require_selectable_host(bindings, host):
+    """Keep host qualification ahead of every planned model/default/root waiver."""
+    _, hosts, _, _ = bindings
+    require(not any(item["host"] == host and item.get("host_status", "selectable") == "planned"
+                    for item in hosts.values()), "host is planned; Teams support is not qualified")
+    return bindings
+
+
+def checked_model_bindings(setup, base, host, *, stand_in=False):
+    """Verify stand-in pins; every executable plan also loads host qualification."""
+    if stand_in:
+        read_pinned_bindings(setup, base)
+        return None
+    return require_selectable_host(load_model_bindings(setup, base), host)
+
+
 def planned_model_settings(bindings, host, kind, options, record, fixed=None):
+    require_selectable_host(bindings, host)
     if kind in MODEL_POLICY_EXEMPT_ROLES:
         return options, record
     roles, hosts, sha256, path = bindings
@@ -665,8 +713,12 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
                              (kind, binding["levels"][band["default"]], band["default"]))
         raise ValueError("%s has no effort; provide request effort or team.json reasoning; "
                          "host defaults are not allowed for an unbanded role" % kind)
-    bound = [item for item in hosts.values() if item["model"] == model]
-    model_binding = next((item for item in bound if item["host"] == host), None)
+    bound = [item for item in hosts.values() if item["model"] == model or
+             (item.get("effort_encoding", "flag") == "model_suffix" and isinstance(effort, str) and
+              effort in item["levels"].values() and item["model"] + "-" + effort == model)]
+    matching = [item for item in bound if item["host"] == host]
+    require(len(matching) <= 1, "ambiguous model binding")
+    model_binding = matching[0] if matching else None
     if model_binding is None:
         source = record["model_from"] if record is not None else "request"
         if bound:
@@ -679,14 +731,15 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
             "%s model %s has class frontier; frontier models are only for isolated turns, not long-lived seats" %
             (kind, diagnostic_name(model)))
     if binding is not None:
-        require(model == binding["model"], "%s model %s has class %s, requires class %s; choose model %s" %
+        require(model_binding is binding, "%s model %s has class %s, requires class %s; choose model %s" %
                 (kind, diagnostic_name(model), model_binding["class"], binding["class"], binding["model"]))
     else:
         binding = model_binding
-    reverse = {level: intent for intent, level in binding["levels"].items()}
+    reverse = {level: intent for intent, level in binding["levels"].items() if level is not None}
     require(isinstance(effort, str) and effort in reverse,
             "%s effort %s has no supported intent; supported intents: %s; choose a supported effort" %
-            (kind, diagnostic_name(effort), ", ".join(intent for intent in EFFORT_INTENTS if intent in binding["levels"])))
+            (kind, diagnostic_name(effort), ", ".join(intent for intent in EFFORT_INTENTS
+                                                     if binding["levels"].get(intent) is not None)))
     intent = reverse[effort]
     repair = ("; set team.json reasoning_by_kind.%s to an in-band effort" % kind
               if record is not None and record["effort_from"] == "team.json" and
@@ -698,6 +751,9 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
     admission = binding["admission"][intent]
     require(admission != "rejected", "%s intent %s (effort %s) is rejected for %s; choose a different supported level" %
             (binding["model"], intent, effort, host))
+    if binding.get("effort_encoding", "flag") == "model_suffix":
+        model = binding["model"] + "-" + effort
+        options = dict(options, model=model)
     record = dict(record or {"model": model, "effort": effort, "reasoning": effort, "model_from": "request",
                              "effort_from": "request", "reasoning_from": "request"})
     record.update(model=model, effort=effort, model_class=binding["class"], intent=intent,
@@ -795,7 +851,7 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
             mailbox_root = read_json(base / "provision.json")["mailbox_root"]
         governing, home = governing_setup(mailbox_root, plan)
     if plan is not None and kind == "root":
-        read_pinned_bindings(governing, home)
+        checked_model_bindings(governing, home, host)
         # ROOT is owner-chosen, recorded rather than resolved from the team's settings. Keep complete explicit
         # requests' existing return shape; otherwise name the host defaults for dimensions the owner left out.
         if full_request:
@@ -825,7 +881,7 @@ def team_settings(base, host, request, kind=None, plan=PLAN_UNSET, mailbox_root=
     # No bindings read or parse without a plan; planned team files have already been strictly validated.
     bindings = None
     if plan is not None and kind not in MODEL_POLICY_EXEMPT_ROLES:
-        bindings = load_model_bindings(governing, home)
+        bindings = checked_model_bindings(governing, home, host)
     if (plan is not None and raw is None and kind in TEAM_KINDS and
             "model" not in request and "effort" not in request):
         # MR-1b waives band enforcement for banded defaults, never canonical source/policy verification.
@@ -1146,7 +1202,7 @@ def add_role(request):
     scope, stand_in = check_host_plan(plan, request, mailbox, endpoint, cwd) if plan is not None else (None, False)
     if plan is not None and (stand_in or endpoint_parts(endpoint)[1] == "root"):
         governing, home = governing_setup(setup["mailbox_root"], plan)
-        read_pinned_bindings(governing, home)
+        checked_model_bindings(governing, home, host, stand_in=stand_in)
     team = None
     fixed = None
     if host in (CLAUDE, CODEX) and endpoint_parts(endpoint)[1] != "root" and not stand_in:
