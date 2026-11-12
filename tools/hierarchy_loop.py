@@ -56,6 +56,7 @@ sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from hierarchy_jobs import NEEDS_ROOT  # noqa: E402
+from hierarchy_hosts import child_environment, validate_plan  # noqa: E402
 from hierarchy_mailbox import cli_path, parse_time, timestamp  # noqa: E402
 
 
@@ -332,12 +333,12 @@ def _child_diagnostics(tool, result):
     return {key: valid}
 
 
-def run_child(tool, args, decoder):
+def run_child(tool, args, decoder, *, planned=None):
     """Exit, validated result, stderr tail and a contract failure (if any)."""
-    child_env = {key: value for key, value in os.environ.items()
-                 if key not in {"CLAUDECODE", "CLAUDE_PID"} and not key.startswith("CLAUDE_CODE_")}
     proc = subprocess.run([sys.executable, "-I", "-B", str(TOOLS[tool]), *args], stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, start_new_session=True, env=child_env)
+                          capture_output=True, text=True, start_new_session=True, env=child_environment(os.environ, "host-cli") if planned is not False else
+                          {key: value for key, value in os.environ.items()
+                           if key not in {"CLAUDECODE", "CLAUDE_PID"} and not key.startswith("CLAUDE_CODE_")})
     lines = proc.stdout.strip().splitlines()
     try:
         parsed = json.loads(lines[-1]) if lines else None
@@ -393,7 +394,7 @@ def _failed_step(step, code, problem, **where):
 
 class Pass:
     def __init__(self, args, earlier=None, skipped=None, beat=None):
-        self.args = args
+        self.args, self.planned = args, getattr(args, "dispatcher_host_plan", None) is not None
         self.steps, self.holds = [], []
         self.journal_unavailable = self.status_read = False
         self.planning_exclusions = set()
@@ -414,7 +415,7 @@ class Pass:
         return ["--store", str(self.args.store), "--recipes", str(self.args.recipes)]
 
     def router_status(self):
-        code, result, stderr, problem = run_child("router", self.common("router") + ["status", "--recipes", str(self.args.recipes)], _decode_router_status)
+        code, result, stderr, problem = run_child("router", self.common("router") + ["status", "--recipes", str(self.args.recipes)], _decode_router_status, planned=self.planned)
         if code == 0 and result is not None:
             self.status_read = True
             self.steps.append({"step": "router_status", "state": "ok", "exit": 0, "router": result.get("router")})
@@ -444,7 +445,7 @@ class Pass:
             return rows if status else None
         actor = status["router"]
         code, result, stderr, problem = run_child(
-            "router", self.common("router") + ["route", "--actor", actor, "--evidence-only"], _decode_route)
+            "router", self.common("router") + ["route", "--actor", actor, "--evidence-only"], _decode_route, planned=self.planned)
         if code == 0 and result is not None:
             self.steps.append({"step": "route", "state": "ok", "exit": 0, "actor": actor,
                                "routed": [row["request_id"] for row in result["routed"]]})
@@ -490,7 +491,7 @@ class Pass:
         if status is not None and "small_changes" not in status:
             return
         code, result, stderr, problem = run_child("router", self.common("router") + ["dispatch", "--recipes",
-                    str(self.args.recipes), "--evidence-only"], _decode_dispatch)
+                    str(self.args.recipes), "--evidence-only"], _decode_dispatch, planned=self.planned)
         if code == 0 and result is not None:
             self.steps.append({"step": "dispatch", "state": "ok", "exit": 0})
             self.small_changes = result.get("small_changes", [])
@@ -503,7 +504,6 @@ class Pass:
         # This is configuration selection, not a role/binding/activation grant.
         from hierarchy_router import preflight_paths
         from hierarchy_fresh_brief import _Operation
-        from hierarchy_hosts import validate_plan
         path = self.args.dispatcher_host_plan
         preflight_paths(path)
         operation = _Operation()
@@ -542,7 +542,7 @@ class Pass:
             args += ["--skip", endpoint]
         for endpoint in sorted(self.planning_exclusions):
             args += ["--skip", endpoint]
-        code, result, stderr, problem = run_child("sweep", args, _decode_sweep)
+        code, result, stderr, problem = run_child("sweep", args, _decode_sweep, planned=self.planned)
         if code not in (0, 2, 3) or result is None:
             self.holds.append(child_failure("sweep", code, stderr, problem))
             self.steps.append(_failed_step("sweep", code, problem))
@@ -611,7 +611,7 @@ class Pass:
         args = self.common("jobs") + ["run-open"]
         if self.args.max_jobs is not None:
             args += ["--max-jobs", str(self.args.max_jobs)]
-        code, result, stderr, problem = run_child("jobs", args, _decode_jobs)
+        code, result, stderr, problem = run_child("jobs", args, _decode_jobs, planned=self.planned)
         if code not in (0, 2, 3) or result is None:
             self.holds.append(child_failure("run_open", code, stderr, problem))
             self.steps.append(_failed_step("run_open", code, problem))

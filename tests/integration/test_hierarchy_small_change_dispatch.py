@@ -3777,7 +3777,8 @@ def test_r7_expects_tests_semantics_cannot_be_skipped_by_status_without_recipes(
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
-def r7_router_probe(world, injection, *, command="dispatch", extra=()):
+def r7_router_probe(world, injection, *, command="dispatch", extra=(), evidence_only=True, expect=0, telemetry=None,
+                    environ=None):
     script = """import importlib.util, json, os, pwd, sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -3792,16 +3793,16 @@ finally:
     telemetry.write_text(json.dumps(seen))
 sys.exit(code)
 """
-    telemetry = world.tmp / "r7-io.json"
+    telemetry = telemetry or world.tmp / "r7-io.json"
     args = ["--lifecycle", str(world.ledger.path), "--store", str(world.workspace.store), command,
             "--recipes", str(world.recipes_path), "--wait", "0.1"]
-    if command == "dispatch":
+    if command == "dispatch" and evidence_only:
         args.append("--evidence-only")
-    env = {k: v for k, v in os.environ.items()
+    env = {k: v for k, v in (os.environ if environ is None else environ).items()
            if k not in {"CLAUDECODE", "CLAUDE_PID"} and not k.startswith("CLAUDE_CODE_")}
     p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(world.tmp / "home"),
                         str(telemetry), *args, *extra], env=env, capture_output=True, text=True, timeout=30)
-    assert p.returncode == 0 and p.stderr == "", p.stdout + p.stderr
+    assert p.returncode == expect and p.stderr == "", p.stdout + p.stderr
     return json.loads(p.stdout), json.loads(telemetry.read_text())
 
 
@@ -5666,21 +5667,110 @@ def test_r12_completed_source_witness_requires_full_clean_equal_observations(tmp
         assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
-def test_r12_git_environment_uses_every_registry_hosts_declared_policy(tmp_path):
+@pytest.mark.parametrize("planned", [False, True, None])
+def test_hostenv_clean_source_actual_git_environment(tmp_path, monkeypatch, planned):
+    from types import SimpleNamespace
+    import hierarchy_hosts
+    import hierarchy_small_change_dispatch as dispatch
+    import shutil
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    tracked = checkout / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    git(checkout, "add", "tracked.txt")
+    git(checkout, "commit", "-qm", "test-owned initial commit")
+    revision, tree = git(checkout, "rev-parse", "HEAD"), git(checkout, "rev-parse", "HEAD^{tree}")
+    names = set()
+    for host in hierarchy_hosts.describe()["hosts"].values():
+        names.update(host["billing_variables"])
+        names.add(host["session_variable"]["name"])
+        names.update(host["session_markers"]["names"])
+        names.update(prefix + "FUTURE_MARKER" for prefix in host["session_markers"]["prefixes"])
+    # This executable observes its actual inherited environment, then becomes the real Git process.
+    real_git = shutil.which("git")
+    assert real_git
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    evidence = tmp_path / "git-environments.jsonl"
+    wrapper = binaries / "git"
+    wrapper.write_text("#!" + sys.executable + "\n" + """
+import json, os, sys
+with open(sys.argv[0] + '.evidence', encoding='utf-8') as stream:
+    config = json.load(stream)
+with open(config['evidence'], 'a', encoding='utf-8') as stream:
+    stream.write(json.dumps({'names': sorted(os.environ), 'unrelated': os.environ.get('TEST_UNRELATED_SETTING'),
+                             'optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS')}) + '\\n')
+os.execv(config['git'], [config['git'], *sys.argv[1:]])
+""", encoding="utf-8")
+    wrapper.chmod(0o755)
+    wrapper.with_name("git.evidence").write_text(json.dumps({"git": real_git, "evidence": str(evidence)}), encoding="utf-8")
+    parent_before = dict(os.environ)
+    inherited = {**os.environ, **dict.fromkeys(names, "modelled-value"), "TEST_UNRELATED_SETTING": "retained",
+                 "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}
+    inherited_before = dict(inherited)
+    original_read_env = dispatch.jobs.object_read_env
+    def read_env(*, inherit_config=False):
+        return original_read_env(inherited, inherit_config=inherit_config)
+    monkeypatch.setattr("hierarchy_small_change_dispatch.jobs", SimpleNamespace(**{**vars(dispatch.jobs), "object_read_env": read_env}))
+    # Baseline 2103cf22 stripped only these exact billing/session names, not session-marker prefixes.
+    legacy_removed = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                      "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                      "OPENAI_API_KEY", "CODEX_API_KEY", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}
+    git_controls = {"GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT", "GIT_NO_REPLACE_OBJECTS", "GIT_NO_LAZY_FETCH",
+                    "GIT_PROTOCOL_FROM_USER", "GIT_ALLOW_PROTOCOL"}
+    for _ in range(2):
+        assert dispatch._clean_source(checkout, planned=planned) == (revision, tree)
+    tracked.write_text("dirty\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="^source does not match packet$"):
+        dispatch._clean_source(checkout, planned=planned)
+    tracked.write_text("clean\n", encoding="utf-8")
+    assert dispatch._clean_source(checkout, planned=planned) == (revision, tree)
+    rows = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
+    assert rows
+    for row in rows:
+        if planned is not False:
+            assert not names.intersection(row["names"])
+        else:
+            assert set(row["names"]) == (set(inherited) | git_controls) - legacy_removed
+            assert {"CODEX_CI", "CODEX_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_CODE_FUTURE_MARKER"} <= set(row["names"])
+        assert row["unrelated"] == "retained" and row["optional_locks"] == "0"
+        assert "PATH" in row["names"]
+    assert inherited == inherited_before and dict(os.environ) == parent_before
+
+
+@pytest.mark.parametrize("plan_state", ["absent", "present", "unreadable"])
+def test_r12_git_environment_uses_every_registry_hosts_declared_policy(tmp_path, plan_state):
     world = DispatchWorld(tmp_path)
     world.dispatch(); world.finish_writer()
+    environment = {**os.environ, "HOSTENV_TEST_PLAN_STATE": plan_state}
     injection = r"""
-import hierarchy_hosts, subprocess
+import hierarchy_hosts, hierarchy_fresh_brief, hierarchy_small_change_dispatch as dispatch, subprocess
 data=hierarchy_hosts.describe()
 data['hosts']['fixture-extra']={**next(iter(data['hosts'].values())),
-    'billing_variables':['TEST_EXTRA_BILLING'],'session_variable':{'name':'TEST_EXTRA_SESSION','verified_for_mcp':False}}
+    'billing_variables':['TEST_EXTRA_BILLING'],'session_variable':{'name':'TEST_EXTRA_SESSION','verified_for_mcp':False},
+    'session_markers':{'names':['TEST_EXTRA_MARKER'],'prefixes':['TEST_EXTRA_PREFIX_']}}
 hierarchy_hosts.describe=lambda: data
 names=set()
 for entry in data['hosts'].values():
     names.update(entry['billing_variables']);names.add(entry['session_variable']['name'])
+    names.update(entry['session_markers']['names'])
+    names.update(prefix+'FUTURE_MARKER' for prefix in entry['session_markers']['prefixes'])
 for name in names: os.environ[name]='modelled-test-value'
 os.environ['TEST_UNRELATED_SETTING']='retained'
-seen.update(git=0,leaked=[],unrelated=True)
+seen.update(git=0,leaked=[],unrelated=True,plan_probes=0)
+old_exists=hierarchy_fresh_brief._Operation.exists
+# This predicate stub tests selection only. The real decorated failure latch is covered by
+# test_hostenv_real_plan_probe_failure_preserves_precommit_state below.
+def exists(operation,path):
+    if Path(path).name == hierarchy_hosts.PLAN_FILE:
+        seen['plan_probes']+=1
+        state=os.environ['HOSTENV_TEST_PLAN_STATE']
+        if state == 'unreadable': raise PermissionError('modelled unreadable host plan')
+        if state == 'present': return True
+    return old_exists(operation,path)
+hierarchy_fresh_brief._Operation.exists=exists
 old_popen=subprocess.Popen
 def started(argv,*a,**kw):
     if argv[0]=='git':
@@ -5688,11 +5778,92 @@ def started(argv,*a,**kw):
         seen['leaked'].extend(sorted(names & set(kw.get('env',{}))))
         seen['unrelated'] &= kw.get('env',{}).get('TEST_UNRELATED_SETTING')=='retained'
     return old_popen(argv,*a,**kw)
-subprocess.Popen=started
+dispatch.subprocess=SimpleNamespace(**{**vars(subprocess),'Popen':started})
 """
-    answer, seen = r7_router_probe(world, injection)
+    answer, seen = r7_router_probe(world, injection, environ=environment)
+    assert seen["plan_probes"] and seen["unrelated"], seen
+    if plan_state == "unreadable":
+        row = answer["small_changes"][0]
+        assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
+        assert seen["git"] == 0 and seen["leaked"] == []
+        return
     assert answer["small_changes"][0]["state"] == "checking", answer
-    assert seen["git"] and seen["leaked"] == [] and seen["unrelated"], seen
+    assert seen["git"], seen
+    if plan_state == "absent":
+        assert {"CODEX_CI", "CODEX_SESSION_ID", "CLAUDE_EFFORT", "CLAUDE_CODE_FUTURE_MARKER"} <= set(seen["leaked"])
+        assert "CODEX_THREAD_ID" not in seen["leaked"]
+    else:
+        assert seen["leaked"] == []
+
+
+@pytest.mark.parametrize("fault", ["symlink", "permission-first", "permission-second"])
+def test_hostenv_real_plan_probe_failure_preserves_precommit_state(tmp_path, fault):
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.conftest import symlink_or_skip
+
+    world = DispatchWorld(tmp_path, checks=2)
+    world.dispatch()
+    world.finish_writer()
+    plan = world.root.parent / "host-plan.json"
+    if fault == "symlink":
+        symlink_or_skip(world.dispatcher_plan, plan)
+    environment = {**os.environ, "HOSTENV_PROBE_PATH": str(plan),
+                   "HOSTENV_PROBE_FAIL_AT": "2" if fault == "permission-second" else "1", "HOSTENV_PROBE_FAULT": fault}
+    injection = r"""
+import stat, hierarchy_fresh_brief as fresh, hierarchy_lifecycle as life
+probe=fresh._Operation.exists
+seen.update(decorated_probe=hasattr(probe,'__wrapped__'),probe_calls=0,directory_syncs=0)
+original_os=fresh.os
+def lstat(path,*args,**kwargs):
+    if Path(path) == Path(os.environ['HOSTENV_PROBE_PATH']):
+        seen['probe_calls']+=1
+        if (os.environ['HOSTENV_PROBE_FAULT'].startswith('permission-')
+                and seen['probe_calls'] == int(os.environ['HOSTENV_PROBE_FAIL_AT'])):
+            raise PermissionError('modelled unreadable host plan')
+    return original_os.lstat(path,*args,**kwargs)
+fresh.os=SimpleNamespace(**{**vars(original_os),'lstat':lstat})
+sync_os=life.os
+def fsync(descriptor):
+    if stat.S_ISDIR(sync_os.fstat(descriptor).st_mode):
+        seen['directory_syncs']+=1
+    return sync_os.fsync(descriptor)
+life.os=SimpleNamespace(**{**vars(sync_os),'fsync':fsync})
+assert fresh._Operation.exists is probe and seen['decorated_probe']
+"""
+    briefs = world.root.parent / "briefs"
+    assert not list(briefs.glob("check-*.md"))
+    def snapshot():
+        directories = {str(p.relative_to(world.root.parent))
+                       for top in (briefs, world.root) for p in top.rglob("*") if p.is_dir()}
+        return mailbox_snapshot(world.root), world.ledger.files(), directories
+    before = snapshot()
+    # Without --evidence-only, the CLI refuses before reaching the probe.
+    refused, seen = r7_router_probe(world, injection, evidence_only=False, expect=2, environ=environment)
+    assert refused["state"] == "hold" and refused["error"] == (
+        "routing requires --evidence-only; the router is configuration-bound and unauthenticated")
+    assert seen["decorated_probe"] and seen["probe_calls"] == seen["directory_syncs"] == 0
+    assert snapshot() == before
+    def dispatch(index):
+        return r7_router_probe(world, injection, extra=("--wait", "5"),
+                               telemetry=world.tmp / ("hostenv-probe-%d.json" % index), environ=environment)
+    # Sequential retries must reach the latch. Concurrent retries may receive the documented busy refusal.
+    outcomes = [dispatch(0), dispatch(1)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        concurrent = list(pool.map(dispatch, range(2, 4)))
+    outcomes += concurrent
+    assert any(answer["small_changes"][0].get("release_validation_error") for answer, _ in concurrent)
+    for index, (answer, seen) in enumerate(outcomes):
+        row = answer["small_changes"][0]
+        assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
+        assert "route_receipt" not in row and "writer_publication_verified" not in row
+        if row.get("detail") == "mailbox writer is busy; inspect an abandoned lock before retrying":
+            assert index >= 2
+        else:
+            assert row.get("release_validation_error"), "the real decorated capture must retain its failed latch"
+        assert seen["decorated_probe"]
+        assert seen["directory_syncs"] == 0, seen
+    assert not list(briefs.glob("check-*.md")), "a precommit refusal must not leave an orphaned check packet"
+    assert snapshot() == before
 
 
 @pytest.mark.parametrize("home_variable", ["CODEX_HOME", "CLAUDE_CONFIG_DIR"])
