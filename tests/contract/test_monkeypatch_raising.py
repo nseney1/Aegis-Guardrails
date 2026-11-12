@@ -970,6 +970,22 @@ AST_DIGEST_PREFIX = "ast-sha256:"
 # Namespace rows store canonical AST fingerprints, not copies of another file's
 # source syntax. Other ban rows retain the existing source-syntax representation.
 BAN_REGISTRATIONS = {
+    ('tests/conftest.py', '_TestCodeIndex._namespace', 'namespace___dict__', 'ast-sha256:f2f0c1b1deb846ea8cb0b7056a662e5094525ee8e43c2b4a757ab569846e240e', 0):
+        'Reads the builtin ModuleType dictionary descriptor to inspect test-module provenance without invoking module hooks; no namespace mutation.',
+    ('tests/conftest.py', '_TestCodeIndex._class_namespace', 'namespace___dict__', 'ast-sha256:e220644f06bd09bd9b4c3a2bf42ded744b2b23d01d09bc4ad9ae76e882d56b7e', 0):
+        'Reads the builtin type dictionary descriptor to inspect loader-class members without invoking metaclass hooks; no class namespace mutation.',
+    ('tests/conftest.py', '_TestCodeIndex._class_member', 'namespace___dict__', 'ast-sha256:1743e72effc34da1db86f0500add37bbc441ed0bb849c9ed9f11fdecb4c95edc', 0):
+        'Reads the raw class MRO to locate a loader member for test-code authentication without overridable class attribute access; no namespace mutation.',
+    ('tests/conftest.py', '_TestCodeIndex._instance_namespace', 'namespace___dict__', 'ast-sha256:c86c6d7f8205922f432dcd541517c12f0174792e8f16148ea096abcef159202c', 0):
+        'Reads the raw MRO to locate a builtin instance-dictionary slot for inert test-loader metadata inspection; no instance or class namespace mutation.',
+    ('tests/conftest.py', '_TestCodeIndex.preload', 'namespace_sys_modules', 'ast-sha256:7a142aac29df9f293dc9b9448460441d9e2b8cfb86a03ae8087158b9f8e6c3d4', 0):
+        'Snapshots the loaded-module cache to authenticate existing test code trees; never inserts, removes or replaces a sys.modules entry.',
+    ('tests/conftest.py', '_TestCodeIndex.preload', 'namespace_sys_modules', 'ast-sha256:bf9eb5eebdbbb810a650259f15d8f3f8cf75da2a103c904db2956dd5674a79d7', 0):
+        'Reads cached module identity before trusting a test module during preload, rejecting mismatched names without changing sys.modules.',
+    ('tests/conftest.py', '_TestCodeIndex._import_module', 'namespace_sys_modules', 'ast-sha256:0a12bdbc9c8ffcf9b82af88d19ba31566a81b1c0b00823b3bde1143ddc19ff58', 0):
+        'Reads sys.modules to bind observed import code to its actual test module and reject forged globals; no module-cache mutation.',
+    ('tests/conftest.py', '_TestCodeIndex.owns', 'namespace_sys_modules', 'ast-sha256:92f440f2526fcb2291b122c25580244de1f1b556f1d1e3674e0cc8203b76f74b', 0):
+        'Reads sys.modules to verify that a frame namespace belongs to the cached test module; no module-map mutation.',
     ('tests/integration/test_hierarchy_native_probe.py', 'custody_probe', 'namespace___dict__', 'ast-sha256:20b91c2010b2c5cdff757959acea3b15d31ef42bf6b72ceeb1fbb5f883b214c0', 0):
         'Executes the tracked probe source in a fresh fixture-owned ModuleType dictionary; the fixture independently owns and reaps every child.',
     ('tests/integration/test_hierarchy_native_probe.py', 'test_custody_log_close_failure_settles_started_child_and_preserves_error', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
@@ -1671,7 +1687,7 @@ BAN_REGISTRATIONS = {
     ('tests/unit/verification/test_scanners.py', 'descriptor_count', 'namespace_vars', 'ast-sha256:7753147a4a668b8a91f3b2cdb69544cb32cd1138f1fee1be01a8d8d866faf689', 0):
         'Reads vars(os) to copy os into an owned capability/AST namespace for descriptor_count; overrides are installed on the copy rather than the original namespace.',
 }
-BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 39, 'namespace___class__': 3, 'namespace___delattr__': 0, 'namespace___dict__': 13, 'namespace___getattribute__': 1, 'namespace___setattr__': 10, 'namespace_builtin_import': 12, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 9, 'namespace_sys_modules': 47, 'namespace_vars': 59}
+BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 39, 'namespace___class__': 3, 'namespace___delattr__': 0, 'namespace___dict__': 17, 'namespace___getattribute__': 1, 'namespace___setattr__': 10, 'namespace_builtin_import': 12, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 9, 'namespace_sys_modules': 51, 'namespace_vars': 59}
 
 # Formal 0715 example disposition (dynamic examples intentionally unasserted):
 # security 1 / correctness 2: global/nonlocal import/from-import rebindings,
@@ -2014,6 +2030,8 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/unit/core/test_write_census.py', 'test_filesystem_unix_bind_is_a_write', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Uses pytest-owned temporary cwd for a short relative AF_UNIX availability probe; pytest restores cwd and no module attribute is patched.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.setenv', False):

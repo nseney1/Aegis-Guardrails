@@ -59,6 +59,321 @@ _COPIES = {"copy", "copy2", "copyfile", "copytree"}
 _OS_OPERATIONS = {"os.open", "os.replace", "os.rename", "os.link"}
 _DESCRIPTOR_OPERATIONS = _OS_OPERATIONS | {"path.rename", "path.replace"}
 
+# RF-82b baseline of existing metadata, scratch and tool writers. These literal
+# entries grant runtime scope only; descriptor operations retain their static
+# exact-count ceilings. New writers are never learned automatically by the hook.
+# This file is the single registry read by both the static ratchet and census.
+AUDIT_WRITERS = {
+    ("aegis_cli/doctor_repair.py", "_apply_files"): "existing unlink; source lines 236",
+    ("aegis_cli/doctor_repair.py", "_backup_root"): "existing mkdir; source lines 39",
+    ("aegis_cli/doctor.py", "_run_host_cli"): "existing subprocess DEVNULL; source lines 489",
+    ("aegis_cli/hooks/commitmsg.py", "uninstall"): "existing unlink; source lines 189",
+    ("aegis_cli/hooks/management.py", "_back_up_hook"): "existing mkdir; source lines 149",
+    ("aegis_cli/hooks/management.py", "install_hook"): "existing unlink, mkdir; source lines 248, 250",
+    ("aegis_cli/hooks/management.py", "uninstall_hook"): "existing unlink; source lines 287, 336, 340, 344",
+    ("aegis_cli/hooks/registrar.py", "_probe"): "existing TemporaryDirectory, subprocess DEVNULL; source lines 273, 274",
+    ("aegis_cli/hooks/registrar.py", "_restore"): "existing unlink; source lines 494",
+    ("aegis_cli/hooks/registrar.py", "uninstall"): "existing unlink; source lines 798",
+    ("aegis_cli/install_hosts.py", "_run_cli"): "existing TemporaryDirectory, subprocess DEVNULL; source lines 942, 943",
+    ("aegis_cli/install_hosts.py", "private_dirs"): "existing mkdir; source lines 462",
+    ("aegis_cli/install_hosts.py", "remove_managed_block"): "existing unlink; source lines 376",
+    ("aegis_core/ast/batch.py", "BatchDriver._start"): "existing TemporaryDirectory; source lines 82",
+    ("aegis_core/ast/batch.py", "BatchDriver.close"): "cleans the aegis-ast-v2-* TemporaryDirectory allocated by BatchDriver._start after stopping the driver and readers",
+    ("aegis_core/ast/gobuild.py", "_cache_directory"): "existing mkdir; source lines 96",
+    ("aegis_core/ast/gobuild.py", "_run"): "existing subprocess DEVNULL; source lines 120",
+    ("aegis_core/ast/gobuild.py", "prepare_go_driver"): "existing mkdtemp, rmtree; source lines 267, 290",
+    ("aegis_core/ast/runner.py", "_run_driver"): "existing subprocess DEVNULL; source lines 533",
+    ("aegis_core/ast/runner.py", "ASTDriverRunner.parse_file"): "existing TemporaryDirectory; source lines 513",
+    ("aegis_core/benchmark.py", "measure_hook"): "existing mkdtemp, rmtree; source lines 258, 294",
+    ("aegis_core/benchmark.py", "measure_hook.once"): "opens writable subprocess stdin for the hook payload using the neutral aegis-bench-home-* mkdtemp HOME created and cleaned by measure_hook",
+    ("aegis_core/benchmark.py", "run_benchmark"): "existing mkdtemp, rmtree; source lines 325, 333",
+    ("aegis_core/checkrun.py", "_snapshot_check"): "existing mkdtemp, rmtree; source lines 155, 168",
+    ("aegis_core/credit_memo.py", "filesystem_now"): "existing utime; source lines 48",
+    ("aegis_core/ghcli.py", "default_gh_runner"): "existing mkdtemp, subprocess DEVNULL, rmtree; source lines 71, 84, 99",
+    ("aegis_core/gitsafe.py", "add_trailer"): "existing TemporaryDirectory; source lines 273",
+    ("aegis_core/gitsafe.py", "export_tree"): "existing mkdir, mkdtemp, chmod, rmtree; source lines 859, 865, 867, 890, 899, 908",
+    ("aegis_core/gitsafe.py", "run"): "existing subprocess DEVNULL; source lines 227",
+    ("aegis_core/human_gate.py", "_signature"): "existing mkdtemp, chmod, rmtree; source lines 856, 858, 877",
+    ("aegis_core/inference_provider.py", "CommandBackend.generate"): "existing mkdtemp, rmtree; source lines 74, 88",
+    ("aegis_core/insights/keys.py", "_ensure_private_dir"): "existing mkdir, fchmod; source lines 58, 77",
+    ("aegis_core/insights/keys.py", "create_link_key"): "existing fchmod; source lines 106",
+    ("aegis_core/insights/review.py", "write_proposal"): "existing mkdir; source lines 492",
+    ("aegis_core/language_runtime.py", "_base"): "existing mkdir; source lines 53, 54",
+    ("aegis_core/language_runtime.py", "_probe"): "existing mkdir; source lines 88",
+    ("aegis_core/language_runtime.py", "prepare_language_runtime"): "existing mkdir; source lines 124",
+    ("aegis_core/lifecycle/creation.py", "create_rule"): "existing mkdir; source lines 168",
+    ("aegis_core/lifecycle/promotion.py", "_move"): "existing mkdir; source lines 121",
+    ("aegis_core/lifecycle/selection.py", "_park"): "existing mkdir, replace; source lines 87, 93",
+    ("aegis_core/manager_config.py", "initialize.create"): "existing mkdir; source lines 110, 116",
+    ("aegis_core/manager_config.py", "verify_owner"): "existing TemporaryDirectory; source lines 144",
+    ("aegis_core/manager_store.py", "ManagerStore._anchor"): "existing mkdir; source lines 138",
+    ("aegis_core/manager_store.py", "ManagerStore._append"): "existing _audit; source lines 257",
+    ("aegis_core/manager_store.py", "ManagerStore._check"): "existing mkdir; source lines 82",
+    ("aegis_core/migrate.py", "apply"): "existing mkdtemp, chmod; source lines 250, 251",
+    ("aegis_core/model_select.py", "_publish"): "existing fchmod; source lines 906",
+    ("aegis_core/packs.py", "_write"): "existing unlink, rmdir; source lines 561, 566",
+    ("aegis_core/packs.py", "_write.make_dir"): "existing mkdir; source lines 540",
+    ("aegis_core/regression.py", "_run_pr_level"): "existing mkdtemp, chmod, rmtree; source lines 473, 475, 492",
+    ("aegis_core/sync.py", "_commit"): "existing TemporaryDirectory; source lines 450",
+    ("aegis_core/sync.py", "_restore"): "existing , rmdir; source lines 423, 426, 432",
+    ("aegis_core/sync.py", "_write_examples"): "existing mkdir; source lines 265",
+    ("aegis_core/testexec.py", "run_pytest_snapshot"): "existing mkdir; source lines 464, 465",
+    ("aegis_core/treeid.py", "_spawn"): "existing subprocess DEVNULL; source lines 160",
+    ("aegis_core/treeid.py", "BoundTree.__init__"): "existing mkdir; source lines 258",
+    ("aegis_core/treeid.py", "BoundTree.export"): "existing mkdir; source lines 317",
+    ("aegis_core/verification/coverage_check.py", "_native_coverage"): "existing TemporaryDirectory; source lines 250, 253",
+    ("aegis_core/verification/coverage_check.py", "_python_coverage"): "existing TemporaryDirectory; source lines 145",
+    ("aegis_core/verification/language_tests.py", "_dependencies"): "existing symlink_to, rmdir, unlink; source lines 194, 208, 208",
+    ("aegis_core/verification/language_tests.py", "_fresh"): "existing mkdir; source lines 86",
+    ("aegis_core/verification/mutation_tester.py", "_ModuleSwap.stage"): "existing Path; source lines 358",
+    ("aegis_core/verification/mutation_tester.py", "check"): "existing TemporaryDirectory, Path; source lines 662, 673, 707",
+    ("aegis_core/verification/perf_check.py", "run_perf_check"): "existing mkdtemp, rmtree; source lines 128, 149",
+    ("aegis_core/verification/regression_commands.py", "run_configured_snapshot"): "existing mkdir; source lines 46, 48, 49",
+    ("aegis_core/verification/regression_identity.py", "_metadata"): "existing mkdir; source lines 74",
+    ("aegis_core/verification/regression_languages.py", "run_native_regressions"): "existing TemporaryDirectory; source lines 92",
+    ("aegis_core/verification/runner.py", "run_layer1_on_index"): "existing TemporaryDirectory; source lines 981",
+    ("aegis_core/verification/scanners.py", "run_preset"): "existing TemporaryDirectory; source lines 703",
+    ("aegis_core/verification/security_pack.py", "_base_tree"): "existing TemporaryDirectory; source lines 132",
+    ("aegis_core/verification/snapshot_tests.py", "_python"): "existing mkdir; source lines 39, 41, 42",
+    ("aegis_core/verification/test_runner.py", "run_external_cmd"): "existing subprocess DEVNULL; source lines 198",
+    ("aegis_core/verification/windows_junction.py", "create_directory_junction"): "existing mkdir, rmdir; source lines 107, 136",
+    ("aegis_core/workspace/confinement.py", "finish_file_move"): "existing unlink, rmdir; source lines 163, 165",
+    ("aegis_core/workspace/scaffold.py", "scaffold_workspace"): "existing mkdir; source lines 39",
+    ("tools/hierarchy_board.py", "Board.initialize"): "existing mkdir; source lines 347, 348, 349, 350",
+    ("tools/hierarchy_board.py", "Board.lock"): "existing open, unlink; source lines 285, 297",
+    ("tools/hierarchy_board.py", "Board.move_position"): "existing write_bytes; source lines 438",
+    ("tools/hierarchy_board.py", "Board.publish"): "existing unlink; source lines 518",
+    ("tools/hierarchy_board.py", "Board.tombstone"): "existing unlink; source lines 569, 572",
+    ("tools/hierarchy_container.py", "main"): "existing subprocess DEVNULL; source lines 390",
+    ("tools/hierarchy_fixture_broker.py", "serve"): "existing mkdir; source lines 395",
+    ("tools/hierarchy_fixture_broker.py", "Work.__init__"): "existing mkdir; source lines 219",
+    ("tools/hierarchy_fixture_broker.py", "worker"): "existing subprocess DEVNULL; source lines 461",
+    ("tools/hierarchy_foundation_acceptance.py", "inspect_legacy"): "existing TemporaryDirectory, ; source lines 287, 290, 291, 294",
+    ("tools/hierarchy_fresh_brief.py", "publish"): "existing mkdir, open, replace, unlink; source lines 2020, 2058, 2068, 2088",
+    ("tools/hierarchy_fresh_brief.py", "remove_written_file"): "existing unlink; source lines 1991",
+    ("tools/hierarchy_jobs.py", "commit_steps"): "existing mkdir, write_text; source lines 1937, 1938",
+    ("tools/hierarchy_jobs.py", "copy_kept"): "existing mkdir, open; source lines 1677, 1678",
+    ("tools/hierarchy_jobs.py", "export_commit"): "existing mkdir, TemporaryFile, chmod; source lines 697, 700, 745",
+    ("tools/hierarchy_jobs.py", "job_environment"): "existing , mkdir; source lines 1789, 1791, 1802",
+    ("tools/hierarchy_jobs.py", "Job.claim"): "existing mkdir; source lines 1416, 1418",
+    ("tools/hierarchy_jobs.py", "Job.disposition"): "existing open; source lines 1449",
+    ("tools/hierarchy_jobs.py", "keep_evidence"): "existing unlink; source lines 1716",
+    ("tools/hierarchy_jobs.py", "merge_steps"): "existing mkdir, write_text; source lines 1963, 1964",
+    ("tools/hierarchy_jobs.py", "python_info"): "existing subprocess DEVNULL; source lines 321",
+    ("tools/hierarchy_jobs.py", "record_process"): "existing write_bytes; source lines 2006",
+    ("tools/hierarchy_jobs.py", "remove_work_folders"): "existing chmod, rmtree; source lines 1663, 1668, 1669",
+    ("tools/hierarchy_jobs.py", "run_step"): "existing open, subprocess DEVNULL; source lines 2022, 2022, 2022, 2023",
+    ("tools/hierarchy_jobs.py", "write_entry"): "existing mkdir, symlink, open; source lines 603, 609, 611",
+    ("tools/hierarchy_jobs.py", "write_git_stub"): "existing mkdir, open, chmod; source lines 678, 680, 682, 685",
+    ("tools/hierarchy_launcher.py", "FencedWakeProcesses.Popen"): "opens a writable stdin pipe or the platform null device for the pinned wake producer's turn; stdout/stderr use its wake-logs/<endpoint>/<wake_id> files",
+    ("tools/hierarchy_launcher.py", "FencedWakeProcesses.run"): "opens the platform null device for the pinned wake producer's background launch/control stdin",
+    ("tools/hierarchy_launcher.py", "Launches.make"): "existing mkdir; source lines 182",
+    ("tools/hierarchy_launcher.py", "Launches.write"): "existing open, link, unlink; source lines 189, 196, 198",
+    ("tools/hierarchy_launcher.py", "StopCustody.lock"): "opens launches/<quoted endpoint>/.stop-custody/lock for the endpoint's exclusive custody lock",
+    ("tools/hierarchy_launcher.py", "StopCustody.prepare"): "creates and pins the directory chain through launches/<quoted endpoint>/.stop-custody, including mkdir attempts on existing directories",
+    ("tools/hierarchy_launcher.py", "StopCustody.save"): "writes .<uuid>.tmp and atomically replaces state.json inside launches/<quoted endpoint>/.stop-custody, then removes its temporary file",
+    ("tools/hierarchy_launcher.py", "admitted_wake_locked"): "the verified pinned wake producer claims/removes mailbox/.wake-<quoted endpoint>.lock and publishes delivery wake receipts; foreign-source frames are attributed to this rooted caller",
+    ("tools/hierarchy_launcher.py", "clear_running_wake"): "removes only the matching launches/<quoted endpoint>/.running-wake marker",
+    ("tools/hierarchy_launcher.py", "descriptor_stream"): "wraps caller-owned wb descriptors for launcher .resume-admissions, .running-wake and .stop-custody/state.json temporary files, closing every raw descriptor in finally",
+    ("tools/hierarchy_launcher.py", "directory_descriptor"): "creates the pinned launches/<quoted endpoint>, .resume-admissions and mailbox bindings/<endpoint> directory chains when create=True, including mkdir attempts on existing directories",
+    ("tools/hierarchy_launcher.py", "fenced_wake_turn.admitted_turn"): "the verified pinned start_turn creates delivery_dir/wake-logs/<endpoint> and exclusive <wake_id>.stdout/.stderr logs; foreign-source frames are attributed to this rooted caller",
+    ("tools/hierarchy_launcher.py", "locked_start"): "existing open; source lines 530",
+    ("tools/hierarchy_launcher.py", "publish_wake_record"): "writes launches/<quoted endpoint>/.running-wake-<uuid>.tmp, links or renames it to .running-wake and removes temporary or rollback markers",
+    ("tools/hierarchy_launcher.py", "resume"): "existing subprocess DEVNULL; source lines 605",
+    ("tools/hierarchy_launcher.py", "resume_locked"): "opens the platform null device for the fenced resume driver's stdin; its endpoint admission evidence lives in launches/<quoted endpoint>/.resume-admissions",
+    ("tools/hierarchy_launcher.py", "run_start"): "existing open; source lines 251, 251",
+    ("tools/hierarchy_launcher.py", "start_lock"): "existing open, unlink; source lines 300, 309",
+    ("tools/hierarchy_launcher.py", "write_resume_admission"): "writes .admission-<uuid>, renames it to the admission identifier and removes leftovers inside launches/<quoted endpoint>/.resume-admissions",
+    ("tools/hierarchy_lifecycle.py", "initialize"): "existing mkdir, ; source lines 1466, 1467",
+    ("tools/hierarchy_lifecycle.py", "ProtectedCanonicalEnrollmentWriter.initialize_reserved_genesis"): "existing mkdir, ; source lines 1138, 1144",
+    ("tools/hierarchy_loop.py", "run_child"): "existing subprocess DEVNULL; source lines 339",
+    ("tools/hierarchy_loop.py", "serve"): "existing mkdir; source lines 789",
+    ("tools/hierarchy_loop.py", "write_status"): "existing mkstemp, replace, Path; source lines 701, 707, 709",
+    ("tools/hierarchy_mailbox_mcp.py", "serve"): "existing open; source lines 946",
+    ("tools/hierarchy_mailbox.py", "_writer_stream"): "owns a fixed wb stream over the caller-opened mailbox lock/publication descriptor with closefd=False and always closes the raw descriptor in finally",
+    ("tools/hierarchy_mailbox.py", "initialize"): "existing mkdir, ; source lines 1135, 1138, 1140",
+    ("tools/hierarchy_mailbox.py", "Mailbox.write_delivery_receipt"): "existing mkdir; source lines 1050",
+    ("tools/hierarchy_mailbox.py", "publish_file"): "existing mkdir, open, link, unlink; source lines 306, 309, 314, 317",
+    ("tools/hierarchy_mailbox.py", "writer_lock"): "existing open, unlink; source lines 260, 270",
+    ("tools/hierarchy_native_probe.py", "cleanup_command"): "existing unlink; source lines 1671",
+    ("tools/hierarchy_native_probe.py", "clear_folder"): "existing rmdir; source lines 1459",
+    ("tools/hierarchy_native_probe.py", "end_hold"): "existing open; source lines 470",
+    ("tools/hierarchy_native_probe.py", "git"): "existing subprocess DEVNULL; source lines 173",
+    ("tools/hierarchy_native_probe.py", "owned_stream"): "wraps writable descriptors for write_private's probe JSON files (including report.json) and run's .run.lock with closefd=False, retaining raw ownership and closing the descriptor in finally even when fdopen fails",
+    ("tools/hierarchy_native_probe.py", "plan"): "existing mkdir, , copyfile, chmod, rmtree; source lines 273, 276, 277, 278, 279, 281, 282, 320",
+    ("tools/hierarchy_native_probe.py", "remove_login"): "existing unlink; source lines 1393",
+    ("tools/hierarchy_native_probe.py", "run"): "existing open, unlink; source lines 1528, 1536",
+    ("tools/hierarchy_native_probe.py", "Runner.cleanup"): "existing subprocess DEVNULL; source lines 1343",
+    ("tools/hierarchy_native_probe.py", "Runner.hold"): "existing mkdir, open, subprocess DEVNULL; source lines 1230, 1231, 1231, 1232",
+    ("tools/hierarchy_native_probe.py", "Runner.login"): "opens a writable stdin pipe for the probe's codex login --with-api-key; the child writes auth.json in the planned isolated codex_home",
+    ("tools/hierarchy_native_probe.py", "Runner.role_steps"): "existing ; source lines 1142",
+    ("tools/hierarchy_native_probe.py", "Runner.run_turn"): "existing mkdir, open, subprocess DEVNULL; source lines 1008, 1009, 1009, 1010",
+    ("tools/hierarchy_native_probe.py", "tool"): "existing subprocess DEVNULL; source lines 192",
+    ("tools/hierarchy_native_probe.py", "unlink_at"): "existing unlink; source lines 1427",
+    ("tools/hierarchy_native_probe.py", "write_private"): "existing mkdir, open; source lines 165, 166",
+    ("tools/hierarchy_provision.py", "add_role"): "existing link, unlink; source lines 1215, 1218",
+    ("tools/hierarchy_provision.py", "build_base"): "existing mkdir, rename, rmtree; source lines 346, 348, 354, 356",
+    ("tools/hierarchy_provision.py", "claude_start"): "existing mkdir, write_text; source lines 1388, 1389",
+    ("tools/hierarchy_provision.py", "session_folder"): "existing mkdir; source lines 1095",
+    ("tools/hierarchy_provision.py", "write_role_file"): "existing mkdir, write_text; source lines 1100, 1101",
+    ("tools/hierarchy_review.py", "export"): "existing mkdir, TemporaryFile, open; source lines 85, 86, 101, 103",
+    ("tools/hierarchy_review.py", "lock_down"): "existing chmod; source lines 153, 155",
+    ("tools/hierarchy_review.py", "prepare"): "existing mkdir, write_text, rename, chmod, rmtree; source lines 185, 187, 192, 211, 212, 216",
+    ("tools/hierarchy_review.py", "remove"): "existing rmtree; source lines 315",
+    ("tools/hierarchy_review.py", "unlock"): "existing chmod; source lines 159, 162, 166",
+    ("tools/hierarchy_review.py", "write_output"): "existing open; source lines 143",
+    ("tools/hierarchy_root.py", "_temp_beside"): "existing open; source lines 161",
+    ("tools/hierarchy_root.py", "atomic_write_json"): "existing link, replace, unlink; source lines 201, 207, 210",
+    ("tools/hierarchy_root.py", "cas_update_json"): "existing replace, unlink; source lines 237, 240",
+    ("tools/hierarchy_root.py", "create_file"): "existing link, unlink; source lines 604, 608",
+    ("tools/hierarchy_root.py", "git_state.git"): "existing subprocess DEVNULL; source lines 1332",
+    ("tools/hierarchy_root.py", "probe_folder_writable"): "existing unlink; source lines 180",
+    ("tools/hierarchy_root.py", "run_claude"): "existing subprocess DEVNULL; source lines 277",
+    ("tools/hierarchy_runtime_source.py", "git"): "existing subprocess DEVNULL; source lines 34",
+    ("tools/hierarchy_runtime_source.py", "run"): "existing TemporaryDirectory; source lines 152",
+    ("tools/hierarchy_small_change_dispatch.py", "_git_read"): "existing subprocess DEVNULL; source lines 47",
+    ("tools/hierarchy_source.py", "SourceViews.bounded"): "existing TemporaryFile; source lines 106",
+    ("tools/hierarchy_team.py", "aegis"): "existing subprocess DEVNULL; source lines 786",
+    ("tools/hierarchy_team.py", "append_evidence"): "existing mkdir, open; source lines 720, 721",
+    ("tools/hierarchy_team.py", "approve"): "existing subprocess DEVNULL; source lines 1725",
+    ("tools/hierarchy_team.py", "collect"): "existing mkdir, copy2; source lines 2011, 2032",
+    ("tools/hierarchy_team.py", "copy_tree"): "existing rmtree, copytree, mkdir; source lines 1912, 1914, 1916",
+    ("tools/hierarchy_team.py", "discard_claude_login_evidence"): "existing ; source lines 1308",
+    ("tools/hierarchy_team.py", "git"): "existing subprocess DEVNULL; source lines 772",
+    ("tools/hierarchy_team.py", "init"): "existing mkdir; source lines 1134",
+    ("tools/hierarchy_team.py", "log_command"): "existing open; source lines 2271",
+    ("tools/hierarchy_team.py", "login_claude"): "existing subprocess DEVNULL; source lines 1341",
+    ("tools/hierarchy_team.py", "login_lock"): "existing open; source lines 1166",
+    ("tools/hierarchy_team.py", "make_home"): "existing mkdir, chmod; source lines 846, 850, 851",
+    ("tools/hierarchy_team.py", "purge"): "existing rmtree; source lines 2185",
+    ("tools/hierarchy_team.py", "purge_claude"): "existing rmtree; source lines 2193",
+    ("tools/hierarchy_team.py", "remove_login_credentials"): "existing ; source lines 1301",
+    ("tools/hierarchy_team.py", "start_loop"): "existing mkdir, open, subprocess DEVNULL; source lines 1547, 1550, 1551",
+    ("tools/hierarchy_team.py", "step_worktrees.add"): "existing mkdir; source lines 976, 979",
+    ("tools/hierarchy_team.py", "tool"): "existing subprocess DEVNULL; source lines 753",
+    ("tools/hierarchy_team.py", "turn"): "existing subprocess DEVNULL, unlink; source lines 1783, 1787",
+    ("tools/hierarchy_team.py", "update_state"): "existing open; source lines 658",
+    ("tools/hierarchy_team.py", "write_atomic"): "existing mkdir, write_bytes, replace; source lines 136, 138, 139",
+    ("tools/hierarchy_templates/native-probe-attempt.py", "main"): "existing open; source lines 18",
+    ("tools/hierarchy_wake.py", "claim_wake"): "existing open; source lines 292",
+    ("tools/hierarchy_wake.py", "control_command"): "existing subprocess DEVNULL; source lines 101",
+    ("tools/hierarchy_wake.py", "finish_background"): "existing unlink; source lines 429",
+    ("tools/hierarchy_wake.py", "launch_background"): "existing unlink; source lines 397",
+    ("tools/hierarchy_wake.py", "save_terminal_output"): "existing open; source lines 223",
+    ("tools/hierarchy_wake.py", "start_background"): "existing mkdir, open, subprocess DEVNULL; source lines 362, 364, 364, 365",
+    ("tools/hierarchy_wake.py", "start_turn"): "existing mkdir, open, subprocess DEVNULL; source lines 331, 335, 335, 336",
+    ("tools/hierarchy_wake.py", "wake"): "existing unlink; source lines 527, 544",
+    ("tools/hierarchy_watch_bridge.py", "ProcessBridge.__init__"): "existing mkdir; source lines 80",
+    ("tools/hierarchy_watch_bridge.py", "ProcessBridge._call"): "existing mkdir, ; source lines 132, 133, 211",
+    ("tools/hierarchy_watch_supervisor.py", "initialize"): "existing mkdir, connect; source lines 53, 57",
+    ("tools/hierarchy_watch_supervisor.py", "Supervisor.database"): "existing connect; source lines 91",
+    ("tools/hierarchy_watch_supervisor.py", "Supervisor.worker"): "existing open; source lines 110",
+    ("tools/hierarchy_workspace.py", "run"): "existing mkdir; source lines 551",
+    ("tools/hierarchy_workspace.py", "Store.lock"): "existing open, unlink; source lines 284, 292",
+}
+
+# Shared runtime boundaries and classifications. Descriptor reviews do not
+# imply write authority. Every approval needs an explicit classification.
+AUDIT_STORAGE_MODULES = (
+    "aegis_core/storage.py", "aegis_core/atomicio.py", "aegis_core/storage_shared.py",
+    "aegis_core/storage_confined.py",
+)
+AUDIT_FORWARDER_OPERATIONS = {
+    ("aegis_core/atomicio.py", "_replace_with_retry", "os.replace"): ("os.rename", "reviewed atomic publication delegate; rename effects are owned by its caller"),
+    ("aegis_core/atomicio.py", "_open_regular", "os.open"): ("open", "flag-taking regular opener; writable access is owned by its caller"),
+    ("aegis_core/atomicio.py", "open_regular", "aegis_core.atomicio._open_regular"): ("open", "flag-taking regular opener delegation; writable access is owned by its caller"),
+    ("aegis_core/manager_store.py", "ManagerStore._audit", "os.open"): ("open", "flag-taking manager audit opener; writable access is owned by its caller"),
+    ("aegis_core/message_codec_store.py", "Store._open", "os.open"): ("open", "flag-taking message opener; writable access is owned by its caller"),
+}
+# These operations do not own a mutation in the approving frame: read-only I/O
+# or delegation to an independently registered writer/storage boundary.
+AUDIT_READ_ONLY_OPERATIONS = {
+    ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_cli/init.py", "_link_key_step", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/language_capabilities.py", "runner_suggestion", "aegis_cli.language_capabilities._package"): "read package metadata for the suggested language runner; this approved call requests read-only inspection",
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.message_codec_store.Store.__init__"): "bind the explicit caller-selected message store through its public re-export; this approved call requests read-only inspection",
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.storage.message_store"): "use the required storage boundary for a workspace-bound message store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/verify.py", "_run_calibration", "aegis_core.storage.read_jsonl"): "read calibration predictions through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "RepoConfig.load", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "UserConfig.load", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "read_user_config", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): "read earlier check records through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): "read credit ledger events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): "O_RDONLY ancestor walk and regular-file snapshot",
+    ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "remember", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
+    ("aegis_core/events.py", "read", "aegis_core.storage.read_jsonl"): "read stored events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/fitness.py", "_collect_t4_events_for_rules", "aegis_core.storage.read_jsonl"): "read fitness ledger events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.insights.keys._ensure_private_dir"): "create private user insight directories and verify descriptor permissions; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/insights/capture.py", "_known_inventory_revs", "aegis_core.storage.read_jsonl"): "read stored inventory revisions through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "_read_rows_of_session", "aegis_core.storage.read_jsonl"): "read session insight rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.storage.read_jsonl"): "read existing suggestions and hooks through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "_append_user_insights", "aegis_core.insights.keys._ensure_private_dir"): "create private user insight directories and verify descriptor permissions; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.read_link_key"): "read-only user link key for session hashing; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "session_hs", "aegis_core.insights.keys.read_link_key"): "read-only user link key for session hashing; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "read_insight_rows", "aegis_core.storage.read_jsonl"): "read stored insight rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/lane_gate.py", "check_lane", "aegis_core.team.load_team"): "read-only team policy for lane admission; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "initialize", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "load_config", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_store.py", "ManagerStore._locked", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
+    ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): "passes O_RDONLY to Store._open; never requests record creation",
+    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): "bounded migration rule and target reads through the declared partial; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): "read-only anchored decision log generation check before atomic publication; closes the inspected stream without mutation",
+    ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): "read-only bounded decision input config inspection; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._decision_directory"): "bind the caller-selected directory through an O_RDONLY directory walk; locking effects belong to the deeper file_lock boundary",
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._open_log"): "read-only decision log existence probe before lock creation; closes the probe and returns without side effects when the log is missing",
+    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._open_log"): "read-only replay of the bound decision log; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "append_decision", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): "read the existing export manifest through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): "read-only bounded stable rule inventory bytes; this approved call requests read-only inspection",
+    ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded compliance evidence through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): "read stored scan activity through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): "read derived metadata through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.atomicio.open_regular"): "read-only regular-file descriptor for bounded ledger or SARIF inspection; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/telemetry_engine/ledger.py", "_read_worktree_ledger", "aegis_core.storage.read_jsonl"): "read the worktree ledger through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "merge_rows_report", "aegis_core.storage.read_jsonl"): "read existing merge rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "read", "aegis_core.storage.read_jsonl"): "read ledger rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded test output through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "parse_junit_cases", "aegis_core.testexec._inspect_junit"): "read-only bounded JUnit report inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/coverage_check.py", "_module_prefix", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/language_tests.py", "run_language_snapshot", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/regression_identity.py", "_module_files", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/regression_identity.py", "_rust", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/runner.py", "_t7_on_index", "aegis_core.verification.runner._identical_work_file"): "read-only comparison of worktree bytes with the selected git object; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "aegis_core.verification.scanners._sarif_open_artifact"): "read-only descriptor-confined SARIF artifact inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_sarif_open_by_path", "aegis_core.atomicio.open_regular"): "read-only regular-file descriptor for bounded ledger or SARIF inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "ingest_sarif", "aegis_core.verification.scanners._SarifLineCache.fill"): "read-only batched source excerpts for SARIF findings; this approved call requests read-only inspection",
+    ("aegis_mcp/handlers/msg.py", "_store", "aegis_core.storage.message_store"): "use the required storage boundary for a workspace-bound message store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/language_capabilities.py", "_package", "os.open"): "read-only package metadata inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "_read_json", "os.open"): "read-only bounded config inspection; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "_snapshot", "os.open"): "O_RDONLY ancestor walk and regular-file snapshot",
+    ("aegis_core/insights/keys.py", "read_link_key", "os.open"): "read-only link key inspection; this approved call requests read-only inspection",
+    ("aegis_core/language_runtime.py", "read_runtime_report", "os.open"): "read-only bounded runtime report inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "public_file", "os.open"): "read-only public manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_store.py", "_sync_directory", "os.open"): "read-only directory descriptor for audit durability; this approved call requests read-only inspection",
+    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): "read-only directory walk binding the message store root; this approved call requests read-only inspection",
+    ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): "read-only directory descriptor for message reference lookup; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_decision_directory", "os.open"): "read-only directory walk binding the caller's decision log directory; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_open_log", "os.open"): "read-only decision log inspection; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_open_regular", "os.open"): "read-only ancestor walk and decision config inspection; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "_read_stable_file", "os.open"): "read-only stable rule snapshot; this approved call requests read-only inspection",
+    ("aegis_core/team.py", "load_team", "os.open"): "read-only team metadata inspection; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "_inspect_junit", "os.open"): "read-only bounded test report inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/runner.py", "_identical_work_file", "os.open"): "read-only working file comparison; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): "read-only SARIF root directory descriptor; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): "read-only confined SARIF artifact directory walk and file inspection; this approved call requests read-only inspection",
+    ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): "read-only bounded confined file inspection; this approved call requests read-only inspection",
+}
+
 # These atomicio wrappers expose its descriptor opener transitively. Other
 # forwarding functions are discovered from nonconstant flags below.
 _ATOMIC_WRAPPERS = {
@@ -127,6 +442,9 @@ CALLBACK_EXCEPTIONS = {
     ),
     ("aegis_core/model_select.py", "_publish", "os.rename", "_path_call"): (
         1, "reviewed writer publishes the temporary decision log within the same bound directory",
+    ),
+    ("aegis_core/model_select.py", "_publish", "os.unlink", "_path_call"): (
+        1, "reviewed writer removes its unpublished temporary log through the deferred cleanup boundary",
     ),
 }
 
@@ -373,6 +691,20 @@ class _Writes(ast.NodeVisitor):
                 counted = isinstance(self.parents[parent], ast.Call)
             if not counted:
                 self._refuse(node, f"forbidden forwarding opener reference: {operation}")
+
+    def visit_Tuple(self, node):
+        # Publication cleanup defers (wrapper, positional args, keyword args).
+        # Count only this explicit unlink callback shape. It grants no writer
+        # scope and retains the file/caller/wrapper/exact-count ratchet.
+        if (len(node.elts) == 3 and isinstance(node.elts[0], ast.Name)
+                and isinstance(node.elts[1], ast.Tuple) and node.elts[1].elts
+                and isinstance(node.elts[2], ast.Dict)):
+            operation = node.elts[1].elts[0]
+            if (isinstance(operation, ast.Attribute) and operation.attr == 'unlink'
+                    and isinstance(operation.value, ast.Name) and operation.value.id == 'os'):
+                scope = '.'.join(self.stack) or '<module>'
+                self.callbacks.append((self.rel, scope, node.lineno, 'os.unlink', node.elts[0].id))
+        self.generic_visit(node)
 
     def visit_Assign(self, node):
         if not self.stack and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -667,6 +999,30 @@ def test_reviewed_callbacks_are_allowed_and_still_counted_as_operations():
     assert visitor.found == [("_decision_directory", line, "os.open") for line in (2, 3, 4)]
     key = ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call")
     assert _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}) == []
+
+
+def test_deferred_publication_cleanup_callback_is_counted():
+    visitor = _Writes('aegis_core/model_select.py')
+    visitor.visit(ast.parse('def _publish():\n'
+                            '    cleanup.append((_path_call, (os.unlink, temporary), {"dir_fd": directory}))\n'))
+    key = ('aegis_core/model_select.py', '_publish', 'os.unlink', '_path_call')
+    assert visitor.callbacks == [('aegis_core/model_select.py', '_publish', 2, 'os.unlink', '_path_call')]
+    assert _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}) == []
+
+
+@pytest.mark.parametrize('scope,wrapper,count,reason', [
+    ('new_scope', '_path_call', 1, 'unreviewed OS callback'),
+    ('_publish', '_other_helper', 1, 'unreviewed OS callback'),
+    ('_publish', '_path_call', 2, 'reviewed callback count 1 -> 2'),
+    ('_publish', '_path_call', 0, 'stale callback: remove'),
+])
+def test_deferred_cleanup_callback_refuses_other_contexts_and_counts(scope, wrapper, count, reason):
+    visitor = _Writes('aegis_core/model_select.py')
+    visitor.visit(ast.parse('def %s():\n    pass\n' % scope +
+                            ('    cleanup.append((%s, (os.unlink, temporary), {"dir_fd": directory}))\n' % wrapper) * count))
+    key = ('aegis_core/model_select.py', '_publish', 'os.unlink', '_path_call')
+    errors = _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}, {key[:2]: 1})
+    assert any(reason in error for error in errors), errors
 
 
 @pytest.mark.parametrize("rel,scope,operation,callee,count,reason", [
@@ -1127,6 +1483,38 @@ def test_every_allowlisted_writer_still_exists():
         visitor.visit(tree)
         present |= {(rel, scope) for scope, _lineno, what in visitor.found if not _reviewed_operation(what)}
     assert set(NON_AEGIS_WRITERS) - present == set()
+
+
+def test_every_audit_writer_still_exists():
+    """A renamed/deleted runtime writer must not leave a reusable exemption."""
+    present = set()
+    for rel in {key[0] for key in AUDIT_WRITERS}:
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"), filename=rel)
+        present.add((rel, "<module>"))
+
+        def collect(node, parents):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                parents = parents + [node.name]
+                present.add((rel, ".".join(parents)))
+            for child in ast.iter_child_nodes(node):
+                collect(child, parents)
+
+        collect(tree, [])
+    assert set(AUDIT_WRITERS) - present == set()
+
+
+def test_every_descriptor_approval_has_runtime_classification():
+    writers = set(NON_AEGIS_WRITERS) | set(AUDIT_WRITERS)
+    forwarded = AUDIT_FORWARDER_OPERATIONS
+    readers = AUDIT_READ_ONLY_OPERATIONS
+    storage = AUDIT_STORAGE_MODULES
+    forwarder_scopes = {key[:2] for key in forwarded}
+    missing = [key for key in REVIEWED_DESCRIPTOR_OPERATIONS
+               if key[:2] not in writers and key not in readers and key not in forwarded
+               and not (key[0] in storage and key[:2] not in forwarder_scopes)]
+    assert not missing, 'descriptor approvals lack runtime classification: ' + repr(missing)
+    assert not (set(readers) | set(forwarded)) - set(REVIEWED_DESCRIPTOR_OPERATIONS)
+    assert all(readers.values()), 'read-only classifications need explicit reasons'
 
 
 _PATH_LITERAL = re.compile(r"^[~/\\]*\.aegis(?:[/\\][^\s]*)?$")
