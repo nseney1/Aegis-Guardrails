@@ -29,6 +29,9 @@ A mailbox root beside a team run's host plan binds only a successor on the host
 the plan assigns, and refuses the entry when the plan is not that root's own. The
 successor's session record comes from the add-role that builds its connection and
 profile. Roots without a host plan keep today's unchecked host choice.
+For runs with a governing host plan, the next checkpoint keeps briefs for open
+work, the last touching brief and entries[].briefs, so standing briefs must be listed
+there; without a plan, briefs carry forward unchanged.
 """
 from __future__ import annotations
 
@@ -252,6 +255,25 @@ def preflight_stops(spec):
                 hierarchy_launcher.require_resolved_custody(str(root.parent), entry["endpoint"])
 
 
+def prune_handoff_briefs(mailbox, endpoint, checkpoint, requested):
+    """Keep current obligations in draft order; bind still validates the resulting snapshot."""
+    records = mailbox.messages()
+    closed, _ = mailbox.dispatch_history(records)
+    touching = [row["message"] for row in records.values()
+                if endpoint in (row["message"]["from"], row["message"]["to"])]
+    required = list(requested)
+    required.extend(message["brief"] for message in touching
+                    if message["type"] == "dispatch" and message["message_id"] not in closed)
+    required.extend(job["brief"] for job in mailbox.open_job_requests(records)
+                    if endpoint in (job["from"], job["to"]))
+    latest = max((message for message in touching if "brief" in message),
+                 key=lambda message: (message["created_at"], message["message_id"]), default=None)
+    if latest is not None:
+        required.append(latest["brief"])
+    kept = [brief for brief in checkpoint["briefs"] if brief in required]
+    return kept or checkpoint["briefs"][-1:]
+
+
 def hand_off(spec, entry):
     fields(entry, {"root", "endpoint"}, {"completed_checks", "briefs", "evidence_dir", "delivery_dir", "kind"})
     root = safe_path(text(entry["root"], "root"))
@@ -306,6 +328,9 @@ def hand_off(spec, entry):
         draft = mailbox.draft_handoff({
             "endpoint": entry["endpoint"], "host": spec["host"], "session": spec["session"],
             "outgoing_stopped": spec["outgoing_stopped"], **optional})
+        if plan is not None:
+            draft["checkpoint"]["briefs"] = prune_handoff_briefs(
+                mailbox, entry["endpoint"], draft["checkpoint"], entry.get("briefs", []))
         if root_fence is not None:
             root_fence.check()
         if fence is not None:
