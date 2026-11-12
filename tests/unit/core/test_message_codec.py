@@ -659,7 +659,7 @@ def test_r3_class_d_fixed_budget_bounds_ref_io(tmp_path, monkeypatch, expanded):
             return real_open(path, *args, **kwargs)
 
         monkeypatch.setattr(os, "open", counted)
-        monkeypatch.setattr(codec, "MAX_REF_BYTES", 10000, raising=False)
+        monkeypatch.setattr(codec, "MAX_REF_BYTES", 10000)
         assert_error("E_LIMIT", lambda: codec.read_view(parent, store=store,
                      expand=list(parent["refs"]) if expanded else [], max_chars=60000))
         assert 0 < len(calls) <= 2

@@ -89,7 +89,7 @@ def test_r23_unsupported_admission_publication_refuses_before_io(tmp_path, monke
 def test_r22_unsupported_running_publication_refuses_before_effects(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False, raising=False)
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False)
     launches = SimpleNamespace(base=tmp_path, folder=lambda endpoint: tmp_path / "launches" / endpoint.replace("/", "%2F"))
     known = dict(host="codex-cli", session=SESSION, generation=1)
     with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
@@ -261,7 +261,7 @@ def test_describe_is_the_json_registry_and_callers_cannot_change_it():
     assert described["schema"] == hierarchy_hosts.SCHEMA == "aegis.hierarchy-host-registry/v1"
     assert list(described["hosts"]) == list(hierarchy_hosts.HOST_KINDS)
     assert json.loads(json.dumps(described)) == described
-    keys = {"kind", "family", "team_start", "home", "billing_variables", "session_variable", "transcripts", "usage",
+    keys = {"kind", "family", "team_start", "home", "billing_variables", "session_variable", "session_markers", "transcripts", "usage",
             "write_scope", "qualification", "entrypoints", "session_selectors"}
     for kind, entry in described["hosts"].items():
         assert set(entry) == keys and entry["kind"] == kind
@@ -282,6 +282,87 @@ def test_describe_is_the_json_registry_and_callers_cannot_change_it():
     assert again["hosts"]["claude-code"]["write_scope"]["boundary"] == "permission rules, not OS-enforced"
     assert "CHANGED" not in again["hosts"]["codex-cli"]["billing_variables"]
     assert again["hosts"]["claude-code"]["qualification"]["writer"] == "weaker-boundary"
+
+
+def test_hostenv_registry_declares_evidenced_markers_and_returns_detached_data():
+    expected = {
+        "claude-code": {"names": ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT"], "prefixes": ["CLAUDE_CODE_"]},
+        "codex-cli": {"names": ["CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI",
+                                "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+                                "CODEX_TOOL_CALL_ID", "CODEX_VERSION"], "prefixes": []},
+    }
+    expected["codex"] = expected["codex-cli"]
+    for kind, markers in expected.items():
+        found = hierarchy_hosts.describe()["hosts"][kind]["session_markers"]
+        assert found == markers
+        found["names"].append("CHANGED")
+        assert hierarchy_hosts.entry(kind)["session_markers"] == markers
+
+
+@pytest.mark.parametrize("purpose", ["no-host", "host-cli"])
+@pytest.mark.parametrize("kind", hierarchy_hosts.HOST_KINDS)
+@pytest.mark.parametrize("category", ["billing", "session", "marker", "prefix", "unrelated"])
+def test_hostenv_policy_table(kind, category, purpose):
+    from types import MappingProxyType
+
+    host = hierarchy_hosts.entry(kind)
+    markers = host["session_markers"]
+    names = {"billing": host["billing_variables"], "session": [host["session_variable"]["name"]],
+             "marker": markers["names"], "prefix": [p + "FUTURE_MARKER" for p in markers["prefixes"]],
+             "unrelated": ["PATH", host["home"]["variable"], "UNRELATED_SETTING"]}[category]
+    source = {name: "modelled-value" for name in names}
+    before = dict(source)
+    expected = {name: value for name, value in source.items()
+                if category == "unrelated" or (category == "billing" and purpose == "host-cli"
+                                               and not name.startswith(tuple(markers["prefixes"])))}
+    for _ in range(2):
+        result = hierarchy_hosts.child_environment(MappingProxyType(source), purpose)
+        assert type(result) is dict and result == expected
+        result["CHANGED"] = "only the result"
+        assert source == before
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("purpose", ["no-host", "host-cli"])
+def test_hostenv_case_folding_is_local_to_windows(monkeypatch, platform, purpose):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(hierarchy_hosts, "os", SimpleNamespace(name=platform))
+    source = {"cLaUdEcOdE": "x", "cLaUdE_pId": "x", "cLaUdE_eFfOrT": "x",
+              "cLaUdE_cOdE_future": "x", "cOdEx_tHrEaD_iD": "x", "cOdEx_sEsSiOn_iD": "x",
+              "oPeNaI_aPi_KeY": "x", "aNtHrOpIc_aPi_KeY": "x", "Path": "kept"}
+    expected = dict(source) if platform == "posix" else {"Path": "kept"}
+    if platform == "nt" and purpose == "host-cli":
+        expected.update({"oPeNaI_aPi_KeY": "x", "aNtHrOpIc_aPi_KeY": "x"})
+    assert hierarchy_hosts.child_environment(source, purpose) == expected
+
+
+@pytest.mark.parametrize("purpose", ["", "unknown\nsecret", None, [], {}])
+def test_hostenv_unknown_purpose_refuses_without_echo_or_reading_input(purpose):
+    class Unreadable:
+        def items(self):
+            pytest.fail("invalid purpose must refuse before reading the environment")
+
+    with pytest.raises(ValueError, match="^unsupported child environment purpose$"):
+        hierarchy_hosts.child_environment(Unreadable(), purpose)
+
+
+def test_hostenv_parallel_purposes_have_no_shared_state():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import MappingProxyType
+
+    source = MappingProxyType({"CLAUDE_EFFORT": "x", "CODEX_SESSION_ID": "x",
+                               "OPENAI_API_KEY": "modelled-value", "PATH": "kept"})
+    def run(index):
+        purpose = "host-cli" if index % 2 else "no-host"
+        return hierarchy_hosts.child_environment(source, purpose)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(run, range(24)))
+    for index, result in enumerate(results):
+        assert result == ({"OPENAI_API_KEY": "modelled-value", "PATH": "kept"} if index % 2 else {"PATH": "kept"})
+    assert dict(source) == {"CLAUDE_EFFORT": "x", "CODEX_SESSION_ID": "x",
+                            "OPENAI_API_KEY": "modelled-value", "PATH": "kept"}
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex-exec", "", None, ["codex"], "x" * 200])

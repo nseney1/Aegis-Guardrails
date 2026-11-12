@@ -14,6 +14,7 @@ import sys
 import tempfile
 import tracemalloc
 from types import SimpleNamespace
+import uuid
 
 import pytest
 
@@ -994,8 +995,9 @@ def test_launch_refuses_a_cwd_a_background_session_cannot_trust(tmp_path, stub, 
 
 def test_launch_refuses_a_cwd_under_tmp_without_the_test_seam(tmp_path, stub, prompt_file):
     root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
-    # The default-root refusal runs before launch and does not require an existing cwd.
-    cwd = Path(root) / tmp_path.name
+    # The default-root policy refuses before opening; the system temp root may be read-only.
+    cwd = Path(root) / ("aegis47-hfix-cwd-" + uuid.uuid4().hex)
+    assert not cwd.exists()
     spec_path, spec = launch_spec(tmp_path, prompt_file, cwd=str(cwd))
     code, out, _ = run_tool("launch", "--spec", spec_path, "--plan", env=stub.env())
     assert code == 2, out

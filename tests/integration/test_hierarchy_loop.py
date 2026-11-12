@@ -140,6 +140,117 @@ def step_states(result):
     return {row["step"]: row["state"] for row in result["steps"]}
 
 
+@pytest.mark.parametrize("exit_code", [0, 2, 3, 7])
+@pytest.mark.parametrize("planned", [True, None])
+def test_hostenv_run_child_actual_environment(tmp_path, monkeypatch, exit_code, planned):
+    from types import SimpleNamespace
+    import hierarchy_hosts
+    import hierarchy_loop
+
+    names, billing = set(), set()
+    for host in hierarchy_hosts.describe()["hosts"].values():
+        names.add(host["session_variable"]["name"])
+        names.update(host["session_markers"]["names"])
+        names.update(prefix + "FUTURE_MARKER" for prefix in host["session_markers"]["prefixes"])
+        billing.update(host["billing_variables"])
+    names.update({"CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN",
+                  "CLAUDE_EFFORT"})
+    parent_before = dict(os.environ)
+    environment = {**os.environ, **dict.fromkeys(names | billing, "modelled-value")}
+    monkeypatch.setattr("hierarchy_loop.os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    script = tmp_path / "environment.py"
+    script.write_text("import json, os, sys\nprint(json.dumps({'error': 'modelled refusal', "
+                      "'names': sorted(os.environ)}))\nsys.exit(int(sys.argv[1]))\n", encoding="utf-8")
+    monkeypatch.setattr("hierarchy_loop.TOOLS", {**hierarchy_loop.TOOLS, "router": script})
+    before = dict(environment)
+    expected = hierarchy_hosts.child_environment(before, "host-cli")
+    for _ in range(2):
+        code, result, stderr, problem = hierarchy_loop.run_child("router", [str(exit_code)], lambda value: None,
+                                                                planned=planned)
+        assert code == exit_code and not stderr and problem is None
+        assert not names.intersection(result["names"])
+        assert set(result["names"]) == set(expected)
+        assert "PATH" in result["names"]
+        assert {"OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY"} <= set(result["names"])
+    assert environment == before and dict(os.environ) == parent_before
+
+
+def test_hostenv_no_plan_run_child_preserves_pre_hostenv_environment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import hierarchy_loop
+
+    # Expected data from integration tip 2103cf22, inlined so snapshots need no repository history.
+    markers = {"CODEX_CI", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_EFFORT", "CLAUDECODE", "CLAUDE_PID",
+               "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_FUTURE_MARKER"}
+    parent_before = dict(os.environ)
+    environment = {**os.environ, **dict.fromkeys(markers, "modelled-value")}
+    monkeypatch.setattr("hierarchy_loop.os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    script = tmp_path / "legacy-environment.py"
+    script.write_text("import json, os\nprint(json.dumps({'names': sorted(os.environ)}))\n", encoding="utf-8")
+    monkeypatch.setattr("hierarchy_loop.TOOLS", {**hierarchy_loop.TOOLS, "router": script})
+    before = dict(environment)
+    removed = {name for name in before if name in {"CLAUDECODE", "CLAUDE_PID"} or name.startswith("CLAUDE_CODE_")}
+    for _ in range(2):
+        code, result, stderr, problem = hierarchy_loop.run_child("router", [], lambda value: None, planned=False)
+        assert (code, stderr, problem) == (0, "", None)
+        assert set(result["names"]) == set(before) - removed
+        assert {"CODEX_CI", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_EFFORT", "PATH"} <= set(result["names"])
+    assert environment == before and dict(os.environ) == parent_before
+
+
+@pytest.mark.parametrize("plan_state", ["absent", "present", "unreadable"])
+def test_hostenv_loop_reuses_dispatcher_plan_opt_in(tmp_path, monkeypatch, plan_state):
+    from types import SimpleNamespace
+    import hierarchy_loop
+
+    markers = ("CODEX_CI", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_EFFORT", "CLAUDE_CODE_MESSAGING_TOKEN")
+    environment = {**os.environ, **dict.fromkeys(markers, "modelled-value")}
+    monkeypatch.setattr("hierarchy_loop.os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    script = tmp_path / "router.py"
+    script.write_text("import json, os\nprint(json.dumps({'router': 'router-1', 'requests': [], "
+                      "'names': sorted(os.environ)}))\n", encoding="utf-8")
+    monkeypatch.setattr("hierarchy_loop.TOOLS", {**hierarchy_loop.TOOLS, "router": script})
+    plan = tmp_path / "host-plan.json"
+    if plan_state == "present":
+        plan.write_text("{}", encoding="utf-8")
+    elif plan_state == "unreadable":
+        plan.mkdir()  # A directory cannot be read as a JSON plan on any platform.
+    args = SimpleNamespace(lifecycle=tmp_path / "journal", store=tmp_path / "store", recipes=tmp_path / "recipes",
+                           dispatcher_host_plan=None if plan_state == "absent" else plan)
+    for _ in range(2):
+        result = hierarchy_loop.Pass(args).router_status()
+        assert result is not None
+        retained = {"CODEX_CI", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_EFFORT"}
+        assert retained.intersection(result["names"]) == (retained if plan_state == "absent" else set())
+        assert "CLAUDE_CODE_MESSAGING_TOKEN" not in result["names"] and "PATH" in result["names"]
+
+
+def test_hostenv_concurrent_children_keep_plan_selection_local(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    import hierarchy_loop
+
+    parent_before = dict(os.environ)
+    environment = {**os.environ, "CODEX_CI": "modelled-value", "CLAUDE_EFFORT": "modelled-value"}
+    monkeypatch.setattr("hierarchy_loop.os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    script = tmp_path / "environment.py"
+    script.write_text("import json, os\nprint(json.dumps({'names': sorted(os.environ)}))\n", encoding="utf-8")
+    monkeypatch.setattr("hierarchy_loop.TOOLS", {**hierarchy_loop.TOOLS, "router": script})
+    before = dict(environment)
+    modes = [False, True, None] * 3
+    def run(planned):
+        code, result, stderr, problem = hierarchy_loop.run_child("router", [], lambda value: None, planned=planned)
+        assert (code, stderr, problem) == (0, "", None)
+        return set(result["names"])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(run, modes))
+    for planned, names in zip(modes, results):
+        assert ("CODEX_CI" in names) == (planned is False)
+        assert ("CLAUDE_EFFORT" in names) == (planned is False)
+        assert "PATH" in names
+    assert environment == before and dict(os.environ) == parent_before
+
+
 @pytest.fixture
 def world(tmp_path):
     return World(tmp_path)
