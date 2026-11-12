@@ -1,5 +1,6 @@
 """Source pages reuse bounded immutable data without changing their public answers."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -41,8 +42,7 @@ def source(tmp_path, monkeypatch):
         return real_run(argv, **kwargs)
 
     # Replace this module's boundary, never the process-wide subprocess module.
-    monkeypatch.setattr(hierarchy_source, "subprocess", SimpleNamespace(
-        run=run, Popen=subprocess.Popen, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(hierarchy_source, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": run}))
     return repository, commit, views, calls
 
 
@@ -57,6 +57,18 @@ def test_eight_pages_read_the_blob_only_once(source):
             "next_start_line": start + 100 if start < 701 else None}
     assert sum("blob" in call for call in calls) == 1
     assert len(calls) <= 12
+
+
+@pytest.mark.skipif(os.name == "nt", reason="source grep uses POSIX pipe selectors")
+@pytest.mark.parametrize("pattern,matches", [
+    ("line 800", [{"path": "page.txt", "line": 800, "text": "line 800"}]),
+    ("absent text", []),
+])
+def test_grep_uses_the_complete_subprocess_boundary(source, pattern, matches):
+    _, commit, views, _ = source
+    assert views.call("source_grep", {"commit": commit, "pattern": pattern, "paths": ["page.txt"]}) == {
+        "commit": commit, "pattern": pattern, "paths": ["page.txt"],
+        "matches": matches, "truncated": False}
 
 
 def test_cache_is_bounded_and_replaces_the_previous_file(source, monkeypatch):
@@ -143,8 +155,7 @@ def test_blob_timeout_is_a_documented_refusal_and_can_be_read_later(source, monk
         return real_run(argv, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(hierarchy_source, "subprocess", SimpleNamespace(
-            run=timeout, TimeoutExpired=subprocess.TimeoutExpired))
+        patch.setattr(hierarchy_source, "subprocess", SimpleNamespace(**{**vars(subprocess), "run": timeout}))
         with pytest.raises(ValueError, match="^git timed out in the source repository$"):
             views.show({"commit": commit, "path": "page.txt"})
     assert views.show({"commit": commit, "path": "page.txt"})["lines"][0] == "line 1"
