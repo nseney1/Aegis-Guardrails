@@ -1527,7 +1527,7 @@ def test_mr1_planless_does_not_open_bindings_and_preserves_answers(setup, mr1_cl
     before = call(command, dict(request))
     garbage = setup.tmp / "garbage.json"
     garbage.write_text("not JSON", encoding="utf-8")
-    monkeypatch.setattr(module, "MODEL_BINDINGS", garbage, raising=False)
+    monkeypatch.setattr(module, "MODEL_BINDINGS", garbage)
     original = Path.open
 
     def open_file(path, *args, **kwargs):
