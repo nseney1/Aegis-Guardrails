@@ -49,6 +49,10 @@ CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
 # Spec rule 3 is not enforced in T2(a) (owner decision B): no MCP child has been shown to carry either variable.
 CLAUDE_SESSION_VARIABLE = {"name": "CLAUDE_CODE_SESSION_ID", "verified_for_mcp": False}
 CODEX_SESSION_VARIABLE = {"name": "CODEX_THREAD_ID", "verified_for_mcp": False}
+# Names observed in the HOSTENV-1 writer's inherited environment (2026-11-11); no broad config prefix.
+CODEX_SESSION_MARKERS = {"names": ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI",
+                                    "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+                                    "CODEX_TOOL_CALL_ID", "CODEX_VERSION"), "prefixes": ()}
 CLAUDE_USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
 CODEX_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
 CLAUDE_INIT_KEYS = (("session_id", "session_id"), ("tools", "tools"), ("model", "model"),
@@ -124,6 +128,7 @@ _HOSTS = {
         "billing_variables": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                               "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"),
         "session_variable": CLAUDE_SESSION_VARIABLE,
+        "session_markers": {"names": ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT"), "prefixes": ("CLAUDE_CODE_",)},
         "transcripts": ("projects/*/{session}.jsonl",),
         "usage": "claude-stream-json-result",
         "write_scope": {"boundary": "permission rules, not OS-enforced", "mechanism": "claude --restricted",
@@ -146,6 +151,7 @@ _HOSTS = {
         "home": {"variable": "CODEX_HOME", "run_folder": "codex-home", "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
         "session_variable": CODEX_SESSION_VARIABLE,
+        "session_markers": CODEX_SESSION_MARKERS,
         "transcripts": CODEX_TRANSCRIPTS,
         "usage": "codex-token-count",
         # Unknown until T2(b) qualifies it: rule 6 reports what no run has shown as unknown, never as true.
@@ -165,6 +171,7 @@ _HOSTS = {
         "home": {"variable": "CODEX_HOME", "run_folder": None, "owner_folder": ".codex"},
         "billing_variables": CODEX_BILLING,
         "session_variable": CODEX_SESSION_VARIABLE,
+        "session_markers": CODEX_SESSION_MARKERS,
         "transcripts": CODEX_TRANSCRIPTS,
         "usage": None,
         "write_scope": None,
@@ -186,6 +193,26 @@ def entry(kind):
 
 def describe():
     return {"schema": SCHEMA, "hosts": {kind: entry(kind) for kind in HOST_KINDS}}
+
+
+def child_environment(environ, purpose):
+    """Copy a child environment without inherited host sessions, and optionally without billing variables."""
+    if purpose not in ("no-host", "host-cli"):
+        raise ValueError("unsupported child environment purpose")
+    names, prefixes = set(), []
+    for host in describe()["hosts"].values():
+        names.add(host["session_variable"]["name"])
+        names.update(host["session_markers"]["names"])
+        prefixes.extend(host["session_markers"]["prefixes"])
+        if purpose == "no-host":
+            names.update(host["billing_variables"])
+    if os.name == "nt":
+        names = {name.upper() for name in names}
+        prefixes = [prefix.upper() for prefix in prefixes]
+    prefixes = tuple(prefixes)
+    return {key: value for key, value in environ.items()
+            if (key.upper() if os.name == "nt" else key) not in names
+            and not (key.upper() if os.name == "nt" else key).startswith(prefixes)}
 
 
 def family(kind):
