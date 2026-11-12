@@ -1,10 +1,14 @@
-"""The independent tools/core validators must accept the same binding documents.
+"""The independent tools/core validators agree on shared binding-schema rules.
+
+Provision also requires admitted band endpoints; selector enforcement is filed
+separately as MR-1c-SEL.
 
 Only the tools reader boundary is replaced: source pin verification is covered by
 the provisioning integration suite. Both real validation functions run below.
 The core's host registry is passed as data, preserving its vendor independence.
 """
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
 from pathlib import Path
@@ -14,6 +18,94 @@ import pytest
 from aegis_core import model_select
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("intent", ["standard", "deep", "max"])
+@pytest.mark.parametrize("state", ["admitted", "unprobed", "rejected"])
+@pytest.mark.parametrize("planned", [False, True])
+def test_mr1c_load_requires_admitted_band_endpoints(tmp_path, monkeypatch, host, intent, state, planned):
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    coding = next(row for row in data["hosts"] if (row["host"], row["class"]) == (host, "coding"))
+    coding["admission"][intent] = state
+    if planned:
+        for row in data["hosts"]:
+            if row["host"] == host:
+                row["host_status"] = "planned"
+    path = tmp_path / "bindings.json"
+    raw = json.dumps(data).encode()
+    path.write_bytes(raw)
+    monkeypatch.setattr("tools.hierarchy_provision.read_pinned_bindings",
+                        lambda setup, base: (path, path.read_bytes()))
+
+    def load(_):
+        try:
+            _, rows, digest, _ = provision.load_model_bindings({}, tmp_path)
+        except ValueError as exc:
+            return str(exc)
+        return "loaded", rows[host, "coding"]["admission"][intent], digest
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        answers = list(workers.map(load, range(6)))
+    assert all(answer == answers[0] for answer in answers)
+    assert load(None) == answers[0]
+    assert path.read_bytes() == raw
+    if planned or state == "admitted":
+        assert answers[0][:2] == ("loaded", state)
+        if planned:
+            with pytest.raises(ValueError, match="^host is planned; Teams support is not qualified$"):
+                provision.require_selectable_host(provision.load_model_bindings({}, tmp_path), host)
+    else:
+        assert answers[0] == ("invalid model bindings %s: band default and ceiling levels must be admitted; "
+                              "probe the level or repair model-bindings.json" % path)
+        coding["admission"][intent] = "admitted"
+        path.write_text(json.dumps(data))
+        assert load(None)[:2] == ("loaded", "admitted")
+
+
+def test_mr1c_registry_admits_only_probed_supported_coding_levels():
+    data = fixture_case("valid")
+    for row in data["hosts"]:
+        for intent, level in row["levels"].items():
+            expected = ("admitted" if row["host"] in ("claude-code", "codex-cli") and
+                        row["class"] == "coding" and level is not None else "unprobed")
+            assert row["admission"][intent] == expected
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("state", ["admitted", "rejected", "unprobed", "null"])
+def test_mr1c_planned_admission_is_repeatable_and_does_not_mutate_inputs(host, state):
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    roles = {row["kind"]: row for row in data["roles"]}
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == (host, "coding"))
+    row["admission"]["extended"] = "admitted" if state == "null" else state
+    if state == "null":
+        row["levels"]["extended"] = None
+    bindings = (roles, {(host, "coding"): row}, "0" * 64, REPO / "bindings.json")
+    options = {"model": row["model"], "effort": "xhigh"}
+    before = copy.deepcopy((bindings, options))
+
+    def resolve(_):
+        try:
+            return provision.planned_model_settings(bindings, host, "implementer", options, None)
+        except ValueError as exc:
+            return str(exc)
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        answers = list(workers.map(resolve, range(6)))
+    assert all(answer == answers[0] for answer in answers)
+    assert resolve(None) == answers[0]
+    assert (bindings, options) == before
+    if state == "admitted":
+        assert answers[0][1]["admission"] == "admitted"
+    elif state == "null":
+        assert answers[0] == ("implementer effort xhigh has no supported intent; supported intents: "
+                              "light, standard, deep, max; choose a supported effort")
+    else:
+        assert answers[0] == ("%s intent extended (effort xhigh) is not admitted for %s; "
+                              "choose an admitted supported level" % (row["model"], host))
 
 
 def fixture_case(case):

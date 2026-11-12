@@ -94,6 +94,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team_profile_display": 0,
     "aegis_core.team_templates": 0,
     "aegis_core.team_hosts": 2,
+    "aegis_core.team_gitops": 0,
     "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.
     "aegis_core.manager_policy": 1,

@@ -127,8 +127,28 @@ def test_mr4_usage_alias_does_not_change_selection_or_decision_bytes(bindings, p
     assert choose(bindings, policy) == expected
 
 
+def test_mr1c_current_registry_admits_exactly_the_probed_tuples(bindings):
+    expected = {
+        (host, "coding", model, intent)
+        for host, model in (("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol"))
+        for intent in ("light", "standard", "deep", "extended", "max")
+    }
+    actual = {
+        (row["host"], row["class"], row["model"], intent): state
+        for row in bindings["hosts"] for intent, state in row["admission"].items()
+    }
+    assert {key for key, state in actual.items() if state == "admitted"} == expected
+    assert all(state == "unprobed" for key, state in actual.items() if key not in expected)
+
+
 def test_mr4_existing_choices_and_records_match_integration_tip(bindings, policy):
     # Captured from 99d399a9 before product edits; no git history is needed to run this test.
+    # Freeze the former input admission values before the MR-1c coding probes.
+    for row in bindings["hosts"]:
+        if (row["host"], row["class"], row["model"]) in {
+                ("claude-code", "coding", "claude-opus-5-5"),
+                ("codex-cli", "coding", "gpt-6.1-sol")}:
+            row["admission"].update(dict.fromkeys(("light", "standard", "deep", "extended", "max"), "unprobed"))
     history, results = [], []
     for task, role in (("T1", "orchestrator"), ("T1", "decider"), ("T2", "implementer"),
                        ("T9", "integrator"), ("T4", "reviewer"), ("T5", "reviewer"),
@@ -296,7 +316,7 @@ def test_family_split_and_replay(bindings, policy):
     assert [r["choice"]["family"] for r in history] == [
         "first", "second", "first", "first", "second", "first", "first", "second", "first", "first"]
     assert choice == {"host": "codex-cli", "class": "coding", "model": "gpt-6.1-sol",
-                      "level": "high", "family": "first", "reason": "family_split", "admission": "unprobed"}
+                      "level": "high", "family": "first", "reason": "family_split", "admission": "admitted"}
     assert (bindings, policy) == before
 
 
