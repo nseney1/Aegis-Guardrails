@@ -161,6 +161,14 @@ def test_native_host_not_qualified():
         profile.resolve(repo={"model_settings": {"hosts": {"primary": {"kind": "codex"}}}})
 
 
+@pytest.mark.parametrize("role", ["writer", "reviewer.correctness", "reviewer.security", "research", "lens.extra"])
+def test_candidate_host_cannot_enable_any_role(role):
+    with pytest.raises(profile.ProfileError, match="^host kind not qualified for team-run roles$"):
+        profile.resolve(repo={"model_settings": {
+            "hosts": {"candidate": {"kind": "antigravity"}},
+            "roles": {role: {"hosts": ["candidate"]}}}})
+
+
 def test_fallback_must_be_declared_and_respect_pinned_family():
     with pytest.raises(profile.ProfileError, match="undeclared"):
         profile.resolve(repo={"model_settings": {"capacity": {"primary": {"fallback": {"review": ["absent"]}}}}})
@@ -524,7 +532,12 @@ def test_registry_data_matches_tracked_registry():
                 constants[node.targets[0].id] = node.value.value
             if node.targets[0].id == "HOST_KINDS":
                 kinds = {constants[item.id] for item in node.value.elts}
-    assert set(profile.PRESET_DATA["hosts"]) == kinds
+    from aegis_core import hosts
+    candidates = {spec.id for spec in hosts.all_hosts() if spec.team_adapter}
+    assert set(profile.PRESET_DATA["hosts"]) == kinds | candidates
+    for kind in candidates - kinds:
+        assert profile.PRESET_DATA["hosts"][kind]["writer"] is False
+        assert profile.PRESET_DATA["hosts"][kind]["boundary"] is None
     registry = next(node.value for node in tree.body if isinstance(node, ast.Assign)
                     and any(isinstance(target, ast.Name) and target.id == "_HOSTS" for target in node.targets))
     for key, value in zip(registry.keys, registry.values):
