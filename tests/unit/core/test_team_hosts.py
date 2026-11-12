@@ -175,7 +175,7 @@ def test_dense_routing_counts_edges_and_queue_operations(monkeypatch):
         plans[kind, start_host] += 1
         return original_plan(document, kind, start_host=start_host)
 
-    monkeypatch.setattr(profile, "deque", CountedDeque, raising=False)
+    monkeypatch.setattr(profile, "deque", CountedDeque)
     monkeypatch.setattr(profile, "plan", counted_plan)
 
     def assert_work():
