@@ -42,7 +42,7 @@ from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESS
 from aegis_mcp.handlers.msg import message_result
 from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 from .stdio_reader import FrameError, MANAGER_MAX_BYTES, REPOSITORY_MAX_BYTES, input_stream, read_frame
-from .tools import SERVER_INJECTED, execute_tool, is_known_tool
+from .tools import SERVER_INJECTED, model_argument_refusal, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
 # client might still send. A client value is dropped before dispatch, so the workspace, the
@@ -327,6 +327,25 @@ def _message_failure(req_id, error):
     return _message_refusal(req_id, "E_AUTH", detail="operation")
 
 
+def _model_request_refusal(req_id, params):
+    if not isinstance(params, dict) or params.get("name") != "aegis_team_model":
+        return None
+    supplied = params.get("arguments", {})
+    refusal = model_argument_refusal(supplied)
+    if refusal is not None:
+        return _tool_result(req_id, json.dumps(refusal), True)
+    if _workspace_error is not None:
+        return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
+    return None
+
+
+def _model_repository_call(req_id, params, name, args):
+    try:
+        return _repository_call(req_id, params, name, args)
+    except Exception:
+        return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
+
+
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
@@ -383,6 +402,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _manager_config is not None:
         return _manager_call(req_id, params)
 
+    model_refusal = _model_request_refusal(req_id, params)
+    if model_refusal is not None:
+        return model_refusal
     if isinstance(params, dict) and params.get("name") == "aegis_team_config":
         supplied = params.get("arguments")
         if supplied is not None and (not isinstance(supplied, dict) or supplied):
@@ -416,6 +438,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         max_calls, window = _RATE_LIMITS[name]
         return _error(req_id, -32000, f"Rate limit exceeded for '{name}': max {max_calls} calls per {window}s")
 
+    if name == "aegis_team_model":
+        return _model_repository_call(req_id, params, name, args)
     if name in ("aegis_msg_read", "aegis_msg_write"):
         try:
             return _repository_call(req_id, params, name, args)
@@ -434,6 +458,8 @@ def _repository_call(req_id, params, name, args):
     elif binding.status == "unbound" and name == "aegis_scan":
         args["_unbound"] = binding.reason
     else:
+        if name == "aegis_team_model":
+            return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):
             detail = {"unbound": "workspace", "hold": "hold"}.get(binding.status, "binding")
             return _message_refusal(req_id, "E_AUTH", detail=detail, binding_reason=binding.reason)
@@ -447,6 +473,8 @@ def _repository_call(req_id, params, name, args):
         with contextlib.redirect_stdout(sys.stderr):
             result = execute_tool(name, args)
     except Exception as exc:
+        if name == "aegis_team_model":
+            return _tool_result(req_id, json.dumps({"error": "model_io_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):
             return _message_failure(req_id, exc)
         traceback.print_exc(file=sys.stderr)

@@ -33,6 +33,304 @@ VIEW_KEYS = ["lane", "role", "owner", "claim_id", "gen", "oid", "branch", "paths
              "clock_basis", "expired", "clock_skew", "overlaps"]
 
 
+@pytest.mark.parametrize("argv", [
+    ["team", "model", "--json"],
+    ["--json", "team", "model", "--unknown", "token=private-value"],
+    ["--json=token=private-value", "team", "model"],
+    ["team", "model", "--bindings", "--json"],
+])
+def test_model_usage_is_json_exit_two_without_echo(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_model_workspace_failure_is_json_exit_two(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AEGIS_WORKSPACE", str(tmp_path / "missing-pin"))
+    assert main(["team", "model", "--bindings", "b", "--policy", "p", "--history", "h",
+                 "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane",
+                 "--host-kind", "codex-cli", "--workspace", "token=private-value", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_workspace_unavailable"}
+
+
+def test_model_host_registry_is_bounded_during_argument_parsing(capsys):
+    assert main(["team", "model", "--json"] + ["--host-kind", "host"] * 257) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_model_workspace_text_is_bounded_before_resolution(capsys):
+    assert main(["team", "model", "--workspace", "x" * 262145, "--bindings", "b", "--policy", "p",
+                 "--history", "h", "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane",
+                 "--host-kind", "host", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def _model_argv_with_workspace(root, option, location):
+    workspace = [option + str(root)] if option.endswith("=") else [option, str(root)]
+    prefix = workspace + ["team", "model"] if location == "global" else ["team", *workspace, "model"]
+    return prefix + ["--bindings", "bindings.json", "--policy", "policy.json", "--history", "history.jsonl",
+                     "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane-one",
+                     "--host-kind", "codex-cli", "--json"]
+
+
+@pytest.mark.parametrize("option", ["--work", "--worksp", "--workspace=", "--worksp="])
+@pytest.mark.parametrize("location", ["global", "team"])
+@pytest.mark.parametrize("failure", ["usage", "workspace"])
+def test_model_workspace_spellings_keep_fixed_json_errors(tmp_path, monkeypatch, capsys, option, location, failure):
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    argv = _model_argv_with_workspace(root, option, location)
+    if failure == "usage":
+        argv.extend(["--unknown", "token=private-value"])
+        error = "invalid_model_arguments"
+    else:
+        monkeypatch.setenv("AEGIS_WORKSPACE", str(tmp_path / "missing-pin"))
+        error = "model_workspace_unavailable"
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": error}
+
+
+@pytest.mark.parametrize("location", ["global", "team"])
+def test_abbreviated_workspace_operation_failure_is_fixed_json(tmp_path, monkeypatch, capsys, location):
+    from types import SimpleNamespace
+    from aegis_core import model_select
+
+    if not model_select._DIR_FD_SUPPORTED:
+        pytest.skip("requires anchored model-selection I/O")
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    (root / "bindings.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+
+    def fail(*args, **kwargs):
+        import sys
+
+        print("token=private-value")
+        print("token=private-value", file=sys.stderr)
+        raise TypeError("token=private-value")
+
+    module_os = SimpleNamespace(**{name: getattr(os, name) for name in dir(os)})
+    module_os.open = fail
+    monkeypatch.setattr(model_select, "os", module_os)
+    assert main(_model_argv_with_workspace(root, "--worksp", location)) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_io_unavailable"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["--=token=private-value", "team", "model"],
+    ["team", "--=token=private-value", "model"],
+    ["team", "model", "--=token=private-value"],
+    ["--unknown", "token=private-value", "team", "model"],
+    ["team", "--unknown", "token=private-value", "model"],
+    ["team", "token=private-value", "model"],
+    ["team", "--unknown=token=private-value", "model"],
+    ["team", "model", "--unknown", "token=private-value"],
+    ["team", "model", "token=private-value"],
+], ids=["ambiguous-root", "ambiguous-team", "ambiguous-model", "unknown-value-root",
+        "unknown-value-before", "value-before", "unknown-equals-before", "unknown-value-after", "value-after"])
+def test_parser_routes_unknown_values_to_model_json_errors(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["audit", "team", "model"],
+    ["hook", "stop", "team", "model"],
+    ["--work", "team", "model"],
+    ["--unknown", "token=private-value", "msg", "team", "model"],
+])
+def test_model_invocation_superset_covers_preparse_refusals(capsys, argv):
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+@pytest.mark.parametrize("option", ["--w", "--wo", "--wor", "--work", "--works", "--worksp",
+                                   "--workspa", "--workspac", "--workspace", "--work=",
+                                   "--worksp=", "--workspace="])
+@pytest.mark.parametrize("name", ["audit", "install", "report", "agent"])
+@pytest.mark.parametrize("failure", ["usage", "workspace"])
+def test_removed_command_workspace_values_keep_model_json(tmp_path, monkeypatch, capsys, option, name, failure):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    argv = _model_argv_with_workspace(name, option, "global")
+    if failure == "usage":
+        argv.extend(["--unknown", "token=private-value"])
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    error = "invalid_model_arguments" if failure == "usage" else "model_workspace_unavailable"
+    assert json.loads(captured.out) == {"error": error}
+
+
+@pytest.mark.parametrize("option", ["--w", "--wo", "--wor", "--work", "--works", "--worksp",
+                                   "--workspa", "--workspac", "--workspace", "--work=",
+                                   "--worksp=", "--workspace="])
+def test_root_workspace_values_are_not_removed_commands(capsys, option):
+    workspace = [option + "audit"] if option.endswith("=") else [option, "audit"]
+    with pytest.raises(SystemExit) as exited:
+        main(workspace + ["status", "--help"])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "usage: aegis status" in captured.out
+
+
+@pytest.mark.parametrize("option", ["--round-workspace", "--round-work", "--round-work="])
+def test_removed_command_scan_uses_the_built_root_option_table(monkeypatch, capsys, option):
+    from aegis_cli import cli as cli_module
+
+    build_parser = cli_module._build_parser
+
+    def build(*args, **kwargs):
+        parser = build_parser(*args, **kwargs)
+        parser.add_argument("--round-workspace")
+        return parser
+
+    monkeypatch.setattr(cli_module, "_build_parser", build)
+    values = [option + "audit"] if option.endswith("=") else [option, "audit"]
+    with pytest.raises(SystemExit) as exited:
+        main(values + ["status", "--help"])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "usage: aegis status" in captured.out
+
+
+@pytest.mark.parametrize("argv", [
+    ["--=token=private-value", "status"],
+    ["--unknown", "token=private-value", "status"],
+    ["--unknown", "token=private-value", "model", "team"],
+    ["--unknown", "token=private-value", "--", "team", "model"],
+    ["--unknown", "token=private-value", "team", "--", "model"],
+    ["--unknown", "token=private-value", "team=model"],
+])
+def test_non_model_root_failures_keep_argparse_diagnostics(capsys, argv):
+    with pytest.raises(SystemExit) as exited:
+        main(argv)
+    assert exited.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "error:" in captured.err
+    assert "token=private-value" in captured.err
+
+
+def test_genuine_removed_audit_command_keeps_its_pointer(capsys):
+    assert main(["audit"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "aegis audit was removed in v4: use aegis doctor\n"
+
+
+@pytest.mark.parametrize("option,expected", [("--help", "Aegis"), ("--version", f"aegis {__version__}")])
+def test_non_model_keeps_successful_root_output(capsys, option, expected):
+    with pytest.raises(SystemExit) as exited:
+        main([option])
+    assert exited.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert expected in captured.out
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["hook", "run"], []),
+    # Root help already loads command metadata through the existing registry.
+    (["--help"], ["aegis_cli.team", "aegis_core.team_profile"]),
+], ids=["hook", "root-help"])
+def test_non_model_startup_preserves_baseline_imports(tmp_path, argv, expected):
+    import sys
+
+    root = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ, PYTHONPATH=str(root))
+    environment.pop("AEGIS_WORKSPACE", None)
+    script = """import contextlib, io, json, sys
+from aegis_cli.cli import main
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        code = main(json.loads(sys.argv[1]))
+    except SystemExit as error:
+        code = error.code
+assert code == 0, code
+print(json.dumps(sorted(sys.modules)))
+"""
+    result = subprocess.run([sys.executable, "-c", script, json.dumps(argv)], cwd=tmp_path,
+                            env=environment, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    modules = json.loads(result.stdout)
+    watched = {"aegis_cli.team", "aegis_core.model_select", "aegis_core.team_profile"}
+    assert sorted(set(modules) & watched) == expected
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("argv", [
+    ["--work", "team", "--work", "model"],
+    ["team", "--work", "model", "--workspace", "token=private-value"],
+    ["team", "--work", "model"],
+    ["--worksp", "team", "--worksp", "model"],
+    ["team", "--worksp", "model", "--workspace=token=private-value"],
+    ["team", "--workspace=unused", "--worksp", "model"],
+    ["--workspace=unused", "--work", "team", "--worksp", "model"],
+    ["--work", "team", "--workspace=model", "model"],
+    ["--worksp", "team", "model"],
+    ["--work", "team", "status", "--work", "model"],
+    ["team", "claim", "docs", "--paths", "docs/**", "--owner", "model"],
+    ["--help", "team", "model"],
+    ["--version", "team", "model"],
+    ["team", "--help", "model"],
+    ["team", "model", "--help"],
+    ["hook", "run", "team", "model"],
+    ["hook", "run", "--host", "team", "model"],
+])
+def test_raw_model_invocation_has_only_model_json_outcomes(tmp_path, monkeypatch, capsys, argv, pinned):
+    root = tmp_path / "workspace"
+    (root / ".aegis" / "rules").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    if pinned:
+        monkeypatch.setenv("AEGIS_WORKSPACE", str(root))
+    else:
+        monkeypatch.delenv("AEGIS_WORKSPACE", raising=False)
+    assert main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_outer_model_policy_covers_stdout_setup_failure(monkeypatch, capsys):
+    import sys
+    from types import SimpleNamespace
+    from aegis_cli import cli as cli_module
+
+    def fail(**kwargs):
+        print("token=private-value")
+        print("token=private-value", file=sys.stderr)
+        raise OSError("token=private-value")
+
+    # Replace this module's reference, leaving pytest's process streams intact.
+    monkeypatch.setattr(cli_module, "sys", SimpleNamespace(stdout=SimpleNamespace(reconfigure=fail)))
+    assert main(["team", "model"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {"error": "model_io_unavailable"}
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
