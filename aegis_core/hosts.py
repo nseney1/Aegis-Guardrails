@@ -53,6 +53,15 @@ APP_DIRS = {
     "win32": ("%LOCALAPPDATA%/Programs",),
 }
 
+_TEAM_MARKERS = ("AEGIS_TEAM_HOST", "AEGIS_TEAM_SESSION")
+_CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
+_CODEX_MARKERS = _TEAM_MARKERS + (
+    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_VERSION")
+_CLAUDE_BILLING = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                   "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+_CLAUDE_MARKERS = _TEAM_MARKERS + ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
+
 
 @dataclass(frozen=True)
 class Registration:
@@ -104,11 +113,26 @@ class HostSpec:
     apps: Tuple[Tuple[str, str], ...] = ()
     #: For a host Aegis never registers: where a surface of it that Aegis does govern goes.
     redirect: str = ""
+    #: Optional candidate Teams adapter module; registration does not qualify roles.
+    team_adapter: str = ""
+    #: Review independence family, separate from product identity and display vendor.
+    team_family: str = ""
+    #: Inherited credential/billing names to scrub from every host child.
+    #: Empty means no measured names, not runtime qualification of that host.
+    billing_variables: Tuple[str, ...] = ()
+    #: Every registry row includes the common Aegis markers. Additional names
+    #: and prefixes mirror the observed legacy host environment catalog.
+    session_markers: Tuple[str, ...] = _TEAM_MARKERS
+    session_marker_prefixes: Tuple[str, ...] = ()
+    #: Launcher-local auth overrides must not cross a child boundary either.
+    environment_overrides: Tuple[str, ...] = ()
 
 
 HOSTS: Tuple[HostSpec, ...] = (
     HostSpec(
         id="codex-cli",
+        billing_variables=_CODEX_BILLING,
+        session_markers=_CODEX_MARKERS,
         display_name="Codex CLI",
         vendor="OpenAI",
         client_names=("codex-mcp-client",),
@@ -134,6 +158,9 @@ HOSTS: Tuple[HostSpec, ...] = (
     ),
     HostSpec(
         id="claude-code",
+        billing_variables=_CLAUDE_BILLING,
+        session_markers=_CLAUDE_MARKERS,
+        session_marker_prefixes=("CLAUDE_CODE_",),
         display_name="Claude Code",
         vendor="Anthropic",
         client_names=("claude-code",),
@@ -155,6 +182,9 @@ HOSTS: Tuple[HostSpec, ...] = (
     ),
     HostSpec(
         id="claude-desktop",
+        billing_variables=_CLAUDE_BILLING,
+        session_markers=_CLAUDE_MARKERS,
+        session_marker_prefixes=("CLAUDE_CODE_",),
         display_name="Claude Desktop",
         vendor="Anthropic",
         client_prefixes=("local-agent-mode-",),
@@ -168,6 +198,8 @@ HOSTS: Tuple[HostSpec, ...] = (
     ),
     HostSpec(
         id="antigravity",
+        billing_variables=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        environment_overrides=("TEAMS_GEMINI_MODE", "TEAMS_GEMINI_KEY_FILE"),
         display_name="Antigravity",
         vendor="Google",
         client_names=("antigravity-client",),
@@ -182,9 +214,12 @@ HOSTS: Tuple[HostSpec, ...] = (
         # DOC for hooks, rules and AGENTS.md; the app's MCP file is UNVERIFIED (same format).
         surfaces=("Antigravity app", "Antigravity IDE", "agy CLI"),
         aliases=("antigravity-app", "antigravity-ide"),
+        team_adapter="aegis_core.team_host_agy",
+        team_family="google",
     ),
     HostSpec(
         id="gemini-cli",
+        billing_variables=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         display_name="Gemini CLI",
         vendor="Google",
         client_names=("gemini-cli-mcp-client",),
