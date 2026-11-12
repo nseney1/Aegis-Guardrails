@@ -315,7 +315,7 @@ Preview model selection as JSON; --record atomically selects and appends. Errors
 | `--role-kind` | `ROLE_KIND` |  | Seat kind: orchestrator, decider, implementer, integrator or reviewer |
 | `--subject` | `SUBJECT` |  | Single-line lane/endpoint/generation identifier for this decision |
 | `--host-kind` | `HOST_KINDS` |  | Host registry kind; repeat for each host (at most 256) |
-| `--intent` | `INTENT` |  | Semantic intent: light, standard, deep, extended or max; default from policy/role band |
+| `--intent` | `INTENT` |  | Semantic intent: light, standard, deep, extended, max or ultra; default from policy/role band |
 | `--author-family` | `AUTHOR_FAMILY` |  | Author family required for reviews; T7 binds it to its chosen family |
 | `--lane-family` | `LANE_FAMILY` |  | Lane family required for T3; writer lanes must match team_family |
 | `--review-stage` | `REVIEW_STAGE` | `"primary"` | Review stage: primary, correctness, security, whole or second as allowed by the task |
@@ -775,7 +775,7 @@ Select a model inside the workspace with the same JSON as aegis team model; reco
 | `role_kind` | string | yes | Seat: orchestrator, decider, implementer, integrator or reviewer. |
 | `subject` | string | yes | Single-line lane/endpoint/generation identifier. |
 | `host_kinds` | array of string | yes | Explicit host registry kinds; at most 256. |
-| `intent` | string | no | Semantic light, standard, deep, extended or max; defaults to policy/role band. |
+| `intent` | string | no | Semantic light\|standard\|deep\|extended\|max\|ultra; defaults to policy/role band. |
 | `author_family` | string | no | Known author family required for reviews; T7 binds its chosen family. |
 | `lane_family` | string | no | Required for T3; writer lane family must match team_family. |
 | `review_stage` | string | no | Primary, correctness, security, whole or second as allowed by the task. |
@@ -822,7 +822,7 @@ Input schema:
     },
     "intent": {
       "type": "string",
-      "description": "Semantic light, standard, deep, extended or max; defaults to policy/role band."
+      "description": "Semantic light|standard|deep|extended|max|ultra; defaults to policy/role band."
     },
     "author_family": {
       "type": "string",
