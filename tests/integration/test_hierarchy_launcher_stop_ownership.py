@@ -618,7 +618,7 @@ def test_r31_namespace_refusal_preserves_live_custody_and_consumers(r2_case, cap
         probe["procfs_pid"] += 1
     elif fault == "boot":
         probe["boot"] = "00000000-0000-0000-0000-000000000000"
-    monkeypatch.setattr(module, "pid_namespace_probe", lambda: None if fault == "unreadable" else probe, raising=False)
+    monkeypatch.setattr(module, "pid_namespace_probe", lambda: None if fault == "unreadable" else probe)
     # MODELLED B's syscall/proc view: P and G are absent there although the original A child is live.
     module.process_census = lambda session: module.ProcessCensus([], "proven")
     module.read_process = lambda pid, *args: module.ProcessObservation("CONFIRMED_ABSENT", pid,
@@ -2451,7 +2451,7 @@ def test_r23_cleanup_holds_pending_mailbox_admission(r2_case, capsys, monkeypatc
                     return result
             control.Runner = LateClaim
         elif fault == "unsupported":
-            monkeypatch.setattr(module, "mailbox_wake_inspection_capable", lambda: False, raising=False)
+            monkeypatch.setattr(module, "mailbox_wake_inspection_capable", lambda: False)
         else:
             shutil.copytree(base, replacement)
             alternate = replacement / "mailbox" / marker.name
@@ -2634,7 +2634,7 @@ def test_r22_restricted_procfs_has_an_explicit_manual_refusal(r2_case, capsys, m
         def unsupported(observation):
             faults.append(observation.kind)
             return False
-        monkeypatch.setattr(module, "procfs_exit_evidence_supported", unsupported, raising=False)
+        monkeypatch.setattr(module, "procfs_exit_evidence_supported", unsupported)
     r22_wake_processes(r2_case, module, monkeypatch)
     code = module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW, "--dry-run"])
     answer = json.loads(capsys.readouterr().out)
@@ -3628,7 +3628,7 @@ def test_r21_resume_can_be_stopped_mid_turn(r2_case, capsys, monkeypatch, host, 
                 return r2_case.home
         wake.Path = Paths
         return wake
-    monkeypatch.setattr(module, "load_wake", load_wake, raising=False)
+    monkeypatch.setattr(module, "load_wake", load_wake)
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(module.resume, module.Launches(str(r2_case.launch.base)), REVIEW, False)
         try:
@@ -7798,6 +7798,50 @@ def test_stop_spares_an_unknown_node_option_value(launch, children, monkeypatch,
     assert held.poll() is None
 
 
+@pytest.mark.parametrize("missing", ["open", "send", "both"])
+@pytest.mark.parametrize("scenario,error,change", [
+    ("unsupported", 38, None), ("unsupported", 1, None), ("unsupported", 5, None),
+    ("descendants", None, None), ("descendants", None, "cmdline"),
+    ("descendants", None, "unreadable"), ("descendants", None, "named-session"),
+])
+def test_pidfd_fallback_cases_run_without_optional_apis(launch, children, monkeypatch, capsys,
+                                                      missing, scenario, error, change):
+    from types import SimpleNamespace
+
+    class WithoutPidfds:
+        projection = children.projection
+
+        def __call__(self, *args, **kwargs):
+            return children(*args, **kwargs)
+
+        def module(self, pidfds=True):
+            # The real fixture refuses native mode before loading the consumer on such builds.
+            assert pidfds is False, "fallback case requested native pidfd qualification"
+            module = children.module(pidfds=False)
+            # Delete only from owned copies: no stdlib mutation reaches pytest or cleanup.
+            module.os.original = SimpleNamespace(**{**vars(os)})
+            module.signal.original = SimpleNamespace(**{**vars(signal)})
+            if missing in ("open", "both"):
+                if hasattr(module.os.original, "pidfd_open"):
+                    del module.os.original.pidfd_open
+                assert not hasattr(module.os.original, "pidfd_open")
+                # The explicit ENOSYS fixture seam remains available on an API-less build.
+            if missing in ("send", "both"):
+                if hasattr(module.signal.original, "pidfd_send_signal"):
+                    del module.signal.original.pidfd_send_signal
+                if hasattr(module.signal, "pidfd_send_signal"):
+                    del module.signal.pidfd_send_signal
+                assert not hasattr(module.signal, "pidfd_send_signal")
+            return module
+
+    absent = WithoutPidfds()
+    if scenario == "unsupported":
+        test_stop_falls_back_only_when_pidfd_is_unsupported(launch, absent, monkeypatch, capsys, error)
+    else:
+        test_stop_retains_stubborn_descendants_after_the_middle_exits(
+            launch, absent, monkeypatch, capsys, False, change)
+
+
 @pytest.mark.parametrize("error", [1, 38, 5])
 def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkeypatch, capsys, error):
     session = str(uuid.uuid4())
@@ -7807,9 +7851,9 @@ def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkey
     def unavailable(pid):
         raise OSError(error, "pidfd unavailable")
 
-    module = children.module()
-    monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
-    monkeypatch.setattr(module.signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"), raising=False)
+    module = children.module(pidfds=False)
+    monkeypatch.setattr(module.os, "pidfd_open", unavailable)
+    module.signal = R2Facade(module.signal, pidfd_send_signal=lambda *args: pytest.fail("unopened pidfd signalled"))
     code = module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"])
     answer = json.loads(capsys.readouterr().out)
     if error == 38:  # ENOSYS establishes lack of kernel capability; other errors do not.
@@ -7822,6 +7866,15 @@ def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkey
         assert held.poll() is None
         custody = module.Launches(str(launch.base)).folder(REVIEW) / ".stop-custody" / "state.json"
         assert json.loads(custody.read_text())["active"]
+        assert children.projection.events == []
+
+        def unsupported(pid):
+            raise OSError(38, "pidfd unsupported on retry")
+
+        module.os = R2Facade(module.os, pidfd_open=unsupported)
+        assert module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"]) == 0
+        assert json.loads(capsys.readouterr().out)["pids"] == [held.pid]
+        assert held.wait(timeout=5) == -signal.SIGTERM
 
 
 def test_stop_spares_a_forked_claude_session(launch, children):
@@ -8037,7 +8090,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     middle = children(sys.executable, "-c", CHILD, logical_argv=None)
     worker = children(str(launch.tmp / "worker"), "-c", ignore_term, logical_argv=None, body=ignore_term)
     present_family(children.projection, {middle.pid: (leader.pid, leader.pid), worker.pid: (leader.pid, middle.pid)})
-    module = children.module()
+    module = children.module(pidfds=use_pidfds)
     term_done, handles, events = [], {}, []
     kill = module.os.kill
 
@@ -8071,7 +8124,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     else:
         def unavailable(*args):
             raise OSError(errno.ENOSYS, "pidfds unavailable")
-        monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
+        monkeypatch.setattr(module.os, "pidfd_open", unavailable)
 
     def changed(pid, count, row):
         if term_done and pid == worker.pid:
@@ -8117,8 +8170,8 @@ def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, childre
         actors.append(process)
         return process
 
-    def module():
-        loaded = children.module()
+    def module(pidfds=True):
+        loaded = children.module(pidfds=pidfds)
         killing = loaded.os.kill
 
         def delayed(pid, number):

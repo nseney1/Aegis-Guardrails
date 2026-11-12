@@ -476,7 +476,7 @@ def reporting(tmp_path, monkeypatch):
     monkeypatch.setattr(treeid, "bind", bind)
     # The process-lifetime maps start empty, as in a fresh server.
     monkeypatch.setattr(telemetry, "_RECORDED", type(telemetry._RECORDED)())
-    monkeypatch.setattr(telemetry, "_EDITS", {}, raising=False)
+    monkeypatch.setattr(telemetry, "_EDITS", {})
 
     def report(key: str, session: str = "S") -> dict:
         return telemetry.handle_report_outcome({

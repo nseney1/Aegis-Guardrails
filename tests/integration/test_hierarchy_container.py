@@ -719,7 +719,7 @@ def container_registry(monkeypatch, entries, kinds=None):
 
     # Replace only the consumer's module reference, never the shared registry.
     monkeypatch.setattr(verifier, "hierarchy_hosts", SimpleNamespace(
-        TEAM_HOSTS=registry.TEAM_HOSTS if kinds is None else kinds, entry=entry), raising=False)
+        TEAM_HOSTS=registry.TEAM_HOSTS if kinds is None else kinds, entry=entry))
 
 
 def test_registry_host_environment_golden(adapter, layout):
