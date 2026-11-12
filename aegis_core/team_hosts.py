@@ -11,9 +11,13 @@ and invalid host/KIND arguments remain 2. Advice does not authorize execution.
 from __future__ import annotations
 
 from datetime import datetime
+from importlib import import_module
 import math
 
-from aegis_core import team_profile
+from aegis_core import hosts as host_registry, team_profile
+from aegis_core.team_host_adapter import (
+    HostAdapter as HostAdapter, HostAdapterError as HostAdapterError, copy_environment,
+)
 from aegis_core.team_profile import NEXT_ACTION_TEMPLATES as NEXT_ACTION_TEMPLATES
 
 
@@ -21,14 +25,60 @@ __all__ = [
     "EXIT_CODES",
     "FakeUsageAdapter",
     "HostCapacity",
+    "HostAdapter",
+    "HostAdapterError",
     "NEXT_ACTION_TEMPLATES",
     "UnconfiguredUsageAdapter",
     "normalize_usage",
     "usage_adapter",
+    "host_adapter",
+    "scrub_child_environment",
 ]
 
 
 EXIT_CODES = {"go": 0, "hold": 3, "fallback": 4, "skip": 5, "refused": 1, "usage": 2}
+
+
+def scrub_child_environment(environment):
+    """Return a bounded private snapshot and a child free of all host controls.
+
+    Both results are private process inputs, never display/evidence payloads.
+    The adapter may deliberately re-add its selected credential and markers
+    after this single registry-driven, case-insensitive scrub. Returning the
+    snapshot separately permits that selection without importing this service
+    from a lower-layer adapter or rereading a mutable caller Mapping.
+    """
+    snapshot = copy_environment(environment)
+    names, prefixes = set(), []
+    for spec in host_registry.all_hosts():
+        names.update(name.upper() for name in (*spec.billing_variables, *spec.session_markers,
+                                               *spec.environment_overrides))
+        prefixes.extend(prefix.upper() for prefix in spec.session_marker_prefixes)
+    prefixes = tuple(prefixes)
+    child = {key: value for key, value in snapshot.items()
+             if key.upper() not in names and not key.upper().startswith(prefixes)}
+    return snapshot, child
+
+
+def host_adapter(host_kind):
+    """Resolve an explicitly registered adapter; never select another provider."""
+    action = "Select a registered host with a candidate adapter; no provider fallback is permitted."
+    if type(host_kind) is not str or len(host_kind) > 128:
+        raise HostAdapterError("host_adapter_unavailable", action, exit_code=2)
+    try:
+        spec = host_registry.get(host_registry.resolve(host_kind))
+    except KeyError:
+        raise HostAdapterError("host_adapter_unavailable", action, exit_code=2) from None
+    if not spec.team_adapter:
+        raise HostAdapterError("host_adapter_unavailable", action)
+    # The module path is trusted registry data, never profile or model input.
+    try:
+        adapter = import_module(spec.team_adapter).Adapter(scrub_environment=scrub_child_environment)
+    except (ImportError, AttributeError):
+        raise HostAdapterError("host_adapter_unavailable", action) from None
+    if not isinstance(adapter, HostAdapter):
+        raise HostAdapterError("host_adapter_unavailable", action)
+    return adapter
 
 
 class UnconfiguredUsageAdapter:
