@@ -43,7 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from aegis_cli import stdin_is_tty as _stdin_is_tty
 from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
-from aegis_core import gitsafe, governance, human_gate
+from aegis_core import approval_policy, gitsafe, governance, human_gate
 
 __all__ = ["ApproveCommand", "run_approve"]
 
@@ -71,6 +71,16 @@ def _review_text(value: object) -> str:
     """Apply shared terminal filtering, then escape every remaining non-printable character."""
     text = sanitize_display(value, max_len=None)
     return ''.join(char if char.isprintable() else ascii(char)[1:-1] for char in text)
+
+
+def _base_label(value: str) -> str:
+    """Canonicalize, redact, then bound the selector used only for display."""
+    from aegis_core.redaction import redact_insight_text
+
+    if len(value) > _MAX_BASE_CHARS:
+        return "[diagnostic omitted: too_large]"
+    text = sanitize_display(value, max_len=None)
+    return redact_insight_text(text, max_len=max(len(text), _MAX_BASE_CHARS))[:_MAX_BASE_CHARS]
 
 
 def _staged(top: Path) -> bool:
@@ -114,23 +124,33 @@ def _base_review(top: Path, base_ref: str, commit: str, merge_base: str) -> str:
     return label
 
 
-def _preflight(root: Path, base: Optional[str]) -> Tuple[Path, str, str, str, str]:
-    """(top, base ref, resolved base, merge-base, review label), or a shared refusal."""
+def _preflight(root: Path, base: Optional[str]) -> Tuple[Path, str, str, str, str, Optional[str]]:
+    """(top, base ref, pinned base, merge-base, review label, target), or a refusal."""
     top = gitsafe.toplevel(root)
     if top is None:
         raise _Refused("not_git", f"{root} is not inside a git work tree")
     head = gitsafe.head_commit(top)
     if not head:
         raise _Refused("no_head", "the repository has no commit yet")
-    base_ref = base or gitsafe.resolve_base_ref(top)
-    if not base_ref:
+    if base == "":
+        base = None
+    base_ref = base if base is not None else gitsafe.resolve_base_ref(top)
+    if base_ref is None:
         raise _Refused("no_base", "no base branch found (origin/$GITHUB_BASE_REF, the branch origin/HEAD "
                                      "names, main, develop or master); pass --base")
-    base_commit = gitsafe.resolve_commit(top, base_ref)
-    merge_base = gitsafe.merge_base(top, base_commit, head) if base_commit else None
+    try:
+        resolved = approval_policy.resolve_comparison(top, base_ref, discovered=base is None)
+    except approval_policy.PolicyUnavailable as exc:
+        raise _Refused("invalid_approval_policy", approval_policy.POLICY_UNAVAILABLE_DETAIL) from exc
+    base_commit = resolved.commit
+    label = _base_label(base_ref)
+    if not base_commit:
+        origin = "fetch origin; " if base_ref.startswith(("origin/", "refs/remotes/origin/")) else ""
+        raise _Refused("no_base", f"cannot resolve the base {label!r}; {origin}fetch it or pass the full commit id")
+    merge_base = gitsafe.merge_base(top, base_commit, head)
     if not merge_base:
-        raise _Refused("no_base", f"HEAD shares no history with {base_ref}: fetch with fetch-depth 0")
-    return top, base_ref, base_commit, merge_base, _base_review(top, base_ref, base_commit, merge_base)
+        raise _Refused("no_common_history", "the resolved base and HEAD share no history; pass a base from HEAD's history")
+    return top, label, base_commit, merge_base, _base_review(top, label, base_commit, merge_base), resolved.target
 
 
 def _clean(top: Path) -> None:
@@ -187,7 +207,18 @@ def _sign(top: Path, use_json: bool, summary: List[str], what: str, message: str
 
 
 def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
-    top, base_ref, base_commit, merge_base, base_review = _preflight(root, base)
+    top, base_ref, base_commit, merge_base, base_review, target = _preflight(root, base)
+    try:
+        policy = approval_policy.resolve_policy(top, base_commit, gitsafe.head_commit(top), target)
+    except approval_policy.InvalidApprovalPolicy as exc:
+        detail = (approval_policy.POLICY_UNAVAILABLE_DETAIL if isinstance(exc, approval_policy.PolicyUnavailable)
+                  else approval_policy.INVALID_DETAIL)
+        raise _Refused("invalid_approval_policy", detail) from exc
+    if policy.mode in ("none", "review"):
+        raise _Refused("not_required", "this target does not require a signed governance approval; "
+                       "next_action: review and merge through the target branch's owner policy")
+    if policy.error:
+        print(policy.error, file=sys.stderr)
     _clean(top)
     try:
         digest = human_gate.governance_tree_hash(top, "HEAD", base=merge_base)
@@ -211,7 +242,7 @@ def _approve(root: Path, base: Optional[str], use_json: bool) -> Dict[str, Any]:
 
 
 def _approve_test_exemption(root: Path, base: Optional[str], exempt_commit: str, reason: str, use_json: bool) -> Dict[str, Any]:
-    top, base_ref, base_commit, merge_base, base_review = _preflight(root, base)
+    top, base_ref, base_commit, merge_base, base_review, _target = _preflight(root, base)
     fix_commit = gitsafe.resolve_commit(top, exempt_commit.strip())
     if not fix_commit:
         raise _Refused("unresolved", f"cannot resolve {exempt_commit!r} to a commit in {top}")
