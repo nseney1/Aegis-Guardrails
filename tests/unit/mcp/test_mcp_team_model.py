@@ -258,7 +258,8 @@ def test_malformed_arguments_refuse_without_echo_or_io(workspace, args, monkeypa
 
 
 @pytest.mark.parametrize("field,value,error", [("subject", "token=private-value\n", "model_output_needs_redaction"),
-    ("intent", "ultra", "unknown_intent"), ("task_kind", "hostile", "unknown_task_kind"),
+    ("intent", "ultra", "intent_outside_role_band"), ("intent", "beyond", "unknown_intent"),
+    ("task_kind", "hostile", "unknown_task_kind"),
     ("role_kind", "router", "unknown_role_kind"), ("lane_family", "other", "invalid_request:lane_family")])
 def test_semantic_refusals_are_core_codes(workspace, capsys, field, value, error):
     require_descriptors()
