@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -299,6 +299,27 @@ Claims and denials from the events log, and for each first-parent merge since --
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
 | `--base` | `REF` |  | Count merges since this commit (default: the branch base, as for aegis check --lane: origin/$GITHUB_BASE_REF, the branch origin/HEAD names, then main, develop or master; with none, the whole first-parent history) |
+
+### `aegis team model`
+
+Select a model; optionally record the decision
+
+Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed admission remains explicit.
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--bindings` | `BINDINGS` |  | Model bindings JSON file inside the workspace (bounded, regular, no symlinks) |
+| `--policy` | `POLICY` |  | Team selection policy JSON file inside the workspace (bounded, regular, no symlinks) |
+| `--history` | `HISTORY` |  | Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history |
+| `--task-kind` | `TASK_KIND` |  | Task kind T1 through T14, validated by the core |
+| `--role-kind` | `ROLE_KIND` |  | Seat kind: orchestrator, decider, implementer, integrator or reviewer |
+| `--subject` | `SUBJECT` |  | Single-line lane/endpoint/generation identifier for this decision |
+| `--host-kind` | `HOST_KINDS` |  | Host registry kind; repeat for each host (at most 256) |
+| `--intent` | `INTENT` |  | Semantic intent: light, standard, deep, extended or max; default from policy/role band |
+| `--author-family` | `AUTHOR_FAMILY` |  | Author family required for reviews; T7 binds it to its chosen family |
+| `--lane-family` | `LANE_FAMILY` |  | Lane family required for T3; writer lanes must match team_family |
+| `--review-stage` | `REVIEW_STAGE` | `"primary"` | Review stage: primary, correctness, security, whole or second as allowed by the task |
+| `--record` |  |  | Atomically select and append under the history lock (60-second timeout); default preview |
 
 ### `aegis team release`
 
@@ -729,6 +750,7 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 
 | Tool | Title |
 | --- | --- |
+| `aegis_team_model` | Team Model |
 | `aegis_team_config` | Team Config |
 | `aegis_scan` | Scan JIT Rules |
 | `aegis_report_outcome` | Report Outcome |
@@ -737,6 +759,102 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 | `aegis_capture_insight` | Capture Insight |
 | `aegis_msg_read` | Read Message |
 | `aegis_msg_write` | Write Message |
+
+### `aegis_team_model`
+
+**Team Model**
+
+Select a model inside the workspace with the same JSON as aegis team model; record opts into atomic history publication. Uses the model-selection core without launching a host.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `bindings` | string | yes | Bindings JSON path inside the workspace; bounded regular file, no symlinks. |
+| `policy` | string | yes | Team policy JSON path inside the workspace; bounded regular file, no symlinks. |
+| `history` | string | yes | Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history. |
+| `task_kind` | string | yes | Task kind T1 through T14, validated by the core. |
+| `role_kind` | string | yes | Seat: orchestrator, decider, implementer, integrator or reviewer. |
+| `subject` | string | yes | Single-line lane/endpoint/generation identifier. |
+| `host_kinds` | array of string | yes | Explicit host registry kinds; at most 256. |
+| `intent` | string | no | Semantic light, standard, deep, extended or max; defaults to policy/role band. |
+| `author_family` | string | no | Known author family required for reviews; T7 binds its chosen family. |
+| `lane_family` | string | no | Required for T3; writer lane family must match team_family. |
+| `review_stage` | string | no | Primary, correctness, security, whole or second as allowed by the task. |
+| `record` | boolean | no | Atomically select and append under the history lock (60-second timeout); default preview. |
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "bindings": {
+      "type": "string",
+      "description": "Bindings JSON path inside the workspace; bounded regular file, no symlinks."
+    },
+    "policy": {
+      "type": "string",
+      "description": "Team policy JSON path inside the workspace; bounded regular file, no symlinks."
+    },
+    "history": {
+      "type": "string",
+      "description": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history."
+    },
+    "task_kind": {
+      "type": "string",
+      "description": "Task kind T1 through T14, validated by the core."
+    },
+    "role_kind": {
+      "type": "string",
+      "description": "Seat: orchestrator, decider, implementer, integrator or reviewer."
+    },
+    "subject": {
+      "type": "string",
+      "description": "Single-line lane/endpoint/generation identifier."
+    },
+    "host_kinds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 256,
+      "minItems": 1,
+      "description": "Explicit host registry kinds; at most 256."
+    },
+    "intent": {
+      "type": "string",
+      "description": "Semantic light, standard, deep, extended or max; defaults to policy/role band."
+    },
+    "author_family": {
+      "type": "string",
+      "description": "Known author family required for reviews; T7 binds its chosen family."
+    },
+    "lane_family": {
+      "type": "string",
+      "description": "Required for T3; writer lane family must match team_family."
+    },
+    "review_stage": {
+      "type": "string",
+      "default": "primary",
+      "description": "Primary, correctness, security, whole or second as allowed by the task."
+    },
+    "record": {
+      "type": "boolean",
+      "default": false,
+      "description": "Atomically select and append under the history lock (60-second timeout); default preview."
+    }
+  },
+  "required": [
+    "bindings",
+    "policy",
+    "history",
+    "task_kind",
+    "role_kind",
+    "subject",
+    "host_kinds"
+  ],
+  "additionalProperties": false
+}
+```
 
 ### `aegis_team_config`
 

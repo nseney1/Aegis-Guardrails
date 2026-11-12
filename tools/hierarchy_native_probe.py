@@ -165,10 +165,38 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+@contextmanager
+def owned_stream(fd, *args, **kwargs):
+    """Keep raw ownership through stream construction, I/O and closure, including partial failures."""
+    try:
+        with os.fdopen(fd, *args, closefd=False, **kwargs) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def settling(action):
+    """Always settle an acquired child; a cleanup error must not replace the original failure."""
+    error = None
+    try:
+        yield
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        try:
+            action()
+        except BaseException as cleanup_error:
+            if error is not None:
+                raise error from cleanup_error
+            raise
+
+
 def write_private(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    with owned_stream(fd, "w", encoding="utf-8") as stream:
         stream.write(json.dumps(value, sort_keys=True, indent=2) + "\n")
     return path
 
@@ -666,7 +694,7 @@ def auth_digest(auth):
                       % (stat.S_IMODE(info.st_mode), auth))
     # O_NONBLOCK: a FIFO swapped in after the lstat would otherwise block this open forever.
     fd = os.open(auth, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as stream:
+    with owned_stream(fd, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if not stat.S_ISREG(opened.st_mode):
             raise Refusal("auth.json in CODEX_HOME is not a regular file: " + str(auth))
@@ -1050,17 +1078,17 @@ class Runner:
     def run_turn(self, argv, cwd, name, timeout):
         logs = {kind: self.root / "logs" / (name + "." + kind) for kind in ("stdout", "stderr")}
         logs["stdout"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
-            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                       start_new_session=True)
+        process = None
         timed_out = False
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        finally:
-            # Also on an interrupt: the turn runs in its own session, so nothing else would stop it.
-            stop_group(process)
+        # Custody starts at Popen's return, before either log closes, including on interrupts.
+        with settling(lambda: stop_group(process) if process is not None else None):
+            with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
+                process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                           start_new_session=True)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
         return process.returncode, timed_out, {kind: str(path) for kind, path in logs.items()}
 
     def login(self):
@@ -1272,13 +1300,54 @@ class Runner:
         before = len(turns(rollout))
         logs = {kind: self.root / "logs" / (name + "-hold." + kind) for kind in ("stdout", "stderr")}
         logs["stdout"].parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
-            process = subprocess.Popen(wake_profile["argv"] + [planned["hold_prompt"]], cwd=wake_profile["cwd"],
-                                       stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
         grace = self.state["timeouts"]["stop_grace_seconds"]
         code, answer, seen, marks = None, {}, None, None
-        try:
+        process = None
+
+        def stop_hold():
+            nonlocal code, answer, marks
+            if process is None:
+                return
+            # Stop now requires kernel group absence. Reap our own child alongside the synchronous
+            # stop, so our zombie cannot keep its group alive while we wait for that same stop.
+            settled, wait_errors = threading.Event(), []
+            def reap_owned_child():
+                while not settled.is_set():
+                    try:
+                        process.wait(timeout=POLL_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    except (OSError, ValueError) as exc:
+                        wait_errors.append(exc)
+                    return
+            waiter = threading.Thread(target=reap_owned_child, name="aegis-probe-hold-reap")
             try:
+                try:
+                    waiter.start()
+                except RuntimeError:
+                    wait_errors.append(ValueError("hold child exit observer unavailable"))
+                code, answer = self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"],
+                                             "--grace-seconds", str(grace))
+            finally:
+                settled.set()
+                if waiter.ident is not None:
+                    waiter.join()
+            if wait_errors:
+                raise wait_errors[0]
+            try:
+                process.wait(timeout=grace + 5)
+            except subprocess.TimeoutExpired:
+                pass
+            # Only after the stop: written earlier, the hold turn itself could see .done and end on its own.
+            marks = end_hold(planned["hold"])
+
+        # Both settlement layers cover log closure, not just rollout polling. A failed spawn owns no child.
+        with settling(lambda: stop_group(process) if process is not None else None):
+            with settling(stop_hold):
+                with open(logs["stdout"], "xb") as stdout, open(logs["stderr"], "xb") as stderr:
+                    process = subprocess.Popen(wake_profile["argv"] + [planned["hold_prompt"]], cwd=wake_profile["cwd"],
+                                               stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                               start_new_session=True)
                 deadline = time.monotonic() + self.state["timeouts"]["hold_wait_seconds"]
                 while time.monotonic() < deadline and process.poll() is None:
                     rows = turns(rollout)
@@ -1286,42 +1355,6 @@ class Runner:
                         seen = rows[-1]["turn_id"]
                         break
                     time.sleep(POLL_SECONDS)
-            finally:
-                # The launcher's stop runs even when a read fails, so a reader error never leaves the turn running.
-                # Stop now requires kernel group absence. Reap our own child alongside the synchronous
-                # stop, so our zombie cannot keep its group alive while we wait for that same stop.
-                settled, wait_errors = threading.Event(), []
-                def reap_owned_child():
-                    while not settled.is_set():
-                        try:
-                            process.wait(timeout=POLL_SECONDS)
-                        except subprocess.TimeoutExpired:
-                            continue
-                        except (OSError, ValueError) as exc:
-                            wait_errors.append(exc)
-                        return
-                waiter = threading.Thread(target=reap_owned_child, name="aegis-probe-hold-reap")
-                try:
-                    try:
-                        waiter.start()
-                    except RuntimeError:
-                        wait_errors.append(ValueError("hold child exit observer unavailable"))
-                    code, answer = self.launcher(planned["base"], "stop", "--endpoint", planned["endpoint"],
-                                                 "--grace-seconds", str(grace))
-                finally:
-                    settled.set()
-                    if waiter.ident is not None:
-                        waiter.join()
-                if wait_errors:
-                    raise wait_errors[0]
-                try:
-                    process.wait(timeout=grace + 5)
-                except subprocess.TimeoutExpired:
-                    pass
-                # Only after the stop: written earlier, the hold turn itself could see .done and end on its own.
-                marks = end_hold(planned["hold"])
-        finally:
-            stop_group(process)
         rows = turns(rollout)
         turn = seen or (rows[-1]["turn_id"] if len(rows) > before else None)
         found = next((r for r in rows if r["turn_id"] == turn), None)
@@ -1707,7 +1740,7 @@ def run(args):
         lock = root / ".run.lock"
         fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            with owned_stream(fd, "w", encoding="utf-8") as stream:
                 stream.write(json.dumps({"pid": os.getpid(), "started_at": now()}) + "\n")
             return run_locked(state, cap, key_name, codex, fake, root, args.auth, auth_sha)
         finally:
