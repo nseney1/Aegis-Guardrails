@@ -116,6 +116,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.governance": 1,
     "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
+    "aegis_core.approval_policy": 1,
     "aegis_core.approval_shape": 0,
     # Literal workflow parsing (text in, verdicts out; stdlib only).
     "aegis_core.workflow_jobs": 0,
