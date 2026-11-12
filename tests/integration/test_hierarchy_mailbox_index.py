@@ -14,6 +14,11 @@ import sys
 import time
 import tracemalloc
 import weakref
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
+from functools import partial
+import inspect
+from unittest import mock
 from types import SimpleNamespace
 
 import pytest
@@ -778,6 +783,205 @@ def test_pending_can_vanish_during_symlink_check(mailbox, monkeypatch):
 def test_unknown_mode_refused(mailbox):
     error_type, message = caught(lambda: index_module().MailboxIndex(mailbox, mode="bad"))
     assert issubclass(error_type, ValueError) and "indexed" in message and "shadow" in message
+
+
+MODE_REFUSAL = "mailbox index mode is read-only; changing mode requires the ADR phase-0 exit"
+
+
+def _attempt_mode_change(index, other, operation):
+    target = "indexed" if index.mode == "shadow" else "shadow"
+    if operation == "assignment":
+        index.mode = target
+    elif operation == "setattr":
+        setattr(index, "mode", target)
+    elif operation == "imported-setattr":
+        from builtins import setattr as assign
+        assign(index, "mode", target)
+    elif operation == "captured-setattr":
+        assign = setattr
+        assign(index, "mode", target)
+    elif operation == "bound-setattr":
+        assign = index.__setattr__
+        assign("mode", target)
+    elif operation == "object-setattr":
+        assign = object.__setattr__
+        assign(index, "mode", target)
+    elif operation == "delete":
+        del index.mode
+    elif operation == "delattr":
+        delattr(index, "mode")
+    elif operation == "object-delattr":
+        object.__delattr__(index, "mode")
+    elif operation == "dict-update":
+        index.__dict__.update(mode=target)
+    elif operation == "dict-item":
+        index.__dict__["mode"] = target
+    elif operation == "dict-replacement":
+        index.__dict__ = {"mode": target}
+    elif operation == "vars-update":
+        vars(index).update(mode=target)
+    elif operation == "captured-vars":
+        state = vars
+        state(index).update(mode=target)
+    elif operation == "imported-vars":
+        from builtins import vars as state
+        state(index).update(mode=target)
+    elif operation == "reinit":
+        index.__init__(other, mode=target)
+    elif operation == "captured-reinit":
+        reinit = index.__init__
+        reinit(other, mode=target)
+    elif operation == "partial-reinit":
+        partial(index.__init__, mode=target)(other)
+    elif operation == "invalid-reinit":
+        index.__init__(other, mode="invalid\nmode")
+    elif operation == "slot-assignment":
+        index._MailboxIndex__mode = target
+    elif operation == "slot-setattr":
+        object.__setattr__(index, "_MailboxIndex__mode", target)
+    elif operation == "slot-deletion":
+        del index._MailboxIndex__mode
+    elif operation == "slot-delattr":
+        object.__delattr__(index, "_MailboxIndex__mode")
+    elif operation == "slot-delete-reinit":
+        try:
+            del index._MailboxIndex__mode
+        except AttributeError as exc:
+            assert str(exc) == MODE_REFUSAL
+        index.__init__(other, mode=target)
+    else:
+        raise AssertionError("unknown test operation")
+
+
+MODE_OPERATIONS = ["assignment", "setattr", "imported-setattr", "captured-setattr", "bound-setattr",
+                   "object-setattr", "delete", "delattr", "object-delattr", "dict-update", "dict-item",
+                   "dict-replacement", "vars-update", "captured-vars", "imported-vars", "reinit",
+                   "captured-reinit", "partial-reinit", "invalid-reinit"]
+BACKING_OPERATIONS = ["slot-assignment", "slot-setattr", "slot-deletion", "slot-delattr", "slot-delete-reinit"]
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("operation", MODE_OPERATIONS)
+def test_mode_guard_refuses_existing_instance_changes(mailbox, mode, operation):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()
+    # Reinitialization must refuse before replacing the mailbox or clearing memo.
+    entries = index._entries
+    for _ in range(2):
+        with pytest.raises(AttributeError) as refused:
+            _attempt_mode_change(index, object(), operation)
+        assert str(refused.value) == MODE_REFUSAL
+        assert index.mode == mode and index.mailbox is mailbox and index._entries is entries
+    assert index.messages() == expected
+    assert index.get("seed") == expected["seed"]
+    assert index.inbox("a/lane/review") == mailbox.inbox("a/lane/review")
+    assert index.verify() == []
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mode_guard_concurrent_refusals_keep_dispatch(mailbox, mode):
+    module = index_module()
+    index = module.MailboxIndex(mailbox, mode=mode)
+    expected = mailbox.messages()
+
+    def attempt(operation):
+        return caught(lambda: _attempt_mode_change(index, object(), operation))
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        results = list(workers.map(attempt, MODE_OPERATIONS + BACKING_OPERATIONS, timeout=10))
+    assert all(kind is AttributeError and message == MODE_REFUSAL for kind, message in results)
+    assert index.mode == mode and index.mailbox is mailbox
+    calls = []
+
+    def wrong():
+        calls.append(True)
+        return {}
+
+    index._indexed_messages = wrong
+    assert index.messages() == (expected if mode == "shadow" else {})
+    assert len(calls) == (2 if mode == "shadow" else 1)
+    assert bool(index.last_divergence) == (mode == "shadow")
+
+
+@pytest.mark.parametrize("mode", ["shadow", "indexed"])
+def test_mode_guard_sentinel_is_local(mailbox, monkeypatch, mode):
+    from tools import hierarchy_mailbox_index as module
+    index = module.MailboxIndex(mailbox, mode=mode)
+    monkeypatch.setattr(module, "_MISSING", mode)
+    with pytest.raises(AttributeError, match="^" + MODE_REFUSAL + "$"):
+        index.__init__(object(), mode="indexed" if mode == "shadow" else "shadow")
+    assert index.mode == mode and index.mailbox is mailbox
+
+
+def test_mode_guard_invalid_initialization_can_retry(mailbox):
+    cls = index_module().MailboxIndex
+    index = cls.__new__(cls)
+    with pytest.raises(ValueError, match="^unknown mailbox index mode; valid modes: shadow, indexed$"):
+        index.__init__(mailbox, mode="bad")
+    index.__init__(mailbox, mode="shadow")
+    assert index.mode == "shadow" and index.messages() == mailbox.messages()
+    for mode in ("shadow", "indexed"):
+        fresh = type(index)(mailbox, mode=mode)
+        assert fresh.mode == mode and fresh.messages() == mailbox.messages()
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+@pytest.mark.parametrize("operation", BACKING_OPERATIONS)
+def test_mode_backing_slot_refuses_mutation_and_reinitialization(mailbox, mode, operation):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()
+    entries = index._entries
+    for _ in range(2):
+        with pytest.raises(AttributeError) as refused:
+            _attempt_mode_change(index, object(), operation)
+        assert str(refused.value) == MODE_REFUSAL
+        assert index.mode == mode and index.mailbox is mailbox and index._entries is entries
+    assert index.messages() == expected
+
+
+@pytest.mark.parametrize("mode", ["indexed", "shadow"])
+def test_mode_dict_snapshot_keeps_inspection_copy_and_mock_usable(mailbox, mode):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    expected = index.messages()
+    assert hasattr(index, "__dict__") and "mode" in dir(index)
+    assert dict(inspect.getmembers(index))["mode"] == mode
+    snapshot = vars(index)
+    assert snapshot["mailbox"] is mailbox and snapshot["_entries"] is index._entries
+    assert snapshot == index.__dict__ and snapshot is not index.__dict__
+    index.last_reconciliation = {"kind": "test"}
+    assert snapshot["last_reconciliation"] is None
+    clone = copy(index)
+    assert clone is not index and clone.mode == mode and clone.mailbox is mailbox
+    assert clone._entries is index._entries and clone.messages() == expected
+    with mock.patch.object(index, "last_reconciliation", "patched"):
+        assert index.last_reconciliation == "patched"
+    assert index.last_reconciliation == {"kind": "test"}
+
+
+@pytest.mark.parametrize("operation", ["item", "delete", "clear", "pop", "popitem", "setdefault", "update", "ior"])
+@pytest.mark.parametrize("mode", ["shadow", "indexed"])
+def test_mode_dict_snapshot_mutators_have_fixed_refusal(mailbox, operation, mode):
+    index = index_module().MailboxIndex(mailbox, mode=mode)
+    snapshot = vars(index)
+    with pytest.raises(AttributeError) as refused:
+        if operation == "item":
+            snapshot["mode"] = "indexed"
+        elif operation == "delete":
+            del snapshot["mailbox"]
+        elif operation == "clear":
+            snapshot.clear()
+        elif operation == "pop":
+            snapshot.pop("mailbox")
+        elif operation == "popitem":
+            snapshot.popitem()
+        elif operation == "setdefault":
+            snapshot.setdefault("mode", "indexed")
+        elif operation == "update":
+            snapshot.update(mode="indexed")
+        else:
+            snapshot |= {"mode": "indexed"}
+    assert str(refused.value) == MODE_REFUSAL
+    assert index.mode == mode and index.mailbox is mailbox
 
 
 def test_oracle_detects_order_only_difference(mailbox, monkeypatch):
@@ -1817,10 +2021,11 @@ def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, monkeypatch, 
     source = Path(seed["path"])
     folder = mailbox.root / "a/orchestrator" if defect == "wrong_folder" else source.parent
     paths = [os.fspath(folder / ("zz-rejected-%04d.md" % number)) for number in range(1000)]
-    # CPython 3.12 globally interns Path components. Prepare fixture paths
-    # before tracing so intern-table growth is not charged to reader history.
+    # Python 3.9 and 3.12 pathlib intern Path components. Retain the interned
+    # strings before tracing so table growth is not charged to reader history.
     # Keep immutable strings only. Retaining Paths charges their lazily filled
     # platform caches to the reader's post-GC retention measurement.
+    interned_components = [sys.intern(component) for name in paths for component in Path(name).parts]
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
@@ -1850,6 +2055,7 @@ def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, monkeypatch, 
     finally:
         if not tracing:
             tracemalloc.stop()
+        del interned_components
     record_property("retained_growth_bytes", growth)
     record_property("retained_allocation_tracebacks", allocation_details)
     assert growth <= 128 * 1024, "retained %d bytes; top 5 allocation tracebacks:\n%s" % (

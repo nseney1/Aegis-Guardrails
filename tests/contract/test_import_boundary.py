@@ -89,8 +89,10 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
     "aegis_core.team": 1,
+    "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
     "aegis_core.team_profile_display": 0,
+    "aegis_core.team_templates": 0,
     "aegis_core.team_hosts": 2,
     "aegis_core.model_select": 1,
     # Manager-only policy and append-only audit domain; no repository credit imports.

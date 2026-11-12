@@ -81,6 +81,7 @@ packages = [
     "aegis_core.lifecycle",
     "aegis_core.outcomes",
     "aegis_core.skills",
+    "aegis_core.team_templates",
     "aegis_core.telemetry_engine",
     "aegis_core.verification",
     "aegis_core.workspace",
@@ -108,6 +109,10 @@ aegis_core = [
 ]
 "aegis_core._data.rules" = ["*.md", ".oracles/*.md"]
 "aegis_core._data.skills" = ["*/SKILL.md"]
+"aegis_core.team_templates" = ["*", "**/*"]
+
+[tool.setuptools.exclude-package-data]
+"aegis_core.team_templates" = ["__pycache__/*", "**/__pycache__/*", "*.py[cod]", "**/*.py[cod]"]
 
 
 [tool.pytest.ini_options]
