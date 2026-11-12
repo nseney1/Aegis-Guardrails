@@ -426,7 +426,8 @@ def test_a_start_whose_output_has_no_init_event_is_a_failed_start(claude_team):
                             % shlex.quote(shutil.which("grep")))
     answer = claude_team.start(expect=3, endpoint=IMPLEMENTER)
     assert answer["state"] == "failed_to_start" and answer["session"] is None and answer["exit_code"] == 0
-    assert "error" not in answer and '"type": "result"' in Path(answer["log"]["stdout"]).read_text()
+    assert answer["error"] == "the start exited without reporting a session"
+    assert '"type": "result"' in Path(answer["log"]["stdout"]).read_text()
     assert [row["state"] for row in claude_team.records(IMPLEMENTER)] == ["failed_to_start"]
     assert unbound(claude_team, IMPLEMENTER)
 
