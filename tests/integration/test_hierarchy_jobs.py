@@ -4461,7 +4461,7 @@ def test_a_version_probe_that_prints_no_version_is_recorded_without_one(shop):
 def test_a_version_probe_whose_escaped_child_holds_the_pipe_still_returns(tmp_path, monkeypatch):
     jobs = load_jobs_module()
     monkeypatch.setattr(jobs, "PYTHON_PROBE_SECONDS", 0.5)
-    monkeypatch.setattr(jobs, "PYTHON_PROBE_DRAIN_SECONDS", 1, raising=False)
+    monkeypatch.setattr(jobs, "PYTHON_PROBE_DRAIN_SECONDS", 1)
     monkeypatch.setattr(jobs, "PYTHON_INFO", {})
     pidfile = tmp_path / "escaped.pid"
     # Not a python: a child in its own session keeps stdout open, so the group kill misses it and EOF never comes.

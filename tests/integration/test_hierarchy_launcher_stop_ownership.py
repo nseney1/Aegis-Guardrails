@@ -618,7 +618,7 @@ def test_r31_namespace_refusal_preserves_live_custody_and_consumers(r2_case, cap
         probe["procfs_pid"] += 1
     elif fault == "boot":
         probe["boot"] = "00000000-0000-0000-0000-000000000000"
-    monkeypatch.setattr(module, "pid_namespace_probe", lambda: None if fault == "unreadable" else probe, raising=False)
+    monkeypatch.setattr(module, "pid_namespace_probe", lambda: None if fault == "unreadable" else probe)
     # MODELLED B's syscall/proc view: P and G are absent there although the original A child is live.
     module.process_census = lambda session: module.ProcessCensus([], "proven")
     module.read_process = lambda pid, *args: module.ProcessObservation("CONFIRMED_ABSENT", pid,
@@ -2451,7 +2451,7 @@ def test_r23_cleanup_holds_pending_mailbox_admission(r2_case, capsys, monkeypatc
                     return result
             control.Runner = LateClaim
         elif fault == "unsupported":
-            monkeypatch.setattr(module, "mailbox_wake_inspection_capable", lambda: False, raising=False)
+            monkeypatch.setattr(module, "mailbox_wake_inspection_capable", lambda: False)
         else:
             shutil.copytree(base, replacement)
             alternate = replacement / "mailbox" / marker.name
@@ -2634,7 +2634,7 @@ def test_r22_restricted_procfs_has_an_explicit_manual_refusal(r2_case, capsys, m
         def unsupported(observation):
             faults.append(observation.kind)
             return False
-        monkeypatch.setattr(module, "procfs_exit_evidence_supported", unsupported, raising=False)
+        monkeypatch.setattr(module, "procfs_exit_evidence_supported", unsupported)
     r22_wake_processes(r2_case, module, monkeypatch)
     code = module.main(["--base", str(r2_case.launch.base), "resume", "--endpoint", REVIEW, "--dry-run"])
     answer = json.loads(capsys.readouterr().out)
@@ -3628,7 +3628,7 @@ def test_r21_resume_can_be_stopped_mid_turn(r2_case, capsys, monkeypatch, host, 
                 return r2_case.home
         wake.Path = Paths
         return wake
-    monkeypatch.setattr(module, "load_wake", load_wake, raising=False)
+    monkeypatch.setattr(module, "load_wake", load_wake)
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(module.resume, module.Launches(str(r2_case.launch.base)), REVIEW, False)
         try:
@@ -7808,8 +7808,8 @@ def test_stop_falls_back_only_when_pidfd_is_unsupported(launch, children, monkey
         raise OSError(error, "pidfd unavailable")
 
     module = children.module()
-    monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
-    monkeypatch.setattr(module.signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"), raising=False)
+    monkeypatch.setattr(module.os, "pidfd_open", unavailable)
+    monkeypatch.setattr(module.signal, "pidfd_send_signal", lambda *args: pytest.fail("unopened pidfd signalled"))
     code = module.main(["--base", str(launch.base), "stop", "--endpoint", REVIEW, "--grace-seconds", "1"])
     answer = json.loads(capsys.readouterr().out)
     if error == 38:  # ENOSYS establishes lack of kernel capability; other errors do not.
@@ -8071,7 +8071,7 @@ def test_stop_retains_stubborn_descendants_after_the_middle_exits(launch, childr
     else:
         def unavailable(*args):
             raise OSError(errno.ENOSYS, "pidfds unavailable")
-        monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
+        monkeypatch.setattr(module.os, "pidfd_open", unavailable)
 
     def changed(pid, count, row):
         if term_done and pid == worker.pid:
