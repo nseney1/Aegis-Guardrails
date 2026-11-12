@@ -505,7 +505,7 @@ class ModelledProbeClient:
         argv = list(argv)
         native = self.config["entry"] == "probe"
         if native and (Path(argv[0]).name != "codex" or argv[1:2] == ["login"]):
-            return subprocess.Popen(argv, **options)
+            return ModelledProbeReturnedTool(self, argv, **options)
         target, entry, logical, leaf = None, None, None, False
         if native:
             target, entry, logical, leaf = FAKE_CODEX, "rollout_main", argv, False
@@ -559,7 +559,9 @@ class ModelledProbeClient:
                 # This scripted case promises actual exit before stop, rather than a SIGTERM mask
                 # which the stop's SIGKILL escalation can bypass while captured helpers import.
                 child.wait(timeout=MODELLED_PROBE_HANDSHAKE_SECONDS)
-        return child
+        # The returned facade is created after every constructor-only wait. Its first use is an
+        # acknowledgement from the caller, after Popen returned and the caller obtained its handle.
+        return ModelledProbeReturnedChild(child, argv)
 
     def run(self, argv, input=None, capture_output=False, timeout=None, check=False, **options):
         if self.config["entry"] == "probe":
@@ -643,6 +645,52 @@ class ModelledProbeChild:
             return self.process.communicate(*args, **kwargs)
         finally:
             self.report()
+
+
+def modelled_popen_returned(client, identifier, argv):
+    modelled_json(Path(client.config["folder"]) / (identifier + ".popen-returned.json"),
+                  {"nonce": client.config["nonce"], "parent": client.config["slot"], "argv": list(argv)})
+
+
+class ModelledProbeReturnedChild(ModelledProbeChild):
+    """Only caller use of the returned facade publishes the constructor-return witness."""
+    def __init__(self, child, argv):
+        super().__init__(child.process, child.client, child.slot, child.birth)
+        self.started, self.reported = child.started, child.reported
+        self.argv, self.return_observed = list(argv), False
+
+    def begin(self):
+        if not self.return_observed:
+            modelled_popen_returned(self.client, self.slot, self.argv)
+            self.return_observed = True
+        super().begin()
+
+
+class ModelledProbeReturnedTool(subprocess.Popen):
+    """The same post-return witness for a runner-owned launcher tool handle."""
+    def __init__(self, client, argv, **options):
+        self.fixture_client, self.fixture_argv = client, list(argv)
+        self.fixture_identifier = client.config["slot"] + "-tool-" + uuid.uuid4().hex
+        self.constructor_finished = self.return_observed = False
+        super().__init__(argv, **options)
+        self.constructor_finished = True
+
+    def observe_return(self):
+        if self.constructor_finished and not self.return_observed:
+            modelled_popen_returned(self.fixture_client, self.fixture_identifier, self.fixture_argv)
+            self.return_observed = True
+
+    def poll(self):
+        self.observe_return()
+        return super().poll()
+
+    def wait(self, *args, **kwargs):
+        self.observe_return()
+        return super().wait(*args, **kwargs)
+
+    def communicate(self, *args, **kwargs):
+        self.observe_return()
+        return super().communicate(*args, **kwargs)
 
 
 def run_reviewed_constructor(config, client):
@@ -1715,20 +1763,254 @@ def live_sessions(probe):
     return [line for session in sessions for line in census(session)]
 
 
+SIGNAL_TURN_TIMEOUT_SECONDS = 120
+SIGNAL_TIMEOUTS = {"start_timeout_seconds": SIGNAL_TURN_TIMEOUT_SECONDS,
+                   "turn_timeout_seconds": SIGNAL_TURN_TIMEOUT_SECONDS,
+                   "hold_wait_seconds": SIGNAL_TURN_TIMEOUT_SECONDS, "stop_grace_seconds": 2}
+
+
+def pending_signal_turn(probe, phase):
+    """The single-role fake has recorded this turn, before its delayed context or completion.
+
+    Invocation logs and process presence precede task_started. Read the flushed rollout instead;
+    the reader leaves an incomplete final record out until the fake finishes writing it.
+    """
+    expected = {"start": 1, "probe": 2, "hold": 3}[phase]
+    for path in probe.codex_home.glob("sessions/*/*/*/rollout-*.jsonl"):
+        rows = native_probe.turns(str(path))
+        if len(rows) == expected and not rows[-1]["context"] and not rows[-1]["completed"]:
+            return True
+    return False
+
+
+def signal_turn_ready(probe, phase):
+    if not pending_signal_turn(probe, phase) or probe.process_scope is None:
+        return False
+    scope = probe.process_scope
+    with scope.lock:
+        runners = {slot for slot, row in scope.rows.items()
+                   if row["config"]["parent"] is None and row["config"]["entry"] == "probe"}
+    for path in scope.folder.glob("*.popen-returned.json"):
+        witness = modelled_read(path)
+        if witness["nonce"] != scope.physical.nonce or witness["parent"] not in runners:
+            continue
+        argv = witness["argv"]
+        if phase == "start":
+            if "start" in argv and any(Path(word).name == "hierarchy_launcher.py" for word in argv):
+                return True
+        elif (Path(argv[0]).name == "codex" and
+              probe.role("implementer")[phase + "_marker"] in argv[-1]):
+            return True
+    return False
+
+
+@pytest.mark.parametrize("phase,previous", [("start", 0), ("probe", 1), ("hold", 2)])
+def test_signal_readiness_requires_the_matching_runner_return_witness(tmp_path, phase, previous):
+    from types import SimpleNamespace
+    from tests.integration.hierarchy_fake_codex import Rollout
+
+    folder = tmp_path / "processes"
+    folder.mkdir()
+    scope = SimpleNamespace(folder=folder, lock=threading.RLock(), physical=SimpleNamespace(nonce="current"),
+                            rows={"runner": {"config": {"parent": None, "entry": "probe"}}})
+    fixture = SimpleNamespace(codex_home=tmp_path / "home", process_scope=scope,
+                              role=lambda name: {"probe_marker": "probe turn", "hold_marker": "hold turn"})
+    path = fixture.codex_home / "sessions" / "2026" / "11" / "11" / "rollout-test.jsonl"
+    path.parent.mkdir(parents=True)
+    rollout = Rollout(path, "session")
+    for number in range(previous):
+        rollout.event({"type": "task_started", "turn_id": str(number)})
+        rollout.event({"type": "task_complete", "turn_id": str(number)})
+    rollout.event({"type": "task_started", "turn_id": "pending"})
+    assert pending_signal_turn(fixture, phase)
+    assert not signal_turn_ready(fixture, phase)
+    marker = folder / "child.popen-returned.json"
+    argv = ([sys.executable, str(ROOT / "tools" / "hierarchy_launcher.py"), "start"] if phase == "start" else
+            ["codex", "resume", "session", fixture.role("implementer")[phase + "_marker"]])
+    correct = {"nonce": "current", "parent": "runner", "argv": argv}
+    for wrong in ({"nonce": "stale"}, {"parent": "another-runner"}, {"argv": ["codex", "another turn"]}):
+        modelled_json(marker, {**correct, **wrong})
+        assert not signal_turn_ready(fixture, phase)
+    modelled_json(marker, correct)
+    assert signal_turn_ready(fixture, phase)
+    # Even a valid returned-handle witness cannot turn an ended turn back into a pending one.
+    rollout.event({"type": "task_complete", "turn_id": "pending"})
+    assert not signal_turn_ready(fixture, phase)
+
+
+def test_returned_child_publishes_no_witness_until_its_caller_uses_the_handle(tmp_path):
+    from types import SimpleNamespace
+
+    client = SimpleNamespace(config={"folder": str(tmp_path), "nonce": "current", "slot": "runner"})
+    process = SimpleNamespace(poll=lambda: None, native_wait_evidence=None, native_wait_unavailable=False)
+    constructed = ModelledProbeChild(process, client, "child", "birth")
+    constructed.begin()
+    returned = ModelledProbeReturnedChild(constructed, ["codex", "pending turn"])
+    marker = tmp_path / "child.popen-returned.json"
+    assert not marker.exists()
+    assert returned.poll() is None
+    assert modelled_read(marker) == {"nonce": "current", "parent": "runner", "argv": ["codex", "pending turn"]}
+    # The facade records its return once; later polls do not replace that observation.
+    returned.argv = ["codex", "changed after return"]
+    assert returned.poll() is None
+    assert modelled_read(marker)["argv"] == ["codex", "pending turn"]
+
+
+def test_returned_tool_records_caller_use_after_a_failed_constructor_can_be_retried(tmp_path):
+    import errno
+    from types import SimpleNamespace
+
+    client = SimpleNamespace(config={"folder": str(tmp_path), "nonce": "current", "slot": "runner"})
+    with pytest.raises(FileNotFoundError) as failure:
+        ModelledProbeReturnedTool(client, [str(tmp_path / "missing-program")], stdin=subprocess.DEVNULL)
+    assert failure.value.errno == errno.ENOENT
+    assert list(tmp_path.glob("*.popen-returned.json")) == []
+    argv = [sys.executable, "-c", "print('returned')"]
+    with ModelledProbeReturnedTool(client, argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True) as process:
+        assert list(tmp_path.glob("*.popen-returned.json")) == []
+        assert process.communicate(timeout=15) == ("returned\n", "")
+        assert process.returncode == 0
+    markers = list(tmp_path.glob("*.popen-returned.json"))
+    assert len(markers) == 1
+    assert modelled_read(markers[0]) == {"nonce": "current", "parent": "runner", "argv": argv}
+
+
+@pytest.mark.parametrize("phase", ["probe", "hold"])
+@LINUX_HOST_PROGRAMS
+def test_signal_waits_for_popen_return_when_the_child_started_inside_the_constructor(probe, phase):
+    plan = probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    probe.script_turns(**{phase: {"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS}})
+    scope = ModelledProbeProcesses(probe.tmp / "modelled-processes", probe.constructor_catalog())
+    probe.process_scope = scope
+    # This wraps only the fixture's constructor, after entry readiness but before its caller can own
+    # the returned handle. A file gate forces the reported schedule without a timing assumption.
+    injection = '''
+client_type = scope["ModelledProbeClient"]
+original_popen = client_type.popen
+def gated_popen(self, argv, *args, **options):
+    process = original_popen(self, argv, *args, **options)
+    if self.config["entry"] == "probe" and %r in argv[-1]:
+        folder = Path(self.config["folder"])
+        scope["modelled_json"](folder / "popen-held.json", {"nonce": self.config["nonce"]})
+        release = folder / "popen-release.json"
+        deadline = time.monotonic() + scope["SIGNAL_TURN_TIMEOUT_SECONDS"]
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("modelled probe: constructor release timed out")
+            time.sleep(.005)
+        if scope["modelled_read"](release) != {"nonce": self.config["nonce"]}:
+            raise RuntimeError("modelled probe: constructor release differs")
+    return process
+client_type.popen = gated_popen
+''' % probe.role("implementer")[phase + "_marker"]
+    original = scope.bootstrap.read_text()
+    entry = 'sys.exit(scope["modelled_probe_entry"](sys.argv[1:]))'
+    assert original.count(entry) == 1
+    scope.bootstrap.write_text(original.replace(entry, injection + "\n" + entry))
+    held, release = scope.folder / "popen-held.json", scope.folder / "popen-release.json"
+    process = start_run(probe)
+    try:
+        assert wait_for(held.exists), "the constructor never reached its return gate"
+        assert wait_for(lambda: pending_signal_turn(probe, phase)), "the child never started inside Popen"
+
+        def ready():
+            result = signal_turn_ready(probe, phase)
+            if not result:
+                # A readiness refusal while task_started is already flushed lets the constructor
+                # return. A premature True instead delivers the signal inside the constructor.
+                modelled_json(release, {"nonce": scope.physical.nonce})
+            return result
+
+        assert wait_for(ready), "the returned child never became ready for a signal"
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=90)
+    finally:
+        modelled_json(release, {"nonce": scope.physical.nonce})
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+    assert process.returncode == 3, (stdout[-2000:], stderr[-2000:])
+    report = json.loads((probe.root / "report.json").read_text())
+    assert report["state"] == "interrupted" and json.loads(stdout) == report
+    assert "interrupted by signal 15" in report["summary"]["failures"]
+    assert report["cleanup"]["found_running"] == [], report["cleanup"]
+    assert report["cleanup"]["leftover_processes"] == []
+    assert report["cleanup"]["worktree_removed"] is True and report["cleanup"]["auth_removed"] is True
+    clean_after(probe, plan)
+
+
+@pytest.mark.parametrize("phase,previous", [("start", 0), ("probe", 1), ("hold", 2)])
+def test_signal_turn_marker_requires_the_requested_complete_started_record(tmp_path, phase, previous):
+    from types import SimpleNamespace
+    from tests.integration.hierarchy_fake_codex import Rollout
+
+    fixture = SimpleNamespace(codex_home=tmp_path)
+    assert not pending_signal_turn(fixture, phase)
+    path = tmp_path / "sessions" / "2026" / "11" / "11" / "rollout-test.jsonl"
+    path.parent.mkdir(parents=True)
+    path.touch()
+    rollout = Rollout(path, "session")
+    for number in range(previous):
+        rollout.event({"type": "task_started", "turn_id": str(number)})
+        rollout.event({"type": "task_complete", "turn_id": str(number)})
+    assert not pending_signal_turn(fixture, phase)
+    record = json.dumps({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "target"}})
+    with path.open("a") as stream:
+        stream.write(record[:20])
+        stream.flush()
+        assert not pending_signal_turn(fixture, phase)
+        stream.write(record[20:] + "\n")
+    assert pending_signal_turn(fixture, phase)
+    rollout.event({"type": "task_complete", "turn_id": "target"})
+    assert not pending_signal_turn(fixture, phase)
+    rollout.event({"type": "task_started", "turn_id": "next"})
+    assert not pending_signal_turn(fixture, phase)
+
+
+def test_signal_turn_marker_retries_a_concurrent_write_and_refuses_a_context_or_missing_turn(tmp_path):
+    from types import SimpleNamespace
+    from tests.integration.hierarchy_fake_codex import Rollout
+
+    fixture = SimpleNamespace(codex_home=tmp_path)
+    assert not wait_for(lambda: pending_signal_turn(fixture, "start"), seconds=0.01)
+    path = tmp_path / "sessions" / "2026" / "11" / "11" / "rollout-test.jsonl"
+    path.parent.mkdir(parents=True)
+    partial, release = threading.Event(), threading.Event()
+
+    def write_started():
+        with path.open("w") as stream:
+            stream.write('{"type": "event_msg", "payload": ')
+            stream.flush()
+            partial.set()
+            if release.wait(timeout=5):
+                stream.write('{"type": "task_started", "turn_id": "target"}}\n')
+
+    writer = threading.Thread(target=write_started)
+    writer.start()
+    try:
+        assert partial.wait(timeout=5)
+        assert not pending_signal_turn(fixture, "start")
+        release.set()
+        assert wait_for(lambda: pending_signal_turn(fixture, "start"), seconds=5)
+    finally:
+        release.set()
+        writer.join(timeout=5)
+    assert not writer.is_alive()
+    Rollout(path, "session").write("turn_context", {"turn_id": "target"})
+    assert not pending_signal_turn(fixture, "start")
+
+
 @pytest.mark.parametrize("number", ["SIGTERM", "SIGHUP", "SIGINT"])
 @LINUX_HOST_PROGRAMS
 def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_report(probe, number):
     number = getattr(__import__("signal"), number)
-    plan = probe.plan([{"role": "implementer"}])
-    # The hold's context comes late, so the signal lands while the probe still waits on a live turn (not while
-    # the launcher is already stopping it).
-    probe.script_turns(hold={"context_delay": 20})
+    plan = probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    # Both the delayed context and the probe's inner deadline outlast the bounded 60-second marker wait.
+    probe.script_turns(hold={"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     process = start_run(probe)
     try:
-        # The hold turn is the long one; the signal lands while it runs.
-        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
-                                    for call in probe.calls())), "the hold turn never started"
-        assert wait_for(lambda: bool(live_sessions(probe)))
+        assert wait_for(lambda: signal_turn_ready(probe, "hold")), "the hold turn never became owned and started"
         process.send_signal(number)
         stdout, stderr = process.communicate(timeout=90)
     finally:
@@ -1749,13 +2031,11 @@ def test_a_signal_mid_run_stops_the_turn_cleans_up_and_writes_an_interrupted_rep
 
 @LINUX_HOST_PROGRAMS
 def test_the_cleanup_command_cleans_up_after_a_killed_run_and_can_be_repeated(probe):
-    plan = probe.plan([{"role": "implementer"}])
-    probe.script_turns(hold={"context_delay": 20})
+    plan = probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    probe.script_turns(hold={"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     process = start_run(probe)
     try:
-        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
-                                    for call in probe.calls())), "the hold turn never started"
-        assert wait_for(lambda: bool(live_sessions(probe)))
+        assert wait_for(lambda: signal_turn_ready(probe, "hold")), "the hold turn never became owned and started"
         process.kill()
         process.communicate(timeout=30)
     finally:
@@ -2419,13 +2699,11 @@ def strays(probe):
 
 @LINUX_HOST_PROGRAMS
 def test_a_signal_during_the_probe_turn_stops_it_before_the_cleanup(probe):
-    plan = probe.plan([{"role": "implementer"}])
-    probe.script_turns(probe={"context_delay": 20})
+    plan = probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    probe.script_turns(probe={"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     process = start_run(probe)
     try:
-        assert wait_for(lambda: any(probe.role("implementer")["probe_marker"] in json.dumps(call["argv"])
-                                    for call in probe.calls()))
-        assert wait_for(lambda: bool(live_sessions(probe)))
+        assert wait_for(lambda: signal_turn_ready(probe, "probe")), "the probe turn never became owned and started"
         process.send_signal(signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=90)
     finally:
@@ -2440,16 +2718,15 @@ def test_a_signal_during_the_probe_turn_stops_it_before_the_cleanup(probe):
 
 
 def test_a_signal_while_the_launcher_start_runs_leaves_no_codex_and_keeps_the_record(probe):
-    plan = probe.plan([{"role": "implementer"}])
+    plan = probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
     probe.script_turns()
     script = json.loads(probe.script.read_text())
     # The start turn matches no marker; it waits before its context, so the signal lands inside the launcher.
-    script["turns"].append({"match": "", "context_delay": 6})
+    script["turns"].append({"match": "", "context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     probe.script.write_text(json.dumps(script))
     process = start_run(probe)
     try:
-        assert wait_for(lambda: bool(probe.calls()))
-        time.sleep(1.0)
+        assert wait_for(lambda: signal_turn_ready(probe, "start")), "the start turn never became owned and started"
         process.send_signal(signal.SIGTERM)
         stdout, stderr = process.communicate(timeout=90)
     finally:
@@ -3467,13 +3744,11 @@ def test_modelled_probe_runner_registers_the_real_host_before_public_stop(probe)
 def test_modelled_probe_custody_outlives_its_killed_runner(probe):
     import signal
 
-    probe.plan([{"role": "implementer"}])
-    probe.script_turns(hold={"context_delay": 20})
+    probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    probe.script_turns(hold={"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     process = start_run(probe)
     try:
-        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
-                                    for call in probe.calls()))
-        assert wait_for(lambda: bool(live_sessions(probe)))
+        assert wait_for(lambda: signal_turn_ready(probe, "hold")), "the hold turn never became owned and started"
         process.kill()
         process.communicate(timeout=5)
         assert process.returncode == -signal.SIGKILL and live_sessions(probe)
@@ -3489,12 +3764,11 @@ def test_modelled_probe_custody_outlives_its_killed_runner(probe):
 
 @LINUX_HOST_PROGRAMS
 def test_modelled_probe_request_rejects_extra_fields_before_reservation(probe):
-    probe.plan([{"role": "implementer"}])
-    probe.script_turns(hold={"context_delay": 20})
+    probe.plan([{"role": "implementer"}], timeouts=SIGNAL_TIMEOUTS)
+    probe.script_turns(hold={"context_delay": SIGNAL_TURN_TIMEOUT_SECONDS})
     process = start_run(probe)
     try:
-        assert wait_for(lambda: any(probe.role("implementer")["hold_marker"] in json.dumps(call["argv"])
-                                    for call in probe.calls()))
+        assert wait_for(lambda: signal_turn_ready(probe, "hold")), "the hold turn never became owned and started"
         scope = probe.process_scope
         with scope.lock:
             parent = next(slot for slot, row in scope.rows.items() if row["config"]["parent"] is None)
