@@ -34,6 +34,31 @@ def _write(title: str) -> dict:
 
 TOOL_DEFINITIONS = [
     {
+        "name": "aegis_team_model",
+        "description": "Select a model inside the workspace with the same JSON as aegis team model; record opts into atomic history publication. Uses the model-selection core without launching a host.",
+        "annotations": _write("Team Model"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bindings": {"type": "string", "description": "Bindings JSON path inside the workspace; bounded regular file, no symlinks."},
+                "policy": {"type": "string", "description": "Team policy JSON path inside the workspace; bounded regular file, no symlinks."},
+                "history": {"type": "string", "description": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history."},
+                "task_kind": {"type": "string", "description": "Task kind T1 through T14, validated by the core."},
+                "role_kind": {"type": "string", "description": "Seat: orchestrator, decider, implementer, integrator or reviewer."},
+                "subject": {"type": "string", "description": "Single-line lane/endpoint/generation identifier."},
+                "host_kinds": {"type": "array", "items": {"type": "string"}, "maxItems": 256, "minItems": 1,
+                               "description": "Explicit host registry kinds; at most 256."},
+                "intent": {"type": "string", "description": "Semantic light, standard, deep, extended or max; defaults to policy/role band."},
+                "author_family": {"type": "string", "description": "Known author family required for reviews; T7 binds its chosen family."},
+                "lane_family": {"type": "string", "description": "Required for T3; writer lane family must match team_family."},
+                "review_stage": {"type": "string", "default": "primary", "description": "Primary, correctness, security, whole or second as allowed by the task."},
+                "record": {"type": "boolean", "default": False, "description": "Atomically select and append under the history lock (60-second timeout); default preview."},
+            },
+            "required": ["bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "aegis_team_config",
         "description": "Read the resolved team profile with per-value layer provenance.",
         "annotations": _read("Team Config"),

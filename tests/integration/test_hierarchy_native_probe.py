@@ -3678,3 +3678,367 @@ scope["ModelledProbeClient"].popen = returned
     if finish_before_stop:
         finished = [row for row in observations if row["finish_before_stop"]]
         assert len(finished) == 1 and finished[0]["exit_code"] == 0
+
+
+@pytest.fixture
+def custody_probe():
+    """Faults affect only this module; the fixture independently owns and reaps every real child."""
+    from types import ModuleType
+    module = ModuleType("_custody_probe")
+    module.__file__ = str(PROBE)
+    exec(compile(PROBE.read_bytes(), str(PROBE), "exec"), module.__dict__)
+    children = []
+    yield module, children
+    for child in children:
+        # These children never fork, and remain ours until wait: no PID can be reused before reaping.
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("method,cleanup_failure", [("run_turn", None), ("run_turn", "group"),
+                                                    ("hold", None), ("hold", "group"), ("hold", "launcher")])
+@pytest.mark.parametrize("log_kind", ["stdout", "stderr"])
+def test_custody_log_close_failure_settles_started_child_and_preserves_error(
+        tmp_path, custody_probe, method, log_kind, cleanup_failure):
+    import builtins
+    import errno
+    import select
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    module, children = custody_probe
+    failure = OSError(errno.EIO, "fixture log close failed")
+    secondary = OSError(errno.EIO, "fixture settlement failed after reaping")
+    read_fd, write_fd = os.pipe()
+    argv = [sys.executable, "-I", "-c",
+            "import os,sys,time; os.write(int(sys.argv[1]), b'R'); time.sleep(60)", str(write_fd)]
+    stops, groups = [], []
+    original_stop = module.stop_group
+
+    def popen(words, **options):
+        child = subprocess.Popen(words, pass_fds=(write_fd,), **options)
+        children.append(child)
+        assert select.select([read_fd], [], [], 5)[0], "fixture child did not start"
+        assert os.read(read_fd, 1) == b"R"
+        return child
+
+    class Log:
+        def __init__(self, path, mode):
+            self.stream = builtins.open(path, mode)
+            self.selected = str(path).endswith("." + log_kind)
+
+        def __enter__(self):
+            return self.stream
+
+        def __exit__(self, *exc):
+            self.stream.close()
+            if self.selected and len(children) == 1:
+                assert children[0].poll() is None
+                raise failure
+
+    def stop_group(child):
+        groups.append(child)
+        original_stop(child)
+        if cleanup_failure == "group" and len(children) == 1:
+            raise secondary
+
+    runner = module.Runner({"probe_root": str(tmp_path),
+                            "timeouts": {"stop_grace_seconds": 0, "hold_wait_seconds": 0}},
+                           4, None, "codex", True)
+
+    def launcher(base, *words):
+        stops.append(words)
+        child = children[-1]
+        if child.poll() is None:
+            child.terminate()
+        # The synchronous launcher requires reaping alongside stop; only the product waiter does it here.
+        deadline = time.monotonic() + 5
+        while child.returncode is None and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert child.returncode is not None, "hold's concurrent waiter did not reap its child"
+        if cleanup_failure == "launcher" and len(children) == 1:
+            raise secondary
+        return 0, {"state": "stopped"}
+
+    module.subprocess = R2Facade(subprocess, Popen=popen)
+    module.open, module.stop_group = Log, stop_group
+    module.turns = lambda rollout: []
+    module.end_hold = lambda hold: {"done": "written"}
+    runner.launcher = launcher
+    planned = {"base": str(tmp_path), "endpoint": "fixture", "hold_prompt": "",
+               "hold": {"nonce": "fixture"}}
+
+    def invoke(name):
+        if method == "run_turn":
+            return runner.run_turn(argv, tmp_path, name, .01)
+        return runner.hold(planned, {"argv": argv, "cwd": str(tmp_path)}, "unused", name)
+
+    try:
+        with pytest.raises(OSError) as caught:
+            invoke("failed")
+        assert caught.value is failure
+        if cleanup_failure:
+            assert caught.value.__cause__ is secondary
+        assert children[0].returncode is not None
+        assert groups == children
+        assert len(stops) == (1 if method == "hold" else 0)
+        # A fresh invocation on the same runner still settles its own child after the failure.
+        result = invoke("retry")
+        assert children[-1].returncode is not None and groups == children
+        if method == "run_turn":
+            assert result[1] is True
+        else:
+            assert result["state"] == "stopped"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+@pytest.mark.parametrize("site", ["write_private", "auth_digest", "run"])
+@pytest.mark.parametrize("failure_at", ["constructor", "partial", "io"])
+def test_custody_fdopen_failure_closes_acquired_descriptor_and_allows_retry(
+        tmp_path, custody_probe, site, failure_at):
+    import errno
+    from types import SimpleNamespace
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    module, _ = custody_probe
+    failure = OSError(errno.EIO, "fixture fdopen construction failed")
+    descriptors = []
+    attempts = []
+    path = tmp_path / "auth.json"
+    path.write_text("fixture", encoding="utf-8")
+    path.chmod(0o600)
+
+    def opened(*args, **options):
+        fd = os.open(*args, **options)
+        descriptors.append(fd)
+        return fd
+
+    def fdopen(fd, *args, **options):
+        attempts.append(fd)
+        if len(attempts) == 1:
+            if failure_at == "constructor":
+                raise failure
+            stream = os.fdopen(fd, *args, **options)
+            if failure_at == "partial":
+                # A wrapper created during a failed fdopen may already have closed itself.
+                stream.close()
+                raise failure
+
+            class FailedIO:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    stream.close()
+
+                def fileno(self):
+                    return stream.fileno()
+
+                def read(self):
+                    raise failure
+
+                def write(self, value):
+                    raise failure
+
+            return FailedIO()
+        return os.fdopen(fd, *args, **options)
+
+    module.os = R2Facade(os, open=opened, fdopen=fdopen)
+    module.preflight = lambda args: ({"probe_root": str(tmp_path)}, 1, None, "codex", True, None)
+    module.run_locked = lambda *args: "ran"
+
+    def invoke():
+        if site == "write_private":
+            return module.write_private(tmp_path / "private.json", {"ok": True})
+        if site == "auth_digest":
+            return module.auth_digest(path)
+        return module.run(SimpleNamespace(auth="existing"))
+
+    try:
+        with pytest.raises(OSError) as caught:
+            invoke()
+        assert caught.value is failure
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[0])
+        assert closed.value.errno == errno.EBADF
+        assert not (tmp_path / ".run.lock").exists()
+        result = invoke()
+        if site == "write_private":
+            assert json.loads(result.read_text()) == {"ok": True}
+        elif site == "auth_digest":
+            assert result == hashlib.sha256(b"fixture").hexdigest()
+        else:
+            assert result == "ran" and not (tmp_path / ".run.lock").exists()
+        with pytest.raises(OSError) as closed:
+            os.fstat(descriptors[-1])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        # RED runs must not leak their intentionally exposed descriptors into pytest teardown.
+        for fd in set(descriptors):
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("method,event", [(method, event) for method in ("run_turn", "hold")
+                                         for event in ("open", "spawn", "exit", "timeout", "interrupt", "wait", "group")]
+                         + [("hold", "launcher"), ("hold", "mark"), ("hold", "observer"), ("hold", "grace")])
+def test_custody_turn_failure_and_completion_paths(tmp_path, custody_probe, method, event):
+    import builtins
+    import errno
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    module, children = custody_probe
+    failure = module.Interrupted(2) if event == "interrupt" else OSError(errno.EIO, "fixture " + event)
+    streams, groups, stops = [], [], []
+    original_stop = module.stop_group
+    argv = [sys.executable, "-I", "-c", "pass" if event == "exit" else "import time; time.sleep(60)"]
+    read_count = 0
+
+    def opened(path, mode):
+        if event == "open" and str(path).endswith(".stderr"):
+            raise failure
+        stream = builtins.open(path, mode)
+        streams.append(stream)
+        return stream
+
+    def popen(words, **options):
+        if event == "spawn":
+            raise failure
+        child = subprocess.Popen(words, **options)
+        children.append(child)
+        if event == "exit":
+            child.wait(timeout=5)
+        if method == "run_turn" and event in ("wait", "interrupt"):
+            def wait(**options):
+                raise failure
+            return R2Facade(child, wait=wait)
+        return child
+
+    def stop_group(process):
+        groups.append(process.pid)
+        # The wait error is scoped to the turn's wait operation, not the independent fixture's reap.
+        original_stop(children[-1])
+        if event == "group":
+            raise failure
+
+    def turns(rollout):
+        nonlocal read_count
+        read_count += 1
+        if method == "hold" and read_count > 1 and event == "interrupt":
+            raise failure
+        return []
+
+    def launcher(base, *words):
+        stops.append(words)
+        if event == "launcher":
+            raise failure
+        original_stop(children[-1])
+        return 0, {"state": "stopped"}
+
+    def end_hold(hold):
+        if event == "mark":
+            raise failure
+        return {"done": "written"}
+
+    if method == "hold" and event == "wait":
+        # The reaper records a wait failure, then group settlement must still run.
+        original_popen = popen
+        def failed_wait_popen(words, **options):
+            child = original_popen(words, **options)
+            def wait(**options):
+                raise failure
+            return R2Facade(child, wait=wait)
+        module.subprocess = R2Facade(subprocess, Popen=failed_wait_popen)
+    else:
+        module.subprocess = R2Facade(subprocess, Popen=popen)
+    if event == "observer":
+        class FailedObserver:
+            ident = None
+
+            def __init__(self, **options):
+                pass
+
+            def start(self):
+                raise RuntimeError("fixture thread start failed")
+        module.threading = R2Facade(threading, Thread=FailedObserver)
+    module.open, module.stop_group, module.turns, module.end_hold = opened, stop_group, turns, end_hold
+    timeouts = {"stop_grace_seconds": 0, "hold_wait_seconds": .01}
+    if event == "grace":
+        del timeouts["stop_grace_seconds"]
+    runner = module.Runner({"probe_root": str(tmp_path), "timeouts": timeouts}, 4, None, "codex", True)
+    runner.launcher = launcher
+
+    def invoke():
+        if method == "run_turn":
+            return runner.run_turn(argv, tmp_path, "control", .01)
+        return runner.hold({"base": str(tmp_path), "endpoint": "fixture", "hold_prompt": "",
+                            "hold": {"nonce": "fixture"}},
+                           {"argv": argv, "cwd": str(tmp_path)}, "unused", "control")
+
+    if event in ("exit", "timeout"):
+        result = invoke()
+        if method == "run_turn":
+            assert result[1] is (event == "timeout")
+        else:
+            assert result["state"] == "stopped"
+    elif event == "observer":
+        with pytest.raises(ValueError, match="^hold child exit observer unavailable$"):
+            invoke()
+    elif event == "grace":
+        with pytest.raises(KeyError, match="^'stop_grace_seconds'$"):
+            invoke()
+    else:
+        with pytest.raises(type(failure)) as caught:
+            invoke()
+        assert caught.value is failure
+    assert all(stream.closed for stream in streams)
+    assert all(child.returncode is not None for child in children)
+    assert groups == [child.pid for child in children]
+    assert len(stops) == (1 if method == "hold" and children else 0)
+
+
+def test_custody_concurrent_descriptor_transfers_do_not_close_each_others_streams(tmp_path, custody_probe):
+    import errno
+    from concurrent.futures import ThreadPoolExecutor
+    from tests.integration.test_hierarchy_launcher import R2Facade
+
+    module, _ = custody_probe
+    barrier = threading.Barrier(2)
+    paths, descriptors = {}, []
+    failure = OSError("fixture concurrent fdopen failure")
+
+    def opened(path, *args):
+        fd = os.open(path, *args)
+        paths[fd] = Path(path).name
+        descriptors.append(fd)
+        return fd
+
+    def fdopen(fd, *args, **options):
+        barrier.wait(timeout=5)
+        if paths[fd] == "failed.json":
+            raise failure
+        return os.fdopen(fd, *args, **options)
+
+    module.os = R2Facade(os, open=opened, fdopen=fdopen)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            failed = pool.submit(module.write_private, tmp_path / "failed.json", {})
+            successful = pool.submit(module.write_private, tmp_path / "success.json", {"ok": True})
+            with pytest.raises(OSError) as caught:
+                failed.result(timeout=10)
+            assert caught.value is failure
+            assert json.loads(successful.result(timeout=10).read_text()) == {"ok": True}
+        for fd in descriptors:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
