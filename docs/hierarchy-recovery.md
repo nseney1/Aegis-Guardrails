@@ -285,6 +285,8 @@ All rows above make `run-open` exit 3, including `execution_custody_unknown`.
 - `granted_elsewhere` with `stale_kind`: a newly granted request has another heavy
   kind than its admitted job now needs. `stale_job` names that job. Follow the
   matching-grant rule above; do not start a command solely because of this row.
+  A light owner requires no heavy kind and is never `stale_kind`; its reservation
+  remains correlated with that owner for planned reconciliation.
   Other job holders reported as `granted_elsewhere` must be re-admitted through
   their owning initiative's `run-open`, with dependencies and reservations checked.
   A manual holder may start only its already authorized work.
@@ -311,6 +313,98 @@ All rows above make `run-open` exit 3, including `execution_custody_unknown`.
   An acknowledged grant observed as released in the post-grant locked snapshot is
   retired from reservation recovery. Its census record remains historical evidence;
   a later fault must not report that released request as a retained reservation.
+  Reporting compatibility belongs to the owning initiative. Its plan status is
+  captured when it first participates, with each job and acknowledged reservation;
+  outcomes also retain the observed execution-fence and terminal-result facts.
+  Work on a pre-existing grant participates even when this pass acknowledges no
+  grant for that job. An unrelated initiative's grant never selects its mode.
+  For each participating initiative with a host plan, recovery records the pass-level fault exactly once before
+  looking up any per-job row. It preserves every existing outcome and reservation
+  field and appends a reconciliation diagnostic for every affected job or held reservation,
+  including for running,
+  dependency waiting, stale-grant waiting, abandoned and settle-pending outcomes.
+  Its guidance retains live or unknown custody and held reservations, distinguishes
+  work that has not started, and never authorizes repeating completed work.
+  Retired records are not recovered as reservations. Any earlier completed job
+  retains its own terminal row and reconciliation obligation, even when the last
+  retired grant belonged to a manual holder or a job outside the admitted candidates.
+  The request initiative's plan status is remembered with its acknowledged grant;
+  reporting does not depend on admitted-job ownership or a later filesystem probe.
+  All outcomes recorded in the pass are visited; a stale-kind reservation for one
+  job cannot hide another job's completed replacement. Repeated views of the same
+  job share one reconciliation row. The pass fault reason appears once, while
+  each additional row retains the guidance for its own outcome.
+  Owner identity is recorded when each job is considered, including jobs with an
+  existing claim. Its required kind is recorded on validated admission, before
+  execution starts for the pass. Removing an attempted job from a scheduling queue does not remove
+  its ownership: a later different-kind grant still names `stale_job`, and its
+  reservation view cannot replace that job's actual outcome.
+  Ownerless reservation diagnostics identify the validated request ID rather than
+  copying holder text into another output field.
+  A retryable settle-pending outcome before an execution fence says that this
+  attempt has not started execution and gives the repair-and-retry action. A
+  reservation bound to a known pre-fence owner gets that same guidance, including
+  a job closed by a root refusal receipt with no execution directory or result.
+  Positive execution-fence evidence comes only from `Job.observe_fence`: it must
+  open a bounded regular claim file without following links, from an anchored
+  directory descriptor, and fully validate the JSON writer schema. The required
+  fields are the matching job ID, positive integer PID, decimal process-start
+  string, valid UTC timestamp, exact boot-ID/PID-namespace process scope, and a
+  single SHA-256 recipes digest (or the supported legacy null digest). A plain
+  claim may additionally carry its validated census kind. Missing fields, wrong
+  types, invalid structure, extra fields, malformed or oversized JSON, symlinks,
+  directories, unreadable files, and every verification exception yield uncertain
+  custody. Planned liveness consumes that same validated snapshot; it never
+  retries a weaker claim parser. Directories, link publication, candidate paths,
+  and successful `lstat` alone cannot establish a positive fence.
+  Fresh liveness checks, including `resolve` and `recovery-status`, select an
+  execution claim through the same no-follow metadata classification. Without
+  an execution candidate they may inspect the staging runner's validated claim;
+  that admission claim does not become a derived execution fence.
+  Every entry point uses this verifier: existing jobs, closed-job reconciliation,
+  competing attempts, refusal losers, lost publication races, successful publication,
+  and released peer grants. Once verified, the fence remains historical evidence even if the
+  path later disappears. An unverified candidate observed absent before this
+  attempt crosses the execution boundary permits pre-fence repair guidance;
+  uncertain custody instead preserves the candidate and reservation and requires
+  custody to be established before execution retry.
+  Regular-result observation is a separate fact: every settlement-entry check
+  records it immediately, independently of earlier failed observations. Malformed
+  or subsequently missing results retain that fact and require preservation of the
+  observed result and reservation, terminal validation, and no repeated execution.
+  A result does not certify an execution claim. Only a verified claim permits
+  original-fence and stopped-process instructions.
+  Successful derivation admission records no execution fence until a separate
+  execution claim is verified. Its uncertainty flag clears immediately when the
+  saved admission validates, before independent source, lease, or execution checks;
+  this does not erase any separately observed execution evidence. An unvalidated
+  admission marker remains uncertain. A refusal receipt cannot turn an observed
+  execution claim or result into unstarted work.
+  A retained validated terminal result requires retrying settlement without
+  repeating execution; live or unknown custody retains its preservation guidance.
+  For an initiative without a host plan, legacy recovery row bytes remain unchanged, including the
+  extra reconciliation diagnostic for the released, unexecuted job.
+  Legacy parser refusal codes and error bytes also remain unchanged; the shared
+  verifier still records uncertain custody for those failed reads.
+  A dangling result remains absent for legacy settlement, dependency and recovery
+  reporting. Legacy result reads retain the original OS error, including failures
+  after the initial existence check; descriptor-relative reads report the same
+  full result path as the original diagnostic.
+  Planned ownership and legacy serialization use separate owner views. Planned
+  reconciliation retains every considered owner. No-plan grant reporting selects
+  its owner from the current scheduling candidates, as before; reservation and
+  fallback recovery use that candidate-based selection saved when the grant was
+  acknowledged. A past attempted owner or an admitted light job cannot add
+  persistent-owner fields to a legacy row.
+  Shared-store arbitration still determines the same legacy fallback reservation;
+  planned reconciliation is applied only to its own initiative's rows.
+  An empty initiative contributes no fault row merely because it has a plan.
+  A mailbox-only enumeration error is retained as its original row; it does not
+  register participation in another initiative's post-grant recovery. Participation
+  is recorded only by a job considered in the pass or an acknowledged reservation.
+  A job's actual outcome takes precedence over reservation rows that refer to it;
+  a later stale-kind grant cannot replace an earlier waiting outcome or invent
+  an execution fence for that attempt.
 
 A mailbox-writer lock or claim error before the exclusive execution fence is a
 per-job `settle_pending` row with a retry instruction; unrelated jobs and other
@@ -318,11 +412,24 @@ kinds still proceed. Before this attempt enters its claim boundary, another
 runner's newly created directory does not establish this attempt's custody. A
 mailbox lock at that point stays retryable, with the original claimant preserved.
 An admitted derivation's directory is separate from its later execution fence;
-starting `take_execution` clears the earlier in-memory admission marker. A busy
+successful validation clears admission uncertainty before later checks. A busy
 disposition lock before execution publication likewise stays retryable.
-A non-derived job's fence is its exclusive job directory;
-an admitted derivation uses its exclusive `execution.json`. A failure after that
-fence exists but before execution custody is established reports `abandoned`,
+If publication fails before this attempt links its execution claim, a readable
+peer claim does not become this attempt's fence: the error stays `settle_pending`,
+including when the peer has already completed. A failure after publishing this
+attempt's claim still preserves unknown custody, including a cleanup failure.
+The bounded claim read uses the shared anchored directory helper, whose Linux
+`O_PATH` traversal permits search-only ancestors without directory read access.
+The execution publisher preserves the pinned publisher's complete-file, fsync,
+same-filesystem hard-link no-replace and pending-name cleanup semantics. It records
+successful linking before cleanup; any later failure retains unknown custody even
+when the claim or an ancestor can no longer be read, including a cleanup
+`FileExistsError`, which is not a losing-publication result after our own link.
+A non-derived job excludes competing writers with its exclusive job directory;
+a derived job publishes a separate `execution.json` without replacement. Those
+physical boundaries prevent duplicate attempts; only the fully validated regular
+`claim.json` or `execution.json` records positive fence evidence. A failure after
+crossing that boundary but before custody is established reports `abandoned`,
 `reason: execution_custody_unknown` and `process_alive: null`, with exit 3. Later
 passes preserve an unreadable claim as unknown and never run through the existing
 fence. Root must inspect `recovery-status`, original claims and process scope;
@@ -333,6 +440,15 @@ a no-effect refusal: ENOSPC after directory creation is unknown custody even on
 that refusal path. A publication loser settling a completed claimant's retained
 result instead reports `settle_pending` if settlement fails. Observing that result
 does not make the loser its execution owner or authorize a second execution.
+Closed-job reconciliation, publication losers and existing jobs in planned
+initiatives select settlement only after observing a regular or nonregular result
+node. An observed directory, FIFO or symlink, or an observed regular result that
+cannot be read, therefore retains its settlement error. An unresolved directory
+or result probe is uncertain custody;
+it reports abandoned with execution_custody_unknown, without attempting settlement
+or giving retry guidance. An observed result does not verify an execution claim.
+Recovery inspection remains read-only and reports invalid retained results as
+evidence errors.
 
 When the job budget is exhausted, remaining ready jobs report `job_limit` before
 any further kind grant snapshots, replays or grants. Ready heavy jobs still enter
