@@ -1,11 +1,15 @@
 """Fresh-thread checkpoints retain every unread obligation or refuse without rotating."""
 import hashlib
+import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from tests.integration.test_hierarchy_delivery import Pilot, TARGET, posix_only
-from tests.integration.test_hierarchy_handoff import draft, mailbox_files
+from tests.integration.test_hierarchy_handoff import HANDOFF, draft, handoff, mailbox_files
 from tests.integration.test_hierarchy_mailbox import (  # noqa: F401
     INBOX_WIRE_BUDGET, cli_inbox_wire, invoke, message, pilot,
 )
@@ -202,3 +206,220 @@ def test_large_unread_briefs_remain_losslessly_pageable_after_handoff(pilot, tmp
 
     assert digest(received) == digest(expected)
     assert received == expected
+
+
+@pytest.fixture
+def pruning_case(tmp_path):
+    root = tmp_path / "mailbox"
+    endpoints = {name: {} for name in ("a/front-door", "a/root", "a/orchestrator", "a/lane/review")}
+    endpoints["a/lane/review"] = {"kind": "reviewer"}
+    invoke(root, "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": endpoints,
+                          "counterparts": [], "writer_limit": 3})
+    for endpoint in endpoints:
+        invoke(root, "bind", {"endpoint": endpoint, "host": "host-one", "session": endpoint,
+                              "expected_generation": 0})
+    briefs = [brief_at(tmp_path / ("inherited-%02d.md" % index), "Scope %d.\n" % index)
+              for index in range(74)]
+    request = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator", host="host-one",
+                                                  session="incumbent", briefs=briefs))
+    binding = invoke(root, "bind", request)
+    invoke(root, "ack-handoff", {"endpoint": "a/orchestrator", "session": "incumbent", "generation": 2,
+                                 "checkpoint_sha256": binding["checkpoint_sha256"]})
+    (tmp_path / "provision.json").write_text(json.dumps({"mailbox_root": str(root), "initiative": "a"}),
+                                            encoding="utf-8")
+    (tmp_path / "host-plan.json").write_text(json.dumps({
+        "schema": "aegis.hierarchy-host-plan/v1", "hierarchy": "a", "root": "codex-cli", "team": "codex-cli",
+        "stand_ins": {}, "config_sha256": "0" * 64}), encoding="utf-8")
+    return root, briefs
+
+
+def pruning_message(identifier, kind="info", **changes):
+    return {**message(recipient="a/lane/review", identifier=identifier, kind=kind),
+            "session": "incumbent", "binding_generation": 2, **changes}
+
+
+def pruning_spec(root, **changes):
+    return {"schema": "aegis.hierarchy-handoff/v1", "host": "codex-cli", "session": "successor",
+            "outgoing_stopped": True,
+            "entries": [{"root": str(root), "endpoint": "a/orchestrator", **changes}]}
+
+
+def pruned_binding(root):
+    return json.loads((root / "bindings" / "a" / "orchestrator" / "000003.json").read_text(encoding="utf-8"))
+
+
+def test_handoff_prunes_74_inherited_briefs_to_active_and_last_touching(pruning_case, tmp_path):
+    root, briefs = pruning_case
+    for index in (2, 9):
+        invoke(root, "publish", pruning_message("active-%d" % index, "dispatch", brief=briefs[index]))
+    invoke(root, "publish", message("a/lane/review", "a/orchestrator", identifier="last-brief", brief=briefs[40]))
+    # A later message without a brief must not erase the most recent touching brief.
+    invoke(root, "publish", message("a/lane/review", "a/orchestrator", identifier="unread-note"))
+    entry = {"delivery_dir": str(tmp_path / "delivery"), "completed_checks": ["review complete"]}
+    baseline = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator", **entry))["checkpoint"]
+    assert len(baseline["briefs"]) == 74
+    spec = pruning_spec(root, **entry)
+    result = handoff(tmp_path, spec, 0)
+    binding = pruned_binding(root)
+    expected = {**baseline, "briefs": [briefs[2], briefs[9], briefs[40]]}
+    assert binding["checkpoint"] == expected
+    assert len(binding["checkpoint"]) == 7
+    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    assert binding["checkpoint_sha256"] == hashlib.sha256(encoded).hexdigest()
+    assert "unread-note" in binding["checkpoint"]["pending_message_ids"]
+    assert invoke(root, "ack-handoff", result["entries"][0]["acknowledge"])["ready"] is True
+    before = mailbox_files(root)
+    repeated = handoff(tmp_path, spec, 0)
+    assert repeated["entries"][0]["already_bound"] is True
+    assert repeated["entries"][0]["checkpoint_sha256"] == binding["checkpoint_sha256"]
+    assert mailbox_files(root) == before
+
+
+@pytest.mark.parametrize("touching", [False, True])
+def test_handoff_with_no_active_work_keeps_exactly_one_brief(pruning_case, tmp_path, touching):
+    root, briefs = pruning_case
+    if touching:
+        invoke(root, "publish", pruning_message("last-touch", brief=briefs[12]))
+    result = handoff(tmp_path, pruning_spec(root), 0)
+    assert pruned_binding(root)["checkpoint"]["briefs"] == [briefs[12] if touching else briefs[-1]]
+    assert invoke(root, "ack-handoff", result["entries"][0]["acknowledge"])["ready"] is True
+
+
+def test_handoff_keeps_requested_briefs_in_draft_order(pruning_case, tmp_path):
+    root, briefs = pruning_case
+    extra = brief_at(tmp_path / "requested.md", "Explicit next scope.\n")
+    invoke(root, "publish", pruning_message("last-touch", brief=briefs[12]))
+    handoff(tmp_path, pruning_spec(root, briefs=[briefs[50], extra, briefs[50]]), 0)
+    assert pruned_binding(root)["checkpoint"]["briefs"] == [briefs[50], extra, briefs[12]]
+
+
+@pytest.mark.parametrize("endpoint", ["a/orchestrator", "a/root"])
+def test_handoff_keeps_an_open_jobs_brief_at_either_endpoint(pruning_case, tmp_path, endpoint):
+    root, briefs = pruning_case
+    if endpoint == "a/root":
+        request = invoke(root, "draft-handoff", draft(root, endpoint=endpoint, host="host-one",
+                                                      session="root-incumbent", briefs=briefs))
+        binding = invoke(root, "bind", request)
+        invoke(root, "ack-handoff", {"endpoint": endpoint, "session": "root-incumbent", "generation": 2,
+                                     "checkpoint_sha256": binding["checkpoint_sha256"]})
+    invoke(root, "publish", pruning_message("open-job", "job_request", to="a/root", brief=briefs[7]))
+    invoke(root, "publish", pruning_message("last-touch", to="a/root", brief=briefs[12]))
+    spec = pruning_spec(root)
+    spec["entries"][0]["endpoint"] = endpoint
+    result = handoff(tmp_path, spec, 0)
+    path = root / "bindings" / Path(endpoint) / "000003.json"
+    checkpoint = json.loads(path.read_text(encoding="utf-8"))["checkpoint"]
+    assert checkpoint["briefs"] == [briefs[7], briefs[12]]
+    assert checkpoint["pending_message_ids"] == ["open-job"]
+    assert invoke(root, "ack-handoff", result["entries"][0]["acknowledge"])["ready"] is True
+
+
+@pytest.mark.parametrize("boundary", ["draft_handoff", "bind"])
+def test_handoff_refuses_a_concurrent_dispatch_then_retries(pruning_case, tmp_path, capsys, boundary):
+    root, _ = pruning_case
+    module_spec = importlib.util.spec_from_file_location("mb4_handoff", HANDOFF)
+    control = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(control)
+    original = control.Mailbox
+    late = brief_at(tmp_path / "late.md", "Concurrent assignment.\n")
+    new_dispatch = pruning_message("late-dispatch", "dispatch", brief=late)
+
+    class ChangingMailbox(original):
+        def draft_handoff(self, request):
+            result = super().draft_handoff(request)
+            if boundary == "draft_handoff":
+                self.publish(new_dispatch)
+            return result
+
+        def bind(self, request):
+            if boundary == "bind":
+                self.publish(new_dispatch)
+            return super().bind(request)
+
+    # This test owns the freshly loaded module, which is not installed in sys.modules.
+    # Change its consumer reference only; the shared mailbox class and OS globals stay intact.
+    control.Mailbox = ChangingMailbox
+    path = tmp_path / "handoff-spec.json"
+    path.write_text(json.dumps(pruning_spec(root)), encoding="utf-8")
+    before = mailbox_files(root / "bindings")
+    try:
+        assert control.main(["--spec", str(path)]) == 3
+    finally:
+        control.Mailbox = original
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert json.loads(captured.out)["entries"][0]["error"] == "checkpoint omits active dispatch"
+    assert mailbox_files(root / "bindings") == before
+    assert not (root / ".write.lock").exists()
+    result = handoff(tmp_path, pruning_spec(root), 0)
+    assert pruned_binding(root)["checkpoint"]["briefs"] == [late]
+    assert invoke(root, "ack-handoff", result["entries"][0]["acknowledge"])["ready"] is True
+
+
+def test_no_plan_codex_handoff_preserves_checkpoint_hash_and_acknowledgment(pilot, tmp_path):  # noqa: F811
+    root, first = pilot
+    second = brief_at(tmp_path / "standing.md", "Standing owner intent.\n")
+    initial = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator", host="codex-cli",
+                                                session="incumbent", briefs=[first, second]))
+    binding = invoke(root, "bind", initial)
+    invoke(root, "ack-handoff", {"endpoint": "a/orchestrator", "session": "incumbent", "generation": 2,
+                                 "checkpoint_sha256": binding["checkpoint_sha256"]})
+    assert not (tmp_path / "host-plan.json").exists()
+    baseline = invoke(root, "draft-handoff", draft(root, endpoint="a/orchestrator", host="codex-cli"))["checkpoint"]
+    assert baseline["briefs"] == [first, second]
+    expected_hash = hashlib.sha256(json.dumps(baseline, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=True).encode("utf-8")).hexdigest()
+    spec = pruning_spec(root)
+    result = handoff(tmp_path, spec, 0)
+    actual = pruned_binding(root)
+    assert actual["checkpoint"] == baseline
+    assert actual["checkpoint_sha256"] == expected_hash
+    expected_ack = {"endpoint": "a/orchestrator", "session": "successor", "generation": 3,
+                    "checkpoint_sha256": expected_hash}
+    assert result["entries"][0]["acknowledge"] == expected_ack
+    assert invoke(root, "ack-handoff", expected_ack)["ready"] is True
+    before = mailbox_files(root)
+    assert handoff(tmp_path, spec, 0)["entries"][0]["acknowledge"] == expected_ack
+    assert mailbox_files(root) == before
+
+
+def test_planned_handoff_drops_completed_dispatch_and_terminal_job_briefs(pruning_case, tmp_path):
+    root, briefs = pruning_case
+    invoke(root, "publish", pruning_message("finished-dispatch", "dispatch", brief=briefs[2]))
+    invoke(root, "publish", message("a/lane/review", "a/orchestrator", identifier="accepted", kind="ack",
+                                    in_reply_to="finished-dispatch", acknowledgment="accepted"))
+    invoke(root, "publish", message("a/lane/review", "a/orchestrator", identifier="reviewed", kind="review",
+                                    in_reply_to="finished-dispatch", result={
+                                        "source_revision": "a" * 40, "source_tree": "b" * 40,
+                                        "checks": [{"check": "read diff", "outcome": "pass", "reference": "review"}]}))
+    invoke(root, "publish", pruning_message("finished-job", "job_request", to="a/root", brief=briefs[7]))
+    invoke(root, "publish", message("a/root", "a/orchestrator", identifier="job-done", kind="job_receipt",
+                                    in_reply_to="finished-job", receipt={"state": "refused", "reason": "closed"}))
+    invoke(root, "publish", pruning_message("last-touch", brief=briefs[12]))
+    result = handoff(tmp_path, pruning_spec(root), 0)
+    checkpoint = pruned_binding(root)["checkpoint"]
+    assert briefs[2] not in checkpoint["briefs"]
+    assert briefs[7] not in checkpoint["briefs"]
+    assert checkpoint["briefs"] == [briefs[12]]
+    assert checkpoint["pending_message_ids"] == []
+    assert invoke(root, "ack-handoff", result["entries"][0]["acknowledge"])["ready"] is True
+
+
+def test_planned_handoff_wrong_host_refuses_then_retries(pruning_case, tmp_path):
+    root, briefs = pruning_case
+    spec = pruning_spec(root)
+    before = mailbox_files(root)
+    refused = handoff(tmp_path, {**spec, "host": "claude-code"}, 3)
+    assert refused["entries"][0]["error"] == "a/orchestrator runs on codex-cli in this run's host plan, not claude-code"
+    assert mailbox_files(root) == before
+    handoff(tmp_path, spec, 0)
+    assert pruned_binding(root)["checkpoint"]["briefs"] == [briefs[-1]]
+
+
+def test_handoff_help_explains_planned_pruning_and_legacy_carry_forward():
+    result = subprocess.run([sys.executable, "-I", str(HANDOFF), "--help"],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0 and not result.stderr
+    assert "with a governing host plan" in result.stdout
+    assert "entries[].briefs" in result.stdout
+    assert "without a plan, briefs carry forward unchanged" in result.stdout
