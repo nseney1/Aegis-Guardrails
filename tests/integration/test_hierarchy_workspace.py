@@ -19,6 +19,7 @@ import venv
 import pytest
 
 from tools import hierarchy_workspace as controller
+from aegis_core import team as lease_reader
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, message
 from tests.integration.test_hierarchy_scenario import aegis
 
@@ -606,6 +607,108 @@ def test_a_real_lease_in_another_clone_conflicts_though_that_clone_cannot_see_it
     assert row["lane"] == "first-lane" and row["initiative"] == "first" and row["checkout"] == str(first)
     clear = workspace.run("check-paths", {"initiative": "second", "paths": ["src/b/**"]})
     assert clear["conflict"] is False and clear["conflicts"] == []
+
+
+@pytest.mark.parametrize("held,wanted,expired,conflict", [
+    (["src/a/**"], "src/a/value.txt", False, True),
+    (["src/a/**"], "src/b/value.txt", False, False),
+    (["/pyproject.toml"], "pyproject.toml", False, True),
+    (["/pyproject.toml"], "nested/pyproject.toml", False, False),
+    (["/docs/"], "docs/guide.md", False, True),
+    (["/docs/"], "nested/docs/guide.md", False, False),
+    (["README.md"], "nested/README.md", False, True),
+    (["docs/a.py src/b.py"], "src/b.py", False, True),
+    (["src/b.py"], "docs/a.py src/b.py", False, True),
+    ([".//pyproject.toml"], "nested/pyproject.toml", False, True),
+    (["src/**"], "src/value.txt", True, False),
+    ([" "], "other/value.txt", True, True),
+])
+def test_workspace_lease_parser_preserves_scope_exit_codes_and_read_only_checks(
+        workspace, two_clones, held, wanted, expired, conflict):
+    first, _ = two_clones
+    write_lease(first, "peer-lane", held, ts=100 if expired else None, ttl=1 if expired else 3600)
+    before = {p.name: p.read_bytes() for p in event_files(workspace)}
+    oid = git(first, "rev-parse", "refs/aegis/lanes/peer-lane")
+    for _ in range(2):
+        result = workspace.run("check-paths", {"initiative": "second", "paths": [wanted]},
+                               expect=3 if conflict else 0)
+        assert result["conflict"] is conflict
+        assert [row["lane"] for row in result["conflicts"]] == (["peer-lane"] if conflict else [])
+        assert result["checked_checkouts"] == 2
+    assert before == {p.name: p.read_bytes() for p in event_files(workspace)}
+    assert git(first, "rev-parse", "refs/aegis/lanes/peer-lane") == oid
+
+
+@pytest.mark.parametrize("held,hit,miss", [
+    (["/pyproject.toml"], "pyproject.toml", "nested/pyproject.toml"),
+    (["docs/a.py src/b.py"], "src/b.py", "other/value.txt"),
+])
+def test_workspace_lease_parser_keeps_mailbox_mcp_alive_across_overlap_frames(tmp_path, held, hit, miss):
+    from tests.integration.test_hierarchy_role_tools import Team
+
+    built = Team(tmp_path)
+    first, second = clone_pair(tmp_path)
+    built.workspace.register("own", checkouts=[str(first)])
+    built.workspace.register("peer", checkouts=[str(second)])
+    write_lease(second, "peer-lane", held)
+    before = {p.name: p.read_bytes() for p in event_files(built.workspace)}
+    responses = built.responses("a/lane/f2", [
+        ("workspace_path_overlap", {"paths": [path]}) for path in (hit, miss, hit)])
+    tools = [row["result"] for row in responses[2:]]
+    assert len(tools) == 3 and all(not row.get("isError", False) for row in tools)
+    assert [json.loads(row["content"][0]["text"])["conflict"] for row in tools] == [True, False, True]
+    assert before == {p.name: p.read_bytes() for p in event_files(built.workspace)}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the job runner reads /proc")
+def test_workspace_lease_parser_allows_jobs_with_a_disjoint_live_lease(tmp_path, tmp_path_factory, request):
+    from tests.integration.test_hierarchy_jobs import Shop, commit_request
+    from tests.integration.test_hierarchy_provision import worker_source_seed
+
+    shop = Shop(tmp_path, source_seed=worker_source_seed(tmp_path_factory, request))
+    write_lease(shop.checkout, "root-file-lane", ["/pyproject.toml"])
+    commit_request(shop)
+    assert shop.run_open()["rows"][0]["state"] == "completed"
+    assert shop.states("job-1") == ["started", "completed"]
+    shop.workspace.run("update", {"initiative": "pilot", "source": "fixture", "touched_paths": ["src/app.py"]})
+    report = shop.jobs("recovery-status", expect=0)
+    assert report["initiatives"][0]["paths"]["conflict"] is False
+
+
+def test_workspace_lease_parser_rechecks_a_replaced_lease_on_the_next_observation(workspace, two_clones, monkeypatch):
+    first, _ = two_clones
+    write_lease(first, "peer-lane", ["/pyproject.toml"])
+    original = lease_reader.read_leases
+    replaced = []
+
+    def read_then_replace(checkout):
+        observed = original(checkout)
+        if checkout == first and not replaced:
+            write_lease(first, "peer-lane", ["nested/pyproject.toml"])
+            replaced.append(True)
+        return observed
+
+    monkeypatch.setattr(lease_reader, "read_leases", read_then_replace)
+    ledger = controller.Store(workspace.store).load()
+    # The check is advisory: the first observation retains its parsed snapshot,
+    # and the next public call must read the new scope rather than cache it.
+    for expected in (0, 3, 3):
+        code, result = controller.check_paths(ledger, "second", ["nested/pyproject.toml"])
+        assert code == expected and result["conflict"] is (expected == 3)
+    assert replaced == [True]
+
+
+@pytest.mark.parametrize("raw", ["a.py /", "a.py ..", " "], ids=["empty-component", "parent", "empty-split"])
+def test_workspace_lease_parser_refuses_invalid_request_components_before_reading_leases(
+        workspace, two_clones, raw, monkeypatch):
+    def unexpected_read(*args):
+        raise AssertionError("invalid request reached the lease reader")
+
+    monkeypatch.setattr(lease_reader, "read_leases", unexpected_read)
+    with pytest.raises(ValueError, match=r"\Apaths is not a non-empty list of globs\Z"):
+        controller.check_paths(controller.Store(workspace.store).load(), "second", [raw])
+    response = workspace.run("check-paths", {"initiative": "second", "paths": [raw]}, expect=2)
+    assert response == {"error": "paths is not a non-empty list of globs"}
 
 
 def test_an_expired_lease_does_not_conflict(workspace, two_clones):

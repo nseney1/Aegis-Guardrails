@@ -81,7 +81,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aegis_core import primitives
-from aegis_core import events, gitsafe, team
+from aegis_core import events, gitsafe, team, team_paths
 from aegis_core.errors import AegisError, AegisValidationError
 from aegis_core.lane_ast import (
     collected_ids,
@@ -89,7 +89,7 @@ from aegis_core.lane_ast import (
     pytest_settings,
     skip_forms,
 )
-from aegis_core.match import is_test_path, matches, normalize_path
+from aegis_core.match import LeaseGlobError, is_test_path, matches, normalize_path, require_rule_glob
 from aegis_core.primitives import utc_stamp
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
@@ -345,6 +345,7 @@ def _cli_globs(paths: object) -> Tuple[str, ...]:
         raise LaneGateUsage("--paths: give at least one glob")
     out: List[str] = []
     for ordinal, glob in enumerate(paths, 1):
+        require_rule_glob(glob)
         problem = team.glob_problem(glob)
         if problem:
             message = {"not_text": "is not text without control characters",
@@ -381,14 +382,19 @@ def _commit_range(top: Path, base: Optional[str], tip: Optional[str] = None) -> 
     return ref, base_commit, merge_base, head
 
 
-def _lease_paths(top: Path, lane: str, now: int) -> Tuple[str, ...]:
+def _lease_paths(top: Path, lane: str, now: int) -> team_paths.PathSet:
     found = team.read_leases(top)
     lease = found.get(lane)
     if lease is not None and not lease.expired(now):
-        return lease.paths
+        return lease.path_set
+    bad = found.unreadable_lane(lane)
+    if bad is not None and bad.error == team_paths.STORED_PATH_ERROR:
+        raise LaneGateUsage(f"lane {lane} has no live lease (its lease is unreadable): "
+                            f"claim it with aegis team claim (release {lane} --expect {bad.oid}, then claim), "
+                            "give its globs with --paths, or read them from base with --base-policy")
     if lease is not None:
         why = f"its lease expired at {utc_stamp(lease.expires_at)}"
-    elif found.unreadable_lane(lane) is not None:
+    elif bad is not None:
         why = "its lease is unreadable"
     else:
         why = "it holds no lease"
@@ -396,13 +402,32 @@ def _lease_paths(top: Path, lane: str, now: int) -> Tuple[str, ...]:
                         "give its globs with --paths, or read them from base with --base-policy")
 
 
-def _contain(entry: Tuple[str, str, str, str], allowed: Sequence[Tuple[str, str]]) -> PathCheck:
+def _rule_path_matches(glob: str, path: str) -> bool:
+    """Rule/base-policy glob semantics, kept separate from lease containment."""
+    require_rule_glob(glob)
+    return matches(glob, path)
+
+
+def _captured_paths(paths: object) -> team_paths.PathSet:
+    """Parse a captured lease before Git work, preserving the gate's usage contract."""
+    try:
+        return team_paths.stored_paths(paths)
+    except team_paths.LeasePathError:
+        raise LaneGateUsage("paths: invalid captured lease globs") from None
+
+
+def _contain(entry: Tuple[str, str, str, str], allowed: Sequence[Tuple[str, str]],
+             leased: Optional[team_paths.PathSet], lease_source: str) -> PathCheck:
     status, old_mode, new_mode, path = entry
     protected = is_protected(path)
+    if leased is not None and not protected:
+        glob = team_paths.first_match(leased, path)
+        if glob is not None:
+            return PathCheck(path, status, old_mode, new_mode, True, glob, lease_source, protected)
     for glob, source in allowed:
         if protected and not source.startswith("base@"):
             continue
-        if matches(glob, path):
+        if _rule_path_matches(glob, path):
             return PathCheck(path, status, old_mode, new_mode, True, glob, source, protected)
     return PathCheck(path, status, old_mode, new_mode, False, None, None, protected)
 
@@ -524,48 +549,63 @@ def check_lane(root: Any, lane: str, base: Optional[str] = None, paths: Optional
     docstring) and append a ``lane_check`` event. ``tip`` substitutes an explicit
     commit for HEAD and reads shared policy from that commit; ``record=False``
     suppresses the event for read-only repository status. Default behavior is unchanged.
+    With explicit ``paths``, ``tip`` checks captured lease globs. Their existing
+    ``cli`` provenance lets status relabel them with the observed lease object id.
+    Ordinary explicit paths and base-policy paths retain rule glob semantics.
 
     Raises TeamUsageError for an invalid lane name; LaneGateUsage for ``paths`` with
     ``base_policy``, an invalid glob or no git work tree; TeamFileError for an unusable
     team.json; LaneGateError when there is no usable history, no live lease (without
     ``paths``) or no ``lanes`` entry at base (with ``base_policy``); GitError when git
-    fails.
+    fails. Internal lease/rule type errors map to a fixed usage refusal with
+    status=refused, reason and next_action.
     """
-    team.lane_ref(lane)
-    if base_policy and paths is not None:
-        raise LaneGateUsage("--paths cannot be combined with --base-policy: the lane's paths then come only "
-                            "from team.json at the base tip")
-    cli_paths = _cli_globs(paths) if paths is not None else None
-    workspace = Path(os.fspath(root))
-    top = gitsafe.toplevel(workspace)
-    if top is None:
-        raise LaneGateUsage("not in a git work tree: the lane gate checks git history")
-    moment = int(time.time()) if now is None else int(now)
-    ref, base_commit, merge_base, head = _commit_range(top, base, tip)
-    if base_policy:
-        policy = team.load_team_at(top, base_commit)
-        if policy.lanes is None or lane not in policy.lanes:
-            raise LaneGateError(f"team.json at {ref} ({base_commit[:12]}) has no lanes entry for {lane}: "
-                                "--base-policy takes the lane's paths only from there")
-        lane_paths, paths_source = policy.lanes[lane], f"base@{base_commit}"
-        shared, shared_source = policy.shared, f"base@{base_commit}"
-    else:
-        if cli_paths is not None:
-            lane_paths, paths_source = cli_paths, "cli"
+    try:
+        team.lane_ref(lane)
+        if base_policy and paths is not None:
+            raise LaneGateUsage("--paths cannot be combined with --base-policy: the lane's paths then come only "
+                                "from team.json at the base tip")
+        captured = _captured_paths(paths) if tip is not None and paths is not None else None
+        cli_paths = _cli_globs(paths) if paths is not None and captured is None else None
+        workspace = Path(os.fspath(root))
+        top = gitsafe.toplevel(workspace)
+        if top is None:
+            raise LaneGateUsage("not in a git work tree: the lane gate checks git history")
+        moment = int(time.time()) if now is None else int(now)
+        ref, base_commit, merge_base, head = _commit_range(top, base, tip)
+        leased = captured
+        if base_policy:
+            policy = team.load_team_at(top, base_commit)
+            if policy.lanes is None or lane not in policy.lanes:
+                raise LaneGateError(f"team.json at {ref} ({base_commit[:12]}) has no lanes entry for {lane}: "
+                                    "--base-policy takes the lane's paths only from there")
+            lane_paths, paths_source = policy.lanes[lane], f"base@{base_commit}"
+            shared, shared_source = policy.shared, f"base@{base_commit}"
         else:
-            lane_paths, paths_source = _lease_paths(top, lane, moment), "lease"
-        shared = team.load_team(top).shared if tip is None else team.load_team_at(top, head).shared
-        shared_source = "worktree" if tip is None else f"tip@{head}"
-    allowed = [(glob, paths_source) for glob in lane_paths] + [(glob, shared_source) for glob in shared]
-    entries = gitsafe.diff_entries(top, merge_base, head)
-    findings, checked, not_checked = _integrity(top, merge_base, head, entries)
-    # Passing is right (the lane changed nothing), but a reader of "PASSED" should know why.
-    empty = (f"HEAD is already contained in {ref}: nothing was checked",) if merge_base == head else ()
-    result = LaneCheck(
-        lane=lane, workspace=str(workspace), repository=str(top), base=ref, base_commit=base_commit,
-        merge_base=merge_base, head=head, paths=tuple(lane_paths), paths_source=paths_source,
-        shared=tuple(shared), shared_source=shared_source,
-        changes=tuple(_contain(entry, allowed) for entry in entries),
-        findings=findings, checked=checked, not_checked=not_checked, checked_at=utc_stamp(moment), warnings=empty,
-    )
-    return dataclasses.replace(result, warnings=empty + _record(top, result)) if record else result
+            if captured is not None:
+                lane_paths, paths_source = captured.raw, "cli"
+            elif cli_paths is not None:
+                lane_paths, paths_source = cli_paths, "cli"
+            else:
+                leased = _lease_paths(top, lane, moment)
+                lane_paths, paths_source = leased.raw, "lease"
+            shared = team.load_team(top).shared if tip is None else team.load_team_at(top, head).shared
+            shared_source = "worktree" if tip is None else f"tip@{head}"
+        allowed = [] if leased is not None else [(glob, paths_source) for glob in lane_paths]
+        allowed += [(glob, shared_source) for glob in shared]
+        entries = gitsafe.diff_entries(top, merge_base, head)
+        findings, checked, not_checked = _integrity(top, merge_base, head, entries)
+        # Passing is right (the lane changed nothing), but a reader of "PASSED" should know why.
+        empty = (f"HEAD is already contained in {ref}: nothing was checked",) if merge_base == head else ()
+        result = LaneCheck(
+            lane=lane, workspace=str(workspace), repository=str(top), base=ref, base_commit=base_commit,
+            merge_base=merge_base, head=head, paths=tuple(lane_paths), paths_source=paths_source,
+            shared=tuple(shared), shared_source=shared_source,
+            changes=tuple(_contain(entry, allowed, leased, paths_source) for entry in entries),
+            findings=findings, checked=checked, not_checked=not_checked, checked_at=utc_stamp(moment), warnings=empty,
+        )
+        return dataclasses.replace(result, warnings=empty + _record(top, result)) if record else result
+    except LeaseGlobError:
+        next_action = "Repair lease/rule separation, then retry aegis check --lane."
+        raise LaneGateUsage("refused: lease globs cannot use rule matching; " + next_action,
+                            status="refused", reason="lease_rule_mix", next_action=next_action) from None
