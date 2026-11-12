@@ -39,12 +39,7 @@ BUILTIN_GLOBALS = {
         "The dynamically loaded hierarchy_root module reads builtin open through its globals.",
 }
 # Temporary exceptions pin the file, lexical scope, call syntax and occurrence.
-LEASED_SITES = {
-    ('tests/integration/test_hierarchy_provision.py', 'test_mr1_planless_does_not_open_bindings_and_preserves_answers', 'patch', "monkeypatch.setattr(module, 'MODEL_BINDINGS', garbage, raising=False)", 0):
-        'raising=False added by merged lane; follow-up to drop the flag',
-    ('tests/unit/core/test_team_hosts.py', 'test_dense_routing_counts_edges_and_queue_operations', 'patch', "monkeypatch.setattr(profile, 'deque', CountedDeque, raising=False)", 0):
-        'TP6 wraps the existing module-level collections.deque binding with CountedDeque to count routing traversals, edges, pushes and pops; retain the merged raising=False flag only at this exact call.',
-}
+LEASED_SITES = {}
 
 # Exact computed calls: (file, scope, kind, syntax, occurrence) -> (shared, reason).
 # A newly permissive flag changes the key and requires its own explicit review.
@@ -264,8 +259,6 @@ OWNER_REGISTRATIONS = {
         (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
     ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_falls_back_only_when_pidfd_is_unsupported', 'module.os'):
         (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
-    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_falls_back_only_when_pidfd_is_unsupported', 'module.signal'):
-        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
     ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_uses_real_and_effective_status_uids', 'module.os'):
         (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
     ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_retains_stubborn_descendants_after_the_middle_exits', 'module.os'):
@@ -6331,12 +6324,14 @@ def test_builtin_allowances_are_exact_module_names_in_the_consumer_file():
         "1: other.input permits a missing target"]
 
 
-def test_leased_allowances_pin_file_scope_call_flags_and_occurrence():
+def test_retired_lease_refuses_file_scope_call_flags_and_occurrence():
     path = "tests/integration/test_hierarchy_provision.py"
     source = ("def test_mr1_planless_does_not_open_bindings_and_preserves_answers(monkeypatch, module):\n"
               "    monkeypatch.setattr(module, 'MODEL_BINDINGS', garbage, raising=False)")
-    assert raising_errors(patch_sites(source, path), path) == []
-    assert raising_errors(patch_sites("# marker\n" + source, path), path) == []
+    assert raising_errors(patch_sites(source, path), path) == [
+        "2: module.MODEL_BINDINGS permits a missing target"]
+    assert raising_errors(patch_sites("# marker\n" + source, path), path) == [
+        "3: module.MODEL_BINDINGS permits a missing target"]
     assert raising_errors(patch_sites(source, "tests/other.py"), "tests/other.py")
     assert raising_errors(patch_sites(source.replace("MODEL_BINDINGS", "RENAMED"), path), path)
     assert raising_errors(patch_sites(source + "\n    monkeypatch.setattr(module, 'MODEL_BINDINGS', garbage, raising=False)", path), path)
@@ -7091,7 +7086,7 @@ def test_r12c_computed_keys_survive_markers_and_pin_call_flags_and_occurrence():
     assert raising_errors(patch_sites(source[:-1] + ', raising=False)', path, dynamic=dynamic), path, dynamic=dynamic)
 
 
-def test_r12c_existing_lease_survives_marker_only_edits():
+def test_r12c_strict_site_survives_marker_only_edits():
     path = "tests/integration/test_hierarchy_provision.py"
     source = (REPO / path).read_text(encoding="utf-8")
     assert raising_errors(patch_sites(source, path), path) == []
@@ -7480,9 +7475,19 @@ def test_r15_merged_sites_have_exact_reviewed_registrations(filename):
     assert raising_errors(patch_sites(source, filename), filename) == []
 
 
+@pytest.mark.parametrize('filename,target', [
+    ('tests/integration/test_hierarchy_provision.py', 'MODEL_BINDINGS'),
+    ('tests/unit/core/test_team_hosts.py', 'deque'),
+])
+def test_rf11d_always_present_targets_require_strict_patches(filename, target):
+    rows = patch_sites((REPO / filename).read_text(encoding='utf-8'), filename)
+    selected = [row for row in rows if row[1].endswith('.' + target)]
+    assert selected, 'the behavior probe must still patch its intended target'
+    assert all(not nonraising for _, _, _, nonraising in selected)
+
+
 @pytest.mark.parametrize('filename,function', [
     ('tests/unit/cli/test_team_hosts_cli.py', 'test_public_entrypoint'),
-    ('tests/unit/core/test_team_hosts.py', 'test_dense_routing_counts_edges_and_queue_operations'),
 ])
 def test_r15_registrations_do_not_authorize_a_sibling_scope(filename, function):
     source = (REPO / filename).read_text(encoding='utf-8')
@@ -7491,10 +7496,10 @@ def test_r15_registrations_do_not_authorize_a_sibling_scope(filename, function):
     assert raising_errors(patch_sites(changed, filename), filename)
 
 
-def test_r15_queue_registration_does_not_authorize_a_different_target():
+def test_r15_queue_patch_cannot_permit_a_missing_target():
     filename = 'tests/unit/core/test_team_hosts.py'
     source = (REPO / filename).read_text(encoding='utf-8')
-    changed = source.replace('"deque", CountedDeque, raising=False', '"unregistered_queue", CountedDeque, raising=False', 1)
+    changed = source.replace('"deque", CountedDeque)', '"unregistered_queue", CountedDeque, raising=False)', 1)
     assert changed != source
     assert any('aegis_core.team_profile.unregistered_queue permits a missing target' in error
                for error in raising_errors(patch_sites(changed, filename), filename))
