@@ -58,7 +58,8 @@ Linux only, because the census and the liveness checks read /proc.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from collections import namedtuple
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import os
@@ -72,6 +73,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import xml.etree.ElementTree as ElementTree
 
 sys.dont_write_bytecode = True
@@ -79,8 +81,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_git import object_read_argv, object_read_env  # noqa: E402
 import hierarchy_hosts  # noqa: E402
-from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
-                               publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
+from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, MAX_BYTES, SHA256, SLUG, Mailbox, encoded, fields, integer, matching,  # noqa: E402
+                               parse_time, publish_file, read_bytes, read_json, require, safe_path, strict_json, strings, text, timestamp,
                                status_entries, writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
 from hierarchy_workspace import (KINDS as LEDGER_KINDS, MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view,  # noqa: E402
@@ -97,6 +99,8 @@ ENV_TOKENS = {"$scratch", "$checkout"}
 SANDBOXES = ("bwrap", "none")
 # The ledger kinds a heavy job can wait for, in the order they are granted. Each has its own limit.
 HEAVY_KINDS = ("heavy", "heavy-tests")
+FENCE_VERIFIED, FENCE_UNCERTAIN = "verified", "uncertain"
+ClaimObservation = namedtuple("ClaimObservation", "state value present parsed read_error")
 # Cargo subcommands and aliases that compile. fmt, metadata, tree and --version stay light.
 CARGO_COMPILING = {"build", "b", "test", "t", "check", "c", "run", "r", "bench", "clippy", "doc", "d", "rustc", "install",
                    "nextest", "miri"}
@@ -954,6 +958,7 @@ def admitted_derivation(job, raw, recipes_sha256):
     matching(derived["dirty_content_sha256"], SHA256, "admitted dirty_content_sha256")
     matching(derived["expected_tree"], GIT_ID, "admitted expected_tree")
     require(derived["derived_by"] == "runner", "invalid admitted derivation")
+    job.validated_admission()
     return derived
 
 
@@ -1118,8 +1123,10 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         host_plan = derive_host_plan(initiative)
         require(store is not None, "derivation requires the workspace store")
         job = job or Job(store.path, initiative, message)
-        saved = (admitted_derivation(job, raw, recipes["recipes_sha256"])
-                 if (job.folder / "admitted.json").exists() else None)
+        marker = job.metadata_kind("admitted.json") if job.planned else (
+            "regular" if (job.folder / "admitted.json").exists() else "absent")
+        require(marker in ("absent", "regular"), "admission marker unverified")
+        saved = admitted_derivation(job, raw, recipes["recipes_sha256"]) if marker == "regular" else None
         if saved is not None:
             require(saved["host_plan"] == host_plan, "host plan changed after admission")
     checkout = absolute(packet["checkout"], "checkout")
@@ -1197,6 +1204,7 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         publish_file(job.folder / "admitted.json", encoded({"packet_sha256": hashlib.sha256(raw).hexdigest(),
                      "recipes_sha256": recipes["recipes_sha256"],
                      "derivation_sha256": file_sha256(job.folder / "derivation.json")}) + b"\n")
+        job.validated_admission()
     if kind == "merge":
         merge_refusals(checkout, packet["commit"], packet["merge"])
         # The witness binds the revision and tree, not the branch, so the branch is held here and checked again at run time.
@@ -1353,6 +1361,17 @@ class Job:
         self.admission_owned = False
         self.execution_owned = False
         self.execution_fence = None
+        self.execution_published = False
+        self.planned = has_host_plan(initiative)
+        self.execution_claim_name = "claim.json"
+        self.fence_observations = {}
+        self.claim_candidates = set()
+        self.execution_boundary_crossed = False
+        self.metadata_uncertain = False
+        self.result_observed = False
+        self.admission_validated = False
+        self.admission_unverified = False
+        self.terminal_observed = False
         self.settlement_attempted = False
         self.census_capacity = None
         self.census_request_id = None
@@ -1362,13 +1381,240 @@ class Job:
         self.census_requests = None
         self.written_result = None
 
+    def recorded_execution_fence(self):
+        observation = self.fence_observations.get(self.execution_claim_name)
+        if observation is not None and observation.state == FENCE_VERIFIED:
+            return True
+        if (self.admission_unverified or self.execution_boundary_crossed or self.metadata_uncertain
+                or self.execution_claim_name in self.claim_candidates):
+            return None
+        return False if observation is None or observation.present is False else None
+
+    @contextmanager
+    def directory_descriptor(self):
+        """Hold the exact job directory beneath an anchored, no-follow parent."""
+        from hierarchy_fresh_brief import directory_flags, open_directory, require_secure_publication
+
+        require_secure_publication()
+        with ExitStack() as owned:
+            try:
+                parent = open_directory(self.folder.parent)
+            except ValueError as exc:
+                if isinstance(exc.__cause__, FileNotFoundError):
+                    raise FileNotFoundError("job directory absent") from exc
+                raise ValueError("job directory unavailable") from exc
+            owned.callback(os.close, parent)
+            before = os.stat(self.folder.name, dir_fd=parent, follow_symlinks=False)
+            require(stat.S_ISDIR(before.st_mode), "job directory is not a directory")
+            directory = os.open(self.folder.name, directory_flags(), dir_fd=parent)
+            owned.callback(os.close, directory)
+            after = os.fstat(directory)
+            require(stat.S_ISDIR(after.st_mode) and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+                    "job directory changed")
+            yield directory
+
+    def observe_fence(self, name=None, directory=None):
+        """The sole producer of VERIFIED fence evidence; every other outcome is UNCERTAIN."""
+        name = self.execution_claim_name if name is None else name
+        value, present, parsed = None, None, False
+        try:
+            require(name in ("claim.json", "execution.json"), "invalid claim filename")
+            with ExitStack() as owned:
+                if directory is None:
+                    directory = owned.enter_context(self.directory_descriptor())
+                try:
+                    before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    before = None
+                    present = False
+                require(before is not None, "claim absent")
+                present = True
+                self.claim_candidates.add(name)
+                require(stat.S_ISREG(before.st_mode) and before.st_size <= MAX_BYTES, "claim is not a bounded regular file")
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+                owned.callback(os.close, descriptor)
+                after = os.fstat(descriptor)
+                require(stat.S_ISREG(after.st_mode) and after.st_size <= MAX_BYTES
+                        and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), "claim changed")
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    raw = stream.read(MAX_BYTES + 1)
+                require(len(raw) <= MAX_BYTES, "claim exceeds its limit")
+            value = strict_json(raw.decode("utf-8"))
+            parsed = True
+            required = {"job", "pid", "start", "at", "process_scope", "recipes_sha256"}
+            optional = {"census_kind"} if name == "claim.json" else set()
+            require(isinstance(value, dict) and required <= set(value) <= required | optional,
+                    "invalid claim fields")
+            require(isinstance(value["job"], str) and value["job"] == self.id, "invalid claim job")
+            require(type(value["pid"]) is int and value["pid"] > 0, "invalid claim pid")
+            require(isinstance(value["start"], str) and re.fullmatch(r"[0-9]+", value["start"]) is not None,
+                    "invalid claim start")
+            parse_time(value["at"])
+            scope = value["process_scope"]
+            require(isinstance(scope, dict) and set(scope) == {"boot_id", "pid_namespace"}, "invalid process scope")
+            require(isinstance(scope["boot_id"], str)
+                    and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", scope["boot_id"]) is not None,
+                    "invalid boot id")
+            require(isinstance(scope["pid_namespace"], str)
+                    and re.fullmatch(r"pid:\[[0-9]+\]", scope["pid_namespace"]) is not None, "invalid pid namespace")
+            require(value["recipes_sha256"] is None or (isinstance(value["recipes_sha256"], str)
+                    and SHA256.fullmatch(value["recipes_sha256"]) is not None), "invalid recipe digest")
+            if "census_kind" in value:
+                require(isinstance(value["census_kind"], str) and value["census_kind"] in ("none", *HEAVY_KINDS),
+                        "invalid census kind")
+            observation = ClaimObservation(FENCE_VERIFIED, value, True, True, None)
+        except Exception as exc:
+            observation = ClaimObservation(FENCE_UNCERTAIN, value if parsed else None, present, parsed,
+                                           None if parsed else exc)
+        previous = self.fence_observations.get(name)
+        if previous is None or previous.state != FENCE_VERIFIED or observation.state == FENCE_VERIFIED:
+            self.fence_observations[name] = observation
+        return observation
+
+    def metadata_kind(self, name):
+        try:
+            with self.directory_descriptor() as directory:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                return "regular" if stat.S_ISREG(info.st_mode) else "other"
+        except FileNotFoundError:
+            return "absent"
+        except Exception:
+            return "uncertain"
+
+    def observe_result(self, directory=None):
+        """Record a regular result immediately, independently of all earlier observations."""
+        try:
+            with ExitStack() as owned:
+                if directory is None:
+                    directory = owned.enter_context(self.directory_descriptor())
+                try:
+                    info = os.stat(self.result_path.name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    return "absent"
+                if stat.S_ISREG(info.st_mode):
+                    self.result_observed = True
+                    return "regular"
+                self.metadata_uncertain = True
+                return "other"
+        except FileNotFoundError:
+            return "absent"
+        except Exception:
+            self.metadata_uncertain = True
+            return "uncertain"
+
+    def observe_existing_fence(self):
+        """Classify every metadata node without following links, then use the one claim verifier."""
+        nodes = {"folder": "uncertain", "result": "uncertain", "admitted": "uncertain",
+                 "execution": "uncertain", "observation": None}
+        try:
+            with self.directory_descriptor() as directory:
+                nodes["folder"] = "directory"
+                nodes["result"] = self.observe_result(directory)
+                for key, name in (("admitted", "admitted.json"), ("execution", "execution.json")):
+                    try:
+                        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        nodes[key] = "absent"
+                    except Exception:
+                        nodes[key] = "uncertain"
+                    else:
+                        nodes[key] = "regular" if stat.S_ISREG(info.st_mode) else "other"
+                if nodes["execution"] != "absent":
+                    self.execution_claim_name = "execution.json"
+                elif self.admission_validated or nodes["admitted"] == "regular":
+                    self.execution_claim_name = "execution.json"
+                    self.admission_unverified = not self.admission_validated
+                else:
+                    self.execution_claim_name = "claim.json"
+                    self.execution_boundary_crossed = True
+                nodes["observation"] = self.observe_fence(directory=directory)
+        except FileNotFoundError:
+            nodes.update(folder="absent", result="absent", admitted="absent", execution="absent")
+        except Exception:
+            self.metadata_uncertain = True
+            nodes["observation"] = self.observe_fence()
+        return nodes
+
+    def validated_admission(self):
+        self.admission_validated = True
+        self.admission_unverified = False
+        self.execution_claim_name = "execution.json"
+        self.execution_boundary_crossed = False
+
+    def runner_alive(self, observation=None):
+        """Planned liveness uses the verified snapshot; legacy labels and refusal codes stay compatible."""
+        if self.planned:
+            if observation is None:
+                nodes = self.observe_existing_fence()
+                observation = nodes["observation"]
+                if (nodes["folder"] == "directory" and nodes["execution"] == "absent"
+                        and self.execution_claim_name == "execution.json"):
+                    # Admission-only jobs still have a staging runner, but its claim is not an execution fence.
+                    observation = self.observe_fence("claim.json")
+            if observation is None or observation.state != FENCE_VERIFIED:
+                return None
+        else:
+            name = self.execution_path.name if self.execution_path.exists() else self.claim_path.name
+            observation = self.observe_fence(name)
+            if not observation.parsed:
+                if isinstance(observation.read_error, ERRORS) and not isinstance(observation.read_error, (ValueError, OSError)):
+                    # The old reader let these reach main's documented refusal handler. This is serialization
+                    # compatibility only: the common verifier still returned UNCERTAIN and recorded no fence.
+                    raise observation.read_error
+                return None
+        claim = observation.value
+
+        def inspect():
+            require(isinstance(claim, dict) and claim.get("job") == self.id, "claim does not belong to job: " + self.id)
+            require(type(claim.get("pid")) is int and claim["pid"] > 0 and isinstance(claim.get("start"), str)
+                    and claim["start"].isdigit(), "invalid runner claim: " + self.id)
+            if claim.get("process_scope") != process_scope():
+                return None
+            return process_start(claim["pid"]) == claim["start"]
+
+        if not self.planned:
+            return inspect()
+        try:
+            return inspect()
+        except Exception:
+            return None
+
     def result(self):
         """Read with the same limit it was written with, or a valid large result could never be settled."""
-        if not self.result_path.exists():
+        if not self.planned and not self.result_path.exists():
             return None
-        info = os.lstat(self.result_path)
-        require(stat.S_ISREG(info.st_mode) and info.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
-        result = strict_json(self.result_path.read_bytes().decode("utf-8"))
+        try:
+            with ExitStack() as owned:
+                directory = owned.enter_context(self.directory_descriptor())
+                before = os.stat(self.result_path.name, dir_fd=directory, follow_symlinks=False)
+                require(stat.S_ISREG(before.st_mode), "result is not a readable file within its limit")
+                self.result_observed = True
+                require(before.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
+                descriptor = os.open(self.result_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                     dir_fd=directory)
+                owned.callback(os.close, descriptor)
+                after = os.fstat(descriptor)
+                require(stat.S_ISREG(after.st_mode) and after.st_size <= MAX_RESULT_BYTES
+                        and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+                        "result is not a readable file within its limit")
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    raw = stream.read(MAX_RESULT_BYTES + 1)
+                require(len(raw) <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
+        except OSError as exc:
+            if not self.planned:
+                # Descriptor-relative access reports the leaf; preserve the legacy full-path OS diagnostic.
+                if exc.filename == self.result_path.name:
+                    exc.filename = str(self.result_path)
+                raise
+            if isinstance(exc, FileNotFoundError):
+                return None
+            raise ValueError("result is not a readable file within its limit") from exc
+        try:
+            result = strict_json(raw.decode("utf-8"))
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            if not self.planned:
+                raise
+            raise ValueError("invalid job result schema") from exc
         require(isinstance(result, dict) and result.get("schema") == RESULT_SCHEMA, "invalid job result schema")
         require(result.get("job") == self.id, "result does not belong to job: " + self.id)
         require(result.get("state") in ("completed", "failed", "refused"), "invalid terminal job state")
@@ -1408,38 +1654,32 @@ class Job:
                 or (result["state"] == "completed" and type(code) is int and code == 0)
                 or (result["state"] == "failed" and type(code) is int and code != 0),
                 "job result state and exit code disagree")
+        self.terminal_observed = True
         return result
 
-    def claim(self, packet_raw, recipes_sha256=None):
-        """Exclusive, so two runners or a retry can never start the same job twice. The recipe file's hash is kept here so
-        a later root resolution records the file the job was taken under, not whatever file exists by then."""
+    def claim(self, packet_raw, recipes_sha256=None, *, for_execution=False):
+        """The directory excludes competing writers; only its validated claim proves a fence."""
         self.folder.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.folder.mkdir(mode=0o700)
         except FileExistsError:
+            if for_execution:
+                self.observe_existing_fence()
             return False
+        self.execution_claim_name = "claim.json"
+        self.execution_boundary_crossed = True
         self.execution_fence = self.folder
-        ticks = process_start(os.getpid())
         extra = ({"census_kind": self.census_kind}
                  if self.census_policy is not None and self.census_kind is not None else {})
-        publish_file(self.claim_path, encoded({"pid": os.getpid(), "start": ticks, "job": self.id, "at": timestamp(),
-                                             "process_scope": process_scope(), "recipes_sha256": recipes_sha256, **extra}) + b"\n")
+        claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
+                 "process_scope": process_scope(), "recipes_sha256": recipes_sha256, **extra}
+        publish_file(self.claim_path, encoded(claim) + b"\n")
+        observation = self.observe_fence()
+        require(observation.state == FENCE_VERIFIED and observation.value == claim, "claim publication unverified")
         if packet_raw is not None:
             publish_file(self.folder / "packet.md", packet_raw)
         return True
 
-    def runner_alive(self):
-        """True/False only with a valid original claim and observable process; otherwise unknown."""
-        try:
-            claim = read_json(self.execution_path if self.execution_path.exists() else self.claim_path)
-        except (ValueError, OSError):
-            return None
-        require(isinstance(claim, dict) and claim.get("job") == self.id, "claim does not belong to job: " + self.id)
-        require(type(claim.get("pid")) is int and claim["pid"] > 0 and isinstance(claim.get("start"), str)
-                and claim["start"].isdigit(), "invalid runner claim: " + self.id)
-        if claim.get("process_scope") != process_scope():
-            return None
-        return process_start(claim["pid"]) == claim["start"]
 
     @contextmanager
     def disposition(self):
@@ -1456,28 +1696,99 @@ class Job:
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
+    def execution_publication_matches(self, claim=None, directory=None):
+        """Compatibility predicate; all positive evidence comes from observe_fence."""
+        observation = self.observe_fence("execution.json", directory)
+        if observation.state == FENCE_VERIFIED:
+            return claim is None or observation.value == claim
+        return False if observation.present is False else None
+
+    def publish_execution_claim(self, raw):
+        """Publish without replacement, and validate the linked file before recording its evidence."""
+        require(len(raw) <= MAX_BYTES, "record exceeds %d bytes" % MAX_BYTES)
+        from hierarchy_fresh_brief import require_secure_publication
+
+        require_secure_publication()
+        pending = ".pending-" + uuid.uuid4().hex
+        self.execution_claim_name = "execution.json"
+        with ExitStack() as owned:
+            try:
+                directory = owned.enter_context(self.directory_descriptor())
+            except (ValueError, OSError) as exc:
+                raise ValueError("execution claim directory unavailable") from exc
+            created = False
+            try:
+                descriptor = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     0o600, dir_fd=directory)
+                created = True
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                finally:
+                    os.close(descriptor)
+                try:
+                    os.link(pending, self.execution_path.name, src_dir_fd=directory, dst_dir_fd=directory,
+                            follow_symlinks=False)
+                except FileExistsError:
+                    self.observe_fence(directory=directory)
+                    raise
+                self.execution_published = True
+                self.execution_boundary_crossed = True
+                self.execution_fence = self.execution_path
+                observation = self.observe_fence(directory=directory)
+                require(observation.state == FENCE_VERIFIED and observation.value == strict_json(raw.decode("utf-8")),
+                        "execution claim publication unverified")
+            finally:
+                if created:
+                    os.unlink(pending, dir_fd=directory)
+
     def take_execution(self, packet_raw, recipes_sha256):
-        """A successful derived admission may wait across polls; its execution claim is still one-use."""
-        self.execution_fence = None  # A completed admission's directory is not this execution attempt's fence.
-        if not (self.folder / "admitted.json").exists():
-            return self.claim(packet_raw, recipes_sha256)
+        """Successful derivation admission and the separate execution claim have distinct custody."""
+        self.execution_fence = None
+        self.execution_published = False
+        self.execution_boundary_crossed = False
+        if self.planned:
+            marker = self.metadata_kind("admitted.json")
+            require(marker in ("absent", "regular"), "admission marker unverified")
+            admitted = marker == "regular"
+        else:
+            admitted = (self.folder / "admitted.json").exists()
+        if not admitted:
+            return self.claim(packet_raw, recipes_sha256, for_execution=True)
+        self.execution_claim_name = "execution.json"
         with self.disposition():
             raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
             admitted_derivation(self, raw, recipes_sha256)
             check_settlement_processes(self, {"steps": []})
-            self.execution_fence = self.execution_path
             claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
                      "process_scope": process_scope(), "recipes_sha256": recipes_sha256}
             try:
-                publish_file(self.execution_path, encoded(claim) + b"\n")
-            except FileExistsError:
+                self.publish_execution_claim(encoded(claim) + b"\n")
+            except Exception as exc:
+                if self.execution_published:
+                    # The boundary was crossed even if the linked file could not be verified.
+                    raise ValueError("execution claim was published; custody requires recovery") from exc
+                if isinstance(exc, FileExistsError):
+                    return False
+                if isinstance(exc, OSError):
+                    observation = self.observe_fence()
+                    if observation.state == FENCE_VERIFIED:
+                        if observation.value == claim:
+                            self.execution_boundary_crossed = True
+                            self.execution_fence = self.execution_path
+                    elif observation.present is not False:
+                        self.execution_fence = self.execution_path
+                raise
+            self.execution_fence = self.execution_path
+            result = self.observe_result()
+            if result == "regular":
                 return False
-            # A scheduler may have re-admitted this job before root resolved it. Claim publication alone is not
-            # permission to run: check the terminal record and our ownership under the same exclusion as resolve.
-            if self.result_path.exists():
-                return False
-            require(read_json(self.execution_path) == claim and self.runner_alive() is True,
-                    "execution claim ownership changed: " + self.id)
+            require(result == "absent", "result publication unverified")
+            observation = self.observe_fence()
+            require(observation.state == FENCE_VERIFIED and observation.value == claim
+                    and self.runner_alive(observation) is True, "execution claim ownership changed: " + self.id)
             return True
 
     def process_record(self):
@@ -1724,6 +2035,8 @@ def keep_evidence(job, keep):
 def refuse(store, job, reason, wait, recipes_sha256=None, *, outside_policy=None):
     job.census_policy = outside_policy
     if not job.admission_owned and not job.take_execution(None, recipes_sha256):
+        if job.planned:
+            return taken_execution_row(store, job, None, wait)
         return {"job": job.id, "state": "running", "process_group": job.process_group()}
     job.execution_owned = True
     if job.admission_owned:
@@ -2123,11 +2436,27 @@ def checkout_state(checkout, commit, created, view):
             "HEAD." % (head, role, index, count))
 
 
+def observed_result_action():
+    return ("Root: repair store or audit access; retain the observed result and any reservation. Inspect "
+            "recovery-status and validate terminal evidence before settlement; do not rerun execution.")
+
+
+
 def taken_execution_row(store, job, packet, wait):
-    """The exclusive execution belongs to another attempt; this one publishes no new execution or census view."""
-    if packet.get("derived_by") == "runner" and job.result_path.exists():
-        return settle(store, job, wait)
+    """Record a peer's evidence without acquiring its execution custody."""
+    nodes = job.observe_existing_fence()
+    result = nodes["result"]
+    derived = job.admission_validated if packet is None else packet.get("derived_by") == "runner"
+    if derived:
+        result = job.observe_result()
+        retained = (nodes["result"] in ("regular", "other")
+                    or result in ("regular", "other")) if job.planned else job.result_path.exists()
+        if retained:
+            return settle(store, job, wait)
+    if job.planned and (result == "uncertain" or job.recorded_execution_fence() is not True):
+        return unknown_custody_row(job, job.process_group())
     return {"job": job.id, "state": "running", "process_group": job.process_group()}
+
 
 
 def run_job(store, job, packet, packet_raw, recipes, wait):
@@ -2307,13 +2636,18 @@ def run_job(store, job, packet, packet_raw, recipes, wait):
     return row
 
 
+def has_host_plan(initiative):
+    """Reporting metadata only; admission validates the plan before derived work."""
+    root = initiative.get("mailbox_root")
+    return root is not None and os.path.lexists(Path(root).parent / hierarchy_hosts.PLAN_FILE)
+
+
 def planned_action(row, initiative, action):
     """Additional operational guidance belongs to planned initiatives; retain existing legacy row bytes.
 
     This metadata check only selects reporting. Admission validates the plan separately before any derived work.
     """
-    root = initiative.get("mailbox_root")
-    if root is not None and os.path.lexists(Path(root).parent / hierarchy_hosts.PLAN_FILE):
+    if has_host_plan(initiative):
         row["next_action"] = action
     return row
 
@@ -2325,50 +2659,84 @@ def blocked_row(job, exc):
         "settlement error; an existing claim is never executed twice."), job)
 
 
+def unverified_custody_action():
+    return ("Root: preserve any candidate claim and reservation; inspect recovery-status and establish execution "
+            "custody before settlement or retry. Do not retry execution while custody is unknown.")
+
+
 def unknown_custody_row(job, group=None, reason="execution_custody_unknown"):
+    if job.recorded_execution_fence() is True:
+        action = ("Root: preserve the original execution fence and reservation; inspect recovery-status, "
+                  "the original claim and process scope. Establish custody and stopped-process evidence "
+                  "before recovery or settlement. Do not remove the fence or retry execution.")
+    elif job.result_observed:
+        action = observed_result_action()
+    else:
+        action = unverified_custody_action()
     return planned_action({"job": job.id, "state": "abandoned", "process_group": group, "process_alive": None,
-                           "reason": reason}, job.initiative,
-        "Root: preserve the original execution fence and reservation; inspect recovery-status, "
-        "the original claim and process scope. Establish custody and stopped-process evidence "
-        "before recovery or settlement. Do not remove the fence or retry execution.")
+                           "reason": reason}, job.initiative, action)
+
 
 
 def execution_error_row(job, packet, exc):
-    """Before the execution fence an error is retryable; after it, absence of custody is unknown, never no effect."""
+    """Preserve observed evidence; a retained path never certifies its own publication."""
     if not job.execution_owned and not job.settlement_attempted:
-        # A packet's expected path is not custody: another runner may create it before this attempt takes a claim.
-        fence = job.execution_fence
-        if fence is None:
-            return blocked_row(job, exc)
-        try:
-            fence.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
+        if job.execution_boundary_crossed:
             return unknown_custody_row(job)
-        else:
-            return unknown_custody_row(job)
+        if job.execution_fence is not None:
+            observation = job.observe_fence()
+            if observation.present is False:
+                job.claim_candidates.discard(job.execution_claim_name)
+            else:
+                return unknown_custody_row(job)
     return blocked_row(job, exc)
 
 
+
 def visit_existing(store, job, wait):
-    """Rows for a job this or an earlier run already took. None when the job is new."""
-    if job.result_path.exists():
-        try:
-            return settle(store, job, wait)
-        except ERRORS as exc:
-            return blocked_row(job, exc)
-    if not job.folder.exists():
-        return None
-    if (job.folder / "admitted.json").exists() and not job.execution_path.exists():
-        # Only a successful, stopped derivation can publish this marker. It is ready, not a crashed execution.
-        try:
-            check_settlement_processes(job, {"steps": []})
-        except ERRORS as exc:
-            return blocked_row(job, exc)
-        return None
+    """Rows for prior attempts. Planned liveness consumes the same validated snapshot as recovery."""
+    observation = None
+    if job.planned:
+        nodes = job.observe_existing_fence()
+        result = job.observe_result()
+        if result in ("regular", "other"):
+            try:
+                return settle(store, job, wait)
+            except ERRORS as exc:
+                return blocked_row(job, exc)
+        if nodes["folder"] == "absent" and result == "absent":
+            return None
+        if nodes["folder"] != "directory" or result != "absent":
+            return unknown_custody_row(job)
+        if nodes["admitted"] == "regular" and nodes["execution"] == "absent":
+            try:
+                check_settlement_processes(job, {"steps": []})
+            except ERRORS as exc:
+                return blocked_row(job, exc)
+            return None
+        observation = nodes["observation"]
+        if observation is None or observation.state != FENCE_VERIFIED:
+            return unknown_custody_row(job, job.process_group(),
+                                       "runner visibility is unknown; retain the original claim and reservation")
+    else:
+        # Compatibility selects the old labels; it cannot create positive fence evidence.
+        if job.result_path.exists():
+            job.observe_result()
+            try:
+                return settle(store, job, wait)
+            except ERRORS as exc:
+                return blocked_row(job, exc)
+        if not job.folder.exists():
+            return None
+        job.observe_existing_fence()
+        if (job.folder / "admitted.json").exists() and not job.execution_path.exists():
+            try:
+                check_settlement_processes(job, {"steps": []})
+            except ERRORS as exc:
+                return blocked_row(job, exc)
+            return None
     group = job.process_group()
-    runner = job.runner_alive()
+    runner = job.runner_alive(observation)
     if runner is None:
         return unknown_custody_row(job, group,
                                    "runner visibility is unknown; retain the original claim and reservation")
@@ -2383,12 +2751,12 @@ def visit_existing(store, job, wait):
         return blocked_row(job, exc)
     row = {"job": job.id, "state": "abandoned", "process_group": group, "process_alive": alive}
     if unrecorded and not alive:
-        # Unknown, not stopped: the step that may still run was never recorded.
         row.update(process_alive=None, unrecorded_step=unrecorded)
     return row
 
 
-def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows):
+
+def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows, admission=None):
     """A receipt can go out before a busy store lets the slot go. The request is closed by then, so the ledger is the record."""
     prefix = "job:" + initiative["id"] + "/"
     # Deliberately kind-independent, bound to the initiative: an open row of any kind that this initiative holds
@@ -2402,14 +2770,22 @@ def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows)
         if identifier and identifier not in open_ids and identifier in records and identifier not in settled:
             settled.add(identifier)
             job = Job(store.path, initiative, records[identifier]["message"])
-            if job.result_path.exists():
+            if admission is not None:
+                admission.participate(job)
+            nodes = job.observe_existing_fence()
+            result = job.observe_result()
+            retained = (nodes["result"] in ("regular", "other")
+                        or result in ("regular", "other")) if job.planned else job.result_path.exists()
+            if retained:
                 try:
                     rows.append(settle(store, job, wait))
                 except ERRORS as exc:
                     rows.append(blocked_row(job, exc))
+            elif job.planned and result == "uncertain":
+                rows.append(unknown_custody_row(job))
 
 
-def admit_requests(store, ledger, initiatives, recipes, wait, rows):
+def admit_requests(store, ledger, initiatives, recipes, wait, rows, admission=None):
     """Settle what is finished and refuse what cannot run, in priority order. Returns the jobs ready to run."""
     ready = []
     for initiative in initiatives:
@@ -2418,11 +2794,16 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows):
             records = mailbox.messages()
             requests = mailbox.open_job_requests(records)
         except ERRORS as exc:
+            if admission is not None:
+                admission.remember_initiative(initiative)
             rows.append({"initiative": initiative["id"], "state": "mailbox_error", "error": str(exc)[:512]})
             continue
-        finish_closed_jobs(store, ledger, initiative, records, {message["message_id"] for message in requests}, wait, rows)
+        finish_closed_jobs(store, ledger, initiative, records, {message["message_id"] for message in requests}, wait, rows,
+                           admission=admission)
         for message in requests:
             job = Job(store.path, initiative, message)
+            if admission is not None:
+                admission.participate(job)
             existing = visit_existing(store, job, wait)
             if existing is not None:
                 rows.append(existing)
@@ -2841,6 +3222,10 @@ def waiting_owner(waiting, request):
     return entry[0]
 
 
+def is_stale_heavy_kind(owner_kind, granted_kind):
+    return owner_kind in HEAVY_KINDS and owner_kind != granted_kind
+
+
 def admission_outside_policy(ledger, kind, waiting, policy):
     if policy not in ("report", "ignore"):
         return policy
@@ -2883,14 +3268,91 @@ class GrantAdmission:
         self.store, self.recipes = store, recipes
         self.explicit = "census_outside_policy" in recipes
         self.records = []
+        self.outcomes = []
+        self.initiatives = {}
+        self.participants = set()
+        self.jobs = {}
+        self.owners = {}
+        self.row_facts = {}
         self.stage = "post_grant_step_failed"
 
-    def remember(self, request, view, candidates):
+    def remember_initiative(self, initiative):
+        """Choose reporting compatibility once for this owner, never from another initiative's grant."""
+        identifier = initiative["id"]
+        if identifier not in self.initiatives:
+            self.initiatives[identifier] = {"initiative": identifier, "planned": has_host_plan(initiative)}
+        return self.initiatives[identifier]
+
+    def participate(self, job):
+        self.participants.add(job.initiative["id"])
+        if job.id not in self.jobs:
+            self.jobs[job.id] = {"job": job, **self.remember_initiative(job.initiative)}
+            self.owners[(job.initiative["id"], job.holder)] = {"job": job, "kind": None}
+
+    def admitted(self, job, packet):
+        """Save the validated owner and required kind before any job can leave the scheduling maps."""
+        key = (job.initiative["id"], job.holder)
+        if self.owners[key]["kind"] is None:
+            recipe = self.recipes["recipes"][packet["recipe"]]
+            self.owners[key]["kind"] = job_kind(recipe) if is_heavy(recipe) else "none"
+
+    def capture(self, row, job=None, scope=None, actual=True):
+        """Freeze owner and custody facts with the outcome, without reading paths during recovery."""
+        known = self.row_facts.get(id(row))
+        if known is not None:
+            return known
+        if job is None and scope is not None:
+            job = scope.get("owner_job") or scope.get("job") or scope.get("stale_job")
+        participant = self.jobs.get(job.id if job is not None else row.get("job") or row.get("stale_job"))
+        if participant is not None:
+            job = participant["job"] if job is None else job
+            scope = participant if scope is None else scope
+        if scope is None:
+            scope = self.initiatives[row["initiative"]]
+        facts = {"row": row, "initiative": scope["initiative"], "planned": scope["planned"],
+                 "job": job.id if job is not None else None,
+                 "job_outcome": bool(job and actual and row.get("job") == job.id),
+                 "fence": job.recorded_execution_fence() if job is not None else False,
+                 "result_observed": bool(job and job.result_observed),
+                 "execution_owned": bool(job and job.execution_owned),
+                 "settlement_attempted": bool(job and job.settlement_attempted),
+                 "terminal": row["state"] in ("completed", "failed", "refused")
+                             or bool(job and (job.terminal_observed or job.written_result is not None))}
+        self.row_facts[id(row)] = facts
+        return facts
+
+    def capture_rows(self, rows):
+        for row in rows:
+            self.capture(row)
+
+    def candidate_owner(self, candidates, request):
+        """The review-base owner selection, evaluated at the original grant and reporting boundaries."""
         owner = waiting_owner(candidates, request)
-        matching = owner is not None and job_kind(self.recipes["recipes"][candidates[owner.holder][1]["recipe"]]) == request["kind"]
+        kind = job_kind(self.recipes["recipes"][candidates[owner.holder][1]["recipe"]]) if owner is not None else None
+        matching = owner is not None and kind == request["kind"]
+        return {"job": owner if matching else None,
+                "stale_job": owner if owner is not None and is_stale_heavy_kind(kind, request["kind"]) else None,
+                "kind": kind}
+
+    def serialization_owner(self, record, candidates=None):
+        """Keep persistent ownership out of every legacy row, including recovery of an earlier grant."""
+        if record["planned"]:
+            return record["planned_owner"]
+        return (self.candidate_owner(candidates, record["request"]) if candidates is not None
+                else record["legacy_owner"])
+
+    def remember(self, request, view, candidates, initiative):
+        owner = self.owners.get((request["initiative"], request["holder"]))
+        job = owner["job"] if owner is not None else None
+        matching = owner is not None and owner["kind"] == request["kind"]
+        self.participants.add(initiative["id"])
         record = {"request": dict(request), "view": dict(view), "publication": None, "attempted": False,
-                  "handled": False, "failure": None, "job": owner if matching else None,
-                  "stale_job": owner if owner is not None and not matching else None}
+                  "handled": False, "failure": None,
+                  "planned_owner": {"job": job if matching else None,
+                                    "stale_job": job if owner is not None and is_stale_heavy_kind(owner["kind"], request["kind"]) else None,
+                                    "kind": owner["kind"] if owner is not None else None},
+                  "legacy_owner": self.candidate_owner(candidates, request), "owner_job": job,
+                  **self.remember_initiative(initiative)}
         self.records.append(record)
         return record
 
@@ -2912,51 +3374,138 @@ class GrantAdmission:
             return "post_grant_store_busy"
         return self.stage
 
-    def handled(self, record, row):
+    def handled(self, record, row, job=None):
+        if row is not None:
+            # Execution can use an already granted replacement, with no acknowledged record in this iteration.
+            self.outcomes.append(self.capture(row, job=job, scope=record, actual=job is not None))
         if record is not None:
             record["handled"], record["row"] = True, row
 
-    def recover(self, rows, pending, reason):
-        """No ledger reads or new execution here: retain the grant facts, audit outcome and prior output rows."""
+    def legacy_recovery_rows(self, rows, pending, reason):
+        """Retain the original global arbitration decisions, so filtering by owner preserves legacy row bytes."""
+        additions = []
         recovered = False
         for record in self.records:
             self.publish(record)
             if record["handled"]:
                 continue
             request = record["request"]
-            job = record["job"]
+            owner = self.serialization_owner(record)
+            job = owner["job"]
             state = ("settle_pending" if job.execution_owned or job.settlement_attempted else "waiting") if job is not None else "granted_elsewhere"
             row = {"state": state,
                    "kind": request["kind"], "request_id": census_request_id(request["request_id"]), "reason": reason,
                    "next_action": "Root: preserve the reservation; repair store or audit access, then reconcile and "
                                   "settle with correlated terminal evidence."}
-            if record["job"] is not None:
-                row["job"] = record["job"].id
+            if job is not None:
+                row["job"] = job.id
             else:
                 row["holder"] = request["holder"]
-                if record["stale_job"] is not None:
-                    row.update(stale_job=record["stale_job"].id, reason="stale_kind", failure_reason=reason)
+                if owner["stale_job"] is not None:
+                    row.update(stale_job=owner["stale_job"].id, reason="stale_kind", failure_reason=reason)
             if self.explicit:
                 row["z_census"] = census_summary(record["publication"] or record["view"], request["request_id"])
-            rows.append(row)
             self.handled(record, row)
+            additions.append((row, self.row_facts[id(row)], "reservation"))
             recovered = True
         reported = {row.get("job") for row in rows}
+        reported.update(row.get("job") for row, _, _ in additions)
         for job, packet, _ in pending.values():
             if job.id not in reported:
-                rows.append({"job": job.id, "state": "waiting", "kind": job_kind(self.recipes["recipes"][packet["recipe"]]),
-                             "reason": reason})
+                row = {"job": job.id, "state": "waiting", "kind": job_kind(self.recipes["recipes"][packet["recipe"]]),
+                       "reason": reason}
+                additions.append((row, self.capture(row, job=job), "pending"))
                 reported.add(job.id)
         if not recovered:
             # Terminal rows remain terminal. The loop raises holds from row states, not from run-open's exit alone.
             action = "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."
             record = self.records[-1]
             request = record["request"]
-            job = record["job"] or record["stale_job"]
+            owner = self.serialization_owner(record)
+            job = owner["job"] or owner["stale_job"]
             row = {"state": "settle_pending" if job is not None else "granted_elsewhere",
                    "reason": reason, "next_action": action}
             row.update({"job": job.id} if job is not None else {"holder": request["holder"]})
+            additions.append((row, self.capture(row, job=job, scope=record), "fallback"))
+        return additions
+
+    def recovery_contexts(self, rows, faults):
+        contexts = {owner: {} for owner in faults}
+        for source in (self.outcomes, (self.row_facts.get(id(row)) for row in rows)):
+            for facts in source:
+                if facts is None or facts["initiative"] not in contexts:
+                    continue
+                context = facts["row"]
+                job = facts["job"]
+                if job is not None:
+                    owned = contexts[facts["initiative"]]
+                    previous = owned.get(("job", job))
+                    # Reservation rows describe capacity, not what the job's attempt did. A later stale-kind
+                    # grant must never replace an actual waiting, running or terminal outcome for that job.
+                    if previous is None or not previous["job_outcome"] or facts["job_outcome"]:
+                        owned[("job", job)] = facts
+                elif context.get("holder") is not None:
+                    contexts[facts["initiative"]][("request_id", census_request_id(context.get("request_id")))] = facts
+        return contexts
+
+    def recovery_action(self, field, facts):
+        context = facts["row"]
+        action = "Root: repair store or audit access; "
+        if field == "request_id":
+            return action + "preserve the holder's reservation and reconcile it with correlated terminal evidence."
+        if facts["terminal"]:
+            if context["state"] in ("completed", "failed", "refused"):
+                return "Root: inspect and reconcile the store; retain terminal evidence and do not rerun completed work."
+            return (action + "retain terminal evidence. Run run-open again to retry settlement; "
+                    "do not rerun completed work.")
+        if facts["result_observed"] and facts["fence"] is not True:
+            return observed_result_action()
+        if facts["fence"] is False and not any(facts[key] for key in
+                ("execution_owned", "settlement_attempted")):
+            if context["state"] == "waiting":
+                return action + "this job has not started. Preserve any reservation and reconcile its blockers before run-open."
+            return (action + "this attempt has not started execution. Run run-open again after repairing the "
+                    "reported error; existing claims are rechecked and never executed twice.")
+        if facts["fence"] is True:
+            if context["state"] == "running":
+                return (action + "preserve the running job's custody and reservation; inspect recovery-status before "
+                        "settlement. Do not rerun it.")
+            return (action + "preserve execution custody, the original fence and any reservation; inspect "
+                    "recovery-status and establish stopped-process evidence before settlement or retry.")
+        return unverified_custody_action()
+
+    def recover(self, rows, pending, reason):
+        """Choose compatibility per recorded owner; never read the ledger or acquire new execution custody."""
+        original_count = len(rows)
+        faults = {}
+        for owner, scope in self.initiatives.items():
+            if owner in self.participants and scope["planned"]:
+                # One fault point per planned owner, before looking up any outcome or retired reservation.
+                fault = {"state": "mailbox_error", "reason": reason,
+                         "next_action": "Root: repair store or audit access; preserve custody, reservation and terminal "
+                                        "evidence before reconciliation. Do not infer permission to retry execution."}
+                faults[owner] = fault
+                rows.append(fault)
+        for index in range(original_count):
+            self.capture(rows[index])
+        for row, facts, category in self.legacy_recovery_rows(rows, pending, reason):
+            if facts["planned"]:
+                if category == "fallback":
+                    continue
+                if row.get("reason") == reason:
+                    del row["reason"]
+                row.pop("failure_reason", None)
             rows.append(row)
+        contexts = self.recovery_contexts(rows, faults)
+        for owner, fault in faults.items():
+            for index, ((field, identifier), facts) in enumerate(contexts[owner].items()):
+                diagnostic = fault if index == 0 else {}
+                diagnostic.update({field: identifier, "state": "settle_pending" if field == "job" else "granted_elsewhere",
+                                   "next_action": self.recovery_action(field, facts)})
+                if diagnostic is not fault:
+                    rows.append(diagnostic)
+            if not contexts[owner]:
+                fault["initiative"] = owner
 
 
 class GrantAdmissionStore(Store):
@@ -2972,7 +3521,8 @@ class GrantAdmissionStore(Store):
         if kind == "grant":
             # Record durability before any reconciliation can fail. Publication is attempted after unlocking, even
             # when this callback could not withdraw a stale queue row (e.g. the event history reached its limit).
-            self.last = self.remember(ledger.request(data["request_id"]))
+            request = ledger.request(data["request_id"])
+            self.last = self.remember(request, ledger.initiatives[request["initiative"]])
             try:
                 self.after_grant(ledger)
             except Exception:
@@ -2995,6 +3545,9 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
     minimum = recipes.get("min_free_gigabytes", 0)
     candidates = waiting if everyone is None else everyone
     admission = GrantAdmission(store, recipes) if admission is None else admission
+    for job, packet, _ in candidates.values():
+        admission.participate(job)
+        admission.admitted(job, packet)
     held = {}
     seen = {}
 
@@ -3015,8 +3568,8 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
             grants, blocked = reconcile(ledger)
             return ledger, grants, blocked
 
-    def remember(request):
-        return admission.remember(request, seen, candidates)
+    def remember(request, initiative):
+        return admission.remember(request, seen, candidates, initiative)
 
     grant_store = None
     if waiting and budget > 0 and not store_busy:
@@ -3073,14 +3626,15 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                 admission.stage = "post_grant_ledger_unreadable"
                 ledger, grants, held = patient(snapshot, wait)
                 admission.stage = "post_grant_step_failed"
-                owner = waiting_owner(candidates, request)
-                current_kind = job_kind(recipes["recipes"][candidates[granted][1]["recipe"]]) if owner else None
+                ownership = admission.serialization_owner(record, candidates)
+                owner = ownership["job"] or ownership["stale_job"]
+                current_kind = ownership["kind"]
                 if ledger.request(request["request_id"])["state"] == "released":
                     # Release is positive terminal evidence. Keep the audit record, but never recover it as reserved.
                     admission.handled(record, None)
-                    if owner is None or current_kind != kind or granted in grants:
+                    if owner is None or current_kind != kind or granted in grants or granted not in waiting:
                         continue
-                if owner is None or current_kind != kind:
+                if owner is None or current_kind != kind or granted not in waiting:
                     row = planned_action({"state": "granted_elsewhere", "holder": granted, "request_id": request_id},
                            ledger.initiatives[request["initiative"]],
                            ("Root: re-admit the owning job through run-open for its initiative and "
@@ -3088,8 +3642,8 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                                            "authorize job execution." if granted.startswith("job:") else
                                            "The holder may start its already authorized work; retain the reservation "
                                            "until correlated terminal evidence permits settlement."))
-                    if owner is not None and current_kind != kind:
-                        row.update(stale_job=owner.id, reason="stale_kind", next_action=(
+                    if ownership["stale_job"] is not None:
+                        row.update(stale_job=ownership["stale_job"].id, reason="stale_kind", next_action=(
                             "Job %s now needs %s; this %s grant is additional capacity, not its execution grant. It runs "
                             "only on a matching grant; otherwise it waits for root to reconcile and settle this reservation. "
                             "Settlement releases additional grants with the job's result as evidence."
@@ -3103,8 +3657,13 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                     # A competing executor can finish and settle this matching grant while its census is published.
                     # Preserve the exclusive-claim loser's outcome without attempting execution on a missing grant.
                     job, packet, _ = waiting[granted]
-                    fence = job.execution_path if packet.get("derived_by") == "runner" else job.folder
-                    if fence.exists():
+                    nodes = job.observe_existing_fence()
+                    exists = (nodes["execution"] != "absent" if packet.get("derived_by") == "runner"
+                              else nodes["folder"] != "absent")
+                    if not job.planned:
+                        fence = job.execution_path if packet.get("derived_by") == "runner" else job.folder
+                        exists = fence.exists()
+                    if exists:
                         waiting.pop(granted)
                         if everyone is not None:
                             everyone.pop(granted, None)
@@ -3114,7 +3673,7 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                         except ERRORS as exc:
                             row = blocked_row(job, exc)
                         rows.append(row)
-                        admission.handled(record, row)
+                        admission.handled(record, row, job=job)
                     continue  # Without a claim, the next locked snapshot decides how the job waits.
         except MatchingJobGrant as existing:
             granted, ledger, held = existing.holder, existing.ledger, existing.held
@@ -3148,7 +3707,7 @@ def run_kind(store, kind, waiting, recipes, wait, fixture, budget, rows, store_b
                 request_summary(stale)["request_id"])
             row["detail"] = (row.get("detail", "") + " " + detail).strip()
         rows.append(row)
-        admission.handled(record, row)
+        admission.handled(record, row, job=job)
     for job, _, _ in waiting.values():
         if budget > 0 and not store_busy and job.holder in held:
             rows.append(held[job.holder])
@@ -3183,7 +3742,11 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait, expect_r
     initiatives = sorted((i for i in ledger.initiatives.values() if i["state"] == "active" and "mailbox_root" in i
                           and (not chosen or i["id"] in chosen)), key=lambda i: (i["priority"], i["id"]))
     rows = []
-    ready = admit_requests(store, ledger, initiatives, recipes, wait, rows)
+    admission = GrantAdmission(store, recipes)
+    ready = admit_requests(store, ledger, initiatives, recipes, wait, rows, admission=admission)
+    for job, packet, _ in ready:
+        admission.admitted(job, packet)
+    admission.capture_rows(rows)
     budget = max_jobs
     heavy = {}
     store_busy = False
@@ -3218,7 +3781,7 @@ def run_open(store_path, recipes_path, chosen, max_jobs, fixture, wait, expect_r
                 rows.append(execution_error_row(job, packet, exc))
         else:
             rows.append({"job": job.id, "state": "waiting", "reason": "job_limit"})
-    admission = GrantAdmission(store, recipes)
+    admission.capture_rows(rows)
     try:
         run_heavy(store, heavy, recipes, wait, fixture, budget, rows, store_busy, admission=admission)
         if admission.records:
