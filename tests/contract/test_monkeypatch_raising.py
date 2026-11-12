@@ -150,6 +150,146 @@ MOCK_CALLABLES = MOCK_PATCH | {factory + "." + method for factory in MOCK_PATCH
 # (file, lexical scope, source owner) -> (may be shared, reviewed reason).
 # These are identities the static import/binding resolver cannot prove.
 OWNER_REGISTRATIONS = {
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'sys.modules[__name__]'):
+        (False, 'sys.modules[__name__] is this test module; replaces its owned fixture reference only.'),
+    ('tests/integration/test_hierarchy_hosts.py', 'test_r13_unknown_grammar_family_refuses', 'grammar'):
+        (False, "grammar is hierarchy_hosts._HOSTS['claude-code']['session_selectors']['grammar']; setitem changes the product registry's family control, not a shared process module."),
+    ('tests/integration/test_hierarchy_launcher.py', 'test_stop_records_a_failed_process_census', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher.py', 'test_endpoint_namespace_unsupported_probe_refuses_before_opening', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher.py', 'test_r31_unavailable_pid_namespace_probe_refuses_without_opening', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r33_terminal_claim_changed_during_recovery_keeps_prior_attempts', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r33_terminal_claim_changed_during_recovery_keeps_prior_attempts', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r32_no_namespace_preserves_no_launch_resume_results', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r32_transient_pidfd_failure_keeps_custody_without_numeric_delivery', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r32_pidfd_delivery_errors_keep_fixed_refusal_and_custody', 'module.signal'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r32_no_namespace_refuses_every_stop_state', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r31_namespace_switch', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r31_late_namespace_loss_refuses_before_signal', 'module.StopCustody'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r31_namespace_refusal_preserves_live_custody_and_consumers', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r30_resume_uses_the_real_spawns_cwd_and_path', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r29_log_close_after_creation_keeps_the_admitted_child', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r29_popen_failure_still_retires_only_the_no_child_admission', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_identity_limit_refusal_is_recorded_before_any_signal', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_real_producer_wrapper_exec_keeps_its_admitted_instance', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_no_plan_failure_keeps_legacy_output_and_record_bytes', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_no_plan_failure_keeps_legacy_output_and_record_bytes', 'module.Launches'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r26_captured_resume_requires_no_installed_host_cli', 'r2_case'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_fork_gap_pipe_allocation_failure_closes_prior_descriptors', 'sys.modules[__name__]'):
+        (False, 'sys.modules[__name__] is this test module; replaces its owned fixture reference only.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_no_plan_resume_keeps_historical_bytes', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_spawn_failure_is_retryable', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_every_resolved_refusal_has_one_record', 'module.Launches'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_recovered_group_budget_is_checked_before_admission', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_admission_metadata_refuses_unsupported_descriptors', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_failed_spawn_retirement_names_failure_and_exact_recovery', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_cleanup_holds_pending_mailbox_admission', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r22_restricted_procfs_has_an_explicit_manual_refusal', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_resume_persists_admission_before_creating_the_host', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_failed_publication_and_abandonment_keep_the_unknown_group', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_full_history_refuses_resume_before_spawning', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_parent_outcome_failure_keeps_admission_until_a_later_stop', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_parent_outcome_failure_keeps_admission_until_a_later_stop', 'module.Launches'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_private_worker_checks_history_room_before_spawning', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_refused_resume_requires_a_later_stop', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r22_wake_processes', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r22_failed_group_cleanup_retains_the_running_wake', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r21_resume_can_be_stopped_mid_turn', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r22_expected_stop_input_is_bounded_and_redacted', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_linux_matcher_reads_proc_without_a_ps_census', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_ps_fallback_ignores_unrelated_quotes', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_ps_fallback_does_not_reconstruct_paths_with_spaces', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_observed_claude_argv_shapes', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_opens_a_pidfd_then_verifies_then_signals', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_opens_a_pidfd_then_verifies_then_signals', 'module.signal'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_fallback_records_unproven_argument_boundaries', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_ps_fallback_checks_uid_and_positional_selectors', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_spares_an_unowned_member_of_an_owned_group', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_records_a_signal_permission_failure', 'module.signal'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_records_a_signal_permission_failure', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_records_a_signal_permission_failure', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'fallback_process', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'fallback_process', 'module.subprocess'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_falls_back_only_when_pidfd_is_unsupported', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_falls_back_only_when_pidfd_is_unsupported', 'module.signal'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_uses_real_and_effective_status_uids', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_retains_stubborn_descendants_after_the_middle_exits', 'module.os'):
+        (True, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_retains_stubborn_descendants_after_the_middle_exits', 'module.signal'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stop_retains_stubborn_descendants_after_the_middle_exits', 'module'):
+        (False, 'launcher_module loads hierarchy_launcher; OS/subprocess owners remain counted as shared candidates, including R2Facade views.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_stubborn_descendant_completion_waits_for_deferred_native_reap.spawn', 'process'):
+        (False, 'process is the physical child returned by children(...); poll is its fixture-owned observation boundary.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r11_crash_cuts_observe_exit_before_asserting_dead', 'r2_case'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r2_fixture_closure_failed_ready_keeps_physical_custody', 'r2_case.projection'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r2_sibling_fixture_closes_both_children_when_ready_staging_fails', 'r2_case.projection'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r2_exec_fixture_closes_an_actual_exec_on_ready_failure', 'r2_case.projection'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r2_captured_exec_closes_a_child_still_behind_its_gate', 'r2_case.custody'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure', 'r2_case.projection'):
+        (False, 'r2_case is the R2Case fixture; its projection and custody are fixture-owned objects, not shared process modules.'),
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_r24_hold_constructor_delivers_its_entry_or_exit_event_before_return', 'sys.modules[__name__]'):
+        (False, 'sys.modules[__name__] is this test module; replaces its owned fixture reference only.'),
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'globals()'):
         (False, 'The contract replaces its own _tracked_names helper to count Git prefilter queries while the observed subprocess and AST boundaries check clean Git environment and single-pass parsing.'),
     ('tests/integration/test_hierarchy_mailbox_doctor.py', 'test_lock_and_pending_are_reported_without_takeover', 'module'):
@@ -837,6 +977,118 @@ AST_DIGEST_PREFIX = "ast-sha256:"
 # Namespace rows store canonical AST fingerprints, not copies of another file's
 # source syntax. Other ban rows retain the existing source-syntax representation.
 BAN_REGISTRATIONS = {
+    ('tests/integration/test_hierarchy_native_probe.py', 'custody_probe', 'namespace___dict__', 'ast-sha256:20b91c2010b2c5cdff757959acea3b15d31ef42bf6b72ceeb1fbb5f883b214c0', 0):
+        'Executes the tracked probe source in a fresh fixture-owned ModuleType dictionary; the fixture independently owns and reaps every child.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_custody_log_close_failure_settles_started_child_and_preserves_error', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        "Acquires builtins for the probe's local log-open failure wrapper; only the fixture-owned probe module receives the replacement, leaving shared builtins unchanged.",
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_custody_turn_failure_and_completion_paths', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        "Acquires builtins for the probe's local log-open failure wrapper; only the fixture-owned probe module receives the replacement, leaving shared builtins unchanged.",
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_custody_turn_failure_and_completion_paths.turns', 'declaration', 'nonlocal read_count', 0):
+        "nonlocal read_count updates only this closure's hold-turn counter to inject interruption after the first read; no imported owner is rebound.",
+    ('tests/unit/cli/test_cli_team.py', 'test_abbreviated_workspace_operation_failure_is_fixed_json', 'namespace_getattr', 'ast-sha256:88bb5a1e3013ee8dc7f21c0d646ec771eff0aa587d652a6f4cb1e3257aa20ad6', 0):
+        "Copies os attributes into a local SimpleNamespace whose open raises for the model-selection consumer; pytest's real process-wide os and cleanup remain intact.",
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_io_errors_are_fixed_refusals', 'namespace_getattr', 'ast-sha256:88bb5a1e3013ee8dc7f21c0d646ec771eff0aa587d652a6f4cb1e3257aa20ad6', 0):
+        'Copies os attributes into a local SimpleNamespace whose write injects the model I/O refusal; only model_select.os is replaced and real os remains intact.',
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_component_swap_after_confinement_keeps_no_follow_refusal', 'namespace_getattr', 'ast-sha256:88bb5a1e3013ee8dc7f21c0d646ec771eff0aa587d652a6f4cb1e3257aa20ad6', 0):
+        'Copies os attributes into a local SimpleNamespace whose open interleaves a directory/symlink swap, verifying confined no-follow refusal without changing real os.',
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'namespace_sys_modules', 'ast-sha256:8d2da3da34ba4b80a8a17082294363e1aca4687ef28102028190ee6f981c6bdb', 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'module_write', "monkeypatch.setattr(sys.modules[__name__], 'handoff_module', scoped_module)", 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'module_write', "monkeypatch.setattr(sys.modules[__name__], 'handoff', scoped_handoff)", 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'namespace_sys_modules', 'ast-sha256:d4657d7288774ecc833c34c86ee05d2224543bfd8b2be4f6d4cff56dc33a0fc1', 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'namespace_sys_modules', 'ast-sha256:3eb98cffac5febfeb46f1a1c05fe6bd50c039dc8e9005bf6d7aa31aa517fd35d', 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_handoff_stop_evidence.py', 'modelled_processes', 'module_write', "monkeypatch.setattr(sys.modules[__name__], 'Launch', scoped_launch)", 0):
+        "Temporarily replaces this test module's handoff_module, handoff and Launch fixture references; pytest restores the dictionary entries.",
+    ('tests/integration/test_hierarchy_launcher.py', 'launcher_module', 'module_write', 'sys.modules[name] = module', 0):
+        'Registers the importlib-created hierarchy_launcher test module under its unique name before executing its definitions.',
+    ('tests/integration/test_hierarchy_launcher.py', 'launcher_module', 'namespace_sys_modules', 'ast-sha256:e99af6430ef2b4454169d817fdf13327686baebae2e529d45cd821688c4be96d', 0):
+        'Registers the importlib-created hierarchy_launcher test module under its unique name before executing its definitions.',
+    ('tests/integration/test_hierarchy_launcher.py', 'R2Facade.__init__', 'namespace___dict__', 'ast-sha256:1e6d5cf70e0a734a12074564175232893a079b9a3e4839dddc1ff3eb84a8f7ff', 0):
+        'R2Facade initializes only its owned instance dictionary with explicit OS/process overrides, preserving the delegated base module.',
+    ('tests/integration/test_hierarchy_launcher.py', 'R2Facade.__getattr__', 'namespace_getattr', 'ast-sha256:8423ce6e998a2a3fd7d6e5ef6285d31602564866bbba972189faa698eb83dbf3', 0):
+        "R2Facade delegates missing test overrides to the original module using getattr; its instances replace only the loaded consumer's module reference.",
+    ('tests/integration/test_hierarchy_launcher.py', 'r2_captured_entry', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_launcher.py', 'r2_captured_entry.Child.__getattr__', 'namespace_getattr', 'ast-sha256:27da59c888af961e8a3f6e609658659f19a150874b61bb873c037b398c1057f2', 0):
+        'The process wrapper delegates missing attributes to its registered physical child; the exact getattr reads instance state.',
+    ('tests/integration/test_hierarchy_launcher.py', 'r2_captured_entry', 'namespace_vars', 'ast-sha256:01eeb02195b1ffc3f0cbc0b9df43cb1f31f197a017ae72343bdb279b05a81896', 0):
+        "Copies builtins into the captured actor's owned execution namespace and replaces only its import boundary for registered physical children.",
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r29_log_close_after_creation_keeps_the_admitted_child.Stream.__getattr__', 'namespace_getattr', 'ast-sha256:7e5240a49aa711f8b7dd9c3cdaf8b011f4d0708bd36adf1336a1cbcd77e5c325', 0):
+        'Stream delegates missing attributes to its owned raw stream while injecting publication failures; no module namespace is acquired.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_partial_zombie_with_replacement_uid_cannot_commit_original_exit.replacement.<lambda>', 'namespace_getattr', 'ast-sha256:9c39c6fb87815dc91724a800a7837ec882b9658595ef90f5fc60c9446dfc5e23', 0):
+        'Reads only the parameterized birth/UID field on the process snapshot to model identity replacement at the consumer boundary.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r27_replacement_identity_latches_birth_and_each_uid.replacement', 'namespace_getattr', 'ast-sha256:4dff364e618754b036163a0f0db38be129d67ef0522d62be570c4391dc3e89d1', 0):
+        'Reads only the parameterized birth/UID field on the process snapshot to model identity replacement at the consumer boundary.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_fork_gap_pipe_allocation_failure_closes_prior_descriptors', 'module_write', "monkeypatch.setattr(sys.modules[__name__], 'os', R2Facade(real_os, pipe=failed))", 0):
+        "Temporarily replaces this test module's os reference with an R2Facade pipe-failure boundary; pytest restores the dictionary entry.",
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r25_fork_gap_pipe_allocation_failure_closes_prior_descriptors', 'namespace_sys_modules', 'ast-sha256:f1854eb1e8a3f4eda5a988a1f723eedcea645309fc3a61e08745adc36ca625ca', 0):
+        "Temporarily replaces this test module's os reference with an R2Facade pipe-failure boundary; pytest restores the dictionary entry.",
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r23_failed_publication_and_abandonment_keep_the_unknown_group.Stream.__getattr__', 'namespace_getattr', 'ast-sha256:7e5240a49aa711f8b7dd9c3cdaf8b011f4d0708bd36adf1336a1cbcd77e5c325', 0):
+        'Stream delegates missing attributes to its owned raw stream while injecting publication failures; no module namespace is acquired.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r22_running_wake_enospc_cleans_publication_and_marker.Stream.__getattr__', 'namespace_getattr', 'ast-sha256:7e5240a49aa711f8b7dd9c3cdaf8b011f4d0708bd36adf1336a1cbcd77e5c325', 0):
+        'Stream delegates missing attributes to its owned raw stream while injecting publication failures; no module namespace is acquired.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r21_cleanup_fences_an_unbound_start', 'namespace_sys_modules', 'ast-sha256:2a7d9c890202093d47c4774ad079e42b1e90073ba51a916b6b284585b750af75', 0):
+        'Temporarily installs the fixture-owned launcher under the import spelling used by the handoff control; pytest restores the module-table entry.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r21_cleanup_fences_an_unbound_start', 'module_write', "monkeypatch.setitem(sys.modules, 'hierarchy_launcher', module)", 0):
+        'Temporarily installs the fixture-owned launcher under the import spelling used by the handoff control; pytest restores the module-table entry.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles', 'namespace___dict__', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles', 'namespace_vars', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r15_probe_cleanup_preserves_custody_but_removes_auth_and_finishes_roles', 'namespace___dict__', 'ast-sha256:067dc81654d7647457bb5ce1723fc3d69288ad588904e2e3ec86b8c441cbd9f1', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r16_cleanup_control', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r16_cleanup_control', 'namespace___dict__', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r16_cleanup_control', 'namespace_vars', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'r16_cleanup_control', 'namespace___dict__', 'ast-sha256:067dc81654d7647457bb5ce1723fc3d69288ad588904e2e3ec86b8c441cbd9f1', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_public_probe_cleanup_holds_unresolved_census', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_public_probe_cleanup_holds_unresolved_census', 'namespace___dict__', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_public_probe_cleanup_holds_unresolved_census', 'namespace_vars', 'ast-sha256:b86b7373185bc4fd14ab3e43da329c37134975444e62f89d727c8a47c357cc42', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_public_probe_cleanup_holds_unresolved_census', 'namespace___dict__', 'ast-sha256:067dc81654d7647457bb5ce1723fc3d69288ad588904e2e3ec86b8c441cbd9f1', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit', 'namespace_sys_modules', 'ast-sha256:276b6b4971643730994affeaada4ed5111fa169eee01f0a2222016d65ccd8023', 0):
+        'Registers an importlib-created fixture-owned custody helper under its unique spec name before executing its definitions.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit', 'module_write', 'sys.modules[spec.name] = isolated', 0):
+        'Registers an importlib-created fixture-owned custody helper under its unique spec name before executing its definitions.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_modelled_custody_lost_birth_cannot_be_resolved_by_numeric_absence', 'namespace_sys_modules', 'ast-sha256:276b6b4971643730994affeaada4ed5111fa169eee01f0a2222016d65ccd8023', 0):
+        'Registers an importlib-created fixture-owned custody helper under its unique spec name before executing its definitions.',
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_modelled_custody_lost_birth_cannot_be_resolved_by_numeric_absence', 'module_write', 'sys.modules[spec.name] = isolated', 0):
+        'Registers an importlib-created fixture-owned custody helper under its unique spec name before executing its definitions.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'ModelledProbeChild.__getattr__', 'namespace_getattr', 'ast-sha256:27da59c888af961e8a3f6e609658659f19a150874b61bb873c037b398c1057f2', 0):
+        'The process wrapper delegates missing attributes to its registered physical child; the exact getattr reads instance state.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'run_reviewed_constructor', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'run_reviewed_constructor', 'namespace___dict__', 'ast-sha256:b17d4cb652625f7d83fe9650944512a60416e4afc076309eed6c7ad5ac4a04a2', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'run_reviewed_constructor', 'namespace_vars', 'ast-sha256:b17d4cb652625f7d83fe9650944512a60416e4afc076309eed6c7ad5ac4a04a2', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'run_reviewed_constructor', 'namespace___dict__', 'ast-sha256:0c02d24f1e66e8edf9519a145a937fd9572b7d116272082f3ee8423496994ed0', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'modelled_probe_entry', 'namespace_builtin_import', 'ast-sha256:d002c54b6d6b883775198058c993778d98a248c17682e08aeb910cbe9e59ce1b', 0):
+        'Acquires builtins for the fixture-owned execution namespace and its scoped import boundary.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'modelled_probe_entry', 'namespace___dict__', 'ast-sha256:8ad84dbe88c1addc465df01134bbcb3e04b9195db5e91a21245f77b0c48310e7', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'modelled_probe_entry', 'namespace_vars', 'ast-sha256:8ad84dbe88c1addc465df01134bbcb3e04b9195db5e91a21245f77b0c48310e7', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'modelled_probe_entry', 'namespace___dict__', 'ast-sha256:2c990c17c2e5e6454ddc018035f35d4f2e0188d21ccca85e2a986e7ff002f56d', 0):
+        'Initializes or executes the fixture-owned trusted probe module namespace with copied builtins and a scoped import boundary; the real builtins module is unchanged.',
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_r24_hold_constructor_delivers_its_entry_or_exit_event_before_return', 'module_write', "monkeypatch.setattr(sys.modules[__name__], 'MODELLED_PROBE_BOOTSTRAP', MODELLED_PROBE_BOOTSTRAP.replace(entry, observe + '\\n' + entry))", 0):
+        "Temporarily replaces this test module's MODELLED_PROBE_BOOTSTRAP fixture to observe the constructor's entry/exit event; pytest restores the dictionary entry.",
+    ('tests/integration/test_hierarchy_native_probe.py', 'test_r24_hold_constructor_delivers_its_entry_or_exit_event_before_return', 'namespace_sys_modules', 'ast-sha256:3166c1baf5ac44f7202d6bf65888639dbb15a1d11516a1e9109c999b169ecee1', 0):
+        "Temporarily replaces this test module's MODELLED_PROBE_BOOTSTRAP fixture to observe the constructor's entry/exit event; pytest restores the dictionary entry.",
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'namespace_globals', 'ast-sha256:bd90f66af016c1979ec356dabd779a5830559f74fb2e18e0121ca75860836800', 0):
         'The contract replaces its own _tracked_names helper to count Git prefilter queries while the observed subprocess and AST boundaries check clean Git environment and single-pass parsing.',
     ('tests/contract/test_mailbox_index_rollout.py', 'test_tip_prefilters_once_with_clean_git_environment', 'module_write', "monkeypatch.setitem(globals(), '_tracked_names', observed_tracked_names)", 0):
@@ -1426,7 +1678,7 @@ BAN_REGISTRATIONS = {
     ('tests/unit/verification/test_scanners.py', 'descriptor_count', 'namespace_vars', 'ast-sha256:7753147a4a668b8a91f3b2cdb69544cb32cd1138f1fee1be01a8d8d866faf689', 0):
         'Reads vars(os) to copy os into an owned capability/AST namespace for descriptor_count; overrides are installed on the copy rather than the original namespace.',
 }
-BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 19, 'import': 3, 'module_write': 30, 'namespace___class__': 3, 'namespace___delattr__': 0, 'namespace___dict__': 1, 'namespace___getattribute__': 1, 'namespace___setattr__': 10, 'namespace_builtin_import': 4, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 107, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 9, 'namespace_sys_modules': 38, 'namespace_vars': 53}
+BAN_LIMITS = {'constructor': 0, 'constructor_reference': 1, 'declaration': 20, 'import': 3, 'module_write': 39, 'namespace___class__': 3, 'namespace___delattr__': 0, 'namespace___dict__': 13, 'namespace___getattribute__': 1, 'namespace___setattr__': 10, 'namespace_builtin_import': 12, 'namespace_delattr': 0, 'namespace_generated_builtin_import': 5, 'namespace_getattr': 118, 'namespace_globals': 5, 'namespace_importlib': 5, 'namespace_locals': 0, 'namespace_setattr': 9, 'namespace_sys_modules': 47, 'namespace_vars': 59}
 
 # Formal 0715 example disposition (dynamic examples intentionally unasserted):
 # security 1 / correctness 2: global/nonlocal import/from-import rebindings,
@@ -1769,6 +2021,54 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_spellings_keep_fixed_json_errors', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and isolates AEGIS_WORKSPACE while checking abbreviated/root/team workspace spellings preserve the fixed usage or workspace JSON error.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_spellings_keep_fixed_json_errors', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and isolates AEGIS_WORKSPACE while checking abbreviated/root/team workspace spellings preserve the fixed usage or workspace JSON error.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_spellings_keep_fixed_json_errors', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and isolates AEGIS_WORKSPACE while checking abbreviated/root/team workspace spellings preserve the fixed usage or workspace JSON error.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_abbreviated_workspace_operation_failure_is_fixed_json', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and clears inherited AEGIS_WORKSPACE before checking that an anchored model I/O failure yields only fixed JSON.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_abbreviated_workspace_operation_failure_is_fixed_json', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and clears inherited AEGIS_WORKSPACE before checking that an anchored model I/O failure yields only fixed JSON.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_abbreviated_workspace_operation_failure_is_fixed_json', 'owner', 'model_select', False):
+        ((0,), 'model_select is aegis_core.model_select; this call replaces only its os reference with the local failing-open namespace for fixed JSON refusal, not process-wide os.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_removed_command_workspace_values_keep_model_json', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and clears inherited AEGIS_WORKSPACE to verify command-like workspace values retain the model JSON refusal.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_removed_command_workspace_values_keep_model_json', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and clears inherited AEGIS_WORKSPACE to verify command-like workspace values retain the model JSON refusal.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_removed_command_scan_uses_the_built_root_option_table', 'owner', 'cli_module', False):
+        ((0,), 'cli_module is aegis_cli.cli; this call wraps its _build_parser to add the test-only --round-workspace option and verify model routing through the built option table.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_raw_model_invocation_has_only_model_json_outcomes', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and sets or removes AEGIS_WORKSPACE for the pinned/unpinned model-invocation refusal matrix.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_raw_model_invocation_has_only_model_json_outcomes', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and sets or removes AEGIS_WORKSPACE for the pinned/unpinned model-invocation refusal matrix.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_raw_model_invocation_has_only_model_json_outcomes', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary workspace and sets or removes AEGIS_WORKSPACE for the pinned/unpinned model-invocation refusal matrix.'),
+    ('tests/unit/cli/test_cli_team.py', 'test_outer_model_policy_covers_stdout_setup_failure', 'owner', 'cli_module', True):
+        ((0,), "cli_module is aegis_cli.cli; this call replaces only its sys reference with a local stdout.reconfigure failure namespace, preserving pytest's real streams. The exact stdout-setup operation is conservatively counted as shared per the round20 brief."),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'workspace', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The MCP fixture enters its temporary governed workspace and clears inherited AEGIS_WORKSPACE before initializing the real server against that root.'),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'workspace', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'Fixture delenv operation; environment, path or restoration API outside the module-attribute census. The MCP fixture enters its temporary governed workspace and clears inherited AEGIS_WORKSPACE before initializing the real server against that root.'),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_cli_subdirectory_resolves_to_the_mcp_workspace', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The parity control enters a temporary workspace subdirectory to verify CLI resolution still matches the initialized MCP workspace.'),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_direct_subdirectory_adapter_matches_both_frontends', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The parity control enters the temporary docs directory for its cwd variant, checking both direct adapters and MCP dispatch resolve the same workspace.'),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_direct_adapter_denied_roots_refuse_before_paths', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control points HOME and USERPROFILE at its test-owned home directory so all model adapters reject home/root workspaces before path handling.'),
+    ('tests/unit/mcp/test_mcp_team_model.py', 'test_argument_refusal_precedes_held_workspace', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control pins a deliberately missing workspace while a held binding is installed, verifying argument refusal precedes workspace refusal.'),
+    ('tests/integration/test_hierarchy_launcher.py', 'test_stop_records_a_failed_process_census', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r30_resume_uses_the_real_spawns_cwd_and_path', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
+    ('tests/integration/test_hierarchy_launcher_stop_ownership.py', 'test_r26_captured_resume_requires_no_installed_host_cli', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/integration/test_hierarchy_mailbox.py', 'test_fdopen_failure_closes_descriptor', 'owner', 'mailbox', False):
         ((0,), 'The mailbox fdopen-failure control copies os into a test-local namespace, then replaces only tools.hierarchy_mailbox.os to track descriptor closure before and after raw-stream cleanup.'),
     ('tests/unit/cli/test_cli_msg.py', 'test_mc2b_overflow_and_invalid_earlier_family_match_mcp', 'owner', 'server', False):
@@ -7516,6 +7816,8 @@ def test_ruling_additional_allowed_fixture_and_dictionary_shapes(source):
 # Initial shared-module baseline re-measured at tip b11638bf, before RF-11b lands.
 # After landing, reductions require lowering the recorded value.
 PROCESS_PATCH_LIMITS = {
+    'tests/unit/cli/test_cli_team.py': 1,
+    'tests/integration/test_hierarchy_launcher_stop_ownership.py': 18,
     'tests/contract/test_mailbox_index_rollout.py': 5,
     'tests/helpers_popen.py': 1,
     'tests/integration/test_ci_green.py': 1,

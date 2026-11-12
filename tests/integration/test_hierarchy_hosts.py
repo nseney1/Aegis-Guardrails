@@ -89,7 +89,7 @@ def test_r23_unsupported_admission_publication_refuses_before_io(tmp_path, monke
 def test_r22_unsupported_running_publication_refuses_before_effects(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False, raising=False)
+    monkeypatch.setattr(hierarchy_launcher, "running_wake_publication_capable", lambda: False)
     launches = SimpleNamespace(base=tmp_path, folder=lambda endpoint: tmp_path / "launches" / endpoint.replace("/", "%2F"))
     known = dict(host="codex-cli", session=SESSION, generation=1)
     with pytest.raises(ValueError, match="^running wake atomic publication unsupported on this platform$"):
