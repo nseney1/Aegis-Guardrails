@@ -4757,6 +4757,210 @@
             "description": "Claims and denials from the events log, and for each first-parent merge since --base: whether both sides changed a common path and whether git merge-tree reports a conflict (unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded.",
             "help": "Lease events and merge outcomes"
           },
+          "model": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "bindings",
+                "flags": [
+                  "--bindings"
+                ],
+                "help": "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "policy",
+                "flags": [
+                  "--policy"
+                ],
+                "help": "Team selection policy JSON file inside the workspace (bounded, regular, no symlinks)",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "history",
+                "flags": [
+                  "--history"
+                ],
+                "help": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "task_kind",
+                "flags": [
+                  "--task-kind"
+                ],
+                "help": "Task kind T1 through T14, validated by the core",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "role_kind",
+                "flags": [
+                  "--role-kind"
+                ],
+                "help": "Seat kind: orchestrator, decider, implementer, integrator or reviewer",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "subject",
+                "flags": [
+                  "--subject"
+                ],
+                "help": "Single-line lane/endpoint/generation identifier for this decision",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "host_kinds",
+                "flags": [
+                  "--host-kind"
+                ],
+                "help": "Host registry kind; repeat for each host (at most 256)",
+                "kind": "ModelHostKinds",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "intent",
+                "flags": [
+                  "--intent"
+                ],
+                "help": "Semantic intent: light, standard, deep, extended or max; default from policy/role band",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "author_family",
+                "flags": [
+                  "--author-family"
+                ],
+                "help": "Author family required for reviews; T7 binds it to its chosen family",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "lane_family",
+                "flags": [
+                  "--lane-family"
+                ],
+                "help": "Lane family required for T3; writer lanes must match team_family",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "primary",
+                "dest": "review_stage",
+                "flags": [
+                  "--review-stage"
+                ],
+                "help": "Review stage: primary, correctness, security, whole or second as allowed by the task",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": false,
+                "dest": "record",
+                "flags": [
+                  "--record"
+                ],
+                "help": "Atomically select and append under the history lock (60-second timeout); default preview",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              }
+            ],
+            "description": "Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed admission remains explicit.",
+            "help": "Select a model; optionally record the decision"
+          },
           "release": {
             "aliases": [],
             "arguments": [

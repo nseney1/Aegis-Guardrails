@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from pathlib import Path
+
+from aegis_core.primitives import sanitize_display
 
 from aegis_mcp.handlers.core import handle_scan
 from aegis_mcp.handlers.governance import handle_create_rule, handle_list_rules
@@ -73,6 +76,135 @@ def _handle_team_config(args: dict) -> dict:
     return display_profile(payload)
 
 
+MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "subject", "host_kinds")
+MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
+
+
+def _model_output_safe(value):
+    """Refuse any changed field; successful operational values stay lossless."""
+    from aegis_core.redaction import redact_command_secrets
+
+    if isinstance(value, dict):
+        return all(_model_output_safe(key) and _model_output_safe(item) for key, item in value.items())
+    if isinstance(value, list):
+        return all(_model_output_safe(item) for item in value)
+    if isinstance(value, str):
+        return value == sanitize_display(redact_command_secrets(sanitize_display(value, max_len=None)), max_len=512)
+    return True
+
+
+def model_argument_refusal(arguments):
+    """Validate shape, types and bounds before workspace or path operations."""
+    from aegis_core.model_select import MAX_INPUT_BYTES
+
+    if (type(arguments) is not dict or
+            not set(MODEL_REQUIRED) <= arguments.keys() or
+            any(key not in MODEL_REQUIRED + MODEL_OPTIONAL for key in arguments)):
+        return {"error": "invalid_model_arguments"}
+    args = dict(arguments)
+    for key in MODEL_REQUIRED + MODEL_OPTIONAL:
+        if key in ("host_kinds", "record") or key not in args:
+            continue
+        value = args[key]
+        if (value is None and key in MODEL_OPTIONAL):
+            continue
+        if type(value) is not str or len(value) > MAX_INPUT_BYTES:
+            return {"error": "invalid_model_arguments"}
+    hosts = args["host_kinds"]
+    if (type(hosts) is not list or not 1 <= len(hosts) <= 256 or
+            any(type(host) is not str or len(host) > 128 for host in hosts) or
+            type(args.get("record", False)) is not bool):
+        return {"error": "invalid_model_arguments"}
+    return None
+
+
+def model_result(arguments, root=None):
+    """MCP adapter over the public selector; parity is pinned through both transports."""
+    from aegis_core import model_select
+    from aegis_core.config import env_workspace
+    from aegis_core.storage import LockTimeoutError
+    from aegis_core.errors import PathTraversalError
+    from aegis_core.workspace import confine_path
+    from aegis_core.workspace.base import Workspace
+    from aegis_core.workspace.binding import resolve_cli_root
+    from aegis_core.workspace.layout import has_rules_dir
+
+    refusal = model_argument_refusal(arguments)
+    if refusal is not None:
+        return refusal
+    args = dict(arguments)
+    hosts = args["host_kinds"]
+    try:
+        if isinstance(root, Workspace):
+            root = root.root
+        if root is not None:
+            if not isinstance(root, (str, Path)):
+                return {"error": "model_workspace_unavailable"}
+            root = str(root)
+            if len(root) > model_select.MAX_INPUT_BYTES or root.count("/") + root.count("\\") > 256:
+                return {"error": "model_workspace_unavailable"}
+        workspace = Workspace(root=resolve_cli_root(explicit=root, pin=env_workspace()))
+        if not has_rules_dir(workspace.root):
+            return {"error": "model_workspace_unavailable"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_workspace_unavailable"}
+    try:
+        # Bound raw path text before pathlib allocation. The core owns no-follow
+        # descriptor walks, file byte caps and strict JSON validation.
+        for key in ("bindings", "policy", "history"):
+            value = args[key]
+            if value.count("/") + value.count("\\") > 256:
+                return {"error": "invalid_model_arguments"}
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                return {"error": "invalid_model_arguments"}
+            confine_path(value, workspace)
+            # Keep the original spelling so the core no-follow walk still rejects
+            # symlinks introduced before or after the confinement check.
+            args[key] = str(workspace.root / path)
+        requested = {key: args[key] for key in MODEL_REQUIRED + MODEL_OPTIONAL
+                     if key in args and key not in ("bindings", "policy", "history", "record")}
+        if not _model_output_safe(requested):
+            return {"error": "model_output_needs_redaction"}
+        options = {key: args[key] for key in ("subject", "intent", "author_family", "lane_family", "review_stage")
+                   if key in args and args[key] is not None}
+        if args.get("record", False):
+            choice, record = model_select.select_and_append(
+                args["history"], args["bindings"], args["policy"], args["task_kind"], args["role_kind"],
+                host_kinds=hosts, **options)
+        else:
+            history = model_select.read_decisions(args["history"])
+            try:
+                choice, record = model_select.select_model(
+                    args["bindings"], args["policy"], args["task_kind"], args["role_kind"], history,
+                    host_kinds=hosts, **options)
+            finally:
+                history.close()
+        result = {"choice": choice, "record": record}
+        return result if _model_output_safe(result) else {"error": "model_output_needs_redaction"}
+    except PathTraversalError:
+        return {"error": "invalid_model_arguments"}
+    except model_select.ModelSelectionError as exc:
+        error = str(exc)
+        return {"error": error if _model_output_safe(error) else "model_output_needs_redaction"}
+    except LockTimeoutError:
+        return {"error": "model_lock_timeout"}
+    except (OSError, ValueError, RuntimeError):
+        return {"error": "model_io_unavailable"}
+
+
+def _handle_team_model(args):
+    if type(args) is not dict:
+        return model_result(args)
+    if any(key not in MODEL_REQUIRED + MODEL_OPTIONAL and key not in SERVER_INJECTED for key in args):
+        return {"error": "invalid_model_arguments"}
+    values = {key: value for key, value in args.items() if key not in SERVER_INJECTED}
+    refusal = model_argument_refusal(values)
+    if refusal is not None:
+        return refusal
+    return model_result(values, args.get("workspace"))
+
+
 _TOOL_HANDLERS = {
     "aegis_scan": handle_scan,
     "aegis_report_outcome": handle_report_outcome,
@@ -82,6 +214,7 @@ _TOOL_HANDLERS = {
     "aegis_msg_read": handle_msg_read,
     "aegis_msg_write": handle_msg_write,
     "aegis_team_config": _handle_team_config,
+    "aegis_team_model": _handle_team_model,
 }
 
 # Set by the server (or passed by an in-process caller), never part of a tool schema.
@@ -132,6 +265,10 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
 
 def execute_tool(name: str, args: dict, *, client_arguments: bool = False) -> Any:
     """Check the arguments against the schema, dispatch, and project the response if a view is asked for."""
+    if name == "aegis_team_model":
+        if client_arguments and (type(args) is not dict or any(key in SERVER_INJECTED for key in args)):
+            return {"error": "invalid_model_arguments"}
+        return _handle_team_model(args)
     if name == "aegis_team_config":
         # This closed read surface owns non-echoing, CLI-shaped argument refusals.
         if client_arguments and (not isinstance(args, dict) or args):

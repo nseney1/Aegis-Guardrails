@@ -22,7 +22,7 @@ _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint":
 READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule",
         "aegis_msg_read": "Read Message", "aegis_team_config": "Team Config"}
 WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight",
-         "aegis_msg_write": "Write Message"}
+         "aegis_msg_write": "Write Message", "aegis_team_model": "Team Model"}
 
 
 @pytest.fixture
@@ -64,6 +64,7 @@ def test_write_tools_claim_nothing_beyond_not_read_only(tools):
         "aegis_report_outcome": {"readOnlyHint": False, "title": "Report Outcome"},
         "aegis_capture_insight": {"readOnlyHint": False, "title": "Capture Insight"},
         "aegis_msg_write": {"readOnlyHint": False, "title": "Write Message"},
+        "aegis_team_model": {"readOnlyHint": False, "title": "Team Model"},
     }
 
 
@@ -117,7 +118,7 @@ def test_every_input_schema_property_has_a_short_description(tools):
 def test_tools_list_declares_no_output_schema(tools):
     """D-mcp-schema: no tool declares an outputSchema, so a result key needs no schema edit."""
     assert [name for name, tool in tools.items() if "outputSchema" in tool] == []
-    assert len(json.dumps(list(tools.values()))) <= 10_642  # 60% of the 4.3.3 list
+    assert len(json.dumps(list(tools.values()))) <= 11_500  # MR-3b adds the selector schema.
 
 
 @pytest.fixture
@@ -197,6 +198,7 @@ SIBLINGS = {
     "aegis_msg_read": ("aegis_msg_write",),
     "aegis_msg_write": ("aegis_msg_read",),
     "aegis_team_config": (),
+    "aegis_team_model": (),
 }
 
 
@@ -226,11 +228,9 @@ def test_the_report_description_states_the_limits_the_code_enforces(tools):
 
 
 def test_tools_list_fits_the_handshake_budget(tools):
-    # MC-3: codec ADR D2 puts trust notices and grammar in the cached prefix.
-    # Round 2 requires kind fields too: their compact lists exceed 8,500;
-    # TP-1b adds an eighth tool (coordinator ruling 2026-11-11T07:33Z)
-    budget = 9_214  # Measured with json.dumps(list(tools.values())).
-    assert budget <= 9_500
+    # MR-3b: ninth tool; compact selector schema measured with json.dumps.
+    budget = 11_235
+    assert budget <= 11_500
     assert len(json.dumps(list(tools.values()))) <= budget
 
 
