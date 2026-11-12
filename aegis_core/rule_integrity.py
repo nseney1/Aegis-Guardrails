@@ -44,6 +44,11 @@ _GIT_TIMEOUT, _MD, _MISSING = 60.0, ".md", object()
 class IntegrityError(AegisError):
     """The base cannot be read, or a blob does not hash to its object id."""
 
+    def __init__(self, message: str, *, code: Optional[str] = None, next_action: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.next_action = next_action
+
 
 @dataclass(frozen=True)
 class BaseAnchor:
@@ -528,14 +533,18 @@ class CiReport:
     governance_categories: Tuple[str, ...] = ()
     governance_paths: Tuple[Tuple[str, str], ...] = ()
     signers_at_base: int = 0
+    approval_policy: Optional[Any] = None
 
     @property
     def governance_gated(self) -> bool:
         """A governance change needs the approval only when the base lists a key to sign it with."""
-        return bool(self.governance_categories) and self.signers_at_base > 0
+        mode = self.approval_policy.mode if self.approval_policy is not None else None
+        return bool(self.governance_categories) and (mode == "signature" or (mode is None and self.signers_at_base > 0))
 
     @property
     def passed(self) -> bool:
+        if self.approval_policy is not None and self.approval_policy.mode in ("none", "review"):
+            return True
         if not self.weakenings and not self.governance_gated:
             return True
         return self.approval is not None and self.approval.valid
@@ -551,6 +560,7 @@ class CiReport:
                 "merge_base": self.merge_base,
             }),
             "schema": SCHEMA,
+            **(self.approval_policy.as_dict() if self.approval_policy is not None else {}),
             "status": "pass" if self.passed else "fail",
             "rules_checked": self.rules_checked,
             "weakenings": [asdict(w) for w in self.weakenings],
@@ -655,23 +665,30 @@ def _governance_paths(root: str, merge: str, head: str, prefix: str) -> Tuple[Tu
 
 
 @gitsafe.scrubbed()
-def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None) -> CiReport:
+def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any = None,
+             target: Optional[str] = None) -> CiReport:
     """``pull_request`` (a ``human_gate.PullRequest``): with no signed approval, tier A's approving
     review of that pull request's head may approve instead, and only when the head under check is it."""
-    from aegis_core import human_gate
+    from aegis_core import approval_policy, human_gate
 
     root = workspace_root(workspace)
-    base_commit = gitsafe.resolve_commit(root, base)
+    resolved = approval_policy.resolve_comparison(root, base)
+    base_commit = resolved.commit
     head_commit = gitsafe.resolve_commit(root, head)
     if not base_commit:
         raise IntegrityError(
-            f"cannot resolve the base {base!r} to a commit (fetch it, or with a shallow clone fetch the full history)"
+            "base_unavailable: cannot resolve the base to a commit; fetch it or pass the full commit id",
+            code="base_unavailable", next_action="fetch it or pass the full commit id"
         )
     if not head_commit:
         raise IntegrityError(f"cannot resolve the head {head!r} to a commit")
+    # Review identity does not establish a target; only the caller or a verified branch can.
+    branch = target if target is not None else resolved.target
+    policy = approval_policy.resolve_policy(root, base_commit, head_commit, branch)
     merge = gitsafe.merge_base(root, base_commit, head_commit)
     if not merge:
-        raise IntegrityError(f"{base!r} and {head!r} share no history (a shallow clone needs fetch-depth: 0)")
+        raise IntegrityError("comparison_unavailable: the resolved base and head share no history; pass a base from the head's history",
+                             code="comparison_unavailable", next_action="pass --base from the head's history")
     prefix = _prefix(root)
     base_rules = load_rules(root, inventory=_inventory_at(root, merge))
     head_rules = load_rules(root, inventory=_inventory_at(root, head_commit))
@@ -704,15 +721,15 @@ def check_ci(workspace: Any, base: str, head: str = "HEAD", *, pull_request: Any
     categories = tuple(c for c in order if c in {category for _path, category in paths})
     signers = human_gate.signing_keys_at(root, base_commit) if categories else 0
     approval = None
-    if found or (categories and signers):
+    if policy.mode not in ("none", "review") and (found or (categories and (signers or policy.mode == "signature"))):
         try:
             approval = human_gate.find_approval(root, head_commit, base_commit)
         except (human_gate.HumanGateError, gitsafe.GitError):
             approval = None
         if approval is None and pull_request is not None and pull_request.head.lower() == head_commit.lower():
-            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers else [])
+            flagged = [prefix + w.path for w in found] + ([path for path, _c in paths] if signers or policy.mode else [])
             try:
                 approval = human_gate.find_review_approval(root, pull_request, base_commit, flagged)
             except (human_gate.HumanGateError, gitsafe.GitError):
                 approval = None
-    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers)
+    return CiReport(base_commit, head_commit, merge, checked, tuple(found), approval, categories, paths, signers, policy)
