@@ -57,14 +57,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -76,14 +78,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -95,14 +99,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -114,14 +120,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -133,14 +141,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -152,14 +162,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -171,14 +183,16 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     },
     {
@@ -190,14 +204,110 @@
         "standard": "medium",
         "deep": "high",
         "extended": "xhigh",
-        "max": "max"
+        "max": "max",
+        "ultra": null
       },
       "admission": {
         "light": "unprobed",
         "standard": "unprobed",
         "deep": "unprobed",
         "extended": "unprobed",
-        "max": "unprobed"
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "frontier",
+      "model": "gemini-4-carbon",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "scout",
+      "model": "gemini-4-argon",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "mechanical",
+      "model": "gemini-3.8-flash",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "grok",
+      "host_status": "planned",
+      "class": "coding",
+      "model": "grok-4.7",
+      "served_aliases": [
+        "grok-4.7-build"
+      ],
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
       }
     }
   ]
