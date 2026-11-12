@@ -44,27 +44,210 @@ import time
 from typing import NamedTuple, Optional
 import uuid
 
+# Bootstrap stays stdlib-only: importing the selected provisioner here would be too late to fence
+# an older runtime. Keep the governing-pin rule aligned with hierarchy_provision.check_governing_pin.
+BOOTSTRAP_PIN_CHECK_ERROR = "governing source pin check failed; use the governing base or reprovision"
+BOOTSTRAP_JSON_LIMIT = 262144
+BOOTSTRAP_DESCRIPTOR_CAPS = (all(hasattr(os, key) for key in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")) and
+                             os.open in getattr(os, "supports_dir_fd", ()) and
+                             os.stat in getattr(os, "supports_dir_fd", ()))
+
+
+def bootstrap_descriptor_capable():
+    return BOOTSTRAP_DESCRIPTOR_CAPS
+
+
+@contextmanager
+def bootstrap_directory(path):
+    """Open from the filesystem root, retaining every edge until the bootstrap read is checked."""
+    if not bootstrap_descriptor_capable():
+        raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+    path = Path(path)
+    if ".." in path.parts or len(path.parts) > 256:
+        raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+    path = Path(os.path.abspath(path))
+    if len(path.parts) > 256:
+        raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+    descriptors, edges = [], []
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path.anchor, flags)
+        descriptors.append(descriptor)
+        for part in path.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            descriptors.append(child)
+            info = os.fstat(child)
+            edges.append((descriptor, part, (info.st_dev, info.st_ino)))
+            descriptor = child
+
+        def check():
+            for parent, name, identity in edges:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+                    raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+
+        yield descriptor, check
+        check()
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def bootstrap_json(directory):
+    """Bound before allocation/parsing, reject duplicate keys, and never format untrusted input."""
+    descriptor = os.open("provision.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > BOOTSTRAP_JSON_LIMIT:
+            raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+        raw = bytearray()
+        while len(raw) <= BOOTSTRAP_JSON_LIMIT:
+            block = os.read(descriptor, min(65536, BOOTSTRAP_JSON_LIMIT + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        after = os.fstat(descriptor)
+        named = os.stat("provision.json", dir_fd=directory, follow_symlinks=False)
+        def mark(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if len(raw) > BOOTSTRAP_JSON_LIMIT or mark(before) != mark(after) or mark(after) != mark(named):
+            raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+    finally:
+        os.close(descriptor)
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+            result[key] = value
+        return result
+
+    def integer_literal(value):
+        if len(value.lstrip("-")) > 128:
+            raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+        return int(value)
+
+    def finite(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+        return number
+
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_int=integer_literal,
+                      parse_float=finite, parse_constant=finite)
+
+
+def bootstrap_plan_present(folder):
+    """Silent lstat discovery: True is present, False is proven absent, None is indeterminate."""
+    path = None
+    try:
+        path = Path(folder) / "host-plan.json"
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except ValueError:
+        return False if path is not None and "\0" in str(path) else None
+    except Exception:
+        # A failed lookup is not proof that an older retained runtime may resolve policy.
+        return None
+    return True
+
+
+def bootstrap_setup(base):
+    """Preserve the integration-tip read and diagnostics until a governing plan is established."""
+    local_plan = bootstrap_plan_present(base)
+    if local_plan is True:
+        return bootstrap_planned_setup(base)
+    # This is the legacy bootstrap read, deliberately unchanged on the no-plan path.
+    # Its mailbox association is needed to discover a plan beside the canonical mailbox.
+    provision = Path(base) / "provision.json"
+    setup = json.loads(provision.read_text(encoding="utf-8"))
+    # Preserve a legacy read failure first; a successful read cannot authorize uncertain discovery.
+    if local_plan is None:
+        raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+    mailbox_root = setup.get("mailbox_root") if isinstance(setup, dict) else None
+    if isinstance(mailbox_root, str) and mailbox_root:
+        governing_plan = bootstrap_plan_present(Path(mailbox_root).parent)
+        if governing_plan is None:
+            raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR)
+        if governing_plan is True:
+            # Re-read through descriptors after discovery; never dispatch using this preliminary read.
+            return bootstrap_planned_setup(base)
+    return setup
+
+
+def bootstrap_planned_setup(base):
+    """The same equal-or-refuse rule as provision, before any retained code can run."""
+    try:
+        with bootstrap_directory(base) as (directory, check_base):
+            setup = bootstrap_json(directory)
+            mailbox_root = setup.get("mailbox_root") if isinstance(setup, dict) else None
+            if not isinstance(mailbox_root, str) or not mailbox_root:
+                return setup  # Ordinary runtime validation retains its malformed-record diagnostic.
+
+            def planned(folder):
+                try:
+                    os.stat("host-plan.json", dir_fd=folder, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+                return True
+
+            local_plan = planned(directory)
+            with ExitStack() as homes:
+                try:
+                    home, check_home = homes.enter_context(bootstrap_directory(Path(mailbox_root).parent))
+                except FileNotFoundError:
+                    if local_plan:
+                        raise
+                    return setup  # No governing home and no local plan: retain legacy dispatch.
+                if not local_plan and not planned(home):
+                    return setup
+                left, right = os.fstat(directory), os.fstat(home)
+                if (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino):
+                    return setup
+                governing = bootstrap_json(home)
+                check_home()
+                check_base()
+    except (ValueError, OSError, KeyError, TypeError, UnicodeError, RecursionError, OverflowError, RuntimeError) as exc:
+        raise ValueError(BOOTSTRAP_PIN_CHECK_ERROR) from exc
+    if (not isinstance(governing, dict) or governing.get("schema") != "aegis.hierarchy-provision/v1" or
+            governing.get("mailbox_root") != mailbox_root or governing.get("initiative") != setup.get("initiative")):
+        raise ValueError("governing provision record does not match this run; reprovision the base")
+    keys = ("source_commit", "source_tree")
+    if not all(isinstance(governing.get(key), str) and
+               re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", governing[key]) for key in keys):
+        raise ValueError("governing provision record has an invalid source pin; reprovision the base")
+    if any(setup.get(key) != governing[key] for key in keys):
+        raise ValueError("runtime source pin differs from governing provision; use the governing base or reprovision")
+    return setup
+
+
+def bootstrap_runtime(arguments):
+    """Enter the retained verifier only after the current bootstrap has checked the governing pin."""
+    import runpy
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--base")
+    early.add_argument("command", nargs="?")
+    parsed, _ = early.parse_known_args(arguments)
+    if parsed.command not in ("start", "resume", "_resume-wake") or not parsed.base:
+        return False
+    base = Path(parsed.base)
+    provision = base / "provision.json"
+    setup = bootstrap_setup(base)
+    verifier = base / "runtime-source.py"
+    if not verifier.is_file():
+        raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
+    loaded = runpy.run_path(str(verifier))
+    loaded["run"](provision, Path(setup["source"]) / "tools" / Path(__file__).name, arguments)
+    return True
+
+
 # Provisioned CLI actions must enter through the retained verifier before importing any peer module.
 # A process-local marker prevents recursion; an environment variable cannot bypass verification.
 if __name__ == "__main__" and getattr(sys, "_aegis_verified_runtime_entry", None) != str(Path(__file__).resolve()):
-    import runpy
-    early = argparse.ArgumentParser(add_help=False)
-    guarded = False
     try:
-        early.add_argument("--base")
-        early.add_argument("command", nargs="?")
-        parsed, _ = early.parse_known_args()
-        if parsed.command in ("start", "resume", "_resume-wake") and parsed.base:
-            base = Path(parsed.base)
-            guarded = True
-        if guarded:
-            provision = base / "provision.json"
-            setup = json.loads(provision.read_text(encoding="utf-8"))
-            verifier = base / "runtime-source.py"
-            if not verifier.is_file():
-                raise ValueError("runtime source verifier is missing; reprovision into a new base through the existing handoff flow")
-            loaded = runpy.run_path(str(verifier))
-            loaded["run"](provision, Path(setup["source"]) / "tools" / Path(__file__).name, sys.argv[1:])
+        if bootstrap_runtime(sys.argv[1:]):
             sys.exit(0)
     except (ValueError, OSError, KeyError, TypeError, UnicodeError) as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True))
@@ -709,14 +892,17 @@ def locked_start(launches, request, endpoint, identifier, plan, host, stand_in, 
     details = {"argv": argv, "cwd": started["cwd"], "contract": contracts[-1], "contracts": contracts,
                "start_timeout_seconds": timeout, "exit_code": exit_code, "timed_out": timed_out, **via}
     if not (isinstance(session, str) and SESSION.fullmatch(session)):
-        error = error or (None if session is None else "the start reported an invalid session")
-        record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details,
-                                 **({"error": error} if error else {}))
+        error = error or ("the start reported an invalid session" if session is not None else
+                          "the start timed out" if timed_out else
+                          "the start process exited unsuccessfully" if exit_code != 0 else
+                          "the start exited without reporting a session")
+        record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details, error=error)
         return 3, {**record, "log": logs}
     known["session"] = session
     if error or exit_code != 0 or timed_out:
         record = launches.record(endpoint, identifier, "start", "start_incomplete", **known, **details,
-                                 **({"error": error} if error else {}))
+                                 error=error or ("the start timed out" if timed_out else
+                                                 "the start process exited unsuccessfully"))
         return 3, {**record, "log": logs}
 
     def bind():
