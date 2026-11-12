@@ -1347,8 +1347,8 @@ def mr1_bindings():
     ("missing", "cannot read file"), ("json", "invalid JSON"), ("duplicate-key", "duplicate JSON key 'schema'"),
     ("schema", "unsupported schema"), ("top-key", "unexpected top-level keys"),
     ("kind", "unknown role kind 'wizard'"), ("class", "unknown model class 'wizard'"),
-    ("intent", "unknown intent 'ultra'"), ("order", "band must satisfy floor <= default <= ceiling"),
-    ("native", "unknown native level 'ultra'"), ("duplicate-host", "duplicate host/class row"),
+    ("intent", "unknown intent 'beyond'"), ("order", "band must satisfy floor <= default <= ceiling"),
+    ("native", "unknown native level 'beyond'"), ("duplicate-host", "duplicate host/class row"),
     ("missing-intent", "binding claude-code/coding lacks band ceiling max for implementer"),
     ("role-key", "unexpected role keys"), ("host-key", "unexpected host keys"),
     ("duplicate-role", "duplicate role row"), ("band-key", "unexpected band keys"),
@@ -1382,11 +1382,11 @@ def test_mr1_broken_bindings_refuse_before_binding(setup, mr1_cli, monkeypatch, 
     elif case == "class":
         data["hosts"][0]["class"] = "wizard"
     elif case == "intent":
-        data["roles"][0]["band"]["floor"] = "ultra"
+        data["roles"][0]["band"]["floor"] = "beyond"
     elif case == "order":
         data["roles"][0]["band"]["floor"] = "deep"
     elif case == "native":
-        data["hosts"][0]["levels"]["max"] = "ultra"
+        data["hosts"][0]["levels"]["max"] = "beyond"
     elif case == "duplicate-host":
         data["hosts"].append(data["hosts"][0])
     elif case == "missing-intent":
@@ -2169,8 +2169,8 @@ def test_mr1_r5_launcher_records_deep_team_parse_refusal(tmp_path_factory, host)
     ("extra-admission", "admission must map exactly supported intents"),
     ("unknown-admission", "unknown admission value 'allowed'"),
     ("typed-admission", "unknown admission value 7"),
-    ("empty-levels", "levels must map a nonempty subset of light, standard, deep, extended, max"),
-    ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max"),
+    ("empty-levels", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
+    ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
     ("missing-default", "binding claude-code/coding lacks band default standard for orchestrator"),
     ("missing-ceiling", "binding claude-code/coding lacks band ceiling max for implementer"),
     ("rejected-default", "binding claude-code/coding has rejected band default standard for orchestrator"),
@@ -3494,3 +3494,101 @@ def test_mr1_r14a_direct_fixed_roles_record_registry_provenance(mr1_r2_setup, mr
     assert record["effort_from"] == record["reasoning_from"] == "registry"
     assert record["model_from"] == ("request" if model_present else "model-bindings.json")
     assert not (setup.base / "profiles").exists()
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("endpoint", ["pilot/lane/f2", "pilot/root"])
+@pytest.mark.parametrize("configuration", ["defaults", "explicit", "team"])
+def test_mr4_2h_planned_registered_hosts_refuse_every_public_path(setup, mr1_cli, command, host,
+                                                               endpoint, configuration):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    plan_path = setup.base / "host-plan.json"
+    plan = json.loads(plan_path.read_text())
+    plan["root"] = host
+    plan_path.write_text(json.dumps(plan))
+    data = json.loads((setup.source / "tools/hierarchy_templates/model-bindings.json").read_text())
+    for row in data["hosts"]:
+        if row["host"] == host:
+            row["host_status"] = "planned"
+    mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    model = "gpt-6.1-sol" if host == "codex-cli" else "claude-opus-5-5"
+    options = {"model": model, "effort": "high"} if configuration == "explicit" else {}
+    if configuration == "team":
+        write_team(setup, model=model, reasoning="high")
+    for _ in range(2):
+        refused = call(command, mr1_request(setup, command, endpoint, host, **options), expect=2)
+        assert refused == {"error": "host is planned; Teams support is not qualified"}
+        assert unbound(setup, endpoint)
+
+
+@pytest.mark.parametrize("command", ["codex-start", "add-role"])
+def test_mr4_2h_withheld_native_ultra_refuses_public_profile_and_binding(setup, mr1_cli, command):
+    _, call = mr1_cli
+    mr1_plan(setup, "codex-cli")
+    data = json.loads((setup.source / "tools/hierarchy_templates/model-bindings.json").read_text())
+    assert all(row["levels"]["ultra"] is None for row in data["hosts"])
+    refused = call(command, mr1_request(setup, command, "pilot/lane/f2", "codex-cli",
+                                      model="gpt-6.1-sol", effort="ultra"), expect=2)
+    assert refused == {"error": "request effort 'ultra' is a deprecated alias accepted only in team.json; "
+                     "ask for max, or set team.json reasoning to ultra; allowed request efforts: "
+                     "low, medium, high, xhigh, max"}
+    assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mr4_2h_rendered_collision_refuses_public_provision_in_every_order(setup, mr1_cli, command,
+                                                                       host, reverse):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    coding = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    other = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "frontier"))
+    coding.update(model="m", effort_encoding="model_suffix")
+    coding["admission"]["deep"] = "admitted"
+    other["model"] = "m-high"
+    other["admission"]["deep"] = "rejected"
+    if reverse:
+        data["hosts"].reverse()
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    for _ in range(2):
+        refused = call(command, mr1_request(setup, command, "pilot/lane/f2", host,
+                                          model="m-high", effort="high"), expect=2)
+        assert refused == {"error": "invalid model bindings %s: ambiguous effective model identity; "
+                         "repair model-bindings.json" % path}
+        assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("edge,intent", [("default", "deep"), ("ceiling", "max")])
+@pytest.mark.parametrize("shape", ["missing", "null"])
+def test_mr4_2h_null_endpoint_uses_the_missing_key_refusal_envelope(setup, mr1_cli, command, host,
+                                                                edge, intent, shape):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(r for r in data["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    if shape == "null":
+        row["levels"][intent] = None
+    else:
+        del row["levels"][intent]
+        del row["admission"][intent]
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    refused = call(command, mr1_request(setup, command, "pilot/lane/f2", host,
+                                      model=row["model"], effort="high"), expect=2)
+    assert refused == {"error": "invalid model bindings %s: binding %s/coding lacks band %s %s "
+                     "for implementer; repair model-bindings.json" % (path, host, edge, intent)}
+    assert unbound(setup, "pilot/lane/f2")
+
+
+def test_mr4_2h_grok_registered_but_still_planned_refuses_host_defaults(setup, mr1_cli, monkeypatch):
+    module, _ = mr1_cli
+    # Model the future Teams host registration without implementing a Grok launcher.
+    monkeypatch.setattr("hierarchy_provision.hierarchy_hosts.TEAM_HOSTS",
+                        module.hierarchy_hosts.TEAM_HOSTS + ("grok",))
+    mr1_plan(setup, "grok")
+    for _ in range(2):
+        with pytest.raises(ValueError, match="^host is planned; Teams support is not qualified$"):
+            module.team_settings(setup.base, "grok", {}, "implementer")
+    assert unbound(setup, "pilot/lane/f2")
