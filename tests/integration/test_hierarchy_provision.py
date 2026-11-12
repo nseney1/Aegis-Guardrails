@@ -1337,7 +1337,7 @@ def mr1_bindings():
                            ("integrator", ("standard", "deep", "max")),
                            ("reviewer", ("deep", "deep", "max"))]], "hosts": [
         {"host": host, "class": cls, "model": model, "levels": dict(levels),
-         "admission": {intent: "unprobed" for intent in levels}}
+         "admission": {intent: "admitted" if cls == "coding" else "unprobed" for intent in levels}}
         for host, models in [("claude-code", ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"]),
                              ("codex-cli", ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"])]
         for cls, model in zip(("coding", "frontier", "scout", "mechanical"), models)]}
@@ -1484,7 +1484,7 @@ def test_mr1_in_band_requests_record_provenance(setup, host, model, endpoint, ef
                               "effort_from": "request", "reasoning_from": "request", "model_class": "coding",
                               "intent": intent, "band": dict(zip(("floor", "default", "ceiling"), band)),
                               "bindings_sha256": hashlib.sha256((ROOT / "tools/hierarchy_templates/model-bindings.json").read_bytes()).hexdigest(),
-                              "admission": "unprobed"}
+                              "admission": "admitted"}
 
 
 @pytest.mark.parametrize("host,model", [("claude-code", "claude-opus-5-5"), ("codex-cli", "gpt-6.1-sol")])
@@ -1939,7 +1939,7 @@ def test_mr1_r4_copied_base_uses_canonical_resolution_and_provenance(setup, mr1_
     answer = call(command, mr1_r4_request(setup, copied, command, host))
     assert answer["team"]["model"] == model and answer["team"]["effort"] == "medium"
     assert answer["team"]["reasoning_from"] == "kind" and answer["team"]["intent"] == "standard"
-    assert answer["team"]["admission"] == "unprobed"
+    assert answer["team"]["admission"] == "admitted"
     argv = json.loads(Path(answer["wake_profile"]).read_text())["argv"] if command == "add-role" else answer["start_argv"]
     if host == "codex-cli":
         assert codex_config(argv)["model"] == model and codex_config(argv)["model_reasoning_effort"] == "medium"
@@ -2173,8 +2173,8 @@ def test_mr1_r5_launcher_records_deep_team_parse_refusal(tmp_path_factory, host)
     ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
     ("missing-default", "binding claude-code/coding lacks band default standard for orchestrator"),
     ("missing-ceiling", "binding claude-code/coding lacks band ceiling max for implementer"),
-    ("rejected-default", "binding claude-code/coding has rejected band default standard for orchestrator"),
-    ("rejected-ceiling", "binding claude-code/coding has rejected band ceiling max for implementer"),
+    ("rejected-default", "band default and ceiling levels must be admitted"),
+    ("rejected-ceiling", "band default and ceiling levels must be admitted"),
 ])
 def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeypatch, case, problem):
     module, call = mr1_cli
@@ -2206,31 +2206,62 @@ def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeyp
     path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     refused = call("add-role", mr1_r4_request(setup, setup.base, "add-role", "claude-code",
                                             model="claude-opus-5-5", effort="medium"), expect=2)
-    assert refused == {"error": "invalid model bindings %s: %s; repair model-bindings.json" % (path, problem)}
+    action = ("probe the level or repair model-bindings.json" if case.startswith("rejected-") else
+              "repair model-bindings.json")
+    assert refused == {"error": "invalid model bindings %s: %s; %s" % (path, problem, action)}
     assert unbound(setup, "pilot/orchestrator")
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
-@pytest.mark.parametrize("state", ["unprobed", "admitted", "rejected"])
+@pytest.mark.parametrize("intent", ["standard", "max"])
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+def test_mr1c_band_admission_refuses_before_binding_and_allows_repair(setup, mr1_cli, command, host, intent, state):
+    _, call = mr1_cli
+    mr1_plan(setup, host)
+    data = mr1_bindings()
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == (host, "coding"))
+    row["admission"][intent] = state
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
+                             model=row["model"], effort="high")
+    for _ in range(2):
+        assert call(command, dict(request), expect=2) == {
+            "error": "invalid model bindings %s: band default and ceiling levels must be admitted; "
+                     "probe the level or repair model-bindings.json" % path}
+        assert unbound(setup, "pilot/lane/f2")
+    row["admission"][intent] = "admitted"
+    mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    assert call(command, dict(request))["team"]["admission"] == "admitted"
+
+
+@pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
+@pytest.mark.parametrize("state", ["unprobed", "admitted", "rejected", "null"])
 def test_mr1_r5_selected_admission_is_recorded_or_refused(setup, mr1_cli, monkeypatch, command, host, state):
     module, call = mr1_cli
     mr1_plan(setup, host)
     data = mr1_bindings()
     row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
-    row["admission"]["extended"] = state
+    row["admission"]["extended"] = "admitted" if state == "null" else state
+    if state == "null":
+        row["levels"]["extended"] = None
     row["admission"]["light"] = "rejected"  # Neither a required default nor ceiling.
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
     path = mr1_r9_publish_bindings(setup, path.read_bytes() if path.exists() else None)
     request = mr1_r4_request(setup, setup.base, command, host, endpoint="pilot/lane/f2",
                              model=row["model"], effort="xhigh")
-    answer = call(command, request, expect=2 if state == "rejected" else 0)
-    if state == "rejected":
-        assert answer == {"error": "%s intent extended (effort xhigh) is rejected for %s; choose a different supported level" %
-                          (row["model"], host)}
-        assert unbound(setup, "pilot/lane/f2")
-    else:
-        assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
+    for _ in range(2):
+        answer = call(command, dict(request), expect=0 if state == "admitted" else 2)
+        if state == "null":
+            assert answer == {"error": "implementer effort xhigh has no supported intent; supported intents: "
+                                      "light, standard, deep, max; choose a supported effort"}
+        elif state != "admitted":
+            assert answer == {"error": "%s intent extended (effort xhigh) is not admitted for %s; "
+                                      "choose an admitted supported level" % (row["model"], host)}
+        else:
+            assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
+        if state != "admitted":
+            assert unbound(setup, "pilot/lane/f2")
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)
@@ -2243,7 +2274,7 @@ def test_mr1_r5_partial_binding_accepts_supported_levels_and_names_unsupported_o
     for row in data["hosts"]:
         intents = ("standard", "deep", "max") if row["class"] == "coding" else ("deep",)
         row["levels"] = {key: row["levels"][key] for key in intents}
-        row["admission"] = {key: "unprobed" for key in intents}
+        row["admission"] = {key: "admitted" if row["class"] == "coding" else "unprobed" for key in intents}
     row = next(row for row in data["hosts"] if row["host"] == host and row["class"] == "coding")
     path = setup.tmp / (uuid.uuid4().hex + ".json")
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -2862,7 +2893,8 @@ def test_mr1_r9_unbound_effort_never_bypasses_supported_levels(mr1_r2_setup, mr1
         row["levels"] = {"standard": "low", "deep": "high", "max": "max"}
     else:
         del row["levels"]["extended"]
-    row["admission"] = {intent: "unprobed" for intent in row["levels"]}
+    # Valid band endpoints let this case reach its unsupported-effort check.
+    row["admission"] = {intent: "admitted" for intent in row["levels"]}
     mr1_r9_publish_bindings(setup, json.dumps(data).encode("utf-8"))
     options = {} if endpoint.endswith("router") else {"effort": effort}
     refused = call(command, mr1_request(setup, command, endpoint, host, **options), expect=2)

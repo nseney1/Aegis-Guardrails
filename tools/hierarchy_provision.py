@@ -531,9 +531,8 @@ def binding_identifier(value, label):
             label + " must be a nonempty ASCII identifier")
 
 
-def bindings_error(problem, path):
-    return ValueError("invalid model bindings %s: %s; repair model-bindings.json" %
-                      (path, problem))
+def bindings_error(problem, path, *, action="repair model-bindings.json"):
+    return ValueError("invalid model bindings %s: %s; %s" % (path, problem, action))
 
 
 def check_role_model_class(kind, model_class):
@@ -567,6 +566,7 @@ def read_pinned_bindings(setup, base):
 def load_model_bindings(setup, base):
     """Read once per planned resolution; the hash describes the exact validated bytes, not a reserialization."""
     path, raw = read_pinned_bindings(setup, base)
+    action = "repair model-bindings.json"
     try:
         data = parse_json_bytes(raw)
         binding_keys(data, ("schema", "roles", "hosts"), "top-level")
@@ -639,7 +639,7 @@ def load_model_bindings(setup, base):
             keys = {(host, name) for name in names}
             require(not identities.intersection(keys), "ambiguous effective model identity")
             identities.update(keys)
-            # Unprobed levels remain runnable in MR-1; only known rejected levels refuse.
+            # Planned rows describe capabilities; executable band endpoints are checked below.
             hosts[host, model_class] = row
         required_classes = {row["model_class"] for row in roles.values()}
         missing_bindings = sorted("%s/%s" % (host, model_class)
@@ -657,12 +657,12 @@ def load_model_bindings(setup, base):
                     intent = policy["band"][edge]
                     require(binding["levels"].get(intent) is not None, "binding %s/%s lacks band %s %s for %s" %
                             (host, policy["model_class"], edge, intent, kind))
-                    require(binding["admission"][intent] != "rejected",
-                            "binding %s/%s has rejected band %s %s for %s" %
-                            (host, policy["model_class"], edge, intent, kind))
+                    if binding["admission"][intent] != "admitted":
+                        action = "probe the level or repair model-bindings.json"
+                        raise ValueError("band default and ceiling levels must be admitted")
         return roles, hosts, hashlib.sha256(raw).hexdigest(), path
     except JSON_FAILURES as exc:
-        raise bindings_error(str(exc), path) from exc
+        raise bindings_error(str(exc), path, action=action) from exc
 
 
 def require_selectable_host(bindings, host):
@@ -749,7 +749,7 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
                 "%s effort %s maps to intent %s outside band %s..%s; choose an effort within the band" %
                 (kind, effort, intent, band["floor"], band["ceiling"]) + repair)
     admission = binding["admission"][intent]
-    require(admission != "rejected", "%s intent %s (effort %s) is rejected for %s; choose a different supported level" %
+    require(admission == "admitted", "%s intent %s (effort %s) is not admitted for %s; choose an admitted supported level" %
             (binding["model"], intent, effort, host))
     if binding.get("effort_encoding", "flag") == "model_suffix":
         model = binding["model"] + "-" + effort
