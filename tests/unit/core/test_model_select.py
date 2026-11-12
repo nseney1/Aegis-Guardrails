@@ -1,6 +1,7 @@
 """Public selector contract: refusals first, then deterministic choices and audit I/O."""
 import copy
 import errno
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -63,6 +64,154 @@ def test_model_selection_document_names_every_public_function():
             assert name in document
 
 
+@pytest.mark.parametrize("intent", ["extended"])
+def test_mr4_null_levels_never_select_and_can_retry(bindings, policy, intent):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row["levels"][intent] = None
+    for _ in range(2):
+        with pytest.raises(ModelSelectionError, match="^binding_unavailable:codex-cli:" + intent + "$"):
+            choose(bindings, policy, intent=intent)
+    assert choose(bindings, policy, intent="deep")[0]["level"] == "high"
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_mr4_planned_host_never_selects_even_when_listed(bindings, policy, registered):
+    row = copy.deepcopy(bindings["hosts"][0])
+    row.update(host="future-host", host_status="planned")
+    bindings["hosts"].append(row)
+    policy["family_hosts"]["first"] = ["future-host", "codex-cli"]
+    registry = ("codex-cli", "claude-code") + (("future-host",) if registered else ())
+    for _ in range(2):
+        with pytest.raises(ModelSelectionError, match="^binding_unavailable:future-host:deep$"):
+            choose(bindings, policy, host_kinds=registry)
+    policy["family_hosts"]["first"].reverse()
+    assert choose(bindings, policy, host_kinds=registry)[0]["host"] == "codex-cli"
+
+
+@pytest.mark.parametrize("case", ["planned", "null-default"])
+def test_mr4_unavailable_bindings_refuse_concurrent_retries(bindings, policy, case):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    if case == "planned":
+        for item in bindings["hosts"]:
+            if item["host"] == "codex-cli":
+                item["host_status"] = "planned"
+    else:
+        row["levels"]["deep"] = None
+    before = copy.deepcopy((bindings, policy))
+
+    def refused(_):
+        error = "binding_unavailable:codex-cli:deep" if case == "planned" else "invalid_bindings"
+        with pytest.raises(ModelSelectionError, match="^" + error + "$"):
+            choose(bindings, policy)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(9)))
+    assert (bindings, policy) == before
+
+
+def test_mr4_suffix_and_usage_metadata_are_deterministic_under_concurrency(bindings, policy):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row.update(model="gemini-4-carbon", effort_encoding="model_suffix", served_aliases=["usage-only"])
+    before = copy.deepcopy((bindings, policy))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: choose(bindings, policy), range(9)))
+    assert all(result == results[0] for result in results)
+    assert results[0][0]["model"] == "gemini-4-carbon-high"
+    assert (bindings, policy) == before
+
+
+def test_mr4_usage_alias_does_not_change_selection_or_decision_bytes(bindings, policy):
+    expected = choose(bindings, policy)
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row["served_aliases"] = ["served-build"]
+    assert choose(bindings, policy) == expected
+
+
+def test_mr4_existing_choices_and_records_match_integration_tip(bindings, policy):
+    # Captured from 99d399a9 before product edits; no git history is needed to run this test.
+    history, results = [], []
+    for task, role in (("T1", "orchestrator"), ("T1", "decider"), ("T2", "implementer"),
+                       ("T9", "integrator"), ("T4", "reviewer"), ("T5", "reviewer"),
+                       ("T6", "reviewer"), ("T8", "reviewer")):
+        result = select_model(bindings, policy, task, role, history, author_family="first")
+        results.append(result)
+        history.append(result[1])
+    raw = json.dumps(results, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(raw).hexdigest() == "bed6bbcae15e5966f395e77aa8178609baec86530908bc2823d99628c68591de"
+
+
+@pytest.mark.parametrize("host", ["codex-cli", "claude-code"])
+def test_mr4_ultra_is_highest_but_not_offered_until_provisioning_is_qualified(bindings, policy, host):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    assert row["levels"]["ultra"] is None
+    assert row["admission"]["ultra"] == "unprobed"
+    policy["family_hosts"]["first"] = [host]
+    policy["family_hosts"]["second"] = ["claude-code" if host == "codex-cli" else "codex-cli"]
+    with pytest.raises(ModelSelectionError, match="^intent_outside_role_band$"):
+        choose(bindings, policy, intent="ultra")
+    band = next(r["band"] for r in bindings["roles"] if r["kind"] == "implementer")
+    band.update(floor="max", default="max", ceiling="ultra")
+    with pytest.raises(ModelSelectionError, match="^invalid_bindings$"):
+        choose(bindings, policy, intent="ultra")
+    band.update(floor="ultra", default="max")
+    with pytest.raises(ModelSelectionError, match="^invalid_bindings$"):
+        choose(bindings, policy)
+
+
+@pytest.mark.parametrize("host,intent", [("grok", "max"), ("grok", "deep"),
+    ("antigravity", "extended"), ("antigravity", "max"), ("antigravity", "deep")])
+def test_mr4_capability_only_registry_hosts_never_route(bindings, policy, host, intent):
+    policy["family_hosts"]["first"] = [host]
+    with pytest.raises(ModelSelectionError, match="^binding_unavailable:" + host + ":" + intent + "$"):
+        choose(bindings, policy, intent=intent)
+
+
+def test_mr4_grok_usage_alias_retains_requested_model_identity(bindings, policy):
+    _, hosts = core.validate_bindings(bindings, host_kinds=("codex-cli", "claude-code"))
+    row = hosts["grok", "coding"]
+    assert "grok-4.7-build" in row["served_aliases"]
+    assert row["model"] == "grok-4.7"
+    # Simulate future host qualification without changing the tracked planned row.
+    row["host_status"] = "selectable"
+    for role in bindings["roles"]:
+        if role["band"]["ceiling"] == "max":
+            role["band"]["ceiling"] = "extended"
+    policy["family_hosts"]["first"] = ["grok"]
+    choice, _ = choose(bindings, policy, host_kinds=("codex-cli", "claude-code", "grok"))
+    assert choice["model"] == "grok-4.7"
+    with pytest.raises(ModelSelectionError, match="^intent_outside_role_band$"):
+        choose(bindings, policy, intent="max", host_kinds=("codex-cli", "claude-code", "grok"))
+
+
+@pytest.mark.parametrize("intent", ["deep", "max"])
+def test_mr4_2h_null_band_endpoints_refuse_at_load_and_on_concurrent_retry(bindings, policy, intent):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row["levels"][intent] = None
+
+    def refused(_):
+        with pytest.raises(ModelSelectionError, match="^invalid_bindings$"):
+            choose(bindings, policy)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(9)))
+
+
+def test_mr4_2h_rendered_collisions_refuse_concurrent_validation_without_mutation(bindings, policy):
+    coding = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    other = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "frontier"))
+    coding.update(model="m", effort_encoding="model_suffix")
+    other["model"] = "m-high"
+    before = copy.deepcopy(bindings)
+
+    def refused(_):
+        with pytest.raises(ModelSelectionError, match="^invalid_bindings$"):
+            choose(bindings, policy)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(9)))
+    assert bindings == before
+
+
 @pytest.mark.parametrize("task,role,error", [
     ("unknown", "implementer", "unknown_task_kind"),
     ("T2", "router", "unknown_role_kind"),
@@ -73,7 +222,8 @@ def test_unknown_kinds_and_incompatible_seats(bindings, policy, task, role, erro
         select_model(bindings, policy, task, role, [])
 
 
-@pytest.mark.parametrize("intent,error", [("ultra", "unknown_intent"),
+@pytest.mark.parametrize("intent,error", [("none", "unknown_intent"), ("minimal", "unknown_intent"),
+                                          ("ultra", "intent_outside_role_band"),
                                           ("bogus", "unknown_intent"),
                                           ("light", "intent_outside_role_band")])
 def test_invalid_intents(bindings, policy, intent, error):
@@ -97,7 +247,7 @@ def test_malformed_bindings(bindings, policy, case):
     elif case == "model":
         bindings["hosts"][0]["model"] = ""
     elif case == "levels":
-        bindings["hosts"][0]["levels"]["ultra"] = "ultra"
+        bindings["hosts"][0]["levels"]["beyond"] = "ultra"
     elif case == "admission":
         bindings["hosts"][0]["admission"]["deep"] = "bogus"
     else:
@@ -192,7 +342,7 @@ def test_configured_reviews_and_amended_efforts(bindings, policy, task, family):
 
 def test_renamed_hosts_and_models_are_data(bindings, policy):
     for row in bindings["hosts"]:
-        row["host"] = {"codex-cli": "local-a", "claude-code": "local-b"}[row["host"]]
+        row["host"] = {"codex-cli": "local-a", "claude-code": "local-b"}.get(row["host"], row["host"])
         row["model"] = "new-" + row["model"]
     policy["family_hosts"] = {"first": ["local-a"], "second": ["local-b"]}
     assert choose(bindings, policy, host_kinds=("local-a", "local-b"))[0]["host"] == "local-a"
@@ -605,7 +755,7 @@ def test_all_policy_refusals_have_exact_error(bindings, policy, case):
         "task-unknown": ("task_intents", {"unknown": {"first": "deep"}}),
         "task-shape": ("task_intents", {"T9": []}), "task-empty": ("task_intents", {"T9": {}}),
         "task-family": ("task_intents", {"T9": {"other": "deep"}}),
-        "task-intent": ("task_intents", {"T9": {"first": "ultra"}}),
+        "task-intent": ("task_intents", {"T9": {"first": "beyond"}}),
     }
     if case == "shape":
         policy = []
