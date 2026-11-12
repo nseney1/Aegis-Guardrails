@@ -1204,17 +1204,28 @@ def owned_pids(session, host="codex-cli", projection=None):
 
 
 @LINUX_HOST_PROGRAMS
-def test_stop_spares_a_caller_that_names_the_session(launch):
+@pytest.mark.parametrize("observe_after_stop", [False, True], ids=["concurrent", "completed"])
+def test_stop_spares_a_caller_that_names_the_session(launch, observe_after_stop):
     session = launch.start()["session"]
     from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case
 
     context = R2Case(launch)
-    hung = context.spawn(["codex", "exec", "--json", "resume", session])
-    wait_until(lambda: owned_pids(session, projection=context.projection) == [hung.pid])
-    caller, _ = context.runner(session=session, echo_exit=True,
-                               stop_words=("stop", "--endpoint", REVIEW, "--grace-seconds", "2"))
     try:
-        wait_until(lambda: hung.pid in owned_pids(session, projection=context.projection))
+        hung = context.spawn(["codex", "exec", "--json", "resume", session])
+        wait_until(lambda: owned_pids(session, projection=context.projection) == [hung.pid])
+
+        def before_stop(caller, runner):
+            assert owned_pids(session, projection=context.projection) == sorted([hung.pid, caller.pid])
+
+        caller, _ = context.runner(session=session, echo_exit=True, before_stop=before_stop,
+                                   stop_words=("stop", "--endpoint", REVIEW, "--grace-seconds", "2"))
+        if observe_after_stop:
+            # Exercise a scheduler that completes stop before the test observes its result.
+            # Reap our own child while the runner independently proves its physical exit.
+            def completed():
+                hung.poll()
+                return caller.poll() is not None
+            wait_until(completed, seconds=R2_STOP_TIMEOUT_SECONDS)
         out, err = caller.communicate(timeout=R2_STOP_TIMEOUT_SECONDS)
         assert caller.returncode == 0 and err == "", out + err
         answer, last = out.splitlines()
