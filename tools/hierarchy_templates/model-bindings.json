@@ -61,11 +61,11 @@
         "ultra": null
       },
       "admission": {
-        "light": "unprobed",
-        "standard": "unprobed",
-        "deep": "unprobed",
-        "extended": "unprobed",
-        "max": "unprobed",
+        "light": "admitted",
+        "standard": "admitted",
+        "deep": "admitted",
+        "extended": "admitted",
+        "max": "admitted",
         "ultra": "unprobed"
       }
     },
@@ -145,11 +145,11 @@
         "ultra": null
       },
       "admission": {
-        "light": "unprobed",
-        "standard": "unprobed",
-        "deep": "unprobed",
-        "extended": "unprobed",
-        "max": "unprobed",
+        "light": "admitted",
+        "standard": "admitted",
+        "deep": "admitted",
+        "extended": "admitted",
+        "max": "admitted",
         "ultra": "unprobed"
       }
     },
