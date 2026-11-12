@@ -651,7 +651,7 @@ class TestSarifLineCache:
         assert len(artifact_reads) == 2
 
     def test_byte_budget_batches_interleaved_artifacts_without_rereading(self, tmp_path, artifact_reads, monkeypatch):
-        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 2048, raising=False)
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 2048)
         for name in ("a", "b"):
             (tmp_path / name).write_bytes(name.encode() * 1000 + b"\n")
         report = scanners.ingest_sarif(self.document(("a", 1), ("b", 1), ("b", 1), ("a", 1)),
@@ -663,7 +663,7 @@ class TestSarifLineCache:
                                       "x" * 65535 + "\r\n" + "\u00e9" * 65537 + "\u2029final"],
                              ids=["crlf-and-vertical-tab", "unicode-separators", "chunk-boundaries"])
     def test_over_budget_sources_keep_splitlines_and_fingerprints(self, tmp_path, artifact_reads, monkeypatch, text):
-        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 1024, raising=False)
+        monkeypatch.setattr(scanners, "_SARIF_LINE_CACHE_BYTES", 1024)
         (tmp_path / "a").write_bytes(text.encode())
         lines = text.splitlines()
         numbers = [1, len(lines) - 1, len(lines), len(lines) + 1]
@@ -883,7 +883,7 @@ class TestSarifLineCache:
             return fd
 
         monkeypatch.setattr(scanners, "_sarif_descriptor_reads_supported", lambda: False)
-        monkeypatch.setattr(scanners, "atomicio", SimpleNamespace(open_regular=changed), raising=False)
+        monkeypatch.setattr(scanners, "atomicio", SimpleNamespace(open_regular=changed))
         report = scanners.ingest_sarif(_sarif_for("sub/a"), workspace_root=tmp_path)
         assert report["findings"][0].snippet == "reported message"
         assert len(opened) == 1
