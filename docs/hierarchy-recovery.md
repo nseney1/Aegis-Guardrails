@@ -364,21 +364,47 @@ All rows above make `run-open` exit 3, including `execution_custody_unknown`.
   Every entry point uses this verifier: existing jobs, closed-job reconciliation,
   competing attempts, refusal losers, lost publication races, successful publication,
   and released peer grants. Once verified, the fence remains historical evidence even if the
-  path later disappears. An unverified candidate observed absent before this
+  path later disappears. Without retained result evidence, recorded uncertainty makes custody unknown;
+  the historical claim supplies preservation guidance, never permission to execute.
+  An unverified candidate observed absent before this
   attempt crosses the execution boundary permits pre-fence repair guidance;
   uncertain custody instead preserves the candidate and reservation and requires
-  custody to be established before execution retry.
-  Regular-result observation is a separate fact: every settlement-entry check
-  records it immediately, independently of earlier failed observations. Malformed
+  custody to be established before execution retry. An observed execution candidate
+  remains uncertain if it disappears before verification. Failed initial directory
+  classification never verifies a staging claim as an execution fence through a
+  fallback read.
+  Result observations accumulate on the Job for the whole attempt, from its first
+  probe through settlement. `observe_result` is the sole writer of its result
+  observations; the same accumulator retains observed admission and execution nodes.
+  `result_decision` is the shared settlement/custody decision. A later absent probe
+  never clears a regular, nonregular or uncertain observation. Regular-result
+  classification is retained before descriptor cleanup, so a close failure cannot
+  erase it. A job directory disappearing after an admission or execution observation
+  retains unknown custody, just as disappearance of an individual marker does.
+  Claim creation also refuses to recreate a directory after this attempt observed
+  a peer claim there; disappearance cannot authorize another execution.
+  Regular-result
+  observation is a separate fact, recorded independently of earlier failed observations. Malformed
   or subsequently missing results retain that fact and require preservation of the
   observed result and reservation, terminal validation, and no repeated execution.
+  Once admission or an execution candidate has been observed, later absence cannot
+  select the staging claim as an execution fence, including after `AdmissionHeld`.
+  This includes the first `metadata_kind` probe when a peer publishes admission
+  after the initial directory inspection. An invalid admission cannot become a
+  pre-execution retry merely because its content failed validation.
+  A retained execution candidate also prevents publishing another execution claim.
   A result does not certify an execution claim. Only a verified claim permits
   original-fence and stopped-process instructions.
   Successful derivation admission records no execution fence until a separate
   execution claim is verified. Its uncertainty flag clears immediately when the
   saved admission validates, before independent source, lease, or execution checks;
   this does not erase any separately observed execution evidence. An unvalidated
-  admission marker remains uncertain. A refusal receipt cannot turn an observed
+  admission marker remains uncertain, including a nonregular or unreadable marker.
+  Its live staging runner still reports running; a stopped or unverified staging
+  runner reports unknown custody without publishing an unknown receipt or treating
+  its staging claim as an execution fence. Only a bounded descriptor-based read
+  yielding a positive integer supplies its process-group diagnostic; failures leave
+  that diagnostic unknown. A refusal receipt cannot turn an observed
   execution claim or result into unstarted work.
   A retained validated terminal result requires retrying settlement without
   repeating execution; live or unknown custody retains its preservation guidance.
@@ -387,9 +413,12 @@ All rows above make `run-open` exit 3, including `execution_custody_unknown`.
   Legacy parser refusal codes and error bytes also remain unchanged; the shared
   verifier still records uncertain custody for those failed reads.
   A dangling result remains absent for legacy settlement, dependency and recovery
-  reporting. Legacy result reads retain the original OS error, including failures
-  after the initial existence check; descriptor-relative reads report the same
-  full result path as the original diagnostic.
+  reporting. Legacy result reads retain the original OS error for result-node
+  failures after the initial existence check. Result-node and directory-component
+  OS errors carrying a filename retain their original type and errno and name the
+  full result path. A non-directory job component reports ENOTDIR with that path.
+  Descriptor read, fstat and close errors without a filename keep their original
+  filename-free diagnostic.
   Planned ownership and legacy serialization use separate owner views. Planned
   reconciliation retains every considered owner. No-plan grant reporting selects
   its owner from the current scheduling candidates, as before; reservation and
@@ -443,12 +472,26 @@ does not make the loser its execution owner or authorize a second execution.
 Closed-job reconciliation, publication losers and existing jobs in planned
 initiatives select settlement only after observing a regular or nonregular result
 node. An observed directory, FIFO or symlink, or an observed regular result that
-cannot be read, therefore retains its settlement error. An unresolved directory
-or result probe is uncertain custody;
+cannot be read, therefore retains its settlement error. The first observed node
+still selects settlement if a later probe cannot observe it; a missing terminal
+result is refused with `job has no validated terminal result` without repeating
+execution. This also covers observations made by a losing claim, a released-peer-grant
+entry or the execution-publication check before reconciliation begins. Execution
+entry refuses to publish another claim after retained result evidence.
+An unresolved result probe followed by absence reports abandoned with
+execution_custody_unknown for existing jobs, publication losers, refusal losers,
+released peer grants and closed-job reconciliation. A subsequently validated terminal
+result selects settlement. Admission and execution entry
+points also refuse recorded metadata uncertainty. A final unresolved directory
+or result probe with no observed result node is uncertain custody;
 it reports abandoned with execution_custody_unknown, without attempting settlement
 or giving retry guidance. An observed result does not verify an execution claim.
 Recovery inspection remains read-only and reports invalid retained results as
-evidence errors.
+evidence errors. Validated terminal results still permit independent verification
+that their runner stopped, as required by dependency admission. Resolve and recovery
+reporting consume retained result observations themselves: a result appearing during
+a liveness check is preserved and refused without replacing it or reporting it as
+unstarted work.
 
 When the job budget is exhausted, remaining ready jobs report `job_limit` before
 any further kind grant snapshots, replays or grants. Ready heavy jobs still enter

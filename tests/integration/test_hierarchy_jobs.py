@@ -7607,10 +7607,15 @@ def test_jobs2_argon0057_closed_job_retains_observed_execution_evidence(
     originals = []
     if evidence in ("malformed-result", "result-vanishes"):
         blocked = {"job": "pilot/job-0", "state": "settle_pending",
-                   "error": "'NoneType' object is not subscriptable" if evidence == "result-vanishes" else "invalid job result schema"}
+                   "error": ("job has no validated terminal result" if planned else "'NoneType' object is not subscriptable")
+                   if evidence == "result-vanishes" else "invalid job result schema"}
         if planned:
             blocked["next_action"] = JOBS2_BLOCKED_ACTION
         originals.append(blocked)
+    if planned and evidence == "unsupported-observation":
+        originals.append({"job": "pilot/job-0", "state": "abandoned", "process_group": None,
+                          "process_alive": None, "reason": "execution_custody_unknown",
+                          "next_action": JOBS2_UNVERIFIED_ACTION})
     reserve = {"state": "granted_elsewhere", "kind": kind, "request_id": old,
                "holder": "job:pilot/job-0", "next_action": JOBS2_RESERVATION_ACTION}
     pending = {"job": "pilot/job-1", "state": "waiting", "kind": kind}
@@ -7793,7 +7798,8 @@ def test_jobs2_argon0057_unvalidated_admission_marker_is_not_unstarted_work(kind
             retained.rename(store)
     assert acknowledged == [True] and swapped == [True]
     original, diagnostic = [row for row in report["rows"] if row.get("job") == "pilot/job-0"]
-    assert original["state"] == diagnostic["state"] == "settle_pending"
+    assert original == jobs2_2m_unknown_report("job-0", JOBS2_UNVERIFIED_ACTION)["rows"][0]
+    assert diagnostic["state"] == "settle_pending"
     assert diagnostic["next_action"] == JOBS2_UNVERIFIED_ACTION
     assert not (folder / "result.json").exists() and not (folder / "execution.json").exists()
 
@@ -8602,7 +8608,8 @@ def jobs2_2l_expected_result_row(shop, entry, node, planned, identifier, claim):
         return row
     row = {"job": "pilot/" + identifier, "state": "settle_pending", "error": error}
     if planned:
-        row["next_action"] = JOBS2_2L_RETRY
+        row["next_action"] = (JOBS2_OBSERVED_RESULT_ACTION if node == "unreadable"
+                              else JOBS2_2L_RETRY)
     return row
 
 
@@ -8681,10 +8688,12 @@ def test_jobs2_2l_argon2_publication_loser_settles_retained_result(kind_shop, ca
         with jobs2_patch.object(jobs2_module, "run_job", run_job):
             assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
+        action = JOBS2_OBSERVED_RESULT_ACTION if node == "unreadable" else JOBS2_2L_RETRY
         assert report == {"rows": [{"job": "pilot/job-1", "state": "settle_pending",
-                                    "error": JOBS2_2L_RESULT_ERROR, "next_action": JOBS2_2L_RETRY}]}
+                                    "error": JOBS2_2L_RESULT_ERROR, "next_action": action}]}
         assert len(peers) == len(losers) == 1
-        assert losers[0].recorded_execution_fence() is True
+        assert losers[0].recorded_execution_fence() is None
+        assert losers[0].fence_observations["execution.json"].state == jobs2_module.FENCE_VERIFIED
         assert losers[0].settlement_attempted and not losers[0].execution_owned
         assert (folder / "execution.json").read_bytes() == peers[0][0]
         assert shop.head() == peers[0][2] and (shop.checkout / ".git/index").read_bytes() == peers[0][3]
@@ -8846,7 +8855,8 @@ def test_jobs2_2m_publication_loser_distinguishes_uncertainty_from_an_observed_n
             assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
         assert len(captured) == len(peers) == 1
-        assert captured[0].recorded_execution_fence() is True, "retain the peer's historical verified fence"
+        assert captured[0].recorded_execution_fence() is None
+        assert captured[0].fence_observations["execution.json"].state == jobs2_module.FENCE_VERIFIED
         assert captured[0].execution_owned is False
         if fault == "symlink":
             assert changed == [True]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+from functools import partial
 import json
 import sys
 import time
@@ -186,7 +187,10 @@ class ModelErrorPolicy:
     def __init__(self, fallback=None, *, argv=()):
         self.fallback = fallback
         self.payload = None
+        self.queue_payload = None
         self.model_ready = False
+        # Preserve the raw-token policy until a successful parse establishes
+        # that model is queue data rather than a model-policy invocation.
         self.model_invocation = False
         seen_team = False
         for token in argv:
@@ -209,6 +213,9 @@ class ModelErrorPolicy:
                 code = self.output({"error": "invalid_model_arguments"})
             except (KeyboardInterrupt, Exception):
                 code = self.operation_error()
+        if self.queue_payload is not None:
+            _emit(self.queue_payload)
+            return code
         payload = self.payload
         if (payload is None or
                 (code == EXIT_OK and (not self.model_ready or "error" in payload)) or
@@ -216,6 +223,10 @@ class ModelErrorPolicy:
             payload, code = {"error": "invalid_model_arguments"}, EXIT_USAGE
         _emit(payload)
         return EXIT_OK if code == EXIT_OK else EXIT_USAGE
+
+    def queue_output(self, payload):
+        self.queue_payload = payload
+        return payload["exit_code"]
 
     def output(self, payload):
         if self.model_invocation:
@@ -243,6 +254,11 @@ class ModelErrorPolicy:
         try:
             args = self.fallback.parse(parser, argv) if self.fallback is not None else parser.parse_args(argv)
             if isinstance(args, int):
+                return args
+            if args.command == "team" and getattr(args, "team_action", None) == "queue":
+                self.model_invocation = False
+                self.model_errors = False
+                args._queue_output_policy = self
                 return args
             is_model = args.command == "team" and getattr(args, "team_action", None) == "model"
             if self.model_invocation and not is_model:
@@ -591,17 +607,185 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
             "lease": lease,
             "warnings": list(exc.warnings),
         })
+        if exc.next_action:
+            payload["next_action"] = exc.next_action
         _emit(payload)
         return EXIT_REFUSED
     _warn(list(exc.warnings))
     print(sanitize_display(str(exc), max_len=None), file=sys.stderr)
+    if exc.next_action:
+        print(sanitize_display(exc.next_action, max_len=None), file=sys.stderr)
     for line in _lease_lines(lease):
         print(line, file=sys.stderr)
     return EXIT_REFUSED
 
 
+def _queue_command(args):
+    """Thin adapter: core owns item parsing, scheduling, storage and refusals."""
+    from aegis_core import team_queue
+
+    verb = getattr(args, "queue_action", None)
+    root = args.ws.root if getattr(args, "ws", None) is not None else getattr(args, "workspace", None)
+    if verb == "add":
+        parsed = team_queue.parse_item(args.item)
+        result = (team_queue.refusal("invalid_item", verb=verb) if parsed["refused"]
+                  else team_queue.add(root, parsed["item"]))
+    elif verb == "list":
+        result = team_queue.list(root, capabilities=args.capabilities)
+    elif verb == "audit":
+        result = team_queue.audit(root)
+    elif verb == "claim":
+        result = team_queue.claim(root, args.item_id, expect=args.expect, lane=args.lane,
+                                  capabilities=args.capabilities or [], ttl_s=args.ttl)
+    elif verb in ("release", "done"):
+        result = getattr(team_queue, verb)(root, args.item_id, expect=args.expect, lane=args.lane)
+    else:
+        result = team_queue.refusal("invalid_arguments")
+    return _queue_output(args, result)
+
+
+def _queue_privacy_scoped(argv):
+    """Conservatively cover team followed by queue anywhere in argv.
+
+    Options, their values and -- deliberately receive no interpretation.
+    Only argparse's successful namespace can establish a policy exemption.
+    """
+    seen_team = False
+    for token in argv:
+        if seen_team and token == "queue":
+            return True
+        if token == "team":
+            seen_team = True
+    return False
+
+
+def _queue_removed_pointer(original, argv, lookup):
+    # Let the scoped parser own refusals before any removed-command shortcut
+    # can print a different diagnostic or bypass the queue envelope.
+    return None if _queue_privacy_scoped(argv) else original(argv, lookup)
+
+
+def _parse_queue_or_default(original, parser, argv, *, output=None):
+    if not _queue_privacy_scoped(argv):
+        return original(parser, argv)
+    from aegis_core import team_queue
+    from aegis_cli.msg import MsgArgumentError
+
+    # Own the complete parse, including both ancestors. Diagnostics are
+    # suppressed before argparse can echo an untrusted option or value.
+    try:
+        with redirect_stderr(_SilentModelOutput()):
+            args = parser.parse_args(argv)
+            raw = args.workspace
+            if raw is not None and not team_queue.valid_workspace_spelling(raw):
+                raise ModelArgumentError()
+            return args
+    except SystemExit as error:
+        if error.code == 0:
+            return EXIT_OK
+    except (ModelArgumentError, MsgArgumentError):
+        pass
+    result = team_queue.refusal("invalid_arguments")
+    if output is not None:
+        return output(result)
+    _emit(result)
+    return result["exit_code"]
+
+
+def _configure_queue_parser(sub, common, parent):
+    """Scope non-echoing parser/workspace errors to this new command only."""
+    from aegis_core import team_queue
+
+    # The shared policy is invocation-local. Wrapping its parse boundary also
+    # covers errors raised before argparse reaches the queue child parser.
+    policy = getattr(parent, "_error_policy", None)
+    if policy is not None:
+        # Model policy must still validate the successful namespace. Wrap its
+        # underlying parser boundary, rather than bypassing that validation.
+        target = policy.fallback if isinstance(policy, ModelErrorPolicy) else policy
+        output = policy.queue_output if isinstance(policy, ModelErrorPolicy) else None
+        target.parse = partial(_parse_queue_or_default, target.parse, output=output)
+        target.removed_pointer = partial(_queue_removed_pointer, target.removed_pointer)
+
+    class QueueParser(type(parent)):
+        def error(self, message):
+            if getattr(self, "_error_policy", None) is not None:
+                raise ModelArgumentError()
+            _emit(team_queue.refusal("invalid_arguments"))
+            self.exit(EXIT_USAGE)
+
+        def parse_known_args(self, args=None, namespace=None):
+            values, extras = super().parse_known_args(args, namespace)
+            if extras:
+                self.error("")
+            raw = getattr(values, "workspace", None)
+            if raw is not None and not team_queue.valid_workspace_spelling(raw):
+                self.error("")
+            # Each invocation owns this policy instance. Preserve the shared
+            # resolver while replacing its input-reflecting diagnostic only
+            # after the parser has selected queue.
+            policy = getattr(self, "_error_policy", None)
+            if policy is not None:
+                policy.workspace_error = _queue_workspace_error
+            return values, extras
+
+    class Capabilities(argparse.Action):
+        def __call__(self, parser, namespace, value, option_string=None):
+            previous = getattr(namespace, self.dest, None) or []
+            if len(previous) >= 128 or len(value) > 64:
+                parser.error("")
+            setattr(namespace, self.dest, previous + [value])
+
+    factory = sub._parser_class
+    keywords = {"error_policy": parent._error_policy} if hasattr(parent, "_error_policy") else {}
+    sub._parser_class = partial(QueueParser, **keywords)
+    try:
+        parser = sub.add_parser("queue", parents=[common], help="Manage queued team work with CAS leases",
+                                description="Queue add, list, claim, release, done and audit; all results are JSON.",
+                                allow_abbrev=False)
+    finally:
+        sub._parser_class = factory
+    verbs = parser.add_subparsers(dest="queue_action", metavar="VERB")
+    add = verbs.add_parser("add", parents=[common], help="Enqueue a bounded inline JSON item", allow_abbrev=False)
+    add.add_argument("--item", required=True, metavar="JSON", help="Queue item object; no file paths are opened")
+    view = verbs.add_parser("list", parents=[common], help="List items, blockers and lane labels", allow_abbrev=False)
+    view.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
+                      help="Filter by a team capability label; repeat for each label")
+    claim = verbs.add_parser("claim", parents=[common], help="Claim a current item revision with a lease", allow_abbrev=False)
+    claim.add_argument("item_id", metavar="ITEM", help="Stable queue item id")
+    claim.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by add or list")
+    claim.add_argument("--lane", required=True, help="Lane declared in .aegis/team.json")
+    claim.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
+                       help="Team capability label; repeat for each label")
+    claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS", help="Claim lifetime, at most one day")
+    for verb in ("release", "done"):
+        action = verbs.add_parser(verb, parents=[common], help="Release a claim" if verb == "release" else "Complete a live claim",
+                                  allow_abbrev=False)
+        action.add_argument("item_id", metavar="ITEM", help="Stable queue item id")
+        action.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by claim or list")
+        action.add_argument("--lane", default=None, help="Current claim lane; required for a live claim")
+    verbs.add_parser("audit", parents=[common], help="Report held work needing a decision", allow_abbrev=False)
+
+
+def _queue_workspace_error(args, error):
+    from aegis_core import team_queue
+
+    result = team_queue.refusal("queue_io_unavailable", verb=getattr(args, "queue_action", "usage"))
+    return _queue_output(args, result)
+
+
+def _queue_output(args, result):
+    policy = getattr(args, "_queue_output_policy", None)
+    if policy is not None:
+        return policy.queue_output(result)
+    _emit(result)
+    return result["exit_code"]
+
+
 def run_team(args: argparse.Namespace) -> int:
     action = getattr(args, "team_action", None)
+    if action == "queue":
+        return _queue_command(args)
     if action == "model":
         values = {key: getattr(args, key) for key in MODEL_REQUIRED + MODEL_OPTIONAL}
         root = args.ws.root if getattr(args, "ws", None) is not None else args.workspace
@@ -679,6 +863,7 @@ class TeamCommand(AegisCommand):
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, help="Target workspace root")
         sub = parser.add_subparsers(dest="team_action", metavar="ACTION")
         _configure_model_parser(sub, common)
+        _configure_queue_parser(sub, common, parser)
         config = sub.add_parser("config", parents=[common], help="Inspect or initialize a layered team profile")
         config_sub = config.add_subparsers(dest="config_action")
         config_sub.add_parser("show", parents=[common], help="Show every resolved value and its layer")
