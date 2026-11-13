@@ -628,15 +628,15 @@ def _queue_command(args):
     root = args.ws.root if getattr(args, "ws", None) is not None else getattr(args, "workspace", None)
     if verb == "add":
         parsed = team_queue.parse_item(args.item)
-        result = (team_queue.refusal("invalid_item", verb=verb) if parsed["refused"]
+        result = (team_queue.refusal(parsed["reason"], verb=verb) if parsed["refused"]
                   else team_queue.add(root, parsed["item"]))
     elif verb == "list":
-        result = team_queue.list(root, capabilities=args.capabilities)
-    elif verb == "audit":
-        result = team_queue.audit(root)
+        result = team_queue.list(root, capabilities=args.capabilities, include_done=args.include_done)
+    elif verb in ("audit", "compact"):
+        result = getattr(team_queue, verb)(root)
     elif verb == "claim":
         result = team_queue.claim(root, args.item_id, expect=args.expect, lane=args.lane,
-                                  capabilities=args.capabilities or [], ttl_s=args.ttl)
+                                  capabilities=args.capabilities or [], ttl_s=args.ttl, branch=args.branch)
     elif verb in ("release", "done"):
         result = getattr(team_queue, verb)(root, args.item_id, expect=args.expect, lane=args.lane)
     else:
@@ -741,7 +741,7 @@ def _configure_queue_parser(sub, common, parent):
     sub._parser_class = partial(QueueParser, **keywords)
     try:
         parser = sub.add_parser("queue", parents=[common], help="Manage queued team work with CAS leases",
-                                description="Queue add, list, claim, release, done and audit; all results are JSON.",
+                                description="Queue add, list, claim, release, done, audit and compact; all results are JSON.",
                                 allow_abbrev=False)
     finally:
         sub._parser_class = factory
@@ -751,10 +751,12 @@ def _configure_queue_parser(sub, common, parent):
     view = verbs.add_parser("list", parents=[common], help="List items, blockers and lane labels", allow_abbrev=False)
     view.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
                       help="Filter by a team capability label; repeat for each label")
+    view.add_argument("--include-done", action="store_true", help="Include completed items hidden by default")
     claim = verbs.add_parser("claim", parents=[common], help="Claim a current item revision with a lease", allow_abbrev=False)
     claim.add_argument("item_id", metavar="ITEM", help="Stable queue item id")
     claim.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by add or list")
     claim.add_argument("--lane", required=True, help="Lane declared in .aegis/team.json")
+    claim.add_argument("--branch", default=None, help="Lane's local branch; omitted means unknown branch evidence")
     claim.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
                        help="Team capability label; repeat for each label")
     claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS", help="Claim lifetime, at most one day")
@@ -765,6 +767,7 @@ def _configure_queue_parser(sub, common, parent):
         action.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by claim or list")
         action.add_argument("--lane", default=None, help="Current claim lane; required for a live claim")
     verbs.add_parser("audit", parents=[common], help="Report held work needing a decision", allow_abbrev=False)
+    verbs.add_parser("compact", parents=[common], help="Remove completed items not needed by unfinished dependencies", allow_abbrev=False)
 
 
 def _queue_workspace_error(args, error):

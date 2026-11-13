@@ -136,7 +136,7 @@ def _expected_facts(channel, value):
     result += " json=" + types[type(decoded)]
     if isinstance(decoded, dict):
         expected = {"aegis_capture_insight", "aegis_create_rule", "aegis_list_rules", "aegis_msg_read", "aegis_msg_write",
-            "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model",
+            "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model", "aegis_team_queue",
             "result", "error", "tools", "name", "content", "text", "rules", "_name", "schema", "lanes", "check",
             "status", "tip", "hosts", "source", "dry_run", "aegis_version", "checked_at", "scope", "actions",
             "rule", "type", "triggers", "tp", "fp", "score"}
@@ -156,14 +156,16 @@ def _expected_identifier(value, expected, label=None, schema=False):
 
 
 @pytest.mark.parametrize("change", ["same", "missing", "unexpected", "substituted", "duplicate",
-    "non-dict", "nameless", "non-string", "whitespace-name", "zero-width-name", "fullwidth-name", "empty-name", "long-name"])
+    "non-dict", "nameless", "non-string", "whitespace-name", "zero-width-name", "fullwidth-name", "empty-name", "long-name",
+    "queue-duplicate", "queue-fact-key"])
 def test_wheel_smoke_checks_mcp_names(wheel_smoke, monkeypatch, tmp_path, capsys, change):
     from aegis_mcp.registry import TOOL_DEFINITIONS
 
     names = sorted(tool["name"] for tool in TOOL_DEFINITIONS)
     missing = [names.pop()] if change in ("missing", "substituted") else []
     unexpected = ["aegis_unexpected"] if change in ("unexpected", "substituted") else []
-    duplicates = ["aegis_scan"] if change == "duplicate" else []
+    duplicates = (["aegis_scan"] if change == "duplicate" else
+                  ["aegis_team_queue"] if change == "queue-duplicate" else [])
     tools = [{"name": name} for name in reversed(names + unexpected)] + [{"name": name} for name in duplicates]
     invalid = {"non-dict": None, "nameless": {}, "non-string": {"name": 7}}
     invalid_names = {"whitespace-name": "aegis_scan ", "zero-width-name": "aegis_scan\u200b",
@@ -172,7 +174,9 @@ def test_wheel_smoke_checks_mcp_names(wheel_smoke, monkeypatch, tmp_path, capsys
         tools.append(invalid[change])
     if change in invalid_names:
         tools.append({"name": invalid_names[change]})
-    frames = [{}, {"result": {"tools": tools}},
+    queue_error = {"aegis_team_queue": "private-value", "private-field": "private-value"}
+    frame = {"error": queue_error} if change == "queue-fact-key" else {"result": {"tools": tools}}
+    frames = [{}, frame,
               {"result": {"content": [{"text": json.dumps({"rules": [{"_name": "trap-smoke"}]})}]}}]
     proc = subprocess.CompletedProcess([], 0, "\n".join(map(json.dumps, frames)), "")
     monkeypatch.setattr(wheel_smoke, "subprocess", SimpleNamespace(run=lambda *a, **kw: proc))
@@ -183,7 +187,10 @@ def test_wheel_smoke_checks_mcp_names(wheel_smoke, monkeypatch, tmp_path, capsys
     with pytest.raises(SystemExit) as error:
         wheel_smoke.check_mcp(str(tmp_path))
     assert error.value.code == 1
-    if change in invalid:
+    if change == "queue-fact-key":
+        reason = ("returned no result: " + _expected_facts("error", queue_error) +
+                  "; " + _expected_facts("stderr", proc.stderr))
+    elif change in invalid:
         reason = f"invalid tool entry at index {len(names)}: expected a dict with a string name"
     elif change in invalid_names:
         actual = invalid_names[change]
@@ -200,7 +207,14 @@ def test_wheel_smoke_checks_mcp_names(wheel_smoke, monkeypatch, tmp_path, capsys
                 rows.append(_expected_identifier(actual, expected))
             return f"count={len(values)} [" + "; ".join(rows) + "]"
         reason = f"tools mismatch: missing={missing!r}, unexpected={identifiers(unexpected)}, duplicates={identifiers(duplicates)}"
-    assert capsys.readouterr().err == f"wheel smoke FAILED: MCP tools/list {reason}\n"
+    captured = capsys.readouterr()
+    assert captured.err == f"wheel smoke FAILED: MCP tools/list {reason}\n"
+    if change in ("queue-duplicate", "queue-fact-key"):
+        assert captured.out == ""
+        assert "private-value" not in captured.err and "private-field" not in captured.err
+        assert all(FACT_LINE.fullmatch(line) for line in captured.err.splitlines())
+        if change == "queue-fact-key":
+            assert "known-keys=[aegis_team_queue]" in captured.err
 
 
 @pytest.mark.parametrize("response", ["error", "no-result", "null-result", "bad-json", "wrong-tools"])
@@ -448,7 +462,8 @@ stdout-json non-json mapping scalar json-key identifier rule-name dry-run seeded
 """.split()
 _EXPECTED_FACT_WORDS = ("aegis.team.claim/v1", "aegis.team.status/v1", "aegis.doctor/v1", "aegis init", "ok", "pass",
     "aegis_capture_insight", "aegis_create_rule", "aegis_list_rules", "aegis_msg_read", "aegis_msg_write",
-    "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model", "[A-Za-z0-9_.-]{1,128}", "True", "False")
+    "aegis_report_outcome", "aegis_scan", "aegis_team_config", "aegis_team_model", "aegis_team_queue",
+    "[A-Za-z0-9_.-]{1,128}", "True", "False")
 _FACT_TOKEN = "(?:" + "|".join(re.escape(word) for word in sorted(set(_FACT_WORDS + list(_EXPECTED_FACT_WORDS)), key=len, reverse=True)) + r"|[0-9a-f]{12}|[0-9]+|aegis(?:\.[a-z]{1,24}){1,4}/v[0-9]{1,3})"
 FACT_LINE = re.compile(_FACT_TOKEN + r"(?:[ ,;:=\[\]'().-]+" + _FACT_TOKEN + r")*[ ,;:=\[\]'().-]*", re.ASCII)
 

@@ -11,6 +11,7 @@ from tests.contract.test_process_ratchets import module_trees, ScopedNames, impo
 
 REPO = Path(__file__).resolve().parents[2]
 PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1,
+ 'aegis_core/team_queue.py:aegis_core.team._check_branch': 1,
  'aegis_cli/check.py:aegis_cli.verify._resolve_git_cwd': 2,
  'aegis_cli/check.py:aegis_cli.verify._wants_json': 1,
  'aegis_cli/doctor.py:aegis_cli.doctor_base._Ctx': 1,

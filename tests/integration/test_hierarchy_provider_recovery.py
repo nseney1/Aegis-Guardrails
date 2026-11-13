@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tests.integration.test_hierarchy_lifecycle import Ledger, request
+from tests.integration.test_hierarchy_jobs import kind_shop as kind_shop
 from tests.integration.test_hierarchy_workspace import Workspace
 
 
@@ -306,3 +307,149 @@ def test_cli_provider_reference_error_is_exact_json_and_no_effect(ledger):
     assert proc.returncode == 2 and proc.stderr == ""
     assert json.loads(proc.stdout) == {"error": "canonical request sha256 mismatch"}
     assert ledger.files() == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
+@pytest.mark.parametrize("terminal", ["completed", "failed", None], ids=["finished", "failed", "unsettled"])
+@pytest.mark.parametrize("recipes", ["match", "mismatch", "absent"])
+@pytest.mark.parametrize("surface", ["api", "cli-before", "cli-after"])
+def test_planned_job_recipe_matrix(kind_shop, capsys, terminal, recipes, surface):
+    from tests.integration.test_hierarchy_jobs_followups import (ADMISSION_UNVERIFIED_ACTION,
+                                                                recovery_admission_case)
+
+    shop = kind_shop
+    folder = recovery_admission_case(shop, terminal)
+    if recipes == "mismatch":
+        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+        shop.save_recipes()
+    trusted = None if recipes == "absent" else shop.recipes_path
+    candidate = module()
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    if surface == "api":
+        status = (candidate.job_status(shop.workspace.store, "pilot/job-1") if trusted is None else
+                  candidate.job_status(shop.workspace.store, "pilot/job-1", recipes_path=trusted))
+    else:
+        recipe_args = [] if trusted is None else ["--recipes", str(trusted)]
+        argv = ["--store", str(shop.workspace.store)]
+        argv += (recipe_args + ["job", "--job", "pilot/job-1"] if surface == "cli-before" else
+                 ["job", "--job", "pilot/job-1"] + recipe_args)
+        assert candidate.main(argv) == 0
+        status = json.loads(capsys.readouterr().out)
+    row = status["projection"]
+    expected = "finished" if terminal else {"match": "admitted", "mismatch": "evidence_error",
+                                            "absent": "admission_unverified"}[recipes]
+    assert row["state"] == expected, row
+    assert status["read_only"] is True and status["payload_effect"] == "unknown"
+    if terminal:
+        assert row["result"]["state"] == terminal and row["receipt"] == "match"
+        assert "error" not in row
+    elif recipes == "absent":
+        assert row["source"] == {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                                 "recipe_bytes_unavailable": True}
+        assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+        assert "error" not in row and "detail" not in row
+    elif recipes == "mismatch":
+        assert row["error"] == row["detail"] == "recipes changed after admission"
+    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
+@pytest.mark.parametrize("custody", ["reservation", "live-runner"])
+@pytest.mark.parametrize("recipes", ["absent", "match", "mismatch"])
+@pytest.mark.parametrize("surface", ["api", "cli"])
+def test_unsettled_provider_projection_agrees_with_blocking_inventory(kind_shop, capsys, custody, recipes, surface):
+    from tests.integration.test_hierarchy_jobs_followups import (ADMISSION_UNVERIFIED_ACTION,
+                                                                unsettled_recovery_obligation)
+
+    shop = kind_shop
+    unsettled_recovery_obligation(shop, custody)
+    if recipes == "mismatch":
+        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+        shop.save_recipes()
+    trusted = None if recipes == "absent" else shop.recipes_path
+    candidate = module()
+    code, inventory = candidate.recovery_status(shop.workspace.store, recipes_path=trusted)
+    assert code == 3
+    if surface == "api":
+        status = candidate.job_status(shop.workspace.store, "pilot/job-1", recipes_path=trusted)
+    else:
+        args = [] if trusted is None else ["--recipes", str(trusted)]
+        assert candidate.main(["--store", str(shop.workspace.store), "job", "--job", "pilot/job-1", *args]) == 0
+        status = json.loads(capsys.readouterr().out)
+    row = next(row for row in inventory["jobs"] if row["job"] == "pilot/job-1")
+    assert status["projection"] == row
+    expected = {"absent": "admission_unverified", "match": "admitted", "mismatch": "evidence_error"}[recipes]
+    assert row["state"] == expected
+    blocker = next(blocker for blocker in inventory["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == expected
+    if recipes == "absent":
+        assert blocker["next_action"] == row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+        assert row["source"]["recipe_bytes_unavailable"] is True
+    assert row["runner_alive"] is (custody == "live-runner")
+    if custody == "reservation":
+        assert row["reservations"][0]["state"] == "granted"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
+def test_provider_missing_request_is_not_a_recipe_unavailable_projection(kind_shop):
+    from tests.integration.test_hierarchy_jobs_followups import recovery_admission_case
+
+    shop = kind_shop
+    recovery_admission_case(shop, None)
+    candidate = module()
+    record = candidate.Mailbox(shop.root).messages()["job-1"]
+    Path(record["path"]).rename(shop.tmp / "retained-original-request.md")
+    code, inventory = candidate.recovery_status(shop.workspace.store, recipes_path=shop.recipes_path)
+    assert code == 3
+    status = candidate.job_status(shop.workspace.store, "pilot/job-1", recipes_path=shop.recipes_path)
+    row = next(row for row in inventory["jobs"] if row["job"] == "pilot/job-1")
+    assert status["projection"] == row and row["state"] == "admitted"
+    assert row["source"] == {"state": "unavailable", "reason": "original mailbox request is unavailable"}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
+@pytest.mark.parametrize("surface", ["api", "cli"])
+def test_provider_reports_resolved_unbound_provenance_as_unavailable(kind_shop, capsys, surface):
+    from tests.integration.test_hierarchy_jobs_followups import jobs, orphaned_staging_case
+
+    shop = kind_shop
+    orphaned_staging_case(shop, "after-stage")
+    assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                               "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+    capsys.readouterr()
+    candidate = module()
+    code, inventory = candidate.recovery_status(shop.workspace.store)
+    assert code == 3
+    if surface == "api":
+        status = candidate.job_status(shop.workspace.store, "pilot/job-1")
+    else:
+        assert candidate.main(["--store", str(shop.workspace.store), "job", "--job", "pilot/job-1"]) == 0
+        status = json.loads(capsys.readouterr().out)
+    row = next(row for row in inventory["jobs"] if row["job"] == "pilot/job-1")
+    assert status["projection"] == row and row["state"] == "finished"
+    assert row["source"] == {"state": "unavailable", "reason": "derivation provenance unverified",
+                             "terminal_source_unverified": True}
+    assert row["reservations"][0]["state"] == "released"
+    blocker = next(blocker for blocker in inventory["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == "source_unavailable" and blocker["next_action"] == row["next_action"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="planned job evidence uses Linux /proc")
+@pytest.mark.parametrize("route", ["kill", "refusal"])
+def test_provider_missing_derivation_publication_stays_unavailable(kind_shop, capsys, route):
+    from tests.integration.test_hierarchy_jobs_followups import jobs, missing_derivation_publication_case
+
+    shop = kind_shop
+    missing_derivation_publication_case(shop, route)
+    if route == "kill":
+        assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                                   "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+        capsys.readouterr()
+    candidate = module()
+    code, inventory = candidate.recovery_status(shop.workspace.store)
+    assert code == 3
+    status = candidate.job_status(shop.workspace.store, "pilot/job-1")
+    row = next(row for row in inventory["jobs"] if row["job"] == "pilot/job-1")
+    assert status["projection"] == row and row["state"] == "finished" and row["receipt"] == "match"
+    assert row["source"]["terminal_source_unverified"] is True
+    assert next(blocker for blocker in inventory["blockers"] if blocker.get("job") == row["job"])["reason"] == "source_unavailable"

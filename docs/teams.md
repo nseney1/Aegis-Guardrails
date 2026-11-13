@@ -79,10 +79,12 @@ no-follow operations. Unsupported platforms return a structured refusal.
 ```sh
 aegis team queue add --item '{"id":"DOCS-1","title":"Update guide","paths":["docs/**"],"capabilities":["docs"]}' --json
 aegis team queue list --capability docs --json
-aegis team queue claim DOCS-1 --lane docs --capability docs --expect REVISION --ttl 3600 --json
+aegis team queue list --include-done --json
+aegis team queue claim DOCS-1 --lane docs --branch lane/docs --capability docs --expect REVISION --ttl 3600 --json
 aegis team queue release DOCS-1 --lane docs --expect CLAIM_REVISION --json
 aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
 aegis team queue audit --json
+aegis team queue compact --json
 ```
 
 Use the actual `revision` returned by add, list, claim or release in place of the
@@ -95,11 +97,30 @@ Each lane may hold one live queue claim; another claim refuses with `lane_busy`.
 Release and done accept `--lane`; live claims require their matching lane
 (`lane_required` or `lane_mismatch` otherwise). Lane labels are cooperative caller
 assertions, not authenticated identities or OS permissions.
+Pass the lane's branch explicitly with `claim --branch`; it can be a short local
+name or `refs/heads/` name. Queue claims never infer a lane branch from the shared
+workspace's HEAD. Omitted branches are recorded as unknown. Queue claims use the
+repository lease's branch-label predicate: 1 to 200 characters with no whitespace
+or control characters. Punctuation and non-ASCII characters are accepted. The
+optional `refs/heads/` prefix counts toward this input limit and is removed for
+new claim storage and audit comparison. Stored evidence, including older prefixed
+records, is kept verbatim and sanitized for display; unsupported values are
+reported per item instead of preventing queue operations.
+Other `refs/` prefixes, empty local names, nested ref prefixes and `HEAD` are
+refused. This validates a label, without requiring that branch to exist in the
+coordinator checkout.
 
 All queue results are JSON, with schema `aegis.team.queue.<verb>/v1`, including
 refusals. Exit codes are 0 done, 1 refused and 2 usage. Refusals contain `refused`,
 `reason` and `next_action`; parser failures use the `usage` verb. List and audit
-create no state or locks. MCP queue access is deferred to BL-16b.
+create no state or locks. The read-only MCP tool `aegis_team_queue` lists the same
+items, blockers and labels, with optional `capabilities` and `include_done` fields.
+Its schema admits no mutation verb. Successful payloads match the CLI; refusals
+retain the core envelope and add `error` with the fixed reason for MCP's `isError` flag.
+The MCP server validates the original closed client object before workspace
+binding or removal of reserved keys. Unknown keys (including `workspace` and
+`files`), malformed objects and invalid values refuse as `invalid_arguments`.
+Binding failures refuse as `queue_io_unavailable` without raw pin diagnostics.
 Any invocation containing `team` followed anywhere by `queue` in the whole argv
 uses the queue's non-echoing parser boundary, including words after `--`, option
 values and malformed commands. Removed-command shortcuts also defer to this
@@ -110,26 +131,53 @@ exempts queue data named `model` from the raw model-token policy. Workspace boun
 apply equally before `team`, between `team` and `queue`, and after `queue` or its verb.
 Empty workspace values, NUL bytes and `..` components refuse before workspace
 resolution, as do values exceeding the length or separator limits.
-CLI and core use one pure spelling check under both Windows and POSIX path rules,
-so drive-relative parents such as `C:..\ws` refuse on every OS.
+CLI and core use one bounded tokenizer independent of Python's Windows path parser.
+Parents separated by slash, backslash or colon refuse, including drive-relative,
+UNC server/share and device-prefix spellings, on every OS and supported Python version.
 
 Items require `id`, a single-line `title`, nonempty workspace-relative `paths`
 globs, and `capabilities`, a list of team labels. These labels are never host kinds.
 Optional fields are `after` (prerequisite item ids), `hold` (a judgment hold),
-`hold_until`, `scope_rulings` and `invariants` (lists of single-line text). Unknown
-fields, duplicate JSON keys, multiline values and malformed items refuse. Limits
+`hold_until`, `scope_rulings` and `invariants` (lists of single-line text), and
+`brief_paths` (up to 128 literal workspace-relative write paths from the brief).
+Brief paths cannot contain wildcards; this typed declaration never opens a brief
+file or parses arbitrary Markdown. Omitted declarations add no paths to the item's scope.
+Every declared brief path must match the item's `paths` at add time; otherwise
+`brief_outside_scope` refuses with exit 2 before storage is created. Correct the
+declaration and add again; an invalid immutable item never consumes a queue slot.
+Unknown fields, duplicate JSON keys, multiline values and malformed items refuse. Limits
 are 256 unfinished items, 128 entries per item list, 64 characters per id/label,
 256 per title/path, 4,096 per ruling/invariant/hold, and 1 MiB of queue state.
-Validated constraint text is returned in full. Completed rows remain in history
-without consuming the unfinished-item cap. The entire proposed serialized state
+Validated constraint text is returned in full. Completed rows are hidden by default;
+`list --include-done` includes them. They do not consume the unfinished-item cap.
+`compact` removes completed rows except prerequisites named by unfinished items,
+and keeps a minimal completion marker for every removed ID. It reports
+`removed_count`, `removed_ids` and `retained_done_count`, is serialized with
+mutations, and is safe to retry. Later `after` dependencies still resolve as done,
+and removed IDs remain reserved: re-adding them refuses `item_exists` and claiming
+them refuses `item_done`. `list --include-done` exposes compacted IDs separately as
+`completed_ids`; this global history has no retained capability metadata to filter.
+Completion history is bounded to 8,192 IDs and the existing file/JSON limits.
+`queue_history_limit` refuses further compaction without changing state. Today,
+the operator should stop retrying compact, run `aegis team queue list --include-done
+--json`, and give the coordinator the refusal and `completed_ids` history. Keep
+the queue state and ID reservations intact while the coordinator tracks the ruled
+archive-command follow-up. This version has no supported command to free history
+slots; do not hand-edit or reset the state file. Existing work can continue within
+the remaining queue limits.
+Compaction retains no removed item bodies.
+Queue transition events remain in their existing event history. The entire proposed serialized state
 must also pass the bounded JSON reader before publication; `queue_size_limit`
 names the file/reader limit and leaves the previous queue intact. `queue_live_limit`
 requires completing unfinished work before adding another item.
 
 Credential-like text in `id`, `title`, `paths`, `capabilities`, `after`, `hold`,
 `scope_rulings` or `invariants` refuses
-add with the fixed `invalid_item` response. The heuristic can also refuse ordinary
-text such as `Auth: update login flow`. Detection is per field: a value split
+add. Text-field detections return `credential_like_text` (exit 2), with guidance
+to rephrase assignments, for example `Auth: update login flow` as `Update login flow`.
+Item IDs, prerequisite IDs in `after` and capability labels are validated as
+identifiers first and return `invalid_item` when malformed. The heuristic remains fail closed
+and can refuse ordinary prose. Detection is per field: a value split
 across `id` and `title` is not detected across that boundary. Labels are composed
 after each field is canonicalized, redacted and bounded; generated `id: title`
 punctuation does not trigger another credential check on the joined label.
@@ -153,9 +201,15 @@ at claim time; it cannot prevent adding or listing items. The team-policy parser
 accepts a UTF-8 BOM and uses its own limits. Prerequisites
 must be done; missing prerequisites remain visible with `next_action`. Claim checks
 the lane declaration, capability labels, overlap with other live queue claims and
-available writer slots. Unconditional claim-time path preflight against other
-lanes' live repository leases belongs to BL-16b. In BL-16a, repository overlap
-gates explicit `lease_free` conditions and repository lanes count toward capacity.
+available writer slots. Under the queue mutation lock, claim re-reads repository
+leases and refuses `foreign_lease` for overlapping live foreign leases or unreadable
+lease records, even without a `lease_free` condition. The requested lane's own
+repository lease is exempt from this scope check. `brief_paths` are validated
+against the item's admitted globs at add time; an out-of-scope declaration refuses
+add with `brief_outside_scope` before the item enters the queue. Claim rechecks
+this declaration as part of its preflight.
+The lease observation is a snapshot; queue and repository lease stores are separate
+and this command grants no cross-store transaction or execution authority.
 The layered team profile supplies `run_config.limits.writers_max`; live repository
 lease lanes and live queue claim lanes share that count, with each lane counted once.
 The resulting distinct lane count must fit the limit, including when the requested
@@ -166,6 +220,33 @@ Audit identifies items waiting only on the coordinator and satisfied typed condi
 still retained with a judgment hold on queued work. A judgment hold is never
 automatically removed; satisfied `lease_free` conditions should remain in place
 so a later claim rechecks them.
+Audit reports `LANE-NO-LEASE` when a live queue claim has an absent or expired
+repository lease. `LEASE-UNREADABLE` is a distinct outcome: inspect `aegis team list
+--json`, then use `aegis team release` with the unreadable lease's current
+`--expect` OID before claiming again. An unreadable snapshot never proves absence.
+`CLAIM-BRANCH-UNKNOWN` reports null or absent branch evidence, including legacy
+claims and claims made without `--branch` while detached. It never substitutes
+the shared workspace's current HEAD. `LEASE-BRANCH-UNKNOWN` reports missing branch
+evidence or a branch that is not a local branch on a readable live repository
+lease; release and recreate that lease with an explicit local branch.
+`LEASE-BRANCH-MISMATCH` requires two known
+branches that differ. Short and `refs/heads/` names compare equally. Independent
+claim-branch and lease findings can both appear. The live-claim findings above
+include fixed reasons and next actions, and stop appearing after the queue claim
+is released or expires.
+`CLAIM-BRANCH-UNSUPPORTED` reports one item's stored branch evidence that current
+claim rules refuse, including nested ref prefixes accepted by older versions.
+Its item view includes `branch_supported: false`. The evidence is not rewritten.
+Unsupported evidence suppresses only the branch comparison: live claims still
+report lease presence, readability and lease-side branch findings. Other queue
+items remain usable. This finding persists on expired and completed rows until
+cleared by a normal transition, even when completed items are hidden by the
+default list view. Release active or expired claims using their current
+revision (or complete a live claim with done); compact completed rows after any
+unfinished dependents finish. These normal transitions clear unsupported
+evidence. An expired claim still refuses done with `lease_expired`; re-claim it
+directly with its current revision and a supported branch, or release it first.
+New claims continue to refuse unsupported branch spellings.
 
 Add, claim, release and done append a correlated event under the queue transaction
 lock, using the existing `lease_claimed` event kind and `queue_<verb>` result.
@@ -176,8 +257,13 @@ an event failure leaves the completed mutation intact and returns a fixed
 `event_not_recorded` warning with a next action; list before retrying, since the
 previous revision is stale. Events provide cooperative audit history, not a
 cross-file atomic journal.
+Compaction that removes rows appends a `queue_compact` event with counts and every
+removed ID in the bounded `removed_ids` list;
+an unchanged retry appends no duplicate event. Event failure returns a warning
+without undoing the already completed compaction.
 
-Queue state is `.aegis/state/team-queue.json`. Milestones are an owner-managed
+Queue state is `.aegis/state/team-queue.json`. Its optional `completed` object maps
+compacted IDs to `true`; older records without it load as empty history. Milestones are an owner-managed
 list of stable labels in that versioned document; this round adds no milestone
 recording verb. Model inputs and editable files are untrusted. Owner-UID rewriting
 of owner-only state is outside v5.0's threat model. These records supply no OS

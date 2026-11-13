@@ -80,6 +80,38 @@ MODEL_REQUIRED = ("bindings", "policy", "history", "task_kind", "role_kind", "su
 MODEL_OPTIONAL = ("intent", "author_family", "lane_family", "review_stage", "record")
 
 
+def queue_argument_refusal(arguments):
+    from aegis_core import team_queue
+
+    result = team_queue.list_argument_refusal(arguments)
+    if result is not None:
+        result["error"] = result["reason"]
+    return result
+
+
+def _handle_team_queue(args):
+    """Read-only adapter: no client argument can select a queue mutation."""
+    from aegis_core import team_queue
+    from aegis_core.workspace.base import Workspace
+
+    if (type(args) is not dict or len(args) > len(SERVER_INJECTED) + 2 or
+            any(key not in ("capabilities", "include_done") and key not in SERVER_INJECTED for key in args)):
+        return queue_argument_refusal(None)
+    else:
+        options = {key: args[key] for key in ("capabilities", "include_done") if key in args}
+        invalid = queue_argument_refusal(options)
+        if invalid is not None:
+            return invalid
+        root = args.get("workspace")
+        root = root.root if isinstance(root, Workspace) else root
+        result = team_queue.list(root, **options)
+    if result["refused"]:
+        # The generic MCP transport recognizes error; retain the core envelope
+        # and add only this fixed reason for its isError flag.
+        result["error"] = result["reason"]
+    return result
+
+
 def _model_output_safe(value):
     """Refuse any changed field; successful operational values stay lossless."""
     from aegis_core.redaction import redact_command_secrets
@@ -215,6 +247,7 @@ _TOOL_HANDLERS = {
     "aegis_msg_write": handle_msg_write,
     "aegis_team_config": _handle_team_config,
     "aegis_team_model": _handle_team_model,
+    "aegis_team_queue": _handle_team_queue,
 }
 
 # Set by the server (or passed by an in-process caller), never part of a tool schema.
@@ -265,6 +298,12 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
 
 def execute_tool(name: str, args: dict, *, client_arguments: bool = False) -> Any:
     """Check the arguments against the schema, dispatch, and project the response if a view is asked for."""
+    if name == "aegis_team_queue":
+        if client_arguments:
+            invalid = queue_argument_refusal(args)
+            if invalid is not None:
+                return invalid
+        return _handle_team_queue(args)
     if name == "aegis_team_model":
         if client_arguments and (type(args) is not dict or any(key in SERVER_INJECTED for key in args)):
             return {"error": "invalid_model_arguments"}

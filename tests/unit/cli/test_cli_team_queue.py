@@ -101,10 +101,11 @@ def test_queue_usage_refuses_without_echo(workspace, capsys, arguments):
     assert "private-value" not in json.dumps(result)
 
 
-def test_cli_unsupported_platform_uses_refusal_envelope(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("verb", ["list", "audit", "compact"])
+def test_cli_unsupported_platform_uses_refusal_envelope(tmp_path, monkeypatch, capsys, verb):
     (tmp_path / ".aegis" / "rules").mkdir(parents=True)
     monkeypatch.setattr(team_queue, "descriptor_supported", lambda: False)
-    code, result = run(capsys, tmp_path, "list")
+    code, result = run(capsys, tmp_path, verb)
     assert code == 1 and result["reason"] == "unsupported_platform"
 
 
@@ -328,7 +329,7 @@ def test_secret_item_text_reaches_fixed_service_refusal(workspace, capsys, field
     value[field] = ["token=private-value"] if field in ("scope_rulings", "invariants") else "token=private-value"
     code, result = run(capsys, workspace, "add", "--item", json.dumps(value))
     assert code == 2 and result["schema"] == "aegis.team.queue.add/v1"
-    assert result["reason"] == "invalid_item" and result["next_action"]
+    assert result["reason"] == "credential_like_text" and result["next_action"]
     assert "private-value" not in json.dumps(result)
     assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
 
@@ -343,6 +344,188 @@ def test_successful_nonqueue_parse_keeps_model_token_policy(capsys, argv):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert json.loads(captured.out) == {"error": "invalid_model_arguments"}
+
+
+def test_cli_completed_filter_compact_and_retry(workspace, capsys):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    code, added = run(capsys, workspace, "add", "--item", json.dumps(value))
+    assert code == 0
+    code, claimed = run(capsys, workspace, "claim", "ONE", "--expect", added["item"]["revision"], "--lane", "writer")
+    assert code == 0
+    assert run(capsys, workspace, "done", "ONE", "--expect", claimed["item"]["revision"], "--lane", "writer")[0] == 0
+    assert run(capsys, workspace, "list")[1]["items"] == []
+    assert run(capsys, workspace, "list", "--include-done")[1]["items"][0]["id"] == "ONE"
+    code, compacted = run(capsys, workspace, "compact")
+    assert code == 0 and compacted["removed_count"] == 1
+    assert compacted["schema"] == "aegis.team.queue.compact/v1"
+    assert run(capsys, workspace, "compact")[1]["removed_count"] == 0
+
+
+def test_cli_brief_and_foreign_lease_preflight(workspace, capsys):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"],
+             "capabilities": [], "brief_paths": ["src/a.py"]}
+    code, added = run(capsys, workspace, "add", "--item", json.dumps(value))
+    assert code == 0
+    lease = team.claim(workspace, "foreign", ["src/**"], owner="owner")
+    code, refused = run(capsys, workspace, "claim", "ONE", "--expect", added["item"]["revision"], "--lane", "writer")
+    assert code == 1 and refused["reason"] == "blocked"
+    assert refused["blockers"][0]["reason"] == "foreign_lease"
+    team.release(workspace, "foreign", lease.oid, caller="owner")
+    assert run(capsys, workspace, "claim", "ONE", "--expect", added["item"]["revision"], "--lane", "writer")[0] == 0
+
+
+@pytest.mark.parametrize("branch", [None, "lane/writer", "refs/heads/lane/writer"])
+def test_cli_queue_branch_evidence_is_explicit(workspace, capsys, branch):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    assert run(capsys, workspace, "add", "--item", json.dumps(value))[0] == 0
+    revision = team_queue.list(workspace)["items"][0]["revision"]
+    args = ["claim", "ONE", "--expect", revision, "--lane", "writer"]
+    if branch is not None:
+        args.extend(["--branch", branch])
+    code, claimed = run(capsys, workspace, *args)
+    assert code == 0
+    assert claimed["item"]["branch"] == (None if branch is None else "lane/writer")
+    team.claim(workspace, "writer", ["src/**"], owner="owner", branch="lane/writer")
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/other"], cwd=workspace, check=True)
+    code, audited = run(capsys, workspace, "audit")
+    assert code == 0
+    assert [row["code"] for row in audited["findings"]] == (["CLAIM-BRANCH-UNKNOWN"] if branch is None else [])
+
+
+@pytest.mark.parametrize("branch,accepted", [
+    ("feature/c++", True), ("fix/issue#12", True), ("user@topic", True), ("feat/naïve", True),
+    ("refs/heads/x", True), ("x" * 200, True), ("x" * 201, False),
+    ("refs/tags/x", False), ("HEAD", False), ("private-value topic", False),
+    ("private-value\ntrailer", False),
+], ids=["plus", "hash", "at", "unicode", "full", "limit", "over-limit", "tag", "head", "space", "multiline"])
+def test_cli_queue_uses_lease_branch_grammar(workspace, capsys, branch, accepted):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    code, added = run(capsys, workspace, "add", "--item", json.dumps(value))
+    assert code == 0
+    if accepted:
+        team.claim(workspace, "writer", ["src/**"], owner="owner", branch=branch)
+    code, result = run(capsys, workspace, "claim", "ONE", "--expect", added["item"]["revision"],
+                       "--lane", "writer", "--branch", branch)
+    if accepted:
+        assert code == 0, result
+        assert result["item"]["branch"] == branch.removeprefix("refs/heads/")
+        code, audited = run(capsys, workspace, "audit")
+        assert code == 0 and audited["findings"] == []
+    else:
+        assert code == 2 and result["reason"] == "invalid_arguments"
+        assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("branch,unsupported", [
+    ("refs/heads/refs/tags/x", True), ("refs/heads/refs/heads/x", True),
+    ("refs/heads/refs/remotes/origin/x", True), ("lane/writer", False),
+], ids=["nested-tag", "nested-head", "nested-remote", "valid"])
+@pytest.mark.parametrize("state", ["active", "expired", "completed"])
+@pytest.mark.parametrize("verb", ["list", "audit", "compact", "add", "claim", "release", "done"])
+def test_cli_stored_branch_isolated_from_queue_operations(workspace, capsys, monkeypatch, branch, unsupported, state, verb):
+    root = workspace
+    monkeypatch.setattr(team_queue, "time", SimpleNamespace(time=lambda: 100))
+    (root / ".aegis" / "team.json").write_text(json.dumps({"v": 1,
+        "lanes": {"writer": ["src/**"], "beta": ["docs/**"]}}), encoding="utf-8")
+    profile = root / ".aegis" / "team" / "profile.json"
+    profile.parent.mkdir()
+    profile.write_text(json.dumps({"version": 1, "run_config": {"limits": {"writers_max": 2}}}), encoding="utf-8")
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    code, added = run(capsys, root, "add", "--item", json.dumps(value))
+    assert code == 0
+    code, second = run(capsys, root, "add", "--item", json.dumps({**value, "id": "TWO", "paths": ["docs/**"]}))
+    assert code == 0
+    code, claimed = run(capsys, root, "claim", "ONE", "--expect", added["item"]["revision"],
+                         "--lane", "writer", "--branch", "lane/writer", "--ttl", "10")
+    assert code == 0
+    if state == "completed":
+        assert run(capsys, root, "done", "ONE", "--expect", claimed["item"]["revision"], "--lane", "writer")[0] == 0
+    path = root / ".aegis" / "state" / "team-queue.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["items"]["ONE"]["branch"] = branch
+    path.write_text(json.dumps(document), encoding="utf-8")
+    revision = document["items"]["ONE"]["revision"]
+    team.claim(root, "writer", ["src/**"], owner="owner", branch="lane/writer", now=100)
+    team.claim(root, "beta", ["docs/**"], owner="owner", branch="lane/beta", now=100)
+    moment = 112 if state == "expired" else 103
+    monkeypatch.setattr(team_queue, "time", SimpleNamespace(time=lambda: moment))
+    arguments = [verb]
+    if verb == "list":
+        arguments.append("--include-done")
+    elif verb == "add":
+        arguments.extend(["--item", json.dumps({**value, "id": "THREE", "paths": ["other/**"]})])
+    elif verb == "claim":
+        arguments.extend(["TWO", "--expect", second["item"]["revision"], "--lane", "beta", "--branch", "lane/beta"])
+    elif verb in ("release", "done"):
+        arguments.extend(["ONE", "--expect", revision, "--lane", "writer"])
+    code, result = run(capsys, root, *arguments)
+    expected_error = ("not_claimed" if state == "completed" else "lease_expired"
+                      if state == "expired" and verb == "done" else None) if verb in ("release", "done") else None
+    if expected_error:
+        assert code == 1 and result["reason"] == expected_error
+    else:
+        assert code == 0, result
+    cleared = ((verb == "release" and state != "completed") or
+               (verb == "done" and state == "active") or (verb == "compact" and state == "completed"))
+    code, audited = run(capsys, root, "audit")
+    assert code == 0, audited
+    findings = audited["findings"]
+    assert [row["code"] for row in findings] == (["CLAIM-BRANCH-UNSUPPORTED"] if unsupported and not cleared else [])
+    if findings:
+        assert findings[0]["item_id"] == "ONE" and findings[0]["reason"] == "claim_branch_unsupported"
+        assert findings[0]["next_action"] and branch not in json.dumps(findings)
+    if not cleared:
+        assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+    if unsupported and not cleared:
+        recovery_args = ["compact"] if state == "completed" else ["release", "ONE", "--expect", revision, "--lane", "writer"]
+        assert run(capsys, root, *recovery_args)[0] == 0
+        assert run(capsys, root, "audit")[1]["findings"] == []
+
+
+@pytest.mark.parametrize("lease_state,lease_code", [
+    ("missing", "LANE-NO-LEASE"), ("branchless", "LEASE-BRANCH-UNKNOWN"),
+    ("unreadable", "LEASE-UNREADABLE"), ("healthy", None),
+])
+def test_cli_unsupported_branch_preserves_independent_lease_findings(workspace, capsys, monkeypatch, lease_state, lease_code):
+    from aegis_core import gitsafe
+
+    root = workspace
+    monkeypatch.setattr(team_queue, "time", SimpleNamespace(time=lambda: 100))
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    code, added = run(capsys, root, "add", "--item", json.dumps(value))
+    assert code == 0
+    code, claimed = run(capsys, root, "claim", "ONE", "--expect", added["item"]["revision"],
+                        "--lane", "writer", "--branch", "lane/writer")
+    assert code == 0
+    branch = "refs/heads/refs/tags/private-value"
+    path = root / ".aegis" / "state" / "team-queue.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["items"]["ONE"]["branch"] = branch
+    path.write_text(json.dumps(document), encoding="utf-8")
+    if lease_state == "unreadable":
+        bad = gitsafe.write_blob(root, b"{}")
+        gitsafe.update_ref(root, team.lane_ref("writer"), bad, None)
+    elif lease_state != "missing":
+        team.claim(root, "writer", ["src/**"], owner="owner", now=100,
+                   branch=None if lease_state == "branchless" else "other/branch")
+    code, result = run(capsys, root, "audit")
+    assert code == 0, result
+    findings = result["findings"]
+    expected = ["CLAIM-BRANCH-UNSUPPORTED"] + ([lease_code] if lease_code else [])
+    assert [row["code"] for row in findings] == expected
+    assert all(row["item_id"] == "ONE" and row["lane"] == "writer" and
+               row["refused"] and row["reason"] and row["next_action"] for row in findings)
+    assert "private-value" not in json.dumps(findings)
+    assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+
+
+def test_cli_outside_brief_is_refused_at_add_and_corrected_retry_succeeds(workspace, capsys):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": [], "brief_paths": ["docs/a.md"]}
+    code, result = run(capsys, workspace, "add", "--item", json.dumps(value))
+    assert code == 2 and result["reason"] == "brief_outside_scope"
+    assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
+    value["brief_paths"] = ["src/a.py"]
+    assert run(capsys, workspace, "add", "--item", json.dumps(value))[0] == 0
 
 
 def test_queue_with_model_data_keeps_workspace_refusal(tmp_path, capsys):
