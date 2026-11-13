@@ -38,6 +38,152 @@ aegis team claim docs --paths 'docs/**' --branch lane/docs --ttl 3600 --json
 aegis team list --json
 ```
 
+### Lease path globs
+
+A leading slash anchors a lease glob to the workspace root. Use `/pyproject.toml`
+for the root file and `/docs/` for the root directory prefix. The anchor is retained
+in the stored lease and in JSON claim, list and status output:
+
+```sh
+aegis team claim root-files --paths '/pyproject.toml' '/MANIFEST.in' --json
+```
+
+A slashless glob retains its any-depth meaning: `pyproject.toml` also protects
+nested files with that basename. Its overlap is conservative and can conflict with
+unrelated lanes. An anchored root-file declaration avoids that broad basename
+reading. Wildcards with a shared literal prefix can still conflict even when their
+extensions differ; uncertainty refuses the claim.
+
+When a slashless existing root file is refused solely because of the any-depth
+reading, the refusal may suggest its anchored form in `next_action`. This is advice
+to retry; it does not grant the lease or bypass the next claim's conflict check.
+JSON refusals include that guidance when available; text refusals print it on stderr.
+
+Lease blobs remain version 1. Older readers strip a root anchor and therefore
+interpret an anchored root filename more widely, preserving conflict protection
+across versions. Known whitespace leases retain their old conservative scope and
+must be released and reclaimed to change their paths.
+
+These semantics also govern queue item and `lease_free` path globs. Queue entries
+use POSIX separators. Rule targeting and `.aegis/team.json` policy globs retain
+their existing normalization and matching behavior.
+
+## Queue work for teams
+
+The Router enqueues work; an orchestrator selects an item and claims its current
+revision. Queue claims are cooperative scheduling records, separate from the
+repository path leases above. They do not launch sessions or grant execution authority.
+The service uses Python 3.9's standard library and requires POSIX descriptor-relative
+no-follow operations. Unsupported platforms return a structured refusal.
+
+```sh
+aegis team queue add --item '{"id":"DOCS-1","title":"Update guide","paths":["docs/**"],"capabilities":["docs"]}' --json
+aegis team queue list --capability docs --json
+aegis team queue claim DOCS-1 --lane docs --capability docs --expect REVISION --ttl 3600 --json
+aegis team queue release DOCS-1 --lane docs --expect CLAIM_REVISION --json
+aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
+aegis team queue audit --json
+```
+
+Use the actual `revision` returned by add, list, claim or release in place of the
+example placeholders. Release and done are alternative transitions from a claim;
+after release, claim again before completing the item. Claims expire at their
+recorded `expires_at`: an expired claim can be replaced using its current revision,
+but cannot complete work. Stale revisions always refuse, including concurrent
+claims of the same item. List displays claimed lanes as `lane [ITEM: title]`.
+Each lane may hold one live queue claim; another claim refuses with `lane_busy`.
+Release and done accept `--lane`; live claims require their matching lane
+(`lane_required` or `lane_mismatch` otherwise). Lane labels are cooperative caller
+assertions, not authenticated identities or OS permissions.
+
+All queue results are JSON, with schema `aegis.team.queue.<verb>/v1`, including
+refusals. Exit codes are 0 done, 1 refused and 2 usage. Refusals contain `refused`,
+`reason` and `next_action`; parser failures use the `usage` verb. List and audit
+create no state or locks. MCP queue access is deferred to BL-16b.
+Any invocation containing `team` followed anywhere by `queue` in the whole argv
+uses the queue's non-echoing parser boundary, including words after `--`, option
+values and malformed commands. Removed-command shortcuts also defer to this
+parser boundary. The existing `aegis hook run` shortcut runs before that boundary:
+malformed hook arguments, including ones mentioning `team queue`, exit 0 silently
+to preserve the hook's must-not-block contract. Only a successful parse as `team queue`
+exempts queue data named `model` from the raw model-token policy. Workspace bounds
+apply equally before `team`, between `team` and `queue`, and after `queue` or its verb.
+Empty workspace values, NUL bytes and `..` components refuse before workspace
+resolution, as do values exceeding the length or separator limits.
+CLI and core use one pure spelling check under both Windows and POSIX path rules,
+so drive-relative parents such as `C:..\ws` refuse on every OS.
+
+Items require `id`, a single-line `title`, nonempty workspace-relative `paths`
+globs, and `capabilities`, a list of team labels. These labels are never host kinds.
+Optional fields are `after` (prerequisite item ids), `hold` (a judgment hold),
+`hold_until`, `scope_rulings` and `invariants` (lists of single-line text). Unknown
+fields, duplicate JSON keys, multiline values and malformed items refuse. Limits
+are 256 unfinished items, 128 entries per item list, 64 characters per id/label,
+256 per title/path, 4,096 per ruling/invariant/hold, and 1 MiB of queue state.
+Validated constraint text is returned in full. Completed rows remain in history
+without consuming the unfinished-item cap. The entire proposed serialized state
+must also pass the bounded JSON reader before publication; `queue_size_limit`
+names the file/reader limit and leaves the previous queue intact. `queue_live_limit`
+requires completing unfinished work before adding another item.
+
+Credential-like text in `id`, `title`, `paths`, `capabilities`, `after`, `hold`,
+`scope_rulings` or `invariants` refuses
+add with the fixed `invalid_item` response. The heuristic can also refuse ordinary
+text such as `Auth: update login flow`. Detection is per field: a value split
+across `id` and `title` is not detected across that boundary. Labels are composed
+after each field is canonicalized, redacted and bounded; generated `id: title`
+punctuation does not trigger another credential check on the joined label.
+Milestone names and `lease_free` paths within `hold_until` use the same checks.
+
+Typed `hold_until` conditions are objects of one of these shapes:
+
+| Condition | When a claim may proceed |
+| --- | --- |
+| `{"kind":"lease_free","paths":["docs/**"]}` | No live repository or queue lease covers those globs; unreadable repository leases block. |
+| `{"kind":"milestone","name":"develop-merge"}` | The coordinator has recorded that milestone in the owner-managed queue state. |
+| `{"kind":"owner"}` | An owner decision removes the condition; it never self-clears. |
+| `{"kind":"coordinator"}` | A coordinator decision removes the condition; it never self-clears. |
+
+For a live claimed item, `lease_free` ignores its own queue claim and its holder's
+repository lease. Other lanes' covering leases still block; expired claims have
+no holder exemption.
+
+Missing or invalid `.aegis/team.json` lane configuration is a coordinator blocker
+at claim time; it cannot prevent adding or listing items. The team-policy parser
+accepts a UTF-8 BOM and uses its own limits. Prerequisites
+must be done; missing prerequisites remain visible with `next_action`. Claim checks
+the lane declaration, capability labels, overlap with other live queue claims and
+available writer slots. Unconditional claim-time path preflight against other
+lanes' live repository leases belongs to BL-16b. In BL-16a, repository overlap
+gates explicit `lease_free` conditions and repository lanes count toward capacity.
+The layered team profile supplies `run_config.limits.writers_max`; live repository
+lease lanes and live queue claim lanes share that count, with each lane counted once.
+The resulting distinct lane count must fit the limit, including when the requested
+lane already has a repository lease. Add/release responses show known blockers;
+an unobserved `lease_free` condition asks for list to evaluate repository leases,
+so it cannot be reported as satisfied merely because a mutation skipped that read.
+Audit identifies items waiting only on the coordinator and satisfied typed conditions
+still retained with a judgment hold on queued work. A judgment hold is never
+automatically removed; satisfied `lease_free` conditions should remain in place
+so a later claim rechecks them.
+
+Add, claim, release and done append a correlated event under the queue transaction
+lock, using the existing `lease_claimed` event kind and `queue_<verb>` result.
+Details include the caller, item/lane label, previous/current revision, holder and
+expiry. These queue receipts are excluded from lease metrics. The default caller
+is the existing local owner label. As with lane leases,
+an event failure leaves the completed mutation intact and returns a fixed
+`event_not_recorded` warning with a next action; list before retrying, since the
+previous revision is stale. Events provide cooperative audit history, not a
+cross-file atomic journal.
+
+Queue state is `.aegis/state/team-queue.json`. Milestones are an owner-managed
+list of stable labels in that versioned document; this round adds no milestone
+recording verb. Model inputs and editable files are untrusted. Owner-UID rewriting
+of owner-only state is outside v5.0's threat model. These records supply no OS
+authorization. Renew/gc liveness changes and build-kit wrapper retirement remain
+separate follow-up work.
+
 ## Inspect every lane
 
 ```sh
