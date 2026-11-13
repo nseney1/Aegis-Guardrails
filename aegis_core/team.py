@@ -30,8 +30,9 @@ backstops are the post-lane gate (``aegis check --lane``) and ``merge_metrics``.
 **Events.** The events log's kinds are fixed: every lease change writes a
 ``lease_claimed`` row whose ``result`` names it (claimed, taken_over, renewed,
 transferred, released, collected; a release or collection records the caller's label),
-and a refused claim writes ``lease_denied`` with ``reason`` overlap or taken. An event
-that cannot be written is a warning on the change, never a failure.
+and a refused claim writes ``lease_denied`` with ``reason`` overlap or taken. Queue
+receipts reuse ``lease_claimed`` with ``detail.queue`` true and are excluded from
+lease metrics. An event that cannot be written is a warning on the change, never a failure.
 
 **team.json** (committed, optional): ``{"v":1,"shared":[globs],"lanes":{"<lane>":[globs]}}``.
 ``shared`` globs may be changed by any lane; ``lanes`` are committed per-lane path sets.
@@ -872,8 +873,10 @@ def event_counts(root: Any) -> Dict[str, Any]:
     stamps: List[str] = []
     claims = denials = 0
     for row in found.rows:
-        stamps.append(row["ts"])
         detail = row["detail"]
+        if detail.get("queue") is True:
+            continue
+        stamps.append(row["ts"])
         if row["event"] == "lease_denied":
             denials += 1
             reason = detail.get("reason")

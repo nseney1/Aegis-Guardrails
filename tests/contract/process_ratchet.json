@@ -67,6 +67,10 @@
     "count": 1,
     "reason": "Single hardened git transport."
   },
+  "process:aegis_core/gitsafe_run.py:capture:subprocess.Popen": {
+    "count": 1,
+    "reason": "GM-5 opt-in bounded custody transport with chunk ceilings, deadline and process cleanup."
+  },
   "process:aegis_core/inference_provider.py:CommandBackend.generate:subprocess.run": {
     "count": 1,
     "reason": "Explicit user-configured model command boundary."

@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from aegis_core import gitsafe
+from aegis_core import gitsafe, gitsafe_run
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
@@ -1139,7 +1139,7 @@ def test_no_package_module_reaches_gitsafe_private_names():
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel != "aegis_core/gitsafe.py":
+            if rel not in ("aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"):
                 offenders += _single_reader_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
 
@@ -1224,24 +1224,165 @@ _RUN_ALLOWED_IN = {
 }
 
 
-def _run_subcommand_offenders(rel: str, source: str) -> list:
-    """``gitsafe.run([...])`` and ``gitsafe.run_checked([...])`` calls whose subcommand (after leading
-    ``-c <setting>`` pairs) is not allowed. Wrappers that pass ``list(args)`` (sync._git) are out of this
-    detector's reach."""
-    offenders = []
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("run", "run_checked")
-                and isinstance(node.func.value, ast.Name) and node.func.value.id == "gitsafe"
-                and node.args and isinstance(node.args[0], ast.List)):
+# This is a spelling/shape guard only. The spawn-boundary runtime classifier
+# enforces strict custody; this check deliberately performs no Python dataflow.
+_STRICT_RUNNERS = {"run", "run_checked", "_run", "execute", "capture", "checked", "output", "text"}
+
+
+def _literal_command(argument):
+    if not isinstance(argument, (ast.List, ast.Tuple)):
+        return None
+    elements = argument.elts
+    position = 0
+    while position < len(elements):
+        node = elements[position]
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            return None
+        if node.value == "-c":
+            position += 2
+        elif node.value.startswith("-"):
+            position += 1
+        else:
+            return node.value
+    return None
+
+
+def _run_subcommand_offenders(rel, source):
+    tree, offenders = ast.parse(source), []
+    if rel == "aegis_core/team_git.py":
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_lane_operation"), None)
+        wrapper = next((n for n in entry.body if isinstance(n, ast.FunctionDef) and n.name == "wrapped"), None) if entry else None
+        store_type = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GitStore"), None)
+        enter = next((n for n in store_type.body if isinstance(n, ast.FunctionDef) and n.name == "__enter__"), None) if store_type else None
+        require = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_require_runner"), None)
+        allowed = {"gitsafe": {"MERGE_TREE_MIN_VERSION", "GitError"},
+                   "gitsafe_run": set()}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run"):
+                offenders.append(f"{rel}:{node.lineno} bare Git import")
+            if isinstance(node, ast.Import) and any(a.name in ("aegis_core.gitsafe", "aegis_core.gitsafe_run") for a in node.names):
+                offenders.append(f"{rel}:{node.lineno} aliased Git import")
+            if isinstance(node, ast.ImportFrom) and node.module == "aegis_core" and any(a.asname for a in node.names if a.name in allowed):
+                offenders.append(f"{rel}:{node.lineno} aliased Git import")
+            if not isinstance(node, ast.Name) or node.id not in allowed or not isinstance(node.ctx, ast.Load):
+                continue
+            parent = parents.get(node)
+            scope = parent
+            scopes = []
+            while scope is not None:
+                if isinstance(scope, ast.FunctionDef):
+                    scopes.append(scope)
+                scope = parents.get(scope)
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                offenders.append(f"{rel}:{node.lineno} forwards unrestricted Git module")
+                continue
+            attribute, context = parent.attr, parents.get(parent)
+            factory = (node.id == "gitsafe" and attribute == "lane_runner" and entry in scopes
+                       and isinstance(context, ast.Call) and context.func is parent)
+            type_check = (node.id == "gitsafe_run" and attribute == "LaneRunner"
+                          and isinstance(context, ast.Call) and isinstance(context.func, ast.Name)
+                          and context.func.id == "isinstance")
+            if attribute not in allowed[node.id] and not factory and not type_check:
+                offenders.append(f"{rel}:{node.lineno} unrestricted Git reference")
+        protected = {"cas", "paths", "publish", "_run"}
+        lane_methods = {"run", "run_checked", "paths", "environment", "read_ref", "cas", "publish",
+                        "read_private_object", "read_private_objects", "private_object_headers"}
+        for module in ("gitsafe.py", "gitsafe_run.py"):
+            protected.update(n.name for n in ast.parse((ROOT / "aegis_core" / module).read_text(encoding="utf-8")).body
+                             if isinstance(n, ast.FunctionDef))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in ("runner", "_runner") and isinstance(node.ctx, ast.Load):
+                parent = parents.get(node)
+                scope = parent
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                call = isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                transfer = call and parent.func.id in ("_require_runner", "_current", "_publish", "_snapshot_baselines", "_write_snapshot")
+                type_check = call and parent.func.id == "isinstance" and require is not None and scope is require
+                retain = isinstance(parent, ast.Assign) and enter is not None and scope is enter and ast.unparse(parent.targets[0]) == "self._lane"
+                inject = isinstance(parent, ast.keyword) and parent.arg == "_runner" and wrapper is not None and scope is wrapper
+                if not (isinstance(parent, ast.Attribute) and parent.value is node or transfer or type_check or retain or inject):
+                    offenders.append(f"{rel}:{node.lineno} unproved lane capability escape")
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id in ("runner", "_runner") and node.attr not in lane_methods):
+                offenders.append(f"{rel}:{node.lineno} unissued lane capability access")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type"
+                    and any(isinstance(arg, ast.Name) and arg.id in ("runner", "_runner") for arg in node.args)):
+                offenders.append(f"{rel}:{node.lineno} derives lane constructor")
+            if isinstance(node, ast.Name) and node.id in ("runner", "_runner") and isinstance(node.ctx, (ast.Store, ast.Del)):
+                parent, scope = parents.get(node), parents.get(node)
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                factory_binding = (node.id == "runner" and wrapper is not None and scope is wrapper
+                    and isinstance(parent, ast.Assign) and isinstance(parent.value, ast.IfExp)
+                    and ast.unparse(parent.value.body) == "store._lane"
+                    and isinstance(parent.value.orelse, ast.Call)
+                    and ast.unparse(parent.value.orelse.func) == "gitsafe.lane_runner")
+                if not factory_binding:
+                    offenders.append(f"{rel}:{node.lineno} rebinds lane capability")
+            if not isinstance(node, ast.Attribute) or node.attr not in protected:
+                continue
+            if node.attr == "_run" and isinstance(node.value, ast.Name) and node.value.id in ("store", "self"):
+                continue  # GitStore's own guarded entry; it never accepts a runner.
+            if isinstance(node.value, ast.Name) and node.value.id in allowed:
+                continue  # Module references were checked above.
+            scope = parents.get(node)
+            while scope is not None and not isinstance(scope, ast.FunctionDef):
+                scope = parents.get(scope)
+            receiver = node.value.id if isinstance(node.value, ast.Name) else None
+            body = [] if scope is None else scope.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                body = body[1:]
+            proof = body[0].value if body and isinstance(body[0], ast.Expr) else None
+            checked = (isinstance(proof, ast.Call) and isinstance(proof.func, ast.Name)
+                and proof.func.id == "_require_runner" and len(proof.args) == 1
+                and isinstance(proof.args[0], ast.Name) and proof.args[0].id == receiver)
+            if receiver not in ("runner", "_runner") or not checked:
+                offenders.append(f"{rel}:{node.lineno} unproved runner reference")
+            if node.attr == "cas" and (scope is None or scope.name != "cas_fast_forward" or parents.get(scope) is not tree):
+                offenders.append(f"{rel}:{node.lineno} CAS outside its lane entry")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (isinstance(node.func, ast.Name) and node.func.id == "replace"
+                    or isinstance(node.func, ast.Attribute) and node.func.attr == "replace"
+                    and (ast.unparse(node.func.value) in ("dataclasses", "dc")
+                         or any(isinstance(arg, ast.Name) and arg.id in ("runner", "_runner") for arg in node.args))):
+                offenders.append(f"{rel}:{node.lineno} replaces lane capability")
+            if isinstance(node, ast.Call) and any(k.arg in ("_env", "env", "scratch") for k in node.keywords):
+                scope = parents.get(node)
+                while scope is not None and not isinstance(scope, ast.FunctionDef):
+                    scope = parents.get(scope)
+                if not (scope and scope.name == "_run" and parents.get(scope) in tree.body
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+                        and all(k.arg != "_env" or isinstance(k.value, ast.Name) and k.value.id == "extra_env" for k in node.keywords)):
+                    offenders.append(f"{rel}:{node.lineno} caller spawn environment")
+        return offenders
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
-        elts = node.args[0].elts
-        while len(elts) > 1 and isinstance(elts[0], ast.Constant) and elts[0].value == "-c":
-            elts = elts[2:]
-        head = elts[0].value if elts and isinstance(elts[0], ast.Constant) else None
-        if isinstance(head, str) and head not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
-            offenders.append(f"{rel}:{node.lineno} runs git {head}")
+        if node.func.attr not in _STRICT_RUNNERS or not isinstance(node.func.value, ast.Name) or node.func.value.id != "gitsafe":
+            continue
+        argument = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg in ("args", "argv")), None)
+        command = _literal_command(argument)
+        if command is not None and command not in _RUN_ALLOWED | _RUN_ALLOWED_IN.get(rel, set()):
+            offenders.append(f"{rel}:{node.lineno} runs git {command}")
     return offenders
+
+
+@pytest.mark.parametrize("source", [
+    "from dataclasses import replace\ndef operation(_runner):\n _require_runner(_runner)\n replace(_runner, scratch=root).run(['read-tree', '--empty'])",
+    "import dataclasses as dc\ndef operation(_runner):\n _require_runner(_runner)\n dc.replace(_runner, scratch=root).run(['read-tree', '--empty'])",
+    "def outer():\n def cas_fast_forward(_runner):\n  _require_runner(_runner)\n  _runner.cas(ref, new, old)",
+    "def operation(_runner):\n _require_runner(_runner)\n _runner.run(['version'], _env={'GIT_TRACE': root})",
+    "def operation(_runner):\n _require_runner(_runner)\n _runner._run(['version'])",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(_runner._lane_binding)",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(type(_runner)(root,scratch,services,token))",
+    "def operation(_runner):\n _require_runner(_runner)\n getattr(_runner, 'cas')(ref,new,old)",
+    "def operation(_runner):\n _require_runner(_runner)\n forward(_runner)",
+    "def outer():\n def _lane_operation():\n  def wrapped(store):\n   runner = store._lane if store.active else gitsafe.lane_runner(store.repo, store.scratch)\n   return forward(_runner=runner)",
+])
+def test_lane_guard_refuses_environment_replacement_and_nested_cas(source):
+    assert _run_subcommand_offenders("aegis_core/team_git.py", source)
 
 
 def test_gitsafe_run_callers_use_only_allowed_subcommands():
@@ -1256,13 +1397,75 @@ def test_the_subcommand_ratchet_flags_a_worktree_add():
     source = "gitsafe.run(['worktree', 'add', 'x'], root)\ngitsafe.run(['-c', 'a=b', 'worktree', 'add'], root)\n"
     assert _run_subcommand_offenders("aegis_core/x.py", source) == [
         "aegis_core/x.py:1 runs git worktree", "aegis_core/x.py:2 runs git worktree"]
-    assert _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], top)\n") == []
-    assert _run_subcommand_offenders("aegis_core/x.py", "gitsafe.run(['push', 'origin'], top)\n") != []
+    assert not _run_subcommand_offenders("aegis_core/sync.py", "gitsafe.run(['push', 'origin'], root)")
 
 
-def test_the_subcommand_ratchet_sees_run_checked_too():
-    source = "gitsafe.run_checked(['worktree', 'add'], root, error=E)\ngitsafe.run_checked(['ls-tree', 'HEAD'], root)\n"
-    assert _run_subcommand_offenders("aegis_core/x.py", source) == ["aegis_core/x.py:1 runs git worktree"]
+@pytest.mark.parametrize("source", ["gitsafe.run(args, root)", "g.run(args=argv, cwd=root)",
+    "gitsafe.run_checked(values, root)", "gitsafe_run.execute(argv, root)", "from aegis_core.gitsafe import run"])
+def test_strict_structural_guard_refuses_names_without_resolving_bindings(source):
+    assert _run_subcommand_offenders("aegis_core/team_git.py", source)
+
+
+def test_exemption_carrier_is_private_to_central_writer():
+    owner = {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"}
+    carriers = {"_REF_WRITE", "_STRICT_SERVICES", "_LaneServices", "_strict_services", "_LaneBinding", "_lane_binding", "issue_runner"}
+    violations = []
+    for package in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
+        for path in (ROOT / package).rglob("*.py"):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel in owner:
+                if rel == "aegis_core/gitsafe.py":
+                    assert not any(isinstance(n, ast.keyword) and n.arg == "_grant"
+                                   for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            assert not any((isinstance(n, ast.keyword) and n.arg == "_grant")
+                           or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == "_grant")
+                           for n in ast.walk(tree)), rel
+            for node in ast.walk(tree):
+                if ((isinstance(node, ast.Attribute) and node.attr in carriers)
+                        or (isinstance(node, ast.Name) and node.id in carriers)
+                        or (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in carriers)
+                        or (isinstance(node, ast.ImportFrom) and any(a.name in carriers for a in node.names))):
+                    violations.append((rel, node.lineno))
+    assert not violations
+    for package in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
+        for path in (ROOT / package).rglob("*.py"):
+            rel = path.relative_to(ROOT).as_posix()
+            if rel in owner:
+                if rel == "aegis_core/gitsafe.py":
+                    assert not any(isinstance(n, ast.keyword) and n.arg == "_grant"
+                                   for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            assert not any((isinstance(n, ast.keyword) and n.arg == "_grant")
+                           or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == "_grant")
+                           for n in ast.walk(tree)), rel
+            if rel == "aegis_core/team_git.py":
+                assert not _run_subcommand_offenders(rel, path.read_text(encoding="utf-8"))
+                continue
+            for node in ast.walk(tree):
+                assert not (isinstance(node, ast.Attribute) and node.attr in ("LaneRunner", "lane_runner")), (rel, node.lineno)
+                assert not (isinstance(node, ast.ImportFrom) and node.module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run")
+                            and any(a.name in ("LaneRunner", "lane_runner") for a in node.names)), (rel, node.lineno)
+    tree = ast.parse(Path(gitsafe_run.__file__).read_text(encoding="utf-8"))
+    parents = {child: n for n in ast.walk(tree) for child in ast.iter_child_nodes(n)}
+    grants, launches = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        scopes, parent = [], parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.FunctionDef):
+                scopes.append(parent.name)
+            parent = parents.get(parent)
+        if any(k.arg == "_grant" for k in node.keywords):
+            grants.append("cas" in scopes or scopes == ["publish"])
+        if ast.unparse(node.func) == "subprocess.Popen":
+            launches.append(scopes[0])
+    assert grants == [True, True]
+    assert launches == ["capture"]
+
 
 
 # ── merge_base: a full oid is not re-resolved; a revision is validated (R-trust-61) ──
@@ -1765,3 +1968,269 @@ def test_commit_iterator_refuses_malformed_preflight_framing_before_capture(repo
     with pytest.raises(gitsafe.GitError, match=f"^git cannot read object {oid}$"):
         list(gitsafe.iter_objects(repo, [oid], kind="commit"))
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("payload", [None, b"payload"], ids=["devnull", "input"])
+def test_transport_extraction_preserves_legacy_default_argv_and_kwargs(repo, monkeypatch, payload):
+    from types import SimpleNamespace
+    seen = []
+    def record(argv, **kwargs):
+        seen.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 7, b"out\n", b"err\n")
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(
+        run=record, DEVNULL=-321, TimeoutExpired=subprocess.TimeoutExpired))
+    result = gitsafe.run(["version"], repo, timeout=2.5, stdin=payload)
+    assert (result.returncode, result.stdout, result.stderr) == (7, b"out\n", b"err\n")
+    argv, kwargs = seen[0]
+    assert argv == [gitsafe.git_executable(), *gitsafe._HARDENING, "version"]
+    assert {key: value for key, value in kwargs.items() if key != "env"} == {
+        "cwd": str(repo), "input": payload, "stdin": -321 if payload is None else None,
+        "capture_output": True, "timeout": 2.5, "check": False}
+    expected = dict(os.environ)
+    expected.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1",
+                    GIT_ALLOW_PROTOCOL="", GIT_NO_LAZY_FETCH="1", LC_ALL="C")
+    assert kwargs["env"] == expected
+
+
+def test_legacy_facade_keeps_its_process_namespace_timeout_type(repo, monkeypatch):
+    from types import SimpleNamespace
+    class NamespaceTimeout(Exception):
+        pass
+    def timeout(*args, **kwargs):
+        raise NamespaceTimeout()
+    monkeypatch.setattr(gitsafe, "subprocess", SimpleNamespace(
+        run=timeout, DEVNULL=subprocess.DEVNULL, TimeoutExpired=NamespaceTimeout))
+    with pytest.raises(gitsafe.GitError, match="^git version timed out after 2.5s$"):
+        gitsafe.run(["version"], repo, timeout=2.5)
+
+
+@pytest.mark.parametrize("extra", [0, 1], ids=["exact-ceiling", "overflow"])
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_custody_capture_ceiling_on_each_stream(repo, tmp_path, extra, stream):
+    # hash-object --stdin emits a fixed-size OID; config's unknown key emits no
+    # output, so use a real controlled process at the subprocess boundary.
+    payload = b"x" * (128 + extra)
+    code = "import os; os.write(" + ("1" if stream == "stdout" else "2") + ", " + repr(payload) + ")"
+    with gitsafe.custody(scratch=tmp_path, stdout_limit=128, stderr_limit=128):
+        if extra:
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                    stdin=None, timeout=2, error=gitsafe.GitError)
+            assert caught.value.code == "git_output_limit"
+        else:
+            result = gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                        stdin=None, timeout=2, error=gitsafe.GitError)
+            assert (result.stdout if stream == "stdout" else result.stderr) == payload
+
+
+def test_custody_timeout_has_fixed_code_and_context_restores(repo, tmp_path):
+    with gitsafe.custody(scratch=tmp_path):
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.capture([sys.executable, "-c", "import time; time.sleep(5)"], cwd=repo,
+                                env=dict(os.environ), stdin=None, timeout=0.1, error=gitsafe.GitError)
+        assert caught.value.code == "git_timeout"
+        assert str(caught.value) == "git custody timed out"
+    assert not gitsafe_run.custody_active()
+    assert gitsafe.run(["version"], repo).stdout.startswith(b"git version")
+
+
+@pytest.mark.parametrize("case", ["success", "overflow", "timeout"])
+def test_windows_pipe_capture_uses_blocking_reads_and_keeps_limits(repo, tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    def fixed_poll(*args):
+        pytest.fail("custody used fixed pipe polling")
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "sleep": fixed_poll}))
+    code = "import os; os.write(1, b'x' * " + ("129" if case == "overflow" else "128") + ")"
+    if case == "timeout":
+        code = "import time; time.sleep(5)"
+    with gitsafe.custody(scratch=tmp_path, stdout_limit=128):
+        if case == "success":
+            result = gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                        stdin=None, timeout=2, error=gitsafe.GitError)
+            assert result.stdout == b"x" * 128
+        else:
+            with pytest.raises(gitsafe.GitError) as caught:
+                gitsafe_run.capture([sys.executable, "-c", code], cwd=repo, env=dict(os.environ),
+                                    stdin=None, timeout=0.1 if case == "timeout" else 2, error=gitsafe.GitError)
+            assert caught.value.code == ("git_timeout" if case == "timeout" else "git_output_limit")
+
+
+def test_windows_pipe_reader_start_failure_is_typed_and_input_free(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    class UnavailableThread:
+        def __init__(self, **kwargs):
+            pass
+        def start(self):
+            raise RuntimeError("hostile-payload")
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
+    monkeypatch.setattr(gitsafe_run, "Thread", UnavailableThread)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run(["version"], repo)
+    assert caught.value.code == "git_failed"
+    assert "hostile-payload" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["blob", "tree", "commit"])
+def test_private_object_reader_keeps_objects_private_and_enforces_size(repo, tmp_path, kind):
+    scratch = tmp_path / "private"
+    scratch.mkdir(mode=0o700)
+    objects = scratch / "objects"
+    objects.mkdir(mode=0o700)
+    env = {"GIT_OBJECT_DIRECTORY": str(objects),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / ".git/objects")}
+    blob = gitsafe.run(["hash-object", "-w", "--stdin"], repo, stdin=b"private tree child", _env=env).stdout.decode().strip()
+    data = {"blob": b"private", "tree": b"100644 child\0" + bytes.fromhex(blob), "commit": (
+        b"tree " + _git(repo, "rev-parse", "HEAD^{tree}").strip().encode() +
+        b"\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nprivate\n")}[kind]
+    oid = gitsafe.run(["hash-object", "-w", "-t", kind, "--stdin"], repo, stdin=data, _env=env).stdout.decode().strip()
+    assert gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=len(data), env=env, scratch=scratch) == data
+    if data:
+        with pytest.raises(gitsafe.GitError) as caught:
+            gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=len(data)-1, env=env, scratch=scratch)
+        assert caught.value.code == "git_object_limit"
+    absent = gitsafe.run(["cat-file", "-e", oid], repo)
+    assert absent.returncode != 0
+
+
+def test_private_batch_reads_mixed_objects_and_preflights_aggregate_limit(repo, tmp_path, monkeypatch):
+    oids = [_git(repo, "rev-parse", rev).strip() for rev in ("HEAD", "HEAD^{tree}", "HEAD:a.py")]
+    expected = {oid: (kind, gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=10000,
+                env={}, scratch=tmp_path)) for oid, kind in zip(oids, ("commit", "tree", "blob"))}
+    total = sum(len(data) for kind, data in expected.values())
+    calls, real = [], gitsafe.run
+    def record(args, *rest, **kwargs):
+        calls.append(args)
+        return real(args, *rest, **kwargs)
+    monkeypatch.setattr(gitsafe, "run", record)
+    assert gitsafe.read_private_objects(repo, oids, max_bytes=total, max_object_bytes=10000,
+                                        env={}, scratch=tmp_path) == expected
+    assert calls == [["cat-file", "--batch-check"], ["cat-file", "--batch"]]
+    calls.clear()
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.read_private_objects(repo, oids, max_bytes=total - 1, max_object_bytes=10000,
+                                     env={}, scratch=tmp_path)
+    assert caught.value.code == "git_object_limit"
+    assert calls == [["cat-file", "--batch-check"]]
+
+
+@pytest.mark.parametrize("failure", ["large-size", "wrong-kind", "missing", "trailing", "hash"])
+def test_private_batch_refuses_malformed_frames_without_echo(repo, tmp_path, monkeypatch, failure):
+    oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
+    real = gitsafe.run
+    calls = []
+    def corrupt(args, *rest, **kwargs):
+        calls.append(args)
+        result = real(args, *rest, **kwargs)
+        if args == ["cat-file", "--batch-check"]:
+            if failure == "large-size":
+                result.stdout = oid.encode() + b" blob " + b"9" * 21 + b"\n"
+            elif failure == "wrong-kind":
+                result.stdout = oid.encode() + b" hostile-payload 1\n"
+            elif failure == "missing":
+                result.stdout = oid.encode() + b" missing\n"
+        elif args == ["cat-file", "--batch"]:
+            result.stdout = result.stdout + b"hostile-payload" if failure == "trailing" else result.stdout.replace(b"a = 1", b"a = 2")
+        return result
+    monkeypatch.setattr(gitsafe, "run", corrupt)
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.read_private_objects(repo, [oid], max_bytes=10000, max_object_bytes=10000,
+                                     env={}, scratch=tmp_path)
+    assert caught.value.code == "invalid_object"
+    assert str(caught.value) == "invalid private object"
+    if failure in ("large-size", "wrong-kind", "missing"):
+        assert calls == [["cat-file", "--batch-check"]]
+
+
+def test_single_attempt_ref_update_and_legacy_defaults(repo, tmp_path, monkeypatch):
+    real_run = gitsafe.run
+    oid = _git(repo, "rev-parse", "HEAD").strip()
+    attempts = []
+    def unknown(args, cwd, **kwargs):
+        if "update-ref" in args:
+            attempts.append(args)
+            raise gitsafe.GitError("git custody timed out", code="git_timeout")
+        return real_run(args, cwd, **kwargs)
+    monkeypatch.setattr(gitsafe, "run", unknown)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.update_ref(repo, "refs/aegis/once", oid, None, single_attempt=True)
+    assert caught.value.code == "ref_update_unknown" and len(attempts) == 1
+    monkeypatch.setattr(gitsafe, "run", real_run)
+    assert gitsafe.update_ref(repo, "refs/aegis/legacy", oid, None) is None
+    assert gitsafe.read_ref(repo, "refs/aegis/legacy") == oid
+
+
+def test_custody_queries_preserve_refusals_and_legacy_fallback(repo, tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("never echo this input", code="privacy_refused")
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    for query in (gitsafe.common_dir, gitsafe.toplevel, gitsafe.git_version):
+        with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+            query(repo)
+        assert caught.value.code == "privacy_refused"
+        assert query(repo) is None
+
+
+def test_expired_input_preparation_never_starts_a_process(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    ticks = iter((0, 1, 1, 1, 1))
+    def unexpected(*args, **kwargs):
+        pytest.fail("expired request started a process")
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: next(ticks)}))
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([sys.executable], cwd=repo, env=dict(os.environ), stdin=b"input", timeout=0.1,
+                            error=gitsafe.GitError)
+    assert caught.value.code == "git_timeout"
+
+
+def test_capture_closes_both_pipes_even_when_one_close_raises(repo, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    events, streams = [], []
+    class Pipe:
+        def __init__(self, name):
+            self.name = name
+            self.fd, write = os.pipe()
+            os.close(write)
+            self.closed = False
+        def fileno(self):
+            return self.fd
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                events.append(self.name)
+                os.close(self.fd)
+                if self.name == "stdout":
+                    raise OSError("must not echo cleanup input")
+    class Child:
+        def __init__(self, *args, **kwargs):
+            self.stdout, self.stderr = Pipe("stdout"), Pipe("stderr")
+            streams.extend((self.stdout, self.stderr))
+            self.returncode = 0
+        def wait(self, **kwargs):
+            return 0
+    monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": Child}))
+    try:
+        with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+            gitsafe_run.capture([sys.executable], cwd=repo, env=dict(os.environ), stdin=None, timeout=2,
+                                error=gitsafe.GitError)
+        observed = tuple(events)
+        assert caught.value.code == "git_cleanup_failed"
+        assert observed == ("stdout", "stderr")
+        assert "input" not in str(caught.value)
+    finally:
+        for stream in streams:
+            if not stream.closed:
+                stream.close()
+
+
+def test_custody_checked_bridge_cannot_downgrade_or_echo_a_refusal(repo, tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("private input never displayed", code="privacy_refused")
+    monkeypatch.setattr(gitsafe, "run", refuse)
+    with gitsafe.custody(scratch=tmp_path), pytest.raises(gitsafe.GitError) as caught:
+        gitsafe.run_checked(["version"], repo, error=ValueError)
+    assert caught.value.code == "privacy_refused"
+    # Outside custody, the same explicitly requested legacy conversion remains.
+    with pytest.raises(ValueError, match="^private input never displayed$"):
+        gitsafe.run_checked(["version"], repo, error=ValueError)
