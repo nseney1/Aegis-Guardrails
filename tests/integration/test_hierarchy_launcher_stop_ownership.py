@@ -8206,37 +8206,136 @@ def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, childre
     assert actors[2].wait(timeout=5) == -signal.SIGKILL
 
 
-def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, children, monkeypatch, capsys):
+@pytest.mark.parametrize("exit_after_live_read,fail_while_held", [(False, False), (True, False), (True, True)],
+                         ids=["ordinary", "exit-after-live-read", "body-failure-held"])
+def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, children, monkeypatch, capsys,
+                                                                    exit_after_live_read, fail_while_held):
     """MODELLED one deferred nonblocking reap; the matching zombie and eventual waitpid status are real."""
-    actors, deferred = [], []
+    from contextlib import nullcontext
+    import select
+
+    if fail_while_held and not hasattr(signal, "pidfd_send_signal"):
+        pytest.skip("the failed-body closure control requires original-child pidfd signalling")
+    actors, deferred, held, delivered, check_failures = [], [], [], [], []
+    delivery = {"closing": False}
+
+    def signal_target_matches(process, physical):
+        failures = []
+        if physical["birth"] != process.native_birth:
+            failures.append("signal target birth changed")
+        if physical["pgid"] != process.pid or os.getsid(process.pid) != process.pid:
+            failures.append("signal target left its owned session")
+        if physical["ppid"] != os.getpid():
+            failures.append("signal target is not our direct child")
+        check_failures.extend(failures)
+        return not failures
+
+    def module(pidfds=True):
+        loaded = children.module(pidfds=pidfds)
+        killing = loaded.os.kill
+        delivery["kill"] = killing
+
+        def delayed_kill(pid, number):
+            if delivery["closing"]:
+                return None
+            if number:
+                process = next((actor for actor in actors if actor.pid == pid), None)
+                if process is None:
+                    check_failures.append("signal target is outside this test's actors")
+                    return None
+                physical = r2_kernel_process(pid)
+                if not signal_target_matches(process, physical):
+                    return None
+            if exit_after_live_read and pid == actors[2].pid and number == signal.SIGKILL:
+                held.append(pid)
+                if fail_while_held:
+                    raise RuntimeError("injected test body failure while KILL is held")
+                return None
+            return killing(pid, number)
+
+        loaded.os.kill = delayed_kill
+        return loaded
 
     def spawn(*args, **kwargs):
         process = children(*args, **kwargs)
         actors.append(process)
         if len(actors) == 3:
+            if exit_after_live_read and process.native_handle is None:
+                pytest.skip("the exit-after-read latch requires an original-child pidfd")
             polling = process.poll
+            delivery["poll"] = polling
 
             def delayed():
+                if delivery["closing"]:
+                    return polling()
                 if not deferred:
                     physical = r2_kernel_process(process.pid)
+                    if held and not delivered and signal_target_matches(process, physical):
+                        if physical["state"].startswith("Z"):
+                            check_failures.append("held child exited before scheduled KILL delivery")
+                        else:
+                            # Exit after a genuine live read; latch on the original child's real pidfd.
+                            delivery["kill"](process.pid, signal.SIGKILL)
+                            delivered.append(process.pid)
+                            watcher = select.poll()
+                            watcher.register(process.native_handle, select.POLLIN)
+                            if not watcher.poll(5000):
+                                check_failures.append("the original child's KILL did not complete")
                     if physical["state"].startswith("Z"):
                         deferred.append({key: physical[key] for key in ("pid", "birth", "state", "uid", "euid")})
-                        return None
+                    # A live /proc read can precede a ready waitpid in the same call. Keep native wait
+                    # untouched until the real zombie has been witnessed, so the next read cannot
+                    # inspect an already reaped PID and turn fixture closure into UNKNOWN.
+                    return None
                 return polling()
 
             monkeypatch.setattr(process, "poll", delayed)
+            delivery["hook"] = delayed
         return process
 
-    spawn.projection, spawn.module = children.projection, children.module
-    try:
-        test_stop_retains_stubborn_descendants_after_the_middle_exits(
-            launch, spawn, monkeypatch, capsys, False, None)
-    finally:
-        (launch.tmp / "deferred-reap-evidence.json").write_text(json.dumps(
-            {"physical_zombie": deferred,
-             "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
+    spawn.projection, spawn.module = children.projection, module
+    expected = (pytest.raises(RuntimeError, match="^injected test body failure while KILL is held$")
+                if fail_while_held else nullcontext())
+    with expected:
+        try:
+            test_stop_retains_stubborn_descendants_after_the_middle_exits(
+                launch, spawn, monkeypatch, capsys, False, None)
+        finally:
+            # Disarm before evidence writes and before custody can close the safety pipe. A saved
+            # callback also delegates immediately, even after its instance attribute is restored.
+            delivery["closing"] = True
+            if "poll" in delivery:
+                actors[2].poll = delivery["poll"]
+            (launch.tmp / "deferred-reap-evidence.json").write_text(json.dumps(
+                {"physical_zombie": deferred, "held": held, "delivered": delivered,
+                 "check_failures": check_failures, "closing": delivery["closing"],
+                 "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
+    assert not check_failures, check_failures
+    if fail_while_held:
+        worker = actors[2]
+        assert held == [worker.pid] and not delivered
+        assert (worker.pid, signal.SIGKILL) not in children.projection.events
+        physical = r2_kernel_process(worker.pid)
+        assert physical["birth"] == worker.native_birth
+        assert physical["pgid"] == os.getsid(worker.pid) == worker.pid and physical["ppid"] == os.getpid()
+        # Force the real zombie-before-closure schedule without invoking the patched poll or reaping.
+        signal.pidfd_send_signal(worker.native_handle, signal.SIGKILL)
+        watcher = select.poll()
+        watcher.register(worker.native_handle, select.POLLIN)
+        assert watcher.poll(5000), "the held child's independent exit did not complete"
+        report = children.case.close()
+        assert report["state"] == "CLOSED" and not report["errors"] and not report["unresolved_slots"]
+        assert not children.case.custody.quarantine.exists()
+        assert worker.wait(timeout=5) == -signal.SIGKILL
+        assert native_wait_fields(worker)["returncode"] == -signal.SIGKILL
+        assert worker.poll == delivery["poll"]
+        assert delivery["hook"]() == -signal.SIGKILL  # A retained callback must be disarmed too.
+        assert children.case.close() == report
+        return
     assert len(deferred) == 1 and deferred[0]["birth"] == actors[2].native_birth
+    assert held == delivered == ([actors[2].pid] if exit_after_live_read else [])
     assert native_wait_fields(actors[2])["returncode"] == -signal.SIGKILL
+    assert actors[2].poll() == actors[2].poll() == -signal.SIGKILL  # Repeated terminal observations never read /proc.
 
 
 @pytest.mark.parametrize("evidence", ["proven", "unproven"])
