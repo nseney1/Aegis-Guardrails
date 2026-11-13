@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+from contextlib import contextmanager
 import fnmatch
 import hashlib
 import io
@@ -20,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tokenize
@@ -285,10 +287,48 @@ def _mask_history(source, rel, history):
     return "\n".join(lines)
 
 
-def _tracked_text(path, root):
+def _regular_bytes(path, before):
+    """Validate and read one opened object, including platforms without no-follow."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise ValueError("cannot read listed text file")
+        # Retain ownership even if fdopen itself raises.
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(fd)
+
+
+def _tracked_text(path, root, tracked=True, expected_type=None):
+    """One read boundary for both counters, including every post-listing touch."""
     import codecs
 
-    raw = path.read_bytes()
+    try:
+        before = path.lstat()
+        mode = before.st_mode
+        if expected_type is not None and stat.S_IFMT(mode) != expected_type:
+            raise ValueError("cannot read listed text file")
+        link = stat.S_ISLNK(mode)
+        if not link and not stat.S_ISREG(mode):
+            if tracked and expected_type != stat.S_IFDIR:
+                raise ValueError("cannot read listed text file")
+            return None
+        raw = os.readlink(path) if link else _regular_bytes(path, before)
+    except (FileNotFoundError, NotADirectoryError):
+        if not tracked:
+            return None
+        raise ValueError("cannot read listed text file") from None
+    except OSError:
+        raise ValueError("cannot read listed text file") from None
+    if any(part.startswith(("aegis-mutant-", "aegis-mutants-")) for part in path.relative_to(root).parts):
+        raise ValueError("mutation scratch present in repository")
+    if link:
+        return raw, True
     encoding = "utf-8-sig"
     if raw.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
         encoding = "utf-32"
@@ -300,15 +340,18 @@ def _tracked_text(path, root):
         raise ValueError(f"cannot decode tracked text file: {path.relative_to(root).as_posix()}") from None
     if "\x00" in source:
         raise ValueError(f"cannot decode tracked text file: {path.relative_to(root).as_posix()}")
-    return source.replace("\r\n", "\n").replace("\r", "\n")
+    return source.replace("\r\n", "\n").replace("\r", "\n"), False
 
 
-def file_counts(path, root, words, ordinary=(), history=(), patterns=None):
+def file_counts(path, root, words, ordinary=(), history=(), patterns=None, *, content=None):
     rel = path.relative_to(root).as_posix()
     patterns = DEFAULT_ENGLISH_PATTERNS if patterns is None else patterns
-    if path.is_symlink():
-        return _filtered_counts([rel, os.readlink(path)], words, patterns)
-    source = _tracked_text(path, root)
+    content = _tracked_text(path, root) if content is None else content
+    if content is None:
+        return dict.fromkeys(words, 0)
+    source, link = content
+    if link:
+        return _filtered_counts([rel, source], words, patterns)
     if rel == "tests/contract/test_legacy_ratchet.py":
         source = _without_word_list(source)
     source = _mask_history(source, rel, history)
@@ -386,15 +429,37 @@ def _word_counts(texts, words):
 def repository_files(root):
     """Git's tracked and nonignored new files, including hidden configuration.
 
-    A deleted tracked path is absent from the working candidate. Never walk the
-    runtime state, a symlink target, or a sibling worktree.
+    Git's deleted-file view excludes pre-listing deletions. Preserve membership
+    thereafter without a racy stat/filter pass; tracked disappearance refuses.
     """
-    done = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    listed = {}
+    deleted = subprocess.run(
+        ["git", "ls-files", "--deleted", "-z"], cwd=root, check=True, stdout=subprocess.PIPE,
+    )
+    absent = set(deleted.stdout.decode("utf-8").split("\0"))
+    others = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         cwd=root, check=True, stdout=subprocess.PIPE,
     )
-    return [root / name for name in sorted(set(done.stdout.decode("utf-8").split("\0")))
-            if name and ((root / name).is_symlink() or (root / name).is_file())]
+    listed.update({root / name: (False, None) for name in others.stdout.decode("utf-8").split("\0") if name})
+    cached = subprocess.run(
+        ["git", "ls-files", "--cached", "--stage", "-z"], cwd=root, check=True, stdout=subprocess.PIPE,
+    )
+    types = {"100644": stat.S_IFREG, "100755": stat.S_IFREG, "120000": stat.S_IFLNK, "160000": stat.S_IFDIR}
+    for entry in cached.stdout.decode("utf-8").split("\0"):
+        if not entry:
+            continue
+        try:
+            metadata, name = entry.split("\t", 1)
+            mode, _, stage = metadata.split()
+            expected_type = types[mode]
+            if stage != "0":
+                raise ValueError
+        except (ValueError, KeyError):
+            raise ValueError("cannot list repository files") from None
+        if name not in absent:
+            listed[root / name] = (True, expected_type)
+    return dict(sorted(listed.items()))
 
 
 def _without_word_list(text):
@@ -463,13 +528,18 @@ def tree_counts(data=None, root=None):
     deferred = {rel: dict.fromkeys(REQUIRED_WORDS, 0) for rel in data.get("deferred", {})}
     files = {}
     all_paths = repository_files(root)
-    for path in all_paths:
+    contents = {}
+    for path, (tracked, expected_type) in all_paths.items():
+        content = _tracked_text(path, root, tracked, expected_type)
+        if content is not None:
+            contents[path] = content
+    for path, content in contents.items():
         rel = path.relative_to(root).as_posix()
         if rel in data.get("exempt_files", {}) or any(fnmatch.fnmatchcase(rel, p) for p in data.get("exempt_patterns", {})):
             continue
         counts = file_counts(path, root, REQUIRED_WORDS, data.get("ordinary_english", ()),
                              [*data.get("historical_sections", ()), *data.get("documented_removals", ())],
-                             data.get("ordinary_patterns", DEFAULT_ENGLISH_PATTERNS))
+                             data.get("ordinary_patterns", DEFAULT_ENGLISH_PATTERNS), content=content)
         if rel in data.get("deferred", {}):
             deferred[rel] = counts
         else:
@@ -479,10 +549,9 @@ def tree_counts(data=None, root=None):
     total.update(dict.fromkeys(ZERO_ROWS, 0))
     total[SNAPSHOT_ROW] = sum(sum(counts.values()) for rel, counts in files.items()
                               if rel in ("tests/contract/cli_tree.json", "tests/contract/mcp_tools.json"))
-    for path in all_paths:
-        if path.suffix != ".py" or path.is_symlink():
+    for path, (source, link) in contents.items():
+        if path.suffix != ".py" or link:
             continue
-        source = _tracked_text(path, root)
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
@@ -613,6 +682,922 @@ def test_the_record_keeps_every_required_row():
     assert "governance/debrief_queue.jsonl" not in data["exempt_files"]
     assert data["exempt_patterns"] == {"tests/fixtures/**": "Immutable fixture evidence; requires an owner successor pin."}
     assert all(entry["reason"] and entry["counts"] for entry in data["ordinary_english"])
+
+
+@pytest.fixture
+def external_scratch_root():
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="rf-external-scratch-") as root:
+        yield Path(root)
+
+
+@contextmanager
+def _git_environment(cwd=None):
+    names = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES")
+    saved = {name: os.environ.get(name) for name in names}
+    previous_cwd = Path.cwd()
+    try:
+        for name in names[:3]:
+            os.environ.pop(name, None)
+        if cwd is not None:
+            os.chdir(cwd)
+        yield
+    finally:
+        if cwd is not None:
+            os.chdir(previous_cwd)
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+@pytest.mark.parametrize("inside", [False, True], ids=["outside", "inside"])
+def test_mutation_scratch_stays_outside_checkout(tmp_path, monkeypatch, suffix, inside, external_scratch_root):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    scratch = (checkout if inside else external_scratch_root) / "scratch"
+    scratch.mkdir()
+    target = checkout / "package" / ("target" + suffix)
+    target.parent.mkdir()
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test = checkout / "test_target.py"
+    test.write_text(
+        (f"import sys\nsys.path.insert(0, {str(target.parent)!r})\nfrom target import add\n"
+         "def test_add():\n    assert add(2, 3) == 5\n") if suffix == ".py" else
+        "def test_ok():\n    assert True\n", encoding="utf-8",
+    )
+    real_tempfile = mutation_tester.tempfile
+    created = []
+
+    def temporary_directory(**kwargs):
+        kwargs.setdefault("dir", str(scratch))
+        directory = real_tempfile.TemporaryDirectory(**kwargs)
+        created.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(scratch), TemporaryDirectory=temporary_directory,
+    ))
+    # The external driver is a real boundary; no mutation-stage internals are patched.
+    from aegis_core.ast.schema import MutationPoint
+    point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
+    runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
+    for _ in range(2):
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+        if inside:
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+        else:
+            assert "survived" in result.detail, result.detail
+            assert result.verdict is (suffix == ".py"), result.detail
+    if inside:
+        assert created == []
+        return
+    assert len(created) == 2
+    assert all(checkout.resolve() not in directory.resolve().parents for directory in created)
+    assert all(REPO not in directory.resolve().parents for directory in created)
+    assert all(not directory.exists() for directory in created)
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "invalid", "permission"])
+def test_invalid_mutation_root_refuses_before_allocation(tmp_path, monkeypatch, kind):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    target = tmp_path / "target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test = tmp_path / "test_target.py"
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    candidate = tmp_path / "scratch"
+    if kind == "file":
+        candidate.write_text("regular file", encoding="utf-8")
+    if kind == "invalid":
+        candidate = "private\x00diagnostic"
+
+    class RefusingPath(type(tmp_path)):
+        def resolve(self, *args, **kwargs):
+            if self == candidate and kind == "permission":
+                raise PermissionError("private diagnostic")
+            return super().resolve(*args, **kwargs)
+
+    def forbidden_allocation(**kwargs):
+        pytest.fail("invalid root reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.Path", RefusingPath)
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=forbidden_allocation,
+    ))
+    for _ in range(2):
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+        assert result.verdict is False
+        assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+        assert result.lines == [-1]
+
+
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+@pytest.mark.parametrize("layout", ["root", "intermediate", "beside", "explicit"])
+def test_target_checkout_scratch_refuses_independently_of_candidate(monkeypatch, suffix, layout):
+    import tempfile
+    from types import SimpleNamespace
+    from aegis_core.ast.schema import MutationPoint
+    from aegis_core.verification import mutation_tester
+
+    with _git_environment(), tempfile.TemporaryDirectory(prefix="rf-root-boundary-") as directory:
+        checkout = Path(directory) / "checkout"
+        package = checkout / "src" / "package"
+        package.mkdir(parents=True)
+        if layout == "explicit":
+            metadata = Path(directory) / "metadata.git"
+            subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True)
+            os.environ["GIT_DIR"] = str(metadata)
+            os.environ["GIT_WORK_TREE"] = str(checkout)
+            assert not (checkout / ".git").exists()
+        else:
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        assert REPO not in checkout.parents
+        target = package / ("target" + suffix)
+        target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        test = package / "test_target.py"
+        test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        candidate = checkout / "scratch" if layout == "beside" else (
+            checkout / "src" if layout == "intermediate" else checkout
+        )
+        candidate.mkdir(exist_ok=True)
+
+        def forbidden_allocation(**kwargs):
+            pytest.fail("target checkout reached scratch allocation")
+
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+            gettempdir=lambda: str(candidate), TemporaryDirectory=forbidden_allocation,
+        ))
+        point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
+        runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
+        for _ in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+
+
+@pytest.mark.parametrize("inside", [False, True], ids=["sibling-control", "cwd-checkout"])
+@pytest.mark.parametrize("boundary_owner", ["cwd", "tool"])
+def test_cwd_and_tool_checkout_roots_are_scratch_boundaries(monkeypatch, inside, boundary_owner):
+    import tempfile
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    with _git_environment(), tempfile.TemporaryDirectory(prefix="rf-cwd-boundary-") as directory:
+        outer = Path(directory)
+        checkout, target_checkout = outer / "cwd-checkout", outer / "target-checkout"
+        subdir, package = checkout / "sub", target_checkout / "package"
+        subdir.mkdir(parents=True)
+        package.mkdir(parents=True)
+        for repo in (checkout, target_checkout):
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(outer)
+        target, test = package / "target.py", package / "test_target.py"
+        target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        test.write_text(f"import sys\nsys.path.insert(0, {str(package)!r})\nfrom target import add\n"
+                        "def test_add():\n    assert add(2, 3) == 5\n", encoding="utf-8")
+        candidate = (checkout if inside else outer) / "scratch"
+        candidate.mkdir()
+        real_tempfile = mutation_tester.tempfile
+        real_module_file = Path(mutation_tester.__file__)
+        installed_module = checkout / "installed" / "aegis_core" / "verification" / "mutation_tester.py"
+        installed_module.parent.mkdir(parents=True)
+        installed_module.write_text("# fixture module location\n", encoding="utf-8")
+        created = []
+
+        class CwdPath(type(Path())):
+            @classmethod
+            def cwd(cls):
+                return cls(subdir) if boundary_owner == "cwd" else super().cwd()
+
+            def resolve(self, *args, **kwargs):
+                if boundary_owner == "tool" and self == real_module_file:
+                    return type(self)(installed_module)
+                return super().resolve(*args, **kwargs)
+
+        def allocate(**kwargs):
+            if inside:
+                pytest.fail("cwd checkout reached scratch allocation")
+            manager = real_tempfile.TemporaryDirectory(**kwargs)
+            created.append(Path(manager.name))
+            return manager
+
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.Path", CwdPath)
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+            gettempdir=lambda: str(candidate), TemporaryDirectory=allocate,
+        ))
+        for _ in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            if inside:
+                assert result.verdict is False
+                assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+                assert result.lines == [-1]
+            else:
+                assert result.verdict is True, result.detail
+        assert len(created) == (0 if inside else 2)
+        assert all(not path.exists() for path in created)
+
+
+def test_broken_git_marker_still_bounds_mutation_scratch(monkeypatch):
+    import tempfile
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+    from tests.conftest import symlink_or_skip
+
+    with _git_environment(), tempfile.TemporaryDirectory(prefix="rf-broken-marker-") as directory:
+        checkout = Path(directory) / "checkout"
+        package = checkout / "package"
+        package.mkdir(parents=True)
+        symlink_or_skip("absent-metadata", checkout / ".git", target_is_directory=True)
+        target, test = package / "target.py", package / "test_target.py"
+        target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+        def forbidden_allocation(**kwargs):
+            pytest.fail("broken Git marker reached scratch allocation")
+
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+            gettempdir=lambda: str(checkout), TemporaryDirectory=forbidden_allocation,
+        ))
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+        assert result.verdict is False
+        assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+        assert result.lines == [-1]
+
+
+def test_mutation_root_symlink_into_checkout_is_refused(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+    from tests.conftest import symlink_or_skip
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    target = checkout / "target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test = checkout / "test_target.py"
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    alias = tmp_path / "outside-alias"
+    symlink_or_skip(checkout, alias, target_is_directory=True)
+
+    def forbidden_allocation(**kwargs):
+        pytest.fail("symlink into checkout reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(alias), TemporaryDirectory=forbidden_allocation,
+    ))
+    result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+
+
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+@pytest.mark.parametrize("invoked_from", ["other-checkout", "target-checkout"])
+@pytest.mark.parametrize("layout", ["relative", "absolute", "unresolved", "common-relative"])
+@pytest.mark.parametrize("external", [False, True], ids=["checkout-scratch", "external-scratch"])
+def test_explicit_layout_keeps_invocation_paths(
+    tmp_path, monkeypatch, suffix, invoked_from, layout, external, external_scratch_root,
+):
+    from types import SimpleNamespace
+    from aegis_core.ast.schema import MutationPoint
+    from aegis_core.verification import mutation_tester
+
+    checkout, other, metadata = tmp_path / "B", tmp_path / "A", tmp_path / "metadata.git"
+    package = checkout / "src" / "package"
+    package.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True)
+    target, test = package / ("target" + suffix), package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text(
+        (f"import sys\nsys.path.insert(0, {str(package)!r})\nfrom target import add\n"
+         "def test_add():\n    assert add(2, 3) == 5\n") if suffix == ".py" else
+        "def test_ok():\n    assert True\n", encoding="utf-8",
+    )
+    invocation = other if invoked_from == "other-checkout" else checkout
+
+    real_tempfile = mutation_tester.tempfile
+    allocated = []
+
+    def allocate(**kwargs):
+        if not external or layout == "unresolved":
+            pytest.fail("explicit checkout layout reached scratch allocation")
+        manager = real_tempfile.TemporaryDirectory(**kwargs)
+        allocated.append(Path(manager.name))
+        return manager
+
+    candidate = external_scratch_root / "scratch" if external or layout == "unresolved" else checkout
+    candidate.mkdir(exist_ok=True)
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=allocate,
+    ))
+    point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
+    runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
+    with _git_environment(invocation):
+        os.environ["GIT_DIR"] = str(metadata) if layout in ("absolute", "common-relative") else "../metadata.git"
+        os.environ["GIT_WORK_TREE"] = str(checkout) if layout in ("absolute", "common-relative") else "../B"
+        if layout == "unresolved":
+            os.environ["GIT_DIR"] = "../missing.git"
+        if layout == "common-relative":
+            os.environ["GIT_COMMON_DIR"] = "../metadata.git"
+        before = {name: os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+        if not external or layout == "unresolved":
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+            assert allocated == []
+        else:
+            assert "survived" in result.detail, result.detail
+            assert result.verdict is (suffix == ".py"), result.detail
+            assert len(allocated) == 1
+            assert allocated[0].parent == candidate
+            assert not allocated[0].exists()
+        assert {name: os.environ.get(name) for name in before} == before
+
+
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+@pytest.mark.parametrize("candidate_at", ["root", "intermediate", "beside"])
+@pytest.mark.parametrize("layout", ["missing", "file", "disjoint", "implicit", "valid"])
+def test_explicit_worktree_must_be_established_before_allocation(
+    monkeypatch, external_scratch_root, suffix, candidate_at, layout,
+):
+    from types import SimpleNamespace
+    from aegis_core.ast.schema import MutationPoint
+    from aegis_core.verification import mutation_tester
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    metadata_owner = external_scratch_root / "metadata-owner"
+    package = checkout / "src" / "package"
+    package.mkdir(parents=True)
+    for root in (other, metadata_owner):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    target, test = package / ("target" + suffix), package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    worktree = external_scratch_root / "unresolved-worktree"
+    if layout == "valid":
+        worktree = checkout
+    elif layout == "file":
+        worktree.write_text("regular file\n", encoding="utf-8")
+    elif layout == "disjoint":
+        worktree.mkdir()
+    candidate = checkout if candidate_at == "root" else (
+        checkout / "src" if candidate_at == "intermediate" else checkout / "scratch"
+    )
+    candidate.mkdir(exist_ok=True)
+
+    def forbidden_allocation(**kwargs):
+        pytest.fail("unestablished explicit worktree reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=forbidden_allocation,
+    ))
+    point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
+    runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
+    with _git_environment(other):
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(external_scratch_root)
+        os.environ["GIT_DIR"] = "../metadata-owner/.git"
+        if layout != "implicit":
+            os.environ["GIT_WORK_TREE"] = "../" + worktree.name
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+
+
+@pytest.mark.parametrize("boundary_owner", ["cwd", "tool"])
+def test_explicit_layout_cannot_invent_a_disjoint_context_boundary(
+    monkeypatch, external_scratch_root, boundary_owner,
+):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    metadata_owner = external_scratch_root / "metadata-owner"
+    context = external_scratch_root / "C" / "sub"
+    package = checkout / "package"
+    package.mkdir(parents=True)
+    context.mkdir(parents=True)
+    for root in (other, metadata_owner):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    target, test = package / "target.py", package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    if boundary_owner == "tool":
+        installed = context / "aegis_core" / "verification" / "mutation_tester.py"
+        installed.parent.mkdir(parents=True)
+        installed.write_text("# fixture module location\n", encoding="utf-8")
+        monkeypatch.setattr("aegis_core.verification.mutation_tester.__file__", str(installed))
+    invocation = context if boundary_owner == "cwd" else other
+
+    def forbidden_allocation(**kwargs):
+        pytest.fail("disjoint context fallback reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(context.parent), TemporaryDirectory=forbidden_allocation,
+    ))
+    with _git_environment(invocation):
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(external_scratch_root)
+        os.environ["GIT_DIR"] = os.path.relpath(metadata_owner / ".git", invocation)
+        os.environ["GIT_WORK_TREE"] = os.path.relpath(checkout, invocation)
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+
+
+def test_explicit_worktree_must_match_reported_toplevel(monkeypatch, external_scratch_root):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    metadata_owner = external_scratch_root / "metadata-owner"
+    package = checkout / "package"
+    package.mkdir(parents=True)
+    for root in (other, metadata_owner):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    target, test = package / "target.py", package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    candidate = external_scratch_root / "external-scratch"
+    candidate.mkdir()
+
+    def forbidden_allocation(**kwargs):
+        pytest.fail("mismatched native toplevel reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=forbidden_allocation,
+    ))
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.gitsafe", SimpleNamespace(
+        **{**vars(mutation_tester.gitsafe), "toplevel": lambda _: other},
+    ))
+    with _git_environment(other):
+        os.environ["GIT_CEILING_DIRECTORIES"] = str(external_scratch_root)
+        os.environ["GIT_DIR"] = "../metadata-owner/.git"
+        os.environ["GIT_WORK_TREE"] = "../B"
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
+@pytest.mark.parametrize("malformed", ["oversized", "nul", "expanded"])
+def test_git_layout_limits_refuse_before_path_or_runner(tmp_path, monkeypatch, name, malformed):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    target, test = tmp_path / "target.py", tmp_path / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    value = "private\x00diagnostic" if malformed == "nul" else "x" * (65537 if malformed == "oversized" else 65536)
+
+    class BoundedPath(type(tmp_path)):
+        def __truediv__(self, part):
+            if malformed != "expanded" and part == value:
+                pytest.fail("invalid Git layout reached path parsing")
+            return super().__truediv__(part)
+
+    def forbidden_runner(**kwargs):
+        pytest.fail("invalid Git layout reached the runner")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.Path", BoundedPath)
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.gitsafe", SimpleNamespace(
+        **{**vars(mutation_tester.gitsafe), "custody": forbidden_runner},
+    ))
+    # Model the OS boundary without putenv rejecting malformed/oversized values
+    # first (Windows also bounds individual environment values).
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.os", SimpleNamespace(
+        **{**vars(os), "environ": {name: value}},
+    ))
+    result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+
+
+def test_git_runner_policy_refusal_has_fixed_public_message(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aegis_core.errors import AegisError
+    from aegis_core.verification import mutation_tester
+
+    target, test = tmp_path / "target.py", tmp_path / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    calls = []
+
+    def refused_runner(**kwargs):
+        calls.append(kwargs)
+        raise AegisError("private diagnostic")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.gitsafe", SimpleNamespace(
+        **{**vars(mutation_tester.gitsafe), "custody": refused_runner},
+    ))
+    with _git_environment():
+        os.environ["GIT_DIR"] = str(tmp_path / "metadata.git")
+        os.environ["GIT_WORK_TREE"] = str(tmp_path)
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+    assert result.verdict is False
+    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.lines == [-1]
+    assert len(calls) == 1
+
+
+def test_explicit_layout_preserves_closest_marker_boundary(monkeypatch, external_scratch_root):
+    from types import SimpleNamespace
+    from aegis_core.ast.schema import MutationPoint
+    from aegis_core.verification import mutation_tester
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    nested = checkout / "nested"
+    package = nested / "package"
+    package.mkdir(parents=True)
+    for root in (other, nested):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    metadata = external_scratch_root / "metadata.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True)
+    target, test = package / "target.rs", package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    candidate = checkout / "scratch"
+    candidate.mkdir()
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.__file__",
+                        str(other / "aegis_core" / "verification" / "mutation_tester.py"))
+    real_tempfile = mutation_tester.tempfile
+    allocated = []
+
+    def allocate(**kwargs):
+        manager = real_tempfile.TemporaryDirectory(**kwargs)
+        allocated.append(Path(manager.name))
+        return manager
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=allocate,
+    ))
+    point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
+    runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
+    with _git_environment(other):
+        os.environ.update(GIT_DIR=str(metadata), GIT_WORK_TREE=str(checkout))
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+    assert "survived" in result.detail, result.detail
+    assert len(allocated) == 1
+    assert allocated[0].parent == candidate
+    assert not allocated[0].exists()
+
+
+@pytest.mark.parametrize("index_mode", ["100644", "100755"])
+@pytest.mark.parametrize("replacement", ["symlink", "fifo"])
+@pytest.mark.parametrize("surface", ["tree_counts", "file_counts"])
+def test_indexed_regular_replaced_after_lstat_refuses(tmp_path, index_mode, replacement, surface):
+    from tests.conftest import symlink_or_skip
+
+    if replacement == "fifo" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO creation requires POSIX mkfifo")
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    path = checkout / "sample.py"
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "sample.py"], cwd=checkout, check=True)
+    subprocess.run(["git", "update-index", "--chmod=" + ("+x" if index_mode == "100755" else "-x"),
+                    "sample.py"], cwd=checkout, check=True)
+    readable = tmp_path / "readable.py"
+    readable.write_text("pass\n", encoding="utf-8")
+    prepared = tmp_path / "prepared"
+    if replacement == "symlink":
+        symlink_or_skip(readable, prepared)
+    else:
+        os.mkfifo(prepared)
+    # A child bounds the old FIFO hang and is killed/reaped by subprocess.run.
+    script = '''
+import os
+from pathlib import Path
+import sys
+from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, file_counts, tree_counts
+
+checkout, prepared, surface = sys.argv[1:]
+class SwapPath(type(Path())):
+    def lstat(self):
+        before = super().lstat()
+        if self.name == "sample.py":
+            os.replace(prepared, self)
+        return before
+
+root = SwapPath(checkout)
+try:
+    if surface == "tree_counts":
+        tree_counts({}, root)
+    else:
+        file_counts(root / "sample.py", root, REQUIRED_WORDS)
+except ValueError as exc:
+    assert str(exc) == "cannot read listed text file", str(exc)
+else:
+    raise AssertionError("replacement was read instead of refused")
+'''
+    try:
+        done = subprocess.run([sys.executable, "-c", script, str(checkout), str(prepared), surface],
+                              cwd=REPO, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("regular-file read blocked on a replacement FIFO")
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("replace", [False, True], ids=["same-object", "different-object"])
+def test_regular_read_without_nofollow_checks_opened_identity(tmp_path, monkeypatch, replace):
+    from types import SimpleNamespace
+
+    path, other = tmp_path / "sample.py", tmp_path / "other.py"
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    other.write_text("pass\n", encoding="utf-8")
+    original_os, opened = os, []
+
+    def open_file(candidate, flags):
+        fd = original_os.open(other if replace else candidate, flags)
+        opened.append(fd)
+        return fd
+
+    # Exercise the Windows-equivalent identity path on every host.
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet.os", SimpleNamespace(
+        **{**vars(os), "O_NOFOLLOW": 0, "O_NONBLOCK": 0, "open": open_file},
+    ))
+    if replace:
+        with pytest.raises(ValueError, match="^cannot read listed text file$"):
+            file_counts(path, tmp_path, REQUIRED_WORDS)
+    else:
+        assert file_counts(path, tmp_path, REQUIRED_WORDS)[REQUIRED_WORDS[0]] == 1
+    assert len(opened) == 1
+    with pytest.raises(OSError) as exc:
+        original_os.fstat(opened[0])
+    import errno
+    assert exc.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=["untracked", "tracked"])
+@pytest.mark.parametrize("removal", ["file", "parent", "parent-replaced"])
+def test_listing_to_read_removal_is_classified(tmp_path, monkeypatch, tracked, removal):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "notes" / "sample.py"
+    path.parent.mkdir()
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    if tracked:
+        subprocess.run(["git", "add", "notes/sample.py"], cwd=tmp_path, check=True)
+    original = repository_files
+    listed_ready, resume_read = Event(), Event()
+
+    def list_then_wait(root):
+        listed = original(root)
+        listed_ready.set()
+        assert resume_read.wait(5), "test did not release scanner read"
+        return listed
+
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet.repository_files", list_then_wait)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            scan = pool.submit(tree_counts, {}, tmp_path)
+            try:
+                assert listed_ready.wait(5), "scanner did not finish listing"
+                path.unlink()
+                if removal != "file":
+                    path.parent.rmdir()
+                if removal == "parent-replaced":
+                    path.parent.write_text("replacement", encoding="utf-8")
+            finally:
+                resume_read.set()
+            if tracked:
+                with pytest.raises(ValueError, match="^cannot read listed text file$"):
+                    scan.result(timeout=5)
+            else:
+                assert not any(scan.result(timeout=5)[0].values())
+    finally:
+        monkeypatch.setattr("tests.contract.test_legacy_ratchet.repository_files", original)
+    if removal == "parent-replaced":
+        path.parent.unlink()
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=["untracked", "tracked"])
+@pytest.mark.parametrize("original_type,replacement", [
+    ("regular", "directory"), ("regular", "symlink"), ("regular", "fifo"),
+    ("symlink", "regular"), ("symlink", "directory"), ("symlink", "fifo"),
+])
+def test_listed_file_type_replacement_is_classified(tmp_path, monkeypatch, tracked, original_type, replacement):
+    from tests.conftest import symlink_or_skip
+
+    if replacement == "fifo" and (os.name != "posix" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO creation requires POSIX mkfifo")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "sample.py"
+    if original_type == "symlink":
+        symlink_or_skip(REQUIRED_WORDS[0], path)
+    else:
+        path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    if tracked:
+        subprocess.run(["git", "add", "sample.py"], cwd=tmp_path, check=True)
+    original = repository_files
+
+    def list_then_replace(root):
+        listed = original(root)
+        path.unlink()
+        if replacement == "directory":
+            path.mkdir()
+        elif replacement == "regular":
+            path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+        elif replacement == "symlink":
+            symlink_or_skip("missing-target", path)
+        else:
+            os.mkfifo(path)
+        return listed
+
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet.repository_files", list_then_replace)
+    try:
+        if tracked:
+            with pytest.raises(ValueError, match="^cannot read listed text file$"):
+                tree_counts({}, tmp_path)
+        else:
+            assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == (1 if replacement == "regular" else 0)
+    finally:
+        monkeypatch.setattr("tests.contract.test_legacy_ratchet.repository_files", original)
+    if replacement == "directory":
+        path.rmdir()
+    else:
+        path.unlink()
+    if original_type == "symlink":
+        symlink_or_skip(REQUIRED_WORDS[0], path)
+    else:
+        path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+
+
+def test_indexed_directory_entry_is_not_read_as_source(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "submodule").mkdir()
+    subprocess.run(["git", "update-index", "--add", "--cacheinfo", "160000," + "1" * 40 + ",submodule"],
+                   cwd=tmp_path, check=True)
+    counts, _, files = tree_counts({}, tmp_path)
+    assert not any(counts.values())
+    assert "submodule" not in files
+
+
+def test_unmerged_index_refuses_with_fixed_listing_message(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "sample.py").write_text("LABEL = 0\n", encoding="utf-8")
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=tmp_path,
+                          input=b"LABEL = 0\n", check=True, stdout=subprocess.PIPE).stdout.strip()
+    subprocess.run(["git", "update-index", "--index-info"], cwd=tmp_path, check=True,
+                   input=b"100644 " + blob + b" 1\tsample.py\n")
+    with pytest.raises(ValueError, match="^cannot list repository files$"):
+        tree_counts({}, tmp_path)
+
+
+def test_executable_index_mode_is_still_regular_source(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "sample.py"
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "sample.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "update-index", "--chmod=+x", "sample.py"], cwd=tmp_path, check=True)
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+
+
+def test_python_count_and_ast_share_one_read(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "sample.py"
+    path.write_text("import " + REQUIRED_WORDS[0] + "_x\n", encoding="utf-8")
+    original = _tracked_text
+    reads = []
+
+    def read_then_remove(*args, **kwargs):
+        content = original(*args, **kwargs)
+        reads.append(args[0])
+        path.unlink()
+        return content
+
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet._tracked_text", read_then_remove)
+    counts, _, _ = tree_counts({}, tmp_path)
+    assert reads == [path]
+    assert counts[REQUIRED_WORDS[0]] == 1
+    assert counts[ZERO_ROWS[0]] == 1
+
+
+def test_present_mutation_scratch_is_refused(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "aegis-mutants-example" / "_aegis_mutant_swap.py"
+    path.parent.mkdir()
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="^mutation scratch present in repository$"):
+        tree_counts({}, tmp_path)
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=["untracked", "tracked"])
+@pytest.mark.parametrize("operation", ["lstat", "open", "fstat", "fdopen", "read"])
+def test_scanner_io_errors_refuse_then_retry(tmp_path, monkeypatch, tracked, operation):
+    import errno
+    from types import SimpleNamespace
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "sample.py"
+    path.write_text("LABEL = " + repr(REQUIRED_WORDS[0]) + "\n", encoding="utf-8")
+    if tracked:
+        subprocess.run(["git", "add", "sample.py"], cwd=tmp_path, check=True)
+
+    class FailingPath(type(tmp_path)):
+        def lstat(self):
+            if self.name == path.name and operation == "lstat":
+                raise PermissionError("private diagnostic")
+            return super().lstat()
+
+    original_os, opened = os, []
+
+    def open_file(*args, **kwargs):
+        if operation == "open":
+            raise PermissionError("private diagnostic")
+        fd = original_os.open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def fstat(fd):
+        if operation == "fstat":
+            raise OSError("private diagnostic")
+        return original_os.fstat(fd)
+
+    def fdopen(*args, **kwargs):
+        if operation == "fdopen":
+            raise OSError("private diagnostic")
+
+        return read_stream(*args, **kwargs)
+
+    @contextmanager
+    def read_stream(*args, **kwargs):
+        with original_os.fdopen(*args, **kwargs) as stream:
+            def refused_read():
+                raise OSError("private diagnostic")
+            yield SimpleNamespace(read=refused_read) if operation == "read" else stream
+
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet.os", SimpleNamespace(
+        **{**vars(os), "open": open_file, "fstat": fstat, "fdopen": fdopen},
+    ))
+    try:
+        with pytest.raises(ValueError, match="^cannot read listed text file$"):
+            tree_counts({}, FailingPath(tmp_path))
+    finally:
+        monkeypatch.setattr("tests.contract.test_legacy_ratchet.os", original_os)
+    assert len(opened) == (0 if operation in ("lstat", "open") else 1)
+    for fd in opened:
+        with pytest.raises(OSError) as exc:
+            original_os.fstat(fd)
+        assert exc.value.errno == errno.EBADF
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=["untracked", "tracked"])
+@pytest.mark.parametrize("failure", ["vanished", "permission"])
+def test_symlink_read_failure_is_classified_then_retried(tmp_path, monkeypatch, tracked, failure):
+    from types import SimpleNamespace
+    from tests.conftest import symlink_or_skip
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    link = tmp_path / "sample.link"
+    symlink_or_skip(REQUIRED_WORDS[0], link)
+    if tracked:
+        subprocess.run(["git", "add", "sample.link"], cwd=tmp_path, check=True)
+    real_os = os
+    real_readlink = os.readlink
+
+    def refused_readlink(path):
+        if failure == "permission":
+            raise PermissionError("private diagnostic")
+        link.unlink()
+        return real_readlink(path)
+
+    os_api = SimpleNamespace(**{**vars(os), "readlink": refused_readlink})
+    monkeypatch.setattr("tests.contract.test_legacy_ratchet.os", os_api)
+    try:
+        if tracked or failure == "permission":
+            with pytest.raises(ValueError, match="^cannot read listed text file$"):
+                tree_counts({}, tmp_path)
+        else:
+            assert not any(tree_counts({}, tmp_path)[0].values())
+    finally:
+        monkeypatch.setattr("tests.contract.test_legacy_ratchet.os", real_os)
+    if failure == "vanished":
+        symlink_or_skip(REQUIRED_WORDS[0], link)
+    assert tree_counts({}, tmp_path)[0][REQUIRED_WORDS[0]] == 1
 
 
 def test_all_counts_match_their_nonincreasing_records():
