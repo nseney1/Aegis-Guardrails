@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -320,6 +320,66 @@ Preview model selection as JSON; --record atomically selects and appends. Errors
 | `--lane-family` | `LANE_FAMILY` |  | Lane family required for T3; writer lanes must match team_family |
 | `--review-stage` | `REVIEW_STAGE` | `"primary"` | Review stage: primary, correctness, security, whole or second as allowed by the task |
 | `--record` |  |  | Atomically select and append under the history lock (60-second timeout); default preview |
+
+### `aegis team queue`
+
+Manage queued team work with CAS leases
+
+Queue add, list, claim, release, done and audit; all results are JSON.
+
+Subcommands: `add`, `audit`, `claim`, `done`, `list`, `release`.
+
+### `aegis team queue add`
+
+Enqueue a bounded inline JSON item
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--item` | `JSON` |  | Queue item object; no file paths are opened |
+
+### `aegis team queue audit`
+
+Report held work needing a decision
+
+### `aegis team queue claim`
+
+Claim a current item revision with a lease
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by add or list |
+| `--lane` | `LANE` |  | Lane declared in .aegis/team.json |
+| `--capability` | `CAPABILITIES` |  | Team capability label; repeat for each label |
+| `--ttl` | `SECONDS` | `3600` | Claim lifetime, at most one day |
+
+### `aegis team queue done`
+
+Complete a live claim
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by claim or list |
+| `--lane` | `LANE` |  | Current claim lane; required for a live claim |
+
+### `aegis team queue list`
+
+List items, blockers and lane labels
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--capability` | `CAPABILITIES` |  | Filter by a team capability label; repeat for each label |
+
+### `aegis team queue release`
+
+Release a claim
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by claim or list |
+| `--lane` | `LANE` |  | Current claim lane; required for a live claim |
 
 ### `aegis team release`
 
