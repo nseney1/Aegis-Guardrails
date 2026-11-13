@@ -12,7 +12,7 @@ python3 -I -B tools/hierarchy_jobs.py --store /absolute/store recovery-status
 python3 -I -B tools/hierarchy_jobs.py --store /absolute/store recovery-status --initiative engine
 ```
 
-`recovery_status(store_path, chosen=())` returns `(exit_code, report)`. The report
+`recovery_status(store_path, chosen=(), recipes_path=None)` returns `(exit_code, report)`. The report
 uses `aegis.hierarchy-recovery-status/v1` and includes `read_only`, `capacity`,
 `initiatives`, `jobs`, and `blockers`. Each blocker names an accountable owner
 and next action. Code 0 means no observed outstanding recovery obligation;
@@ -21,12 +21,116 @@ store cannot be read. None of these codes establishes native qualification,
 independent acceptance, or permission to execute. An empty mailbox is not proof
 that the resource ledger or retained job directories are empty.
 
-The capacity view describes ledger reservations. `recovery-status` takes no
-recipes and always reports the raw process census with count semantics: outside
+The capacity view describes ledger reservations. `recovery-status` always
+reports the raw process census with count semantics: outside
 work reduces its observed available slots. Unavailable census evidence leaves
 available capacity unknown. The census sees the current process namespace; it
 does not qualify a host-wide observer or discover processes hidden by an
 unsupported host boundary.
+For an unsettled planned persisted admission, optionally supply
+`--recipes /absolute/recipes.json` before or after `recovery-status`. Reporting
+captures and hashes those bounded recipe bytes once per report, on the first
+unsettled admission that needs them. Every such row uses the same captured
+digest, including the same unavailable observation if acquisition failed.
+Reporting does not execute recipes or apply their census policy.
+
+| Planned job evidence | Recovery state and blocking behavior |
+| --- | --- |
+| Terminal result exists | Existing result, receipt and process checks determine `finished`, `settle_pending` or a refusal; current recipes are neither read nor rechecked. Completed and failed results both retain this behavior after team init regenerates recipes. Source uses the retained result's dirty-content digest and its `after` witness when present. |
+| Unsettled admission, supplied recipe bytes match | `admitted`, with the existing pending-work blocker and instruction to recheck with `run-open`. |
+| Unsettled admission, supplied recipe bytes mismatch | `evidence_error`, a blocker with the fixed admission-content failure detail. |
+| Unsettled admission, recipe bytes absent or unavailable | `admission_unverified`, a blocker with source unavailable and a fixed command requesting trusted recipes. The source has `recipe_bytes_unavailable: true`; the blocker has its own `admission_unverified` reason and the same next action. It cannot verify admission or authorize execution. |
+
+Every unsettled admission remains an outstanding recovery obligation and makes
+`recovery-status` exit 3, including one holding a granted reservation or with a
+live staging runner. The explicit recipe-unavailable flag alone selects
+`admission_unverified` from an admitted row. A missing mailbox request or an
+admission marker changed between reporting probes keeps the earlier blocking
+state and its existing guidance; it does not ask for recipes already supplied.
+
+`recovery_job` produces these rows; `recovery_status` inventories them and its
+CLI returns 0 when no recovery obligation remains. `run-open` does not consume
+these reporting states: its existing admission, custody and terminal-result
+settlement paths are unchanged, including settlement after recipes change.
+No-plan reporting retains its historical bytes and does not read a supplied
+recipe file.
+When a terminal dirty-content digest is needed without an `after` witness,
+it must be a lowercase 64-hex SHA-256 value. An invalid value leaves source
+unavailable with the fixed reason `terminal source digest unverified` and
+does not copy that value into the report. The source also sets
+`terminal_source_unverified: true`. A `finished` row with a matching receipt
+then has a `source_unavailable` blocker and makes recovery-status exit 3. Only
+that finished state gets the terminal-source next action: preserve the result
+and claim while reconciling terminal source evidence. A `settle_pending` row
+keeps its own blocker reason and its instruction that run-open may settle
+without rerunning the job, even if its terminal digest is malformed. Current
+recipes are not rechecked.
+
+Planned provenance copied into a result by resolve, execution or refusal uses
+bounded descriptor-based captures of admitted.json and derivation.json. The
+captured derivation hash must match its captured admission binding before any
+derivation decoding or parsing. Dirty-content and host-plan SHA-256 values must
+be lowercase 64-hex strings; the expected tree must be a valid Git object ID.
+Captured invalid provenance refuses resolve with code 2 and the fixed reason
+`derivation provenance unverified`, before a result, receipt or capacity
+release. Its fixed next action preserves admitted.json and derivation.json,
+asks for binding repair and stopped-process revalidation, then retries resolve.
+A captured invalid binding is checked before derivation acquisition, so a
+missing derivation file cannot conceal that refusal.
+
+Unbound or unavailable provenance does not prevent resolving a stopped planned
+job. Resolve copies none of the derivation fields and persists only the fixed
+`provenance_unverified: true` marker. It settles the failed result and releases
+the job's reservations normally. The unavailable derivation file stays on disk
+and is omitted from receipt evidence, so a missing, unreadable or replaced node
+cannot obstruct settlement or receipt reconciliation. Recovery reports this
+result's source as unavailable, with `terminal_source_unverified: true`; a
+finished row therefore has the source-unavailable blocker and owner-verification
+next action described above. The marker records an outstanding independent
+source-verification obligation, not execution permission or verified source.
+Only the literal true value is valid when this planned-result marker is present.
+
+For a planned `derive: runner` request, absence of both published records is
+unavailable provenance, including a stopped runner before derivation publication
+or failure to publish the record. Resolve records the unverified marker and
+settles; refusal does the same for missing records without clearing retained
+metadata uncertainty or an admission-content failure. Recovery keeps its
+source-unavailable blocker and operator next action. Only a planned request
+known never to derive can legitimately omit provenance entirely.
+
+The derive decision comes from the validated request and recipe captured during
+admission. A fresh resolve reads the original request through bounded directory
+descriptors, checks its recorded SHA-256 before parsing, and reads its derive
+declaration. An unavailable or unverified request stays unknown; file absence
+does not classify it as a non-derive job. Current recipe bytes are not rechecked.
+
+Execution retains strict provenance acquisition. Refusal's missing-record
+exception does not bypass a captured invalid binding or other unavailable
+metadata checks. An unverified refusal includes the result and step evidence
+without derivation evidence, whether a derivation file appears later or not.
+A fresh staging
+failure has no successful admission binding: its
+current admission owner retains its computed provenance in memory for the
+refusal result and does not reread an unbound file. This cache is limited to an
+unvalidated attempt without metadata uncertainty or retained admission failure;
+successful admission clears it. A later recovery report
+with only that unbound staging file leaves source unavailable with the same
+fixed provenance reason.
+
+The provider view forwards optional trusted recipes through
+`job_status(store_path, job_id, recipes_path=None)` to the same inventory. Its
+`projection` preserves the states above, with no provider-to-job authority or
+new execution permission. Its `job` CLI accepts `--recipes` before or after
+the subcommand; omission selects the recipe-unavailable blocking projection
+for an unsettled planned admission. This read-only provider CLI retains code 0
+for a successful projection (including a projected `evidence_error`) and code 2
+for an invalid request or unreadable store.
+
+```sh
+python3 -I -B tools/hierarchy_jobs.py --store /absolute/store recovery-status --recipes /absolute/recipes.json
+python3 -I -B tools/hierarchy_provider_recovery.py --store /absolute/store job --job engine/original --recipes /absolute/recipes.json
+```
+
 Admission with `"report"` or `"ignore"` may therefore proceed when this count-only
 recovery view shows no available slots.
 
@@ -403,13 +507,59 @@ All rows above make `run-open` exit 3, including `execution_custody_unknown`.
   Its live staging runner still reports running; a stopped or unverified staging
   runner reports unknown custody without publishing an unknown receipt or treating
   its staging claim as an execution fence. Only a bounded descriptor-based read
-  yielding a positive integer supplies its process-group diagnostic; failures leave
-  that diagnostic unknown. A refusal receipt cannot turn an observed
+  yielding a positive integer supplies a planned consumer's process-group diagnostic;
+  malformed values, oversized files, replaced nodes and unsupported descriptor
+  platforms leave that diagnostic unknown. Planned process-record consumers,
+  including census exemptions, use the same bounded descriptor reader. An invalid planned record
+  never proves a stopped process: settlement and manual resolution refuse it,
+  and a stopped claimant retains unknown custody. Once a read is refused, a
+  replacement or disappearance cannot clear that uncertainty within the attempt;
+  a fresh attempt can validate repaired evidence. Planned process-metadata
+  refusals direct the owner to repair or remove the job's process.json and
+  revalidate stopped-process evidence before retrying recovery or settlement;
+  stopped-runner unknown-custody rows include that same fixed next action.
+  Each planned liveness or settlement decision uses one captured process record
+  for both group liveness and the unrecorded-step check. A later record cannot
+  erase a null-group launch or substitute a live group without a liveness check.
+  A recovery row uses this same snapshot for its `process_alive` diagnostic and
+  its admission-state decision.
+  A process node observed present and then missing during acquisition records
+  uncertainty; only initial absence remains ordinary absence.
+  Planned recovery reporting also classifies admission markers without following
+  links. Only a regular marker can report admitted; a directory or unverified
+  marker retains unknown custody and reports its source as unavailable.
+  Failed revalidation of captured, parsed planned admission content retains a fixed, bounded `detail`:
+  `recipes changed after admission` or `persisted admission revalidation failed`.
+  No file text is copied into that diagnostic. Captured derivation bytes are
+  checked against their admission-bound hash before any decoding or parsing.
+  Planned admission and derivation decode/parse failures use one fixed message,
+  `persisted admission revalidation failed`, including recovery-status reporting;
+  duplicate JSON keys and malformed bytes cannot echo file text. A parse failure
+  after the derivation hash is verified retains the fixed admission detail.
+  Unavailable metadata, failed metadata probes and unparseable admission markers
+  do not acquire a `detail` field, preserving their unknown-custody row shape.
+  All three admission digests must be lowercase 64-hex SHA-256 values, checked
+  against the actual captured packet, derivation and recipe bytes. Unsettled
+  planned recovery compares the report's captured recipe digest instead of
+  accepting a stored value as its own expected digest. Settled recovery uses
+  the terminal result without rechecking admission against current recipes.
+  A failed content check remains latched for the attempt,
+  including fallback refusal; a saved packet cannot validate against itself or
+  clear the retained detail. Planned refusal uses the original mailbox packet
+  captured during admission, and only a fresh attempt can revalidate repaired
+  content. Admission failure cannot publish execution, a terminal receipt, or
+  release retained capacity through that fallback.
+  A vanished job directory first
+  encountered by `result()` after admission or claim observation also records
+  attempt-wide uncertainty. A refusal receipt cannot turn an observed
   execution claim or result into unstarted work.
   A retained validated terminal result requires retrying settlement without
   repeating execution; live or unknown custody retains its preservation guidance.
-  For an initiative without a host plan, legacy recovery row bytes remain unchanged, including the
-  extra reconciliation diagnostic for the released, unexecuted job.
+  For an initiative without a host plan, legacy output bytes remain unchanged,
+  including malformed `process_group` values in historical rows and the extra
+  reconciliation diagnostic for the released, unexecuted job. This compatibility
+  rule takes precedence over planned process-group opacity; no-plan process
+  parsing and refusal behavior retain their historical reader.
   Legacy parser refusal codes and error bytes also remain unchanged; the shared
   verifier still records uncertain custody for those failed reads.
   A dangling result remains absent for legacy settlement, dependency and recovery
