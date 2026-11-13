@@ -1,10 +1,7 @@
 """Scoped stdio access to the pilot's file protocol, outside Aegis core.
 
-Launch through hierarchy_mailbox.py serve, which supports isolated Python imports.
-The configured sender is provenance, not an authenticated native host identity.
-ROOT gets only a decision adapter over the lifecycle journal, never the mailbox tools. It may also be launched
-through this file's own serve, which adds ROOT's read-only --loop-state and --evidence; the pinned mailbox CLI
-cannot carry them.
+Launch legacy mail through hierarchy_mailbox.py serve. Configured provenance is not native authentication.
+This entry adds ROOT's decision/read adapter and explicit --records adoption for mailbox roles.
 """
 import argparse
 from contextlib import contextmanager, nullcontext
@@ -16,8 +13,7 @@ from pathlib import Path
 import sys
 import time
 
-# Old provisioned profiles may still call the mailbox entry directly. Fence that route before importing
-# peers, while keeping the standalone two-file mailbox adapter independent of the provisioning runtime.
+# Fence old provisioned entries before peer imports; standalone mail needs no provisioner.
 if "serve" in sys.argv[1:] and not getattr(sys, "_aegis_verified_runtime_entry", None):
     early = argparse.ArgumentParser(add_help=False)
     early.add_argument("--root")
@@ -95,13 +91,20 @@ def _response_line(response):
     return (json.dumps(response, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _tool_result(result):
-    return {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}
+RECORD_TOOLS = frozenset(("mailbox_publish_record", "mailbox_read_record", "mailbox_digest"))
+RECORD_UNAVAILABLE = {"error": {"code": "E_AUTH", "message": "record adapter unavailable from this checkout"}}
+
+
+def _tool_result(result, record=False):
+    text = result if record and type(result) is str else json.dumps(result, sort_keys=True)
+    answer = {"content": [{"type": "text", "text": text}]}
+    if record and type(result) is dict and "error" in result:
+        answer["isError"] = True
+    return answer
 
 
 def _board_fragment_size(value):
-    # _tool_result embeds ASCII JSON in a string; _response_line escapes that string.
-    # Exclude the outer string quotes. Default list separators remain two bytes.
+    # Nested JSON escaping, without outer quotes; default list separators use two bytes.
     return len(json.dumps(json.dumps(value, sort_keys=True))) - 2
 
 
@@ -152,9 +155,7 @@ SELF_SPEC = ("Show what this connection is configured as: endpoint, role, host, 
              "is configuration, not authentication. Changes nothing.", {}, [])
 
 
-# The readiness and result shapes the pinned validator in hierarchy_mailbox.py checks (Mailbox.readiness and
-# Mailbox.completion). That file cannot change here, so a test parses its source and compares; this only teaches the
-# shape at the moment of the call, and the validator stays the check.
+# Keep readiness/result schemas equal to the pinned validators; tests compare their source.
 GIT_PATTERN = "^%s$" % GIT_ID.pattern
 TEXT = {"type": "string", "minLength": 1, "maxLength": 4096}
 READINESS_SCHEMA = {
@@ -198,7 +199,7 @@ PUBLISH_DESCRIPTION = (
     "3. on a refusal, read its text and fix exactly the field it names; never re-send unchanged.")
 
 
-def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None, *, inbox_pager=False):
+def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=None, *, inbox_pager=False, records=False):
     """A connection is either a role's mailbox or the board, because they fail and change separately."""
     properties = {
         "message_id": {"type": "string", "maxLength": 80},
@@ -209,8 +210,7 @@ def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=N
         "acknowledgment": {"type": "string", "enum": sorted(STAGES)},
         "readiness": READINESS_SCHEMA, "result": RESULT_SCHEMA, "receipt": {"type": "object"},
     }
-    # Preserve these legacy bytes for standalone/no-plan hosts. Planned variants
-    # are static too; only the caller's shared validated-plan decision selects one.
+    # Legacy and planned variants are static; the validated host plan selects one.
     inbox_description = ("Read only this endpoint's mailbox; optionally include its hash-verified briefs. "
                          "binding_only returns just the binding, a hash check per checkpoint brief and the "
                          "message count.")
@@ -240,6 +240,13 @@ def definitions(extra=(), board_specs=None, source_specs=None, lifecycle_specs=N
     ]
     if not board_specs:
         specs.append((SELF_TOOL, True, *SELF_SPEC))
+    if records and not board_specs:
+        try:
+            from hierarchy_mailbox_records import tool_specs
+        except ImportError:
+            pass  # Unavailable optional tools are omitted; explicit calls return fixed E_AUTH.
+        else:
+            specs += tool_specs(properties, MAX_BYTES)
     specs += [(name, True, *WORKSPACE_TOOL_SPECS[name]) for name in extra]
     specs += [(name, True, *spec) for name, spec in (source_specs or {}).items()]
     specs += [(name, readonly, description, props, required)
@@ -500,9 +507,11 @@ class Connection:
     instructions = MAILBOX_INSTRUCTIONS
 
     def __init__(self, root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None,
-                 initiative=None, board=None, source_repo=None, lifecycle=None, actor=None):
+                 initiative=None, board=None, source_repo=None, lifecycle=None, actor=None, records=False):
         # Owner-facing ROOT gets only the decision adapter; configured-sender mail is not a decision boundary.
         require(endpoint_parts(endpoint)[1] != "root", ROOT_ONLY_ADAPTER)
+        require(type(records) is bool and not (records and board is not None), "records require a mailbox connection")
+        self.records = records
         require(board is None or (delivery_dir is None and workspace_store is None and source_repo is None
                                   and lifecycle is None and actor is None),
                 "a board connection takes no mailbox options")
@@ -624,7 +633,7 @@ class Connection:
         if pager is None:
             pager = self.slim_inbox_metadata() if not self.board_specs else False
         return definitions(self.workspace_tools, self.board_specs, self.source_specs, self.lifecycle_specs,
-                           inbox_pager=pager)
+                           inbox_pager=pager, records=self.records)
 
     def board_call(self, name, arguments, render):
         if self.board_specs[name][0]:
@@ -692,7 +701,7 @@ class Connection:
         # Staging is response-local, including malformed requests and failed writes.
         if self._pager is not None:
             self._pager.begin_response()
-        if self.inbox_pager:
+        if self.inbox_pager or self.records:
             self.returned = []
 
     def note_returned(self, page, rendered_bytes):
@@ -749,9 +758,7 @@ class Connection:
                                brief_status=lambda brief: _brief_status(mailbox, brief), slimming=slimming)
 
     def record_read(self):
-        # Called only after the response is written and flushed. A failure or crash before then
-        # leaves the message unread, and a lost receipt must not cost the session its mail. Both
-        # err toward waking the session again.
+        # After flush only; uncertain delivery leaves mail unread so the session wakes again.
         identifiers, self.returned = self.returned, []
         if self.delivery_dir is None or not identifiers:
             return
@@ -791,6 +798,12 @@ class Connection:
         if self.board is not None:
             require(name in self.board_specs, "unknown mailbox tool: " + name)
             return self.board_call(name, arguments, render)
+        if self.records and name in RECORD_TOOLS:
+            try:
+                from hierarchy_mailbox_records import call
+            except ImportError:
+                return RECORD_UNAVAILABLE
+            return call(self, name, arguments, waiting_writer_lock)
         if name == "mailbox_inbox":
             pager = self.slim_inbox_metadata()
             self.inbox_pager = pager
@@ -891,16 +904,18 @@ def handle(connection, request):
                 # Every selected count was rendered by the pager, including zero
                 # and one. Reuse its size to retain the logarithmic render bound.
                 connection.note_returned(result, rendered_sizes[len(result["messages"])])
-            return _tool_result(result)
+            return _tool_result(result, record=bool(getattr(connection, "records", False)
+                                                   and params["name"] in RECORD_TOOLS))
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:
             return {"content": [{"type": "text", "text": json.dumps({"error": _error_text(exc)})}], "isError": True}
     raise ValueError("unsupported mailbox method: " + method)
 
 
 def serve(root, endpoint, host, session, generation, delivery_dir=None, workspace_store=None, initiative=None, board=None,
-          lifecycle=None, actor=None, source_repo=None, loop_state=None, evidence=None):
+          lifecycle=None, actor=None, source_repo=None, loop_state=None, evidence=None, records=False):
     integer(generation, "binding generation")
     if endpoint_parts(endpoint)[1] == "root":
+        require(not records, "ROOT takes no record tools")
         require(lifecycle is not None and actor is not None, ROOT_ONLY_ADAPTER)
         require(delivery_dir is None and workspace_store is None and initiative is None and board is None,
                 "the ROOT decision adapter takes no mailbox, workspace or board options")
@@ -912,7 +927,7 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
         lifecycle_options(root, endpoint, workspace_store, lifecycle, actor)
         connection = Connection(root, endpoint, host, session, generation, delivery_dir=delivery_dir,
                                 workspace_store=workspace_store, initiative=initiative, board=board,
-                                source_repo=source_repo, lifecycle=lifecycle, actor=actor)
+                                source_repo=source_repo, lifecycle=lifecycle, actor=actor, records=records)
     while True:
         connection.begin_response()
         raw = sys.stdin.buffer.readline(MAX_BYTES + 1)
@@ -940,8 +955,7 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
             sys.stdout.buffer.write(_response_line(response))
             sys.stdout.buffer.flush()
         except OSError:
-            # The connection is gone, so nothing was delivered. Point stdout at nothing so the
-            # interpreter's own flush at exit cannot fail too.
+            # Suppress a second failure from Python's final flush after the connection is lost.
             connection.begin_response()
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
             return 0
@@ -953,12 +967,11 @@ def serve(root, endpoint, host, session, generation, delivery_dir=None, workspac
 
 
 def main(argv=None):
-    """ROOT's decision adapter, with the read-only folders its team_status reads. Every other role keeps one entry,
-    hierarchy_mailbox.py serve."""
-    parser = argparse.ArgumentParser(description="ROOT's decision adapter over stdio: " + ROOT_ONLY_ADAPTER)
+    """ROOT's decision adapter and explicit --records adoption for mailbox roles."""
+    parser = argparse.ArgumentParser(description="Scoped mailbox records and ROOT's decision adapter over stdio")
     parser.add_argument("--root", required=True, help="Absolute path to the external pilot mailbox")
     commands = parser.add_subparsers(dest="command", required=True)
-    server = commands.add_parser("serve", help="ROOT's decision adapter and its read tools")
+    server = commands.add_parser("serve", help="ROOT decision tools, or opt-in mailbox record tools")
     for flag in ("--endpoint", "--host", "--session"):
         server.add_argument(flag, required=True)
     server.add_argument("--generation", required=True, type=int)
@@ -966,18 +979,18 @@ def main(argv=None):
     server.add_argument("--actor", default=None, help="Its configured lifecycle actor; not authenticated")
     server.add_argument("--loop-state", default=None, help="The loop's --state-dir; team_status reads its status.json")
     server.add_argument("--evidence", default=None, help="The run's evidence folder; team_status counts its files")
-    # Taken only so each is refused by name, as hierarchy_mailbox.py serve refuses them for ROOT.
+    server.add_argument("--records", action="store_true", help="Opt in to team record tools on a non-ROOT mailbox")
     for flag in ("--delivery-dir", "--workspace-store", "--initiative", "--board", "--source-repo"):
         server.add_argument(flag, default=None)
     args = parser.parse_args(argv)
     try:
         root = cli_path(args.root, "--root")
-        require(endpoint_parts(args.endpoint)[1] == "root", ROOT_ENTRY_ONLY)
+        require(endpoint_parts(args.endpoint)[1] == "root" or args.records, ROOT_ENTRY_ONLY)
         paths = {name: None if getattr(args, name) is None else cli_path(getattr(args, name), "--" + name.replace("_", "-"))
                  for name in ("lifecycle", "loop_state", "evidence", "source_repo")}
         return serve(root, args.endpoint, args.host, args.session, args.generation, delivery_dir=args.delivery_dir,
                      workspace_store=args.workspace_store, initiative=args.initiative, board=args.board,
-                     actor=args.actor, **paths)
+                     actor=args.actor, records=args.records, **paths)
     except (ValueError, OSError, UnicodeError, RecursionError) as exc:
         sys.stdout.buffer.write(_cli_line({"error": str(exc)}))
         return 2
