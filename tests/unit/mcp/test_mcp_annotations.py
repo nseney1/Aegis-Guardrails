@@ -20,7 +20,7 @@ from aegis_mcp.server import handle_request
 _HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
 READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule",
-        "aegis_msg_read": "Read Message", "aegis_team_config": "Team Config"}
+        "aegis_msg_read": "Read Message", "aegis_team_config": "Team Config", "aegis_team_queue": "Team Queue"}
 WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight",
          "aegis_msg_write": "Write Message", "aegis_team_model": "Team Model"}
 
@@ -199,6 +199,7 @@ SIBLINGS = {
     "aegis_msg_write": ("aegis_msg_read",),
     "aegis_team_config": (),
     "aegis_team_model": (),
+    "aegis_team_queue": (),
 }
 
 
