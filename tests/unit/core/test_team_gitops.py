@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
-from threading import Event
+from threading import Barrier, Event
 
 import pytest
 
@@ -225,6 +225,229 @@ def test_parallel_reservations_results_and_reconcile_are_once_only(make_store):
     with ThreadPoolExecutor(max_workers=3) as pool:
         list(pool.map(lambda _: store.record_result("request-1", "done", NEW), range(9)))
     assert len(store.read().rows) == 2
+
+
+@pytest.mark.parametrize("state,status", [(NEW, "done"), (OLD, "not_applied"), ("c" * 40, "unknown")])
+@pytest.mark.parametrize("completion", ["reconcile", "receipt", "effect_fd"])
+def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monkeypatch, state, status, completion):
+    store = make_store()
+    receipt = orphan_intent(store) if completion == "reconcile" else intent(store)
+    delayed = gitops.GitOpsJournal(store.common_dir)
+    pending_read, resume = Event(), Event()
+    original = gitops._try_effect
+    calls = []
+
+    def pause_before_acquire(directory, request_id):
+        if not pending_read.is_set():
+            pending_read.set()
+            assert resume.wait(10), "delayed reconciler was not released"
+        return original(directory, request_id)
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(state)
+
+    monkeypatch.setattr(gitops, "_try_effect", pause_before_acquire)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        waiting = pool.submit(delayed.reconcile, "lane-1", observe)
+        try:
+            assert pending_read.wait(10), "delayed reconciler did not read pending intents"
+            # A records its result and closes its effect descriptor before B
+            # may acquire that lock using its now-stale pending snapshot.
+            if completion == "reconcile":
+                assert [row["status"] for row in store.reconcile("lane-1", observe)] == [status]
+            elif completion == "receipt":
+                assert store.record_result("request-1", status, state, receipt=receipt)["status"] == status
+            else:
+                script = """
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from aegis_core.team_gitops import GitOpsJournal
+fd = int(sys.argv[3])
+try:
+    GitOpsJournal(sys.argv[2]).record_result('request-1', sys.argv[4], json.loads(sys.argv[5]), effect_fd=fd)
+finally:
+    os.close(fd)
+"""
+                try:
+                    child = subprocess.run([sys.executable, "-I", "-c", script,
+                                            str(Path(__file__).resolve().parents[3]), str(store.common_dir),
+                                            str(receipt.inheritable_fds()[0]), status, json.dumps(state)],
+                                           pass_fds=receipt.inheritable_fds(), capture_output=True, timeout=20)
+                    assert child.returncode == 0, child.stderr
+                finally:
+                    receipt.close()
+        finally:
+            resume.set()
+        assert waiting.result(timeout=15) == []
+
+    expected_calls = ["request-1"] if completion == "reconcile" else []
+    assert calls == expected_calls
+    assert store.reconcile("lane-1", observe) == []
+    assert calls == expected_calls
+    assert intent(store).created is False
+    assert len(store.read().rows) == 2
+    assert store.read().rows[-1]["status"] == status
+
+
+def test_reconcile_generation_failure_refuses_without_observing_and_releases_lock(make_store, monkeypatch):
+    store = make_store()
+    row = orphan_intent(store).row
+    original_effect = gitops._try_effect
+    original_os = gitops.os
+    acquired, calls = [], []
+
+    def track_effect(directory, request_id):
+        fd = original_effect(directory, request_id)
+        if fd is not None:
+            acquired.append(fd)
+        return fd
+
+    def failed_stat(*args, **kwargs):
+        raise OSError(errno.EIO, "token=private-generation-error")
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "_try_effect", track_effect)
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "stat": failed_stat}))
+    refusal("journal_io", lambda: store.reconcile("lane-1", observe))
+    assert calls == []
+    assert len(acquired) == 1
+    for fd in acquired:
+        with pytest.raises(OSError) as error:
+            os.fstat(fd)
+        assert error.value.errno == errno.EBADF
+
+    monkeypatch.setattr(gitops, "os", original_os)
+    assert store.open_intents() == [row]
+    assert [result["status"] for result in store.reconcile("lane-1", observe)] == ["done"]
+    assert calls == ["request-1"]
+    assert intent(store).created is False
+
+
+@pytest.mark.parametrize("failure,code", [("stat", "journal_io"), ("reread", "journal_busy")])
+def test_reconcile_preflight_failure_observes_neither_pending_intent(make_store, monkeypatch, failure, code):
+    store = make_store()
+    # Reverse creation order also exercises the fixed request-id lock order.
+    rows = [orphan_intent(store, request).row for request in ("request-2", "request-1")]
+    activity = gitops.GitOpsJournal(store.common_dir)
+    original_effect, original_os = gitops._try_effect, gitops.os
+    original_transaction = gitops.GitOpsJournal._transaction
+    acquired, calls = [], []
+
+    def track_effect(directory, request_id):
+        fd = original_effect(directory, request_id)
+        if fd is not None and request_id in {row["request_id"] for row in rows}:
+            acquired.append((request_id, fd))
+            try:
+                if len(acquired) == 2 and failure == "reread":
+                    intent(activity, "other-request", lane="other-lane").close()
+            except BaseException:
+                os.close(fd)
+                raise
+        return fd
+
+    def failed_stat(*args, **kwargs):
+        if len(acquired) == 2 and failure == "stat":
+            raise OSError(errno.EIO, "token=private-preflight-error")
+        return original_os.stat(*args, **kwargs)
+
+    @contextmanager
+    def failed_transaction(self, write=False, **kwargs):
+        if self is store and write and len(acquired) == 2 and failure == "reread":
+            raise gitops.LockTimeoutError("token=private-preflight-error")
+        with original_transaction(self, write=write, **kwargs) as transaction:
+            yield transaction
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "_try_effect", track_effect)
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "stat": failed_stat}))
+    monkeypatch.setattr(gitops.GitOpsJournal, "_transaction", failed_transaction)
+    refusal(code, lambda: store.reconcile("lane-1", observe))
+    assert calls == []
+    assert [request for request, _ in acquired] == ["request-1", "request-2"]
+    for _, fd in acquired:
+        with pytest.raises(OSError) as error:
+            os.fstat(fd)
+        assert error.value.errno == errno.EBADF
+
+    monkeypatch.setattr(gitops, "_try_effect", original_effect)
+    monkeypatch.setattr(gitops, "os", original_os)
+    monkeypatch.setattr(gitops.GitOpsJournal, "_transaction", original_transaction)
+    assert store.open_intents("lane-1") == rows
+    assert len(store.reconcile("lane-1", observe)) == 2
+    assert calls == ["request-1", "request-2"]
+    assert store.reconcile("lane-1", observe) == []
+    assert all(intent(store, row["request_id"]).created is False for row in rows)
+
+
+@pytest.mark.parametrize("grow", [False, True])
+def test_concurrent_reconcilers_check_generation_once_before_observing(make_store, monkeypatch, grow):
+    activity = make_store()
+    workers, per_lane = 3, 3
+    stores = [gitops.GitOpsJournal(activity.common_dir) for _ in range(workers)]
+    lanes = ["lane-" + str(index) for index in range(workers)]
+    for lane in lanes:
+        for index in reversed(range(per_lane)):
+            intent(activity, lane + "-request-" + str(index), lane=lane).close()
+    transactions = {store: 0 for store in stores}
+    original_transaction, original_effect = gitops.GitOpsJournal._transaction, gitops._try_effect
+    acquisitions, calls = [], []
+
+    def other_lane_transaction():
+        # A real same-mode chmod invalidates the old timestamp tuple at every
+        # acquisition round, without changing any worker's pending intents.
+        acquisitions.append(None)
+        if grow and len(acquisitions) == per_lane:
+            intent(activity, "unrelated-request", lane="unrelated").close()
+        else:
+            with original_transaction(activity, write=True):
+                pass
+
+    barrier = Barrier(workers, action=other_lane_transaction, timeout=15)
+    observations_ready = Barrier(workers, timeout=15)
+
+    def acquire_together(directory, request_id):
+        fd = original_effect(directory, request_id)
+        try:
+            if request_id != "unrelated-request":
+                barrier.wait()
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            raise
+        return fd
+
+    @contextmanager
+    def count_transactions(self, write=False, **kwargs):
+        if write and self in transactions:
+            transactions[self] += 1
+        with original_transaction(self, write=write, **kwargs) as transaction:
+            yield transaction
+
+    def observe(row):
+        observations_ready.wait()
+        calls.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "_try_effect", acquire_together)
+    monkeypatch.setattr(gitops.GitOpsJournal, "_transaction", count_transactions)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(store.reconcile, lane, observe) for store, lane in zip(stores, lanes)]
+        results = [future.result(timeout=30) for future in futures]
+    assert all(len(rows) == per_lane for rows in results)
+    assert len(calls) == len(set(calls)) == workers * per_lane
+    # Initial snapshot, at most one pre-observe re-read, final append recheck.
+    assert all(count <= 3 for count in transactions.values()), transactions
+    if grow:
+        assert set(transactions.values()) == {3}
+    else:
+        assert all(count == 2 for count in transactions.values()), transactions
 
 
 @pytest.mark.parametrize("component", ["ancestor", "aegis", "gitops.jsonl", "gitops.lock"])

@@ -2078,6 +2078,14 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/unit/core/test_approval_policy.py', '_policy_environment', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'GM-1 temporary-home fixture applies its own environment and clears inherited GitHub/Git selectors for isolated policy checks.'),
+    ('tests/unit/core/test_approval_policy.py', '_policy_environment', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'GM-1 temporary-home fixture applies its own environment and clears inherited GitHub/Git selectors for isolated policy checks.'),
+    ('tests/unit/cli/test_approve_cli.py', '_policy_environment', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'GM-1 temporary-home fixture applies its own environment and clears inherited GitHub/Git selectors for isolated policy checks.'),
+    ('tests/unit/cli/test_approve_cli.py', '_policy_environment', 'fixture', 'monkeypatch.delenv', False):
+        ((0,), 'GM-1 temporary-home fixture applies its own environment and clears inherited GitHub/Git selectors for isolated policy checks.'),
     ('tests/unit/core/test_write_census.py', 'test_filesystem_unix_bind_is_a_write', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'Uses pytest-owned temporary cwd for a short relative AF_UNIX availability probe; pytest restores cwd and no module attribute is patched.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.chdir', False):
@@ -3145,7 +3153,7 @@ PROOF_REGISTRATION_GROUPS = {
     ('tests/unit/cli/test_check_ci_push.py', 'event_file', 'fixture', 'monkeypatch.setenv', False):
         ((0, 1), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/unit/cli/test_check_ci_push.py', 'push_event', 'fixture', 'monkeypatch.setenv', False):
-        ((0, 1), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
+        ((0, 1, 2), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/unit/cli/test_check_ci_push.py', 'test_a_pull_request_run_still_compares_and_fails_an_unapproved_weakening', 'fixture', 'monkeypatch.setenv', False):
         ((0, 1), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census.'),
     ('tests/unit/cli/test_check_ci_push.py', 'test_no_exec_on_pull_request_target_hands_the_pull_request_to_the_weakening_check', 'owner', 'rule_integrity', False):

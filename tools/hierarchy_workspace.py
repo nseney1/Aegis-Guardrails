@@ -544,13 +544,14 @@ def lease_tools():
     # These helpers are source-checkout tools. An installed wheel or a reader
     # cached by an embedding host must not supply another revision's lease rules.
     require(package.resolve() == package, error)
-    for name in ("__init__.py", "match.py", "team.py"):
+    for name in ("__init__.py", "match.py", "team.py", "team_paths.py"):
         path = package / name
         require(path.is_file() and path.resolve().is_relative_to(package), error)
 
     def check_loaded():
         expected = {"aegis_core": package / "__init__.py",
-                    "aegis_core.match": package / "match.py", "aegis_core.team": package / "team.py"}
+                    "aegis_core.match": package / "match.py", "aegis_core.team": package / "team.py",
+                    "aegis_core.team_paths": package / "team_paths.py"}
         for name, module in tuple(sys.modules.items()):
             if name == "aegis_core" or name.startswith("aegis_core."):
                 origin = getattr(module, "__file__", None)
@@ -561,7 +562,7 @@ def lease_tools():
                 if search is not None:
                     require(tuple(Path(entry).resolve() for entry in search) == (resolved.parent,), error)
         loaded = sys.modules.get("aegis_core")
-        for name in ("match", "team"):
+        for name in ("match", "team", "team_paths"):
             if loaded is not None and hasattr(loaded, name):
                 cached = sys.modules.get("aegis_core." + name)
                 require(cached is not None and getattr(loaded, name) is cached, error)
@@ -569,21 +570,22 @@ def lease_tools():
     check_loaded()
     sys.path[:] = [root] + [entry for entry in sys.path if entry != root]
     try:
-        from aegis_core import match, team
+        from aegis_core import match, team, team_paths
     except ImportError as exc:
         raise ValueError(error) from exc
     check_loaded()
-    return match, team
+    return match, team, team_paths
 
 
 def check_paths(ledger, identifier, paths):
     initiative = ledger.initiative(identifier)
     require(isinstance(paths, list) and bool(paths) and len(paths) <= 256, "invalid paths")
-    match, team = lease_tools()
+    match, team, team_paths = lease_tools()
     for path in paths:
         text(path, "path")
         require(team.glob_problem(path) is None and not path.startswith(("/", "\\")) and ":" not in path
                 and "\\" not in path and ".." not in path.split("/"), "invalid path: " + path)
+    requested = team_paths.stored_paths(paths)
     now = int(time.time())
     peers = [i for i in ledger.initiatives.values()
              if i["repository"] == initiative["repository"] and i["state"] != "done"]
@@ -606,7 +608,7 @@ def check_paths(ledger, identifier, paths):
                 key = (lease.lane, lease.oid)
                 if peer["id"] == identifier:
                     visible_here.add(key)
-                if key in seen or lease.expired(now) or not match.sets_overlap(lease.paths, paths):
+                if key in seen or lease.expired(now) or not team_paths.overlap(lease.path_set, requested):
                     continue
                 seen.add(key)
                 row = {"lane": lease.lane, "paths": list(lease.paths), "owner": lease.owner, "initiative": peer["id"],
