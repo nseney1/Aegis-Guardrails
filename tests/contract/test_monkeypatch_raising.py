@@ -2090,6 +2090,8 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'Uses pytest-owned temporary cwd for a short relative AF_UNIX availability probe; pytest restores cwd and no module attribute is patched.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
+    ('tests/unit/cli/test_cli_team_queue.py', 'test_queue_refuses_invalid_raw_workspace_before_resolution', 'fixture', 'monkeypatch.chdir', False):
+        ((0,), 'BL-16a round 7 runs the raw-workspace refusal table in process; the fixture enters its own temporary workspace cwd and pytest restores it; no module attribute is patched.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.setenv', False):
         ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_spellings_keep_fixed_json_errors', 'fixture', 'monkeypatch.chdir', False):
