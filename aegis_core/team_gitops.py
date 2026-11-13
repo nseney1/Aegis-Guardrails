@@ -9,6 +9,13 @@ closes its copy after its effect has stopped. After a lost reply, reconcile uses
 only the caller's read-only observer. Unknown
 is terminal only for an observed foreign state. Unavailable observations keep
 the intent pending; neither condition authorizes another effect attempt.
+An interrupted observation checkpoint refuses checkpoint_stuck after healthy
+intents in the lane have finished. Its next_action lists at most 16 safe request
+identifiers; reconcile again after resolving them to discover any remainder.
+The owner must read external state for those requests, then call
+record_result(request_id, status, observed) to resolve each reservation; never
+retry the effect. A complete saved observation remains authoritative: every
+terminal writer replays a matching result and refuses a contradiction.
 
 State is an object id, None (absence), or a closed, flat remote/worktree/lease
 description. Commands, messages, credentials and environments are not accepted.
@@ -50,6 +57,9 @@ OPS = ("worktree_add", "worktree_remove", "commit", "ref_update", "push", "pr_op
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 MAX_ROW_BYTES = 65536
 MAX_RECORD_LINES = 32768
+RECONCILE_BATCH_SIZE = 8
+FINAL_RECORD_ATTEMPTS = 3
+MAX_CHECKPOINT_REQUEST_IDS = 16
 DISPLAY_LIMIT = 256
 REFUSALS = {
     "invalid_intent": "invalid git operation intent",
@@ -65,6 +75,7 @@ REFUSALS = {
     "journal_busy": "git operation journal lock timed out",
     "effect_busy": "git operation effect is still owned; wait for its result or reconcile after its owner exits",
     "journal_io": "git operation journal I/O failed; observe before any further action",
+    "checkpoint_stuck": "git operation observation checkpoints require owner recovery",
 }
 _RESULT_ACTIONS = {
     "observation": "correct the result status and observation to match the durable intent; then record the result",
@@ -87,7 +98,7 @@ _OWNER_GUARD = threading.RLock()
 class GitOpsError(ValueError):
     """Documented refusal, safe to render verbatim."""
 
-    def __init__(self, code, root=None, *, result_cause="observation"):
+    def __init__(self, code, root=None, *, result_cause="observation", request_ids=()):
         super().__init__(REFUSALS[code])
         self.code = code
         self.next_action = {"actor": "owner", "command": REFUSALS[code]}
@@ -95,6 +106,16 @@ class GitOpsError(ValueError):
             self.next_action["command"] = _RESULT_ACTIONS[result_cause]
         elif code == "journal_io":
             self.next_action["command"] = _RESULT_ACTIONS["capacity"]
+        elif code == "unsupported_platform":
+            self.next_action["command"] = "use a supported descriptor platform and a local filesystem for the git common dir"
+        elif code == "result_conflict":
+            self.next_action["command"] = ("read the durable result for this request; never retry the effect"
+                                           if result_cause == "durable" else
+                                           "reconcile the lane to publish the saved observation, then read its result")
+        elif code == "checkpoint_stuck":
+            self.next_action["command"] = "owner reads external state for each listed request, then calls record_result(request_id, status, observed) to resolve it; never retry the effect; at most 16 request IDs are listed, reconcile again after resolving them"
+            self.next_action["request_ids"] = [_clean(request)[:DISPLAY_LIMIT] for request in request_ids[:MAX_CHECKPOINT_REQUEST_IDS]]
+            self.next_action["request_ids_truncated"] = len(request_ids) > MAX_CHECKPOINT_REQUEST_IDS
         if code == "unsafe_journal" and root is not None:
             try:
                 canonical = sanitize_display(os.path.realpath(root), max_len=None)
@@ -111,6 +132,7 @@ class IntentReceipt:
     inheritable_fds() to subprocess pass_fds; a child may finish with
     record_result(effect_fd=fd), then must close its inherited copy. The parent
     closes its receipt after all of its own effect activity has stopped.
+    The shared lock descriptor is read-only: children cannot write checkpoints.
     Closing an abandoned receipt never grants a retry of the durable intent.
     A close attempt forgets ownership even if the OS reports a close failure;
     subsequent release calls cannot close a reused descriptor number.
@@ -184,9 +206,12 @@ def _pin_effect(effect_fd):
         os.close(closing)
 
 
-def _try_effect(directory, request_id, pinned_fd=None):
+def _try_effect(directory, request_id, pinned_fd=None, *, new_intent=False):
     name = "gitops-effect-" + hashlib.sha256(request_id.encode("ascii")).hexdigest() + ".lock"
-    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    if new_intent:
+        fd = _open_receipt_lock(directory, name)
+    else:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
@@ -216,14 +241,45 @@ def _try_effect(directory, request_id, pinned_fd=None):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return None
+        except OSError as error:
+            if error.errno in (errno.EBADF, errno.ENOLCK):
+                raise GitOpsError("unsupported_platform") from None
+            raise
         os.fchmod(fd, 0o600)
         os.fsync(directory)
+        if new_intent:
+            _clear_retired_checkpoint(directory, name, fd)
         owned, fd = fd, None
         return owned
     finally:
         if fd is not None:
             closing, fd = fd, None
             os.close(closing)
+
+
+def _open_receipt_lock(directory, name):
+    # A new intent acquires the very same read-only open file description that
+    # the receipt and its children retain; there is no lock-transfer gap.
+    return os.open(name, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+
+
+def _clear_retired_checkpoint(directory, name, effect):
+    # Only record_intent reaches this, under the journal lock after proving
+    # there is no existing intent and while holding the read-only effect flock.
+    # A retired request's saved checkpoint must not become authoritative for
+    # the new intent; the writable descriptor must be the same inode.
+    info = os.fstat(effect)
+    if info.st_size == 0:
+        return
+    writable = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        fresh = os.fstat(writable)
+        if (fresh.st_dev, fresh.st_ino) != (info.st_dev, info.st_ino):
+            raise GitOpsError("unsafe_journal")
+        os.ftruncate(writable, 0)
+        os.fsync(writable)
+    finally:
+        os.close(writable)
 
 
 def _release_owner(key, token=None):
@@ -543,6 +599,91 @@ def _pending(rows, lane=None):
             and (lane is None or row["lane"] == lane)]
 
 
+def _committed_generation(fd, data, read, *, appended=0):
+    """Key a lock-held snapshot and committed appends; never cache a torn read."""
+    if fd is None:
+        raise GitOpsError("journal_io")
+    if read.torn_tail:
+        return None
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino, data.rfind(b"\n") + 1 + appended
+
+
+def _observation_checkpoint(effect, intent, *, result=None, reset=False, reserve=True, flush=True):
+    """Reserve one observation durably in its already-locked effect file.
+
+    Empty means unobserved; ! followed by a newline reserves the callback. A
+    complete result after that marker can be replayed into the journal. A torn
+    checkpoint refuses closed: even permanent storage failure or process death
+    after observation must never authorize another observation. An invalid or
+    unavailable callback response clears its reservation for a later pass, as
+    does a failed reservation before the callback has run (best effort).
+    The owner UID is trusted, just as for the journal and effect-lock inode.
+    """
+    if reset:
+        os.ftruncate(effect, 0)
+        os.fsync(effect)
+        return None
+    if result is not None:
+        _append(effect, result, 2)
+        return result
+    size = os.fstat(effect).st_size
+    if size == 0:
+        if not reserve:
+            return None
+        # Admission reserved this capacity. Recheck before reserving/observing
+        # in case a caller changed the configured row bound since admission.
+        if _terminal_bytes(intent) > MAX_ROW_BYTES:
+            raise GitOpsError("invalid_result", result_cause="capacity")
+        os.lseek(effect, 0, os.SEEK_SET)
+        try:
+            if os.write(effect, b"!\n") != 2:
+                raise GitOpsError("journal_io")
+            os.fsync(effect)
+        except (OSError, GitOpsError):
+            # Observe has not run. Best-effort rollback restores liveness; a
+            # crash or failed cleanup still leaves a fail-closed reservation.
+            try:
+                os.ftruncate(effect, 0)
+                os.fsync(effect)
+            except OSError:
+                pass
+            raise
+        return None
+    if not 2 < size <= MAX_ROW_BYTES + 3:
+        raise GitOpsError("checkpoint_stuck")
+    os.lseek(effect, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) < size:
+        chunk = os.read(effect, min(8192, size - len(data)))
+        if not chunk:
+            raise GitOpsError("checkpoint_stuck")
+        data.extend(chunk)
+    try:
+        if not data.startswith(b"!\n") or not data.endswith(b"\n") or data.count(b"\n") != 2:
+            raise ValueError("checkpoint framing")
+        row = json.loads(data[2:-1].decode("ascii"), object_pairs_hook=_pairs)
+        if not _valid_row(row) or row["kind"] != "result" or not _same_intent(row, intent):
+            raise ValueError("checkpoint binding")
+    except (ValueError, UnicodeError, RecursionError):
+        raise GitOpsError("checkpoint_stuck") from None
+    # A previous writer may have failed its fsync after writing a complete row.
+    if flush:
+        os.fsync(effect)
+    return row
+
+
+def _checkpoint_unreplayable(effect, intent):
+    """Inspect remaining bytes; unreadable storage retains the original refusal."""
+    try:
+        _observation_checkpoint(effect, intent, reserve=False, flush=False)
+    except GitOpsError as error:
+        return error.code == "checkpoint_stuck"
+    except OSError:
+        return False
+    return False
+
+
 @contextmanager
 def _refusals(root):
     try:
@@ -652,7 +793,7 @@ class GitOpsJournal:
                     or data.count(b"\n") + 1 + 2 * outstanding > MAX_RECORD_LINES):
                 raise GitOpsError("journal_capacity")
             key = _effect_key(directory, request_id)
-            effect = _try_effect(directory, request_id)
+            effect = _try_effect(directory, request_id, new_intent=True)
             if effect is None:
                 raise GitOpsError("effect_busy")
             try:
@@ -675,6 +816,9 @@ class GitOpsJournal:
         journal open, and this method closes its temporary copies. A durable
         terminal result releases this
         process's receipt; other processes must close their own copies.
+        A complete checkpoint must match the supplied observation. An owner
+        can resolve an interrupted checkpoint by reading external state and
+        recording that observation here, without repeating the effect.
         """
         if not _identifier(request_id):
             raise GitOpsError("invalid_request")
@@ -697,7 +841,7 @@ class GitOpsJournal:
             for old in read.rows:
                 if old["kind"] == "result" and old["request_id"] == request_id:
                     if old["status"] != status or old["observed"] != row["observed"]:
-                        raise GitOpsError("result_conflict")
+                        raise GitOpsError("result_conflict", result_cause="durable")
                     os.fsync(fd)
                     _release_owner(key)
                     return old
@@ -714,10 +858,46 @@ class GitOpsJournal:
             if effect is None:
                 raise GitOpsError("effect_busy")
             try:
+                try:
+                    checkpoint = _observation_checkpoint(effect, intent, reserve=False)
+                except GitOpsError as error:
+                    if error.code != "checkpoint_stuck":
+                        raise
+                    # The owner's explicit observation resolves an interrupted
+                    # reservation. A valid saved result may never be superseded.
+                    checkpoint = None
+                if checkpoint is not None:
+                    if checkpoint["status"] != status or checkpoint["observed"] != row["observed"]:
+                        raise GitOpsError("result_conflict")
+                    row = checkpoint
                 _append(fd, row, len(data))
                 _release_owner(key)
             finally:
                 os.close(effect)
+            return row
+
+    def _observe_once(self, effect, intent, observe):
+        """Checkpoint one callback under its effect lock, outside the journal lock."""
+        with _refusals(self.common_dir):
+            row = _observation_checkpoint(effect, intent)
+            if row is not None:
+                return row
+            status = "unknown"
+            try:
+                # Never let an adapter mutate persisted bindings.
+                observation = observe(json.loads(json.dumps(intent)))
+                if type(observation) is not Observation:
+                    raise ValueError("unavailable observation")
+                state = _state(observation.state)
+                if state == intent["expected_new"]:
+                    status = "done"
+                elif state == intent["expected_old"]:
+                    status = "not_applied"
+            except Exception:
+                _observation_checkpoint(effect, intent, reset=True)
+                return None
+            row = _result(intent, status, state)
+            _observation_checkpoint(effect, intent, result=row)
             return row
 
     def reconcile(self, lane, observe):
@@ -727,64 +907,93 @@ class GitOpsJournal:
         failure or invalid response keeps the intent pending without exception
         details. An authoritative foreign state records terminal unknown.
         This callback is a trusted service boundary, never supplied by a model.
+        Successful observations are checkpointed under the effect lock and
+        survive failed final records. An interrupted checkpoint refuses closed.
+        Healthy intents finish before reporting retriable storage/capacity errors
+        or checkpoints needing the owner's explicit record_result recovery.
+        Claims use eight-descriptor batches and three final-record attempts under
+        those locks; exhausted retries leave durable checkpoints for recovery.
         """
         if not _identifier(lane, _LANE) or not callable(observe):
             raise GitOpsError("invalid_request")
         results = []
-        with _refusals(self.common_dir), _directory(self.common_dir, True) as directory, ExitStack() as effects:
-            with self._transaction(write=True, directory_fd=directory) as (fd, _, read, _):
+        blocked, deferred = [], None
+        with _refusals(self.common_dir), _directory(self.common_dir, True) as directory:
+            with self._transaction(write=True, directory_fd=directory) as (fd, data, read, _):
                 pending = _pending(read.rows, lane)
-                current = {row["request_id"]: row for row in pending}
-                info = os.fstat(fd)
-                # Committed rows only grow this journal. Unlike the general
-                # storage.file_generation policy, chmod timestamps are irrelevant.
-                generation = info.st_dev, info.st_ino, info.st_size
-            claimed = []
-            # Acquire in request-id order without the journal lock. Writers
-            # holding that lock also probe effects nonblockingly, so no cycle
-            # can wait on an effect lock while we wait for the journal lock.
-            for intent in sorted(pending, key=lambda row: row["request_id"]):
-                effect = _try_effect(directory, intent["request_id"])
-                if effect is None:
-                    continue
-                effects.callback(os.close, effect)
-                claimed.append(intent)
-            if not claimed:
-                return results
-            # Check once, after all claims and before any observation: a later
-            # acquisition/check failure cannot discard an earlier observation.
-            info = os.stat("gitops.jsonl", dir_fd=directory, follow_symlinks=False)
-            if (info.st_dev, info.st_ino, info.st_size) != generation:
-                with self._transaction(write=True, directory_fd=directory) as (_, _, read, _):
-                    current = {row["request_id"]: row for row in _pending(read.rows, lane)}
-            observations = []
-            for intent in claimed:
-                live = current.get(intent["request_id"])
-                if live is None or not _same_intent(live, intent):
-                    continue
-                status = "unknown"
-                try:
-                    # A private copy prevents adapter mutation of persisted bindings.
-                    observation = observe(json.loads(json.dumps(intent)))
-                    if type(observation) is not Observation:
+                cached = {row["request_id"]: row for row in pending}
+                generation = _committed_generation(fd, data, read)
+            pending.sort(key=lambda row: row["request_id"])
+            for start in range(0, len(pending), RECONCILE_BATCH_SIZE):
+                with ExitStack() as effects:
+                    claimed = []
+                    # Claim the whole bounded batch before observing. Writers
+                    # probe effects nonblockingly even under the journal lock.
+                    for intent in pending[start:start + RECONCILE_BATCH_SIZE]:
+                        effect = _try_effect(directory, intent["request_id"])
+                        if effect is not None:
+                            effects.callback(os.close, effect)
+                            claimed.append((intent, effect))
+                    if not claimed:
                         continue
-                    state = _state(observation.state)
-                    if state == intent["expected_new"]:
-                        status = "done"
-                    elif state == intent["expected_old"]:
-                        status = "not_applied"
-                except Exception:
-                    # Cannot observe now; preserve the intent for a later read.
-                    continue
-                observations.append((intent, status, state))
-            if observations:
-                with self._transaction(write=True, directory_fd=directory) as (fd, data, read, _):
-                    current = {row["request_id"]: row for row in _pending(read.rows, lane)}
-                    size = len(data)
-                    for intent, status, state in observations:
+                    # Only lock-held snapshots seed the cache; refresh for this batch alone.
+                    current = cached
+                    try:
+                        info = os.stat("gitops.jsonl", dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        raise GitOpsError("journal_io") from None
+                    if (info.st_dev, info.st_ino, info.st_size) != generation:
+                        with self._transaction(directory_fd=directory) as (fd, _, read, _):
+                            if fd is None:
+                                raise GitOpsError("journal_io")
+                            current = {row["request_id"]: row for row in _pending(read.rows, lane)}
+                    observations = []
+                    for intent, effect in claimed:
                         live = current.get(intent["request_id"])
-                        if live is not None and _same_intent(live, intent):
-                            row = _result(live, status, state)
-                            size = _append(fd, row, size)
-                            results.append(row)
+                        if live is None or not _same_intent(live, intent):
+                            continue
+                        try:
+                            row = self._observe_once(effect, intent, observe)
+                        except GitOpsError as error:
+                            if error.code not in ("checkpoint_stuck", "journal_io", "invalid_result"):
+                                raise
+                            if error.code == "checkpoint_stuck" or _checkpoint_unreplayable(effect, intent):
+                                blocked.append(intent["request_id"])
+                            else:
+                                deferred = deferred or error
+                            continue
+                        if row is not None:
+                            observations.append(row)
+                    if not observations:
+                        continue
+                    for attempt in range(FINAL_RECORD_ATTEMPTS):
+                        try:
+                            with _refusals(self.common_dir), self._transaction(
+                                    write=True, directory_fd=directory) as (fd, data, read, _):
+                                completed = {row["request_id"]: row for row in read.rows
+                                             if row["kind"] == "result"}
+                                size, recorded = len(data), []
+                                for row in observations:
+                                    old = completed.get(row["request_id"])
+                                    if old is None:
+                                        size = _append(fd, row, size)
+                                    elif (not _same_intent(old, row) or old["status"] != row["status"]
+                                          or old["observed"] != row["observed"]):
+                                        raise GitOpsError("result_conflict", result_cause="durable")
+                                    recorded.append(old if old is not None else row)
+                                os.fsync(fd)
+                                next_generation = _committed_generation(fd, data, read, appended=size - len(data))
+                                next_cached = {row["request_id"]: row for row in
+                                               _pending(read.rows + recorded, lane)}
+                            cached, generation = next_cached, next_generation
+                            results.extend(recorded)
+                            break
+                        except GitOpsError as error:
+                            if (error.code not in ("journal_busy", "journal_io")
+                                    or attempt + 1 == FINAL_RECORD_ATTEMPTS):
+                                raise
+            if blocked:
+                raise GitOpsError("checkpoint_stuck", request_ids=blocked)
+            if deferred is not None:
+                raise deferred
         return results
