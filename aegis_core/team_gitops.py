@@ -732,14 +732,36 @@ class GitOpsJournal:
             raise GitOpsError("invalid_request")
         results = []
         with _refusals(self.common_dir), _directory(self.common_dir, True) as directory, ExitStack() as effects:
-            with self._transaction(write=True, directory_fd=directory) as (_, _, read, _):
+            with self._transaction(write=True, directory_fd=directory) as (fd, _, read, _):
                 pending = _pending(read.rows, lane)
-            observations = []
-            for intent in pending:
+                current = {row["request_id"]: row for row in pending}
+                info = os.fstat(fd)
+                # Committed rows only grow this journal. Unlike the general
+                # storage.file_generation policy, chmod timestamps are irrelevant.
+                generation = info.st_dev, info.st_ino, info.st_size
+            claimed = []
+            # Acquire in request-id order without the journal lock. Writers
+            # holding that lock also probe effects nonblockingly, so no cycle
+            # can wait on an effect lock while we wait for the journal lock.
+            for intent in sorted(pending, key=lambda row: row["request_id"]):
                 effect = _try_effect(directory, intent["request_id"])
                 if effect is None:
                     continue
                 effects.callback(os.close, effect)
+                claimed.append(intent)
+            if not claimed:
+                return results
+            # Check once, after all claims and before any observation: a later
+            # acquisition/check failure cannot discard an earlier observation.
+            info = os.stat("gitops.jsonl", dir_fd=directory, follow_symlinks=False)
+            if (info.st_dev, info.st_ino, info.st_size) != generation:
+                with self._transaction(write=True, directory_fd=directory) as (_, _, read, _):
+                    current = {row["request_id"]: row for row in _pending(read.rows, lane)}
+            observations = []
+            for intent in claimed:
+                live = current.get(intent["request_id"])
+                if live is None or not _same_intent(live, intent):
+                    continue
                 status = "unknown"
                 try:
                     # A private copy prevents adapter mutation of persisted bindings.
