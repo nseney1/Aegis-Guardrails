@@ -12,7 +12,7 @@ import time
 import pytest
 
 from tests.integration.test_hierarchy_jobs import (JOBS, commit_request, first_job, load_jobs_module, needs_bubblewrap,  # noqa: F401
-                                                   shop, recorded, source_digest, verified_evidence)
+                                                   shop, fresh_shop, recorded, source_digest, verified_evidence)
 from tests.integration.test_hierarchy_jobs import pytestmark as pytestmark
 from tests.integration.test_hierarchy_mailbox import git
 from tests.integration.test_hierarchy_workspace import Workspace, write_lease
@@ -252,6 +252,7 @@ def test_live_execution_claim_excludes_resolve_between_stopped_steps(claude_shop
     assert shop.states("job-1") == ["started", "completed"]
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 @pytest.mark.parametrize("alive, raise_error", [(False, True), (True, True), (True, False)])
 def test_uncertain_derivation_stays_in_job_custody_until_resolved(claude_shop, alive, raise_error):
     shop = claude_shop
