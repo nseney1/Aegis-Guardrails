@@ -892,14 +892,17 @@ def locked_start(launches, request, endpoint, identifier, plan, host, stand_in, 
     details = {"argv": argv, "cwd": started["cwd"], "contract": contracts[-1], "contracts": contracts,
                "start_timeout_seconds": timeout, "exit_code": exit_code, "timed_out": timed_out, **via}
     if not (isinstance(session, str) and SESSION.fullmatch(session)):
-        error = error or (None if session is None else "the start reported an invalid session")
-        record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details,
-                                 **({"error": error} if error else {}))
+        error = error or ("the start reported an invalid session" if session is not None else
+                          "the start timed out" if timed_out else
+                          "the start process exited unsuccessfully" if exit_code != 0 else
+                          "the start exited without reporting a session")
+        record = launches.record(endpoint, identifier, "start", "failed_to_start", **known, **details, error=error)
         return 3, {**record, "log": logs}
     known["session"] = session
     if error or exit_code != 0 or timed_out:
         record = launches.record(endpoint, identifier, "start", "start_incomplete", **known, **details,
-                                 **({"error": error} if error else {}))
+                                 error=error or ("the start timed out" if timed_out else
+                                                 "the start process exited unsuccessfully"))
         return 3, {**record, "log": logs}
 
     def bind():

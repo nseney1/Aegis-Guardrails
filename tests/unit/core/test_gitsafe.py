@@ -1216,7 +1216,12 @@ _RUN_ALLOWED = {
 }
 # `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
 # identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
-_RUN_ALLOWED_IN = {"aegis_core/sync.py": {"remote", "var", "update-ref", "push"}}
+_RUN_ALLOWED_IN = {
+    "aegis_core/sync.py": {"remote", "var", "update-ref", "push"},
+    # GM-1 maps refs/remotes/R/B to target B only through the longest configured remote name,
+    # so the approval policy lists remote names (read-only, size-bounded by the caller).
+    "aegis_core/approval_policy.py": {"remote"},
+}
 
 
 def _run_subcommand_offenders(rel: str, source: str) -> list:

@@ -60,7 +60,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 from aegis_core import events, gitsafe, team_paths
 from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, read_capped
 from aegis_core.errors import AegisError, AegisValidationError
-from aegis_core.match import normalize_path
+from aegis_core.match import normalize_path, require_rule_glob
 from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, utc_stamp
 from aegis_core.team_paths import glob_problem
 from aegis_core.workspace.layout import AEGIS_DIRNAME
@@ -174,17 +174,17 @@ class LeaseRefused(AegisError):
 
     def __init__(self, message: str, reason: str, lane: str, current: Optional[str] = None,
                  lease: Optional["Lease"] = None, lanes: Sequence[str] = (),
-                 warnings: Sequence[str] = ()) -> None:
+                 warnings: Sequence[str] = (), next_action: str = "") -> None:
         if lease is not None:
             recovery = team_paths.legacy_recovery(lease.path_set, lease.lane, lease.oid)
             if recovery and not message.endswith(recovery):
                 message += recovery
         super().__init__(message, code="LEASE_REFUSED", reason=reason, lane=lane, current=current,
-                         lease=lease, lanes=tuple(lanes), warnings=tuple(warnings))
+                         lease=lease, lanes=tuple(lanes), warnings=tuple(warnings), next_action=next_action)
 
     def __reduce__(self):  # every field, so a refusal crosses a process boundary intact
         return (type(self), (self.message, self.reason, self.lane, self.current, self.lease, self.lanes,
-                             self.warnings))
+                             self.warnings, self.next_action))
 
 
 # ── team.json ────────────────────────────────────────────────────────────────
@@ -204,6 +204,7 @@ def _policy_globs(value: object, where: str) -> Tuple[str, ...]:
         raise TeamFileError(f"{where} must be a list of globs")
     out: List[str] = []
     for ordinal, glob in enumerate(value, 1):
+        require_rule_glob(glob)
         clean = normalize_path(glob) if isinstance(glob, str) else ""
         if not clean:
             raise TeamFileError(f"{where} glob {ordinal} must be a non-empty glob")
@@ -432,7 +433,9 @@ class Lease:
     path_set: team_paths.PathSet = field(init=False, compare=False, repr=False)
 
     def __post_init__(self, parsed: Optional[team_paths.PathSet]) -> None:
-        object.__setattr__(self, "path_set", parsed if parsed is not None else team_paths.stored_paths(self.paths))
+        paths = parsed if parsed is not None else team_paths.stored_paths(self.paths)
+        object.__setattr__(self, "path_set", paths)
+        object.__setattr__(self, "paths", paths.raw)
 
     @property
     def expires_at(self) -> int:
@@ -670,14 +673,16 @@ def _detail(lease: Lease, previous: Optional[str], **extra: Any) -> Dict[str, An
             "claim_id": lease.claim_id, "owner": lease.owner, "role": lease.role, **extra}
 
 
-def _refuse_overlap(root: Path, found: LeaseSet, lane: str, paths: team_paths.PathSet, now: int) -> None:
+def _refuse_overlap(root: Path, found: LeaseSet, lane: str, paths: team_paths.PathSet, now: int,
+                    claiming: bool = False) -> None:
     lanes = _overlapping(found, lane, paths, now)
     if lanes:
         warnings = _record(root, "lease_denied", "refused", {"reason": "overlap", "lane": lane, "lanes": list(lanes)})
         recovery = "".join(team_paths.legacy_recovery(other.path_set, other.lane, other.oid)
                            for other in found.leases if other.lane == lane or other.lane in lanes)
         raise LeaseRefused(f"overlap: lane {lane} may overlap live lease(s) of {', '.join(lanes)}{recovery}",
-                           "overlap", lane, lanes=lanes, warnings=warnings)
+                           "overlap", lane, lanes=lanes, warnings=warnings,
+                           next_action=team_paths.anchor_next_action(root, paths, found, lane, now) if claiming else "")
 
 
 def _taken(root: Path, lane: str, current: str, lease: Optional[Lease]) -> LeaseRefused:
@@ -724,7 +729,7 @@ def claim(root: Any, lane: str, paths: Sequence[str], role: Optional[str] = None
     moment = _now(now)
     for _ in range(_CLAIM_ATTEMPTS):
         found = read_leases(repo)
-        _refuse_overlap(repo, found, lane, globs, moment)
+        _refuse_overlap(repo, found, lane, globs, moment, claiming=True)
         current, bad = found.get(lane), found.unreadable_lane(lane)
         if bad is not None:
             raise _taken(repo, lane, bad.oid, None)

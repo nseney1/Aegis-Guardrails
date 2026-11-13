@@ -180,8 +180,68 @@ is refused. For example, the user layer can set `{"run_config":{"token_budgets":
 | ci-only | No model hosts or reviewers; review by humans | Gates and landing only |
 
 Mixed's optional extra lens has an empty binding until a qualified third registry
-kind exists. Gemini is outside version 1 of this profile. Remote runners never
+kind exists. Candidate host kinds can be registered without qualifying any role.
+Remote runners never
 provision automatically; adding configuration does not create a remote resource.
+
+Antigravity (`agy`, review vendor family `google`) has a candidate adapter in
+`aegis_core.team_host_agy`, selected through the generic
+`team_host_adapter.HostAdapter` interface (also re-exported by `team_hosts`) and
+the host registry. Its kind appears in the profile schema and
+user auth preferences; binding it to a run role still refuses as unqualified.
+Finding the binary does not enable the mixed preset's extra lens. No process is
+launched by the adapter, and existing host behavior without a host plan is unchanged.
+
+Authentication requires an explicit `sso`, `token` or `api` mode. Every child
+first receives one generic, case-insensitive scrub of all registered hosts'
+billing variables, session-marker names/prefixes and launcher overrides.
+The registry includes the observed legacy environment catalog; empty metadata
+on an unmeasured host is no qualification claim. SSO re-adds no credential;
+token/api requires a supplied `GEMINI_API_KEY`, re-adds that selected key only,
+and sets `modelProvider` to `gemini`. A missing selected credential refuses; another key
+or the owner's login is never a fallback. Returned environments are private
+process inputs and must never be included in CLI/MCP output or evidence logs.
+`authentication(mode, environment, session=UUID)` combines selected auth and new
+Aegis markers after scrubbing. `child_environment(environment, UUID)` adds only
+markers; supplying `auth_mode` explicitly also preserves the selected credential.
+Use a combined call instead of composing two scrubs, which would remove the
+previously selected credential or markers.
+
+Environment inputs accept readable `Mapping` objects, including read-only maps,
+and return independent dictionaries. Names must be non-empty and contain no `=`
+or NUL; Windows names such as `ProgramFiles(x86)` and exported bash function names
+such as `BASH_FUNC_name%%` are accepted. Limits are 256 entries, 256 characters per
+name, 32,768 per value and 131,072 characters in total, checked before copying
+each entry. Invalid environments refuse with `invalid_host_environment` and a
+mapping-specific next action. Malformed arguments and unknown host kinds use
+usage exit 2; unavailable credentials, adapters and launch admission use refusal
+exit 1. Existing public `team_hosts.HostAdapterError` imports remain valid.
+
+The adapter consumes MR-4 model-binding data, including the existing
+`gemini-4-argon` and `gemini-4-carbon` rows. Low/medium/high effort is encoded in
+the model suffix. All these rows remain planned and unprobed; returning candidate
+model options does not admit a model or authorize a role. Unknown classes and
+unsupported or rejected levels refuse without selecting another model.
+
+Session ownership requires proven argv atoms and one explicit
+`--conversation UUID` selector. Duplicate selectors, continue/latest selection,
+unknown options and project/remote switches hold. Every value-taking option
+refuses a dash-leading value, including split and attached prompts; installed
+help does not document an attached dash-leading prompt form. Accepted prompt
+and settings values are opaque. A plain `env` wrapper and its assignment atoms
+are parsed; `env` options such as `-u` hold. Windows `.exe` basenames are
+case-insensitive on every platform. Aegis-owned `AEGIS_TEAM_HOST` and
+`AEGIS_TEAM_SESSION` markers can be
+exported to children; they do not prove a native host session. The transcript
+locator is relative data for `.gemini/antigravity/brain/UUID/transcript.jsonl`,
+based on the hook-event contract, pending a native admission probe. It performs
+no path reads; any future reader must use descriptors from a trusted root.
+
+The installed CLI's help and current launcher do not establish a no-auto-update
+control or a native child-session marker. `require_launchable()` therefore
+refuses with `host_runtime_unqualified` and a next action to probe those controls
+and qualify/promote the host. Usage readers, qualification evidence, admission
+provenance and mixed-preset enablement are deferred to TP-9b.
 
 A solo Codex-only repository can use just:
 

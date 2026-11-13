@@ -20,6 +20,191 @@ from aegis_core import model_select
 REPO = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("failure", ["missing-row", "role-class", "null-endpoint", "missing-endpoint"])
+def test_r3_all_structure_precedes_admission_in_both_validators(tmp_path, monkeypatch, failure):
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    claude = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("claude-code", "coding"))
+    claude["admission"]["standard"] = "unprobed"
+    if failure == "missing-row":
+        data["hosts"] = [row for row in data["hosts"] if (row["host"], row["class"]) != ("codex-cli", "coding")]
+    elif failure == "role-class":
+        next(role for role in data["roles"] if role["kind"] == "implementer")["model_class"] = "scout"
+    elif failure == "null-endpoint":
+        claude["levels"]["max"] = None
+    else:
+        del claude["levels"]["max"]
+        del claude["admission"]["max"]
+    raw = json.dumps(data).encode()
+    path = tmp_path / "bindings.json"
+    monkeypatch.setattr("tools.hierarchy_provision.read_pinned_bindings", lambda setup, base: (path, raw))
+    before = copy.deepcopy(data)
+
+    def refuse(_):
+        codes = []
+        for operation in (lambda: model_select.validate_bindings(data, host_kinds=("claude-code", "codex-cli")),
+                          lambda: provision.load_model_bindings({}, tmp_path)):
+            with pytest.raises(ValueError) as caught:
+                operation()
+            message = str(caught.value)
+            # Provision retains its documented structural envelope; core uses the bare code.
+            codes.append("invalid_bindings" if message.startswith("invalid model bindings ") else message)
+        assert codes == ["invalid_bindings", "invalid_bindings"]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3)))
+    refuse(None)
+    assert data == before
+    data.clear()
+    data.update(fixture_case("valid"))
+    raw = json.dumps(data).encode()
+    model_select.validate_bindings(data, host_kinds=("claude-code", "codex-cli"))
+    provision.load_model_bindings({}, tmp_path)
+
+
+@pytest.mark.parametrize("surface", ["load", "resolve"])
+@pytest.mark.parametrize("secret", ["github", "slack"])
+def test_r3_provision_locators_do_not_echo_secrets(tmp_path, monkeypatch, surface, secret):
+    from types import SimpleNamespace
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    host = "ghp_" + "A" * 24 if secret == "github" else "xoxb-0123456789." * 7 + "xoxb-0123456789"
+    shown = "[REDACTED_TOKEN]" if secret == "github" else ".".join(["[REDACTED_TOKEN]"] * 8)
+    for row in data["hosts"]:
+        if row["host"] == "codex-cli":
+            row["host"] = host
+            if row["class"] == "coding":
+                row["admission"]["deep"] = "unprobed"
+    if surface == "load":
+        monkeypatch.setattr("tools.hierarchy_provision.hierarchy_hosts",
+                            SimpleNamespace(TEAM_HOSTS=("claude-code", host)))
+    raw = json.dumps(data).encode()
+    path = tmp_path / "bindings.json"
+    monkeypatch.setattr("tools.hierarchy_provision.read_pinned_bindings", lambda setup, base: (path, raw))
+    roles = {row["kind"]: row for row in data["roles"]}
+    hosts = {(row["host"], row["class"]): row for row in data["hosts"]}
+    before = copy.deepcopy(data)
+
+    def refuse(_):
+        with pytest.raises(ValueError) as caught:
+            if surface == "resolve":
+                provision.planned_model_settings((roles, hosts, "0" * 64, path), host, "implementer",
+                    {"model": hosts[host, "coding"]["model"], "effort": "high"}, None)
+            else:
+                provision.load_model_bindings({}, tmp_path)
+        message = str(caught.value)
+        assert host not in message
+        assert shown in message
+        assert message == ("binding_not_admitted: %s/coding intent deep for implementer; "
+                           "probe the level or repair model-bindings.json" % shown)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3)))
+    refuse(None)
+    assert data == before
+
+
+@pytest.mark.parametrize("failure", [ImportError, ValueError])
+@pytest.mark.parametrize("host,shown", [
+    ("claude-code", "claude-code"), ("codex-cli", "codex-cli"),
+    ("future.host-1", "future.host-1"), ("ghp_" + "A" * 24, "ghp_" + "A" * 24),
+    ("bad host", "<redacted locator>"), ("bad\nｘ", "<redacted locator>"),
+    (".bad", "<redacted locator>"), ("a" * 129, "<redacted locator>"),
+])
+def test_r5_unavailable_table_admission_uses_canonical_identifiers(tmp_path, monkeypatch, failure, host, shown):
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("codex-cli", "coding"))
+    row["host"] = host
+    row["admission"]["deep"] = "unprobed"
+    # Exercise the resolution diagnostic boundary with a supplied binding snapshot.
+    roles = {row["kind"]: row for row in data["roles"]}
+    hosts = {(row["host"], row["class"]): row for row in data["hosts"]}
+    hosts[host, "coding"] = row
+    before = copy.deepcopy(data)
+
+    def unavailable():
+        raise failure("secret table unavailable")
+
+    monkeypatch.setattr("tools.hierarchy_provision.secret_patterns", unavailable)
+    expected = ("binding_not_admitted: %s/coding intent deep for implementer; "
+                "probe the level or repair model-bindings.json" % shown)
+
+    def refuse(_):
+        with pytest.raises(ValueError) as caught:
+            provision.planned_model_settings((roles, hosts, "0" * 64, tmp_path / "bindings.json"), host,
+                "implementer", {"model": row["model"], "effort": "high"}, None)
+        assert str(caught.value) == expected
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3)))
+    refuse(None)
+    assert data == before
+
+
+@pytest.mark.parametrize("inferred", [False, True])
+def test_r3_host_refusal_is_seed_independent_and_matches_provision(inferred):
+    import os
+    import subprocess
+    import sys
+    data = fixture_case("valid")
+    for row in data["hosts"]:
+        if row["class"] == "coding" and row["host"] in ("claude-code", "codex-cli"):
+            row["admission"]["deep"] = "unprobed"
+    script = """import json, sys
+from pathlib import Path
+from aegis_core.model_select import validate_bindings
+from tools import hierarchy_provision as provision
+data = json.load(sys.stdin)
+provision.read_pinned_bindings = lambda setup, base: (Path('bindings.json'), json.dumps(data).encode())
+registry = None if sys.argv[1] == 'inferred' else ('claude-code', 'codex-cli')
+messages = []
+for operation in (lambda: validate_bindings(data, host_kinds=registry), lambda: provision.load_model_bindings({}, Path('.'))):
+    try:
+        operation()
+    except ValueError as error:
+        messages.append(str(error))
+print(json.dumps(messages))
+"""
+    results = []
+    for seed in ("0", "1"):
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(REPO))
+        run = subprocess.run([sys.executable, "-c", script, "inferred" if inferred else "provided"],
+                             input=json.dumps(data), cwd=REPO, env=env, text=True, capture_output=True, timeout=20)
+        assert run.returncode == 0, run.stderr
+        assert run.stderr == ""
+        results.append(json.loads(run.stdout))
+    expected = ("binding_not_admitted: claude-code/coding intent deep for implementer; "
+                "probe the level or repair model-bindings.json")
+    assert results == [[expected, expected], [expected, expected]]
+
+
+@pytest.mark.parametrize("registry", ["caller", "inferred", "set", "frozenset"])
+def test_r3_host_order_respects_ordered_inputs_and_canonicalizes_sets(registry):
+    data = fixture_case("valid")
+    for row in data["hosts"]:
+        if row["class"] == "coding" and row["host"] in ("claude-code", "codex-cli"):
+            row["admission"]["deep"] = "unprobed"
+    if registry == "inferred":
+        data["hosts"].sort(key=lambda row: row["host"] != "codex-cli")
+    kinds = {"caller": ["codex-cli", "claude-code", "codex-cli"], "inferred": None,
+             "set": {"codex-cli", "claude-code"}, "frozenset": frozenset(("codex-cli", "claude-code"))}[registry]
+    host = "codex-cli" if registry in ("caller", "inferred") else "claude-code"
+    expected = ("binding_not_admitted: %s/coding intent deep for implementer; "
+                "probe the level or repair model-bindings.json" % host)
+    before = copy.deepcopy(data)
+
+    def refuse(_):
+        with pytest.raises(model_select.ModelSelectionError) as caught:
+            model_select.validate_bindings(data, host_kinds=kinds)
+        assert str(caught.value) == expected
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3)))
+    refuse(None)
+    assert data == before
+
+
 @pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
 @pytest.mark.parametrize("intent", ["standard", "deep", "max"])
 @pytest.mark.parametrize("state", ["admitted", "unprobed", "rejected"])
@@ -57,8 +242,9 @@ def test_mr1c_load_requires_admitted_band_endpoints(tmp_path, monkeypatch, host,
             with pytest.raises(ValueError, match="^host is planned; Teams support is not qualified$"):
                 provision.require_selectable_host(provision.load_model_bindings({}, tmp_path), host)
     else:
-        assert answers[0] == ("invalid model bindings %s: band default and ceiling levels must be admitted; "
-                              "probe the level or repair model-bindings.json" % path)
+        assert answers[0] == ("binding_not_admitted: %s/coding intent %s for %s; "
+                              "probe the level or repair model-bindings.json" %
+                              (host, intent, "orchestrator" if intent == "standard" else "implementer"))
         coding["admission"][intent] = "admitted"
         path.write_text(json.dumps(data))
         assert load(None)[:2] == ("loaded", "admitted")
@@ -71,6 +257,50 @@ def test_mr1c_registry_admits_only_probed_supported_coding_levels():
             expected = ("admitted" if row["host"] in ("claude-code", "codex-cli") and
                         row["class"] == "coding" and level is not None else "unprobed")
             assert row["admission"][intent] == expected
+
+
+@pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
+@pytest.mark.parametrize("kind", ["orchestrator", "decider", "implementer", "integrator", "reviewer"])
+@pytest.mark.parametrize("edge", ["default", "ceiling"])
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+def test_mr1c_sel_all_roles_share_load_and_resolution_refusal(tmp_path, monkeypatch, host, kind, edge, state):
+    import tools.hierarchy_provision as provision
+    data = fixture_case("valid")
+    for role in data["roles"]:
+        role["band"] = {"floor": "light", "default": "standard", "ceiling": "max"}
+    roles = {role["kind"]: role for role in data["roles"]}
+    intent = "deep" if edge == "default" else "extended"
+    roles[kind]["band"][edge] = intent
+    coding = next(row for row in data["hosts"] if (row["host"], row["class"]) == (host, "coding"))
+    coding["admission"][intent] = state
+    raw = json.dumps(data).encode()
+    path = tmp_path / "model-bindings.json"
+    monkeypatch.setattr("tools.hierarchy_provision.read_pinned_bindings", lambda setup, base: (path, raw))
+    before = copy.deepcopy(data)
+    expected = ("binding_not_admitted: %s/coding intent %s for %s; "
+                "probe the level or repair model-bindings.json" % (host, intent, kind))
+    bindings = (roles, {(host, "coding"): coding}, "0" * 64, path)
+
+    def refused(_):
+        for operation in (
+                lambda: model_select.validate_bindings(data, host_kinds=provision.hierarchy_hosts.TEAM_HOSTS),
+                lambda: provision.load_model_bindings({}, tmp_path),
+                lambda: provision.planned_model_settings(bindings, host, kind,
+                    {"model": coding["model"], "effort": coding["levels"][intent]}, None)):
+            with pytest.raises(ValueError) as caught:
+                operation()
+            assert str(caught.value) == expected
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        list(workers.map(refused, range(3)))
+    refused(None)
+    assert data == before
+    coding["admission"][intent] = "admitted"
+    raw = json.dumps(data).encode()
+    model_select.validate_bindings(data, host_kinds=provision.hierarchy_hosts.TEAM_HOSTS)
+    provision.load_model_bindings({}, tmp_path)
+    assert provision.planned_model_settings(bindings, host, kind,
+        {"model": coding["model"], "effort": coding["levels"][intent]}, None)[1]["admission"] == "admitted"
 
 
 @pytest.mark.parametrize("host", ["claude-code", "codex-cli"])
@@ -104,8 +334,8 @@ def test_mr1c_planned_admission_is_repeatable_and_does_not_mutate_inputs(host, s
         assert answers[0] == ("implementer effort xhigh has no supported intent; supported intents: "
                               "light, standard, deep, max; choose a supported effort")
     else:
-        assert answers[0] == ("%s intent extended (effort xhigh) is not admitted for %s; "
-                              "choose an admitted supported level" % (row["model"], host))
+        assert answers[0] == ("binding_not_admitted: %s/coding intent extended for implementer; "
+                              "probe the level or repair model-bindings.json or choose an admitted level within the band" % host)
 
 
 def fixture_case(case):
@@ -198,6 +428,12 @@ def test_core_and_mr1_binding_validation_agree(case, tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(REPO / "tools"))
     provision = importlib.import_module("hierarchy_provision")
     data = fixture_case(case)
+    expected_error = {
+        "rejected-default": "binding_not_admitted: claude-code/coding intent deep for implementer; "
+                            "probe the level or repair model-bindings.json",
+        "rejected-ceiling": "binding_not_admitted: claude-code/coding intent max for implementer; "
+                            "probe the level or repair model-bindings.json",
+    }.get(case, "invalid_bindings")
     path = tmp_path / "model-bindings.json"
     path.write_text(json.dumps(data))
     monkeypatch.setattr(provision, "read_pinned_bindings", lambda setup, base: (path, path.read_bytes()))
@@ -210,7 +446,7 @@ def test_core_and_mr1_binding_validation_agree(case, tmp_path, monkeypatch):
     try:
         model_select.validate_bindings(data, host_kinds=provision.hierarchy_hosts.TEAM_HOSTS)
     except model_select.ModelSelectionError as exc:
-        assert str(exc) == "invalid_bindings"
+        assert str(exc) == expected_error
         core_accepts = False
     else:
         core_accepts = True
@@ -227,7 +463,7 @@ def test_core_and_mr1_binding_validation_agree(case, tmp_path, monkeypatch):
         model_select.select_model(data, policy, "T9", "implementer", [], subject="parity",
                                   host_kinds=provision.hierarchy_hosts.TEAM_HOSTS)
     except model_select.ModelSelectionError as exc:
-        assert str(exc) == "invalid_bindings"
+        assert str(exc) == expected_error
         selection_accepts = False
     else:
         selection_accepts = True

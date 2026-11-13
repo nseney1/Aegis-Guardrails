@@ -57,6 +57,190 @@ def choose(bindings, policy, **kwargs):
     return select_model(bindings, policy, "T9", "implementer", [], **kwargs)
 
 
+def admission_refusal(host, intent, role, *, within_band=False):
+    message = ("binding_not_admitted: %s/coding intent %s for %s; "
+               "probe the level or repair model-bindings.json" % (host, intent, role))
+    return message + (" or choose an admitted level within the band" if within_band else "")
+
+
+@pytest.mark.parametrize("failure", ["planned", "null", "admission"])
+@pytest.mark.parametrize("secret", ["github", "slack"])
+def test_r3_every_core_locator_is_redacted_without_cut_markers(bindings, policy, failure, secret):
+    host = "ghp_" + "A" * 24 if secret == "github" else "xoxb-0123456789." * 7 + "xoxb-0123456789"
+    shown = "[REDACTED_TOKEN]" if secret == "github" else ".".join(["[REDACTED_TOKEN]"] * 8)
+    assert len(host) <= 128
+    for row in bindings["hosts"]:
+        if row["host"] == "codex-cli":
+            row["host"] = host
+            if failure == "planned":
+                row["host_status"] = "planned"
+            if row["class"] == "coding":
+                if failure == "null":
+                    row["levels"]["extended"] = None
+                row["admission"]["deep"] = "unprobed" if failure == "admission" else "admitted"
+    policy["family_hosts"]["first"] = [host]
+    expected = (admission_refusal(shown, "deep", "implementer") if failure == "admission" else
+                "binding_unavailable:" + shown + ":extended")
+    before = copy.deepcopy((bindings, policy))
+
+    def refuse(_):
+        with pytest.raises(ModelSelectionError) as caught:
+            choose(bindings, policy, intent="extended", host_kinds=(host, "claude-code"))
+        assert str(caught.value) == expected
+        assert host not in str(caught.value)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refuse, range(3)))
+    refuse(None)
+    assert (bindings, policy) == before
+
+
+@pytest.mark.parametrize("host", ["codex-cli", "claude-code"])
+@pytest.mark.parametrize("intent", ["standard", "deep", "max", "extended"])
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+def test_mr1c_sel_refuses_unadmitted_bindings_on_concurrent_retry(bindings, policy, host, intent, state):
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == (host, "coding"))
+    row["admission"][intent] = state
+    policy["family_hosts"]["first"] = [host]
+    policy["family_hosts"]["second"] = ["claude-code" if host == "codex-cli" else "codex-cli"]
+    role = "orchestrator" if intent == "standard" else "implementer"
+    before = copy.deepcopy((bindings, policy))
+
+    def refused(_):
+        with pytest.raises(ModelSelectionError) as caught:
+            choose(bindings, policy, intent="extended" if intent == "extended" else "deep")
+        assert str(caught.value) == admission_refusal(host, intent, role, within_band=intent == "extended")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(6)))
+    refused(None)
+    assert (bindings, policy) == before
+    row["admission"][intent] = "admitted"
+    assert choose(bindings, policy, intent="extended" if intent == "extended" else "deep")[0]["admission"] == "admitted"
+
+
+@requires_anchored_io
+def test_mr1c_sel_atomic_refusal_preserves_history_and_repair(bindings, policy, tmp_path):
+    if not core._DIR_FD_SUPPORTED:
+        pytest.skip("anchored I/O unavailable")
+    policy["target_shares"] = {"first": 1, "second": 0}
+    path = tmp_path / "decisions.jsonl"
+    core.select_and_append(path, bindings, policy, "T9", "implementer",
+                           subject="first", host_kinds=("codex-cli", "claude-code"))
+    before = path.read_bytes()
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row["admission"]["extended"] = "unprobed"
+
+    def refused(_):
+        with pytest.raises(ModelSelectionError) as caught:
+            core.select_and_append(path, bindings, policy, "T9", "implementer", subject="retry",
+                                   intent="extended", host_kinds=("codex-cli", "claude-code"))
+        assert str(caught.value) == admission_refusal("codex-cli", "extended", "implementer", within_band=True)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(6)))
+    assert path.read_bytes() == before
+    row["admission"]["extended"] = "admitted"
+    choice, _ = core.select_and_append(path, bindings, policy, "T9", "implementer", subject="repair",
+                                      intent="extended", host_kinds=("codex-cli", "claude-code"))
+    assert choice["admission"] == "admitted"
+    assert len(read_decisions(path)) == 2
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_mr1c_sel_cli_record_refuses_unprobed_without_publication(bindings, policy, tmp_path, supported):
+    import subprocess
+    import sys
+
+    if supported and not core._DIR_FD_SUPPORTED:
+        pytest.skip("anchored I/O unavailable")
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    row = next(r for r in bindings["hosts"] if (r["host"], r["class"]) == ("codex-cli", "coding"))
+    row["admission"]["extended"] = "unprobed"
+    (tmp_path / "bindings.json").write_text(json.dumps(bindings), encoding="utf-8")
+    (tmp_path / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[3]))
+    environment.pop("AEGIS_WORKSPACE", None)
+    script = ("from aegis_core import model_select; "
+              + ("model_select._DIR_FD_SUPPORTED = False; " if not supported else "")
+              + "from aegis_cli.cli import main; raise SystemExit(main())")
+    argv = [sys.executable, "-c", script, "team", "model", "--workspace", str(tmp_path),
+            "--bindings", "bindings.json", "--policy", "policy.json", "--history", "history.jsonl",
+            "--task-kind", "T9", "--role-kind", "implementer", "--subject", "lane-one",
+            "--host-kind", "codex-cli", "--host-kind", "claude-code", "--intent", "extended", "--record", "--json"]
+    for _ in range(2):
+        result = subprocess.run(argv, cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 2
+        assert result.stderr == ""
+        assert json.loads(result.stdout) == {"error": admission_refusal("codex-cli", "extended", "implementer", within_band=True)
+                                            if supported else "anchored_io_unavailable"}
+        assert not (tmp_path / "history.jsonl").exists()
+    if supported:
+        row["admission"]["extended"] = "admitted"
+        (tmp_path / "bindings.json").write_text(json.dumps(bindings), encoding="utf-8")
+        result = subprocess.run(argv, cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["record"]["admission"] == "admitted"
+        assert len(read_decisions(tmp_path / "history.jsonl")) == 1
+
+
+def test_mr1c_sel_unprobed_history_refuses_even_with_consistent_identity(bindings, policy):
+    _, record = choose(bindings, policy)
+    record["admission"] = record["choice"]["admission"] = "unprobed"
+    payload = {k: v for k, v in record.items() if k not in ("outcome", "decision_id")}
+    record["decision_id"] = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                                                     separators=(",", ":")).encode("ascii")).hexdigest()
+    def refused(_):
+        with pytest.raises(ModelSelectionError, match="^invalid_history$"):
+            select_model(bindings, policy, "T9", "implementer", [record])
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, range(6)))
+    refused(None)
+
+
+@pytest.mark.parametrize("intent", ["deep", "extended"])
+def test_mr1c_sel_admission_locator_redacts_untrusted_registered_host(bindings, policy, intent):
+    host = "ghp_" + "A" * 24
+    for row in bindings["hosts"]:
+        if row["host"] == "codex-cli":
+            row["host"] = host
+            if row["class"] == "coding":
+                row["admission"][intent] = "unprobed"
+    policy["family_hosts"]["first"] = [host]
+    with pytest.raises(ModelSelectionError) as caught:
+        choose(bindings, policy, intent=intent, host_kinds=(host, "claude-code"))
+    assert host not in str(caught.value)
+    assert str(caught.value) == admission_refusal("[REDACTED_TOKEN]", intent, "implementer", within_band=intent == "extended")
+
+
+@requires_anchored_io
+@pytest.mark.parametrize("entry", ["append", "read", "select_and_append"])
+def test_mr1c_sel_unprobed_disk_history_never_publishes(bindings, policy, tmp_path, entry):
+    if not core._DIR_FD_SUPPORTED:
+        pytest.skip("anchored I/O unavailable")
+    _, record = choose(bindings, policy)
+    record["admission"] = record["choice"]["admission"] = "unprobed"
+    payload = {k: v for k, v in record.items() if k not in ("outcome", "decision_id")}
+    record["decision_id"] = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                                                     separators=(",", ":")).encode("ascii")).hexdigest()
+    path = tmp_path / "history.jsonl"
+    before = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if entry != "append":
+        path.write_bytes(before)
+        path.chmod(0o600)
+    for _ in range(2):
+        with pytest.raises(ModelSelectionError, match="^invalid_history$"):
+            if entry == "append":
+                append_decision(path, record)
+            elif entry == "read":
+                read_decisions(path)
+            else:
+                core.select_and_append(path, bindings, policy, "T9", "implementer", subject="retry",
+                                       host_kinds=("codex-cli", "claude-code"))
+        assert not path.exists() if entry == "append" else path.read_bytes() == before
+
+
 def test_model_selection_document_names_every_public_function():
     document = (Path(__file__).resolve().parents[3] / "docs/model-selection.md").read_text(encoding="utf-8")
     for name in core.__all__:
@@ -142,13 +326,8 @@ def test_mr1c_current_registry_admits_exactly_the_probed_tuples(bindings):
 
 
 def test_mr4_existing_choices_and_records_match_integration_tip(bindings, policy):
-    # Captured from 99d399a9 before product edits; no git history is needed to run this test.
-    # Freeze the former input admission values before the MR-1c coding probes.
-    for row in bindings["hosts"]:
-        if (row["host"], row["class"], row["model"]) in {
-                ("claude-code", "coding", "claude-opus-5-5"),
-                ("codex-cli", "coding", "gpt-6.1-sol")}:
-            row["admission"].update(dict.fromkeys(("light", "standard", "deep", "extended", "max"), "unprobed"))
+    # Captured at 9c00099f with admitted bindings before MR-1c-SEL product edits.
+    # Running this test needs neither git history nor the superseded unprobed exception.
     history, results = [], []
     for task, role in (("T1", "orchestrator"), ("T1", "decider"), ("T2", "implementer"),
                        ("T9", "integrator"), ("T4", "reviewer"), ("T5", "reviewer"),
@@ -157,7 +336,7 @@ def test_mr4_existing_choices_and_records_match_integration_tip(bindings, policy
         results.append(result)
         history.append(result[1])
     raw = json.dumps(results, sort_keys=True, separators=(",", ":")).encode()
-    assert hashlib.sha256(raw).hexdigest() == "bed6bbcae15e5966f395e77aa8178609baec86530908bc2823d99628c68591de"
+    assert hashlib.sha256(raw).hexdigest() == "48fed84aa53cd605196684a8f5d02c3b873e76da00a18b99fd998dccfead9f86"
 
 
 @pytest.mark.parametrize("host", ["codex-cli", "claude-code"])
@@ -193,6 +372,7 @@ def test_mr4_grok_usage_alias_retains_requested_model_identity(bindings, policy)
     assert row["model"] == "grok-4.7"
     # Simulate future host qualification without changing the tracked planned row.
     row["host_status"] = "selectable"
+    row["admission"].update({intent: "admitted" for intent, level in row["levels"].items() if level is not None})
     for role in bindings["roles"]:
         if role["band"]["ceiling"] == "max":
             role["band"]["ceiling"] = "extended"
@@ -296,8 +476,9 @@ def test_review_requires_known_author(bindings, policy):
 def test_rejected_or_missing_binding_never_falls_back(bindings, policy):
     row = next(r for r in bindings["hosts"] if r["host"] == "codex-cli" and r["class"] == "coding")
     row["admission"]["deep"] = "rejected"
-    with pytest.raises(ModelSelectionError, match="^invalid_bindings$"):
+    with pytest.raises(ModelSelectionError) as caught:
         choose(bindings, policy)
+    assert str(caught.value) == admission_refusal("codex-cli", "deep", "implementer")
     row["admission"]["deep"] = "unprobed"
     del row["levels"]["deep"]
     del row["admission"]["deep"]
@@ -647,11 +828,8 @@ def test_required_subject_distinguishes_reviews(bindings, policy):
 
 
 def test_admission_provenance_is_explicit(bindings, policy):
-    for status in ("unprobed", "admitted"):
-        for row in bindings["hosts"]:
-            row["admission"] = dict.fromkeys(row["levels"], status)
-        choice, record = choose(bindings, policy)
-        assert choice["admission"] == record["admission"] == status
+    choice, record = choose(bindings, policy)
+    assert choice["admission"] == record["admission"] == "admitted"
 
 
 @pytest.mark.parametrize("field", ["bindings", "policy"])
@@ -840,8 +1018,11 @@ def test_selected_optional_level_refuses_without_fallback(bindings, policy, miss
         del row["admission"]["extended"]
     else:
         row["admission"]["extended"] = "rejected"
-    with pytest.raises(ModelSelectionError, match="^binding_unavailable:codex-cli:extended$"):
+    error = ("binding_unavailable:codex-cli:extended" if missing else
+             admission_refusal("codex-cli", "extended", "implementer", within_band=True))
+    with pytest.raises(ModelSelectionError) as caught:
         choose(bindings, policy, intent="extended")
+    assert str(caught.value) == error
 
 
 def test_invalid_author_on_non_review_task_is_attributed(bindings, policy):

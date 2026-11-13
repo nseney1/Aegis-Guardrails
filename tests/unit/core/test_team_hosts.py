@@ -1,15 +1,91 @@
 """Capacity advice through the profile and adapter service surface."""
 from collections import Counter, deque
 from copy import deepcopy
+from dataclasses import replace
 import json
+import importlib
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import team_hosts as hosts, team_profile as profile
+from aegis_core import hosts as registry, team_hosts as hosts, team_profile as profile
 
 
 RESET = "2026-11-16T22:00:00Z"
 KINDS = ("writer", "review", "extra-review", "doc", "research")
+
+
+def test_candidate_contract_reexports_preserve_public_imports():
+    contract = importlib.import_module("aegis_core.team_host_adapter")
+    assert hosts.HostAdapterError is contract.HostAdapterError
+    assert hosts.HostAdapter is contract.HostAdapter
+    assert isinstance(hosts.host_adapter("antigravity"), contract.HostAdapter)
+
+
+def test_candidate_import_has_no_service_dependency():
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import aegis_core.team_host_agy; "
+         "print('aegis_core.team_hosts' in sys.modules)"],
+        cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True, timeout=10, check=True)
+    assert result.stdout == "False\n"
+    assert result.stderr == ""
+
+
+def test_candidate_adapter_lookup_uses_only_registry_configuration(monkeypatch):
+    candidate = hosts.host_adapter("antigravity")
+    imported = []
+    registry = SimpleNamespace(resolve=lambda name: "other-kind",
+                               get=lambda name: SimpleNamespace(team_adapter="example.adapter"))
+
+    def load(module):
+        imported.append(module)
+        return SimpleNamespace(Adapter=lambda **kwargs: candidate)
+
+    monkeypatch.setattr(hosts, "host_registry", registry)
+    monkeypatch.setattr(hosts, "import_module", load)
+    assert hosts.host_adapter("configured-alias") is candidate
+    assert imported == ["example.adapter"]
+
+
+@pytest.mark.parametrize("failure", [ImportError, AttributeError])
+def test_candidate_adapter_import_failure_refuses_without_fallback(monkeypatch, failure):
+    def unavailable(module):
+        raise failure("untrusted diagnostic TOKEN=private")
+
+    monkeypatch.setattr(hosts, "import_module", unavailable)
+    with pytest.raises(hosts.HostAdapterError, match="^host_adapter_unavailable$"):
+        hosts.host_adapter("antigravity")
+
+
+def test_incomplete_candidate_interface_refuses(monkeypatch):
+    monkeypatch.setattr(hosts, "import_module", lambda name: SimpleNamespace(Adapter=lambda **kwargs: object()))
+    with pytest.raises(hosts.HostAdapterError, match="^host_adapter_unavailable$"):
+        hosts.host_adapter("antigravity")
+
+
+def test_generic_scrub_uses_every_registry_row_and_prefix(monkeypatch):
+    rows = [*registry.all_hosts(), replace(registry.get("windsurf"), id="future-host",
+        billing_variables=("FUTURE_KEY",), session_markers=("FUTURE_SESSION",),
+        session_marker_prefixes=("FUTURE_CHILD_",))]
+    monkeypatch.setattr(hosts, "host_registry", SimpleNamespace(all_hosts=lambda: tuple(rows)))
+    source = {"PATH": "bin", "future_key": "private", "Future_Session": "foreign", "future_child_id": "foreign"}
+    snapshot, child = hosts.scrub_child_environment(source)
+    assert child == {"PATH": "bin"}
+    assert snapshot == source and snapshot is not source
+
+
+def test_registry_scrub_covers_legacy_host_environment_catalog():
+    from tools import hierarchy_hosts
+    source = {"PATH": "bin"}
+    for row in hierarchy_hosts.describe()["hosts"].values():
+        source.update({key.lower(): "foreign" for key in row["billing_variables"]})
+        source.update({key.lower(): "foreign" for key in row["session_markers"]["names"]})
+        source[row["session_variable"]["name"].lower()] = "foreign"
+        source.update({prefix.lower() + "child": "foreign" for prefix in row["session_markers"]["prefixes"]})
+    assert hosts.scrub_child_environment(source)[1] == {"PATH": "bin"}
 
 
 @pytest.mark.parametrize("cycle_size", (2, 4, 8))

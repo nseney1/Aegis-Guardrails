@@ -175,7 +175,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hierarchy_mailbox import (MAX_RECORDS, SLUG, Mailbox, digest, encoded, endpoint_parts, initialize, integer,  # noqa: E402
                                matching, publish_file, read_bytes, require, safe_path, strings, text,
                                timestamp, writer_lock)
-from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board  # noqa: E402
+from hierarchy_board import TOOL_SPECS as BOARD_TOOL_SPECS, Board, secret_patterns  # noqa: E402
 from hierarchy_mailbox_mcp import DECISION_TOOL, ROUTER_TAKES_NO_ACTOR, role_workspace_tools  # noqa: E402
 import hierarchy_hosts  # noqa: E402
 from hierarchy_hosts import SESSION  # noqa: E402
@@ -535,6 +535,57 @@ def bindings_error(problem, path, *, action="repair model-bindings.json"):
     return ValueError("invalid model bindings %s: %s; %s" % (path, problem, action))
 
 
+class BindingAdmissionError(ValueError):
+    """Admission refusal shared in shape with the host-neutral selector."""
+
+
+def binding_locator(value):
+    # Only new admission diagnostics use this policy; legacy refusal bytes stay unchanged.
+    if not isinstance(value, str):
+        return "<redacted locator>"
+    canonical = len(value) <= 128 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value) is not None
+    bounded = value[:128] if canonical else ascii(value[:128])
+    try:
+        patterns = secret_patterns()
+    except (ImportError, ValueError):
+        return value if canonical else "<redacted locator>"
+    for pattern in patterns:
+        bounded = pattern.sub("[REDACTED_TOKEN]", bounded)
+    return bounded
+
+
+def binding_admission_error(host, model_class, intent, kind, band=None):
+    action = "probe the level or repair model-bindings.json"
+    if band is not None and intent not in (band["default"], band["ceiling"]):
+        action += " or choose an admitted level within the band"
+    return BindingAdmissionError("binding_not_admitted: %s/%s intent %s for %s; %s" %
+                                 (*(binding_locator(v) for v in (host, model_class, intent, kind)), action))
+
+
+def binding_band_edges(roles, hosts, statuses):
+    """Complete structural coverage before exposing any admission refusal."""
+    required_classes = {row["model_class"] for row in roles.values()}
+    missing = sorted((host, model_class) for host in hierarchy_hosts.TEAM_HOSTS for model_class in required_classes
+                     if statuses.get(host) != "planned" and (host, model_class) not in hosts)
+    if missing:
+        raise ValueError("missing host/class rows: " + ", ".join(sorted(
+            "%s/%s" % (host, model_class) for host, model_class in missing)))
+    edges = []
+    for kind, policy in roles.items():
+        check_role_model_class(kind, policy["model_class"])
+        for host in hierarchy_hosts.TEAM_HOSTS:
+            if statuses.get(host) == "planned":
+                continue
+            binding = hosts[host, policy["model_class"]]
+            for edge in ("default", "ceiling"):
+                intent = policy["band"][edge]
+                if binding["levels"].get(intent) is None:
+                    raise ValueError("binding %s/%s lacks band %s %s for %s" %
+                                     (host, policy["model_class"], edge, intent, kind))
+                edges.append((host, policy["model_class"], intent, kind, binding["admission"][intent]))
+    return edges
+
+
 def check_role_model_class(kind, model_class):
     require(model_class == PRODUCT_MODEL_CLASS, "%s requires model class %s; got %s" %
             (kind, PRODUCT_MODEL_CLASS, safe_value(model_class)))
@@ -566,7 +617,6 @@ def read_pinned_bindings(setup, base):
 def load_model_bindings(setup, base):
     """Read once per planned resolution; the hash describes the exact validated bytes, not a reserialization."""
     path, raw = read_pinned_bindings(setup, base)
-    action = "repair model-bindings.json"
     try:
         data = parse_json_bytes(raw)
         binding_keys(data, ("schema", "roles", "hosts"), "top-level")
@@ -602,7 +652,8 @@ def load_model_bindings(setup, base):
             require(isinstance(status, str) and status in ("selectable", "planned"), "unknown host status")
             require(host not in statuses or statuses[host] == status, "inconsistent host status")
             statuses[host] = status
-            require(status == "planned" or host in hierarchy_hosts.TEAM_HOSTS, "unknown host " + safe_value(host))
+            if status != "planned" and host not in hierarchy_hosts.TEAM_HOSTS:
+                raise ValueError("unknown host " + safe_value(host))
             encoding = row.get("effort_encoding", "flag")
             require(isinstance(encoding, str) and encoding in ("flag", "model_suffix"), "unknown effort encoding")
             require(isinstance(model_class, str) and model_class in MODEL_CLASSES,
@@ -614,8 +665,8 @@ def load_model_bindings(setup, base):
             require(all(isinstance(alias, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", alias) is not None
                         for alias in aliases), "invalid served aliases")
             require(len(set(aliases)) == len(aliases) and row["model"] not in aliases, "invalid served aliases")
-            require((host, row["model"]) not in host_models,
-                    "duplicate host/model row: %s/%s" % (host, row["model"]))
+            if (host, row["model"]) in host_models:
+                raise ValueError("duplicate host/model row: %s/%s" % (host, row["model"]))
             host_models.add((host, row["model"]))
             require(isinstance(levels, dict) and bool(levels) and set(levels) <= set(EFFORT_INTENTS),
                     "levels must map a nonempty subset of " + ", ".join(EFFORT_INTENTS))
@@ -641,28 +692,14 @@ def load_model_bindings(setup, base):
             identities.update(keys)
             # Planned rows describe capabilities; executable band endpoints are checked below.
             hosts[host, model_class] = row
-        required_classes = {row["model_class"] for row in roles.values()}
-        missing_bindings = sorted("%s/%s" % (host, model_class)
-                                  for host in hierarchy_hosts.TEAM_HOSTS for model_class in required_classes
-                                  if statuses.get(host) != "planned"
-                                  if (host, model_class) not in hosts)
-        require(not missing_bindings, "missing host/class rows: " + ", ".join(missing_bindings))
-        for kind, policy in roles.items():
-            check_role_model_class(kind, policy["model_class"])
-            for host in hierarchy_hosts.TEAM_HOSTS:
-                if statuses.get(host) == "planned":
-                    continue
-                binding = hosts[host, policy["model_class"]]
-                for edge in ("default", "ceiling"):
-                    intent = policy["band"][edge]
-                    require(binding["levels"].get(intent) is not None, "binding %s/%s lacks band %s %s for %s" %
-                            (host, policy["model_class"], edge, intent, kind))
-                    if binding["admission"][intent] != "admitted":
-                        action = "probe the level or repair model-bindings.json"
-                        raise ValueError("band default and ceiling levels must be admitted")
+        for host, model_class, intent, kind, admission in binding_band_edges(roles, hosts, statuses):
+            if admission != "admitted":
+                raise binding_admission_error(host, model_class, intent, kind)
         return roles, hosts, hashlib.sha256(raw).hexdigest(), path
+    except BindingAdmissionError:
+        raise
     except JSON_FAILURES as exc:
-        raise bindings_error(str(exc), path, action=action) from exc
+        raise bindings_error(str(exc), path) from exc
 
 
 def require_selectable_host(bindings, host):
@@ -703,9 +740,9 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
         record = dict(record or {"effort": options.get("effort"), "reasoning": options.get("effort"),
                                  "effort_from": "request", "reasoning_from": "request"})
         record.update(model=model, model_from="model-bindings.json")
-    require(model is not None,
-            "no model: set the request model or team.json model (%s binding for %s: %s)" %
-            (model_class, host, binding["model"] if binding is not None else "choose a bound model"))
+    if model is None:
+        raise ValueError("no model: set the request model or team.json model (%s binding for %s: %s)" %
+                         (model_class, host, binding["model"] if binding is not None else "choose a bound model"))
     band, effort = row["band"] if row is not None else None, options.get("effort")
     if effort is None:
         if band is not None:
@@ -726,20 +763,20 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
                              (source, diagnostic_name(model), bound[0]["host"], host))
         raise ValueError("%s model %s is not bound for host %s; choose a model bound in model-bindings.json" %
                          (source, diagnostic_name(model), host))
-    require(model_binding["class"] != "frontier" or
-            (kind not in UNBANDED_MODEL_ROLES and model_class != "frontier"),
-            "%s model %s has class frontier; frontier models are only for isolated turns, not long-lived seats" %
-            (kind, diagnostic_name(model)))
+    if model_binding["class"] == "frontier" and (kind in UNBANDED_MODEL_ROLES or model_class == "frontier"):
+        raise ValueError("%s model %s has class frontier; frontier models are only for isolated turns, not long-lived seats" %
+                         (kind, diagnostic_name(model)))
     if binding is not None:
-        require(model_binding is binding, "%s model %s has class %s, requires class %s; choose model %s" %
-                (kind, diagnostic_name(model), model_binding["class"], binding["class"], binding["model"]))
+        if model_binding is not binding:
+            raise ValueError("%s model %s has class %s, requires class %s; choose model %s" %
+                             (kind, diagnostic_name(model), model_binding["class"], binding["class"], binding["model"]))
     else:
         binding = model_binding
     reverse = {level: intent for intent, level in binding["levels"].items() if level is not None}
-    require(isinstance(effort, str) and effort in reverse,
-            "%s effort %s has no supported intent; supported intents: %s; choose a supported effort" %
-            (kind, diagnostic_name(effort), ", ".join(intent for intent in EFFORT_INTENTS
-                                                     if binding["levels"].get(intent) is not None)))
+    if not isinstance(effort, str) or effort not in reverse:
+        raise ValueError("%s effort %s has no supported intent; supported intents: %s; choose a supported effort" %
+                         (kind, diagnostic_name(effort), ", ".join(intent for intent in EFFORT_INTENTS
+                                                                                  if binding["levels"].get(intent) is not None)))
     intent = reverse[effort]
     repair = ("; set team.json reasoning_by_kind.%s to an in-band effort" % kind
               if record is not None and record["effort_from"] == "team.json" and
@@ -749,8 +786,12 @@ def planned_model_settings(bindings, host, kind, options, record, fixed=None):
                 "%s effort %s maps to intent %s outside band %s..%s; choose an effort within the band" %
                 (kind, effort, intent, band["floor"], band["ceiling"]) + repair)
     admission = binding["admission"][intent]
-    require(admission == "admitted", "%s intent %s (effort %s) is not admitted for %s; choose an admitted supported level" %
-            (binding["model"], intent, effort, host))
+    if admission != "admitted":
+        selectable_band = band if fixed is None else None
+        refusal = binding_admission_error(host, binding["class"], intent, kind, selectable_band)
+        if band is None and fixed is None:
+            refusal = BindingAdmissionError(str(refusal) + " or choose an admitted supported level")
+        raise refusal
     if binding.get("effort_encoding", "flag") == "model_suffix":
         model = binding["model"] + "-" + effort
         options = dict(options, model=model)

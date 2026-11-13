@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from tests.integration.test_hierarchy_jobs import JOBS, Shop, clean_pytest_recipe, recorded
+from tests.integration.test_hierarchy_jobs import JOBS, clean_pytest_recipe, recorded, shop
 from tests.integration.test_hierarchy_mailbox import HELPER, git, pilot  # noqa: F401
 from tests.integration.test_hierarchy_mailbox_fence import source_call
 from tests.integration.test_hierarchy_mailbox_mcp import payload
@@ -190,8 +190,7 @@ def test_running_mcp_reader_never_fetches_after_promisor_config_changes(pilot, r
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the public job runner reads /proc")
-def test_job_export_never_fetches_if_config_changes_after_object_preflight(tmp_path, monkeypatch):
-    shop = Shop(tmp_path)
+def test_job_export_never_fetches_if_config_changes_after_object_preflight(shop, tmp_path, monkeypatch):
     clean_pytest_recipe(shop, "none")
     shop.request_job("job-1", "pt", paths=["tests/test_app.py"])
     missing = git(shop.checkout, "rev-parse", "HEAD:src/app.py")
@@ -230,8 +229,7 @@ os.execv(real, [real, *sys.argv[1:]])
 @pytest.mark.parametrize("command", ["source-digest", "run-open"])
 @pytest.mark.parametrize("missing_kind", ["tree", "blob"])
 @pytest.mark.parametrize("transport", ["ext", "file"])
-def test_public_job_reads_do_not_fetch_before_export_preflight(tmp_path, command, missing_kind, transport):
-    shop = Shop(tmp_path)
+def test_public_job_reads_do_not_fetch_before_export_preflight(shop, tmp_path, command, missing_kind, transport):
     clean_pytest_recipe(shop, "none")
     shop.request_job("job-1", "pt", paths=["tests/test_app.py"])
     # The transport fixture needs only the selected repository path.

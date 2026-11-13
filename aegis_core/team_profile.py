@@ -18,7 +18,7 @@ import re
 import stat
 from typing import Any
 
-from aegis_core import pathlookup, storage
+from aegis_core import hosts as host_registry, pathlookup, storage
 from aegis_core.primitives import sanitize_display as sanitize_display
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
@@ -63,6 +63,9 @@ PRESET_DATA = {
         "claude-code": {"cli": "claude", "family": "claude", "writer": True,
                         "boundary": "permission rules, not OS-enforced"},
         "codex": {"cli": "codex", "family": "codex", "writer": False, "boundary": None},
+        **{spec.id: {"cli": spec.binaries[0], "family": spec.team_family,
+                     "writer": False, "boundary": None}
+           for spec in host_registry.all_hosts() if spec.team_adapter},
     },
     "defaults": {
         "version": 1, "preset": "solo",

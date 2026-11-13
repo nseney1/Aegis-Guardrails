@@ -3,15 +3,166 @@ from __future__ import annotations
 
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from aegis_cli import cli
-from aegis_core import human_gate
+from aegis_core import gitsafe, human_gate
 from tests import helpers_humangate as hg
 
 needs_git = pytest.mark.skipif(not hg.git_ok(), reason="needs git")
+
+
+@pytest.fixture
+def _policy_environment(tmp_path, monkeypatch):
+    home = hg.Home(tmp_path / "home")
+    for name, value in home.env.items():
+        monkeypatch.setenv(name, value)
+    for name in ("GITHUB_EVENT_PATH", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF_NAME", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+@needs_git
+@pytest.mark.parametrize("has_map", [False, True])
+def test_empty_explicit_base_keeps_approval_discovery(tmp_path, _policy_environment, capsys, has_map):
+    repo = hg.make_repo(tmp_path)
+    repo.git("remote", "add", "origin", "/not-contacted")
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": "none", "*": "signature"}} if has_map else {}))
+    base = repo.commit("base policy")
+    repo.git("branch", "-f", "main", base)
+    repo.git("update-ref", "refs/remotes/origin/main", base)
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    head = repo.commit("workflow")
+    for _ in range(2):
+        assert cli.main(["approve", "--workspace", str(repo.root), "--json"]) == 1
+        omitted = json.loads(capsys.readouterr().out)
+        assert cli.main(["approve", "--workspace", str(repo.root), "--base", "", "--json"]) == 1
+        empty = json.loads(capsys.readouterr().out)
+        for result in (omitted, empty):
+            result.pop("checked_at")
+        assert omitted == empty and empty["code"] == ("not_required" if has_map else "no_key")
+        assert repo.head() == head
+
+
+@needs_git
+@pytest.mark.parametrize("mode", ["review", "none"])
+def test_branch_policy_refuses_unneeded_approval_without_commit(tmp_path, _policy_environment, capsys, mode):
+    repo = hg.make_repo(tmp_path)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": mode}}))
+    repo.commit("base policy")
+    repo.git("branch", "-f", "main", "HEAD")
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    repo.commit("workflow")
+    before = repo.head()
+    for _ in range(2):
+        assert cli.main(["approve", "--workspace", str(repo.root), "--base", "main", "--json"]) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["code"] == "not_required"
+        assert repo.head() == before
+
+
+@needs_git
+def test_unknown_base_selector_does_not_claim_signature_is_unneeded(tmp_path, _policy_environment, capsys):
+    repo = hg.make_repo(tmp_path)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": "signature", "*": "none"}}))
+    base = repo.commit("base policy")
+    repo.git("update-ref", "refs/remotes/upstream/main", base)
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    before = repo.commit("workflow")
+    rc = cli.main(["approve", "--workspace", str(repo.root), "--base", "upstream/main", "--json"])
+    document = json.loads(capsys.readouterr().out)
+    assert rc == 1 and document["code"] == "no_key" and repo.head() == before
+
+
+@needs_git
+@pytest.mark.parametrize("selector", ["main", "origin/main", "auto-local", "auto-remote"])
+@pytest.mark.parametrize("pair", ["security", "correctness", "reverse", "review"])
+def test_approve_and_ci_use_the_same_branch_policy_despite_a_tag(tmp_path, _policy_environment, capsys, selector, pair):
+    repo = hg.make_repo(tmp_path)
+    repo.git("remote", "add", "origin", "/not-contacted")
+    mode = "none" if pair == "reverse" else "review" if pair == "review" else "signature"
+    old_map = {"main": "signature", "*": "signature"} if pair in ("reverse", "review") else {"main": "none", "*": "signature"}
+    base_map = {"main": mode, "*": "signature" if mode != "signature" else "none"}
+    if pair == "correctness":
+        base_map = {"main": "signature"}
+    repo.write(".aegis/config.json", json.dumps({"approvals": old_map}))
+    previous = repo.commit("tag policy")
+    repo.write(".aegis/config.json", json.dumps({"approvals": base_map}))
+    base = repo.commit("branch policy")
+    repo.git("branch", "-f", "main", base)
+    remote = selector in ("origin/main", "auto-remote")
+    if remote:
+        repo.git("update-ref", "refs/remotes/origin/main", base)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "none"}}))
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    head = repo.commit("head lowers its map and changes governance")
+    repo.git("tag", "origin/main" if remote else "main", previous)
+    extra = [] if selector.startswith("auto-") else ["--base", selector]
+    expected_mode = mode if selector.startswith("auto-") else "signature"
+    expected_base = base if selector.startswith("auto-") else previous
+    for _ in range(2):
+        assert cli.main(["approve", "--workspace", str(repo.root), *extra, "--json"]) == 1
+        document = json.loads(capsys.readouterr().out)
+        assert document["code"] == ("no_key" if expected_mode == "signature" else "not_required")
+        rc = cli.main(["check", "--ci", "--workspace", str(repo.root), *extra, "--no-exec", "--json"])
+        check = json.loads(capsys.readouterr().out)
+        assert rc == (1 if expected_mode == "signature" else 0) and check["scope"]["base"] == expected_base
+        assert check["approval_mode"] == expected_mode and check["owner_review_required"] == (expected_mode == "review")
+        assert repo.head() == head
+
+
+@needs_git
+def test_approve_ref_move_cannot_rederive_a_weaker_target(tmp_path, _policy_environment, capsys, monkeypatch):
+    repo = hg.make_repo(tmp_path)
+    repo.git("remote", "add", "origin", "/not-contacted")
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": "none", "*": "signature"}}))
+    base = repo.commit("branch policy")
+    repo.git("branch", "-f", "main", base)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "none"}}))
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    head = repo.commit("workflow")
+    original = gitsafe.resolve_commit
+    def move(root, revision):
+        commit = original(root, revision)
+        if revision == "origin/main" and commit == base:
+            repo.git("update-ref", "refs/remotes/origin/main", head)
+        return commit
+    monkeypatch.setattr(gitsafe, "resolve_commit", move)
+    for _ in range(2):
+        repo.git("update-ref", "refs/remotes/origin/main", base)
+        assert cli.main(["approve", "--workspace", str(repo.root), "--base", "origin/main", "--json"]) == 1
+        assert json.loads(capsys.readouterr().out)["code"] == "no_key"
+        assert repo.head() == head
+
+
+@needs_git
+@pytest.mark.parametrize("mode", ["signature", "none"])
+def test_parallel_approve_refusals_use_the_branch_commit(tmp_path, _policy_environment, mode):
+    repo = hg.make_repo(tmp_path)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": "none" if mode == "signature" else "signature", "*": "signature"}}))
+    previous = repo.commit("tag policy")
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"main": mode, "*": "signature"}}))
+    base = repo.commit("branch policy")
+    repo.git("branch", "-f", "main", base)
+    repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "none"}}))
+    repo.write(".github/workflows/ci.yml", "name: changed\n")
+    head = repo.commit("workflow")
+    repo.git("tag", "main", previous)
+    command = [sys.executable, "-m", "aegis_cli", "approve", "--workspace", str(repo.root), "--base", "main", "--json"]
+    def run(_):
+        result = subprocess.run(command, cwd=str(Path(__file__).resolve().parents[3]), capture_output=True, text=True, timeout=30)
+        return result.returncode, json.loads(result.stdout)["code"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run, range(4)))
+    # Both ambiguous explicit names have a signature requirement at their tag;
+    # they cannot borrow the branch's none target from its spelling.
+    assert all(result == (1, "no_key") for result in results)
+    assert repo.head() == head
 
 
 def test_approve_is_a_registered_command_with_a_base_flag(capsys):
@@ -20,6 +171,40 @@ def test_approve_is_a_registered_command_with_a_base_flag(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "--base" in out and "Aegis-Approve" in out
+
+
+@needs_git
+@pytest.mark.parametrize("exempt", [False, True])
+def test_approval_preflight_ref_io_failure_is_a_fixed_refusal(tmp_path, _policy_environment, capsys, monkeypatch, exempt):
+    repo = hg.make_repo(tmp_path)
+    def unavailable(*args, **kwargs):
+        raise gitsafe.GitError("secret ref read failure")
+    monkeypatch.setattr(gitsafe, "read_ref", unavailable)
+    extra = ["--exempt-test", repo.head(), "--reason", "reviewed"] if exempt else []
+    for _ in range(2):
+        assert cli.main(["approve", "--workspace", str(repo.root), "--base", "main", *extra, "--json"]) == 1
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["code"] == "invalid_approval_policy"
+        assert "secret" not in captured.out + captured.err and "Traceback" not in captured.out + captured.err
+
+
+@needs_git
+@pytest.mark.parametrize("use_json", [False, True])
+@pytest.mark.parametrize("exempt", [False, True])
+def test_missing_approval_refusal_redacts_the_base(tmp_path, _policy_environment, capsys, use_json, exempt):
+    repo = hg.make_repo(tmp_path)
+    token = "ghp_" + "a" * 36
+    selector = "origin/" + token
+    extra = ["--exempt-test", "HEAD", "--reason", "reviewed"] if exempt else []
+    argv = ["approve", "--workspace", str(repo.root), "--base", selector, *extra]
+    if use_json:
+        argv.append("--json")
+    for _ in range(2):
+        assert cli.main(argv) == 1
+        captured = capsys.readouterr()
+        assert token not in captured.out + captured.err and "REDACTED" in captured.out + captured.err
+        if use_json:
+            assert json.loads(captured.out)["code"] == "no_base"
 
 
 def test_approve_appears_in_the_categorized_help(capsys):
@@ -158,6 +343,29 @@ def review_repo(tmp_path, monkeypatch):
 
     monkeypatch.setattr(human_gate, "signed_empty_commit", unexpected_sign)
     return repo
+
+
+@pytest.mark.parametrize("exempt", [False, True])
+@pytest.mark.parametrize("use_json", [False, True])
+def test_resolved_tag_review_redacts_its_selector(review_repo, monkeypatch, capsys, exempt, use_json):
+    from aegis_cli import approve
+
+    token = "ghp_" + "a" * 36
+    selector = "origin/" + token
+    review_repo.git("tag", selector, "main")
+    monkeypatch.setattr(human_gate, "check_key_custody", lambda top: human_gate.KeyCustody("agent", "agent", True))
+    monkeypatch.setattr(approve, "input", lambda prompt="": "n", raising=False)
+    args = ["approve", "--workspace", str(review_repo.root), "--base", selector]
+    if exempt:
+        args += ["--exempt-test", "HEAD", "--reason", "reviewed"]
+    if use_json:
+        args.append("--json")
+    for _ in range(2):
+        assert cli.main(args) == 1
+        captured = capsys.readouterr()
+        assert token not in captured.out + captured.err and "REDACTED" in captured.out + captured.err
+        if use_json:
+            assert json.loads(captured.out)["code"] == "declined"
 
 
 @pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
@@ -445,11 +653,11 @@ def test_missing_printable_base_refusal_keeps_fetch_guidance(review_repo, monkey
     if use_json:
         doc = json.loads(captured.out)
         assert doc["status"] == "refused" and doc["code"] == "no_base"
-        assert doc["reason"] == f"HEAD shares no history with {base}: fetch with fetch-depth 0"
+        assert doc["reason"] == f"cannot resolve the base {base!r}; fetch it or pass the full commit id"
         assert captured.err == ""
     else:
         assert captured.out == ""
-        assert captured.err == "aegis approve: HEAD shares no history with missingFORGED: fetch with fetch-depth 0\n"
+        assert captured.err == "aegis approve: cannot resolve the base 'missingFORGED'; fetch it or pass the full commit id\n"
 
 
 @pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
