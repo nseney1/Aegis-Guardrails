@@ -61,6 +61,7 @@ import argparse
 import errno
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -127,6 +128,15 @@ DEFAULT_LOCK_WAIT_SECONDS = 30.0
 PATH_ARGUMENT = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./@+-]*(::[^\x00-\x1f]{1,512})?")
 JOB_ID = re.compile(SLUG.pattern + "/" + SLUG.pattern)
 ERRORS = (ValueError, OSError, UnicodeError, RecursionError, TypeError, KeyError, subprocess.SubprocessError)
+PROCESS_METADATA_ACTION = ("Root: repair or remove the job's process.json; revalidate stopped-process evidence "
+                           "before retrying recovery or settlement.")
+PROCESS_METADATA_REFUSAL = "job process metadata unverified; " + PROCESS_METADATA_ACTION
+ADMISSION_UNVERIFIED_ACTION = ("Root: supply trusted recipe bytes with tools/hierarchy_jobs.py --store "
+                               "<original-workspace-store> --recipes <trusted-recipes-file> recovery-status; "
+                               "revalidate admission before run-open; do not derive again.")
+PROVENANCE_REPAIR_ACTION = ("Root: preserve admitted.json and derivation.json; repair the provenance binding, "
+                            "revalidate stopped-process evidence, then retry resolve.")
+_UNREAD_PROCESS_RECORD = object()
 WORK_FOLDERS = ("scratch", "tmp", "home", "cargo-target", "ruff-cache", "hypothesis")
 # A require_clean job's read-only export of its commit. Not a work folder: the job never writes it, and it is removed
 # after the steps whatever their outcome, or by clean if the runner was lost first.
@@ -947,6 +957,8 @@ class AdmissionHeld(Exception):
 
 def admitted_derivation(job, raw, recipes_sha256):
     """The first successful admission is immutable and bound to both the original packet and recipe bytes."""
+    if job.planned:
+        return planned_admitted_derivation(job, raw, recipes_sha256)
     reference = read_json(job.folder / "admitted.json")
     fields(reference, {"packet_sha256", "recipes_sha256", "derivation_sha256"})
     saved = read_bytes(job.folder / "packet.md")
@@ -963,12 +975,158 @@ def admitted_derivation(job, raw, recipes_sha256):
     return derived
 
 
-def derivation_provenance(job):
+def planned_admission_json(raw):
+    """Decode bounded captured metadata without exposing parser text or duplicate keys."""
+    try:
+        value = strict_json(raw.decode("utf-8"))
+        require(isinstance(value, dict), "invalid planned admission metadata")
+        return value
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("persisted admission revalidation failed") from exc
+
+
+def planned_admitted_derivation(job, raw, recipes_sha256):
+    """Separate unavailable metadata from revalidation of captured admission content."""
+    from hierarchy_fresh_brief import _read_reference, _reference_descriptors
+
+    require(job.admission_detail is None, job.admission_detail or "admission marker unverified")
+    require(_reference_descriptors(), "admission metadata requires directory descriptor support")
+    captured = {}
+    for name in ("admitted.json", "packet.md", "derivation.json"):
+        _, captured[name] = _read_reference(job.folder / name, limit=MAX_BYTES, capture=True)
+    # An unavailable or unparseable marker does not establish persisted admission content.
+    reference = planned_admission_json(captured["admitted.json"])
+    try:
+        fields(reference, {"packet_sha256", "recipes_sha256", "derivation_sha256"})
+        for name in ("packet_sha256", "recipes_sha256", "derivation_sha256"):
+            value = reference[name]
+            require(isinstance(value, str) and len(value) == 64 and SHA256.fullmatch(value) is not None,
+                    "invalid admitted digest")
+        require(isinstance(recipes_sha256, str) and len(recipes_sha256) == 64
+                and SHA256.fullmatch(recipes_sha256) is not None, "invalid expected recipe digest")
+        require(captured["packet.md"] == raw and reference["packet_sha256"] == hashlib.sha256(raw).hexdigest(),
+                "admitted packet does not match the original request")
+        require(reference["recipes_sha256"] == recipes_sha256, "recipes changed after admission")
+        require(reference["derivation_sha256"] == hashlib.sha256(captured["derivation.json"]).hexdigest(),
+                "admitted derivation evidence changed")
+        derived = planned_admission_json(captured["derivation.json"])
+        matching(derived["dirty_content_sha256"], SHA256, "admitted dirty_content_sha256")
+        matching(derived["expected_tree"], GIT_ID, "admitted expected_tree")
+        require(derived["derived_by"] == "runner", "invalid admitted derivation")
+    except ERRORS as exc:
+        job.admission_validated = False
+        job.admission_unverified = True
+        job.admission_detail = ("recipes changed after admission" if str(exc) == "recipes changed after admission"
+                                else "persisted admission revalidation failed")
+        raise ValueError(job.admission_detail) from exc
+    job.validated_admission()
+    return derived
+
+
+class InvalidDerivationProvenance(ValueError):
+    """Captured provenance violates its admission binding or content contract."""
+
+
+def derivation_provenance(job, *, allow_unverified=False, allow_missing=False):
+    if job.planned:
+        return planned_derivation_provenance(job, allow_unverified=allow_unverified, allow_missing=allow_missing)
     path = job.folder / "derivation.json"
     if not path.exists():
         return {}
     derived = read_json(path)
     return {key: derived[key] for key in ("derived_by", "dirty_content_sha256", "expected_tree", "host_plan", "changed_paths")}
+
+
+def planned_request_derives(job):
+    """Use captured admission knowledge or the bounded, hash-bound original request; None is unknown."""
+    if job.derivation_required is not None:
+        return job.derivation_required
+    from hierarchy_fresh_brief import _read_reference, _reference_descriptors
+
+    try:
+        require(_reference_descriptors(), "request descriptors unavailable")
+        brief = job.message["brief"]
+        fields(brief, {"path", "sha256"})
+        expected = brief["sha256"]
+        require(isinstance(expected, str) and len(expected) == 64 and SHA256.fullmatch(expected) is not None,
+                "invalid request digest")
+        _, raw = _read_reference(Path(brief["path"]), limit=MAX_BYTES, capture=True)
+        require(hashlib.sha256(raw).hexdigest() == expected, "request changed")
+        packet = planned_admission_json(packet_text(raw).encode("utf-8"))
+        require(packet.get("schema") in (PACKET_SCHEMA, DEPENDENT_PACKET_SCHEMA), "invalid request schema")
+        matching(packet["recipe"], SLUG, "recipe name")
+        if "derive" in packet:
+            require(packet["derive"] == "runner", "invalid request derivation")
+        return "derive" in packet
+    except ERRORS:
+        return None
+
+
+def planned_derivation_provenance(job, *, allow_unverified=False, allow_missing=False):
+    """Persist only captured, hash-bound file data or this admission owner's computed staging values."""
+    from hierarchy_fresh_brief import _read_reference, _reference_descriptors
+
+    def unavailable(exc):
+        if allow_unverified is True:
+            return {"provenance_unverified": True}
+        raise ValueError("derivation provenance unverified") from exc
+
+    try:
+        require(_reference_descriptors(), "provenance descriptors unavailable")
+        marker = job.metadata_kind("admitted.json")
+        kind = job.metadata_kind("derivation.json")
+        if marker == kind == "absent":
+            if planned_request_derives(job) is False:
+                return {}
+            if allow_missing is True and not job.metadata_uncertain and job.admission_detail is None:
+                return {"provenance_unverified": True}
+            return unavailable(ValueError("derivation record unavailable"))
+        computed = (job.admission_owned and not job.admission_validated and not job.metadata_uncertain
+                    and job.admission_detail is None and marker == "absent" and job.staged_derivation is not None)
+        if not computed:
+            require(marker == "regular", "provenance binding unavailable")
+            _, reference_raw = _read_reference(job.folder / "admitted.json", limit=MAX_BYTES, capture=True)
+    except ERRORS as exc:
+        return unavailable(exc)
+    if not computed:
+        # A captured invalid binding is already a refusal, independently of derivation availability.
+        try:
+            reference = planned_admission_json(reference_raw)
+            fields(reference, {"packet_sha256", "recipes_sha256", "derivation_sha256"})
+            for value in reference.values():
+                require(isinstance(value, str) and len(value) == 64 and SHA256.fullmatch(value) is not None,
+                        "invalid provenance binding digest")
+        except ERRORS as exc:
+            raise InvalidDerivationProvenance("derivation provenance unverified") from exc
+        try:
+            require(kind == "regular", "provenance file unavailable")
+            _, raw = _read_reference(job.folder / "derivation.json", limit=MAX_BYTES, capture=True)
+        except ERRORS as exc:
+            return unavailable(exc)
+    try:
+        if computed:
+            # A failed staging attempt has no persisted admission binding. Its owner retains the
+            # values it computed; do not reopen an unbound file to construct a refusal result.
+            derived = job.staged_derivation
+        else:
+            require(hashlib.sha256(raw).hexdigest() == reference["derivation_sha256"], "provenance hash mismatch")
+            derived = planned_admission_json(raw)
+        keys = {"derived_by", "dirty_content_sha256", "expected_tree", "host_plan", "changed_paths"}
+        fields(derived, keys)
+        fields(derived["host_plan"], {"path", "sha256", "team"})
+        for value in (derived["dirty_content_sha256"], derived["host_plan"]["sha256"]):
+            require(isinstance(value, str) and len(value) == 64 and SHA256.fullmatch(value) is not None,
+                    "invalid provenance digest")
+        require(derived["derived_by"] == "runner", "invalid provenance producer")
+        if computed and derived["expected_tree"] is None:
+            require(derived["changed_paths"] is None, "invalid incomplete provenance")
+        else:
+            matching(derived["expected_tree"], GIT_ID, "provenance expected_tree")
+            require(isinstance(derived["changed_paths"], list)
+                    and all(isinstance(path, str) for path in derived["changed_paths"]), "invalid provenance paths")
+        return {key: derived[key] for key in keys}
+    except ERRORS as exc:
+        raise InvalidDerivationProvenance("derivation provenance unverified") from exc
 
 
 class DependencyPending(ValueError):
@@ -1101,6 +1259,8 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
     if job is not None and job.planned:
         require(not job.metadata_uncertain, "job metadata observation unverified")
     raw = mailbox.brief(message["brief"])
+    if job is not None and job.planned:
+        job.admission_packet = raw
     try:
         packet = strict_json(packet_text(raw))
     except UnicodeError as exc:
@@ -1120,12 +1280,16 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         job.census_policy = recipes.get("census_outside_policy")
     kind = recipe["kind"]
     derive = "derive" in packet
+    if job is not None and job.planned and not derive:
+        job.derivation_required = False
     if derive:
         require(packet["derive"] == "runner", "derive must be runner")
         require(kind == "commit", "only a commit recipe takes derive")
         host_plan = derive_host_plan(initiative)
         require(store is not None, "derivation requires the workspace store")
         job = job or Job(store.path, initiative, message)
+        if job.planned:
+            job.derivation_required = True
         marker = job.metadata_kind("admitted.json") if job.planned else (
             "regular" if (job.folder / "admitted.json").exists() else "absent")
         require(marker in ("absent", "regular"), "admission marker unverified")
@@ -1375,6 +1539,11 @@ class Job:
         self.attempt_observations = {"result": set(), "execution_nodes": set()}
         self.admission_validated = False
         self.admission_unverified = False
+        self.admission_detail = None
+        self.admission_packet = None
+        self.derivation_required = None
+        self.staged_derivation = None
+        self.process_unverified = False
         self.terminal_observed = False
         self.settlement_attempted = False
         self.census_capacity = None
@@ -1607,9 +1776,11 @@ class Job:
     def validated_admission(self):
         self.admission_validated = True
         self.admission_unverified = False
+        self.admission_detail = None
         self.execution_claim_name = "execution.json"
         self.execution_boundary_crossed = False
         if self.planned:
+            self.staged_derivation = None
             self.attempt_observations["execution_nodes"].add("admitted.json")
 
     def runner_alive(self, observation=None):
@@ -1656,6 +1827,7 @@ class Job:
         """Read with the same limit it was written with, or a valid large result could never be settled."""
         if not self.planned and not self.result_path.exists():
             return None
+        directory = None
         try:
             with ExitStack() as owned:
                 directory = owned.enter_context(self.directory_descriptor(legacy_result=not self.planned))
@@ -1682,7 +1854,11 @@ class Job:
                 if isinstance(exc, OSError) and exc.filename is not None:
                     exc.filename = str(self.result_path)
                 raise
-            self.observe_result(exc)
+            if (directory is None and isinstance(exc, FileNotFoundError)
+                    and (self.attempt_observations["execution_nodes"] or self.claim_candidates)):
+                self.observe_result(ValueError("job directory unavailable"))
+            else:
+                self.observe_result(exc)
             if isinstance(exc, FileNotFoundError):
                 require(self.result_decision() != "settle", "job has no validated terminal result")
                 return None
@@ -1716,6 +1892,8 @@ class Job:
             valid(result.get(field) is None or isinstance(result[field], str), field)
         if "process_stopped_confirmed" in result:
             valid(type(result["process_stopped_confirmed"]) is bool, "process_stopped_confirmed")
+        if self.planned and "provenance_unverified" in result:
+            valid(result["provenance_unverified"] is True, "provenance_unverified")
         if result.get("tests") is not None:
             tests = result["tests"]
             valid(isinstance(tests, dict), "tests")
@@ -1832,6 +2010,7 @@ class Job:
     def take_execution(self, packet_raw, recipes_sha256):
         """Successful derivation admission and the separate execution claim have distinct custody."""
         if self.planned:
+            require(self.admission_detail is None, self.admission_detail or "admission marker unverified")
             if self.result_decision() == "settle":
                 return False
             require(not self.metadata_uncertain, "job metadata observation unverified")
@@ -1850,7 +2029,11 @@ class Job:
             return self.claim(packet_raw, recipes_sha256, for_execution=True)
         self.execution_claim_name = "execution.json"
         with self.disposition():
-            raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
+            if self.planned:
+                raw = self.admission_packet if packet_raw is None else packet_raw
+                require(raw is not None, "admission packet unavailable; revalidate the original mailbox request")
+            else:
+                raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
             admitted_derivation(self, raw, recipes_sha256)
             check_settlement_processes(self, {"steps": []})
             claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
@@ -1888,29 +2071,49 @@ class Job:
             return True
 
     def process_record(self):
+        if self.planned:
+            return self.bounded_process_record()
+        # The owner requires exact historical no-plan serialization and refusal behavior.
         try:
             record = read_json(self.process_path)
         except (ValueError, OSError):
             return None
         return record if isinstance(record, dict) else None
 
+    def bounded_process_record(self):
+        """Planned consumers share the bounded, no-follow reader; invalid groups are opaque."""
+        from hierarchy_fresh_brief import _read_reference, _reference_descriptors
+
+        observed = False
+        try:
+            require(_reference_descriptors(), "process metadata requires directory descriptor support")
+            with self.directory_descriptor() as directory:
+                os.stat(self.process_path.name, dir_fd=directory, follow_symlinks=False)
+                observed = True
+            _, raw = _read_reference(self.process_path, limit=MAX_BYTES, capture=True)
+            record = strict_json(raw.decode("utf-8"))
+            require(isinstance(record, dict) and "group" in record, "invalid process record")
+            group = record["group"]
+            require(group is None or (type(group) is int and group > 0), "invalid process group")
+        except FileNotFoundError:
+            if observed:
+                self.process_unverified = True
+            return None
+        except ERRORS:
+            self.process_unverified = True
+            return None
+        return record
+
     def process_group(self):
-        return (self.process_record() or {}).get("group")
+        group = (self.process_record() or {}).get("group")
+        return group if not self.planned or (type(group) is int and group > 0) else None
 
     def staging_process_group(self):
         """An optional diagnostic never follows a replaced node or falls back to a path read."""
-        from hierarchy_fresh_brief import _read_reference, _reference_descriptors
-
-        try:
-            require(_reference_descriptors(), "staging process metadata requires directory descriptor support")
-            _, raw = _read_reference(self.process_path, limit=MAX_BYTES, capture=True)
-            record = strict_json(raw.decode("utf-8"))
-        except ERRORS:
-            return None
-        group = record.get("group") if isinstance(record, dict) else None
+        group = (self.bounded_process_record() or {}).get("group")
         return group if type(group) is int and group > 0 else None
 
-    def unrecorded_step(self):
+    def unrecorded_step(self, *, record=_UNREAD_PROCESS_RECORD):
         """The latest step that may have started while its own group is not on record, else None.
 
         A step's launch is recorded before its log is opened and its process started, and its group once it runs. A
@@ -1918,7 +2121,8 @@ class Job:
         earlier step's stopped group says nothing about whether this one still runs."""
         numbers = [int(path.name[5:-4]) for path in self.folder.glob("step-*.log") if path.name[5:-4].isdigit()]
         latest = max(numbers, default=0)
-        record = self.process_record()
+        if record is _UNREAD_PROCESS_RECORD:
+            record = self.process_record()
         if not latest:
             return None
         if record is None or not isinstance(record.get("step"), int) or record["step"] < latest:
@@ -1928,9 +2132,10 @@ class Job:
         # A later recorded launch whose log was never opened never started, and its earlier steps were confirmed stopped.
         return None
 
-    def evidence(self):
+    def evidence(self, *, include_derivation=True):
         names = sorted(path for path in self.folder.iterdir()
-                       if path.name.startswith("step-") or path.name in ("result.json", "derivation.json"))
+                       if path.name.startswith("step-") or path.name == "result.json"
+                       or (include_derivation and path.name == "derivation.json"))
         return [{"path": str(path), "sha256": file_sha256(path)} for path in names]
 
 
@@ -2008,21 +2213,25 @@ def result_body(job, result):
     return "\n\n".join(lines)
 
 
-def check_settlement_processes(job, result):
+def check_settlement_processes(job, result, *, record=_UNREAD_PROCESS_RECORD):
     """Read-only stop-evidence check shared by settlement and its recovery report."""
     claim = read_json(job.claim_path)
     require(isinstance(claim, dict) and claim.get("job") == job.id and claim.get("process_scope") == process_scope(),
             "job process scope is unknown: " + job.id)
-    record = job.process_record()
+    if record is _UNREAD_PROCESS_RECORD:
+        record = job.process_record()
+    require(not job.planned or not job.process_unverified, PROCESS_METADATA_REFUSAL)
     if result["steps"] and result.get("process_stopped_confirmed") is not True:
         require(record is not None and type(record.get("step")) is int and record["step"] == len(result["steps"])
                 and type(record.get("group")) is int and record["group"] > 0,
                 "executed steps lack process stop evidence: " + job.id)
-    group = job.process_group()
+    group = (record or {}).get("group") if job.planned else job.process_group()
     require(not group or (type(group) is int and group > 0), "invalid job process group")
     require(not (group and group_members(group)), "job process group is still running: " + str(group))
-    require(not job.unrecorded_step() or result.get("process_stopped_confirmed") is True,
+    unrecorded = job.unrecorded_step(record=record) if job.planned else job.unrecorded_step()
+    require(not unrecorded or result.get("process_stopped_confirmed") is True,
             "job has an unrecorded process effect: " + job.id)
+    require(not job.planned or not job.process_unverified, PROCESS_METADATA_REFUSAL)
 
 
 def settle(store, job, wait):
@@ -2034,7 +2243,9 @@ def settle(store, job, wait):
         require(result is not None, "job has no validated terminal result")
     check_settlement_processes(job, result)
     state = result["state"]
-    evidence = job.evidence() if state != "refused" or (job.folder / "derivation.json").exists() else None
+    unverified = job.planned and result.get("provenance_unverified") is True
+    evidence = (job.evidence(include_derivation=not unverified)
+                if state != "refused" or unverified or (job.folder / "derivation.json").exists() else None)
     publish_receipt(job, state, result_body(job, result), wait, exit_code=result["exit_code"], evidence=evidence,
                     reason=result.get("reason"))
     reference = {"path": str(job.result_path), "sha256": file_sha256(job.result_path)}
@@ -2153,7 +2364,8 @@ def refuse(store, job, reason, wait, recipes_sha256=None, *, outside_policy=None
     if job.admission_owned:
         check_settlement_processes(job, {"steps": []})
     job.census_capacity = job_grant_census(store, job, policy=outside_policy)
-    write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256, **derivation_provenance(job))
+    write_result(job, "refused", None, reason=reason[:4096], recipes_sha256=recipes_sha256,
+                 **derivation_provenance(job, allow_missing=True))
     return settle(store, job, wait)
 
 
@@ -2343,12 +2555,16 @@ def derive_commit_tree(packet, recipes, job, host_plan):
     except ERRORS:
         stopped()
         publish_file(job.folder / "derivation.json", encoded(derived) + b"\n")
+        if job.planned:
+            job.staged_derivation = dict(derived)
         raise
     stopped()
     if result.reason is None:
         matching(result.created["expected_tree"], GIT_ID, "derived expected_tree")
         derived.update(result.created)
     publish_file(job.folder / "derivation.json", encoded(derived) + b"\n")
+    if job.planned:
+        job.staged_derivation = dict(derived)
     require(result.reason is None, "could not derive expected_tree: " + str(result.reason))
     return derived
 
@@ -2778,7 +2994,7 @@ def unverified_custody_action():
             "custody before settlement or retry. Do not retry execution while custody is unknown.")
 
 
-def unknown_custody_row(job, group=None, reason="execution_custody_unknown"):
+def unknown_custody_row(job, group=None, reason="execution_custody_unknown", *, process_repair=False):
     # Historical claim verification supplies preservation guidance, never present custody or execution permission.
     observation = job.fence_observations.get(job.execution_claim_name)
     if observation is not None and observation.state == FENCE_VERIFIED:
@@ -2789,8 +3005,12 @@ def unknown_custody_row(job, group=None, reason="execution_custody_unknown"):
         action = observed_result_action()
     else:
         action = unverified_custody_action()
-    return planned_action({"job": job.id, "state": "abandoned", "process_group": group, "process_alive": None,
-                           "reason": reason}, job.initiative, action)
+    if job.planned and process_repair:
+        action += " " + PROCESS_METADATA_ACTION
+    row = {"job": job.id, "state": "abandoned", "process_group": group, "process_alive": None, "reason": reason}
+    if job.planned and job.admission_detail is not None:
+        row["detail"] = job.admission_detail
+    return planned_action(row, job.initiative, action)
 
 
 
@@ -2869,15 +3089,20 @@ def visit_existing(store, job, wait):
             except ERRORS as exc:
                 return blocked_row(job, exc)
             return None
-    group = job.process_group()
+    record = job.process_record() if job.planned else None
+    group = (record or {}).get("group") if job.planned else job.process_group()
     runner = job.runner_alive(observation)
     if runner is None:
         return unknown_custody_row(job, group,
                                    "runner visibility is unknown; retain the original claim and reservation")
     if runner:
         return {"job": job.id, "state": "running", "process_group": group}
+    if job.planned and job.process_unverified:
+        return unknown_custody_row(job, group, process_repair=True)
     alive = bool(group and group_members(group))
-    unrecorded = job.unrecorded_step()
+    unrecorded = job.unrecorded_step(record=record) if job.planned else job.unrecorded_step()
+    if job.planned and job.process_unverified:
+        return unknown_custody_row(job, group, process_repair=True)
     try:
         publish_receipt(job, "unknown", "Job %s has no result: its runner stopped before reporting. Root must "
                         "resolve it." % job.id, wait, reason="the runner stopped before the job reported an exit")
@@ -3068,7 +3293,7 @@ def fixture_roots(fixture, kind):
     return sorted(roots.get(kind, []))
 
 
-def census_owner(store_path, request):
+def census_owner(store_path, request, initiative=None):
     """The job's recorded live step (PID, birth) exempt from the outside census, or None.
 
     A held slot is held whoever filed it, but an exemption names whose live processes are ledger work, so it needs
@@ -3094,10 +3319,14 @@ def census_owner(store_path, request):
                 and isinstance(record.get("start"), str) and record["start"].isdigit(), "invalid runner claim: " + identifier)
     if record.get("process_scope") != process_scope() or process_start(record["pid"]) != record["start"]:
         return None
-    process = safe_path(claim.with_name("process.json"))
-    if not process.exists():
-        return None
-    step = read_json(process)
+    if initiative is not None and has_host_plan(initiative):
+        message_id = identifier.split("/")[1]
+        step = Job(store_path, initiative, {"message_id": message_id}).bounded_process_record()
+    else:
+        process = safe_path(claim.with_name("process.json"))
+        if not process.exists():
+            return None
+        step = read_json(process)
     if (isinstance(step, dict) and type(step.get("step")) is int and step["step"] > 0
             and type(step.get("group")) is int and step["group"] > 0
             and isinstance(step.get("start"), str) and step["start"].isdigit()
@@ -3132,7 +3361,7 @@ def census(store_path, ledger, fixture, kind, outside_policy=None):
         # Every initiative's grants are read, but census_owner exempts only a job its own initiative granted.
         for request in holder_requests(ledger.requests.values(), ANY_HOLDER, kind=kind, initiative=ANY_INITIATIVE,
                                        states=("granted",)):
-            owner = census_owner(store_path, request)
+            owner = census_owner(store_path, request, ledger.initiative(request["initiative"]))
             if owner is not None:
                 owners.add(owner)
         roots = outside_roots(owners, kind)
@@ -3956,9 +4185,12 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
             require(job.result_decision() != "settle", "job is already finished: " + identifier)
         require(runner is not None, "runner visibility is unknown: " + identifier)
         require(not runner, "its runner is still running: " + identifier)
-        group = job.process_group()
+        record = job.process_record() if job.planned else None
+        group = (record or {}).get("group") if job.planned else job.process_group()
+        require(not job.planned or not job.process_unverified, PROCESS_METADATA_REFUSAL)
         require(not (group and group_members(group)), "its process group %s is still running; stop it first" % group)
-        unrecorded = job.unrecorded_step()
+        unrecorded = job.unrecorded_step(record=record) if job.planned else job.unrecorded_step()
+        require(not job.planned or not job.process_unverified, PROCESS_METADATA_REFUSAL)
         if unrecorded:
             require(process_stopped, "step %d started but its process was never recorded, and an earlier step's stopped group "
                     "proves nothing about it; check by hand that it stopped, then pass --process-stopped" % unrecorded)
@@ -3968,7 +4200,8 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
                 "invalid recipes_sha256 in the claim of job: " + identifier)
         job.census_capacity = job_grant_census(store, job)
         write_result(job, "failed", NO_VERDICT_EXIT, reason="Resolved by root: " + reason, resolved_by_root=True,
-                     process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256, **derivation_provenance(job))
+                     process_stopped_confirmed=process_stopped, recipes_sha256=recipes_sha256,
+                     **derivation_provenance(job, allow_unverified=True))
     return 0, settle(store, job, wait)
 
 
@@ -4019,8 +4252,25 @@ def clean_finished(store_path, initiative_id):
                "not_finished": not_finished}
 
 
-def recovery_source(job, mailbox, result):
+def recovery_recipe_digest(recipes_path):
+    """Unavailable trusted bytes leave admission unverified, without exposing path/parser errors."""
+    if recipes_path is None:
+        return None
+    from hierarchy_fresh_brief import _read_reference, _reference_descriptors
+
+    try:
+        require(_reference_descriptors(), "recipe bytes unavailable")
+        _, raw = _read_reference(Path(recipes_path), limit=MAX_BYTES, capture=True)
+        return hashlib.sha256(raw).hexdigest()
+    except ERRORS:
+        return None
+
+
+def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_digest=None):
     """Observe the original packet and current source without admitting or running it."""
+    if job.planned and result is not None and result.get("provenance_unverified") is True:
+        return {"state": "unavailable", "reason": "derivation provenance unverified",
+                "terminal_source_unverified": True}
     if mailbox is None or "brief" not in job.message:
         return {"state": "unavailable", "reason": "original mailbox request is unavailable"}
     raw = mailbox.brief(job.message["brief"])
@@ -4033,15 +4283,41 @@ def recovery_source(job, mailbox, result):
     observed = source_state(mailbox, checkout, view)
     expected = {"source_revision": packet["commit"], "source_tree": packet["tree"],
                 "dirty_content_sha256": packet.get("dirty_content_sha256", EMPTY_STATUS)}
-    if (job.folder / "admitted.json").exists():
-        reference = read_json(job.folder / "admitted.json")
-        derived = admitted_derivation(job, raw, reference["recipes_sha256"])
+    # A terminal result retains its own source witness. Current recipes cannot invalidate history.
+    settled = job.planned and result is not None
+    if settled and not isinstance(result.get("after"), dict) and "dirty_content_sha256" in result:
+        digest = result["dirty_content_sha256"]
+        if not (isinstance(digest, str) and len(digest) == 64 and SHA256.fullmatch(digest) is not None):
+            return {"state": "unavailable", "reason": "terminal source digest unverified",
+                    "terminal_source_unverified": True}
+        expected["dirty_content_sha256"] = digest
+    marker = "absent" if settled else (job.metadata_kind("admitted.json") if job.planned else (
+        "regular" if (job.folder / "admitted.json").exists() else "absent"))
+    if marker not in ("regular", "absent"):
+        return {"state": "unavailable", "reason": "admission marker unverified"}
+    if marker == "regular":
+        if job.planned:
+            expected_recipes = recipe_digest() if recipe_digest is not None else recovery_recipe_digest(recipes_path)
+            if expected_recipes is None:
+                return {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                        "recipe_bytes_unavailable": True}
+        else:
+            reference = read_json(job.folder / "admitted.json")
+            expected_recipes = reference["recipes_sha256"]
+        derived = admitted_derivation(job, raw, expected_recipes)
         expected["dirty_content_sha256"] = derived["dirty_content_sha256"]
-    elif packet.get("derive") == "runner" and (job.folder / "derivation.json").exists():
+    elif not settled and packet.get("derive") == "runner" and (job.folder / "derivation.json").exists():
         # A known staging failure or a crash before the successful-admission marker still has an observed digest.
-        require(read_bytes(job.folder / "packet.md") == raw, "derivation packet does not match the original request")
-        derived = read_json(job.folder / "derivation.json")
-        matching(derived["dirty_content_sha256"], SHA256, "derived dirty_content_sha256")
+        if job.planned:
+            try:
+                derived = derivation_provenance(job)
+                require(bool(derived), "provenance unavailable")
+            except ERRORS:
+                return {"state": "unavailable", "reason": "derivation provenance unverified"}
+        else:
+            require(read_bytes(job.folder / "packet.md") == raw, "derivation packet does not match the original request")
+            derived = read_json(job.folder / "derivation.json")
+            matching(derived["dirty_content_sha256"], SHA256, "derived dirty_content_sha256")
         expected["dirty_content_sha256"] = derived["dirty_content_sha256"]
     # A completed commit/merge changes source intentionally. Its after-witness, not the old packet,
     # is the reference for later incoming-work revalidation; the original packet remains untouched.
@@ -4051,7 +4327,7 @@ def recovery_source(job, mailbox, result):
             "expected": expected, "observed": observed}
 
 
-def recovery_job(store, ledger, initiative, message, records, mailbox):
+def recovery_job(store, ledger, initiative, message, records, mailbox, recipes_path=None, *, recipe_digest=None):
     job = Job(store.path, initiative, message)
     # Deliberately kind-independent and every state, bound to the initiative: recovery reports every row this job's
     # initiative filed under its holder, and any open one keeps it settle_pending/reserved_not_started. Another
@@ -4077,11 +4353,16 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 row["runner_alive"] = job.runner_alive()
                 if job.planned:
                     require(job.result_decision() != "settle", "job has no validated terminal result")
-                group = job.process_group()
+                record = job.process_record() if job.planned else _UNREAD_PROCESS_RECORD
+                group = (record or {}).get("group") if job.planned else job.process_group()
                 row["process_group"] = group
                 row["process_alive"] = bool(group_members(group)) if group else None
-                if (job.folder / "admitted.json").exists() and not job.execution_path.exists():
-                    check_settlement_processes(job, {"steps": []})
+                marker = job.metadata_kind("admitted.json") if job.planned else (
+                    "regular" if (job.folder / "admitted.json").exists() else "absent")
+                execution = job.metadata_kind("execution.json") if job.planned else (
+                    "regular" if job.execution_path.exists() else "absent")
+                if marker == "regular" and execution == "absent":
+                    check_settlement_processes(job, {"steps": []}, record=record)
                     row["state"] = "admitted"
                     row["next_action"] = "Recheck the persisted admission with run-open; do not derive again."
                 else:
@@ -4097,8 +4378,10 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                 receipt = {"state": result["state"]}
                 if result["exit_code"] is not None:
                     receipt["exit_code"] = result["exit_code"]
-                if result["state"] != "refused" or (job.folder / "derivation.json").exists():
-                    receipt["evidence"] = job.evidence()
+                if (result["state"] != "refused" or (job.planned and result.get("provenance_unverified") is True)
+                        or (job.folder / "derivation.json").exists()):
+                    receipt["evidence"] = job.evidence(include_derivation=not (
+                        job.planned and result.get("provenance_unverified") is True))
                 if result.get("reason") is not None:
                     receipt["reason"] = result["reason"][:4096]
                 prior = records.get(receipt_id(job, result["state"]))
@@ -4111,13 +4394,21 @@ def recovery_job(store, ledger, initiative, message, records, mailbox):
                                       "Reconcile the exact receipt and result; run-open may settle without rerunning the job.")
         else:
             row["state"] = "reserved_not_started" if held else "pending"
-        row["source"] = recovery_source(job, mailbox, result)
+        row["source"] = recovery_source(job, mailbox, result, recipes_path, recipe_digest=recipe_digest)
+        if job.planned and row["state"] == "admitted" and row["source"].get("recipe_bytes_unavailable") is True:
+            row["state"] = "admission_unverified"
+            row["next_action"] = ADMISSION_UNVERIFIED_ACTION
         if row["source"]["state"] == "changed":
             row["next_action"] = "Revalidate incoming source before dependent work; retain the historical result and claim."
+        if row["state"] == "finished" and row["source"].get("terminal_source_unverified") is True:
+            row["next_action"] = "Root: preserve the terminal result and claim; reconcile terminal source evidence before dependent work."
     except ERRORS as exc:
         row.update(state="evidence_error", error=str(exc)[:2048],
                    next_action="Preserve all evidence and capacity; reconcile the unavailable or inconsistent record.")
-    if foreign and row["state"] == "finished" and row["source"]["state"] != "changed":
+        if job.planned and job.admission_detail is not None:
+            row["detail"] = job.admission_detail
+    if (foreign and row["state"] == "finished" and row["source"]["state"] != "changed"
+            and row["source"].get("terminal_source_unverified") is not True):
         # Settled for its own initiative, but not clean while another initiative's row holds its dependents.
         row["next_action"] = "Retain evidence for independent acceptance; first " + foreign_reason(foreign[0]) + "."
     return row
@@ -4135,7 +4426,7 @@ def foreign_reservation_blocker(initiative_id, request):
             "next_action": "Root: " + foreign_reason(request) + ". Until then this job's dependents are held."}
 
 
-def recovery_status(store_path, chosen=()):
+def recovery_status(store_path, chosen=(), recipes_path=None):
     """Read-only, replayable inventory; observations never grant, release, resolve or transfer ownership."""
     require(isinstance(chosen, (tuple, list)) and all(isinstance(item, str) for item in chosen), "invalid initiatives")
     store = Store(store_path)
@@ -4144,6 +4435,13 @@ def recovery_status(store_path, chosen=()):
         ledger.initiative(identifier)
     initiatives = sorted((i for i in ledger.initiatives.values() if not chosen or i["id"] in chosen),
                          key=lambda i: (i["priority"], i["id"]))
+
+    @lru_cache(maxsize=1)
+    def recipe_digest():
+        # Lazy so settled jobs and no-plan reports never acquire current recipe bytes.
+        # Cache unavailable evidence too: a replacement cannot mix versions within this report.
+        return recovery_recipe_digest(recipes_path)
+
     rows, blockers, teams, process_census = [], [], [], {}
     for kind in HEAVY_KINDS:
         try:
@@ -4195,10 +4493,12 @@ def recovery_status(store_path, chosen=()):
             require(folder.is_dir() and SLUG.fullmatch(folder.name) is not None, "unexpected job directory: " + str(folder))
             messages.setdefault(folder.name, {"message_id": folder.name})
         for message in messages.values():
-            row = recovery_job(store, ledger, initiative, message, records, mailbox)
+            row = recovery_job(store, ledger, initiative, message, records, mailbox, recipe_digest=recipe_digest)
             rows.append(row)
-            if row["state"] != "finished" or row["source"]["state"] == "changed":
-                blockers.append({"job": row["job"], "owner": owner, "reason": row["state"],
+            source_unavailable = row["state"] == "finished" and row["source"].get("terminal_source_unverified") is True
+            if row["state"] != "finished" or row["source"]["state"] == "changed" or source_unavailable:
+                blockers.append({"job": row["job"], "owner": owner,
+                                 "reason": "source_unavailable" if source_unavailable else row["state"],
                                  "next_action": row["next_action"]})
         if initiative["touched_paths"]:
             _, team["paths"] = check_paths(ledger, initiative["id"], initiative["touched_paths"])
@@ -4226,6 +4526,7 @@ def main(argv=None):
     opened.add_argument("--expect-recipes-sha256", help="Refuse changed recipes; pass the reviewed init hash")
     recovery = commands.add_parser("recovery-status", help="Read retained reservations, source and unknown job effects")
     recovery.add_argument("--initiative", action="append", default=[])
+    recovery.add_argument("--recipes", default=argparse.SUPPRESS, help="Absolute path to root's trusted recipe file")
     commands.add_parser("check-recipes", help="Validate the recipe file and summarize it")
     resolved = commands.add_parser("resolve", help="Close a job whose runner stopped, once nothing of it is running")
     resolved.add_argument("--job", required=True, help="<initiative>/<message-id>")
@@ -4243,7 +4544,7 @@ def main(argv=None):
         if args.command == "source-digest":
             code, result = source_digest(args.checkout)
         elif args.command == "recovery-status":
-            code, result = recovery_status(args.store, args.initiative)
+            code, result = recovery_status(args.store, args.initiative, args.recipes)
         elif args.command == "resolve":
             # --recipes is accepted but not read: the result records the hash the job's claim stored, the file it ran under.
             code, result = resolve(args.store, args.job, args.reason, args.lock_wait, args.process_stopped)
@@ -4273,6 +4574,8 @@ def main(argv=None):
             else:
                 code, result = run_open(args.store, args.recipes, args.initiative, args.max_jobs, args.census_fixture,
                                         args.lock_wait, args.expect_recipes_sha256)
+    except InvalidDerivationProvenance:
+        code, result = 2, {"error": "derivation provenance unverified", "next_action": PROVENANCE_REPAIR_ACTION}
     except ERRORS as exc:
         code, result = 2, {"error": str(exc)}
     print(json.dumps(result, sort_keys=True))
