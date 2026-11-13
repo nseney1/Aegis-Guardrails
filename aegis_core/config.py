@@ -90,7 +90,7 @@ ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD,
 
 _DECAY_KEYS = ("half_life_sessions", "epsilon")
 # "fitness" and the top-level decay keys are known (warned about, not counted as unknown keys).
-_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", *_DECAY_KEYS})
+_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "approvals", *_DECAY_KEYS})
 # tests, rules, perf, regression, scanners and insights are read through read_user_config by their consumers.
 _USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
                         "scanners", "insights", "coverage"})

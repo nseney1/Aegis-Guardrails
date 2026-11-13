@@ -16,6 +16,97 @@ What can hold against the agent depends on what GitHub enforces. `aegis doctor` 
 
 "Governance files" means the rules and Aegis config under `.aegis/`, `allowed_signers`, `CODEOWNERS`, `.github/workflows/`, the pytest configuration and plugin paths a change could use to steer the tests, and a deleted test file. `aegis doctor --github` prints the path-based entries as `CODEOWNERS` lines. [SECURITY.md](../SECURITY.md#trust-tiers) has the claim-by-claim truth table.
 
+## Approval modes per target branch
+
+The tier descriptions below describe repositories without an `approvals` key; their
+existing CI verdicts and report fields stay unchanged. To choose a mode per target,
+commit this key in `.aegis/config.json`:
+
+```json
+{"approvals": {"main": "signature", "develop": "review", "release/**": "review", "*": "none"}}
+```
+
+An exact branch wins, followed by the longest matching `prefix/**`, then `*`.
+An unknown target or a branch with no matching entry uses the strictest declared
+mode (`signature` > `review` > `none`). Maps must contain 1–256 entries; branch
+names use the conservative GitHub branch grammar (at most 255 characters), and
+the committed config is limited to 64 KiB.
+
+- `signature` gates rule weakenings and governance changes on the existing signed
+  approval or qualifying tier-A review. Configure `allowed_signers` on the base;
+  without a usable key or qualifying review, a flagged change cannot pass.
+- `review` lists both kinds of change and passes the approval gate with
+  `owner_review_required: true`. The owner's merge supplies the review. Restrict
+  pushes and merges with forge rules and separate the agent's credentials: this
+  CI notice does not enforce who can merge.
+- `none` lists both kinds of change without blocking on approval.
+
+The target base commit's config anchors the mode. When the base has a map, the
+head may tighten its requirement; it cannot lower it or remove the requirement by
+deleting the key. User config never supplies approval policy. A malformed head
+map is refused with `invalid_approval_policy`; a malformed historical base map
+uses the legacy gate and reports the error so it can be repaired. A base without
+a map stays under legacy evaluation, even when the head introduces a valid map.
+With no map on either side, unusable config bytes do not add a new policy refusal.
+
+Pull-request events supply `base.ref` and `base.sha`. Policy-enabled push events
+use the branch named by a `refs/heads/` `GITHUB_REF` and `before`; tag pushes and
+other refs have an unknown target and use the strictest mode.
+An all-zero `before` keeps the branch-creation fallback, including a pinned
+explicit `--base` that equals or descends from the head.
+Any other missing/unavailable push predecessor is refused with `base_unavailable`
+when a map is in play. A resolved comparison that would start at the head itself
+is refused with `comparison_unavailable`.
+Fetch the push's `before` commit with sufficient history and re-run.
+An explicit push `--base` supplies the comparison without requiring `before`.
+If that explicit comparison is unavailable or cannot precede the head, the
+refusal names the base to fetch or asks for a proper ancestor; it never asks to
+fetch `before`.
+When a resolved predecessor has no map, first-map pushes use its legacy gate.
+An empty `--base` is treated as omitted and uses the discovered comparison base.
+Nonempty `--base` selectors use Git's commit resolution, pinned before target
+classification. Git's symbolic full name `refs/heads/BRANCH` or
+`refs/remotes/REMOTE/BRANCH` identifies that branch, including upstream aliases.
+For a remote-tracking ref, REMOTE must be the uniquely longest matching configured
+remote name; names may contain `/`. An absent or ambiguous remote match gives an
+unknown target. The branch part `HEAD` is always unknown in both rows; a symbolic
+`origin/HEAD` may instead resolve to its actual branch. Remote inventory is bounded
+to 256 names and 64 KiB before parsing; unreadable or malformed data is refused
+with `invalid_approval_policy`.
+Tags, ambiguous names where Git selects a tag, pseudorefs, reflog selectors,
+commit IDs and other namespaces retain their pinned commit with an unknown
+target: they run the legacy gate without a map, or its strictest mode with one.
+Automatically discovered bases remain branch-only (or a CI event's full commit
+identity); a tag never supplies their comparison policy. Only a discovered
+`origin/BRANCH` may fall back to its local branch, with an unknown target.
+Explicit selectors never use that fallback. An absent explicit origin ref asks
+to fetch origin. An unresolvable/non-commit selector returns `base_unavailable`
+in CI (`no_base` in approve), naming the selector with the next action to fetch it
+or pass the full commit id. A resolved comparison without shared history is
+`comparison_unavailable` in CI (`no_common_history` in approve).
+PR event text never upgrades an unknown explicit target, including a full commit
+ID that matches the event and an origin ref.
+Selectors are bounded before Git execution; invalid selector text is refused,
+and malformed Git classification output returns `invalid_approval_policy`.
+An explicit branch that disagrees with the event's PR base or push branch is
+unknown; an explicit branch on a tag push is unknown too.
+Reports add `approval_mode`, `approval_target`, `owner_review_required` and
+`policy_source: base` when a base policy exists (`head` when the head tightens it).
+Other CI checks still block and name their blocking cause. CI uses one event
+snapshot, bounded to 25 MiB, for the base, head, target and review identity.
+Malformed event fields produce a fixed refusal when the resolved base declares
+a map; otherwise event handling retains legacy behavior. Branch names outside
+the conservative target grammar use the strictest mode when a map exists.
+Git object I/O failures refuse with `invalid_approval_policy` and a fetch/repair
+instruction; an unreadable repository cannot establish the absence of a policy.
+The GitHub summary retains permitted changes with their approval mode and shows
+`owner review required` for review targets.
+
+On `review` or `none` targets, `aegis approve --base origin/BRANCH` refuses with
+`not_required` (exit 1) and makes no commit. Signature targets retain the terminal,
+typed confirmation and key-custody checks. Signed test exemptions, manager
+activation and fitness credit keep their separate signature requirements.
+
 ## Tier C: the default
 
 1. Install and initialize: `pipx install aegis-guardrails`, then `aegis init --host claude-code` (or `codex-cli`, `antigravity`). This writes the `AGENTS.md` bootstrap, registers the MCP server and installs the pre-commit hook.
