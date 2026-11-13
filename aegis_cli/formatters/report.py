@@ -144,13 +144,19 @@ def ci_findings(document: dict[str, Any], workspace_root: Optional[str | Path] =
 
     found = []
     approved = bool((document.get("approval") or {}).get("valid"))
+    permitted = document.get("approval_mode") in ("none", "review")
     for w in document.get("weakenings", ()):
-        found.append(_finding(w["rule"], w["path"], 0, f"{w['code']}: {w['message']}",
-                              "note" if approved else "error", workspace_root))
+        label = f"; approval mode {document['approval_mode']}" if permitted else ""
+        found.append(_finding(w["rule"], w["path"], 0, f"{w['code']}: {w['message']}{label}",
+                              "note" if approved or permitted else "error", workspace_root))
     gov = document.get("governance") or {}
     for entry in gov.get("paths", ()) if gov.get("enforced") and not gov.get("approved") else ():
         found.append(_finding(f"governance:{entry['category']}", entry["path"], 0,
                               f"governance change without approval: {entry['path']}", "error", workspace_root))
+    if permitted:
+        for entry in gov.get("paths", ()):
+            found.append(_finding(f"governance:{entry['category']}", entry["path"], 0,
+                                  f"governance change; approval mode {document['approval_mode']}", "note", workspace_root))
     reg = document.get("regression") or {}
     for rf in reg.get("findings", ()):
         level = "error" if reg.get("tier") == "gate" and rf["code"] not in regression.UNVERIFIED_CODES else "warning"
@@ -224,6 +230,9 @@ def governance_note(document: dict[str, Any]) -> str:
     """Why a changed governance set is not enforced (no signing key at the base), or ""."""
     gov = document.get("governance") or {}
     cats = ", ".join(gov.get("categories") or ())
+    mode = document.get("approval_mode")
+    if mode in ("none", "review"):
+        return "owner review required" if mode == "review" else "approval mode none: no owner approval required"
     return (f"governance files changed ({cats}) but the base lists no key in allowed_signers, "
             "so no approval can be required (tier C: detection only)") if cats and not gov.get("enforced") else ""
 
@@ -298,7 +307,10 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
 
     out = []
     approved = bool((document.get("approval") or {}).get("valid"))
+    permitted = document.get("approval_mode") in ("none", "review")
     level, title = ("notice", "weakening approved") if approved else ("error", "weakening without approval")
+    if permitted:
+        level, title = "notice", "weakening permitted by approval mode"
     for w in document.get("weakenings", ()):
         out.append(line(level, title, f"{w['code']}: {w['rule']}: {w['message']}", w["path"]))
     gov = document.get("governance") or {}
@@ -306,9 +318,14 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
     for entry in gov.get("paths", ()) if gov.get("enforced") else ():
         message = f"governance:{entry['category']}: {entry['path']} changed; it passes only with a signed approval (aegis approve)"
         out.append(line(level, title, message, entry["path"]))
+    if permitted:
+        for entry in gov.get("paths", ()):
+            out.append(line("notice", "governance change permitted by approval mode",
+                            f"governance:{entry['category']}: {entry['path']} changed", entry["path"]))
     note = governance_note(document)
     if note:
-        out.append(line("warning", "governance change not enforced", note))
+        out.append(line("notice" if permitted else "warning",
+                        "approval mode" if permitted else "governance change not enforced", note))
     reg = document.get("regression") or {}
     gate = reg.get("tier") == "gate"
     for rf in reg.get("findings", ()):
@@ -376,10 +393,16 @@ def _table_row(*spans: str) -> str:
 def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> str:
     """Render a Markdown job summary for $GITHUB_STEP_SUMMARY."""
     anchored, lineless = _split(report_dict, workspace_root)
-    lineless = [f for f in lineless if f["level"] != "note"]  # an approved change is no finding
+    mode = report_dict.get("approval_mode")
+    if mode not in ("none", "review"):
+        lineless = [f for f in lineless if f["level"] != "note"]  # an approved change is no finding
     status = report_dict.get("status")
     passed = report_dict.get("passed", status == "pass" if status is not None else not (anchored or lineless))
     lines = [f"## Aegis Check Summary: {'PASSED' if passed else 'FAILED'}", ""]
+    if mode in ("none", "review"):
+        lines.extend([f"approval mode {mode}", ""])
+        if mode == "review":
+            lines.extend(["owner review required", ""])
     if anchored:
         lines.extend(["### Line-Anchored Findings", "| Rule | Location | Level | Message |", "| :--- | :--- | :--- | :--- |"])
         lines.extend(_table_row(_md_code(f["rule_id"]), _md_code(f"{f['uri']}:{f['line']}:{f['col']}"), f["level"],
@@ -456,6 +479,12 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
                          for note in report_dict.get("checkpoint_info", ())]
         notifications.extend({"level": "error", "message": {"text": finding["message"]}}
                              for finding in report_dict.get("findings", ()) if finding["rule"] == "strict:no-driver")
+        if report_dict.get("approval_mode") is not None:
+            notifications.append({"level": "note", "message": {"text":
+                f"approval mode {report_dict['approval_mode']}; target {report_dict.get('approval_target') or 'unknown'}"}})
+            notifications.extend({"level": finding["level"], "message": {"text":
+                f"{finding['rule_id']}: {finding['uri']}: {finding['message']}"}}
+                for finding in ci_findings(report_dict, workspace_root) if not finding["line"])
         if notifications:
             run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": notifications}]
     return json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [run]},

@@ -66,6 +66,11 @@ def test_repo_config_v1_keys(ws: Path):
     assert config.warnings == ()
 
 
+def test_approvals_is_a_known_repository_key_validated_only_by_policy_consumers():
+    assert RepoConfig.parse({"approvals": {"*": "none"}}).warnings == ()
+    assert RepoConfig.parse({"approvals": {"*": "bad"}}).warnings == ()
+
+
 def test_repo_config_cannot_name_commands(ws: Path):
     _repo(ws, {
         "v": 1,
