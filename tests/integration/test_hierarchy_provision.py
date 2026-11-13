@@ -42,10 +42,16 @@ LINK_FALLBACK = frozenset(getattr(errno, name) for name in
                           if hasattr(errno, name))
 
 
-def provision(command, request, *, expect=0):
+def provision(command, request, *, expect=0, exported=False):
     path = Path(request.pop("_request_path"))
     path.write_text(json.dumps(request), encoding="utf-8")
-    result = subprocess.run([sys.executable, "-I", str(PROVISION), command, "--request", str(path)], capture_output=True,
+    arguments = [sys.executable, "-I", str(PROVISION), command, "--request", str(path)]
+    if exported:
+        source = Path(json.loads((Path(request["base"]) / "provision.json").read_text())["source"])
+        assert not (source / "aegis_core").exists()
+        arguments = [sys.executable, "-I", "-S", "-B", str(source / "tools" / "hierarchy_provision.py"),
+                     command, "--request", str(path)]
+    result = subprocess.run(arguments, capture_output=True,
                             text=True, timeout=60, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert not result.stderr, result.stderr
     assert result.returncode == expect, result.stdout
@@ -162,8 +168,9 @@ class Setup:
     def init(self):
         return provision("init", self.init_request())
 
-    def add_role(self, endpoint, host="claude-code", *, expect=0, **changes):
-        return provision("add-role", self.request(base=str(self.base), endpoint=endpoint, host=host, **changes), expect=expect)
+    def add_role(self, endpoint, host="claude-code", *, expect=0, exported=False, **changes):
+        return provision("add-role", self.request(base=str(self.base), endpoint=endpoint, host=host, **changes),
+                         expect=expect, exported=exported)
 
     @property
     def root(self):
@@ -1299,6 +1306,69 @@ def mr1_plan(setup, host="claude-code"):
         "team": host, "stand_ins": {}, "config_sha256": "ab" * 32}), encoding="utf-8")
 
 
+@pytest.mark.parametrize("case", ["healthy", "endpoint", "selected", "unknown-host"])
+def test_r4_exported_provision_without_secret_table_preserves_success_and_refusals(setup, case):
+    from concurrent.futures import ThreadPoolExecutor
+    data = mr1_bindings()
+    host = "ghp_" + "A" * 24
+    if case == "unknown-host":
+        for row in data["hosts"]:
+            if row["host"] == "codex-cli":
+                row["host"] = host
+    elif case != "healthy":
+        row = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("codex-cli", "coding"))
+        row["admission"]["standard" if case == "endpoint" else "extended"] = "unprobed"
+    path = mr1_r9_publish_bindings(setup, json.dumps(data).encode())
+    mr1_plan(setup, "codex-cli")
+    request = mr1_r4_request(setup, setup.base, "add-role", "codex-cli", endpoint="pilot/lane/f2",
+                              model=next(row["model"] for row in data["hosts"]
+                                         if row["class"] == "coding" and row["host"] != "claude-code"),
+                              effort="xhigh" if case == "selected" else "high")
+    request_path = Path(request.pop("_request_path"))
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    # -S removes installed Aegis as well: the exported tools must stand alone.
+    script = """import importlib.util, sys
+sys.path.insert(0, sys.argv[1])
+assert importlib.util.find_spec('aegis_core') is None
+import hierarchy_provision as provision
+calls = []
+original = provision.secret_patterns
+def tracked_patterns():
+    calls.append(None)
+    return original()
+provision.secret_patterns = tracked_patterns
+code = provision.main(sys.argv[3:])
+assert bool(calls) == (code != 0 and sys.argv[2] in ('endpoint', 'selected'))
+raise SystemExit(code)
+"""
+
+    def run(_):
+        result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", script, str(setup.source / "tools"), case,
+                                 "add-role", "--request", str(request_path)], capture_output=True,
+                                text=True, timeout=60, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        assert result.stderr == ""
+        return result.returncode, json.loads(result.stdout)
+
+    if case != "healthy":
+        expected = ("invalid model bindings %s: unknown host %s; repair model-bindings.json" % (path, ascii(host))
+                    if case == "unknown-host" else
+                    "binding_not_admitted: codex-cli/coding intent %s for %s; probe the level or repair model-bindings.json" %
+                    (("standard", "orchestrator") if case == "endpoint" else ("extended", "implementer")))
+        if case == "selected":
+            expected += " or choose an admitted level within the band"
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            refused = list(pool.map(run, range(3)))
+        assert run(None) == (2, {"error": expected})
+        assert refused == [(2, {"error": expected})] * 3
+        if case != "unknown-host":
+            assert "<redacted locator>" not in expected
+        assert unbound(setup, "pilot/lane/f2")
+        mr1_r9_publish_bindings(setup, json.dumps(mr1_bindings()).encode())
+    code, answer = run(None)
+    assert code == 0, answer
+    assert answer["team"]["admission"] == "admitted"
+
+
 def mr1_request(setup, command, endpoint="pilot/orchestrator", host="claude-code", **changes):
     body = {"base": str(setup.base), "endpoint": endpoint, "cwd": str(setup.source)}
     if command == "add-role":
@@ -1506,11 +1576,12 @@ def test_mr1_team_ultra_keeps_argv_and_records_deprecation_under_plan(setup, hos
     ("bad\nｘ", "model 'bad\\n\\uff58' is not bound for host claude-code; choose a model bound in model-bindings.json"),
 ])
 @pytest.mark.parametrize("source", ["request", "team.json"])
-def test_mr1_plan_refuses_models_outside_host_bindings(setup, source, model, error):
+@pytest.mark.parametrize("exported", [False, True], ids=["installed", "exported"])
+def test_mr1_plan_refuses_models_outside_host_bindings(setup, source, model, error, exported):
     mr1_plan(setup)
     write_team(setup, model=model, reasoning="medium")
     changes = {"model": model, "effort": "medium"} if source == "request" else {}
-    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2, **changes)
+    refused = setup.add_role("pilot/orchestrator", cwd=str(setup.source), expect=2, exported=exported, **changes)
     if error.startswith("model "):
         error = source + " " + error
     if source == "request":
@@ -1582,16 +1653,17 @@ def test_mr1_bad_team_reasoning_has_safe_refusal_before_binding(setup, value, sh
 
 @pytest.mark.parametrize("endpoint,effort", [("pilot/front-door", "max"), ("pilot/router", "medium")])
 @pytest.mark.parametrize("model", ["claude-opus-5-5", "unbound-model"])
-def test_mr1_unbanded_roles_require_a_bound_model_and_keep_effort(team, endpoint, effort, model):
+@pytest.mark.parametrize("exported", [False, True], ids=["installed", "exported"])
+def test_mr1_unbanded_roles_require_a_bound_model_and_keep_effort(team, endpoint, effort, model, exported):
     mr1_plan(team)
     request = mr1_request(team, "add-role", endpoint, model=model, effort=effort)
     if model == "unbound-model":
-        refused = provision("add-role", request, expect=2)
+        refused = provision("add-role", request, expect=2, exported=exported)
         assert refused == {"error": "request model unbound-model is not bound for host claude-code; "
                            "choose a model bound in model-bindings.json"}
         assert unbound(team, endpoint)
     else:
-        answer = provision("add-role", request)
+        answer = provision("add-role", request, exported=exported)
         assert flag(answer["start_argv"], "--effort") == effort
         assert answer["team"]["model_class"] == "coding" and answer["team"]["band"] is None
 
@@ -2173,8 +2245,8 @@ def test_mr1_r5_launcher_records_deep_team_parse_refusal(tmp_path_factory, host)
     ("unknown-intent", "levels must map a nonempty subset of light, standard, deep, extended, max, ultra"),
     ("missing-default", "binding claude-code/coding lacks band default standard for orchestrator"),
     ("missing-ceiling", "binding claude-code/coding lacks band ceiling max for implementer"),
-    ("rejected-default", "band default and ceiling levels must be admitted"),
-    ("rejected-ceiling", "band default and ceiling levels must be admitted"),
+    ("rejected-default", "binding_not_admitted: claude-code/coding intent standard for orchestrator"),
+    ("rejected-ceiling", "binding_not_admitted: claude-code/coding intent max for implementer"),
 ])
 def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeypatch, case, problem):
     module, call = mr1_cli
@@ -2208,7 +2280,8 @@ def test_mr1_r5_admission_and_partial_levels_fail_closed(setup, mr1_cli, monkeyp
                                             model="claude-opus-5-5", effort="medium"), expect=2)
     action = ("probe the level or repair model-bindings.json" if case.startswith("rejected-") else
               "repair model-bindings.json")
-    assert refused == {"error": "invalid model bindings %s: %s; %s" % (path, problem, action)}
+    assert refused == {"error": (problem + "; " + action if case.startswith("rejected-") else
+                                "invalid model bindings %s: %s; %s" % (path, problem, action))}
     assert unbound(setup, "pilot/orchestrator")
 
 
@@ -2226,8 +2299,9 @@ def test_mr1c_band_admission_refuses_before_binding_and_allows_repair(setup, mr1
                              model=row["model"], effort="high")
     for _ in range(2):
         assert call(command, dict(request), expect=2) == {
-            "error": "invalid model bindings %s: band default and ceiling levels must be admitted; "
-                     "probe the level or repair model-bindings.json" % path}
+            "error": "binding_not_admitted: %s/coding intent %s for %s; "
+                     "probe the level or repair model-bindings.json" %
+                     (host, intent, "orchestrator" if intent == "standard" else "implementer")}
         assert unbound(setup, "pilot/lane/f2")
     row["admission"][intent] = "admitted"
     mr1_r9_publish_bindings(setup, json.dumps(data).encode())
@@ -2256,12 +2330,144 @@ def test_mr1_r5_selected_admission_is_recorded_or_refused(setup, mr1_cli, monkey
             assert answer == {"error": "implementer effort xhigh has no supported intent; supported intents: "
                                       "light, standard, deep, max; choose a supported effort"}
         elif state != "admitted":
-            assert answer == {"error": "%s intent extended (effort xhigh) is not admitted for %s; "
-                                      "choose an admitted supported level" % (row["model"], host)}
+            assert answer == {"error": "binding_not_admitted: %s/coding intent extended for implementer; "
+                                      "probe the level or repair model-bindings.json or choose an admitted level within the band" % host}
         else:
             assert answer["team"]["admission"] == state and answer["team"]["intent"] == "extended"
         if state != "admitted":
             assert unbound(setup, "pilot/lane/f2")
+
+
+@pytest.mark.parametrize("endpoint,kind,action", [
+    ("pilot/front-door", "front-door", "or choose an admitted supported level"),
+    ("pilot/lane/f2", "implementer", "or choose an admitted level within the band"),
+])
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+@pytest.mark.parametrize("exported", [False, True], ids=["installed", "exported"])
+def test_mr1c_selected_admission_keeps_role_next_action(team, endpoint, kind, action, state, exported):
+    from concurrent.futures import ThreadPoolExecutor
+    mr1_plan(team, "codex-cli")
+    data = mr1_bindings()
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("codex-cli", "coding"))
+    row["admission"]["extended"] = state
+    mr1_r9_publish_bindings(team, json.dumps(data).encode())
+    expected = {"error": "binding_not_admitted: codex-cli/coding intent extended for %s; "
+                         "probe the level or repair model-bindings.json %s" % (kind, action)}
+
+    def refuse(_):
+        return provision("add-role", mr1_request(team, "add-role", endpoint, "codex-cli",
+                                                model=row["model"], effort="xhigh"), expect=2, exported=exported)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refuse, range(3))) == [expected] * 3
+    assert refuse(None) == expected
+    assert unbound(team, endpoint)
+    answer = provision("add-role", mr1_request(team, "add-role", endpoint, "codex-cli",
+                                             model=row["model"], effort="high"), exported=exported)
+    assert answer["team"]["admission"] == "admitted" and answer["team"]["intent"] == "deep"
+
+
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+@pytest.mark.parametrize("exported", [False, True], ids=["installed", "exported"])
+def test_mr1c_fixed_router_admission_keeps_owner_next_action(team, state, exported):
+    from concurrent.futures import ThreadPoolExecutor
+    mr1_plan(team, "codex-cli")
+    data = mr1_bindings()
+    for policy in data["roles"]:
+        if policy["kind"] in ("orchestrator", "decider"):
+            policy["band"] = {"floor": "light", "default": "deep", "ceiling": "deep"}
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("codex-cli", "coding"))
+    row["admission"]["standard"] = state
+    mr1_r9_publish_bindings(team, json.dumps(data).encode())
+    assert provision("add-role", mr1_request(team, "add-role", "pilot/router", "codex-cli",
+                                            model=row["model"], effort="xhigh"), expect=2, exported=exported) == {
+        "error": "the router role runs at effort medium from the role registry"}
+
+    def refuse(_):
+        return provision("add-role", mr1_request(team, "add-role", "pilot/router", "codex-cli",
+                                                model=row["model"]), expect=2, exported=exported)
+
+    expected = {"error": "binding_not_admitted: codex-cli/coding intent standard for router; "
+                         "probe the level or repair model-bindings.json"}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refuse, range(3))) == [expected] * 3
+    assert refuse(None) == expected
+    assert unbound(team, "pilot/router")
+    row["admission"]["standard"] = "admitted"
+    mr1_r9_publish_bindings(team, json.dumps(data).encode())
+    answer = provision("add-role", mr1_request(team, "add-role", "pilot/router", "codex-cli",
+                                             model=row["model"]), exported=exported)
+    assert answer["team"]["admission"] == "admitted" and answer["team"]["intent"] == "standard"
+    assert answer["team"]["effort"] == "medium" and answer["team"]["effort_from"] == "registry"
+
+
+MR1C_ROLE_NEXT_ACTIONS = [
+    ("root", None),
+    ("router", ""),
+    ("orchestrator", " or choose an admitted level within the band"),
+    ("reviewer", " or choose an admitted level within the band"),
+    ("decider", " or choose an admitted level within the band"),
+    ("implementer", " or choose an admitted level within the band"),
+    ("test-author", None),
+    ("owner", None),
+    ("watch-supervisor", None),
+    ("provider-bridge", None),
+    ("job-executor", None),
+    ("architect", None),
+    ("validation-operator", None),
+    ("integrator", " or choose an admitted level within the band"),
+    ("specialist-reviewer", None),
+    ("release-operator", None),
+    ("front-door", " or choose an admitted supported level"),
+]
+
+
+@pytest.mark.parametrize("name,suffix", MR1C_ROLE_NEXT_ACTIONS)
+@pytest.mark.parametrize("state", ["unprobed", "rejected"])
+def test_mr1c_registry_roles_offer_only_caller_selectable_next_actions(team, mr1_cli, name, suffix, state):
+    from concurrent.futures import ThreadPoolExecutor
+    module, _ = mr1_cli
+    roles = module.hierarchy_roles.registry()["roles"]
+    assert {role for role, _ in MR1C_ROLE_NEXT_ACTIONS} == set(roles)
+    entry = roles[name]
+    if entry["endpoint"] is None:
+        assert suffix is None  # These roles have no host session or model resolution.
+        return
+    kind = entry["endpoint"].get("lane_kind", entry["endpoint"]["role"])
+    mr1_plan(team, "codex-cli")
+    data = mr1_bindings()
+    for policy in data["roles"]:
+        policy["band"] = {"floor": "light", "default": "deep", "ceiling": "max"}
+    row = next(row for row in data["hosts"] if (row["host"], row["class"]) == ("codex-cli", "coding"))
+    profile = module.hierarchy_roles.fixed_model_profile(entry)
+    request = {"model": row["model"]} if profile is not None else {"model": row["model"], "effort": "xhigh"}
+    options, fixed = module.apply_fixed_profile(request, profile, "codex-cli", entry["endpoint"]["role"])
+    intent = next(intent for intent, level in row["levels"].items() if level == options["effort"])
+    row["admission"][intent] = state
+    mr1_r9_publish_bindings(team, json.dumps(data).encode())
+    setup_record = json.loads((team.base / "provision.json").read_text())
+    bindings = module.load_model_bindings(setup_record, team.base)
+    if suffix is None:
+        assert kind == "root"
+        assert module.team_settings(team.base, "codex-cli", options, kind=kind) == (options, None)
+        return
+
+    def refuse(_):
+        with pytest.raises(module.BindingAdmissionError) as caught:
+            module.planned_model_settings(bindings, "codex-cli", kind, options, None, fixed)
+        return str(caught.value)
+
+    expected = ("binding_not_admitted: codex-cli/coding intent %s for %s; "
+                "probe the level or repair model-bindings.json" % (intent, kind)) + suffix
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(refuse, range(3))) == [expected] * 3
+    assert refuse(None) == expected
+    row["admission"][intent] = "admitted"
+    mr1_r9_publish_bindings(team, json.dumps(data).encode())
+    bindings = module.load_model_bindings(json.loads((team.base / "provision.json").read_text()), team.base)
+    _, record = module.planned_model_settings(bindings, "codex-cli", kind, options, None, fixed)
+    assert record["admission"] == "admitted"
+    assert record["effort_from"] == ("registry" if fixed is not None else "request")
 
 
 @pytest.mark.parametrize("command,host", MR1_R2_ENTRY_POINTS)

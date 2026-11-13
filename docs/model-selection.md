@@ -33,13 +33,37 @@ T7 records set author_family to the chosen family and refuse a contradictory
 author, providing the binding for a subsequent T8 check. No Router seat, launch
 or effort update is added.
 
-MR-1c exception: supported, selectable unprobed bindings remain usable until probes
-exist. Every choice and record carries admission (unprobed or admitted); rejected
-levels refuse. A null selected capability refuses binding_unavailable:<host>:<intent>.
+Selection requires admitted bindings. Unprobed and rejected levels both refuse
+`binding_not_admitted: <host>/<class> intent <intent> for <role>; probe the level or repair model-bindings.json`.
+Provision uses this same refusal at load and resolution. Every choice and record
+carries admission `admitted`; replay and append refuse unprobed records as
+`invalid_history`. A null selected capability refuses binding_unavailable:<host>:<intent>.
+Non-endpoint selections with caller-selectable effort append
+`or choose an admitted level within the band` to the next action.
+Provision's unbanded front-door offers `or choose an admitted supported level`;
+roles with registry-fixed effort, such as router, keep only the probe/repair action.
+Endpoint refusals retain the owner probe/repair action.
+All structural validation finishes before admission is checked, so a missing row,
+invalid role class or null band endpoint cannot be masked by an unadmitted level.
+Core malformed inputs refuse `invalid_bindings`; provision retains its structural
+`invalid model bindings ...` envelope. Host diagnostics follow caller registry
+order (or row order when inferred); unordered set registries are sorted.
+The new admission and unavailable-binding refusals bound locator text before shared-table redaction.
+Redaction markers are emitted whole, including when redaction expands the field.
+Both validators build these diagnostics only on refusal; healthy provision never
+loads the secret table. In an exported tools checkout without the shared table, provision
+keeps the new refusal code and action. A canonical identifier matching
+`[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` is shown as is; anything else becomes
+`<redacted locator>`. The full value must match before any truncation.
+Core imports the shared table directly and applies its patterns to locators,
+using one fixed `[REDACTED_TOKEN]` marker.
+Codes and actions match; locator text can differ when provision lacks the table.
+Refusals that predate MR-1c-SEL retain their exact original formatting and bytes in
+every layout, independently of table availability (coordinator round-5 ruling).
 Planned hosts describe
 capabilities only and never select, even if policy names them. The Gemini and Grok
 rows remain planned and unprobed; this registry change grants no routing admission.
-Selectable hosts need concrete non-null band defaults and ceilings; a null endpoint
+Selectable hosts need admitted, concrete non-null band defaults and ceilings; a null endpoint
 is refused at load just like a missing key. Planned-host refusal applies before
 host-default and ROOT waivers as well as explicit model resolution.
 Validation matches MR-1's band/coverage/model-token rules for selectable hosts in
