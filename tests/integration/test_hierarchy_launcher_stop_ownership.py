@@ -1,4 +1,6 @@
 """Stop owns a host program naming the session, never a diagnostic naming the same UUID."""
+import hashlib
+import hmac
 import os
 import json
 from pathlib import Path
@@ -8206,29 +8208,1121 @@ def test_stubborn_descendant_stop_waits_for_actual_kill_delivery(launch, childre
     assert actors[2].wait(timeout=5) == -signal.SIGKILL
 
 
-@pytest.mark.parametrize("exit_after_live_read,fail_while_held", [(False, False), (True, False), (True, True)],
-                         ids=["ordinary", "exit-after-live-read", "body-failure-held"])
+_HOOK_CHECK_TOKEN_LIMIT = 180
+_HOOK_CHECK_NAME_LIMIT = 80
+_HOOK_CHECK_RECORD_LIMIT = 16
+_RECORDED_CHECK_NAMES = set()
+_FORCED_HOOK_CHECKS = (
+    {"check": "signal_target_birth", "observed": "forced-observed-birth", "expected": "expected-birth"},
+    {"check": "signal_target_parent", "observed": "forced-observed-parent", "expected": "expected-parent"},
+)
+# Recorded checks may follow the sentence. An end anchor would reject that annotated failure.
+_HELD_BODY_FAILURE = "injected test body failure while KILL is held"
+_HELD_BODY_MATCH = "^" + _HELD_BODY_FAILURE
+
+
+def _hook_check_name_ok(check):
+    if not isinstance(check, str) or not 1 <= len(check) <= _HOOK_CHECK_NAME_LIMIT:
+        return False
+    return all(ch.isascii() and (ch.isalnum() or ch in "_.-") for ch in check)
+
+
+def _check_name_printable(check):
+    """A recorded check prints only when it is a short test-authored identifier."""
+    if not _hook_check_name_ok(check):
+        return False
+    return check[0].isascii() and check[0].isalpha()
+
+
+def _remember_check_name(check):
+    if _check_name_printable(check):
+        _RECORDED_CHECK_NAMES.add(check)
+    return check
+
+
+def _canonical_bytes(value):
+    """Canonical bytes of the whole value, taken before any diagnostic is clipped."""
+    try:
+        if isinstance(value, bytes):
+            text = "bytes:" + json.dumps(value.hex(), ensure_ascii=True)
+        elif isinstance(value, str):
+            text = json.dumps(value, ensure_ascii=True)
+        elif isinstance(value, tuple):
+            text = "tuple:" + json.dumps(list(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        elif isinstance(value, float):
+            text = json.dumps(value, allow_nan=False)
+        else:
+            text = repr(value)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        try:
+            text = repr(value)
+        except Exception:
+            text = type(value).__name__
+    return text.encode("utf-8")
+
+
+def _type_label(value):
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, bytes):
+        return "bytes"
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, tuple):
+        return "tuple"
+    if isinstance(value, float):
+        return "float"
+    name = type(value).__name__
+    if name.isascii() and name.isidentifier() and len(name) <= 32:
+        return name
+    return "object"
+
+
+# One key per process. Equal values still match inside a run; a log reader cannot confirm a guess.
+_FINGERPRINT_KEY = os.urandom(32)
+
+
+def _fingerprint(value):
+    canonical = _canonical_bytes(value)
+    digest = hmac.new(_FINGERPRINT_KEY, canonical, hashlib.sha256).hexdigest()[:12]
+    return "<%s len=%d sha256=%s>" % (_type_label(value), len(canonical), digest)
+
+
+def _hook_diagnostic_token(value, check_name=False):
+    """Fingerprint every untrusted value. Only a recorded check name or a number prints.
+
+    Invariant: int, bool, and None print verbatim. A check name prints only when this module
+    recorded it and it matches the identifier pattern. Every other value, including a string
+    equal to a recorded check name, and every mapping key inside a composite, is a fingerprint
+    of the whole value's canonical bytes. The digest is HMAC-SHA256 under a per-process
+    key; the printed field stays sha256=. Nothing is clipped before that hash.
+    """
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return json.dumps(value)
+    if (check_name and isinstance(value, str) and value in _RECORDED_CHECK_NAMES
+            and _check_name_printable(value)):
+        return value
+    return _fingerprint(value)
+
+
+def _count_display_omission(limit, name):
+    """Count one distinct name removed so the summary fits. Repeats and unknown stay put."""
+    if limit["dropped_checks_omitted"] == "unknown":
+        return
+    if name in limit["omitted_checks"]:
+        return
+    if len(limit["omitted_checks"]) < _HOOK_CHECK_RECORD_LIMIT:
+        limit["omitted_checks"].append(name)
+        limit["dropped_checks_omitted"] = len(limit["omitted_checks"])
+        return
+    limit["dropped_checks_omitted"] = "unknown"
+
+
+def _hook_limit_observed(limit):
+    """One valid JSON object naming how many rows and which checks were dropped.
+
+    Names removed to fit the token limit are distinct omitted identities. A display pop
+    does not increment dropped_rows. unknown stays unknown.
+    """
+    names = list(limit["dropped_checks"])
+    while True:
+        shown = [_hook_diagnostic_token(name, check_name=True) for name in names]
+        omitted = limit["dropped_checks_omitted"]
+        payload = {"dropped_rows": limit["dropped_rows"], "dropped_checks": shown}
+        if omitted:
+            payload["dropped_checks_omitted"] = omitted
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if len(rendered) <= _HOOK_CHECK_TOKEN_LIMIT or not names:
+            return rendered
+        _count_display_omission(limit, names.pop())
+
+
+def _note_dropped_hook_check(sink, check_name):
+    """Count each omitted check once. Repeats never inflate dropped_checks_omitted."""
+    limit = None
+    for item in sink:
+        if item.get("check") == "hook_check_record_limit":
+            limit = item
+            break
+    if limit is None:
+        _remember_check_name("hook_check_record_limit")
+        limit = {"check": "hook_check_record_limit", "dropped_rows": 0, "dropped_checks": [],
+                 "omitted_checks": [], "dropped_checks_omitted": 0,
+                 "expected": _hook_diagnostic_token(_HOOK_CHECK_RECORD_LIMIT)}
+        sink.append(limit)
+    limit["dropped_rows"] += 1
+    if check_name not in limit["dropped_checks"] and check_name not in limit["omitted_checks"]:
+        if len(limit["dropped_checks"]) < _HOOK_CHECK_RECORD_LIMIT:
+            limit["dropped_checks"].append(check_name)
+        elif len(limit["omitted_checks"]) < _HOOK_CHECK_RECORD_LIMIT:
+            limit["omitted_checks"].append(check_name)
+            if limit["dropped_checks_omitted"] != "unknown":
+                limit["dropped_checks_omitted"] = len(limit["omitted_checks"])
+        else:
+            limit["dropped_checks_omitted"] = "unknown"
+    limit["observed"] = _hook_limit_observed(limit)
+
+
+def _record_hook_check(sink, check, observed, expected):
+    """Keep the first row of each canonical identity and count exact repeats."""
+    if not _hook_check_name_ok(check):
+        row_check = "hook_check_name_refused"
+        _remember_check_name(row_check)
+        row_observed = _hook_diagnostic_token(check)
+        row_expected = _hook_diagnostic_token("single-line-check-name")
+    else:
+        row_check = check
+        _remember_check_name(row_check)
+        row_observed = _hook_diagnostic_token(observed)
+        row_expected = _hook_diagnostic_token(expected)
+    for existing in sink:
+        if existing.get("check") == "hook_check_record_limit":
+            continue
+        if (existing.get("check"), existing.get("observed"), existing.get("expected")) == (
+                row_check, row_observed, row_expected):
+            existing["count"] = existing.get("count", 1) + 1
+            return
+    kept = sum(1 for item in sink if item.get("check") != "hook_check_record_limit")
+    if kept >= _HOOK_CHECK_RECORD_LIMIT:
+        _note_dropped_hook_check(sink, row_check)
+        return
+    sink.append({"check": row_check, "observed": row_observed, "expected": row_expected})
+
+
+def _format_hook_check_failures(rows):
+    parts = []
+    for row in rows:
+        check = _hook_diagnostic_token(row["check"], check_name=True)
+        segment = "check=%s observed=%s expected=%s" % (check, row["observed"], row["expected"])
+        count = row.get("count", 1)
+        if isinstance(count, int) and not isinstance(count, bool) and count > 1:
+            segment += " count=%d" % count
+        if "\n" in segment or "\r" in segment:
+            segment = "check=hook_check_report_refused observed=%s expected=%s" % (
+                json.dumps("<multi-line>"), json.dumps("single-line"))
+        parts.append(segment)
+    return "; ".join(parts)
+
+
+def _annotate_hook_check_failure(exc, rows):
+    """Attach every recorded check to the failure that would otherwise hide it.
+
+    The same record annotates an exception once. A message that already contains the
+    report is left unchanged, including when that report has no leading newline.
+    TimeoutExpired keeps its type.
+    """
+    report = _format_hook_check_failures(rows)
+    if not report:
+        return exc
+    if report in str(exc):
+        return exc
+    marker = "\nrecorded hook check failures: " + report
+    message = "%s%s" % (exc, marker)
+    if isinstance(exc, subprocess.TimeoutExpired):
+        # 3.9 prints args. 3.12 prints cmd. Put the checks where each version reads them.
+        annotated = subprocess.TimeoutExpired(exc.cmd, exc.timeout, output=exc.output, stderr=exc.stderr)
+        annotated.args = (message,)
+        if marker not in str(annotated):
+            annotated.cmd = "%s%s" % (exc.cmd, marker)
+        return annotated
+    try:
+        return type(exc)(message)
+    except Exception:
+        return RuntimeError(message)
+
+
+def _reraise_with_recorded_hook_checks(exc, rows):
+    annotated = _annotate_hook_check_failure(exc, rows)
+    if annotated is exc:
+        raise exc
+    raise annotated from exc
+
+
+def _call_with_recorded_hook_checks(action, rows):
+    """Run action and re-raise any failure, including DID NOT RAISE, with the recorded checks."""
+    try:
+        return action()
+    except GeneratorExit:
+        raise
+    except BaseException as exc:
+        _reraise_with_recorded_hook_checks(exc, rows)
+
+
+def _reject_recorded_hook_checks(rows):
+    report = _format_hook_check_failures(rows)
+    if report:
+        raise AssertionError("recorded hook check failures: " + report)
+
+
+def _validate_forced_hook_checks(caught, check_failures, evidence_path, forced_checks):
+    """Check the forced-check evidence. Callers wrap this so every failure names the checks."""
+    message = str(caught.value)
+    hook_report = _format_hook_check_failures(check_failures)
+    expected_rows = [{"check": item["check"], "observed": _hook_diagnostic_token(item["observed"]),
+                      "expected": _hook_diagnostic_token(item["expected"])} for item in forced_checks]
+    assert message.startswith("unrelated body failure\nrecorded hook check failures: ")
+    assert hook_report in message and check_failures == expected_rows
+    for row in expected_rows:
+        segment = "check=%s observed=%s expected=%s" % (row["check"], row["observed"], row["expected"])
+        assert segment in message and segment in hook_report
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["closing"] is True
+    assert evidence["check_failures"] == expected_rows
+    assert evidence["check_failure_report"] == hook_report
+
+
+def _annotate_cleanup_failure(exc, rows):
+    """Keep the cleanup type and report object, and name every recorded check once.
+
+    Invariant: hook text is only on the exception message. The stored report stays custody-only.
+    A second annotation of the same record returns the same exception and does not duplicate it.
+    """
+    report_text = _format_hook_check_failures(rows)
+    if not report_text or not isinstance(exc, R2CleanupError):
+        return exc
+    marker = "\nrecorded hook check failures: " + report_text
+    if marker in str(exc):
+        return exc
+    original_report = exc.report
+    try:
+        annotated = type(exc)(original_report)
+    except Exception:
+        return exc
+    annotated.args = ("%s%s" % (exc, marker),)
+    return annotated
+
+
+def _close_with_recorded_hook_checks(close, rows):
+    try:
+        return close()
+    except R2CleanupError as exc:
+        annotated = _annotate_cleanup_failure(exc, rows)
+        if annotated is exc:
+            raise
+        raise annotated from exc
+
+
+def test_recorded_hook_check_failures_keep_identity_on_every_report():
+    """Retry keeps every check; a multi-line name is refused; the assert path names values."""
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "seen\nbirth", "want-birth")
+    _record_hook_check(rows, "signal_target_parent", 4, 5)
+    report = _format_hook_check_failures(rows)
+    assert "\n" not in report and "\r" not in report
+    birth = _hook_diagnostic_token("seen\nbirth")
+    assert birth in report and "seen" not in birth and "birth" not in birth
+    assert "seen birth" not in report
+    assert "observed=4 expected=5" in report
+    _record_hook_check(rows, "original_child_kill_completion", "timeout", "pidfd-readable")
+    report = _format_hook_check_failures(rows)
+    assert report.count("check=") == 3
+    assert "signal_target_parent" in report and "original_child_kill_completion" in report
+    refused = []
+    _record_hook_check(refused, "signal_target_birth\nforged", "observed", "expected")
+    assert refused[0]["check"] == "hook_check_name_refused"
+    assert "\n" not in refused[0]["observed"] and "forged" not in refused[0]["check"]
+    assert "forged" not in refused[0]["observed"]
+    secret_rows = []
+    _record_hook_check(secret_rows, "signal_target_actor", "token=supersecretvalue", 1)
+    assert "supersecretvalue" not in secret_rows[0]["observed"]
+    assert secret_rows[0]["observed"] == _hook_diagnostic_token("token=supersecretvalue")
+    assert secret_rows[0]["observed"].startswith("<str ")
+
+    class Marker:
+        def __repr__(self):
+            return "SECRET-OBJECT-REPR"
+
+    odd = []
+    _record_hook_check(odd, "signal_target_actor", Marker(), 1)
+    assert "SECRET-OBJECT-REPR" not in odd[0]["observed"]
+    assert odd[0]["observed"] == _hook_diagnostic_token(Marker())
+    session = _hook_diagnostic_token({"pgid": 4, "sid": "errno-1"})
+    assert session == _hook_diagnostic_token({"sid": "errno-1", "pgid": 4})
+    assert session.startswith("<dict ") and "errno-1" not in session
+    assert _hook_diagnostic_token(4) == "4" and _hook_diagnostic_token(5) == "5"
+    flood = []
+    for _ in range(20):
+        _record_hook_check(flood, "signal_target_parent", 4, 5)
+    _record_hook_check(flood, "signal_target_actor", 9, 1)
+    assert [row["check"] for row in flood] == ["signal_target_parent", "signal_target_actor"]
+    assert flood[0]["count"] == 20 and "count" not in flood[1]
+    assert "count=20" in _format_hook_check_failures(flood)
+    assert "signal_target_actor" in _format_hook_check_failures(flood)
+    capped = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT + 3):
+        _record_hook_check(capped, "signal_target_actor", index, 0)
+    assert len(capped) == _HOOK_CHECK_RECORD_LIMIT + 1
+    assert capped[-1]["check"] == "hook_check_record_limit"
+    overflow = json.loads(capped[-1]["observed"])
+    assert overflow["dropped_rows"] == 3
+    assert overflow["dropped_checks"] == ["signal_target_actor"]
+    _record_hook_check(capped, "signal_target_parent", 1, 2)
+    _record_hook_check(capped, "signal_target_parent", 1, 2)
+    assert len(capped) == _HOOK_CHECK_RECORD_LIMIT + 1
+    overflow = json.loads(capped[-1]["observed"])
+    assert overflow["dropped_rows"] == 5
+    assert overflow["dropped_checks"] == ["signal_target_actor", "signal_target_parent"]
+    assert "signal_target_actor" in capped[-1]["observed"]
+    assert "signal_target_parent" in capped[-1]["observed"]
+    with pytest.raises(AssertionError) as caught:
+        _reject_recorded_hook_checks(rows)
+    text = str(caught.value)
+    assert text.startswith("recorded hook check failures: ")
+    assert "signal_target_birth" in text and "signal_target_parent" in text
+    assert "original_child_kill_completion" in text
+    assert _hook_diagnostic_token("timeout") in text and "timeout" not in text
+    assert _hook_diagnostic_token("pidfd-readable") in text and "pidfd-readable" not in text
+    _reject_recorded_hook_checks([])
+    body = RuntimeError("unrelated body failure")
+    assert _annotate_hook_check_failure(body, []) is body
+    annotated = _annotate_hook_check_failure(body, rows)
+    assert type(annotated) is RuntimeError
+    assert str(annotated).startswith("unrelated body failure\nrecorded hook check failures: ")
+    assert _format_hook_check_failures(rows) in str(annotated)
+
+    class OddError(Exception):
+        def __init__(self):
+            super().__init__("odd")
+
+    fallback = _annotate_hook_check_failure(OddError(), rows)
+    assert type(fallback) is RuntimeError
+    assert "signal_target_birth" in str(fallback)
+    again = _annotate_hook_check_failure(annotated, rows)
+    assert again is annotated
+
+
+def test_unknown_teardown_exit_names_recorded_hook_checks(launch):
+    """UNKNOWN closure, the second close, and the real fixture teardown name both recorded checks.
+
+    The report pipe raises OSError(9, "Bad file descriptor") during closure. The stored report
+    stays custody-only. Teardown calls the fixture's own exit path.
+    """
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "forced-observed-birth", "expected-birth")
+    _record_hook_check(rows, "signal_target_parent", "forced-observed-parent", "expected-parent")
+    birth = _hook_diagnostic_token("forced-observed-birth")
+    parent = _hook_diagnostic_token("forced-observed-parent")
+    made = _open_r2_case(launch)
+    control = made.custody
+    try:
+        control.LIMIT = 0.5
+        control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+        control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
+                                     "verified_fd": False, "lost": False, "exit": {"proof": "already-exited"}}
+        closed_report = control.report_read
+        os.close(closed_report)
+        control._hook_released_fds = {closed_report}
+        made._recorded_hook_checks = rows
+        with pytest.raises(R2CleanupUnknown) as first:
+            made.close()
+        first_text = str(first.value)
+        assert first_text.count("recorded hook check failures:") == 1
+        assert "signal_target_birth" in first_text and "signal_target_parent" in first_text
+        assert birth in first_text and parent in first_text
+        assert "forced-observed-birth" not in first_text and "forced-observed-parent" not in first_text
+        assert "expected-birth" not in first_text and "expected-parent" not in first_text
+        assert "Bad file descriptor" in first_text
+        assert "signal_target_birth" not in json.dumps(first.value.report)
+        saved = control.quarantine.read_text()
+        assert "UNKNOWN" in saved and "signal_target_birth" not in saved
+        assert "forced-observed-birth" not in saved and "sk-LEAK" not in saved
+        with pytest.raises(R2CleanupUnknown) as second:
+            made.close()
+        second_text = str(second.value)
+        assert second.value.report is first.value.report
+        assert second_text.count("recorded hook check failures:") == 1
+        assert "signal_target_birth" in second_text and "signal_target_parent" in second_text
+        assert birth in second_text and parent in second_text
+        assert "forced-observed-birth" not in second_text and "forced-observed-parent" not in second_text
+        assert "signal_target_birth" not in json.dumps(second.value.report)
+        try:
+            _teardown_r2_case(made)
+        except BaseException as exc:
+            assert type(exc).__name__ == "Exit"
+            exit_text = str(exc)
+        else:
+            raise AssertionError("fixture teardown did not exit")
+        assert exit_text.startswith("R2 fixture UNKNOWN:")
+        assert "signal_target_birth" in exit_text and "signal_target_parent" in exit_text
+        assert birth in exit_text and parent in exit_text
+        assert "forced-observed-birth" not in exit_text and "forced-observed-parent" not in exit_text
+    finally:
+        R2Custody.quarantine_report = None
+        _release_custody_descriptors(control)
+        if control.quarantine.exists():
+            control.quarantine.unlink()
+
+
+def test_annotated_held_body_exception_keeps_the_recorded_checks():
+    """A held-body failure may carry recorded checks. The expectation still accepts that message."""
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "forced-observed-birth", "expected-birth")
+    _record_hook_check(rows, "signal_target_parent", "forced-observed-parent", "expected-parent")
+    annotated = _annotate_hook_check_failure(RuntimeError(_HELD_BODY_FAILURE), rows)
+    with pytest.raises(RuntimeError, match=_HELD_BODY_MATCH):
+        raise annotated
+    text = str(annotated)
+    assert "signal_target_birth" in text and "signal_target_parent" in text
+    assert _hook_diagnostic_token("forced-observed-birth") in text
+    assert _hook_diagnostic_token("forced-observed-parent") in text
+    assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+
+
+def test_forced_check_validation_failures_name_recorded_checks(tmp_path):
+    """A missing file, invalid JSON, or a failed evidence assert names both recorded checks.
+
+    The deferred-reap forced-check variant calls this same helper inside the wrapper.
+    """
+    rows = []
+    for item in _FORCED_HOOK_CHECKS:
+        _record_hook_check(rows, item["check"], item["observed"], item["expected"])
+    report = _format_hook_check_failures(rows)
+
+    class Caught(object):
+        def __init__(self, value):
+            self.value = value
+
+    caught = Caught(RuntimeError("unrelated body failure\nrecorded hook check failures: " + report))
+
+    def names_both(exc):
+        text = str(exc)
+        assert "signal_target_birth" in text and "signal_target_parent" in text
+        assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+        assert "expected-birth" not in text and "expected-parent" not in text
+        assert text.count(report) == 1
+
+    missing = tmp_path / "missing-evidence.json"
+
+    def read_missing():
+        _validate_forced_hook_checks(caught, rows, missing, _FORCED_HOOK_CHECKS)
+
+    with pytest.raises(OSError) as missing_caught:
+        _call_with_recorded_hook_checks(read_missing, rows)
+    assert isinstance(missing_caught.value, OSError)
+    names_both(missing_caught.value)
+
+    invalid = tmp_path / "invalid-evidence.json"
+    invalid.write_text("{")
+
+    def read_invalid():
+        _validate_forced_hook_checks(caught, rows, invalid, _FORCED_HOOK_CHECKS)
+
+    with pytest.raises(Exception) as invalid_caught:
+        _call_with_recorded_hook_checks(read_invalid, rows)
+    names_both(invalid_caught.value)
+
+    rejected = tmp_path / "rejected-evidence.json"
+    rejected.write_text('{"closing": false}')
+
+    def read_rejected():
+        _validate_forced_hook_checks(caught, rows, rejected, _FORCED_HOOK_CHECKS)
+
+    with pytest.raises(AssertionError) as rejected_caught:
+        _call_with_recorded_hook_checks(read_rejected, rows)
+    names_both(rejected_caught.value)
+
+
+def test_annotation_keeps_one_copy_when_the_report_is_already_present():
+    """Report text already in the failure is not appended again, with or without the marker."""
+    rows = []
+    for item in _FORCED_HOOK_CHECKS:
+        _record_hook_check(rows, item["check"], item["observed"], item["expected"])
+    report = _format_hook_check_failures(rows)
+    watcher = AssertionError("the held child's independent exit did not complete; " + report)
+    kept = _annotate_hook_check_failure(watcher, rows)
+    watcher_text = str(kept)
+    assert kept is watcher
+    assert watcher_text.count(report) == 1
+    assert "recorded hook check failures:" not in watcher_text
+    assert "signal_target_birth" in watcher_text and "signal_target_parent" in watcher_text
+
+    closed = AssertionError("recorded hook check failures: " + report)
+    kept_closed = _annotate_hook_check_failure(closed, rows)
+    closed_text = str(kept_closed)
+    assert kept_closed is closed
+    assert closed_text.count(report) == 1
+    assert closed_text.count("recorded hook check failures:") == 1
+    assert "signal_target_birth" in closed_text and "signal_target_parent" in closed_text
+
+    def reject():
+        _reject_recorded_hook_checks(rows)
+
+    with pytest.raises(AssertionError) as rejected:
+        _call_with_recorded_hook_checks(reject, rows)
+    rejected_text = str(rejected.value)
+    assert rejected_text.count(report) == 1
+    assert rejected_text.count("recorded hook check failures:") == 1
+    assert "signal_target_birth" in rejected_text and "signal_target_parent" in rejected_text
+
+    fresh = _annotate_hook_check_failure(RuntimeError("plain"), rows)
+    fresh_text = str(fresh)
+    assert fresh_text.startswith("plain\nrecorded hook check failures: ")
+    assert fresh_text.count(report) == 1
+    assert fresh_text.count("recorded hook check failures:") == 1
+    assert "signal_target_birth" in fresh_text and "signal_target_parent" in fresh_text
+    again = _annotate_hook_check_failure(fresh, rows)
+    assert again is fresh
+    assert str(again).count(report) == 1
+
+
+def test_fingerprint_digest_is_keyed_so_a_guess_does_not_confirm():
+    """Equal values match in-process. The printed digest is not unsalted SHA-256 of the canonical bytes."""
+    value = "sk-LEAK"
+    token = _hook_diagnostic_token(value)
+    unsalted = hashlib.sha256(_canonical_bytes(value)).hexdigest()[:12]
+    assert unsalted not in token
+    assert token == _hook_diagnostic_token(value)
+    assert token != _hook_diagnostic_token(value + "x")
+    assert value not in token
+    assert token.startswith("<str ") and "sha256=" in token and " len=" in token
+
+
+def test_hook_check_overflow_counts_distinct_omitted_checks():
+    """Repeating one extra check after both name caches are full does not inflate the omitted count."""
+    sink = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "k%02d" % index, 0, 0)
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "d%02d" % index, 0, 0)
+    for _ in range(5):
+        _record_hook_check(sink, "ox", 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_checks_omitted"] == 1
+    assert parsed["dropped_rows"] == _HOOK_CHECK_RECORD_LIMIT + 5
+    for _ in range(4):
+        _record_hook_check(sink, "ox", 1, 9)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_checks_omitted"] == 1
+    assert parsed["dropped_rows"] == _HOOK_CHECK_RECORD_LIMIT + 9
+    for index in range(_HOOK_CHECK_RECORD_LIMIT - 1):
+        _record_hook_check(sink, "o%02d" % index, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_checks_omitted"] == _HOOK_CHECK_RECORD_LIMIT
+    _record_hook_check(sink, "oy", 0, 0)
+    _record_hook_check(sink, "oy", 2, 2)
+    _record_hook_check(sink, "ox", 3, 3)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_checks_omitted"] == "unknown"
+    assert parsed["dropped_rows"] == (
+        _HOOK_CHECK_RECORD_LIMIT + 5 + 4 + (_HOOK_CHECK_RECORD_LIMIT - 1) + 3)
+
+
+def test_hook_diagnostics_fingerprint_every_untrusted_value(tmp_path):
+    """No raw string, mapping key, or composite reaches a diagnostic, report, or quarantine file.
+
+    Equal values share a fingerprint. Different values do not. Recorded check names still print.
+    Integers, booleans, and None print verbatim. The fingerprint covers the whole canonical value.
+    """
+    import re
+
+    leak = "sk-LEAK"
+    pattern = re.compile(r"^<[A-Za-z_][A-Za-z0-9_]{0,31} len=\d+ sha256=[0-9a-f]{12}>$")
+    probes = [
+        "secret_key=" + leak,
+        "token_value=" + leak,
+        "tokenValue=" + leak,
+        "credentials=" + leak,
+        "Authorization: Bearer " + leak,
+        'body {"token_value":"%s"}' % leak,
+        'body {"token":["%s"]}' % leak,
+        'body {"token":{"value":"%s"}}' % leak,
+        'body {"token":\n"%s"}' % leak,
+        json.dumps(json.dumps({"token": leak})),
+        json.dumps({"secret_key": leak, "pad": "x" * 8200}),
+        json.dumps({"credentials": leak, "pad": "x" * 300}),
+        json.dumps({"credentials": leak, "pad": "x" * 9000}),
+        'prefix {"secret_key":"%s"}' % leak,
+        '{"secret_key":"%s"}' % leak + ("x" * 240),
+        "secret_key=%s\nnext" % leak,
+        '{"token":\n"%s","pad":"%s"}' % (leak, "x" * 8200),
+        '{"note token=%s": 1}' % leak,
+    ]
+    assert _hook_diagnostic_token(4) == "4"
+    assert _hook_diagnostic_token(True) == "true"
+    assert _hook_diagnostic_token(False) == "false"
+    assert _hook_diagnostic_token(None) == "null"
+    assert _hook_diagnostic_token(probes[0]) == _hook_diagnostic_token(probes[0])
+    assert _hook_diagnostic_token(probes[0]) != _hook_diagnostic_token(probes[1])
+    assert _hook_diagnostic_token(["sk-LEAK"]) != _hook_diagnostic_token(("sk-LEAK",))
+    assert _hook_diagnostic_token({"b": 1, "a": leak}) == _hook_diagnostic_token({"a": leak, "b": 1})
+    assert pattern.match(_hook_diagnostic_token(1.5))
+    assert "1.5" not in _hook_diagnostic_token(1.5)
+    raw = b"sk-LEAK"
+    byte_token = _hook_diagnostic_token(raw)
+    assert pattern.match(byte_token) and "sk-LEAK" not in byte_token
+    assert byte_token == _hook_diagnostic_token(b"sk-LEAK")
+    assert byte_token != _hook_diagnostic_token(b"sk-OTHER")
+
+    class Marker:
+        def __repr__(self):
+            return "SECRET-OBJECT-REPR-sk-LEAK"
+
+    odd = _hook_diagnostic_token(Marker())
+    assert pattern.match(odd) and "sk-LEAK" not in odd and "SECRET-OBJECT-REPR" not in odd
+    huge = json.dumps({"credentials": leak, "pad": "x" * 9000})
+    assert len(huge) >= 9000
+    huge_token = _hook_diagnostic_token(huge)
+    huge_match = pattern.match(huge_token)
+    assert huge_match and "sk-LEAK" not in huge_token
+    assert int(re.search(r"len=(\d+)", huge_token).group(1)) >= len(huge)
+    for probe in probes:
+        assert leak in probe
+        routes = (
+            probe,
+            {"note": probe},
+            {probe: 1},
+            [probe],
+            {"outer": {"inner": probe}},
+        )
+        for value in routes:
+            token = _hook_diagnostic_token(value)
+            assert pattern.match(token) and leak not in token
+            assert "\n" not in token and "\r" not in token
+        sample = []
+        _record_hook_check(sample, "signal_target_actor", probe, probe)
+        assert sample[0]["observed"] == _hook_diagnostic_token(probe)
+        assert sample[0]["expected"] == _hook_diagnostic_token(probe)
+        assert leak not in sample[0]["observed"] and leak not in sample[0]["expected"]
+        report = _format_hook_check_failures(sample)
+        assert "signal_target_actor" in report and leak not in report
+        assert "\n" not in report and "\r" not in report and "sk-LEAK next" not in report
+        annotated = _annotate_hook_check_failure(RuntimeError("boom"), sample)
+        assert leak not in str(annotated) and "signal_target_actor" in str(annotated)
+    named = []
+    _record_hook_check(named, "signal_target_birth", leak, 4)
+    assert named[0]["check"] == "signal_target_birth"
+    assert named[0]["expected"] == "4" and leak not in named[0]["observed"]
+    named_report = _format_hook_check_failures(named)
+    assert "signal_target_birth" in named_report and leak not in named_report
+    _record_hook_check(named, "signal_target_parent", "signal_target_birth", "signal_target_birth")
+    assert named[-1]["observed"] == _hook_diagnostic_token("signal_target_birth")
+    assert "signal_target_birth" not in named[-1]["observed"]
+    unrecorded = _hook_diagnostic_token("not_a_recorded_check")
+    assert pattern.match(unrecorded) and "not_a_recorded_check" not in unrecorded
+    control = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    control.LIMIT = 0.5
+    control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+    control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+    control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
+                                 "verified_fd": False, "lost": False, "exit": {"proof": "already-exited"}}
+    closed_report = control.report_read
+    os.close(closed_report)
+    control._hook_released_fds = {closed_report}
+    stored = []
+    _record_hook_check(stored, "signal_target_birth", huge, "expected-birth")
+    try:
+        with pytest.raises(R2CleanupUnknown) as caught:
+            _close_with_recorded_hook_checks(control.close, stored)
+        text = str(caught.value)
+        assert leak not in text and "signal_target_birth" in text
+        assert re.search(r"<[A-Za-z_][A-Za-z0-9_]{0,31} len=\d+ sha256=[0-9a-f]{12}>", text)
+        assert leak not in json.dumps(caught.value.report)
+        assert "signal_target_birth" not in json.dumps(caught.value.report)
+        saved = (tmp_path / "quarantine.json").read_text()
+        assert "UNKNOWN" in saved and leak not in saved and "signal_target_birth" not in saved
+    finally:
+        R2Custody.quarantine_report = None
+        _release_custody_descriptors(control)
+
+
+def test_display_shrink_counts_each_distinct_omitted_name():
+    """Names removed to fit the 180-character summary count once, from zero or from a nonzero count."""
+    sink = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "k%02d" % index, index, 0)
+    names = ["signal_target_parent_check_%03d" % index for index in range(6)]
+    for name in names:
+        _record_hook_check(sink, name, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    shown = parsed["dropped_checks"]
+    omitted = parsed.get("dropped_checks_omitted", 0)
+    assert len(sink[-1]["observed"]) <= _HOOK_CHECK_TOKEN_LIMIT
+    assert parsed["dropped_rows"] == 6
+    assert shown == names[:len(shown)]
+    assert omitted == 6 - len(shown) and omitted > 0
+
+    sink = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "k%02d" % index, 0, 0)
+    _record_hook_check(sink, "a" * 80, 0, 0)
+    _record_hook_check(sink, "b" * 80, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert len(sink[-1]["observed"]) <= _HOOK_CHECK_TOKEN_LIMIT
+    assert parsed["dropped_rows"] == 2
+    assert parsed["dropped_checks_omitted"] == 1
+    assert parsed["dropped_checks"] == ["a" * 80]
+    _record_hook_check(sink, "c" * 80, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_rows"] == 3
+    assert parsed["dropped_checks_omitted"] == 2
+    assert parsed["dropped_checks"] == ["a" * 80]
+    _record_hook_check(sink, "c" * 80, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_rows"] == 4
+    assert parsed["dropped_checks_omitted"] == 2
+    assert len(sink[-1]["observed"]) <= _HOOK_CHECK_TOKEN_LIMIT
+
+    sink = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "k%02d" % index, 0, 0)
+    _record_hook_check(sink, "a" * 80, 0, 0)
+    limit = sink[-1]
+    assert limit["dropped_checks_omitted"] == 0
+    limit["dropped_checks_omitted"] = 4
+    limit["omitted_checks"] = ["seed%d" % index for index in range(4)]
+    _record_hook_check(sink, "b" * 80, 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_rows"] == 2
+    assert parsed["dropped_checks_omitted"] == 5
+    assert parsed["dropped_checks"] == ["a" * 80]
+    assert len(sink[-1]["observed"]) <= _HOOK_CHECK_TOKEN_LIMIT
+
+    sink = []
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "k%02d" % index, 0, 0)
+    for index in range(_HOOK_CHECK_RECORD_LIMIT):
+        _record_hook_check(sink, "n%02d%s" % (index, "L" * 70), 0, 0)
+    index = 0
+    parsed = json.loads(sink[-1]["observed"])
+    while parsed.get("dropped_checks_omitted") != "unknown":
+        _record_hook_check(sink, "z%02d" % index, 0, 0)
+        parsed = json.loads(sink[-1]["observed"])
+        index += 1
+        assert index <= 40
+    rows_at_unknown = parsed["dropped_rows"]
+    _record_hook_check(sink, "extra_long_name_" + ("Q" * 60), 0, 0)
+    parsed = json.loads(sink[-1]["observed"])
+    assert parsed["dropped_checks_omitted"] == "unknown"
+    assert parsed["dropped_rows"] == rows_at_unknown + 1
+    assert len(sink[-1]["observed"]) <= _HOOK_CHECK_TOKEN_LIMIT
+
+
+def test_held_path_failures_name_recorded_hook_checks():
+    """An assertion or a wait timeout on the held path names every recorded check."""
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "forced-observed-birth", "expected-birth")
+    _record_hook_check(rows, "signal_target_parent", "forced-observed-parent", "expected-parent")
+    birth = _hook_diagnostic_token("forced-observed-birth")
+    parent = _hook_diagnostic_token("forced-observed-parent")
+    with pytest.raises(AssertionError) as asserted:
+        try:
+            assert False
+        except Exception as exc:
+            _reraise_with_recorded_hook_checks(exc, rows)
+    text = str(asserted.value)
+    assert "signal_target_birth" in text and "signal_target_parent" in text
+    assert birth in text and parent in text
+    assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+    with pytest.raises(subprocess.TimeoutExpired) as timed:
+        try:
+            raise subprocess.TimeoutExpired("wait", 5)
+        except Exception as exc:
+            _reraise_with_recorded_hook_checks(exc, rows)
+    assert type(timed.value) is subprocess.TimeoutExpired
+    text = str(timed.value)
+    assert "signal_target_birth" in text and "signal_target_parent" in text
+    assert birth in text and parent in text
+    assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+
+
+def test_did_not_raise_names_recorded_hook_checks():
+    """The held-body expectation's DID NOT RAISE failure names the recorded checks."""
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "forced-observed-birth", "expected-birth")
+    _record_hook_check(rows, "signal_target_parent", "forced-observed-parent", "expected-parent")
+
+    def miss():
+        with pytest.raises(RuntimeError, match=_HELD_BODY_MATCH):
+            return None
+
+    with pytest.raises(BaseException) as caught:
+        _call_with_recorded_hook_checks(miss, rows)
+    text = str(caught.value)
+    assert type(caught.value).__name__ == "Failed"
+    assert "DID NOT RAISE" in text
+    assert "signal_target_birth" in text and "signal_target_parent" in text
+    assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+    assert _hook_diagnostic_token("forced-observed-birth") in text
+
+
+def test_release_closes_safety_write_from_its_own_descriptor(tmp_path):
+    """control.closed does not decide safety_write. A timeout must not leak it, and a closed fd is not closed again."""
+    def occupy(path, number):
+        probe = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        if probe != number:
+            os.dup2(probe, number)
+            os.close(probe)
+            probe = number
+        return probe
+
+    def fresh(name):
+        control = R2Custody(tmp_path / name, tmp_path / (name + "-quarantine.json"))
+        control.LIMIT = 0.5
+        control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        return control
+
+    probes, controls = [], []
+    try:
+        timed = fresh("timeout")
+        controls.append(timed)
+        timed.closed = True
+        write_fd = timed.safety_write
+        os.fstat(write_fd)
+        _release_custody_descriptors(timed)
+        with pytest.raises(OSError):
+            os.fstat(write_fd)
+        probe = occupy(tmp_path / "timeout-probe", write_fd)
+        probes.append(probe)
+        _release_custody_descriptors(timed)
+        assert os.write(probe, b"ok") == 2
+
+        already = fresh("already")
+        controls.append(already)
+        write_fd = already.safety_write
+        os.close(write_fd)
+        _release_custody_descriptors(already)
+        probe = occupy(tmp_path / "already-probe", write_fd)
+        probes.append(probe)
+        _release_custody_descriptors(already)
+        assert os.write(probe, b"ok") == 2
+    finally:
+        R2Custody.quarantine_report = None
+        for probe in probes:
+            try:
+                os.close(probe)
+            except OSError:
+                pass
+        for control in controls:
+            _release_custody_descriptors(control)
+
+
+def _release_custody_descriptors(control):
+    """Close each still-owned control descriptor once.
+
+    close() closes safety_write before it reports a state. A non-UNKNOWN report means
+    close() already closed the remaining descriptors. A second call closes nothing.
+    safety_write is included from its own descriptor when close() has not reported yet,
+    including when a timeout event has set control.closed. An already-closed number is
+    remembered and not closed again, so a reused descriptor stays open.
+    """
+    released = getattr(control, "_hook_released_fds", None)
+    if released is None:
+        released = set()
+        control._hook_released_fds = released
+    report = control.report
+    if report is not None and report.get("state") != "UNKNOWN":
+        return
+    pending = [control.safety_read, control.report_read, control.report_write]
+    pending.extend(fd for pair in control.gates.values() for fd in pair)
+    if report is None:
+        pending.insert(0, control.safety_write)
+    for fd in pending:
+        if not isinstance(fd, int) or fd in released:
+            continue
+        try:
+            os.fstat(fd)
+        except OSError:
+            released.add(fd)
+            continue
+        released.add(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def test_release_custody_descriptors_closes_each_fd_once(tmp_path):
+    """A second release, and a release after close(), must not close a descriptor again."""
+    def descriptors(control):
+        return [control.safety_read, control.safety_write, control.report_read, control.report_write,
+                *(fd for pair in control.gates.values() for fd in pair)]
+
+    def occupy(path, number):
+        probe = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        if probe != number:
+            os.dup2(probe, number)
+            os.close(probe)
+            probe = number
+        return probe
+
+    def fresh(name):
+        control = R2Custody(tmp_path / name, tmp_path / (name + "-quarantine.json"))
+        control.LIMIT = 0.5
+        control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        return control
+
+    probes = []
+    try:
+        early = fresh("early")
+        numbers = descriptors(early)
+        _release_custody_descriptors(early)
+        for fd in numbers:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        probe = occupy(tmp_path / "early-probe", numbers[0])
+        probes.append(probe)
+        _release_custody_descriptors(early)
+        assert os.write(probe, b"ok") == 2
+
+        errored = fresh("errored")
+        errored.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+        errored.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
+                                     "verified_fd": False, "lost": False,
+                                     "exit": {"proof": "already-exited"}}
+
+        def failed(slot):
+            raise OSError("modelled custody closure failure")
+
+        errored.cleanup_hook = failed
+        write_fd = errored.safety_write
+        with pytest.raises(R2CleanupError):
+            errored.close()
+        probe = occupy(tmp_path / "errored-probe", write_fd)
+        probes.append(probe)
+        _release_custody_descriptors(errored)
+        assert os.write(probe, b"ok") == 2
+
+        unknown = fresh("unknown")
+        unknown.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+        unknown.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
+                                     "verified_fd": False, "lost": False, "exit": None}
+
+        def refuse(slot):
+            raise RuntimeError("modelled closure refuses to signal")
+
+        unknown.kill_owned = refuse
+        write_fd = unknown.safety_write
+        still_open = [fd for fd in descriptors(unknown) if fd != write_fd]
+        with pytest.raises(R2CleanupUnknown):
+            unknown.close()
+        for fd in still_open:
+            os.fstat(fd)
+        probe = occupy(tmp_path / "unknown-probe", write_fd)
+        probes.append(probe)
+        _release_custody_descriptors(unknown)
+        assert os.write(probe, b"ok") == 2
+        for fd in still_open:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        _release_custody_descriptors(unknown)
+        assert os.write(probe, b"ok") == 2
+    finally:
+        R2Custody.quarantine_report = None
+        for probe in probes:
+            try:
+                os.close(probe)
+            except OSError:
+                pass
+
+
+@pytest.mark.parametrize("closure_state", ["CLOSED_WITH_ERRORS", "UNKNOWN"])
+def test_recorded_hook_checks_survive_closure_failure(tmp_path, closure_state):
+    """A custody close that raises must name every recorded check and keep its cleanup type and report."""
+    rows = []
+    _record_hook_check(rows, "signal_target_birth", "forced-observed-birth", "expected-birth")
+    _record_hook_check(rows, "signal_target_parent", "forced-observed-parent", "expected-parent")
+    control = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    control.LIMIT = 0.5
+    control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+    control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+    control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
+                                 "verified_fd": False, "lost": False,
+                                 "exit": {"proof": "already-exited"} if closure_state == "CLOSED_WITH_ERRORS" else None}
+    if closure_state == "CLOSED_WITH_ERRORS":
+        def failed(slot):
+            raise OSError("modelled custody closure failure")
+        control.cleanup_hook = failed
+    else:
+        def refuse(slot):
+            raise RuntimeError("modelled closure refuses to signal")
+        control.kill_owned = refuse
+    expected_type = R2CleanupUnknown if closure_state == "UNKNOWN" else R2CleanupError
+    try:
+        with pytest.raises(expected_type) as caught:
+            _close_with_recorded_hook_checks(control.close, rows)
+        text = str(caught.value)
+        hook_report = _format_hook_check_failures(rows)
+        assert type(caught.value) is expected_type
+        assert caught.value.report is control.report
+        assert caught.value.report["state"] == closure_state
+        assert text.startswith("R2 physical cleanup %s:" % closure_state)
+        assert hook_report in text
+        assert "signal_target_birth" not in json.dumps(caught.value.report)
+        assert "signal_target_birth" in text and "signal_target_parent" in text
+        assert _hook_diagnostic_token("forced-observed-birth") in text
+        assert _hook_diagnostic_token("expected-birth") in text
+        assert _hook_diagnostic_token("forced-observed-parent") in text
+        assert _hook_diagnostic_token("expected-parent") in text
+        assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+        assert "expected-birth" not in text and "expected-parent" not in text
+        if closure_state == "UNKNOWN":
+            assert R2Custody.quarantine_report is caught.value.report
+            saved = (tmp_path / "quarantine.json").read_text()
+            assert "UNKNOWN" in saved and "signal_target_birth" not in saved
+        else:
+            assert R2Custody.quarantine_report is None
+            assert not (tmp_path / "quarantine.json").exists()
+            assert any("modelled custody closure failure" in error for error in caught.value.report["errors"])
+        plain = {"state": closure_state, "errors": ["modelled custody fault"]}
+
+        def raise_plain():
+            raise expected_type(plain)
+
+        with pytest.raises(expected_type) as plain_caught:
+            _close_with_recorded_hook_checks(raise_plain, [])
+        assert type(plain_caught.value) is expected_type
+        assert plain_caught.value.report is plain
+        assert "recorded hook check failures" not in str(plain_caught.value)
+    finally:
+        R2Custody.quarantine_report = None
+        _release_custody_descriptors(control)
+
+
+@pytest.mark.parametrize("exit_after_live_read,fail_while_held,forced_checks,closure_fault", [
+    (False, False, None, None), (True, False, None, None), (True, True, None, None),
+    (True, True, _FORCED_HOOK_CHECKS, None), (True, True, _FORCED_HOOK_CHECKS, "errors"),
+], ids=["ordinary", "exit-after-live-read", "body-failure-held", "check-failure-and-body-failure",
+        "check-failure-and-closure-errors"])
 def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, children, monkeypatch, capsys,
-                                                                    exit_after_live_read, fail_while_held):
-    """MODELLED one deferred nonblocking reap; the matching zombie and eventual waitpid status are real."""
+                                                                    exit_after_live_read, fail_while_held,
+                                                                    forced_checks, closure_fault):
+    """MODELLED one deferred nonblocking reap; the matching zombie and eventual waitpid status are real.
+
+    Closure-reachable hooks record check identity and never assert or signal. Disarm happens in finally.
+    """
     from contextlib import nullcontext
     import select
 
     if fail_while_held and not hasattr(signal, "pidfd_send_signal"):
         pytest.skip("the failed-body closure control requires original-child pidfd signalling")
     actors, deferred, held, delivered, check_failures = [], [], [], [], []
+    # Same list the fixture teardown reads, so a later UNKNOWN exit still names these checks.
+    children.case._recorded_hook_checks = check_failures
     delivery = {"closing": False}
 
     def signal_target_matches(process, physical):
-        failures = []
+        matched = True
         if physical["birth"] != process.native_birth:
-            failures.append("signal target birth changed")
-        if physical["pgid"] != process.pid or os.getsid(process.pid) != process.pid:
-            failures.append("signal target left its owned session")
+            _record_hook_check(check_failures, "signal_target_birth", physical["birth"], process.native_birth)
+            matched = False
+        try:
+            sid = os.getsid(process.pid)
+        except OSError as exc:
+            sid = "errno-%s" % exc.errno
+        if physical["pgid"] != process.pid or sid != process.pid:
+            _record_hook_check(check_failures, "signal_target_session",
+                               {"pgid": physical["pgid"], "sid": sid},
+                               {"pgid": process.pid, "sid": process.pid})
+            matched = False
         if physical["ppid"] != os.getpid():
-            failures.append("signal target is not our direct child")
-        check_failures.extend(failures)
-        return not failures
+            _record_hook_check(check_failures, "signal_target_parent", physical["ppid"], os.getpid())
+            matched = False
+        return matched
 
     def module(pidfds=True):
         loaded = children.module(pidfds=pidfds)
@@ -8236,24 +9330,31 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
         delivery["kill"] = killing
 
         def delayed_kill(pid, number):
+            # Closing wins before any check, assert, or signal. Records stay data for the body.
             if delivery["closing"]:
                 return None
             if number:
                 process = next((actor for actor in actors if actor.pid == pid), None)
                 if process is None:
-                    check_failures.append("signal target is outside this test's actors")
+                    _record_hook_check(check_failures, "signal_target_actor", pid,
+                                       sorted(actor.pid for actor in actors))
                     return None
                 physical = r2_kernel_process(pid)
                 if not signal_target_matches(process, physical):
                     return None
             if exit_after_live_read and pid == actors[2].pid and number == signal.SIGKILL:
                 held.append(pid)
+                if forced_checks:
+                    for item in forced_checks:
+                        _record_hook_check(check_failures, item["check"], item["observed"], item["expected"])
+                    raise RuntimeError("unrelated body failure")
                 if fail_while_held:
-                    raise RuntimeError("injected test body failure while KILL is held")
+                    raise RuntimeError(_HELD_BODY_FAILURE)
                 return None
             return killing(pid, number)
 
         loaded.os.kill = delayed_kill
+        delivery["delayed_kill"] = delayed_kill
         return loaded
 
     def spawn(*args, **kwargs):
@@ -8272,7 +9373,8 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
                     physical = r2_kernel_process(process.pid)
                     if held and not delivered and signal_target_matches(process, physical):
                         if physical["state"].startswith("Z"):
-                            check_failures.append("held child exited before scheduled KILL delivery")
+                            _record_hook_check(check_failures, "held_child_live_until_kill",
+                                               physical["state"], "live")
                         else:
                             # Exit after a genuine live read; latch on the original child's real pidfd.
                             delivery["kill"](process.pid, signal.SIGKILL)
@@ -8280,7 +9382,8 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
                             watcher = select.poll()
                             watcher.register(process.native_handle, select.POLLIN)
                             if not watcher.poll(5000):
-                                check_failures.append("the original child's KILL did not complete")
+                                _record_hook_check(check_failures, "original_child_kill_completion",
+                                                   "timeout", "pidfd-readable")
                     if physical["state"].startswith("Z"):
                         deferred.append({key: physical[key] for key in ("pid", "birth", "state", "uid", "euid")})
                     # A live /proc read can precede a ready waitpid in the same call. Keep native wait
@@ -8294,48 +9397,117 @@ def test_stubborn_descendant_completion_waits_for_deferred_native_reap(launch, c
         return process
 
     spawn.projection, spawn.module = children.projection, module
-    expected = (pytest.raises(RuntimeError, match="^injected test body failure while KILL is held$")
-                if fail_while_held else nullcontext())
-    with expected:
-        try:
-            test_stop_retains_stubborn_descendants_after_the_middle_exits(
-                launch, spawn, monkeypatch, capsys, False, None)
-        finally:
-            # Disarm before evidence writes and before custody can close the safety pipe. A saved
-            # callback also delegates immediately, even after its instance attribute is restored.
-            delivery["closing"] = True
-            if "poll" in delivery:
-                actors[2].poll = delivery["poll"]
-            (launch.tmp / "deferred-reap-evidence.json").write_text(json.dumps(
-                {"physical_zombie": deferred, "held": held, "delivered": delivered,
-                 "check_failures": check_failures, "closing": delivery["closing"],
-                 "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
-    assert not check_failures, check_failures
-    if fail_while_held:
-        worker = actors[2]
-        assert held == [worker.pid] and not delivered
-        assert (worker.pid, signal.SIGKILL) not in children.projection.events
-        physical = r2_kernel_process(worker.pid)
-        assert physical["birth"] == worker.native_birth
-        assert physical["pgid"] == os.getsid(worker.pid) == worker.pid and physical["ppid"] == os.getpid()
-        # Force the real zombie-before-closure schedule without invoking the patched poll or reaping.
-        signal.pidfd_send_signal(worker.native_handle, signal.SIGKILL)
-        watcher = select.poll()
-        watcher.register(worker.native_handle, select.POLLIN)
-        assert watcher.poll(5000), "the held child's independent exit did not complete"
-        report = children.case.close()
-        assert report["state"] == "CLOSED" and not report["errors"] and not report["unresolved_slots"]
-        assert not children.case.custody.quarantine.exists()
-        assert worker.wait(timeout=5) == -signal.SIGKILL
-        assert native_wait_fields(worker)["returncode"] == -signal.SIGKILL
-        assert worker.poll == delivery["poll"]
-        assert delivery["hook"]() == -signal.SIGKILL  # A retained callback must be disarmed too.
-        assert children.case.close() == report
-        return
-    assert len(deferred) == 1 and deferred[0]["birth"] == actors[2].native_birth
-    assert held == delivered == ([actors[2].pid] if exit_after_live_read else [])
-    assert native_wait_fields(actors[2])["returncode"] == -signal.SIGKILL
-    assert actors[2].poll() == actors[2].poll() == -signal.SIGKILL  # Repeated terminal observations never read /proc.
+    if forced_checks:
+        expected = pytest.raises(RuntimeError)
+    elif fail_while_held:
+        expected = pytest.raises(RuntimeError, match=_HELD_BODY_MATCH)
+    else:
+        expected = nullcontext()
+    holder = {}
+
+    def run_stop():
+        with expected as caught:
+            try:
+                try:
+                    test_stop_retains_stubborn_descendants_after_the_middle_exits(
+                        launch, spawn, monkeypatch, capsys, False, None)
+                except Exception as exc:
+                    annotated = _annotate_hook_check_failure(exc, check_failures)
+                    if annotated is exc:
+                        raise
+                    raise annotated from exc
+            finally:
+                # Disarm before evidence writes and before custody can close the safety pipe. A saved
+                # callback also delegates immediately, even after its instance attribute is restored.
+                delivery["closing"] = True
+                if "poll" in delivery:
+                    actors[2].poll = delivery["poll"]
+                hook_report = _format_hook_check_failures(check_failures)
+                (launch.tmp / "deferred-reap-evidence.json").write_text(json.dumps(
+                    {"physical_zombie": deferred, "held": held, "delivered": delivered,
+                     "check_failures": check_failures, "check_failure_report": hook_report,
+                     "closing": delivery["closing"],
+                     "stop_records": [r for r in launch.records() if r.get("action") == "stop"]}, indent=2))
+        holder["caught"] = caught
+
+    _call_with_recorded_hook_checks(run_stop, check_failures)
+    caught = holder["caught"]
+
+    def validate_after_stop():
+        if forced_checks:
+            _validate_forced_hook_checks(
+                caught, check_failures, launch.tmp / "deferred-reap-evidence.json", forced_checks)
+        elif not fail_while_held:
+            # Invariant: ordinary completion has no annotated close. Reject before the success asserts.
+            _reject_recorded_hook_checks(check_failures)
+        if fail_while_held:
+            def assert_while_held():
+                worker = actors[2]
+                assert held == [worker.pid] and not delivered
+                assert (worker.pid, signal.SIGKILL) not in children.projection.events
+                physical = r2_kernel_process(worker.pid)
+                assert physical["birth"] == worker.native_birth
+                assert physical["pgid"] == os.getsid(worker.pid) == worker.pid and physical["ppid"] == os.getpid()
+                # A closure-reachable kill must not signal or record once finally has disarmed it.
+                recorded = list(check_failures)
+                assert worker.poll() is None
+                assert delivery["delayed_kill"](worker.pid, signal.SIGKILL) is None
+                assert check_failures == recorded and worker.poll() is None
+                assert (worker.pid, signal.SIGKILL) not in children.projection.events
+                # Force the real zombie-before-closure schedule without invoking the patched poll or reaping.
+                signal.pidfd_send_signal(worker.native_handle, signal.SIGKILL)
+                watcher = select.poll()
+                watcher.register(worker.native_handle, select.POLLIN)
+                assert watcher.poll(5000), (
+                    "the held child's independent exit did not complete; " + _format_hook_check_failures(check_failures))
+                if closure_fault == "errors":
+                    def failed_cleanup(slot):
+                        raise OSError("modelled custody closure failure")
+                    children.case.custody.cleanup_hook = failed_cleanup
+                    with pytest.raises(R2CleanupError) as closure_caught:
+                        _close_with_recorded_hook_checks(children.case.close, check_failures)
+                    text = str(closure_caught.value)
+                    hook_report = _format_hook_check_failures(check_failures)
+                    assert type(closure_caught.value) is R2CleanupError
+                    assert closure_caught.value.report is children.case.custody.report
+                    assert closure_caught.value.report["state"] == "CLOSED_WITH_ERRORS"
+                    assert text.startswith("R2 physical cleanup CLOSED_WITH_ERRORS:")
+                    assert hook_report in text
+                    assert "signal_target_birth" in text and "signal_target_parent" in text
+                    assert _hook_diagnostic_token("forced-observed-birth") in text
+                    assert _hook_diagnostic_token("forced-observed-parent") in text
+                    assert "forced-observed-birth" not in text and "forced-observed-parent" not in text
+                    assert "signal_target_birth" not in json.dumps(closure_caught.value.report["errors"])
+                    assert text.count("recorded hook check failures:") == 1
+                    assert not children.case.custody.quarantine.exists()
+                    assert R2Custody.quarantine_report is None
+                    if not forced_checks:
+                        # Invariant: nonempty checks are rejected only after the annotated close.
+                        _reject_recorded_hook_checks(check_failures)
+                    return
+                closure = _close_with_recorded_hook_checks(children.case.close, check_failures)
+                assert closure["state"] == "CLOSED" and not closure["errors"] and not closure["unresolved_slots"], (
+                    "recorded hook check failures: " + _format_hook_check_failures(check_failures))
+                assert not children.case.custody.quarantine.exists()
+                assert worker.wait(timeout=5) == -signal.SIGKILL
+                assert native_wait_fields(worker)["returncode"] == -signal.SIGKILL
+                assert worker.poll == delivery["poll"]
+                recorded = len(check_failures)
+                assert delivery["hook"]() == -signal.SIGKILL  # A retained callback must be disarmed too.
+                assert len(check_failures) == recorded
+                assert _close_with_recorded_hook_checks(children.case.close, check_failures) == closure
+                if not forced_checks:
+                    # Invariant: nonempty checks are rejected only after the annotated close.
+                    _reject_recorded_hook_checks(check_failures)
+                return
+            _call_with_recorded_hook_checks(assert_while_held, check_failures)
+            return
+        assert len(deferred) == 1 and deferred[0]["birth"] == actors[2].native_birth
+        assert held == delivered == ([actors[2].pid] if exit_after_live_read else [])
+        assert native_wait_fields(actors[2])["returncode"] == -signal.SIGKILL
+        assert actors[2].poll() == actors[2].poll() == -signal.SIGKILL  # Repeated terminal observations never read /proc.
+
+    _call_with_recorded_hook_checks(validate_after_stop, check_failures)
 
 
 @pytest.mark.parametrize("evidence", ["proven", "unproven"])
@@ -8732,22 +9904,41 @@ class R2Case:
         module.subprocess.run = shown
 
     def close(self):
+        """Re-annotate from the case record so a fresh UNKNOWN names every recorded check.
+
+        Invariant: hook text stays on the exception. The stored custody report and the
+        quarantine file stay free of recorded checks. A second close is annotated again
+        from this same record, because custody builds a new exception from the report.
+        """
+        rows = getattr(self, "_recorded_hook_checks", None) or []
+        if rows:
+            return _close_with_recorded_hook_checks(self.custody.close, rows)
         return self.custody.close()
+
+
+def _open_r2_case(launch):
+    """The fixture body. Construction UNKNOWN exits before a case record exists."""
+    try:
+        return R2Case(launch)
+    except R2CleanupUnknown as exc:
+        pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
+
+
+def _teardown_r2_case(made):
+    """Fixture teardown. A fresh UNKNOWN already carries the case record on close()."""
+    try:
+        made.close()
+    except R2CleanupUnknown as exc:
+        pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
 
 
 @pytest.fixture
 def r2_case(launch):
-    try:
-        made = R2Case(launch)
-    except R2CleanupUnknown as exc:
-        pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
+    made = _open_r2_case(launch)
     try:
         yield made
     finally:
-        try:
-            made.close()
-        except R2CleanupUnknown as exc:
-            pytest.exit("R2 fixture UNKNOWN: " + str(exc), returncode=3)
+        _teardown_r2_case(made)
 
 
 @pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "start-time"])
@@ -9478,12 +10669,7 @@ def test_modelled_custody_lost_birth_cannot_be_resolved_by_numeric_absence(tmp_p
         report = control.folder / "closure.json"
         if report.exists():
             report.rename(control.folder / "actorless-observer-report.json")
-        for fd in (control.safety_read, control.safety_write, control.report_read, control.report_write,
-                   *(fd for pair in control.gates.values() for fd in pair)):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        _release_custody_descriptors(control)
 
 
 def test_r2_projection_runner_uses_the_public_stop_entrypoint(r2_case):
