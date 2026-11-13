@@ -46,12 +46,12 @@ def provider_status(lifecycle_root, request_id, request_sha256):
             "next_action": "Retain the original intent; reconcile original job admission before correlation or settlement."}
 
 
-def job_status(store_path, job_id):
+def job_status(store_path, job_id, recipes_path=None):
     """Keep the existing job inventory distinct from external payload knowledge."""
     require(isinstance(job_id, str) and JOB_ID.fullmatch(job_id) is not None,
             "invalid job: " + str(job_id)[:128])
     initiative_id, message_id = job_id.split("/")
-    _, inventory = recovery_status(store_path, chosen=(initiative_id,))
+    _, inventory = recovery_status(store_path, chosen=(initiative_id,), recipes_path=recipes_path)
     row = next((item for item in inventory["jobs"] if item["job"] == job_id), None)
     require(row is not None, "unknown workspace job: " + job_id)
 
@@ -87,12 +87,14 @@ def main(argv=None):
     parser = JsonArgumentParser(description=__doc__)
     parser.add_argument("--lifecycle")
     parser.add_argument("--store")
+    parser.add_argument("--recipes", help="Absolute path to root's trusted job recipe file")
     commands = parser.add_subparsers(dest="command", required=True)
     provider = commands.add_parser("provider")
     provider.add_argument("--request-id", required=True)
     provider.add_argument("--request-sha256", required=True)
     job = commands.add_parser("job")
     job.add_argument("--job", required=True)
+    job.add_argument("--recipes", default=argparse.SUPPRESS, help="Absolute path to root's trusted job recipe file")
     try:
         args = parser.parse_args(argv)
         if args.command == "provider":
@@ -100,7 +102,7 @@ def main(argv=None):
             result = provider_status(args.lifecycle, args.request_id, args.request_sha256)
         else:
             require(args.store is not None, "--store is required")
-            result = job_status(args.store, args.job)
+            result = job_status(args.store, args.job, recipes_path=args.recipes)
         code = 0
     except (ValueError, OSError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
         code, result = 2, {"error": str(exc)}

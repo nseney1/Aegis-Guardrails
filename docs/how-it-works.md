@@ -130,7 +130,7 @@ covers canonical names, parser-recognized comments and evasion bounds.
 
 **The bootstrap.** `aegis init` writes a small marked `AGENTS.md` block. The MCP server sends the same guidance as its `initialize` instructions, which editing files cannot remove. Rule text is never inlined into an instructions file, so it never pushes a host past its size limit.
 
-**The nine tools** (schemas in the [reference](reference.md)):
+**The tools** (schemas in the [reference](reference.md)):
 
 | Tool | What it does |
 |---|---|
@@ -143,6 +143,7 @@ covers canonical names, parser-recognized comments and evasion bounds.
 | `aegis_msg_write` | composes workspace messages through the shared codec with code-authored metadata and heading spans |
 | `aegis_team_config` | reads the resolved team profile with per-value layer provenance; same payload as the CLI JSON except token-shaped identifiers in capacity and fallback fields are masked; writes nothing |
 | `aegis_team_model` | previews a model choice and decision record; `record: true` atomically selects and appends through the model-selection core; identical JSON to `aegis team model` |
+| `aegis_team_queue` | lists work items, blockers and lane labels through the same service as `aegis team queue list`; optional capability and completed-item filters; writes nothing |
 
 **Model selection.** `aegis team model --bindings bindings.json --policy policy.json --history decisions.jsonl --task-kind T9 --role-kind implementer --subject lane-one --host-kind codex-cli --host-kind claude-code --json`
 previews a choice without publishing history. Add `--record` (MCP `record: true`) to select and append under one lock, with a 60-second timeout. Bindings, policy and history paths must stay inside the workspace; absolute paths and parent components are refused. The shared workspace confinement helper validates each path, and the core retains its no-follow descriptor walk over the original spelling. Inputs are bounded regular files, and the history directory must already exist with safe ownership and modes. Missing history in a valid directory means empty history. No host launches or admission grants occur; unprobed and rejected levels refuse with `binding_not_admitted`.
