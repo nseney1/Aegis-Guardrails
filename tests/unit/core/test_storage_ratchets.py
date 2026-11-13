@@ -64,6 +64,8 @@ _DESCRIPTOR_OPERATIONS = _OS_OPERATIONS | {"path.rename", "path.replace"}
 # exact-count ceilings. New writers are never learned automatically by the hook.
 # This file is the single registry read by both the static ratchet and census.
 AUDIT_WRITERS = {
+    ("aegis_core/gitsafe_run.py", "capture"): "GM-5 bounded custody: anonymous capped stdin scratch and subprocess DEVNULL; handles closed on failure and completion",
+    ("aegis_core/gitsafe_run.py", "execute"): "GM-5 extracted legacy subprocess DEVNULL recipe; unchanged default behavior",
     ("aegis_cli/doctor_repair.py", "_apply_files"): "existing unlink; source lines 236",
     ("aegis_cli/doctor_repair.py", "_backup_root"): "existing mkdir; source lines 39",
     ("aegis_cli/doctor.py", "_run_host_cli"): "existing subprocess DEVNULL; source lines 489",
@@ -92,7 +94,6 @@ AUDIT_WRITERS = {
     ("aegis_core/ghcli.py", "default_gh_runner"): "existing mkdtemp, subprocess DEVNULL, rmtree; source lines 71, 84, 99",
     ("aegis_core/gitsafe.py", "add_trailer"): "existing TemporaryDirectory; source lines 273",
     ("aegis_core/gitsafe.py", "export_tree"): "existing mkdir, mkdtemp, chmod, rmtree; source lines 859, 865, 867, 890, 899, 908",
-    ("aegis_core/gitsafe.py", "run"): "existing subprocess DEVNULL; source lines 227",
     ("aegis_core/human_gate.py", "_signature"): "existing mkdtemp, chmod, rmtree; source lines 856, 858, 877",
     ("aegis_core/inference_provider.py", "CommandBackend.generate"): "existing mkdtemp, rmtree; source lines 74, 88",
     ("aegis_core/insights/keys.py", "_ensure_private_dir"): "existing mkdir, fchmod; source lines 58, 77",
@@ -198,6 +199,10 @@ AUDIT_WRITERS = {
     ("tools/hierarchy_loop.py", "serve"): "existing mkdir; source lines 789",
     ("tools/hierarchy_loop.py", "write_status"): "existing mkstemp, replace, Path; source lines 701, 707, 709",
     ("tools/hierarchy_mailbox_mcp.py", "serve"): "existing open; source lines 946",
+    ("tools/hierarchy_mailbox_records.py", "record_store"): "creates the admitted sibling store and atomically links one synced root identity bundle through held descriptors; under the parent reservation, reclaims stale staging and rolls back only its identity inode and empty newly created store on definite refusal",
+    ("tools/hierarchy_mailbox_records.py", "_publication_lock"): "creates/removes fixed shared-store publication and parent lifetime reservations through held store/parent descriptors",
+    ("tools/hierarchy_mailbox_records.py", "_commit_record"): "reclaims abandoned staging, stages/removes the fixed pending stub through the held destination descriptor and reclaims a newly created record after a definite pre-commit failure",
+    ("tools/hierarchy_mailbox_records.py", "_link_message"): "atomically replaces provisional reference grants then the activating wrapper entry last through the held store descriptor, restores prior entries on definite failure and links the accepted stub within the held destination directory",
     ("tools/hierarchy_mailbox.py", "_writer_stream"): "owns a fixed wb stream over the caller-opened mailbox lock/publication descriptor with closefd=False and always closes the raw descriptor in finally",
     ("tools/hierarchy_mailbox.py", "initialize"): "existing mkdir, ; source lines 1135, 1138, 1140",
     ("tools/hierarchy_mailbox.py", "Mailbox.write_delivery_receipt"): "existing mkdir; source lines 1050",
@@ -296,6 +301,8 @@ AUDIT_FORWARDER_OPERATIONS = {
 # These operations do not own a mutation in the approving frame: read-only I/O
 # or delegation to an independently registered writer/storage boundary.
 AUDIT_READ_ONLY_OPERATIONS = {
+    ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
+    ("aegis_core/team_git.py", "snapshot_tree", "os.open"): "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; read-only, closed in finally",
     ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
     ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
     ("aegis_cli/init.py", "_link_key_step", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
@@ -460,6 +467,8 @@ CALLBACK_EXCEPTIONS = {
 # (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
 # another call in an already reviewed function still requires explicit review.
 REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
+    ("aegis_core/team_git.py", "snapshot_tree", "os.open"): (1, "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; closed in finally"),
     ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),
     ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): (2, "read-only bounded existing config or migration source bytes"),
     ("aegis_cli/init.py", "_link_key_step", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),

@@ -122,8 +122,8 @@
       "stmts": 630
     },
     "aegis_core/gitsafe.py": {
-      "lines": 1225,
-      "stmts": 682
+      "lines": 1173,
+      "stmts": 653
     },
     "aegis_core/human_gate.py": {
       "lines": 1073,

@@ -133,6 +133,7 @@ PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1
  'aegis_core/command_safety/guard.py:aegis_core.command_safety.lexer._writes_a_device': 1,
  'aegis_core/credit_memo.py:aegis_core.atomicio._open_regular': 1,
  'aegis_core/fitness.py:aegis_core.stats._num': 1,
+ 'aegis_core/gitsafe.py:aegis_core.gitsafe_run._LaneServices': 2,
  'aegis_core/insights/capture.py:aegis_core.insights.keys._append_user_insights': 1,
  'aegis_core/insights/capture.py:aegis_core.insights.keys._ensure_hs': 1,
  'aegis_core/insights/capture.py:aegis_core.insights.keys._ensure_private_dir': 1,
