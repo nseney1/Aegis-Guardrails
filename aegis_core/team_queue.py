@@ -11,7 +11,7 @@ from __future__ import annotations
 from builtins import list as array
 from contextlib import nullcontext
 import json
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 import re
 import secrets
 import time
@@ -23,28 +23,32 @@ from aegis_core.storage import locked
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
-    "MAX_BYTES", "MAX_ITEMS", "MAX_FIELDS", "MAX_TEXT", "QueueRefusal",
-    "descriptor_supported", "valid_workspace_spelling", "parse_item", "refusal", "add", "list", "claim",
-    "release", "done", "audit",
+    "MAX_BYTES", "MAX_ITEMS", "MAX_FIELDS", "MAX_TEXT", "MAX_COMPLETED", "QueueRefusal",
+    "descriptor_supported", "valid_workspace_spelling", "parse_item", "list_argument_refusal", "refusal", "add", "list", "claim",
+    "release", "done", "audit", "compact",
 ]
 
 MAX_BYTES = 1048576
 MAX_ITEMS = 256
 MAX_FIELDS = 128
 MAX_TEXT = 4096
+MAX_COMPLETED = 8192
 _KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z", re.ASCII)
 _REVISION = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _NEXT = {
     "invalid_item": "Supply a bounded queue item with the documented fields and single-line values.",
+    "credential_like_text": "Rephrase the field without credential-assignment syntax (for example, use 'Update login flow'); never include credentials.",
     "invalid_arguments": "Use the documented queue arguments and the revision returned by list.",
     "invalid_queue_state": "Ask the coordinator to repair the queue state from trusted evidence.",
     "unsupported_platform": "Use a platform supporting descriptor-relative no-follow file operations.",
-    "queue_size_limit": "The proposed queue exceeds the 1 MiB file or bounded JSON reader limits; ask the coordinator to reduce retained state before retrying.",
+    "queue_size_limit": "Run aegis team queue compact to reduce readable retained state; if the queue already exceeds the 1 MiB file or reader limits, ask the coordinator to repair it from trusted evidence.",
+    "queue_history_limit": "Ask the coordinator to archive and reconcile completed-ID history before further compaction; completed IDs must remain reserved.",
+    "brief_outside_scope": "Correct brief_paths to name only files admitted by the item's paths, then add the item again.",
     "queue_live_limit": "Complete unfinished work before adding more than 256 unfinished items.",
     "queue_lock_timeout": "Wait for the workspace writer to finish, then list and retry with its current revision.",
     "queue_io_unavailable": "Check the trusted workspace and queue paths, then list before retrying a mutation.",
     "profile_unavailable": "Correct the layered team profile before claiming work.",
-    "item_exists": "List the existing item; enqueue a different stable id for different work.",
+    "item_exists": "Run aegis team queue list --include-done to inspect existing items and completed_ids; use a new stable id for different work.",
     "item_missing": "List the queue and select an existing item id.",
     "stale_revision": "List the item again and decide whether to retry with its current revision.",
     "already_claimed": "Wait for release or lease expiry; then list and claim the current revision.",
@@ -53,7 +57,7 @@ _NEXT = {
     "lane_mismatch": "Use the current claim's lane from list, or ask its holder to release the work.",
     "not_claimed": "Claim the queued item before releasing or completing it.",
     "lease_expired": "List and claim the item again before completing it.",
-    "item_done": "Select a queued item; completed ids are retained.",
+    "item_done": "Select unfinished work; completed IDs remain reserved, including compacted history.",
     "capability_mismatch": "Select an item matching the team's declared capability labels.",
     "capacity_full": "Release or complete live work before claiming another writer slot.",
     "blocked": "Resolve the listed blockers, then list and retry the current revision.",
@@ -118,7 +122,7 @@ def _text(value, limit=MAX_TEXT, empty=False):
     _require(type(value) is str and (empty or bool(value)) and len(value) <= limit)
     _require(not any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in "\u2028\u2029" for char in value))
     _require(primitives.sanitize_display(value, max_len=None) == value)
-    _require(redact_command_secrets(value) == value)
+    _require(redact_command_secrets(value) == value, "credential_like_text")
     try:
         value.encode("utf-8")
     except UnicodeError:
@@ -129,11 +133,11 @@ def _text(value, limit=MAX_TEXT, empty=False):
 def _strings(value, *, paths=False):
     _require(type(value) is array and len(value) <= MAX_FIELDS)
     for entry in value:
+        if not paths:
+            _require(_key(entry))
         _text(entry, 256)
         if paths:
             _require("\\" not in entry and ":" not in entry)
-        else:
-            _require(_key(entry))
     _require(len(set(value)) == len(value))
     if paths and value:
         try:
@@ -146,12 +150,17 @@ def _strings(value, *, paths=False):
 def _item(value):
     _require(type(value) is dict and len(value) <= 10)
     required = {"id", "title", "paths", "capabilities"}
-    allowed = required | {"after", "hold", "hold_until", "scope_rulings", "invariants"}
+    allowed = required | {"after", "hold", "hold_until", "scope_rulings", "invariants", "brief_paths"}
     _require(required <= value.keys() and value.keys() <= allowed)
     _require(_key(value["id"]))
     _text(value["title"], 256)
     _strings(value["paths"], paths=True)
     _require(bool(value["paths"]))
+    _strings(value.get("brief_paths", []), paths=True)
+    scope = team_paths.claim_paths(value["paths"])
+    for path in value.get("brief_paths", []):
+        _require(not path.startswith("/") and not any(char in path for char in "*?[]"))
+        _require(team_paths.first_match(scope, path) is not None, "brief_outside_scope")
     _strings(value["capabilities"])
     _strings(value.get("after", []))
     _require(value["id"] not in value.get("after", []))
@@ -243,20 +252,33 @@ def parse_item(text):
     """Bound and validate the CLI's inline JSON; no attacker-selected file is opened."""
     try:
         return {"refused": False, "item": _item(_json(text, "invalid_item"))}
-    except QueueRefusal:
-        return {"refused": True, "reason": "invalid_item", "next_action": _NEXT["invalid_item"]}
+    except QueueRefusal as error:
+        return {"refused": True, "reason": error.reason, "next_action": _NEXT[error.reason]}
 
 
 def refusal(reason, *, verb="usage"):
     """Fixed, non-echoing envelope for failures before a service operation runs."""
     if type(reason) is not str or reason not in _NEXT:
         reason = "invalid_arguments"
-    if type(verb) is not str or verb not in ("add", "list", "claim", "release", "done", "audit", "usage"):
+    if type(verb) is not str or verb not in ("add", "list", "claim", "release", "done", "audit", "compact", "usage"):
         verb = "usage"
     payload = primitives.envelope("aegis team queue " + verb, {}, schema="aegis.team.queue." + verb + "/v1")
     payload.update(refused=True, status="refused", reason=reason, next_action=_NEXT[reason],
-                   exit_code=2 if reason in ("invalid_arguments", "invalid_item") else 1)
+                   exit_code=2 if reason in ("invalid_arguments", "invalid_item", "credential_like_text", "brief_outside_scope") else 1)
     return _shown(payload)
+
+
+def list_argument_refusal(arguments):
+    """Validate the closed public list input before any workspace binding or IO."""
+    try:
+        _require(type(arguments) is dict and len(arguments) <= 2)
+        _require(arguments.keys() <= {"capabilities", "include_done"})
+        _require(type(arguments.get("include_done", False)) is bool)
+        if "capabilities" in arguments:
+            _strings(arguments["capabilities"])
+    except QueueRefusal:
+        return refusal("invalid_arguments", verb="list")
+    return None
 
 
 def valid_workspace_spelling(raw):
@@ -264,7 +286,7 @@ def valid_workspace_spelling(raw):
     if (type(raw) is not str or not raw or len(raw) > 32768 or
             raw.count("/") + raw.count("\\") > 256 or "\x00" in raw):
         return False
-    return ".." not in PureWindowsPath(raw).parts and ".." not in PurePosixPath(raw).parts
+    return ".." not in re.split(r"[\\/:]", raw)
 
 
 def _root(root):
@@ -297,25 +319,34 @@ def _read(root, parts, limit=MAX_BYTES):
 def _state(root):
     raw = _read(root, (AEGIS_DIRNAME, "state", "team-queue.json"))
     if raw is None:
-        return {"version": 1, "items": {}, "milestones": []}
+        return {"version": 1, "items": {}, "milestones": [], "completed": {}}
     return _decode_state(raw)
 
 
 def _decode_state(raw):
     try:
         value = _json(raw, "invalid_queue_state")
-        _require(type(value) is dict and value.keys() == {"version", "items", "milestones"})
+        required = {"version", "items", "milestones"}
+        _require(type(value) is dict and required <= value.keys() <= required | {"completed"})
         _require(type(value["version"]) is int and value["version"] == 1)
         _strings(value["milestones"])
         _require(type(value["items"]) is dict)
+        completed = value.setdefault("completed", {})
+        _require(type(completed) is dict and len(completed) <= MAX_COMPLETED)
+        for key, marker in completed.items():
+            _require(_key(key) and marker is True and key not in value["items"])
         unfinished = 0
         for key, row in value["items"].items():
-            _require(type(row) is dict and row.keys() == {"item", "state", "revision", "lane", "expires_at"})
+            required = {"item", "state", "revision", "lane", "expires_at"}
+            _require(type(row) is dict and required <= row.keys() <= required | {"branch"})
             _item(row["item"])
             _require(key == row["item"]["id"])
             _require(type(row["revision"]) is str and _REVISION.fullmatch(row["revision"]) is not None)
             _require(type(row["state"]) is str and row["state"] in ("queued", "claimed", "done"))
             _require(row["lane"] is None or _lane(row["lane"]))
+            # _json already bounds stored metadata. Preserve branch evidence
+            # under older claim rules; an unsupported value is an item finding,
+            # never a reason to disable the queue or its recovery commands.
             _require(row["expires_at"] is None or (type(row["expires_at"]) is int and 0 <= row["expires_at"] <= 4102531200))
             unfinished += row["state"] != "done"
             _require(unfinished <= MAX_ITEMS)
@@ -382,7 +413,7 @@ def _blockers(item, state, lanes, found, now, queue_paths, *, config_checked=Tru
     if item.get("hold"):
         blockers.append(_block("judgment_hold", "Ask the holding actor to resolve the judgment hold."))
     for dependency in item.get("after", []):
-        if state["items"].get(dependency, {}).get("state") != "done":
+        if dependency not in state["completed"] and state["items"].get(dependency, {}).get("state") != "done":
             blockers.append(_block("after", "Complete the prerequisite item before retrying.", item_id=dependency))
     for condition in item.get("hold_until", []):
         kind = condition["kind"]
@@ -406,19 +437,58 @@ def _blockers(item, state, lanes, found, now, queue_paths, *, config_checked=Tru
 def _view(row, now, blockers=()):
     item = row["item"]
     expired = row["state"] == "claimed" and not _live(row, now)
-    return {**item, **{key: value for key, value in row.items() if key != "item"},
+    result = {**item, **{key: value for key, value in row.items() if key != "item"},
             "state": "queued" if expired else row["state"], "lease_expired": expired,
             "label": _QueueLabel(item["id"], item["title"], row["lane"]),
             "blockers": array(blockers), "conditions_met": not blockers}
+    if not _branch_evidence(row.get("branch"))[0]:
+        result["branch_supported"] = False
+    return result
 
 
-def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=None, capabilities=None, ttl_s=3600, lanes=None, found=None, root=None, queue_paths=None):
+def _branch_name(value):
+    """Use lease labels and normalize one optional local-ref prefix; never infer HEAD."""
+    try:
+        value = team._check_branch(value)
+    except team.TeamUsageError:
+        raise QueueRefusal("invalid_arguments") from None
+    if value is None:
+        return None
+    prefix = "refs/heads/"
+    _require(not value.startswith("refs/") or value.startswith(prefix))
+    name = value[len(prefix):] if value.startswith(prefix) else value
+    _require(bool(name) and name != "HEAD" and not name.startswith("refs/"))
+    return name
+
+
+def _branch_evidence(value):
+    """Classify stored evidence without rewriting it or refusing its queue."""
+    try:
+        return True, _branch_name(value)
+    except QueueRefusal:
+        return False, None
+
+
+def _preflight(item, found, lane, now):
+    """Typed brief declarations are data, never paths to open or execute."""
+    blockers = []
+    scope = team_paths.claim_paths(item["paths"])
+    if any(team_paths.first_match(scope, path) is None for path in item.get("brief_paths", [])):
+        blockers.append(_block("brief_outside_scope", "Correct brief_paths to name only files admitted by the item's paths before claiming."))
+    if found.unreadable or any(lease.lane != lane and not lease.expired(now) and
+                              team_paths.overlap(scope, lease.path_set) for lease in found.leases):
+        blockers.append(_block("foreign_lease", "Wait for foreign repository leases to expire or be released; repair unreadable leases, then retry the current revision."))
+    return blockers
+
+
+def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=None, capabilities=None, ttl_s=3600, branch=None, lanes=None, found=None, root=None, queue_paths=None):
     if verb == "add":
-        _require(item["id"] not in state["items"], "item_exists")
+        _require(item["id"] not in state["items"] and item["id"] not in state["completed"], "item_exists")
         _require(sum(row["state"] != "done" for row in state["items"].values()) < MAX_ITEMS, "queue_live_limit")
         row = {"item": item, "state": "queued", "revision": secrets.token_hex(32), "lane": None, "expires_at": None}
         state["items"][item["id"]] = row
         return row
+    _require(identifier not in state["completed"], "item_done")
     _require(identifier in state["items"], "item_missing")
     row = state["items"][identifier]
     _require(row["revision"] == expect, "stale_revision")
@@ -429,6 +499,7 @@ def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=N
                          for other in state["items"].values()), "lane_busy")
         _require(set(row["item"]["capabilities"]) <= set(capabilities), "capability_mismatch")
         blockers = _blockers(row["item"], state, lanes, found, now, queue_paths)
+        blockers.extend(_preflight(row["item"], found, lane, now))
         if lanes and lane not in lanes:
             blockers.append(_block("coordinator", "Ask the coordinator to configure the requested lane in .aegis/team.json."))
         for other in state["items"].values():
@@ -443,7 +514,7 @@ def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=N
         occupied = {other["lane"] for other in state["items"].values() if _live(other, now)}
         occupied.update(lease.lane for lease in found.leases if not lease.expired(now))
         _require(not found.unreadable and len(occupied | {lane}) <= limit, "capacity_full")
-        row.update(state="claimed", lane=lane, expires_at=now + ttl_s)
+        row.update(state="claimed", lane=lane, expires_at=now + ttl_s, branch=branch)
     else:
         _require(row["state"] == "claimed", "not_claimed")
         if _live(row, now):
@@ -452,8 +523,11 @@ def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=N
         if verb == "done":
             _require(_live(row, now), "lease_expired")
             row["state"] = "done"
+            if not _branch_evidence(row.get("branch"))[0]:
+                row.pop("branch", None)
         else:
             row.update(state="queued", lane=None, expires_at=None)
+            row.pop("branch", None)
     row["revision"] = secrets.token_hex(32)
     return row
 
@@ -470,6 +544,120 @@ def _lanes(root):
         return None
 
 
+def _compact(root, state, caller):
+    # Keep bodies still needed by unfinished work and durable minimal completion
+    # markers for every removed body, including dependencies filed in the future.
+    needed = {name for row in state["items"].values() if row["state"] != "done"
+              for name in row["item"].get("after", [])}
+    removed = [key for key, row in state["items"].items() if row["state"] == "done" and key not in needed]
+    _require(len(state["completed"]) + len(removed) <= MAX_COMPLETED, "queue_history_limit")
+    for key in removed:
+        state["completed"][key] = True
+        del state["items"][key]
+    result = {"removed_count": len(removed), "removed_ids": sorted(removed),
+              "retained_done_count": sum(row["state"] == "done" for row in state["items"].values())}
+    if removed:
+        _publish(root, state)
+        if events.try_append(root, "lease_claimed", "queue_compact",
+                             _shown({"queue": True, "action": "compact", "caller": caller, **result})) is not None:
+            result["warnings"] = [_block("event_not_recorded", "Check the events log; list before retrying this completed compaction.")]
+    return result
+
+
+def _mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments):
+    previous = state["items"].get(arguments.get("identifier"))
+    previous = dict(previous) if previous is not None else None
+    row = _change(state, verb, moment, lanes=lanes, found=found, root=root, queue_paths=queue_paths, **arguments)
+    _publish(root, state)
+    holder = row["lane"] or (previous["lane"] if previous else None)
+    detail = {"queue": True, "action": verb, "caller": caller,
+              "item_id": row["item"]["id"], "lane": holder,
+              "label": _QueueLabel(row["item"]["id"], row["item"]["title"], holder),
+              "from_revision": previous["revision"] if previous else None, "to_revision": row["revision"],
+              "from_holder": previous["lane"] if previous else None,
+              "to_holder": row["lane"] if row["state"] == "claimed" else None,
+              "from_state": previous["state"] if previous else None, "to_state": row["state"],
+              "from_expires_at": previous["expires_at"] if previous else None,
+              "expires_at": row["expires_at"] if row["state"] == "claimed" else None}
+    blockers = ([] if row["state"] == "done" else
+        _blockers(row["item"], state, lanes, found, moment, queue_paths,
+                  config_checked=verb == "claim", leases_checked=verb == "claim"))
+    result = {"item": _view(row, moment, blockers)}
+    # Reuse the existing kind; queue/action distinguish these from lane receipts.
+    if events.try_append(root, "lease_claimed", "queue_" + verb, _shown(detail)) is not None:
+        result["warnings"] = [_block("event_not_recorded", "Ask the coordinator to check the events log; list before retrying this completed mutation.")]
+    return result
+
+
+def _lease_findings(state, found, moment):
+    findings = []
+    unreadable = {lease.lane for lease in found.unreadable}
+    for identifier, row in state["items"].items():
+        fields = {"item_id": identifier, "lane": row["lane"]}
+        supported, expected = _branch_evidence(row.get("branch"))
+        if not supported:
+            if row["state"] == "done":
+                action = "Complete any unfinished dependents, then run aegis team queue compact; completed IDs remain reserved."
+            elif row["state"] == "claimed":
+                action = "Run aegis team queue release with this item's current --expect revision and --lane from list, then re-claim with a supported local --branch."
+            else:
+                action = "Claim this queued item with its current --expect revision and a supported local --branch."
+            findings.append({**fields, "code": "CLAIM-BRANCH-UNSUPPORTED", **_block("claim_branch_unsupported", action)})
+            expected = None
+        if not _live(row, moment):
+            continue
+        if supported and expected is None:
+            findings.append({**fields, "code": "CLAIM-BRANCH-UNKNOWN", **_block("claim_branch_unknown",
+                "Release and re-claim this queue item with an explicit --branch for the lane; never infer it from workspace HEAD.")})
+        lease = found.get(row["lane"])
+        if row["lane"] in unreadable:
+            code, reason = "LEASE-UNREADABLE", "lease_unreadable"
+            action = "Run aegis team list --json; inspect the unreadable lease, then use aegis team release with its current --expect OID before claiming again."
+        elif lease is None or lease.expired(moment):
+            code, reason = "LANE-NO-LEASE", "lane_no_lease"
+            action = "Ask the coordinator to establish a live repository lease for this claimed lane and branch."
+        else:
+            try:
+                actual = _branch_name(lease.branch)
+            except QueueRefusal:
+                actual = None
+            if actual is None:
+                code, reason = "LEASE-BRANCH-UNKNOWN", "lease_branch_unknown"
+                action = "Ask the lane holder to release and recreate its repository lease with an explicit valid --branch."
+            elif expected is not None and actual != expected:
+                code, reason = "LEASE-BRANCH-MISMATCH", "lease_branch_mismatch"
+                action = "Ask the coordinator to reconcile the repository lease branch with the branch recorded by the queue claim."
+            else:
+                continue
+        findings.append({**fields, "code": code, **_block(reason, action)})
+    return findings
+
+
+def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done):
+    rows, findings = [], []
+    for identifier in sorted(state["items"]):
+        row = state["items"][identifier]
+        if row["state"] == "done" and not include_done:
+            continue
+        if capabilities is not None and not set(row["item"]["capabilities"]) <= set(capabilities):
+            continue
+        blockers = _blockers(row["item"], state, lanes, found, moment, queue_paths) if row["state"] != "done" else []
+        rows.append(_view(row, moment, blockers))
+        if row["state"] == "done" or _live(row, moment):
+            continue
+        if blockers and all(block["reason"] == "coordinator" for block in blockers):
+            findings.append({"item_id": identifier, "code": "WAITING_ONLY_COORDINATOR", **_block("coordinator", "Ask the coordinator to resolve the listed conditions.")})
+        typed = row["item"].get("hold_until", [])
+        if typed and blockers and all(block["reason"] == "judgment_hold" for block in blockers):
+            findings.append({"item_id": identifier, "code": "CONDITIONS_MET_STILL_HELD", **_block("held_conditions_met", "Review and remove the judgment hold when ready; retain typed conditions for claim-time checks.")})
+    result = {"items": rows}
+    if include_done:
+        result["completed_ids"] = sorted(state["completed"])
+    if verb == "audit":
+        result["findings"] = findings + _lease_findings(state, found, moment)
+    return result
+
+
 def _run(root, verb, now=None, caller=None, **arguments):
     moment = int(time.time()) if now is None else now
     # Invalid clocks never reach utc_stamp or acquire a descriptor.
@@ -479,6 +667,8 @@ def _run(root, verb, now=None, caller=None, **arguments):
     payload.update(refused=False, status="done", exit_code=0)
     try:
         _require(valid_clock, "invalid_arguments")
+        include_done = arguments.pop("include_done", False)
+        _require(type(include_done) is bool, "invalid_arguments")
         if verb == "add":
             arguments["item"] = _item(arguments["item"])
         if verb in ("claim", "release", "done"):
@@ -498,6 +688,10 @@ def _run(root, verb, now=None, caller=None, **arguments):
         if verb == "claim":
             lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
             _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
+            try:
+                arguments["branch"] = _branch_name(arguments.get("branch"))
+            except QueueRefusal:
+                raise QueueRefusal("invalid_arguments") from None
         write = verb not in ("list", "audit")
         if write:
             try:
@@ -507,59 +701,24 @@ def _run(root, verb, now=None, caller=None, **arguments):
         root = _root(root)
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
+            if verb == "compact":
+                payload.update(_compact(root, state, caller))
+                return _shown(payload)
             # Parse each stored queue scope once for this observation. PathSet
             # values stay separate from the JSON state that will be published.
             queue_paths = {key: team_paths.claim_paths(row["item"]["paths"])
                            for key, row in state["items"].items()}
             lanes = _lanes(root) if verb in ("claim", "list", "audit") else None
-            needs_leases = verb == "claim" or (verb in ("list", "audit") and any(condition["kind"] == "lease_free"
+            needs_leases = verb in ("claim", "audit") or (verb == "list" and any(condition["kind"] == "lease_free"
                 for row in state["items"].values() for condition in row["item"].get("hold_until", [])))
             found = team.read_leases(root) if needs_leases else team.LeaseSet((), ())
             if write:
-                previous = state["items"].get(arguments.get("identifier"))
-                previous = dict(previous) if previous is not None else None
-                row = _change(state, verb, moment, lanes=lanes, found=found, root=root, queue_paths=queue_paths, **arguments)
-                _publish(root, state)
-                holder = row["lane"] or (previous["lane"] if previous else None)
-                detail = {"queue": True, "action": verb, "caller": caller,
-                          "item_id": row["item"]["id"], "lane": holder,
-                          "label": _QueueLabel(row["item"]["id"], row["item"]["title"], holder),
-                          "from_revision": previous["revision"] if previous else None,
-                          "to_revision": row["revision"],
-                          "from_holder": previous["lane"] if previous else None,
-                          "to_holder": row["lane"] if row["state"] == "claimed" else None,
-                          "from_state": previous["state"] if previous else None, "to_state": row["state"],
-                          "from_expires_at": previous["expires_at"] if previous else None,
-                          "expires_at": row["expires_at"] if row["state"] == "claimed" else None}
-                # Reuse the existing lease event kind; queue/action distinguish
-                # these receipts without widening the closed events registry.
-                if events.try_append(root, "lease_claimed", "queue_" + verb, _shown(detail)) is not None:
-                    payload["warnings"] = [_block("event_not_recorded", "Ask the coordinator to check the events log; list before retrying this completed mutation.")]
-                blockers = ([] if row["state"] == "done" else
-                    _blockers(row["item"], state, lanes, found, moment, queue_paths,
-                              config_checked=verb == "claim", leases_checked=verb == "claim"))
-                payload["item"] = _view(row, moment, blockers)
+                payload.update(_mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments))
             else:
-                rows, findings = [], []
-                for identifier in sorted(state["items"]):
-                    row = state["items"][identifier]
-                    if capabilities is not None and not set(row["item"]["capabilities"]) <= set(capabilities):
-                        continue
-                    blockers = _blockers(row["item"], state, lanes, found, moment, queue_paths) if row["state"] != "done" else []
-                    rows.append(_view(row, moment, blockers))
-                    if row["state"] == "done" or _live(row, moment):
-                        continue
-                    if blockers and all(block["reason"] == "coordinator" for block in blockers):
-                        findings.append({"item_id": identifier, "code": "WAITING_ONLY_COORDINATOR", **_block("coordinator", "Ask the coordinator to resolve the listed conditions.")})
-                    typed = row["item"].get("hold_until", [])
-                    if typed and any(block["reason"] == "judgment_hold" for block in blockers) and all(block["reason"] == "judgment_hold" for block in blockers):
-                        findings.append({"item_id": identifier, "code": "CONDITIONS_MET_STILL_HELD", **_block("held_conditions_met", "Review and remove the judgment hold when ready; retain typed conditions for claim-time checks.")})
-                payload["items"] = rows
-                if verb == "audit":
-                    payload["findings"] = findings
+                payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done))
     except QueueRefusal as error:
         payload.update(refused=True, status="refused", reason=error.reason, next_action=_NEXT[error.reason],
-                       exit_code=2 if error.reason in ("invalid_item", "invalid_arguments") else 1)
+                       exit_code=2 if error.reason in ("invalid_item", "invalid_arguments", "credential_like_text", "brief_outside_scope") else 1)
         if error.blockers is not None:
             payload["blockers"] = error.blockers
     except storage.LockTimeoutError:
@@ -573,17 +732,27 @@ def add(root, item, *, now=None, caller=None):
     return _run(root, "add", now, caller=caller, item=item)
 
 
-def list(root, *, capabilities=None, now=None):
-    return _run(root, "list", now, capabilities=capabilities)
+def list(root, *, capabilities=None, include_done=False, now=None):
+    arguments = {"include_done": include_done}
+    if capabilities is not None:
+        arguments["capabilities"] = capabilities
+    invalid = list_argument_refusal(arguments)
+    if invalid is not None:
+        return invalid
+    return _run(root, "list", now, capabilities=capabilities, include_done=include_done)
+
+
+def compact(root, *, now=None, caller=None):
+    return _run(root, "compact", now, caller=caller)
 
 
 def audit(root, *, now=None):
     return _run(root, "audit", now)
 
 
-def claim(root, identifier, *, expect, lane, capabilities=(), ttl_s=3600, now=None, caller=None):
+def claim(root, identifier, *, expect, lane, capabilities=(), ttl_s=3600, branch=None, now=None, caller=None):
     return _run(root, "claim", now, caller=caller, identifier=identifier, expect=expect, lane=lane,
-                capabilities=[] if capabilities == () else capabilities, ttl_s=ttl_s)
+                capabilities=[] if capabilities == () else capabilities, ttl_s=ttl_s, branch=branch)
 
 
 def release(root, identifier, *, expect, lane=None, now=None, caller=None):
