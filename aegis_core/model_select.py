@@ -14,6 +14,7 @@ import secrets
 import stat
 import sys
 
+from aegis_core.redaction import SECRET_REPLACEMENTS
 from aegis_core.storage import LockTimeoutError, file_generation, file_lock
 
 __all__ = ["MAX_LINE_BYTES", "MAX_INPUT_BYTES", "MAX_HISTORY_BYTES", "MAX_HISTORY_RECORDS",
@@ -65,6 +66,22 @@ class ModelSelectionError(ValueError):
 def _require(condition, error):
     if not condition:
         raise ModelSelectionError(error)
+
+
+def _diagnostic_locator(value):
+    # Locator tokens are canonical ASCII. Bound raw text; never slice expanded markers.
+    value = value[:128]
+    for pattern, _ in SECRET_REPLACEMENTS:
+        value = pattern.sub("[REDACTED_TOKEN]", value)
+    return value
+
+
+def _admission_refusal(host, model_class, intent, role, band=None):
+    action = "probe the level or repair model-bindings.json"
+    if band is not None and intent not in (band["default"], band["ceiling"]):
+        action += " or choose an admitted level within the band"
+    return "binding_not_admitted: %s/%s intent %s for %s; %s" % (
+        *(_diagnostic_locator(v) for v in (host, model_class, intent, role)), action)
 
 
 def _token(value):
@@ -124,8 +141,9 @@ def _input(value, error):
 
 
 def validate_bindings(value, *, host_kinds=None):
-    """Return (role rows by kind, binding rows by (host, class)); refuse invalid_bindings.
+    """Return (role rows by kind, binding rows by (host, class)).
 
+    Malformed inputs refuse invalid_bindings; band admission uses binding_not_admitted.
     host_kinds supplies the caller's host registry. Otherwise hosts are inferred
     from data; every selectable host still needs every role class and band endpoint.
     Planned rows describe capabilities only, including hosts outside the registry.
@@ -136,6 +154,8 @@ def validate_bindings(value, *, host_kinds=None):
         _require(type(host_kinds) in (list, tuple, set, frozenset) and len(host_kinds) <= 256 and
                  all(_token(h) for h in host_kinds), error)
     registry = None if host_kinds is None else set(host_kinds)
+    host_order = None if host_kinds is None else tuple(dict.fromkeys(
+        sorted(host_kinds) if type(host_kinds) in (set, frozenset) else host_kinds))
     _keys(data, ("schema", "roles", "hosts"), error)
     _require(data["schema"] == "aegis.model-bindings/v1", error)
     _require(type(data["roles"]) is list and type(data["hosts"]) is list and data["hosts"], error)
@@ -188,18 +208,28 @@ def validate_bindings(value, *, host_kinds=None):
         hosts[host, model_class] = row
         models.add((host, row["model"]))
     if registry is None:
-        registry = {h for h, _ in hosts}
+        host_order = tuple(dict.fromkeys(h for h, _ in hosts))
+        registry = set(host_order)
     _require(bool(registry) and all(_token(h) for h in registry), error)
     for role in roles.values():
-        for host in registry:
+        for host in host_order:
             if statuses.get(host) == "planned":
                 continue
             binding = hosts.get((host, role["model_class"]))
             _require(binding is not None, error)
             for edge in ("default", "ceiling"):
                 intent = role["band"][edge]
-                _require(binding["levels"].get(intent) is not None and
-                         binding["admission"][intent] != "rejected", error)
+                _require(binding["levels"].get(intent) is not None, error)
+    # Admission cannot mask a missing row or null endpoint anywhere in the registry.
+    for role in roles.values():
+        for host in host_order:
+            if statuses.get(host) == "planned":
+                continue
+            binding = hosts[host, role["model_class"]]
+            for edge in ("default", "ceiling"):
+                intent = role["band"][edge]
+                if binding["admission"][intent] != "admitted":
+                    raise ModelSelectionError(_admission_refusal(host, role["model_class"], intent, role["kind"]))
     return roles, hosts
 
 
@@ -356,7 +386,7 @@ def _record(record, error):
     _require(all(_token(v) for k, v in choice.items() if k != "model") and
              type(choice["model"]) is str and _IDENTIFIER.fullmatch(choice["model"]) is not None and
              choice["class"] in _CLASSES and choice["level"] in _NATIVE_LEVELS, error)
-    _require(_member(record["admission"], ("unprobed", "admitted")) and
+    _require(record["admission"] == "admitted" and
              choice["admission"] == record["admission"], error)
     shares = record["target_shares"]
     _shares(shares, error)
@@ -546,9 +576,12 @@ def select_model(bindings, policy, task_kind, role_kind, prior_decisions, *, hos
     model_class = roles[role_kind]["model_class"]
     host = data["family_hosts"][family][0]
     binding = hosts.get((host, model_class))
-    _require(binding is not None and binding.get("host_status", "selectable") != "planned" and
-             binding["levels"].get(chosen_intent) is not None and
-             binding["admission"][chosen_intent] != "rejected", "binding_unavailable:" + host + ":" + chosen_intent)
+    if (binding is None or binding.get("host_status", "selectable") == "planned" or
+            binding["levels"].get(chosen_intent) is None):
+        raise ModelSelectionError("binding_unavailable:" + _diagnostic_locator(host) + ":" +
+                                  _diagnostic_locator(chosen_intent))
+    if binding["admission"][chosen_intent] != "admitted":
+        raise ModelSelectionError(_admission_refusal(host, model_class, chosen_intent, role_kind, band))
     model = binding["model"]
     if binding.get("effort_encoding", "flag") == "model_suffix":
         model += "-" + binding["levels"][chosen_intent]
