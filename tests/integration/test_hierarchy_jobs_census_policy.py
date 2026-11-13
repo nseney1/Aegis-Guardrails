@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import uuid
 
 import pytest
 
@@ -26,9 +25,7 @@ POLICY_ERROR = "invalid census_outside_policy: expected count, report or ignore"
 POLICIES = [None, "count", "report", "ignore"]
 
 
-@pytest.fixture
-def policy_shop(tmp_path_factory):
-    return job_fixtures.Shop(tmp_path_factory.mktemp("census-0500-" + uuid.uuid4().hex))
+policy_shop = job_fixtures.shop
 
 
 @pytest.mark.parametrize("policy", POLICIES)
