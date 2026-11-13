@@ -93,6 +93,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
     "aegis_core.team_profile_display": 0,
