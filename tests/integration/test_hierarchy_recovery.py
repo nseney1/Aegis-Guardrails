@@ -10,14 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.integration.test_hierarchy_jobs import Shop, commit_request, verified_evidence
+from tests.integration.test_hierarchy_jobs import shop, commit_request, verified_evidence
 from tests.integration.test_hierarchy_jobs import pytestmark as pytestmark
 from tests.integration.test_hierarchy_workspace import write_lease
-
-
-@pytest.fixture
-def shop(tmp_path):
-    return Shop(tmp_path)
 
 
 def visible_processes(shop, monkeypatch, *pids):

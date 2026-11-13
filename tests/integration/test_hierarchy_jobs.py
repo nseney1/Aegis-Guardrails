@@ -3,6 +3,7 @@
 Jobs here are real processes and the sandbox tests run real bubblewrap when it works on this machine.
 No host session is involved, so these tests say nothing about how a model behaves.
 """
+import copy
 import errno
 import hashlib
 import io
@@ -18,6 +19,8 @@ import time
 import uuid
 
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import patch as jobs2_patch
 
 import pytest
@@ -31,12 +34,14 @@ from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration import test_hierarchy_provision as provision_fixtures
 from tests.integration.test_hierarchy_provision import INITIATIVE, LANES, Setup, provision
 from tests.integration.test_hierarchy_workspace import write_lease
+from tests.conftest import symlink_or_skip
 
 
 JOBS = ROOT / "tools" / "hierarchy_jobs.py"
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the job runner reads /proc")
 PACKET_SCHEMA = "aegis.hierarchy-job-packet/v1"
 EMPTY = hashlib.sha256(b"").hexdigest()
+_WORKER_SHOP = pytest.StashKey[object]()
 
 
 # The CI Linux legs run this same probe as a hard step (test_ci_workflows), so a sandbox that
@@ -170,12 +175,225 @@ class Shop(Setup):
         return self.workspace.run("status")["capacity"]["heavy"]
 
 
-@pytest.fixture
-def shop(tmp_path, tmp_path_factory, request):
+class PristineShop:
+    """A private snapshot restored at its recorded absolute path, once per worker."""
+    def __init__(self, folder, source_seed):
+        active = folder / "active"
+        active.mkdir()
+        self.original = Shop(active, source_seed=source_seed)
+        self.snapshot = folder / "pristine"
+        # No hard links: tests can change even Git object bytes or modes.
+        shutil.copytree(active, self.snapshot, symlinks=True)
+        self.failures_before = None
+        self.retained_count = 0
+        self.nodeid = None
+
+    def preserve_if_failed(self, testsfailed):
+        active = self.original.tmp
+        failed = self.failures_before is not None and testsfailed > self.failures_before
+        if not active.exists():
+            return
+        metadata = {"nodeid": self.nodeid, "time": time.time()}
+        if failed:
+            metadata["reason"] = "failure count rose"
+        else:
+            marker = None
+            try:
+                # RF-36 dot-markers deliberately exclude ordinary product names like evidence.
+                pending = [active]
+                while pending:
+                    folder = pending.pop()
+                    # A 0400 directory can be listed but cannot be searched, even when empty.
+                    os.stat(os.path.join(folder, "."))
+                    with os.scandir(folder) as entries:
+                        for entry in entries:
+                            if entry.name.lower() in (".keep", ".retain"):
+                                marker = entry.name
+                            # Keep classification errors outside os.walk's silent fallback.
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(entry.path)
+            except OSError as error:
+                metadata.update(reason="discovery error", error={"type": type(error).__name__, "errno": error.errno})
+            else:
+                if marker is None:
+                    return  # Only a completed, marker-free traversal permits deletion.
+                metadata.update(reason="marker present", marker=marker)
+        destination = self.snapshot.parent / ("retained-%d" % (self.retained_count + 1))
+        sidecar = destination.with_suffix(".json")
+        if any(path.exists() or path.is_symlink() for path in (destination, sidecar)):
+            raise FileExistsError(errno.EEXIST, "retained Shop destination already exists")
+        # Rename preserves even read-only modes, links and Git metadata byte for byte.
+        active.rename(destination)
+        self.retained_count += 1
+        self.failures_before = None
+        with sidecar.open("x", encoding="utf-8") as stream:
+            json.dump(metadata, stream)
+            stream.write("\n")
+
+    def restore(self, *, nodeid, copy_tree=shutil.copytree, testsfailed=0):
+        # This also catches a teardown error reported after the fixture's own teardown.
+        self.preserve_if_failed(testsfailed)
+        active = self.original.tmp
+        if active.exists():
+            remove_tree(active)
+        self.failures_before = testsfailed
+        self.nodeid = nodeid
+        # A failed copy raises; the next request discards its partial destination.
+        copy_tree(self.snapshot, active, symlinks=True)
+        return copy.deepcopy(self.original)
+
+
+def worker_shop(tmp_path_factory, request, *, copy_tree=shutil.copytree):
+    session = request.session
+    if _WORKER_SHOP not in session.stash:
+        worker = getattr(request.config, "workerinput", {}).get("workerid", "main")
+        folder = tmp_path_factory.mktemp("jobs-shop-" + worker)
+        seed = provision_fixtures.worker_source_seed(tmp_path_factory, request)
+        session.stash[_WORKER_SHOP] = PristineShop(folder, seed)
+    return session.stash[_WORKER_SHOP].restore(nodeid=request.node.nodeid, copy_tree=copy_tree,
+                                             testsfailed=getattr(session, "testsfailed", 0))
+
+
+def build_fresh_shop(tmp_path, tmp_path_factory, request):
     return Shop(tmp_path, source_seed=provision_fixtures.worker_source_seed(tmp_path_factory, request))
 
 
-@pytest.mark.parametrize("fixture", ["shop", "kind_shop"])
+@pytest.fixture
+def fresh_shop(tmp_path, tmp_path_factory, request):
+    return build_fresh_shop(tmp_path, tmp_path_factory, request)
+
+
+@pytest.fixture
+def shop(tmp_path_factory, request):
+    if getattr(request, "param", None) == "fresh":
+        yield build_fresh_shop(request.getfixturevalue("tmp_path"), tmp_path_factory, request)
+        return
+    # Preserve on the next checkout, after every fixture teardown has finished.
+    yield worker_shop(tmp_path_factory, request)
+
+
+def shop_image(folder):
+    """Compare all private fixture bytes and modes, including untracked Git metadata."""
+    image = {".": folder.stat().st_mode}
+    for path in sorted(folder.rglob("*")):
+        name = path.relative_to(folder).as_posix()
+        if path.is_symlink():
+            image[name] = (path.lstat().st_mode, os.readlink(path))
+        elif path.is_dir():
+            image[name] = path.stat().st_mode
+        else:
+            image[name] = (path.stat().st_mode, hashlib.sha256(path.read_bytes()).hexdigest())
+    return image
+
+
+def test_rf36_next_case_restores_every_shop_byte_mode_and_python_value(tmp_path_factory, request):
+    first = worker_shop(tmp_path_factory, request)
+    before = shop_image(first.tmp)
+    original_head = first.head()
+    original_recipes = json.loads(first.recipes_path.read_text())
+    first.request_job("rf36-dirty", "touch")
+    first.run_open()
+    first.add_role("pilot/lane/f2")
+    first.workspace.register("another")
+    first.workspace.run("update", {"initiative": "pilot", "lanes": ["rf36-mutated"], "source": "owner"})
+    (first.base / "team.json").write_text("case-local team record\n")
+    for repository in (first.checkout, first.source):
+        (repository / "dirty").write_text("new commit\n")
+        git(repository, "add", "dirty")
+        git(repository, "commit", "-qm", "fixture mutation")
+        git(repository, "update-ref", "refs/heads/extra", "HEAD")
+        git(repository, "worktree", "add", "-qb", "linked", str(first.tmp / (repository.name + "-linked")))
+        git(repository, "checkout", "-q", "--detach")
+        (repository / "staged").write_text("index mutation\n")
+        git(repository, "add", "staged")
+    symlink_or_skip(first.recipes_path, first.tmp / "linked-recipes")
+    first.recipes["recipes"].clear()
+    first.save_recipes()
+    first.orchestrator.clear()
+    first.recipes_path.chmod(0o400)
+    first.checkout.chmod(0o500)
+    first.tmp.chmod(0o500)
+
+    second = worker_shop(tmp_path_factory, request)
+    assert second is not first and second.tmp == first.tmp
+    assert shop_image(second.tmp) == before
+    assert second.head() == original_head
+    assert second.recipes == original_recipes and second.orchestrator
+    assert second.open_jobs() == [] and not second.sentinel.exists()
+    # A repeated restore must remain pristine after readers refresh Git's index.
+    third = worker_shop(tmp_path_factory, request)
+    assert shop_image(third.tmp) == before
+
+
+def test_rf36_partial_restore_fails_loudly_and_the_next_case_recovers(tmp_path_factory, request):
+    first = worker_shop(tmp_path_factory, request)
+    before = shop_image(first.tmp)
+    def partial_copy(source, destination, **options):
+        Path(destination).mkdir()
+        (Path(destination) / "partial").write_text("incomplete restore")
+        raise OSError(errno.ENOSPC, "rf36 restore full")
+
+    with pytest.raises(OSError, match="rf36 restore full") as failure:
+        worker_shop(tmp_path_factory, request, copy_tree=partial_copy)
+    assert failure.value.errno == errno.ENOSPC
+    restored = worker_shop(tmp_path_factory, request)
+    assert restored.tmp == first.tmp and shop_image(restored.tmp) == before
+
+
+def test_rf36_worker_stashes_restore_concurrently_without_sharing_paths(tmp_path_factory, request):
+    # Model two independent pytest worker sessions, including reused worker ids.
+    sessions = [SimpleNamespace(stash=pytest.Stash(), addfinalizer=request.session.addfinalizer) for _ in range(2)]
+    requests = [SimpleNamespace(session=session, config=request.config, node=request.node) for session in sessions]
+    try:
+        shops = [worker_shop(tmp_path_factory, item) for item in requests]
+        images = [shop_image(item.tmp) for item in shops]
+        assert shops[0].tmp != shops[1].tmp
+        assert all(tmp_path_factory.getbasetemp() in item.tmp.parents for item in shops)
+        for item in shops:
+            item.sentinel.write_text("private mutation")
+            (item.tmp / ".keep").touch()
+        retained_images = [shop_image(item.tmp) for item in shops]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            restored = list(pool.map(lambda item: worker_shop(tmp_path_factory, item), requests))
+        assert [shop_image(item.tmp) for item in restored] == images
+        assert [shop_image(item.tmp.parent / "retained-1") for item in restored] == retained_images
+        for item in restored:
+            metadata = json.loads((item.tmp.parent / "retained-1.json").read_text())
+            assert metadata["nodeid"] == request.node.nodeid
+            assert metadata["reason"] == "marker present"
+    finally:
+        for session in sessions:
+            if _WORKER_SHOP in session.stash:
+                remove_tree(session.stash[_WORKER_SHOP].snapshot.parent)
+
+
+def test_rf36_fixture_restores_between_two_actual_pytest_cases(tmp_path):
+    try:
+        suite = tmp_path / "test_shop_isolation.py"
+        suite.write_text(
+            "from tests.integration.test_hierarchy_jobs import shop, shop_image\n"
+            "seen = []\n"
+            "def test_first(shop):\n"
+            "    seen.append((shop.tmp, shop_image(shop.tmp)))\n"
+            "    shop.sentinel.write_text('previous case')\n"
+            "    shop.recipes.clear()\n"
+            "def test_second(shop):\n"
+            "    path, image = seen[0]\n"
+            "    assert shop.tmp == path and shop_image(shop.tmp) == image\n"
+            "    assert shop.recipes and not shop.sentinel.exists()\n", encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "pytest", str(suite), "-n", "0", "-q",
+                                 "-c", str(ROOT / "pyproject.toml"),
+                                 "--confcutdir", str(tmp_path), "--basetemp", str(tmp_path / "nested"),
+                                 "-o", "tmp_path_retention_policy=failed"],
+                                cwd=ROOT, capture_output=True, text=True, timeout=90)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "2 passed" in result.stdout
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+@pytest.mark.parametrize("fixture", ["shop", "kind_shop", "fresh_shop"])
 def test_rf42_job_fixtures_reuse_the_worker_source_seed(tmp_path_factory, request, monkeypatch, fixture):
     seed = provision_fixtures.worker_source_seed(tmp_path_factory, request)
 
@@ -185,6 +403,270 @@ def test_rf42_job_fixtures_reuse_the_worker_source_seed(tmp_path_factory, reques
     monkeypatch.setattr(provision_fixtures, "build_source", refuse_rebuild)
     built = request.getfixturevalue(fixture)
     assert git(built.source, "rev-parse", "HEAD") == git(seed, "rev-parse", "HEAD")
+
+
+def run_shop_cases(tmp_path, source):
+    suite = tmp_path / "test_shop_cases.py"
+    suite.write_text(source, encoding="utf-8")
+    return subprocess.run([sys.executable, "-m", "pytest", str(suite), "-n", "0", "-q",
+                           "-c", str(ROOT / "pyproject.toml"),
+                           "--confcutdir", str(tmp_path), "--basetemp", str(tmp_path / "nested"),
+                           "-o", "tmp_path_retention_policy=failed"],
+                          cwd=ROOT, capture_output=True, text=True, timeout=120)
+
+
+@pytest.mark.parametrize("module,fixture", [
+    ("jobs", "shop"), ("jobs", "kind_shop"), ("jobs_census_policy", "policy_shop")])
+@pytest.mark.parametrize("marker", [".keep", None])
+@pytest.mark.parametrize("mode", [0o111, 0o400], ids=["unlistable", "unsearchable"])
+def test_rf36_passing_case_with_unreadable_ancestor_is_retained(tmp_path, module, fixture, marker, mode):
+    # Probe actual enumeration permissions: root and some filesystems ignore these mode bits.
+    probe = tmp_path / "unreadable-probe"
+    probe.mkdir()
+    try:
+        probe.chmod(mode)
+        try:
+            with os.scandir(probe) as entries:
+                list(entries)
+            os.stat(os.path.join(probe, "."))
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("chmod is ineffective: restricted ancestor remains listable and searchable")
+    finally:
+        probe.chmod(0o700)
+    try:
+        result = run_shop_cases(tmp_path,
+            "from tests.integration.test_hierarchy_%s import %s\n" % (module, fixture) +
+            "seen = []\n"
+            "def test_first(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    ancestor = shop.checkout / 'src'\n"
+            "    (ancestor / 'evidence.txt').write_text('passing case evidence')\n"
+            "    marker = %r\n" % marker +
+            "    if marker: (ancestor / marker).touch()\n"
+            "    ancestor.chmod(%r)\n" % mode +
+            "    seen.append(shop.tmp)\n"
+            "def test_second(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    retained = seen[0].parent / 'retained-1'\n"
+            "    assert retained.is_dir(), 'incomplete discovery must retain evidence'\n"
+            "    ancestor = retained / 'checkout/src'\n"
+            "    assert ancestor.stat().st_mode & 0o777 == %r\n" % mode +
+            "    ancestor.chmod(0o700)\n"
+            "    assert (ancestor / 'evidence.txt').read_text() == 'passing case evidence'\n"
+            "    assert not (shop.checkout / 'src/evidence.txt').exists()\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "2 passed" in result.stdout
+        sidecars = list((tmp_path / "nested").glob("jobs-shop-main[0-9]*/retained-1.json"))
+        assert len(sidecars) == 1
+        metadata = json.loads(sidecars[0].read_text())
+        assert metadata["nodeid"].endswith("::test_first")
+        assert metadata["reason"] == "discovery error"
+        assert metadata["error"] == {"type": "PermissionError", "errno": errno.EACCES}
+        assert isinstance(metadata["time"], (int, float))
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+@pytest.mark.parametrize("module,fixture", [
+    ("jobs", "shop"), ("jobs", "kind_shop"), ("jobs_census_policy", "policy_shop")])
+@pytest.mark.parametrize("marker", [".keep", ".retain", ".KEEP", ".ReTaIn"])
+def test_rf36_dot_markers_retain_passing_case(tmp_path, module, fixture, marker):
+    try:
+        result = run_shop_cases(tmp_path,
+            "from tests.integration.test_hierarchy_%s import %s\n" % (module, fixture) +
+            "seen = []\n"
+            "def test_first(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    (shop.checkout / 'src' / %r).touch()\n" % marker +
+            "    seen.append(shop.tmp)\n"
+            "def test_second(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    assert (seen[0].parent / 'retained-1/checkout/src' / %r).exists()\n" % marker +
+            "    assert not (shop.checkout / 'src' / %r).exists()\n" % marker)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "2 passed" in result.stdout
+        sidecars = list((tmp_path / "nested").glob("jobs-shop-main[0-9]*/retained-1.json"))
+        assert len(sidecars) == 1
+        metadata = json.loads(sidecars[0].read_text())
+        assert metadata["nodeid"].endswith("::test_first")
+        assert metadata["reason"] == "marker present"
+        assert metadata["marker"].lower() == marker.lower()
+        assert isinstance(metadata["time"], (int, float))
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+@pytest.mark.parametrize("module,fixture", [
+    ("jobs", "shop"), ("jobs", "kind_shop"), ("jobs_census_policy", "policy_shop")])
+def test_rf36_product_evidence_and_bare_keep_names_do_not_retain_passing_cases(tmp_path, module, fixture):
+    try:
+        result = run_shop_cases(tmp_path,
+            "from tests.integration.test_hierarchy_%s import %s\n" % (module, fixture) +
+            "seen = []\n"
+            "def test_first(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    script = \"from pathlib import Path; import sys; p = Path(sys.argv[1]); p.mkdir(); (p / 'report.txt').write_text('kept')\"\n"
+            "    shop.recipes['recipes']['keeps'] = shop.command(['$python', '-c', script, '$scratch'], keep=['run/report.txt'])\n"
+            "    shop.save_recipes()\n"
+            "    shop.request_job('ordinary-evidence', 'keeps')\n"
+            "    shop.run_open()\n"
+            "    evidence = shop.workspace.store / 'jobs/pilot/ordinary-evidence/evidence/run/report.txt'\n"
+            "    assert evidence.read_text() == 'kept'\n"
+            "    for name in ('keep', 'KEEP', 'evidence', 'EvIdEnCe'): (shop.checkout / 'src' / name).touch()\n"
+            "    seen.append(shop.tmp)\n"
+            "def test_second(%s):\n" % fixture +
+            "    shop = %s\n" % fixture +
+            "    assert not list(seen[0].parent.glob('retained-*')), 'ordinary product names must not retain a passing Shop'\n"
+            "    assert not (shop.workspace.store / 'jobs/pilot/ordinary-evidence').exists()\n"
+            "    for name in ('keep', 'KEEP', 'evidence', 'EvIdEnCe'): assert not (shop.checkout / 'src' / name).exists()\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "2 passed" in result.stdout
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+@pytest.mark.parametrize("failure", ["call", "teardown", "teardown_write", "keep", "nested_keep"])
+def test_rf36_retains_failed_case_evidence_before_the_next_case(tmp_path, failure):
+    try:
+        result = run_shop_cases(tmp_path,
+            "import pytest\n"
+            "from tests.integration.test_hierarchy_jobs import shop, shop_image, git\n"
+            "seen = []\n"
+            "failure = %r\n" % failure +
+            "@pytest.fixture\n"
+            "def earlier():\n"
+            "    yield\n"
+            "    if failure == 'teardown_write':\n"
+            "        active, pristine, dirty = seen[0]\n"
+            "        active.chmod(0o700)\n"
+            "        (active / 'teardown.log').write_text('last teardown evidence')\n"
+            "        active.chmod(0o500)\n"
+            "        seen[0] = active, pristine, shop_image(active)\n"
+            "@pytest.fixture\n"
+            "def finish():\n"
+            "    yield\n"
+            "    if failure == 'teardown': pytest.fail('intentional teardown failure')\n"
+            "def test_first(earlier, shop, finish):\n"
+            "    pristine = shop_image(shop.tmp)\n"
+            "    shop.request_job('retain-evidence', 'touch')\n"
+            "    shop.run_open()\n"
+            "    (shop.checkout / 'src/app.py').write_text('failed case edit\\n')\n"
+            "    git(shop.checkout, 'add', 'src/app.py')\n"
+            "    (shop.base / 'team.json').write_text('failed case record')\n"
+            "    if failure == 'keep': (shop.tmp / '.keep').touch()\n"
+            "    if failure == 'nested_keep': (shop.checkout / 'src/.keep').touch()\n"
+            "    shop.recipes_path.chmod(0o400)\n"
+            "    shop.tmp.chmod(0o500)\n"
+            "    seen.append((shop.tmp, pristine, shop_image(shop.tmp)))\n"
+            "    if failure in ('call', 'teardown_write'): pytest.fail('intentional call failure')\n"
+            "def test_second(shop):\n"
+            "    active, pristine, dirty = seen[0]\n"
+            "    retained = [p for p in active.parent.glob('retained-*') if p.is_dir()]\n"
+            "    assert len(retained) == 1\n"
+            "    assert shop_image(retained[0]) == dirty\n"
+            "    assert (retained[0] / 'recipe-ran').read_text() == 'ran\\n'\n"
+            "    assert shop.tmp == active and shop_image(shop.tmp) == pristine\n")
+        expected = "1 failed, 1 passed" if failure in ("call", "teardown_write") else "2 passed"
+        assert result.returncode == (0 if failure in ("keep", "nested_keep") else 1), result.stdout + result.stderr
+        assert expected in result.stdout, result.stdout + result.stderr
+        assert ("error" in result.stdout.strip().splitlines()[-1]) == (failure == "teardown"), result.stdout
+        retained = [path for path in (tmp_path / "nested").glob("jobs-shop-main*/retained-*")
+                    if not path.parent.is_symlink() and path.is_dir()]
+        assert len(retained) == 1
+        assert (retained[0] / "recipe-ran").read_text() == "ran\n"
+        metadata = json.loads(retained[0].with_suffix(".json").read_text())
+        assert metadata["nodeid"].endswith("::test_first")
+        assert metadata["reason"] == ("marker present" if failure in ("keep", "nested_keep") else "failure count rose")
+        assert isinstance(metadata["time"], (int, float))
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+def test_rf36_retention_names_the_shop_owner_after_an_unrelated_failure(tmp_path):
+    try:
+        result = run_shop_cases(tmp_path,
+            "import json, pytest\n"
+            "from tests.integration.test_hierarchy_jobs import shop\n"
+            "seen = []\n"
+            "def test_first(shop, request):\n"
+            "    seen.append((shop.tmp, request.node.nodeid))\n"
+            "    shop.sentinel.write_text('passing owner')\n"
+            "def test_unrelated():\n"
+            "    pytest.fail('unrelated case failure')\n"
+            "def test_second(shop):\n"
+            "    active, owner = seen[0]\n"
+            "    metadata = json.loads((active.parent / 'retained-1.json').read_text())\n"
+            "    assert metadata['nodeid'] == owner\n"
+            "    assert metadata['reason'] == 'failure count rose'\n"
+            "    assert (active.parent / 'retained-1/recipe-ran').read_text() == 'passing owner'\n"
+            "    assert not shop.sentinel.exists()\n"
+            "def test_third(shop):\n"
+            "    assert not (shop.tmp.parent / 'retained-2').exists()\n")
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "1 failed, 3 passed" in result.stdout
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
+
+
+@pytest.mark.parametrize("collision", ["tree", "sidecar"])
+def test_rf36_retention_collision_refuses_before_deleting_evidence_and_can_retry(tmp_path_factory, request, collision):
+    session = SimpleNamespace(stash=pytest.Stash(), addfinalizer=request.session.addfinalizer, testsfailed=0)
+    isolated = SimpleNamespace(session=session, config=request.config, node=request.node)
+    try:
+        built = worker_shop(tmp_path_factory, isolated)
+        built.sentinel.write_text("failure evidence")
+        (built.tmp / ".keep").touch()
+        before = shop_image(built.tmp)
+        destination = built.tmp.parent / "retained-1"
+        if collision == "tree":
+            destination.mkdir()
+        obstacle = destination / "existing" if collision == "tree" else destination.with_suffix(".json")
+        obstacle.write_text("earlier evidence")
+        with pytest.raises(FileExistsError, match="retained Shop destination already exists") as failure:
+            worker_shop(tmp_path_factory, isolated)
+        assert failure.value.errno == errno.EEXIST
+        assert shop_image(built.tmp) == before
+        assert obstacle.read_text() == "earlier evidence"
+        obstacle.unlink()
+        if collision == "tree":
+            destination.rmdir()
+        restored = worker_shop(tmp_path_factory, isolated)
+        assert restored.tmp == built.tmp and not restored.sentinel.exists()
+        assert shop_image(destination) == before
+    finally:
+        if _WORKER_SHOP in session.stash:
+            remove_tree(session.stash[_WORKER_SHOP].snapshot.parent)
+
+
+@pytest.mark.parametrize("module,fixture", [
+    ("jobs", "shop"), ("jobs", "kind_shop"),
+    ("jobs_census_policy", "shop"), ("jobs_census_policy", "policy_shop"),
+    ("recovery", "shop"), ("job_dependencies", "shop"), ("job_results", "shop"),
+    ("jobs_derive", "shop"), ("git_reads", "shop")])
+def test_rf36_fresh_optout_resolves_in_every_using_module(tmp_path, module, fixture):
+    try:
+        source = (
+            "import pytest\n"
+            "from tests.integration import test_hierarchy_%s as fixtures\n"
+            "%s = fixtures.%s\n"
+            "if hasattr(fixtures, 'fresh_shop'): fresh_shop = fixtures.fresh_shop\n"
+            "@pytest.mark.parametrize(%r, ['fresh'], indirect=True)\n"
+            "def test_fresh(%s, tmp_path):\n"
+            "    assert %s.tmp == tmp_path\n"
+            "    assert not %s.sentinel.exists()\n" % (module, fixture, fixture, fixture, fixture, fixture, fixture))
+        result = run_shop_cases(tmp_path, source)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "1 passed" in result.stdout
+    finally:
+        if (tmp_path / "nested").exists():
+            remove_tree(tmp_path / "nested")
 
 
 def verified_evidence(receipt):
@@ -599,11 +1081,7 @@ JOB_HOLDER = "job:pilot/job-1"
 OTHER_KIND_CASES = [("heavy", "writer"), ("heavy", "heavy-tests"), ("heavy-tests", "writer"), ("heavy-tests", "heavy")]
 
 
-@pytest.fixture
-def kind_shop(tmp_path_factory, request):
-    # A fresh, uniquely named store per case; nothing is keyed to a reusable path.
-    return Shop(tmp_path_factory.mktemp("jobs-kind-" + uuid.uuid4().hex),
-                source_seed=provision_fixtures.worker_source_seed(tmp_path_factory, request))
+kind_shop = shop
 
 
 def request_kind_job(shop, kind):
@@ -897,6 +1375,7 @@ def live_claim(jobs, pid, job_id):
             "process_scope": jobs.process_scope(), "recipes_sha256": None}
 
 
+@pytest.mark.parametrize("kind_shop", ["fresh"], indirect=True)
 @pytest.mark.parametrize("row_kind", ["heavy", "heavy-tests"])
 @pytest.mark.parametrize("case", sorted(CENSUS_EXEMPTION_CASES))
 def test_only_a_canonical_own_initiative_grant_exempts_a_live_process_from_the_real_census(kind_shop, case, row_kind):
@@ -1958,6 +2437,7 @@ def test_job_execution_reuses_its_locked_ledger_snapshot(kind_shop, monkeypatch,
     assert reads == ["unlocked replay"] * (1 + count), "initial admission and each terminal settlement only"
 
 
+@pytest.mark.parametrize("kind_shop", ["fresh"], indirect=True)
 @pytest.mark.parametrize("record_state", ["missing", "stale", "live"])
 def test_a_census_exemption_needs_the_jobs_recorded_process_birth(kind_shop, record_state):
     shop = kind_shop
@@ -1988,6 +2468,7 @@ def test_a_census_exemption_needs_the_jobs_recorded_process_birth(kind_shop, rec
             assert finished(child)
 
 
+@pytest.mark.parametrize("kind_shop", ["fresh"], indirect=True)
 def test_a_retained_heavy_claim_cannot_exempt_the_runners_next_heavy_tests_job(kind_shop, monkeypatch, capsys):
     from contextlib import contextmanager
 
@@ -2129,6 +2610,7 @@ def test_a_failed_derived_admission_preserves_its_partial_claim_custody(kind_sho
     assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
 
 
+@pytest.mark.parametrize("kind_shop", ["fresh"], indirect=True)
 def test_a_running_heavy_tests_pytest_step_blocks_a_heavy_grant(kind_shop, capsys):
     shop = kind_shop
     shop.workspace.run("set-limits", {"source": "owner test", "heavy_limit": 1})
@@ -2182,6 +2664,7 @@ def test_a_running_heavy_tests_pytest_step_blocks_a_heavy_grant(kind_shop, capsy
                     pass
 
 
+@pytest.mark.parametrize("kind_shop", ["fresh"], indirect=True)
 @pytest.mark.parametrize("heavy", [False, True], ids=["light", "heavy"])
 @pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
 def test_a_preclaim_mailbox_error_does_not_adopt_another_runners_fence(kind_shop, monkeypatch, capsys, heavy, planned):
@@ -2450,6 +2933,7 @@ def test_a_census_fixture_names_only_known_kinds(shop):
     assert "census fixture kind" in refused["error"]
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_the_real_census_finds_outside_heavy_processes(shop, tmp_path):
     children = []
     try:
@@ -2486,6 +2970,7 @@ def peak(log):
     return most
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_concurrent_runners_never_exceed_the_combined_cap(shop, tmp_path):
     """The census takes time. If it ran outside the grant lock, runners that counted at once would all see room."""
     log = tmp_path / "spans.log"
@@ -2551,6 +3036,7 @@ def test_only_a_chosen_initiative_runs(shop):
     assert not shop.sentinel.exists()
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_job_past_its_timeout_is_stopped_with_its_children(shop, tmp_path):
     pid_file = tmp_path / "child-pid"
     script = ("import subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
@@ -2567,6 +3053,7 @@ def test_a_job_past_its_timeout_is_stopped_with_its_children(shop, tmp_path):
     assert finished(int(pid_file.read_text()))
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_process_left_behind_is_stopped_and_recorded(shop, tmp_path):
     pid_file = tmp_path / "left-behind"
     script = ("import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
@@ -2723,6 +3210,7 @@ def test_a_step_can_name_the_job_cargo_target_folder(shop):
     assert "target %r %s" % (["--target-dir", folder], folder) in log
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_clean_refuses_a_job_that_has_not_finished(shop, tmp_path):
     assert "no job here" in shop.jobs("clean", "--job", "pilot/job-1", expect=2)["error"]
     assert "invalid job" in shop.jobs("clean", "--job", "../../etc", expect=2)["error"]
@@ -2787,6 +3275,7 @@ def start_stuck_job(shop, tmp_path):
     return runner
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_clean_finished_frees_every_finished_job_of_an_initiative_and_skips_running_ones(shop, tmp_path):
     shop.recipes["recipes"]["works"] = shop.command(["$python", "-c", MAKES_WORK + "sys.exit(4)\n"])
     shop.save_recipes()
@@ -2815,6 +3304,7 @@ def test_clean_finished_frees_every_finished_job_of_an_initiative_and_skips_runn
     assert "initiative" in shop.jobs("clean", "--initiative", "../x", "--finished", expect=2)["error"]
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_running_job_is_reported_and_not_started_again(shop, tmp_path):
     runner = start_stuck_job(shop, tmp_path)
     group = None
@@ -2841,6 +3331,7 @@ def processes_with(marker):
     return found
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_step_whose_process_record_cannot_be_written_is_stopped_before_its_slot_is_freed(shop):
     marker = "marker-" + uuid.uuid4().hex
     folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
@@ -2864,6 +3355,7 @@ def test_a_step_whose_process_record_cannot_be_written_is_stopped_before_its_slo
             os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_resolve_needs_a_confirmation_when_no_process_was_ever_recorded(shop, tmp_path):
     runner = start_stuck_job(shop, tmp_path)
     group = shop.run_open(expect=3)["rows"][0]["process_group"]
@@ -2888,6 +3380,7 @@ def test_resolve_needs_a_confirmation_when_no_process_was_ever_recorded(shop, tm
     assert recorded(shop)["recipes_sha256"] is None
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_runner_that_dies_leaves_a_clear_unknown_and_keeps_the_slot_until_root_resolves_it(shop, tmp_path):
     runner = start_stuck_job(shop, tmp_path)
     os.killpg(runner.pid, signal.SIGKILL)
@@ -2983,6 +3476,7 @@ def assert_held_until_root_confirms(shop, marker):
     assert "already finished" in again["error"] and release_count(shop) == 1
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_runner_lost_between_a_later_launch_and_its_record_keeps_the_slot_until_root_confirms(shop):
     marker = "marker-" + uuid.uuid4().hex
     folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
@@ -3000,6 +3494,7 @@ def test_a_runner_lost_between_a_later_launch_and_its_record_keeps_the_slot_unti
             os.kill(pid, signal.SIGKILL)
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 def test_a_later_step_whose_record_fails_and_whose_stop_is_lost_keeps_the_slot_until_root_confirms(shop):
     marker = "marker-" + uuid.uuid4().hex
     folder = shop.workspace.store / "jobs" / "pilot" / "job-1"
@@ -3434,6 +3929,7 @@ ORPHAN = ("import subprocess, sys, time\n"
           "print('started', flush=True)\ntime.sleep(60)\n")
 
 
+@pytest.mark.parametrize("shop", ["fresh"], indirect=True)
 @needs_bubblewrap
 def test_a_sandboxed_step_past_its_timeout_takes_its_own_sessions_with_it(shop):
     """The stop at the end of a step reaches the step's group. A child that called setsid left that group, so only
@@ -4626,6 +5122,7 @@ def test_a_clean_test_job_never_runs_code_outside_its_commit(shop, case, sandbox
 
 def remove_tree(folder):
     """The export's folders are read-only, so they are made writable before the removal."""
+    os.chmod(folder, 0o700)
     for current, folders, _ in os.walk(folder):
         for child in folders:
             if not os.path.islink(os.path.join(current, child)):
