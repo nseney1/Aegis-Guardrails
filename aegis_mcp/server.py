@@ -42,7 +42,7 @@ from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESS
 from aegis_mcp.handlers.msg import message_result
 from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
 from .stdio_reader import FrameError, MANAGER_MAX_BYTES, REPOSITORY_MAX_BYTES, input_stream, read_frame
-from .tools import SERVER_INJECTED, model_argument_refusal, execute_tool, is_known_tool
+from .tools import SERVER_INJECTED, model_argument_refusal, queue_argument_refusal, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
 # client might still send. A client value is dropped before dispatch, so the workspace, the
@@ -346,6 +346,50 @@ def _model_repository_call(req_id, params, name, args):
         return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
 
 
+def _queue_refusal(req_id, reason):
+    from aegis_core import team_queue
+
+    result = team_queue.refusal(reason, verb="list")
+    result["error"] = result["reason"]
+    return _json_tool_result(req_id, result, True)
+
+
+def _queue_repository_call(req_id, params):
+    # Validate the original client object before reserved keys are stripped or
+    # any key can influence workspace discovery. Binding diagnostics stay private.
+    args = params.get("arguments", {})
+    invalid = queue_argument_refusal(args)
+    if invalid is not None:
+        return _json_tool_result(req_id, invalid, True)
+    if _workspace_error is not None:
+        return _queue_refusal(req_id, "queue_io_unavailable")
+    try:
+        return _repository_call(req_id, params, "aegis_team_queue", args)
+    except Exception:
+        return _queue_refusal(req_id, "queue_io_unavailable")
+
+
+def _client_tool_result(req_id, params):
+    """Apply tool-specific client boundaries before generic workspace binding."""
+    if isinstance(params, dict) and params.get("name") == "aegis_team_queue":
+        return _queue_repository_call(req_id, params)
+    model_refusal = _model_request_refusal(req_id, params)
+    if model_refusal is not None:
+        return model_refusal
+    if isinstance(params, dict) and params.get("name") == "aegis_team_config":
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or supplied):
+            # The empty client schema applies before reserved keys can be stripped.
+            result = execute_tool("aegis_team_config", supplied, client_arguments=True)
+            return _tool_result(req_id, json.dumps(result), True)
+    if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or
+                                     any(k not in TOOL_ARGUMENTS[params["name"]] for k in supplied)):
+            return _message_refusal(req_id, "E_FORMAT")
+    return None
+
+
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
@@ -402,20 +446,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _manager_config is not None:
         return _manager_call(req_id, params)
 
-    model_refusal = _model_request_refusal(req_id, params)
-    if model_refusal is not None:
-        return model_refusal
-    if isinstance(params, dict) and params.get("name") == "aegis_team_config":
-        supplied = params.get("arguments")
-        if supplied is not None and (not isinstance(supplied, dict) or supplied):
-            # The empty client schema applies before reserved keys can be stripped.
-            result = execute_tool("aegis_team_config", supplied, client_arguments=True)
-            return _tool_result(req_id, json.dumps(result), True)
-    if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
-        supplied = params.get("arguments")
-        if supplied is not None and (not isinstance(supplied, dict) or
-                                     any(k not in TOOL_ARGUMENTS[params["name"]] for k in supplied)):
-            return _message_refusal(req_id, "E_FORMAT")
+    client_result = _client_tool_result(req_id, params)
+    if client_result is not None:
+        return client_result
     if _workspace_error is not None:
         if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
             return _message_refusal(req_id, "E_AUTH", detail="binding",
@@ -458,6 +491,8 @@ def _repository_call(req_id, params, name, args):
     elif binding.status == "unbound" and name == "aegis_scan":
         args["_unbound"] = binding.reason
     else:
+        if name == "aegis_team_queue":
+            return _queue_refusal(req_id, "queue_io_unavailable")
         if name == "aegis_team_model":
             return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):
@@ -473,6 +508,8 @@ def _repository_call(req_id, params, name, args):
         with contextlib.redirect_stdout(sys.stderr):
             result = execute_tool(name, args)
     except Exception as exc:
+        if name == "aegis_team_queue":
+            return _queue_refusal(req_id, "queue_io_unavailable")
         if name == "aegis_team_model":
             return _tool_result(req_id, json.dumps({"error": "model_io_unavailable"}), True)
         if name in ("aegis_msg_read", "aegis_msg_write"):

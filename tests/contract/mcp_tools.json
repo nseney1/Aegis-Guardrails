@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "aegis_team_model",
-      "description": "Select a model inside the workspace with the same JSON as aegis team model; record opts into atomic history publication. Uses the model-selection core without launching a host.",
+      "description": "Select via `aegis team model` with the same JSON; no host launch. Record opts into atomic history; otherwise preview.",
       "annotations": {
         "readOnlyHint": false,
         "title": "Team Model"
@@ -12,19 +12,19 @@
         "properties": {
           "bindings": {
             "type": "string",
-            "description": "Bindings JSON path inside the workspace; bounded regular file, no symlinks."
+            "description": "Workspace bindings JSON; bounded regular file, no symlinks."
           },
           "policy": {
             "type": "string",
-            "description": "Team policy JSON path inside the workspace; bounded regular file, no symlinks."
+            "description": "Workspace team policy JSON; bounded regular file, no symlinks."
           },
           "history": {
             "type": "string",
-            "description": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history."
+            "description": "Workspace decision JSONL in an existing owner-only directory; absent log is empty."
           },
           "task_kind": {
             "type": "string",
-            "description": "Task kind T1 through T14, validated by the core."
+            "description": "Task T1 through T14."
           },
           "role_kind": {
             "type": "string",
@@ -32,7 +32,7 @@
           },
           "subject": {
             "type": "string",
-            "description": "Single-line lane/endpoint/generation identifier."
+            "description": "Single-line lane/endpoint/generation."
           },
           "host_kinds": {
             "type": "array",
@@ -41,7 +41,7 @@
             },
             "maxItems": 256,
             "minItems": 1,
-            "description": "Explicit host registry kinds; at most 256."
+            "description": "Explicit host kinds; at most 256."
           },
           "intent": {
             "type": "string",
@@ -49,21 +49,21 @@
           },
           "author_family": {
             "type": "string",
-            "description": "Known author family required for reviews; T7 binds its chosen family."
+            "description": "Required for reviews; T7 uses this known family."
           },
           "lane_family": {
             "type": "string",
-            "description": "Required for T3; writer lane family must match team_family."
+            "description": "T3: writer family must equal team_family."
           },
           "review_stage": {
             "type": "string",
             "default": "primary",
-            "description": "Primary, correctness, security, whole or second as allowed by the task."
+            "description": "Stage: primary, correctness, security, whole or second."
           },
           "record": {
             "type": "boolean",
             "default": false,
-            "description": "Atomically select and append under the history lock (60-second timeout); default preview."
+            "description": "Atomic select/append; 60-second lock timeout; default preview."
           }
         },
         "required": [
@@ -91,6 +91,37 @@
       "inputSchema": {
         "type": "object",
         "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "aegis_team_queue",
+      "description": "List queue items. Read-only.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "title": "Team Queue"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Capability filter."
+          },
+          "include_done": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include done."
+          }
+        },
         "additionalProperties": false
       }
     },
@@ -129,7 +160,7 @@
     },
     {
       "name": "aegis_report_outcome",
-      "description": "Call after verifying a change with tests or `aegis check`, naming rules from `aegis_scan`; use `aegis_capture_insight` for user corrections. With a passing `aegis check --record --tests` row for the current tree, the rules this session's scans exposed that match the diff are credited, counting once CI passes on the landing commit; without one, it writes at most one unwitnessed claim per session and tree, which earns no credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.",
+      "description": "After tests or `aegis check`, report rules from `aegis_scan`; corrections use `aegis_capture_insight`. A passing `aegis check --record --tests` row for this tree enables credit for scan-exposed rules matching the diff once CI passes on the landing commit; otherwise at most one uncredited claim per session/tree. Limit: 200 report rows per session and 5 calls per 60 seconds.",
       "annotations": {
         "readOnlyHint": false,
         "title": "Report Outcome"
@@ -204,7 +235,7 @@
     },
     {
       "name": "aegis_create_rule",
-      "description": "Builds a prompt for drafting a rule from `description`, with up to three active workspace rules (500 chars each) as examples; it writes nothing to disk. Save the result to `.aegis/rules/<type_dir>/<id>.md` as `instruction` says. Check `aegis_list_rules` for an existing rule first.",
+      "description": "Draft a rule prompt from `description` with up to three active workspace rules (500 chars each); writes nothing. Save to `.aegis/rules/<type_dir>/<id>.md` per `instruction`. First check `aegis_list_rules`.",
       "annotations": {
         "readOnlyHint": true,
         "destructiveHint": false,
@@ -244,7 +275,7 @@
     },
     {
       "name": "aegis_list_rules",
-      "description": "Lists every rule with metadata and ledger fitness (`_error` if unloadable, `_expired: true` if retired), the `stale_rules` edited since the last `aegis sync`, and non-rule files under `.aegis/rules/` (`ignored`). Records no scan or exposure: call `aegis_scan` before editing files.",
+      "description": "List rules, metadata and ledger fitness: `_error` unloadable, `_expired` retired; `stale_rules` changed since `aegis sync`; `ignored` non-rule files. No scan/exposure recorded; call `aegis_scan` before edits.",
       "annotations": {
         "readOnlyHint": true,
         "destructiveHint": false,

@@ -8,6 +8,7 @@ Setup is shared per module, per xdist worker; discovery uses a fresh stdio proce
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import os
 from pathlib import Path
@@ -365,6 +366,50 @@ def test_snapshot_covers_optional_role_tools():
 def test_snapshot_covers_planned_inbox_schema():
     inboxes = [tool for tools in snapshot_tool_lists() for tool in tools if tool["name"] == "mailbox_inbox"]
     assert any({"order", "since", "briefs"} <= tool["inputSchema"]["properties"].keys() for tool in inboxes)
+
+
+def test_opt_in_records_preserve_legacy_definitions_and_have_closed_schemas():
+    sys.path.insert(0, str(REPO / "tools"))
+    import hierarchy_mailbox_mcp as mailbox_mcp
+    legacy = mailbox_mcp.definitions()
+    adopted = mailbox_mcp.definitions(records=True)
+    assert adopted[:len(legacy)] == legacy
+    tools = {tool["name"]: tool for tool in adopted[len(legacy):]}
+    assert set(tools) == {"mailbox_publish_record", "mailbox_read_record", "mailbox_digest"}
+    for name, tool in tools.items():
+        schema = tool["inputSchema"]
+        assert schema["additionalProperties"] is False
+        assert not {"root", "store", "from", "host", "session", "meta", "spans"} & schema["properties"].keys()
+        assert tool["annotations"]["readOnlyHint"] is (name != "mailbox_publish_record")
+        assert "untrusted" in tool["description"] and "findings.*.{id,severity,file,line}" in tool["description"]
+        if name in {"mailbox_read_record", "mailbox_digest"}:
+            assert schema["properties"]["expand"] == {"type": "array", "maxItems": 64,
+                "items": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
+            assert "one level" in tool["description"]
+            assert "refs_withheld" in tool["description"] and "outline-only" in tool["description"]
+            assert "explicit refs selectors" in tool["description"]
+            if name == "mailbox_digest":
+                assert "inbox rows" in tool["description"]
+            assert schema["properties"]["outline"] == {"type": "boolean"}
+            reference = {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"}
+            if name == "mailbox_read_record":
+                assert schema["properties"]["ref"] == reference
+            else:
+                assert schema["properties"]["refs"] == {"type": "array", "maxItems": 64, "items": reference}
+
+
+def test_record_transaction_uses_the_single_pinned_publish_write_boundary():
+    source = REPO / "tools" / "hierarchy_mailbox.py"
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == "472c96ab7959f5fbcfdee2e3d3a11a78864b0eb7a708029a1e419f410825a905"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    [mailbox] = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Mailbox"]
+    [publish] = [node for node in mailbox.body if isinstance(node, ast.FunctionDef) and node.name == "publish"]
+    writes = [node for node in ast.walk(publish) if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name) and node.func.id == "publish_file"]
+    assert len(writes) == 1
+    assert [ast.unparse(argument) for argument in writes[0].args] == ["path", "raw"]
+    assert writes[0].keywords == []
+    assert publish.body[-2].value is writes[0]
 
 
 def test_profiles_cover_every_registry_role():

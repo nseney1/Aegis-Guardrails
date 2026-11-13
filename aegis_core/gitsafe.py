@@ -52,7 +52,11 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from aegis_core import atomicio, pathlookup
+from aegis_core import atomicio, pathlookup, gitsafe_run
+from aegis_core.gitsafe_run import custody_active, scrubbed
+from aegis_core.gitsafe_run import BASE_ENV as _ENV, LOCAL_ENV as _LOCAL_ENV
+from aegis_core.gitsafe_run import DEFAULT_HARDENING as _HARDENING
+from aegis_core.gitsafe_run import HARDENING_KEEP_HOOKS_PATH as _HARDENING_KEEP_HOOKS_PATH
 from aegis_core.errors import AegisError
 from aegis_core.primitives import is_within, safe_parts
 
@@ -74,6 +78,9 @@ __all__ = [
     "blob_sizes",
     "changed_files",
     "common_dir",
+    "custody",
+    "custody_active",
+    "custody_program",
     "diff_entries",
     "export_tree",
     "filter_overrides",
@@ -94,6 +101,7 @@ __all__ = [
     "read_blob",
     "read_blobs",
     "read_object",
+    "read_private_object", "private_object_headers", "read_private_objects",
     "read_ref",
     "relative_to_prefix",
     "resolve_base_ref",
@@ -118,43 +126,9 @@ MERGE_TREE_MIN_VERSION = (2, 38)
 #: The only ref hierarchy update_ref writes: never a branch, a tag or a remote ref.
 _WRITABLE_REFS = "refs/aegis/"
 _ACMR = "--diff-filter=ACMR"
-# git takes a signature's format from its armor, so a PGP or X.509 signature runs gpg.program
-# or gpg.x509.program, which repository config can set (log.showSignature makes plain ``git
-# log`` check them). Aegis checks SSH signatures only, through the gpg.ssh.program human_gate
-# pins. <devnull>, not a bare ``false``: git looks a bare name up on PATH, where a relative or
-# empty entry finds a program planted in the work tree.
-_HARDENING_KEEP_HOOKS_PATH = (
-    "-c", "core.fsmonitor=false",
-    "-c", "protocol.allow=never",
-    "-c", "core.sshCommand=false",
-    "-c", "credential.helper=",
-    "-c", "log.showSignature=false",
-    "-c", f"gpg.program={os.devnull}",
-    "-c", f"gpg.openpgp.program={os.devnull}",
-    "-c", f"gpg.x509.program={os.devnull}",
-)
-_HARDENING = ("-c", f"core.hooksPath={os.devnull}", *_HARDENING_KEEP_HOOKS_PATH)
-_ENV = {
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_NO_REPLACE_OBJECTS": "1",
-    "GIT_ALLOW_PROTOCOL": "",
-    "GIT_NO_LAZY_FETCH": "1",
-    "LC_ALL": "C",
-}
-# What ``git rev-parse --local-env-vars`` lists: each points git at another repository, index or
-# object store. Identity, SSH and the config-scope variables (how a HOME is faked) are not here.
-_LOCAL_ENV = frozenset((
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
-    "GIT_COMMON_DIR",
-))
-_SCRUB: "contextvars.ContextVar[bool]" = contextvars.ContextVar("aegis_git_scrub", default=False)
 
 
-class GitError(AegisError):
-    """git is missing, timed out, or gave an answer that cannot be trusted."""
+GitError = gitsafe_run.GitError
 
 
 class RefNameError(GitError):
@@ -192,15 +166,28 @@ def git_executable() -> str:
     # Absolute PATH entries only: an empty or relative entry names the cwd (the
     # repository, where a clone can plant a git), and so does the current directory
     # the standard library's lookup searches first on Windows.
-    key = (os.environ.get("PATH"), os.environ.get("PATHEXT"))
-    found = _GIT_FOUND.get(key)
-    if not (found and os.path.isfile(found) and os.access(found, os.X_OK)):
-        _GIT_FOUND.clear()
-        found = pathlookup.which("git")
-        if not found:
-            raise GitError("git is not installed or not on PATH")
-        _GIT_FOUND[key] = found
-    return found
+    return gitsafe_run.find_executable(_GIT_FOUND, os.environ, lambda: pathlookup.which("git"), error=GitError)
+
+
+def custody_program(cwd) -> Optional[str]:
+    """Strict custody resolves Git outside the owner-bound worktree."""
+    return pathlookup.which("git", outside=cwd)
+
+
+def lane_runner(cwd, scratch):
+    """Packaged explicit lane runner; Team constructs it only at its operation entry."""
+    return gitsafe_run.issue_runner(cwd, scratch,
+        gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable))
+
+
+@contextmanager
+def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
+            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False):
+    """Bounded custody; strict scopes receive only the packaged facade services."""
+    with gitsafe_run.custody(scratch=scratch, env=env, stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit, strict_lane=strict_lane,
+            _services=gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable)):
+        yield
 
 
 def run(
@@ -217,52 +204,17 @@ def run(
     A non-zero exit is returned, not raised. Raises GitError when git cannot be started
     or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
     """
-    argv = [git_executable(), *_hardening, *args]
-    scrub = _SCRUB.get()
-    env = {k: v for k, v in os.environ.items() if not (scrub and k.upper() in _LOCAL_ENV)}
-    env.update(_ENV)
-    if _env is not None:
-        env.update(_env)
-    try:
-        return subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            input=stdin,
-            stdin=None if stdin is not None or tty else subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
-    except OSError as exc:
-        raise GitError(f"cannot run git: {exc}") from exc
-
-
-@contextmanager
-def scrubbed() -> Iterator[None]:
-    """Inside the block (or a function decorated with ``@scrubbed()``) ``run`` drops the caller's
-    ``_LOCAL_ENV``, so evidence is about the repository at ``cwd``; ``_env`` still wins. Not the
-    default: git hands a hook its index in GIT_INDEX_FILE (and a linked worktree its GIT_DIR)."""
-    token = _SCRUB.set(True)
-    try:
-        yield
-    finally:
-        _SCRUB.reset(token)
+    return gitsafe_run.execute(args, cwd, executable=git_executable, legacy_runner=subprocess.run,
+                               error=GitError, environ=os.environ, timeout=timeout, stdin=stdin,
+                               hardening=_hardening, env=_env, tty=tty, legacy_namespace=subprocess)
 
 
 def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
                 timeout: float = GIT_TIMEOUT_SECONDS, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
     """``run`` that answers only a zero exit: git that cannot start, times out or exits non-zero raises
     ``error`` (GitError unless named), with git's stderr whitespace-collapsed and cut to 200 characters."""
-    try:
-        res = run(args, cwd, timeout=timeout, stdin=stdin)
-    except GitError as exc:
-        raise error(str(exc)) from exc
-    if res.returncode != 0:
-        raise error(f"git {args[0]} failed: {' '.join(res.stderr.decode('utf-8', 'replace').split())[:200]}")
-    return res
+    return gitsafe_run.checked(args, cwd, runner=run, error=error, git_error=GitError,
+                               timeout=timeout, stdin=stdin)
 
 
 def add_trailer(message_file: Path | str, trailer: str) -> bool:
@@ -280,24 +232,16 @@ def add_trailer(message_file: Path | str, trailer: str) -> bool:
 
 def _completed(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[subprocess.CompletedProcess]:
     """The completed call, or None (git is missing or timed out)."""
-    try:
-        return run(args, cwd, **kwargs)
-    except GitError:
-        return None
+    return gitsafe_run.completed(args, cwd, runner=run, error=GitError, **kwargs)
 
 
 def _out(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[bytes]:
     """stdout of a successful call, or None (git failed, is missing or timed out)."""
-    res = _completed(args, cwd, **kwargs)
-    return res.stdout if res is not None and res.returncode == 0 else None
+    return gitsafe_run.output(args, cwd, completed=_completed, **kwargs)
 
 
 def _text(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[str]:
-    out = _out(args, cwd, **kwargs)
-    if out is None:
-        return None
-    text = os.fsdecode(out.strip())
-    return text or None
+    return gitsafe_run.text(args, cwd, output=_out, **kwargs)
 
 
 def _z_paths(out: Optional[bytes]) -> Optional[List[str]]:
@@ -334,7 +278,7 @@ def memoized(key: Tuple[Any, ...], produce: Callable[[], Any]) -> Any:
     store = _MEMO.get()
     if store is None:
         return produce()
-    key = (_SCRUB.get(), *key)  # an answer under the caller's GIT_DIR is not the scrubbed one
+    key = (gitsafe_run.memo_context(), *key)  # private custody stores never share memo entries
     if key not in store:
         store[key] = produce()
     return store[key]
@@ -352,8 +296,11 @@ class Layout(NamedTuple):
 
 def _layout(cwd: Path | str) -> Optional[Layout]:
     try:
-        res = run(["rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"], cwd)
+        res = gitsafe_run.query_result(run(["rev-parse", "--git-common-dir", "--show-prefix",
+                                           "--is-shallow-repository", "--show-toplevel"], cwd), error=GitError)
     except GitError:
+        if custody_active():
+            raise
         return None
     # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
     lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
@@ -429,16 +376,9 @@ def git_version(cwd: Path | str) -> Optional[Tuple[int, int, int]]:
 
 
 def git_path(cwd: Path | str, name: str) -> Optional[Path]:
-    """``git rev-parse --git-path <name>`` as an absolute path (e.g. the hooks dir), or None.
-
-    This one call omits the ``core.hooksPath`` override: it asks where hooks live, and
-    rev-parse runs no hook.
-    """
-    text = _text(["rev-parse", "--git-path", name], cwd, _hardening=_HARDENING_KEEP_HOOKS_PATH)
-    if not text:
-        return None
-    path = Path(text)
-    return path if path.is_absolute() else (Path(cwd) / path).resolve()
+    """Absolute Git service path, preserving the legacy hooks-path query."""
+    return gitsafe_run.git_path(cwd, name, runner=_text,
+        hardening=_HARDENING if gitsafe_run.strict_active() else _HARDENING_KEEP_HOOKS_PATH)
 
 
 def resolve_commit(cwd: Path | str, ref: str) -> Optional[str]:
@@ -896,16 +836,7 @@ def _full_oid(value: object) -> str:
 
 
 def _hashed_blob(cwd: Path | str, data: bytes, write: bool) -> str:
-    # From stdin with no --path, hash-object applies no attribute, filter or line-ending
-    # conversion: the blob is exactly ``data``, named in the repository's hash format.
-    args = ["hash-object", *(["-w"] if write else []), "--no-filters", "--stdin"]
-    out = _out(args, cwd, stdin=bytes(data))
-    oid = (out or b"").strip().decode("ascii", "replace")
-    if not _OID.match(oid):
-        raise GitError(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
-    if blob_id(bytes(data), len(oid)) != oid:
-        raise GitError(f"git named the blob {oid}, which does not hash its content")
-    return oid
+    return gitsafe_run.hashed_blob(cwd, data, write, runner=_out, hasher=blob_id, error=GitError)
 
 
 def blob_oid(cwd: Path | str, data: bytes) -> str:
@@ -930,19 +861,7 @@ def _check_ref_name(cwd: Path | str, ref: object, what: str = "ref name") -> str
     """``ref`` when it is a full ref under ``refs/`` that ``git check-ref-format``
     accepts; RefNameError otherwise. Nothing that git could read as an option, a
     pattern or a stdin record separator gets through."""
-    ok = (
-        isinstance(ref, str)
-        and ref.startswith("refs/")
-        and not any(ch in ref for ch in "\0\n\r")
-    )
-    if ok:
-        res = _completed(["check-ref-format", ref], cwd)
-        if res is None:
-            raise GitError(f"git cannot check the {what} {ref!r}")
-        ok = res.returncode == 0
-    if not ok:
-        raise RefNameError(f"invalid {what}: {ref!r}")
-    return ref  # type: ignore[return-value]
+    return gitsafe_run.check_ref_name(cwd, ref, what, runner=_completed, error=GitError, ref_error=RefNameError)
 
 
 _REF_FORMAT = "--format=%(objectname)%00%(symref)%00%(refname)"
@@ -1024,15 +943,17 @@ def _never_writable(cwd: Path | str, ref: str, new: Optional[str]) -> Optional[s
     return None
 
 
-def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]) -> None:
+def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str], *, single_attempt: bool = False) -> Optional[str]:
     """Compare-and-swap ``ref`` from ``old`` to ``new`` (object ids; None means absent).
+
+    Custody/single_attempt returns updated or already; the legacy default returns None.
 
     - ``old`` None, ``new`` set: create; fails if the ref exists.
     - both set: update; fails unless the ref holds ``old``.
     - ``new`` None, ``old`` set: delete; fails unless the ref holds ``old``.
 
-    ``ref`` must be under ``refs/aegis/``: a branch, a tag or any other ref is refused.
-    One ``update-ref --no-deref --stdin`` transaction with the ``create``, ``update`` or
+    Outside strict custody, ``ref`` must be under ``refs/aegis/``. Strict custody also
+    permits ``refs/heads/lane/`` commit fast-forwards, with no deletes. One transaction with the
     ``delete`` verb, so no all-zero id is spelled and SHA-1 and SHA-256 repositories
     behave alike. A symbolic ref is never written through: an update or delete of one
     is refused (GitError), and a link that appears after that check, or a dangling one
@@ -1053,12 +974,16 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
     written), ValueError for a malformed object id or for ``new`` and ``old`` both None
     (an unconditional write is no CAS).
     """
-    if new is None and old is None:
-        raise ValueError("update_ref needs a new value, an expected old value, or both")
+    gitsafe_run.validate_update_input(single_attempt, new, old, error=GitError)
+    if gitsafe_run.strict_active():
+        return gitsafe_run.lane_update_ref(cwd, ref, new, old)
     if new is not None:
         _full_oid(new)
     if old is not None:
         _full_oid(old)
+    if single_attempt or custody_active():
+        if not isinstance(ref, str) or not ref.startswith(_WRITABLE_REFS):
+            raise RefNameError("ref not allowed", code="ref_not_allowed")
     _check_ref_name(cwd, ref)
     if not ref.startswith(_WRITABLE_REFS):
         raise RefNameError(f"refusing to write {ref!r}: aegis writes only refs under {_WRITABLE_REFS}")
@@ -1074,6 +999,10 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
         command = b"create " + name + b"\0" + new.encode() + b"\0"
     else:
         command = b"delete " + name + b"\0" + old.encode() + b"\0"  # type: ignore[union-attr]
+
+    if single_attempt or custody_active():
+        return gitsafe_run.update_once(cwd, ref, new, old, command, runner=run,
+                                       observer=read_ref, error=GitError, conflict=RefConflict)
 
     delay = UPDATE_REF_BACKOFF_SECONDS
     detail = ""
@@ -1100,6 +1029,25 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
         f"git update-ref {ref} failed {UPDATE_REF_ATTEMPTS} times while the ref still held the "
         f"expected value" + (f": {detail}" if detail else "")
     )
+
+
+def private_object_headers(cwd, oids, *, env, scratch):
+    """Bounded mixed metadata for full OIDs; missing objects are explicit None values."""
+    return gitsafe_run.private_headers(cwd, oids, env=env, scratch=scratch, runner=run_checked,
+        batch=["cat-file", "--batch-check"], custody=custody, error=GitError)
+
+
+def read_private_object(cwd, oid: str, *, kind: str, max_bytes: int, env: Mapping[str, str], scratch: Path) -> bytes:
+    """Size/type/hash-verified private object; legacy object readers remain unchanged."""
+    return gitsafe_run.private_object(cwd, oid, kind=kind, max_bytes=max_bytes, env=env, scratch=scratch,
+        headers=private_object_headers, runner=run_checked, custody=custody, error=GitError)
+
+
+def read_private_objects(cwd, oids, *, max_bytes, max_object_bytes, env, scratch):
+    """Batch mixed objects, checking all sizes before capture and every payload's hash."""
+    return gitsafe_run.private_objects(cwd, oids, max_bytes=max_bytes, max_object_bytes=max_object_bytes,
+        env=env, scratch=scratch, headers=private_object_headers, runner=run_checked,
+        batch=["cat-file", "--batch"], custody=custody, error=GitError)
 
 
 def read_object(cwd: Path | str, oid: str, max_bytes: int) -> bytes:

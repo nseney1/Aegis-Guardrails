@@ -11,6 +11,7 @@ conflicting) on a fixture repository of the same shape, never on this repository
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +25,46 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 NOW = 1_760_000_000
 LINES = "".join(f"line {n}\n" for n in range(1, 11))
+
+
+@pytest.mark.parametrize("name", ["event_counts", "merge_metrics", "TeamUsageError"])
+def test_metrics_public_exports_are_shared(name):
+    from aegis_core import team_metrics
+
+    assert getattr(team, name) is getattr(team_metrics, name)
+
+
+def test_usage_error_keeps_its_public_pickle_identity():
+    import pickle
+
+    error = team.TeamUsageError("unusable base")
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is team.TeamUsageError
+    assert team.TeamUsageError.__module__ == "aegis_core.team"
+    assert str(restored) == "unusable base"
+    assert restored.code == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("as_text", [False, True], ids=["path", "text"])
+def test_public_repository_root_accepts_git_repositories(tmp_path: Path, as_text):
+    from aegis_core import team_metrics
+
+    repo = _init(tmp_path / "repo")
+    root = str(repo) if as_text else repo
+    assert "repository_root" in team_metrics.__all__
+    assert team.repository_root is team_metrics.repository_root
+    assert team_metrics.repository_root(root) == repo
+
+
+@pytest.mark.parametrize("as_text", [False, True], ids=["path", "text"])
+def test_public_repository_root_refuses_non_repository(tmp_path: Path, as_text):
+    from aegis_core.team_metrics import repository_root
+
+    root = str(tmp_path) if as_text else tmp_path
+    with pytest.raises(team.TeamUsageError) as caught:
+        repository_root(root)
+    assert str(caught.value) == "not in a git repository: aegis team keeps leases in git refs"
+    assert caught.value.code == "VALIDATION_ERROR"
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -269,6 +310,63 @@ def test_a_merge_commit_that_no_pull_ref_names_is_counted(tmp_path: Path):
 
 
 # ── Events ───────────────────────────────────────────────────────────────────
+
+def _write_event_log(repo: Path, entries) -> None:
+    rows = [
+        {"v": events.EVENTS_VERSION, "ts": stamp, "event": kind, "worktree": str(repo),
+         "result": result, "detail": detail}
+        for stamp, kind, result, detail in entries
+    ]
+    events.events_path(repo, create=True).write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def test_event_counts_exclude_queue_receipts_from_every_lease_metric(tmp_path: Path):
+    repo = _init(tmp_path / "repo")
+    _write_event_log(repo, [
+        ("2026-11-13T00:00:00Z", "lease_claimed", "claimed", {"lane": "queue-a", "queue": True}),
+        ("2026-11-13T01:00:00Z", "lease_claimed", "claimed", {"lane": "docs"}),
+        ("2026-11-13T02:00:00Z", "lease_denied", "refused", {"reason": "overlap"}),
+        ("2026-11-13T03:00:00Z", "lease_claimed", "taken_over", {"lane": "ops", "queue": False}),
+        ("2026-11-13T04:00:00Z", "lease_claimed", "taken_over", {"lane": "queue-b", "queue": True}),
+    ])
+    expected = {
+        "claims": 2, "denials": 1, "denials_by_reason": {"overlap": 1},
+        "by_result": {"claimed": 1, "taken_over": 1}, "lanes_claimed": 2,
+        "first": "2026-11-13T01:00:00Z", "last": "2026-11-13T03:00:00Z",
+        "unusable_rows": 0, "error": None,
+    }
+    before = events.events_path(repo).read_bytes()
+    assert team.event_counts(repo) == expected
+    assert team.event_counts(repo) == expected
+    assert events.events_path(repo).read_bytes() == before
+
+
+@pytest.mark.parametrize("result", ["claimed", "taken_over"])
+def test_event_counts_of_only_queue_receipts_are_empty(tmp_path: Path, result):
+    repo = _init(tmp_path / "repo")
+    _write_event_log(repo, [
+        ("2026-11-13T00:00:00Z", "lease_claimed", result, {"lane": "queue", "queue": True}),
+    ])
+    assert team.event_counts(repo) == {
+        "claims": 0, "denials": 0, "denials_by_reason": {}, "by_result": {}, "lanes_claimed": 0,
+        "first": None, "last": None, "unusable_rows": 0, "error": None,
+    }
+
+
+@pytest.mark.parametrize("queue_detail", [{}, {"queue": False}, {"queue": 1}, {"queue": "true"}],
+                         ids=["absent", "false", "integer", "string"])
+def test_event_counts_exclude_only_literal_queue_true(tmp_path: Path, queue_detail):
+    repo = _init(tmp_path / "repo")
+    _write_event_log(repo, [
+        ("2026-11-13T00:00:00Z", "lease_claimed", "claimed", {"lane": "docs", **queue_detail}),
+    ])
+    assert team.event_counts(repo) == {
+        "claims": 1, "denials": 0, "denials_by_reason": {}, "by_result": {"claimed": 1},
+        "lanes_claimed": 1, "first": "2026-11-13T00:00:00Z", "last": "2026-11-13T00:00:00Z",
+        "unusable_rows": 0, "error": None,
+    }
+
 
 def test_event_counts_report_claims_denials_by_reason_and_lanes(tmp_path: Path):
     repo = _init(tmp_path / "repo")

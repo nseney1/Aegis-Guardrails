@@ -221,7 +221,7 @@ Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list,
 
 Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.
 
-Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `release`, `renew`, `status`, `transfer`.
+Category: Daily Workflow & Verification. Subcommands: `claim`, `config`, `doctor`, `gc`, `hosts`, `list`, `metrics`, `model`, `queue`, `release`, `renew`, `status`, `transfer`.
 
 ### `aegis team claim`
 
@@ -320,6 +320,72 @@ Preview model selection as JSON; --record atomically selects and appends. Errors
 | `--lane-family` | `LANE_FAMILY` |  | Lane family required for T3; writer lanes must match team_family |
 | `--review-stage` | `REVIEW_STAGE` | `"primary"` | Review stage: primary, correctness, security, whole or second as allowed by the task |
 | `--record` |  |  | Atomically select and append under the history lock (60-second timeout); default preview |
+
+### `aegis team queue`
+
+Manage queued team work with CAS leases
+
+Queue add, list, claim, release, done, audit and compact; all results are JSON.
+
+Subcommands: `add`, `audit`, `claim`, `compact`, `done`, `list`, `release`.
+
+### `aegis team queue add`
+
+Enqueue a bounded inline JSON item
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--item` | `JSON` |  | Queue item object; no file paths are opened |
+
+### `aegis team queue audit`
+
+Report held work needing a decision
+
+### `aegis team queue claim`
+
+Claim a current item revision with a lease
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by add or list |
+| `--lane` | `LANE` |  | Lane declared in .aegis/team.json |
+| `--branch` | `BRANCH` |  | Lane's local branch; omitted means unknown branch evidence |
+| `--capability` | `CAPABILITIES` |  | Team capability label; repeat for each label |
+| `--ttl` | `SECONDS` | `3600` | Claim lifetime, at most one day |
+
+### `aegis team queue compact`
+
+Remove completed items not needed by unfinished dependencies
+
+### `aegis team queue done`
+
+Complete a live claim
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by claim or list |
+| `--lane` | `LANE` |  | Current claim lane; required for a live claim |
+
+### `aegis team queue list`
+
+List items, blockers and lane labels
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--capability` | `CAPABILITIES` |  | Filter by a team capability label; repeat for each label |
+| `--include-done` |  |  | Include completed items hidden by default |
+
+### `aegis team queue release`
+
+Release a claim
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by claim or list |
+| `--lane` | `LANE` |  | Current claim lane; required for a live claim |
 
 ### `aegis team release`
 
@@ -752,6 +818,7 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 | --- | --- |
 | `aegis_team_model` | Team Model |
 | `aegis_team_config` | Team Config |
+| `aegis_team_queue` | Team Queue |
 | `aegis_scan` | Scan JIT Rules |
 | `aegis_report_outcome` | Report Outcome |
 | `aegis_create_rule` | Create Rule |
@@ -764,22 +831,22 @@ The server speaks MCP over stdio. Its tools, as `tools/list` returns them. A wri
 
 **Team Model**
 
-Select a model inside the workspace with the same JSON as aegis team model; record opts into atomic history publication. Uses the model-selection core without launching a host.
+Select via `aegis team model` with the same JSON; no host launch. Record opts into atomic history; otherwise preview.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `bindings` | string | yes | Bindings JSON path inside the workspace; bounded regular file, no symlinks. |
-| `policy` | string | yes | Team policy JSON path inside the workspace; bounded regular file, no symlinks. |
-| `history` | string | yes | Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history. |
-| `task_kind` | string | yes | Task kind T1 through T14, validated by the core. |
+| `bindings` | string | yes | Workspace bindings JSON; bounded regular file, no symlinks. |
+| `policy` | string | yes | Workspace team policy JSON; bounded regular file, no symlinks. |
+| `history` | string | yes | Workspace decision JSONL in an existing owner-only directory; absent log is empty. |
+| `task_kind` | string | yes | Task T1 through T14. |
 | `role_kind` | string | yes | Seat: orchestrator, decider, implementer, integrator or reviewer. |
-| `subject` | string | yes | Single-line lane/endpoint/generation identifier. |
-| `host_kinds` | array of string | yes | Explicit host registry kinds; at most 256. |
+| `subject` | string | yes | Single-line lane/endpoint/generation. |
+| `host_kinds` | array of string | yes | Explicit host kinds; at most 256. |
 | `intent` | string | no | Semantic light\|standard\|deep\|extended\|max\|ultra; defaults to policy/role band. |
-| `author_family` | string | no | Known author family required for reviews; T7 binds its chosen family. |
-| `lane_family` | string | no | Required for T3; writer lane family must match team_family. |
-| `review_stage` | string | no | Primary, correctness, security, whole or second as allowed by the task. |
-| `record` | boolean | no | Atomically select and append under the history lock (60-second timeout); default preview. |
+| `author_family` | string | no | Required for reviews; T7 uses this known family. |
+| `lane_family` | string | no | T3: writer family must equal team_family. |
+| `review_stage` | string | no | Stage: primary, correctness, security, whole or second. |
+| `record` | boolean | no | Atomic select/append; 60-second lock timeout; default preview. |
 
 Input schema:
 
@@ -789,19 +856,19 @@ Input schema:
   "properties": {
     "bindings": {
       "type": "string",
-      "description": "Bindings JSON path inside the workspace; bounded regular file, no symlinks."
+      "description": "Workspace bindings JSON; bounded regular file, no symlinks."
     },
     "policy": {
       "type": "string",
-      "description": "Team policy JSON path inside the workspace; bounded regular file, no symlinks."
+      "description": "Workspace team policy JSON; bounded regular file, no symlinks."
     },
     "history": {
       "type": "string",
-      "description": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history."
+      "description": "Workspace decision JSONL in an existing owner-only directory; absent log is empty."
     },
     "task_kind": {
       "type": "string",
-      "description": "Task kind T1 through T14, validated by the core."
+      "description": "Task T1 through T14."
     },
     "role_kind": {
       "type": "string",
@@ -809,7 +876,7 @@ Input schema:
     },
     "subject": {
       "type": "string",
-      "description": "Single-line lane/endpoint/generation identifier."
+      "description": "Single-line lane/endpoint/generation."
     },
     "host_kinds": {
       "type": "array",
@@ -818,7 +885,7 @@ Input schema:
       },
       "maxItems": 256,
       "minItems": 1,
-      "description": "Explicit host registry kinds; at most 256."
+      "description": "Explicit host kinds; at most 256."
     },
     "intent": {
       "type": "string",
@@ -826,21 +893,21 @@ Input schema:
     },
     "author_family": {
       "type": "string",
-      "description": "Known author family required for reviews; T7 binds its chosen family."
+      "description": "Required for reviews; T7 uses this known family."
     },
     "lane_family": {
       "type": "string",
-      "description": "Required for T3; writer lane family must match team_family."
+      "description": "T3: writer family must equal team_family."
     },
     "review_stage": {
       "type": "string",
       "default": "primary",
-      "description": "Primary, correctness, security, whole or second as allowed by the task."
+      "description": "Stage: primary, correctness, security, whole or second."
     },
     "record": {
       "type": "boolean",
       "default": false,
-      "description": "Atomically select and append under the history lock (60-second timeout); default preview."
+      "description": "Atomic select/append; 60-second lock timeout; default preview."
     }
   },
   "required": [
@@ -870,6 +937,42 @@ Input schema:
 {
   "type": "object",
   "properties": {},
+  "additionalProperties": false
+}
+```
+
+### `aegis_team_queue`
+
+**Team Queue** (read-only, idempotent)
+
+List queue items. Read-only.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `capabilities` | array of string | no | Capability filter. |
+| `include_done` | boolean | no | Include done. |
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "description": "Capability filter."
+    },
+    "include_done": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include done."
+    }
+  },
   "additionalProperties": false
 }
 ```
@@ -916,7 +1019,7 @@ Input schema:
 
 **Report Outcome**
 
-Call after verifying a change with tests or `aegis check`, naming rules from `aegis_scan`; use `aegis_capture_insight` for user corrections. With a passing `aegis check --record --tests` row for the current tree, the rules this session's scans exposed that match the diff are credited, counting once CI passes on the landing commit; without one, it writes at most one unwitnessed claim per session and tree, which earns no credit. Capped at 200 report rows per session and rate-limited to 5 calls per 60 seconds.
+After tests or `aegis check`, report rules from `aegis_scan`; corrections use `aegis_capture_insight`. A passing `aegis check --record --tests` row for this tree enables credit for scan-exposed rules matching the diff once CI passes on the landing commit; otherwise at most one uncredited claim per session/tree. Limit: 200 report rows per session and 5 calls per 60 seconds.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -1005,7 +1108,7 @@ Input schema:
 
 **Create Rule** (read-only, idempotent)
 
-Builds a prompt for drafting a rule from `description`, with up to three active workspace rules (500 chars each) as examples; it writes nothing to disk. Save the result to `.aegis/rules/<type_dir>/<id>.md` as `instruction` says. Check `aegis_list_rules` for an existing rule first.
+Draft a rule prompt from `description` with up to three active workspace rules (500 chars each); writes nothing. Save to `.aegis/rules/<type_dir>/<id>.md` per `instruction`. First check `aegis_list_rules`.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -1051,7 +1154,7 @@ Input schema:
 
 **List Rules** (read-only, idempotent)
 
-Lists every rule with metadata and ledger fitness (`_error` if unloadable, `_expired: true` if retired), the `stale_rules` edited since the last `aegis sync`, and non-rule files under `.aegis/rules/` (`ignored`). Records no scan or exposure: call `aegis_scan` before editing files.
+List rules, metadata and ledger fitness: `_error` unloadable, `_expired` retired; `stale_rules` changed since `aegis sync`; `ignored` non-rule files. No scan/exposure recorded; call `aegis_scan` before edits.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |

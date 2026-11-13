@@ -57,6 +57,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.storage_confined": 0,
     "aegis_core.storage_shared": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
@@ -91,6 +93,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.team": 1,
     "aegis_core.team_host_adapter": 0,
     "aegis_core.team_host_agy": 1,
+    "aegis_core.team_metrics": 1,
     "aegis_core.team_paths": 1,
     "aegis_core.team_profile": 1,
     "aegis_core.team_profile_display": 0,
@@ -153,6 +156,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    "aegis_core.team_queue": 2,
     # Read-only lane status report over lease declarations and the existing tip gate.
     "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.
