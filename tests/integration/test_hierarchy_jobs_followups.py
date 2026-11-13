@@ -1,7 +1,10 @@
 """JOBS-2b: observations never authorize a second execution or invent custody."""
 import errno
+import hashlib
 import json
 import os
+from pathlib import Path
+import re
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +20,1656 @@ from tests.integration.test_hierarchy_jobs_derive import host_plan
 kind_shop = job_fixtures.kind_shop
 jobs2_fresh_cache = job_fixtures.jobs2_fresh_cache
 jobs = job_fixtures.jobs2_module
+PROCESS_FAULTS = ("text", "zero", "negative", "bool", "float", "oversized", "directory", "symlink", "unsupported")
+PROCESS_REPAIR_ACTION = ("Root: repair or remove the job's process.json; revalidate stopped-process evidence "
+                         "before retrying recovery or settlement.")
+PROCESS_REPAIR_ERROR = "job process metadata unverified; " + PROCESS_REPAIR_ACTION
+ADMISSION_UNVERIFIED_ACTION = ("Root: supply trusted recipe bytes with tools/hierarchy_jobs.py --store "
+                               "<original-workspace-store> --recipes <trusted-recipes-file> recovery-status; "
+                               "revalidate admission before run-open; do not derive again.")
+PROVENANCE_REPAIR_ACTION = ("Root: preserve admitted.json and derivation.json; repair the provenance binding, "
+                            "revalidate stopped-process evidence, then retry resolve.")
+
+
+def recovery_admission_case(shop, terminal):
+    """Retain a real staged admission, optionally execute or settle a fixture failure."""
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    if terminal == "completed":
+        assert job_fixtures.job_row(shop.run_open())["state"] == "completed"
+    elif terminal == "failed":
+        ledger = jobs.Store(shop.workspace.store).load()
+        message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+        job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+        derived = json.loads((folder / "derivation.json").read_bytes())
+        jobs.write_result(job, "failed", 7, reason="fixture execution failure", recipe="commit-exact",
+                          process_stopped_confirmed=True, **derived)
+        assert job_fixtures.job_row(shop.run_open())["state"] == "failed"
+    return folder
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("terminal", ["completed", "failed", None], ids=["finished", "failed", "unsettled"])
+@pytest.mark.parametrize("recipes", ["match", "mismatch", "absent"])
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_recovery_admission_recipe_matrix(kind_shop, capsys, terminal, recipes, placement):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, terminal)
+    if recipes == "mismatch":
+        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+        shop.save_recipes()
+    argv = ["--store", str(shop.workspace.store)]
+    recipe_args = [] if recipes == "absent" else ["--recipes", str(shop.recipes_path)]
+    argv += recipe_args + ["recovery-status"] if placement == "before" else ["recovery-status"] + recipe_args
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    expected = "finished" if terminal else {"match": "admitted", "mismatch": "evidence_error",
+                                            "absent": "admission_unverified"}[recipes]
+    # Completing the commit also changes first-check's incoming source; that independent blocker remains.
+    assert jobs.main(argv) == (3 if terminal == "completed" or terminal is None else 0)
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == expected, row
+    if terminal:
+        assert row["result"]["state"] == terminal and row["receipt"] == "match"
+        assert "error" not in row and "detail" not in row
+        assert not any(blocker.get("job") == row["job"] for blocker in report["blockers"])
+    elif recipes == "absent":
+        assert row["source"] == {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                                 "recipe_bytes_unavailable": True}
+        assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+        assert [blocker["reason"] for blocker in report["blockers"] if blocker.get("job") == row["job"]] == ["admission_unverified"]
+        assert "error" not in row and "detail" not in row
+    elif recipes == "mismatch":
+        assert row["error"] == row["detail"] == "recipes changed after admission"
+    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_recovery_after_team_init_keeps_settled_result_and_run_open_behavior(kind_shop, capsys):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, "completed")
+    before, receipts = (folder / "result.json").read_bytes(), shop.receipts("job-1")
+    # Regenerating the init recipe file changes its bytes without changing historical results.
+    shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+    shop.save_recipes()
+    assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 0
+    assert json.loads(capsys.readouterr().out) == {"rows": []}
+    for recipe_args in ([], ["--recipes", str(shop.recipes_path)]):
+        assert jobs.main(["--store", str(shop.workspace.store), *recipe_args, "recovery-status"]) == 3
+        row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+        assert row["state"] == "finished" and row["source"]["state"] == "match"
+    assert (folder / "result.json").read_bytes() == before and shop.receipts("job-1") == receipts
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("first", ["live", "null"])
+def test_recovery_row_uses_one_process_snapshot(kind_shop, capsys, first):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    process, group = folder / "process.json", os.getpgrp()
+    if first == "live":
+        for log in folder.glob("step-*.log"):
+            log.unlink()
+    process.write_text(json.dumps({"step": 1, "group": group if first == "live" else None}))
+    original, captured = job_fixtures.jobs2_fresh_brief._read_reference, []
+
+    def read_reference(path, **kwargs):
+        answer = original(path, **kwargs)
+        if path == process:
+            captured.append(True)
+            process.write_text(json.dumps({"step": 1, "group": None if first == "live" else group}))
+        return answer
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "evidence_error", row
+    expected = ("job process group is still running: " + str(group) if first == "live" else
+                "job has an unrecorded process effect: pilot/job-1")
+    assert row["error"] == expected and captured == [True]
+    assert row["process_alive"] is (True if first == "live" else None)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("available", [False, True], ids=["unavailable", "available"])
+def test_recovery_report_uses_one_recipe_snapshot(kind_shop, capsys, available):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    shop.request_job("job-2", "commit-exact", raw=jobs.packet_text((folder / "packet.md").read_bytes()))
+    second = folder.with_name("job-2")
+    second.mkdir()
+    for path in folder.iterdir():
+        if path.is_file():
+            (second / path.name).write_bytes(path.read_bytes())
+    claim = json.loads((second / "claim.json").read_bytes())
+    claim["job"] = "pilot/job-2"
+    (second / "claim.json").write_text(json.dumps(claim))
+    mailbox = jobs.Mailbox(shop.root)
+    raw = mailbox.brief(mailbox.messages()["job-2"]["message"]["brief"])
+    (second / "packet.md").write_bytes(raw)
+    reference = json.loads((second / "admitted.json").read_bytes())
+    reference["packet_sha256"] = hashlib.sha256(raw).hexdigest()
+    (second / "admitted.json").write_text(json.dumps(reference))
+    original, captured = job_fixtures.jobs2_fresh_brief._read_reference, []
+    replacement = shop.tmp / "new-recipes.json"
+    replacement.write_bytes(shop.recipes_path.read_bytes() + b"\n")
+    if not available:
+        shop.recipes_path.unlink()
+
+    def read_reference(path, **kwargs):
+        if path != shop.recipes_path:
+            return original(path, **kwargs)
+        captured.append(True)
+        try:
+            return original(path, **kwargs)
+        finally:
+            if replacement.exists():
+                replacement.replace(shop.recipes_path)
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    report = json.loads(capsys.readouterr().out)
+    rows = [row for row in report["jobs"] if row["job"] in ("pilot/job-1", "pilot/job-2")]
+    assert [row["state"] for row in rows] == ["admitted" if available else "admission_unverified"] * 2, rows
+    assert captured == [True]
+    # A fresh report observes the new version and refuses both unsettled admissions.
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    report = json.loads(capsys.readouterr().out)
+    assert [row["state"] for row in report["jobs"] if row["job"] in ("pilot/job-1", "pilot/job-2")] == ["evidence_error"] * 2
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_settled_recovery_never_acquires_current_recipes(kind_shop, capsys, terminal):
+    shop = kind_shop
+    recovery_admission_case(shop, terminal)
+    original = job_fixtures.jobs2_fresh_brief._read_reference
+
+    def read_reference(path, **kwargs):
+        if path == shop.recipes_path:
+            pytest.fail("settled reporting acquired current recipe bytes")
+        return original(path, **kwargs)
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == (3 if terminal == "completed" else 0)
+    row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["result"]["state"] == terminal
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("digest", ["untrusted-group\nsecond-line", ["untrusted-group"], "untrusted-group" * 1000],
+                         ids=["multiline", "array", "oversized"])
+def test_terminal_source_digest_is_opaque_when_unverified(kind_shop, capsys, digest):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, "failed")
+    path = folder / "result.json"
+    result = json.loads(path.read_bytes())
+    result["dirty_content_sha256"] = digest
+    path.write_text(json.dumps(result))
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    output = capsys.readouterr().out
+    row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["source"] == {"state": "unavailable", "reason": "terminal source digest unverified",
+                             "terminal_source_unverified": True}
+    assert "untrusted-group" not in output and "second-line" not in output
+
+
+def unsettled_recovery_obligation(shop, custody):
+    folder = recovery_admission_case(shop, None)
+    if custody == "reservation":
+        identifier = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+        assert shop.workspace.grant("writer")["request_id"] == identifier
+    else:
+        assert custody == "live-runner"
+        path = folder / "claim.json"
+        claim = json.loads(path.read_bytes())
+        claim.update(pid=os.getpid(), start=jobs.process_start(os.getpid()))
+        path.write_text(json.dumps(claim))
+    return folder
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("custody", ["reservation", "live-runner"])
+@pytest.mark.parametrize("recipes", ["absent", "match", "mismatch"])
+def test_unsettled_admission_is_always_a_recovery_blocker(kind_shop, capsys, custody, recipes):
+    shop = kind_shop
+    folder = unsettled_recovery_obligation(shop, custody)
+    if recipes == "mismatch":
+        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+        shop.save_recipes()
+    args = [] if recipes == "absent" else ["--recipes", str(shop.recipes_path)]
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    assert jobs.main(["--store", str(shop.workspace.store), *args, "recovery-status"]) == 3
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    expected = {"absent": "admission_unverified", "match": "admitted", "mismatch": "evidence_error"}[recipes]
+    assert row["state"] == expected
+    blocker = next(blocker for blocker in report["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == expected and blocker["next_action"] == row["next_action"]
+    if recipes == "absent":
+        assert row["source"]["recipe_bytes_unavailable"] is True
+        assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+        assert "error" not in row and "detail" not in row
+    else:
+        assert "recipe_bytes_unavailable" not in row["source"]
+    assert row["runner_alive"] is (custody == "live-runner")
+    if custody == "reservation":
+        assert row["reservations"][0]["state"] == "granted"
+    assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+    assert not (folder / "result.json").exists() and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["unbound", "bound-dirty", "bound-host", "unbound-duplicate", "bound-duplicate",
+                                 "bound-tree", "bound-paths"])
+def test_resolve_validates_bound_derivation_before_persisting(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = unsettled_recovery_obligation(shop, "reservation")
+    path, marker = folder / "derivation.json", folder / "admitted.json"
+    derived = json.loads(path.read_bytes())
+    if fault == "bound-host":
+        derived["host_plan"]["sha256"] = "untrusted-group\nsecond-line"
+    elif fault == "bound-tree":
+        derived["expected_tree"] = "not-a-tree"
+    elif fault == "bound-paths":
+        derived["changed_paths"] = [False]
+    else:
+        derived["dirty_content_sha256"] = "not-a-digest"
+    raw = (b'{"untrusted-group":1,"untrusted-group":2}' if "duplicate" in fault else
+           json.dumps(derived).encode())
+    path.write_bytes(raw)
+    if fault.startswith("bound-"):
+        reference = json.loads(marker.read_bytes())
+        reference["derivation_sha256"] = hashlib.sha256(raw).hexdigest()
+        marker.write_text(json.dumps(reference))
+    original, parsed = jobs.strict_json, []
+
+    def parse(value):
+        if value.encode() == raw:
+            parsed.append(True)
+        return original(value)
+
+    with ExitStack() as active:
+        active.enter_context(patch.object(jobs, "strict_json", parse))
+        assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                                   "--process-stopped", census=[], lock_wait=0)[3:]) == 2
+    output = capsys.readouterr().out
+    assert json.loads(output) == {"error": "derivation provenance unverified", "next_action": PROVENANCE_REPAIR_ACTION}
+    assert "not-a-digest" not in output and "untrusted-group" not in output and "second-line" not in output
+    if fault in ("unbound", "unbound-duplicate"):
+        assert parsed == [], "unbound or unavailable bytes reached parsing"
+    assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+    assert next(iter(job_fixtures.ledger_rows(shop, holder="job:pilot/job-1").values()))["state"] == "granted"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["digest", "syntax"])
+def test_resolve_captured_invalid_binding_refuses_even_when_derivation_is_missing(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = unsettled_recovery_obligation(shop, "reservation")
+    path = folder / "admitted.json"
+    if fault == "digest":
+        reference = json.loads(path.read_bytes())
+        reference["derivation_sha256"] = "not-a-digest"
+        path.write_text(json.dumps(reference))
+    else:
+        path.write_bytes(b"{")
+    (folder / "derivation.json").unlink()
+    assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                               "--process-stopped", census=[], lock_wait=0)[3:]) == 2
+    assert json.loads(capsys.readouterr().out) == {"error": "derivation provenance unverified",
+                                                "next_action": PROVENANCE_REPAIR_ACTION}
+    assert not (folder / "result.json").exists() and shop.receipts("job-1") == []
+    assert next(iter(job_fixtures.ledger_rows(shop, holder="job:pilot/job-1").values()))["state"] == "granted"
+
+
+def orphaned_staging_case(shop, route):
+    if route == "after-stage":
+        folder = unsettled_recovery_obligation(shop, "reservation")
+        (folder / "admitted.json").unlink()
+        return folder
+    from tests.integration.test_hierarchy_jobs_derive import edit_source
+
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    shop.request_job("job-1", "commit-exact", derive="runner", paths=["src/missing.py"], message="fix: missing")
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    publish, write_result, stat_node = jobs.publish_file, jobs.write_result, os.stat
+    published, failed = [], []
+
+    def publish_file(path, *args, **kwargs):
+        answer = publish(path, *args, **kwargs)
+        if path == folder / "derivation.json":
+            published.append(True)
+            if route == "after-failure-publish":
+                failed.append(True)
+                raise OSError(errno.EIO, "fixture staging publication interrupted")
+        return answer
+
+    def result(job, state, *args, **kwargs):
+        if route == "refuse-write-failure" and job.id == "pilot/job-1" and state == "refused":
+            failed.append(True)
+            raise OSError(errno.EIO, "fixture refusal publication interrupted")
+        return write_result(job, state, *args, **kwargs)
+
+    def stat(path, *args, **kwargs):
+        if (route == "uncertain-owner" and published and str(path) == "admitted.json"
+                and kwargs.get("dir_fd") is not None):
+            failed.append(True)
+            raise OSError(errno.EIO, "fixture admission observation unavailable")
+        return stat_node(path, *args, **kwargs)
+
+    with patch.object(jobs, "publish_file", publish_file), patch.object(jobs, "write_result", result):
+        with patch.object(jobs, "os", SimpleNamespace(**{**vars(os), "stat": stat})):
+            code, _ = jobs.run_open(shop.workspace.store, shop.recipes_path, (), 1, None, 0)
+    assert code == 3 and published == [True] and failed
+    assert not (folder / "admitted.json").exists() and not (folder / "result.json").exists()
+    # The fixture's writer has ended. Retain its real stopped steps while making its runner claim stale.
+    path = folder / "claim.json"
+    claim = json.loads(path.read_bytes())
+    claim["start"] = "0"
+    path.write_text(json.dumps(claim))
+    identifier = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+    assert shop.workspace.grant("writer")["request_id"] == identifier
+    return folder
+
+
+def missing_derivation_publication_case(shop, route):
+    """Reach the real stopped staging/publication boundary with a clean matching checkout."""
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    shop.request_job("job-1", "commit-exact", derive="runner", paths=["src/app.py"], message="fix: staged fixture")
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    identifier = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+    assert shop.workspace.grant("writer")["request_id"] == identifier
+    original, interrupted = jobs.publish_file, []
+
+    def publish(path, *args, **kwargs):
+        if path == folder / "derivation.json":
+            interrupted.append(True)
+            if route == "kill":
+                raise SystemExit("fixture interrupted before derivation publication")
+            raise OSError(errno.EIO, "fixture derivation publication unavailable")
+        return original(path, *args, **kwargs)
+
+    with patch.object(jobs, "publish_file", publish):
+        if route == "kill":
+            with pytest.raises(SystemExit, match="^fixture interrupted before derivation publication$"):
+                jobs.run_open(shop.workspace.store, shop.recipes_path, (), 1, None, 0)
+        else:
+            assert route == "refusal"
+            code, report = jobs.run_open(shop.workspace.store, shop.recipes_path, (), 1, None, 0)
+            assert code == 0 and job_fixtures.job_row(report)["state"] == "refused"
+    assert interrupted == [True]
+    assert not (folder / "derivation.json").exists() and not (folder / "admitted.json").exists()
+    if route == "kill":
+        assert not (folder / "result.json").exists()
+        claim = json.loads((folder / "claim.json").read_bytes())
+        claim["start"] = "0"
+        (folder / "claim.json").write_text(json.dumps(claim))
+    return folder
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("route", ["kill", "refusal"])
+def test_missing_derivation_publication_remains_unverified(kind_shop, capsys, route):
+    shop = kind_shop
+    head = shop.head()
+    folder = missing_derivation_publication_case(shop, route)
+    if route == "kill":
+        assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                                   "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+        assert json.loads(capsys.readouterr().out)["state"] == "failed"
+    result = json.loads((folder / "result.json").read_bytes())
+    assert result["provenance_unverified"] is True
+    assert not {"derived_by", "dirty_content_sha256", "expected_tree", "host_plan", "changed_paths"}.intersection(result)
+    assert next(iter(job_fixtures.ledger_rows(shop, holder="job:pilot/job-1").values()))["state"] == "released"
+    receipt = shop.receipts("job-1")[-1]["receipt"]
+    assert any(Path(item["path"]).name == "result.json" for item in receipt["evidence"])
+    assert all(Path(item["path"]).name != "derivation.json" for item in receipt["evidence"])
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["receipt"] == "match"
+    assert row["source"] == {"state": "unavailable", "reason": "derivation provenance unverified",
+                             "terminal_source_unverified": True}
+    blocker = next(blocker for blocker in report["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == "source_unavailable" and blocker["next_action"] == row["next_action"]
+    # Later filesystem contents cannot change the unverified receipt projection.
+    (folder / "derivation.json").write_bytes(b"{}")
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["receipt"] == "match"
+    assert shop.head() == head
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_planned_nonderive_resolution_without_metadata_keeps_clean_inventory(kind_shop, capsys):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-1", "ok")
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    folder.mkdir(parents=True)
+    claim = job_fixtures.live_claim(jobs, os.getpid(), "pilot/job-1")
+    claim["start"] = "0"
+    (folder / "claim.json").write_text(json.dumps(claim))
+    identifier = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+    assert shop.workspace.grant("writer")["request_id"] == identifier
+    assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                               "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+    capsys.readouterr()
+    result = json.loads((folder / "result.json").read_bytes())
+    assert "provenance_unverified" not in result and "dirty_content_sha256" not in result
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 0
+    row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["source"]["state"] == "match"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["oversized", "symlink", "changed-hash", "unsupported"])
+def test_request_derivation_classification_refuses_unverified_bytes_before_parsing(kind_shop, fault):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-1", "ok")
+    ledger = jobs.Store(shop.workspace.store).load()
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    path = Path(message["brief"]["path"])
+    if fault == "oversized":
+        path.write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    elif fault == "symlink":
+        saved = shop.tmp / "foreign-original-request.md"
+        path.rename(saved)
+        symlink_or_skip(saved, path)
+    elif fault == "changed-hash":
+        path.write_bytes(path.read_bytes() + b"\nuntrusted-group")
+
+    def parse(value):
+        pytest.fail("unverified request bytes reached the derivation classifier parser")
+
+    with ExitStack() as active:
+        active.enter_context(patch.object(jobs, "strict_json", parse))
+        if fault == "unsupported":
+            active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
+        assert jobs.planned_request_derives(job) is None
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("route", ["after-stage", "after-failure-publish", "refuse-write-failure", "uncertain-owner"])
+def test_resolve_closes_orphaned_staging_without_copying_provenance(kind_shop, capsys, route):
+    shop = kind_shop
+    folder = orphaned_staging_case(shop, route)
+    before = (folder / "derivation.json").read_bytes()
+    assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                               "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "failed"
+    result = json.loads((folder / "result.json").read_bytes())
+    assert result["provenance_unverified"] is True
+    assert not {"derived_by", "dirty_content_sha256", "expected_tree", "host_plan", "changed_paths"}.intersection(result)
+    assert (folder / "derivation.json").read_bytes() == before and shop.receipts("job-1")
+    assert next(iter(job_fixtures.ledger_rows(shop, holder="job:pilot/job-1").values()))["state"] == "released"
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["receipt"] == "match"
+    assert row["source"] == {"state": "unavailable", "reason": "derivation provenance unverified",
+                             "terminal_source_unverified": True}
+    blocker = next(blocker for blocker in report["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == "source_unavailable" and blocker["next_action"] == row["next_action"]
+    assert "reconcile terminal source evidence" in row["next_action"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["missing", "oversized", "symlink", "directory", "read-error", "binding-probe", "unbound-poison"])
+def test_resolve_omits_unavailable_provenance_from_result_and_receipt(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = unsettled_recovery_obligation(shop, "reservation")
+    path = folder / "derivation.json"
+    if fault == "missing":
+        path.unlink()
+    elif fault == "oversized":
+        path.write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    elif fault == "symlink":
+        target = shop.tmp / "foreign-provenance.json"
+        path.rename(target)
+        symlink_or_skip(target, path)
+    elif fault == "directory":
+        path.unlink()
+        path.mkdir()
+    elif fault == "unbound-poison":
+        (folder / "admitted.json").unlink()
+        path.write_text('{"untrusted-group":1,"untrusted-group":2}')
+    original, refused = job_fixtures.jobs2_fresh_brief._read_reference, []
+    original_stat = os.stat
+
+    def read_reference(node, **kwargs):
+        if fault == "read-error" and node == path:
+            refused.append(True)
+            raise OSError(errno.EIO, "fixture provenance acquisition unavailable")
+        return original(node, **kwargs)
+
+    def stat(node, *args, **kwargs):
+        if fault == "binding-probe" and str(node) == "admitted.json" and kwargs.get("dir_fd") is not None:
+            # One refusal in the provenance phase, after the runner's independent custody probe.
+            refused.append(True)
+            if len(refused) == 2:
+                raise OSError(errno.EIO, "fixture binding observation unavailable")
+        return original_stat(node, *args, **kwargs)
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        with patch.object(jobs, "os", SimpleNamespace(**{**vars(os), "stat": stat})):
+            assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                                       "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+    output = capsys.readouterr().out
+    assert "untrusted-group" not in output
+    result = json.loads((folder / "result.json").read_bytes())
+    assert result["provenance_unverified"] is True and "dirty_content_sha256" not in result
+    receipt = shop.receipts("job-1")[-1]["receipt"]
+    assert all(Path(item["path"]).name != "derivation.json" for item in receipt["evidence"])
+    assert next(iter(job_fixtures.ledger_rows(shop, holder="job:pilot/job-1").values()))["state"] == "released"
+    if fault in ("read-error", "binding-probe"):
+        assert refused
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("pending", ["unpublished", "held", "mismatch"])
+def test_pending_invalid_terminal_digest_keeps_settlement_guidance(kind_shop, capsys, pending):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, None)
+    ledger = jobs.Store(shop.workspace.store).load()
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    derived = json.loads((folder / "derivation.json").read_bytes())
+    if pending == "mismatch":
+        jobs.write_result(job, "failed", 7, reason="historical result", process_stopped_confirmed=True, **derived)
+        assert job_fixtures.job_row(shop.run_open())["state"] == "failed"
+        result_path = folder / "result.json"
+        result = json.loads(result_path.read_bytes())
+        result["dirty_content_sha256"] = "not-a-digest"
+        result_path.write_text(json.dumps(result))
+    else:
+        derived["dirty_content_sha256"] = "not-a-digest"
+        jobs.write_result(job, "failed", 7, reason="historical result", process_stopped_confirmed=True, **derived)
+    if pending == "held":
+        assert job_fixtures.job_row(shop.run_open())["state"] == "failed"
+        identifier = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+        assert shop.workspace.grant("writer")["request_id"] == identifier
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "settle_pending" and row["source"]["terminal_source_unverified"] is True
+    assert row["next_action"] == "Reconcile the exact receipt and result; run-open may settle without rerunning the job."
+    blocker = next(blocker for blocker in report["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == "settle_pending" and blocker["next_action"] == row["next_action"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("value", [False, None, "untrusted-group\nsecond-line"], ids=["false", "null", "text"])
+def test_planned_result_refuses_invalid_provenance_marker(kind_shop, capsys, value):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, "failed")
+    path = folder / "result.json"
+    result = json.loads(path.read_bytes())
+    result["provenance_unverified"] = value
+    path.write_text(json.dumps(result))
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    output = capsys.readouterr().out
+    row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "evidence_error" and row["error"] == "invalid job result provenance_unverified"
+    assert "untrusted-group" not in output and "second-line" not in output
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("resolve", [False, True], ids=["strict", "resolve"])
+def test_planned_provenance_unsupported_descriptors_refuses_before_io(kind_shop, resolve):
+    shop = kind_shop
+    recovery_admission_case(shop, None)
+    ledger = jobs.Store(shop.workspace.store).load()
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+
+    def read_reference(*args, **kwargs):
+        pytest.fail("unsupported provenance reader reached reference IO")
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False):
+        with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+            if resolve:
+                assert jobs.derivation_provenance(job, allow_unverified=True) == {"provenance_unverified": True}
+            else:
+                with pytest.raises(ValueError, match="^derivation provenance unverified$"):
+                    jobs.derivation_provenance(job)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_resolve_uses_captured_hash_bound_derivation(kind_shop, capsys):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, None)
+    derivation = folder / "derivation.json"
+    original, changed = job_fixtures.jobs2_fresh_brief._read_reference, []
+
+    def read_reference(path, **kwargs):
+        answer = original(path, **kwargs)
+        if path == derivation and not changed:
+            derivation.write_bytes(b'{"untrusted-group":1,"untrusted-group":2}')
+            changed.append(True)
+        return answer
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        assert jobs.main(shop.argv("resolve", "--job", "pilot/job-1", "--reason", "owner reconciliation",
+                                   "--process-stopped", census=[], lock_wait=0)[3:]) == 0
+    assert changed == [True]
+    assert json.loads(capsys.readouterr().out)["state"] == "failed"
+    result = json.loads((folder / "result.json").read_bytes())
+    assert len(result["dirty_content_sha256"]) == 64 and "untrusted-group" not in json.dumps(result)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("changed", [False, True], ids=["same-source", "changed-source"])
+@pytest.mark.parametrize("recipes", ["absent", "match", "mismatch"])
+def test_settled_invalid_terminal_digest_remains_unavailable_evidence(kind_shop, capsys, changed, recipes):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, None)
+    ledger = jobs.Store(shop.workspace.store).load()
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    # Model a previously persisted bad result before a matching receipt is published.
+    derived = json.loads((folder / "derivation.json").read_bytes())
+    derived["dirty_content_sha256"] = "not-a-digest"
+    jobs.write_result(job, "failed", 7, reason="historical result", process_stopped_confirmed=True, **derived)
+    assert job_fixtures.job_row(shop.run_open())["state"] == "failed"
+    if changed:
+        (shop.checkout / "src/app.py").write_text("value = 3\n")
+    if recipes == "mismatch":
+        shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+        shop.save_recipes()
+    args = [] if recipes == "absent" else ["--recipes", str(shop.recipes_path)]
+    assert jobs.main(["--store", str(shop.workspace.store), *args, "recovery-status"]) == 3
+    row_report = json.loads(capsys.readouterr().out)
+    row = next(row for row in row_report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "finished" and row["receipt"] == "match"
+    assert row["source"] == {"state": "unavailable", "reason": "terminal source digest unverified",
+                             "terminal_source_unverified": True}
+    blocker = next(blocker for blocker in row_report["blockers"] if blocker.get("job") == row["job"])
+    assert blocker["reason"] == "source_unavailable" and blocker["next_action"] == row["next_action"]
+    assert "--recipes" not in row["next_action"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_planned_staging_refusal_keeps_computed_provenance(kind_shop, capsys):
+    from tests.integration.test_hierarchy_jobs_derive import edit_source
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    digest = job_fixtures.source_digest(shop)["dirty_content_sha256"]
+    shop.request_job("job-1", "commit-exact", derive="runner", paths=["src/missing.py"], message="fix: missing")
+    assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 0
+    assert job_fixtures.job_row(json.loads(capsys.readouterr().out))["state"] == "refused"
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    result = json.loads((folder / "result.json").read_bytes())
+    assert result["derived_by"] == "runner" and result["dirty_content_sha256"] == digest
+    assert result["expected_tree"] is None and not (folder / "admitted.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_recovery_never_parses_unbound_staging_provenance(kind_shop, capsys):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, None)
+    (folder / "admitted.json").unlink()
+    poison = '{"untrusted-group":1,"untrusted-group":2}'
+    (folder / "derivation.json").write_text(poison)
+    original = jobs.strict_json
+
+    def parse(value):
+        if value == poison:
+            pytest.fail("unbound staging provenance reached parsing")
+        return original(value)
+
+    with patch.object(jobs, "strict_json", parse):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+    output = capsys.readouterr().out
+    row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "unknown_effect"
+    assert row["source"] == {"state": "unavailable", "reason": "derivation provenance unverified"}
+    assert "untrusted-group" not in output
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_computed_staging_provenance_cannot_bypass_lost_admission_binding(kind_shop, capsys):
+    from tests.integration.test_hierarchy_jobs_derive import edit_source, request_derive
+
+    shop = kind_shop
+    host_plan(shop)
+    shop.recipes["recipes"]["commit-exact"] = shop.recipes["recipes"]["commit"]
+    shop.save_recipes()
+    edit_source(shop)
+    request_derive(shop)
+    folder = shop.workspace.store / "jobs/pilot/job-1"
+    original, changed = os.link, []
+    head = shop.head()
+
+    def link(source, destination, *args, **kwargs):
+        answer = original(source, destination, *args, **kwargs)
+        if destination == "execution.json" and kwargs.get("dst_dir_fd") is not None and not changed:
+            (folder / "admitted.json").unlink()
+            changed.append(True)
+        return answer
+
+    with patch.object(jobs, "os", SimpleNamespace(**{**vars(os), "link": link})):
+        code = jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:])
+    output = capsys.readouterr().out
+    assert changed == [True]
+    assert code == 3
+    assert "derivation provenance unverified" in output
+    assert shop.head() == head and not (folder / "result.json").exists() and shop.receipts("job-1") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("missing", ["request", "mailbox", "marker-directory", "marker-absent"])
+@pytest.mark.parametrize("recipes", ["match", "absent"])
+def test_nonrecipe_source_unavailability_keeps_prior_blocking_state(kind_shop, capsys, missing, recipes):
+    shop = kind_shop
+    folder = recovery_admission_case(shop, None)
+    if missing == "request":
+        record = jobs.Mailbox(shop.root).messages()["job-1"]
+        Path(record["path"]).rename(shop.tmp / "retained-original-request.md")
+    elif missing == "mailbox":
+        shop.root.rename(shop.tmp / "retained-original-mailbox")
+    marker = folder / "admitted.json"
+    original, probes, changed = os.stat, [], []
+
+    def stat_node(path, *args, **kwargs):
+        matched = str(path) == "admitted.json" and kwargs.get("dir_fd") is not None
+        if matched:
+            probes.append(True)
+        answer = original(path, *args, **kwargs)
+        # The first probe belongs to runner census, the second to the row's admission classification.
+        if matched and len(probes) == 2 and missing.startswith("marker-"):
+            marker.rename(shop.tmp / "retained-original-admission.json")
+            if missing == "marker-directory":
+                marker.mkdir()
+            changed.append(True)
+        return answer
+
+    args = [] if recipes == "absent" else ["--recipes", str(shop.recipes_path)]
+    with patch.object(jobs, "os", SimpleNamespace(**{**vars(os), "stat": stat_node})):
+        assert jobs.main(["--store", str(shop.workspace.store), *args, "recovery-status"]) == 3
+    report = json.loads(capsys.readouterr().out)
+    row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+    assert row["state"] == "admitted", row
+    assert "recipe_bytes_unavailable" not in row["source"]
+    assert row["next_action"] == "Recheck the persisted admission with run-open; do not derive again."
+    assert [blocker["reason"] for blocker in report["blockers"] if blocker.get("job") == row["job"]] == ["admitted"]
+    if missing.startswith("marker-"):
+        assert changed == [True]
+    if missing != "marker-absent":
+        reason = "admission marker unverified" if missing == "marker-directory" else "original mailbox request is unavailable"
+        assert row["source"] == {"state": "unavailable", "reason": reason}
+    assert not (folder / "result.json").exists() and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_live_legacy_group_text_keeps_historical_bytes(kind_shop, capsys):
+    shop = kind_shop
+    shop.request_job("job-0", "ok")
+    folder = shop.workspace.store / "jobs/pilot/job-0"
+    folder.mkdir(parents=True)
+    (folder / "claim.json").write_text(json.dumps(job_fixtures.live_claim(jobs, os.getpid(), "pilot/job-0")))
+    (folder / "process.json").write_text(json.dumps({"group": "untrusted-group\nsecond-line"}))
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        expected = {"rows": [{"job": "pilot/job-0", "state": "running",
+                              "process_group": "untrusted-group\nsecond-line"}]}
+        assert capsys.readouterr().out == json.dumps(expected, sort_keys=True) + "\n"
+        assert shop.receipts("job-0") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_recovery_directory_admission_retains_unknown_custody(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    (folder / "admitted.json").unlink()
+    (folder / "admitted.json").mkdir()
+    for _ in range(2):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+        report = json.loads(capsys.readouterr().out)
+        row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+        assert row["state"] == "unknown_effect", row
+        assert row["source"] == {"state": "unavailable", "reason": "admission marker unverified"}
+        assert "error" not in row
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+        assert row["reason"] == "execution_custody_unknown" and row["process_alive"] is None
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_failed_admission_revalidation_keeps_fixed_detail(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+    shop.save_recipes()
+    before = (folder / "admitted.json").read_bytes()
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+        assert row["reason"] == "execution_custody_unknown"
+        assert row["detail"] == "recipes changed after admission"
+        assert (folder / "admitted.json").read_bytes() == before
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_result_first_probe_of_vanished_directory_retains_uncertainty(kind_shop):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    ledger = jobs.Store(shop.workspace.store).load()
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job.validated_admission()
+    saved = shop.tmp / "vanished-result-first-job"
+    folder.rename(saved)
+    try:
+        for _ in range(2):
+            assert job.result() is None
+            assert job.result_decision() == "unknown"
+            assert job.recorded_execution_fence() is None and job.metadata_uncertain
+    finally:
+        saved.rename(folder)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", PROCESS_FAULTS)
+def test_process_consumers_refuse_untrusted_groups(kind_shop, capsys, fault):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-0", "ok")
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job.folder.mkdir(parents=True)
+    claim = job_fixtures.live_claim(jobs, os.getpid(), job.id)
+    job.claim_path.write_text(json.dumps(claim))
+    group = {"text": "untrusted-group\nsecond-line", "zero": 0, "negative": -1,
+             "bool": True, "float": 1.5}.get(fault, 2147483647)
+    if fault == "directory":
+        job.process_path.mkdir()
+    elif fault == "symlink":
+        decoy = shop.tmp / "foreign-process.json"
+        decoy.write_text(json.dumps({"step": 1, "group": group}))
+        symlink_or_skip(decoy, job.process_path)
+    elif fault == "oversized":
+        job.process_path.write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    else:
+        job.process_path.write_text(json.dumps({"step": 1, "group": group}))
+    (job.folder / "step-1.log").write_bytes(b"")
+    with ExitStack() as active:
+        if fault == "unsupported":
+            active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
+        for _ in range(2):
+            assert job.process_group() is None
+            assert job.staging_process_group() is None
+            assert job.unrecorded_step() == 1
+            assert jobs.census_owner(store.path, {"holder": job.holder, "initiative": "pilot"}, job.initiative) is None
+            # Both a claim loser and a refusal loser must keep their row shape and opacity.
+            assert jobs.taken_execution_row(store, job, None, 0)["process_group"] is None
+            assert jobs.refuse(store, job, "owner refusal", 0)["process_group"] is None
+            with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
+                jobs.check_settlement_processes(job, {"steps": []})
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            assert json.loads(capsys.readouterr().out)["rows"][0]["process_group"] is None
+            assert shop.receipts("job-0") == [] and not job.result_path.exists()
+    # A stopped claimant must never turn a malformed group into stopped-process evidence.
+    claim["start"] = "0"
+    job.claim_path.write_text(json.dumps(claim))
+    for _ in range(2):
+        if fault == "unsupported":
+            # Keep the same unsupported-platform observation for the recovery/resolve routes.
+            context = patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False)
+        else:
+            context = ExitStack()
+        with context:
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            row = json.loads(capsys.readouterr().out)["rows"][0]
+            assert row["process_group"] is None and row["process_alive"] is None
+            assert PROCESS_REPAIR_ACTION in row["next_action"]
+            assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+            row = next(row for row in report["jobs"] if row["job"] == job.id)
+            assert row["process_group"] is None and row["process_alive"] is None
+            assert jobs.main(shop.argv("resolve", "--job", job.id, "--reason", "owner checked")[3:]) == 2
+            assert json.loads(capsys.readouterr().out) == {"error": PROCESS_REPAIR_ERROR}
+        assert shop.receipts("job-0") == [] and not job.result_path.exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("replacement", ["absent", "valid"])
+def test_process_refusal_survives_concurrent_replacement(kind_shop, replacement):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-0", "ok")
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job.folder.mkdir(parents=True)
+    job.claim_path.write_text(json.dumps(job_fixtures.live_claim(jobs, os.getpid(), job.id)))
+    job.process_path.write_text(json.dumps({"step": 1, "group": "untrusted-group\nsecond-line"}))
+    original = jobs.Job.process_record
+    changed = []
+
+    def record(current):
+        answer = original(current)
+        if not changed:
+            current.process_path.unlink()
+            if replacement == "valid":
+                current.process_path.write_text(json.dumps({"step": 1, "group": 2147483647}))
+            changed.append(True)
+        return answer
+
+    with patch.object(jobs.Job, "process_record", record):
+        for _ in range(2):
+            with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
+                jobs.check_settlement_processes(job, {"steps": []})
+    assert changed == [True] and shop.receipts("job-0") == []
+    # A new attempt can use independently verified repaired evidence.
+    repaired = jobs.Job(store.path, job.initiative, message)
+    jobs.check_settlement_processes(repaired, {"steps": []})
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("surface", ["settlement", "resolve", "run-open"])
+def test_final_process_probe_refusal_cannot_be_bypassed(kind_shop, capsys, surface):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-0", "ok")
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job.folder.mkdir(parents=True)
+    claim = job_fixtures.live_claim(jobs, os.getpid(), job.id)
+    claim["start"] = "0"
+    job.claim_path.write_text(json.dumps(claim))
+    (job.folder / "step-1.log").write_bytes(b"")
+    original = jobs.Job.process_record
+    probes = []
+
+    def record(current):
+        answer = original(current)
+        probes.append(True)
+        current.process_path.write_text(json.dumps({"step": 1, "group": 2147483647}))
+        return answer
+
+    for _ in range(2):
+        probes.clear()
+        job = jobs.Job(store.path, job.initiative, message)
+        job.process_path.write_text(json.dumps({"step": 1, "group": "untrusted-group\nsecond-line"}))
+        with patch.object(jobs.Job, "process_record", record):
+            if surface == "settlement":
+                with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
+                    jobs.check_settlement_processes(job, {"steps": [], "process_stopped_confirmed": True})
+            else:
+                flags = ("--job", job.id, "--reason", "owner checked", "--process-stopped") if surface == "resolve" else ()
+                assert jobs.main(shop.argv(surface, *flags, census=[], lock_wait=0)[3:]) == (2 if surface == "resolve" else 3)
+                report = json.loads(capsys.readouterr().out)
+                if surface == "resolve":
+                    assert report == {"error": PROCESS_REPAIR_ERROR}
+                else:
+                    row = report["rows"][0]
+                    assert row["reason"] == "execution_custody_unknown" and row["process_alive"] is None
+                    assert PROCESS_REPAIR_ACTION in row["next_action"]
+        assert probes == [True]
+        assert not job.result_path.exists() and shop.receipts("job-0") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("failure", ["open", "fstat", "read", "close"])
+def test_process_descriptor_failures_close_every_owned_handle(kind_shop, failure):
+    shop = kind_shop
+    host_plan(shop)
+    shop.request_job("job-0", "ok")
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job.folder.mkdir(parents=True)
+    job.process_path.write_text(json.dumps({"step": 1, "group": 2147483647}))
+    owned, process_handles, refused = set(), set(), []
+    original_open, original_close, original_fstat = os.open, os.close, os.fstat
+
+    def fail():
+        refused.append(failure)
+        raise OSError(errno.EIO, "untrusted-group\nsecond-line")
+
+    def open_node(path, *args, **kwargs):
+        process_node = str(path) == "process.json" and kwargs.get("dir_fd") is not None
+        if process_node and failure == "open":
+            fail()
+        descriptor = original_open(path, *args, **kwargs)
+        owned.add(descriptor)
+        if process_node:
+            process_handles.add(descriptor)
+        return descriptor
+
+    def fstat(descriptor):
+        if descriptor in process_handles and failure == "fstat":
+            fail()
+        return original_fstat(descriptor)
+
+    def read(descriptor, amount):
+        if descriptor in process_handles and failure == "read":
+            fail()
+        return os.read(descriptor, amount)
+
+    def close(descriptor):
+        process_node = descriptor in process_handles
+        original_close(descriptor)
+        owned.remove(descriptor)
+        process_handles.discard(descriptor)
+        with pytest.raises(OSError) as gone:
+            original_fstat(descriptor)
+        assert gone.value.errno == errno.EBADF
+        if process_node and failure == "close":
+            fail()
+
+    local_os = SimpleNamespace(**{**vars(os), "open": open_node, "close": close, "read": read, "fstat": fstat})
+    with patch.object(job_fixtures.jobs2_fresh_brief, "os", local_os):
+        for _ in range(2):
+            assert job.process_group() is None and job.process_unverified
+            assert owned == process_handles == set()
+    assert refused == [failure, failure]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("change", ["packet-hash", "fields", "derivation-hash", "derivation-duplicate", "admission-duplicate"])
+def test_admission_content_failure_detail_is_fixed_and_non_echoing(kind_shop, capsys, change):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    marker = folder / "admitted.json"
+    reference = json.loads(marker.read_bytes())
+    hostile = "untrusted-group\nsecond-line"
+    duplicate = b'{"a":1,"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}'
+    if change == "derivation-duplicate":
+        (folder / "derivation.json").write_bytes(duplicate)
+    elif change == "fields":
+        reference[hostile] = hostile
+    elif change != "admission-duplicate":
+        reference["packet_sha256" if change == "packet-hash" else "derivation_sha256"] = hostile
+    marker.write_bytes(duplicate if change == "admission-duplicate" else json.dumps(reference).encode())
+    before = marker.read_bytes()
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = job_fixtures.job_row(json.loads(output))
+        if change == "admission-duplicate":
+            # As with the retained malformed-marker test, parsing establishes no admission content.
+            assert "detail" not in row
+        else:
+            assert row["detail"] == "persisted admission revalidation failed"
+        assert row["reason"] == "execution_custody_unknown"
+        assert "untrusted-group" not in output and "second-line" not in output
+        assert marker.read_bytes() == before
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+        assert row["state"] == "evidence_error"
+        assert row["error"] == "persisted admission revalidation failed"
+        assert "untrusted-group" not in output and "second-line" not in output
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("shape", ["duplicate", "utf8", "syntax", "depth", "array", "scalar"])
+@pytest.mark.parametrize("name", ["admitted.json", "derivation.json"])
+def test_planned_admission_decode_failures_have_one_fixed_message(kind_shop, capsys, name, shape):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    raw = (folder / "packet.md").read_bytes()
+    marker = folder / "admitted.json"
+    reference = json.loads(marker.read_bytes())
+    recipes = reference["recipes_sha256"]
+    poison = {"duplicate": b'{"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}',
+              "utf8": b"\xff", "syntax": b"{", "depth": b"[" * 2000 + b"]" * 2000,
+              "array": b"[]", "scalar": b"null"}[shape]
+    (folder / name).write_bytes(poison)
+    if name == "derivation.json":
+        # The test owner binds these bytes, exercising parsing only after successful hash verification.
+        reference["derivation_sha256"] = hashlib.sha256(poison).hexdigest()
+        marker.write_text(json.dumps(reference))
+    for _ in range(2):
+        with pytest.raises(ValueError, match="^persisted admission revalidation failed$"):
+            jobs.admitted_derivation(job, raw, recipes)
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+        assert row["error"] == "persisted admission revalidation failed"
+        assert "untrusted-group" not in output and "second-line" not in output
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = job_fixtures.job_row(json.loads(output))
+        assert row["reason"] == "execution_custody_unknown"
+        if name == "derivation.json":
+            assert row["detail"] == "persisted admission revalidation failed"
+        else:
+            assert "detail" not in row
+        assert "untrusted-group" not in output and "second-line" not in output
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_recipe_revalidation_precedes_unbound_derivation_parse(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    (folder / "derivation.json").write_bytes(b'{"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}')
+    shop.recipes["recipes"]["ok"]["timeout_seconds"] += 1
+    shop.save_recipes()
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = job_fixtures.job_row(json.loads(output))
+        assert row["detail"] == "recipes changed after admission"
+        assert "untrusted-group" not in output and "second-line" not in output
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_unbound_derivation_bytes_never_reach_the_parser(kind_shop):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    raw = (folder / "packet.md").read_bytes()
+    recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
+    poison = '{"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}'
+    (folder / "derivation.json").write_text(poison)
+    original = jobs.strict_json
+
+    def parse(value):
+        if value == poison:
+            pytest.fail("unbound derivation reached the parser")
+        return original(value)
+
+    with patch.object(jobs, "strict_json", parse):
+        for _ in range(2):
+            with pytest.raises(ValueError, match="^persisted admission revalidation failed$"):
+                jobs.admitted_derivation(job, raw, recipes)
+            assert job.admission_detail == "persisted admission revalidation failed"
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_captured_derivation_is_bound_across_concurrent_replacement(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    derivation = folder / "derivation.json"
+    original_bytes = derivation.read_bytes()
+    original_read, original_parse = job_fixtures.jobs2_fresh_brief._read_reference, jobs.strict_json
+    poison = b'{"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}'
+    changed = []
+
+    def read_reference(path, **kwargs):
+        answer = original_read(path, **kwargs)
+        if path == derivation and not changed:
+            assert answer[1] == original_bytes
+            derivation.write_bytes(poison)
+            changed.append(True)
+        return answer
+
+    def parse(value):
+        if value == poison.decode():
+            pytest.fail("concurrently replaced unbound bytes reached the parser")
+        return original_parse(value)
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+        with patch.object(jobs, "strict_json", parse):
+            for _ in range(2):
+                assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+                output = capsys.readouterr().out
+                row = job_fixtures.job_row(json.loads(output))
+                assert row["reason"] == "execution_custody_unknown", row
+                assert row["detail"] == "persisted admission revalidation failed"
+                assert "untrusted-group" not in output and "second-line" not in output
+                assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+    assert changed == [True]
+
+
+def install_process_fault(shop, process, fault):
+    if process.is_symlink() or process.is_file():
+        process.unlink()
+    elif process.is_dir():
+        process.rmdir()
+    group = {"text": "untrusted-group\nsecond-line", "zero": 0, "negative": -1,
+             "bool": True, "float": 1.5}.get(fault, 2147483647)
+    if fault == "directory":
+        process.mkdir()
+    elif fault == "symlink":
+        decoy = shop.tmp / (process.parent.name + "-foreign-process.json")
+        decoy.write_text(json.dumps({"step": 1, "group": group}))
+        symlink_or_skip(decoy, process)
+    elif fault == "oversized":
+        process.write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    else:
+        process.write_text(json.dumps({"step": 1, "group": group}))
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_failed_mailbox_binding_cannot_fall_back_to_saved_packet(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    packet, marker = folder / "packet.md", folder / "admitted.json"
+    changed = packet.read_bytes() + b"\n"
+    packet.write_bytes(changed)
+    reference = json.loads(marker.read_bytes())
+    reference["packet_sha256"] = hashlib.sha256(changed).hexdigest()
+    marker.write_text(json.dumps(reference))
+    reservation = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+    assert shop.workspace.grant("writer")["request_id"] == reservation
+    before = {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+    for _ in range(2):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+        assert row["reason"] == "execution_custody_unknown", row
+        assert row["detail"] == "persisted admission revalidation failed"
+        assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
+        assert shop.receipts("job-1") == []
+        assert job_fixtures.ledger_rows(shop, holder="job:pilot/job-1")[reservation]["state"] == "granted"
+        assert {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("first", ["null", "live"])
+def test_settlement_uses_one_process_snapshot(kind_shop, first):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    initiative = store.load().initiative("pilot")
+    process = folder / "process.json"
+    jobs.write_result(jobs.Job(store.path, initiative, message), "refused", None, reason="fixture terminal refusal")
+    original, captured = jobs.Job.process_record, []
+    group = os.getpgrp()
+
+    def record(job):
+        answer = original(job)
+        captured.append(True)
+        process.write_text(json.dumps({"step": 1, "group": group if first == "null" else None}))
+        return answer
+
+    for _ in range(2):
+        captured.clear()
+        process.write_text(json.dumps({"step": 1, "group": None if first == "null" else group}))
+        with patch.object(jobs.Job, "process_record", record):
+            expected = ("job has an unrecorded process effect: pilot/job-1" if first == "null" else
+                        "job process group is still running: " + str(group))
+            with pytest.raises(ValueError, match="^" + re.escape(expected) + "$"):
+                jobs.settle(store, jobs.Job(store.path, initiative, message), 0)
+        assert captured == [True]
+        assert shop.receipts("job-1") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_process_disappearance_during_acquisition_is_not_initial_absence(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    process = folder / "process.json"
+    saved = process.read_bytes()
+    original_open, changed = os.open, []
+
+    def open_node(path, *args, **kwargs):
+        if str(path) == "process.json" and kwargs.get("dir_fd") is not None:
+            process.unlink()
+            changed.append(True)
+        return original_open(path, *args, **kwargs)
+
+    for _ in range(2):
+        changed.clear()
+        process.write_bytes(saved)
+        with patch.object(job_fixtures.jobs2_fresh_brief, "os", SimpleNamespace(**{**vars(os), "open": open_node})):
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+            assert row["state"] == "settle_pending" and row["error"] == PROCESS_REPAIR_ERROR, row
+        assert changed == [True]
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("value", ["untrusted-group\nsecond-line", "A" * 64, "b" * 64], ids=["malformed", "uppercase", "mismatch"])
+def test_recovery_recipe_digest_comes_from_actual_bytes(kind_shop, capsys, value):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    marker = folder / "admitted.json"
+    reference = json.loads(marker.read_bytes())
+    reference["recipes_sha256"] = value
+    marker.write_text(json.dumps(reference))
+    for _ in range(2):
+        assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+        expected = "recipes changed after admission" if value == "b" * 64 else "persisted admission revalidation failed"
+        assert row["state"] == "evidence_error", row
+        assert row["error"] == row["detail"] == expected
+        assert row["source"]["state"] == "unavailable"
+        assert "untrusted-group" not in output and "second-line" not in output
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+        assert row["detail"] == expected and row["reason"] == "execution_custody_unknown"
+        assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_planned_recovery_requires_recipe_bytes_without_changing_legacy(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    argv = shop.argv("recovery-status", census=[], lock_wait=0)[3:]
+    position = argv.index("--recipes")
+    del argv[position:position + 2]
+    for _ in range(2):
+        assert jobs.main(argv) == 3
+        report = json.loads(capsys.readouterr().out)
+        row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+        assert row["state"] == "admission_unverified"
+        assert row["source"] == {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                                 "recipe_bytes_unavailable": True}
+        assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+        assert "error" not in row and "detail" not in row
+    assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+    plan = shop.base / "host-plan.json"
+    saved_plan = plan.read_bytes()
+    plan.unlink()
+    try:
+        assert jobs.main(argv) == 3
+        report = json.loads(capsys.readouterr().out)
+        row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+        assert row["state"] == "admitted" and row["source"]["state"] == "match"
+    finally:
+        plan.write_bytes(saved_plan)
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", ["missing", "oversized", "symlink", "unsupported", "leaf-swap", "ancestor-swap"])
+def test_recovery_recipe_acquisition_is_bounded_and_anchored(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    mailbox = jobs.Mailbox(shop.root)
+    message = mailbox.messages()["job-1"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    root = shop.tmp / "recipe-root"
+    root.mkdir()
+    recipe = root / "recipes.json"
+    recipe.write_bytes(shop.recipes_path.read_bytes())
+    saved, decoy = shop.tmp / "retained-recipe-node", shop.tmp / "foreign-recipe-node"
+    if fault == "ancestor-swap":
+        decoy.mkdir()
+        (decoy / recipe.name).write_bytes(recipe.read_bytes())
+    else:
+        decoy.write_bytes(recipe.read_bytes())
+    if fault == "missing":
+        recipe.unlink()
+    elif fault == "oversized":
+        recipe.write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    elif fault == "symlink":
+        recipe.unlink()
+        symlink_or_skip(decoy, recipe)
+    original_open, changed = os.open, []
+
+    def open_node(path, *args, **kwargs):
+        if str(path) == recipe.name and kwargs.get("dir_fd") is not None and not changed:
+            node = root if fault == "ancestor-swap" else recipe
+            if fault in ("leaf-swap", "ancestor-swap"):
+                node.rename(saved)
+                symlink_or_skip(decoy, node, target_is_directory=fault == "ancestor-swap")
+            changed.append(True)
+        return original_open(path, *args, **kwargs)
+
+    for _ in range(2):
+        changed.clear()
+        try:
+            with ExitStack() as active:
+                active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "os",
+                                                 SimpleNamespace(**{**vars(os), "open": open_node})))
+                if fault == "unsupported":
+                    active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
+                unavailable = {"state": "unavailable", "reason": "planned recipe bytes unavailable",
+                               "recipe_bytes_unavailable": True}
+                assert jobs.recovery_source(job, mailbox, None, recipe) == unavailable
+                if fault != "unsupported":
+                    argv = shop.argv("recovery-status", census=[], lock_wait=0)[3:]
+                    argv[argv.index("--recipes") + 1] = str(recipe)
+                    assert jobs.main(argv) == 3
+                    row = next(row for row in json.loads(capsys.readouterr().out)["jobs"] if row["job"] == "pilot/job-1")
+                    assert row["state"] == "admission_unverified" and row["source"] == unavailable
+                    assert row["next_action"] == ADMISSION_UNVERIFIED_ACTION
+                    assert "error" not in row and "detail" not in row
+                assert not job.admission_validated and job.admission_detail is None
+            if fault in ("leaf-swap", "ancestor-swap"):
+                assert changed == [True]
+            else:
+                assert changed == []
+        finally:
+            node = root if fault == "ancestor-swap" else recipe
+            if fault in ("leaf-swap", "ancestor-swap") and node.is_symlink():
+                node.unlink()
+            if saved.exists():
+                saved.rename(node)
+    assert shop.receipts("job-1") == [] and not (folder / "execution.json").exists()
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", PROCESS_FAULTS)
+def test_admitted_and_result_consumers_refuse_hostile_groups(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    initiative = store.load().initiative("pilot")
+    raw = (folder / "packet.md").read_bytes()
+    recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
+    install_process_fault(shop, folder / "process.json", fault)
+    with ExitStack() as active:
+        if fault == "unsupported":
+            active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
+        for _ in range(2):
+            job = jobs.Job(store.path, initiative, message)
+            expected = ("admission metadata requires directory descriptor support" if fault == "unsupported"
+                        else PROCESS_REPAIR_ERROR)
+            with pytest.raises(ValueError, match="^" + re.escape(expected) + "$"):
+                job.take_execution(raw, recipes)
+            assert not (folder / "execution.json").exists()
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            row = job_fixtures.job_row(json.loads(output))
+            assert row["state"] == "settle_pending" and row["error"] == PROCESS_REPAIR_ERROR
+            assert "untrusted-group" not in output and "second-line" not in output
+            assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+            output = capsys.readouterr().out
+            row = next(row for row in json.loads(output)["jobs"] if row["job"] == "pilot/job-1")
+            assert row["state"] == "evidence_error" and row["error"] == PROCESS_REPAIR_ERROR
+            assert row["process_group"] is None and row["process_alive"] is None
+            assert "untrusted-group" not in output and "second-line" not in output
+        # A syntactically valid terminal result cannot release custody with malformed process evidence.
+        job = jobs.Job(store.path, initiative, message)
+        jobs.write_result(job, "refused", None, reason="fixture terminal refusal", process_stopped_confirmed=True)
+        before = (folder / "result.json").read_bytes()
+        for _ in range(2):
+            with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
+                jobs.settle(store, jobs.Job(store.path, initiative, message), 0)
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+            assert row["state"] == "settle_pending" and row["error"] == PROCESS_REPAIR_ERROR
+            assert (folder / "result.json").read_bytes() == before
+        assert shop.receipts("job-1") == []
+        # A closed request with retained capacity reaches finish_closed_jobs' separate settlement entry.
+        reservation = shop.workspace.ask("pilot", "writer", "job:pilot/job-1")
+        assert shop.workspace.grant("writer")["request_id"] == reservation
+        shop.publish("job-1-owner-closed", "job_receipt", "Owner closed this request.", sender="pilot/root",
+                     to="pilot/orchestrator", in_reply_to="job-1", receipt={"state": "refused", "reason": "owner closed"})
+        receipts = shop.receipts("job-1")
+        for _ in range(2):
+            assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+            row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+            assert row["state"] == "settle_pending" and row["error"] == PROCESS_REPAIR_ERROR
+            assert shop.receipts("job-1") == receipts
+            assert job_fixtures.ledger_rows(shop, holder="job:pilot/job-1")[reservation]["state"] == "granted"
+            assert (folder / "result.json").read_bytes() == before
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("fault", PROCESS_FAULTS)
+def test_derivation_stopped_refusal_row_is_opaque_and_actionable(kind_shop, capsys, fault):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    # Keep the admitted predecessor from executing before the separate staging request is inspected.
+    install_process_fault(shop, folder / "process.json", "text" if fault == "unsupported" else fault)
+    shop.request_job("job-2", "commit-exact", raw=jobs.packet_text((folder / "packet.md").read_bytes()))
+    original = jobs.record_process
+    injected = []
+
+    def record_process(job, record, suffix):
+        if job.id != "pilot/job-2":
+            return original(job, record, suffix)
+        # The process-record filesystem publication boundary fails after hostile metadata appears.
+        install_process_fault(shop, job.process_path, fault)
+        if fault == "unsupported":
+            active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
+        injected.append(True)
+        raise OSError(errno.EIO, "process metadata publication unavailable")
+
+    with ExitStack() as active:
+        active.enter_context(patch.object(jobs, "record_process", record_process))
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = job_fixtures.job_row(json.loads(output), "job-2")
+        assert injected == [True], row
+        assert row["state"] == "abandoned" and row["process_group"] is None and row["process_alive"] is None
+        assert "staging stop is unconfirmed" in row["reason"] and PROCESS_REPAIR_ACTION in row["reason"]
+        assert "untrusted-group" not in output and "second-line" not in output
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+        output = capsys.readouterr().out
+        row = job_fixtures.job_row(json.loads(output), "job-2")
+        assert row["process_group"] is None
+        assert "untrusted-group" not in output and "second-line" not in output
+    target = shop.workspace.store / "jobs/pilot/job-2"
+    assert not (target / "result.json").exists() and shop.receipts("job-2") == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("name", ["admitted.json", "packet.md", "derivation.json"])
+def test_planned_admission_size_limit_precedes_open_and_parse(kind_shop, name):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    raw = (folder / "packet.md").read_bytes()
+    recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
+    (folder / name).write_bytes(b" " * (jobs.MAX_BYTES + 1))
+    original_open = os.open
+    opened = []
+
+    def open_node(path, *args, **kwargs):
+        if str(path) == name and kwargs.get("dir_fd") is not None:
+            opened.append(True)
+        return original_open(path, *args, **kwargs)
+
+    def parse(_):
+        pytest.fail("oversized admission metadata reached the parser")
+
+    with patch.object(jobs, "strict_json", parse):
+        with patch.object(job_fixtures.jobs2_fresh_brief, "os", SimpleNamespace(**{**vars(os), "open": open_node})):
+            for _ in range(2):
+                with pytest.raises(ValueError, match="^input exceeds 262144 bytes$"):
+                    jobs.admitted_derivation(job, raw, recipes)
+                assert job.admission_detail is None and not job.admission_validated
+    assert opened == []
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_planned_recovery_does_not_fall_back_to_path_only_marker_reads(kind_shop, capsys):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    original = jobs.read_json
+
+    def read_json(path):
+        if path == folder / "admitted.json":
+            raise PermissionError(errno.EACCES, "path-only metadata access unavailable")
+        return original(path)
+
+    with patch.object(jobs, "read_json", read_json):
+        for _ in range(2):
+            assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
+            report = json.loads(capsys.readouterr().out)
+            row = next(row for row in report["jobs"] if row["job"] == "pilot/job-1")
+            assert row["state"] == "admitted" and row["source"]["state"] == "match"
+            assert "error" not in row
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+def test_planned_admission_unsupported_descriptors_refuses_before_io(kind_shop):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    store = jobs.Store(shop.workspace.store)
+    message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
+    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    raw = (folder / "packet.md").read_bytes()
+    recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
+
+    def read_reference(*args, **kwargs):
+        pytest.fail("unsupported descriptor acquisition reached metadata IO")
+
+    with patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False):
+        with patch.object(job_fixtures.jobs2_fresh_brief, "_read_reference", read_reference):
+            for _ in range(2):
+                with pytest.raises(ValueError, match="^admission metadata requires directory descriptor support$"):
+                    jobs.admitted_derivation(job, raw, recipes)
+                assert job.admission_detail is None and not job.admission_validated
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("component", ["leaf", "ancestor"])
+def test_planned_admission_rejects_concurrent_node_replacement(kind_shop, capsys, component):
+    shop = kind_shop
+    folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
+    marker = folder / "admitted.json"
+    node = marker if component == "leaf" else folder
+    saved = shop.tmp / "retained-admission-node"
+    decoy = shop.tmp / "foreign-admission-node"
+    if component == "ancestor":
+        decoy.mkdir()
+        (decoy / "admitted.json").write_bytes(b"{}")
+    else:
+        decoy.write_bytes(b"{}")
+    original_open = os.open
+    changed = []
+
+    def open_node(path, *args, **kwargs):
+        if str(path) == "admitted.json" and kwargs.get("dir_fd") is not None and not changed:
+            node.rename(saved)
+            symlink_or_skip(decoy, node, target_is_directory=component == "ancestor")
+            changed.append(True)
+        return original_open(path, *args, **kwargs)
+
+    for _ in range(2):
+        changed.clear()
+        try:
+            local_os = SimpleNamespace(**{**vars(os), "open": open_node})
+            with patch.object(job_fixtures.jobs2_fresh_brief, "os", local_os):
+                assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
+                row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
+            assert changed == [True]
+            assert row["reason"] == "execution_custody_unknown" and row["process_alive"] is None
+            assert "detail" not in row
+            assert shop.receipts("job-1") == []
+        finally:
+            if node.is_symlink():
+                node.unlink()
+            if saved.exists():
+                saved.rename(node)
+        assert not (folder / "execution.json").exists() and not (folder / "result.json").exists()
 
 
 @pytest.mark.usefixtures("jobs2_fresh_cache")
