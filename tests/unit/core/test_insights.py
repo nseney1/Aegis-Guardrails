@@ -1264,6 +1264,7 @@ S0 = {
 }
 # The storage split accompanies storage at all three hook stages.
 NEW_MODULES = frozenset({"aegis_core.redaction", "aegis_core.storage_shared",
+                         "aegis_core.gitsafe_run",
                          *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
 REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
                          "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})

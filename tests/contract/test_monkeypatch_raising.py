@@ -2078,6 +2078,16 @@ def _ban_identity(key):
 # Each group lists zero-based occurrences of identical syntax within its lexical scope.
 # Registrations certify today's otherwise unprovable uses, never a wildcard.
 PROOF_REGISTRATION_GROUPS = {
+    ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'GM-5 r7 fixture context restores the real ambient environment after the redirect refusal; its body is independently censused.'),
+    ('tests/unit/core/test_team_git.py', 'test_runner_environment_redirects_refuse_before_spawn', 'fixture', 'scoped.setenv', False):
+        ((0,), 'GM-5 r7 temporarily sets one real Git environment redirect to verify zero Popen calls and successful recovery; context restores the variable.'),
+    ('tests/unit/core/test_team_git.py', 'test_runner_ambient_redirect_before_entry_refuses_and_retries', 'fixture', 'monkeypatch.context', False):
+        ((0,), 'GM-5 r7 fixture context restores the real ambient environment after store-entry refusal; its body is independently censused.'),
+    ('tests/unit/core/test_team_git.py', 'test_runner_ambient_redirect_before_entry_refuses_and_retries', 'fixture', 'scoped.setenv', False):
+        ((0,), 'GM-5 r7 sets a real Git environment redirect before store entry to verify refusal before every Popen, then restores it for retry.'),
+    ('tests/unit/core/test_team_git.py', 'test_global_merge_driver_is_refused_before_merge_tree', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1), 'GM-5 r7 points HOME and USERPROFILE at the test-owned global Git config so the real preflight and target share that configuration without caller spawn overrides.'),
     ('tests/unit/core/test_approval_policy.py', '_policy_environment', 'fixture', 'monkeypatch.setenv', False):
         ((0,), 'GM-1 temporary-home fixture applies its own environment and clears inherited GitHub/Git selectors for isolated policy checks.'),
     ('tests/unit/core/test_approval_policy.py', '_policy_environment', 'fixture', 'monkeypatch.delenv', False):
