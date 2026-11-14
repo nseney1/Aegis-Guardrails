@@ -4828,11 +4828,11 @@ recipe = Path(%r)
 events = Path(%r) / 'events'
 seen['reads'] = {}
 seen['journal_phases'] = {}
-seen['recipe_parses'] = 0
+seen['recipe_preflight_parses'] = 0
 operations = []
 def profiled(frame, event, arg):
-    if event == 'call' and frame.f_code.co_name == 'strict_json' and frame.f_back.f_code.co_name == 'recipe_file':
-        seen['recipe_parses'] += 1
+    if event == 'call' and frame.f_code.co_name == 'strict_json' and frame.f_back.f_code.co_name == '_validate_captured_recipes':
+        seen['recipe_preflight_parses'] += 1
 sys.setprofile(profiled)
 old_open, old_fd = io.open, os.open
 def track(path):
@@ -4865,7 +4865,7 @@ io.open, os.open = opened, descriptor
         answer, seen = r7_router_probe(world, injection)
         assert answer["small_changes"][0]["state"] == "checking", answer
         assert len(world.messages("job_request")) == checks
-        assert seen["reads"][str(world.recipes_path)] == 1 and seen["recipe_parses"] == 1, seen
+        assert seen["reads"][str(world.recipes_path)] == 1 and seen["recipe_preflight_parses"] == 1, seen
         phases = seen["journal_phases"]
         assert set(phases) == {"capture-0", "capture-1", "capture-2"}, seen
         assert all(counts and set(counts.values()) == {1} for counts in phases.values()), seen
@@ -5509,8 +5509,69 @@ os.open = opened
     assert len(list((root / "docs/lane").glob("*scw-*.md"))) == 1
 
 
+@pytest.mark.parametrize("command", ["status", "dispatch"])
+@pytest.mark.parametrize("count", [1, 256])
+@pytest.mark.parametrize("changed", [False, True])
+def test_recipe_folder_validation_uses_linear_metadata_work(tmp_path, command, count, changed):
+    hide, bind = tmp_path / "public-hide", tmp_path / "public-bind"
+    hide.mkdir()
+    bind.mkdir()
+    class FolderWorld(DispatchWorld):
+        def save_recipes(self):
+            self.recipes.update(hide=[str(hide)] * count, ro_binds=[str(bind)] * count)
+            super().save_recipes()
+    world = FolderWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    if changed:
+        world.recipes["recipes"]["focused"]["steps"][0][-1] = "print('changed')"
+        world.save_recipes()
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    injection = r'''
+import hierarchy_jobs as jobs
+import hierarchy_small_change_dispatch as dispatch
+folders = set(map(Path, %r))
+seen['folder_probes'], seen['folder_guards'] = {}, {}
+class RecipePath(type(Path())):
+    def is_dir(self):
+        if self in folders:
+            key = str(self)
+            seen['folder_probes'][key] = seen['folder_probes'].get(key, 0) + 1
+        return super().is_dir()
+original_check = dispatch.checked_path
+def checked(path):
+    if Path(path) in folders:
+        key = str(path)
+        seen['folder_guards'][key] = seen['folder_guards'].get(key, 0) + 1
+    return original_check(path)
+jobs.Path, dispatch.checked_path = RecipePath, checked
+''' % [str(hide), str(bind)]
+    report, seen = r7_router_probe(world, injection, command=command)
+    row = report["small_changes"][0]
+    if changed:
+        assert (row["state"], row["reason"], row["detail"]) == (
+            "held", "small_change_recipe_mismatch", "admitted recipe file changed"), row
+    else:
+        assert row["state"] == "checking", row
+    assert set(seen["folder_probes"]) == {str(hide), str(bind)}, seen
+    limit = count if changed else 2 * count
+    assert all(count <= probes <= limit for probes in seen["folder_probes"].values()), seen
+    assert seen["folder_guards"] == {str(hide): count, str(bind): count}, seen
+    assert len(world.messages("job_request")) == (1 if command == "dispatch" and not changed else 0)
+    if changed or command == "status":
+        assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
 @pytest.mark.parametrize("variant", ["steady", "schema", "python", "path", "env-name", "env-value", "extra", "recipe-kind",
-                                     "steps", "boolean", "identity", "prefix", "valid-env", "valid-prefix", "valid-identity"])
+                                     "steps", "boolean", "identity", "prefix", "valid-env", "valid-prefix", "valid-identity",
+                                     "census-count", "census-report", "census-ignore", "census-invalid", "census-bool",
+                                     "census-int", "census-list", "census-dict", "census-null", "free-zero", "free-invalid",
+                                     "free-bool", "valid-folders", "hide-type", "ro-binds-type", "malformed-json",
+                                     "duplicate-key", "invalid-utf8", "null", "array", "hide-relative", "ro-binds-relative",
+                                     "hide-existing-relative", "ro-binds-existing-relative", "schema-hide-type",
+                                     "missing-hide-type", "python-hide-type", "census-hide-relative", "hide-file-prefix",
+                                     "hide-file-private", "hide-private-invalid-type", "ro-binds-private-invalid-type",
+                                     "header-symlink"])
 def test_r9_recipe_validation_matches_the_public_runner(tmp_path, variant):
     world = DispatchWorld(tmp_path)
     table = world.recipes
@@ -5531,8 +5592,51 @@ def test_r9_recipe_validation_matches_the_public_runner(tmp_path, variant):
     if variant == "valid-identity":
         table["recipes"]["other"] = {"kind": "commit", "timeout_seconds": 5, "sandbox": "none"}
         table["identity"] = {"name": "Fixture", "email": "fixture@example.invalid"}
+    policies = {"census-count": "count", "census-report": "report", "census-ignore": "ignore",
+                "census-invalid": "off", "census-bool": False, "census-int": 1, "census-list": [],
+                "census-dict": {}, "census-null": None}
+    if variant in policies: table["census_outside_policy"] = policies[variant]
+    if variant == "free-zero": table["min_free_gigabytes"] = 0
+    if variant == "free-invalid": table["min_free_gigabytes"] = -1
+    if variant == "free-bool": table["min_free_gigabytes"] = True
+    if variant == "valid-folders": table.update(hide=[str(world.checkout)], ro_binds=[str(world.checkout)])
+    if variant == "hide-type": table["hide"] = "invalid"
+    if variant == "ro-binds-type": table["ro_binds"] = [None]
+    unreachable = []
+    if variant in {"hide-relative", "ro-binds-relative", "hide-existing-relative", "ro-binds-existing-relative"}:
+        field = "hide" if variant.startswith("hide-") else "ro_binds"
+        table[field] = ([str(world.checkout)] if "existing" in variant else []) + ["relative"]
+        unreachable.append("relative")
+    if variant == "schema-hide-type": table.update(schema="unexpected/v99", hide="invalid")
+    if variant == "missing-hide-type":
+        table.clear()
+        table["hide"] = "invalid"
+    if variant == "python-hide-type": table.update(python="relative", hide="invalid")
+    if variant == "census-hide-relative":
+        table.update(census_outside_policy="off", hide=["relative"])
+        unreachable.append("relative")
+    if variant in {"hide-file-prefix", "hide-file-private", "hide-private-invalid-type", "ro-binds-private-invalid-type"}:
+        regular = tmp_path / "folder-is-a-file"
+        regular.write_text("not a directory")
+        private = tmp_path / "home/.codex/unreached"
+        private.mkdir(parents=True)
+        if variant == "hide-file-prefix": table.update(hide=[str(regular)], prefix=["relative"])
+        if variant == "hide-file-private": table["hide"] = [str(regular), str(private)]
+        if variant == "hide-private-invalid-type": table["hide"] = [str(private), None]
+        if variant == "ro-binds-private-invalid-type": table["ro_binds"] = [str(private), None]
+        unreachable.append(str(private))
+    if variant == "header-symlink":
+        from tests.conftest import symlink_or_skip
+        target, linked = tmp_path / "public-folder", tmp_path / "folder-link"
+        target.mkdir()
+        symlink_or_skip(target, linked, target_is_directory=True)
+        table.clear()
+        table.update(schema="other/v1", hide=[str(linked)])
+        unreachable.append(str(linked))
     # Malformed configuration refuses before provenance comparison. A valid changed table reaches that comparison.
     raw = json.dumps(table).encode()
+    raw = {"malformed-json": b"{", "duplicate-key": b'{"schema":"a","schema":"b"}',
+           "invalid-utf8": b"\xff", "null": b"null", "array": b"[]"}.get(variant, raw)
     world.recipes_path.write_bytes(raw)
     script = """import json,sys
 sys.path.insert(0,sys.argv[1]); import hierarchy_jobs as jobs
@@ -5547,7 +5651,30 @@ print(json.dumps(result))
     expected = json.loads(proc.stdout)
     world.dispatch()
     world.finish_writer()
-    row = world.dispatch()["small_changes"][0]
+    injection = PRIVATE_ROOT_PROBE + r'''
+import hierarchy_small_change_dispatch as dispatch
+unreachable = set(map(Path, %r))
+seen['unreached_accesses'], seen['unreached_checks'] = [], []
+original_record, original_check = _probe_record, dispatch.checked_path
+def recorded(kind, value, kwargs=None):
+    path = original_record(kind, value, kwargs)
+    if path is not None and any(path == entry or entry in path.parents for entry in unreachable):
+        seen['unreached_accesses'].append({'path': str(path), 'kind': kind})
+    return path
+def checked(path):
+    if Path(path) in unreachable: seen['unreached_checks'].append(str(path))
+    return original_check(path)
+_probe_record, dispatch.checked_path = recorded, checked
+seen.update(roots=_probe_roots, accesses=_probe_accesses)
+''' % unreachable
+    def dispatch_row(command="dispatch", telemetry=None):
+        if not unreachable:
+            return world.dispatch(command=command)["small_changes"][0]
+        report, seen = r7_router_probe(world, injection, command=command, telemetry=telemetry, extra=("--wait", "5"))
+        assert seen["unreached_accesses"] == seen["unreached_checks"] == [], seen
+        assert_private_root_probes(seen["roots"], seen["accesses"])
+        return report["small_changes"][0]
+    row = dispatch_row()
     if expected["ok"] and variant == "steady":
         assert row["state"] == "checking", row
     elif expected["ok"]:
@@ -5555,6 +5682,22 @@ print(json.dumps(result))
     else:
         assert (row["state"], row.get("reason")) == ("held", "small_change_configuration"), row
         assert row["detail"] == expected["error"], (row, expected)
+        assert "release_validation_error" not in row, row
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    retried = dispatch_row()
+    for field in ("state", "reason", "detail"):
+        assert retried.get(field) == row.get(field), (retried, row)
+    assert "release_validation_error" not in retried, retried
+    if variant in {"hide-relative", "hide-file-private", "header-symlink"}:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(dispatch_row, "status", tmp_path / ("parity-reader-%d.json" % i)) for i in range(2)]
+            for future in futures:
+                current = future.result(timeout=40)
+                for field in ("state", "reason", "detail"):
+                    assert current.get(field) == row.get(field), (current, row)
+                assert "release_validation_error" not in current, current
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
 def test_r9_wake_absence_is_rechecked_at_the_final_publication_hook(tmp_path):
@@ -6599,11 +6742,11 @@ def test_r14_execution_source_export_is_required_and_bound_to_packet(tmp_path, d
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
-@pytest.mark.xfail(strict=True, reason="R15: deferred until JOBS-1 public validate_recipes(data) lands")
-def test_r14_census_recipe_uses_the_same_public_validation(tmp_path):
+@pytest.mark.parametrize("policy", ["count", "report", "ignore"])
+def test_r14_census_recipe_uses_the_same_public_validation(tmp_path, policy):
     class CensusWorld(DispatchWorld):
         def save_recipes(self):
-            self.recipes['census_outside_policy'] = 'ignore'
+            self.recipes['census_outside_policy'] = policy
             super().save_recipes()
     world = CensusWorld(tmp_path)
     assert world.run_jobs()['rows'] == []
@@ -6612,6 +6755,18 @@ def test_r14_census_recipe_uses_the_same_public_validation(tmp_path):
     world.finish_writer()
     row = world.dispatch()['small_changes'][0]
     assert row['state'] == 'checking' and len(world.messages('job_request')) == 1, row
+    # Retrying publication and concurrent readers retain the admitted hash without duplicate effects.
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    assert world.dispatch()['small_changes'][0]['state'] == 'checking'
+    from concurrent.futures import ThreadPoolExecutor
+    def projection():
+        return world.run("status", "--recipes", str(world.recipes_path), "--wait", "5")["small_changes"][0]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(projection) for _ in range(2)]
+        for future in futures:
+            current = future.result(timeout=40)
+            assert current['state'] == 'checking', current
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
 @pytest.mark.parametrize('host_kind', ['codex-cli', 'claude-code'])
