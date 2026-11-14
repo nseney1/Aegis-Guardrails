@@ -1,0 +1,73 @@
+{
+  "tools": [
+    {
+      "name": "aegis_team_queue",
+      "description": "List queue items. Read-only.",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "title": "Team Queue"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "maxItems": 128,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Capability filter."
+          },
+          "include_done": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include done."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "aegis_team_queue_claim",
+      "description": "Claim an item from aegis_team_queue using this owner-bound orchestrator connection. Lane policy supplies capabilities, branch and TTL; no host launch.",
+      "annotations": {
+        "readOnlyHint": false,
+        "title": "Claim Queue Item"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+            "description": "Queue item ID."
+          },
+          "expect": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Revision from aegis_team_queue."
+          },
+          "lane": {
+            "type": "string",
+            "maxLength": 63,
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+            "description": "Owner-admitted lane."
+          }
+        },
+        "required": [
+          "id",
+          "expect",
+          "lane"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
