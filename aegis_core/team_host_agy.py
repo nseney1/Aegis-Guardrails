@@ -119,7 +119,7 @@ class Adapter:
                 "auth_modes": ["sso", "token", "api"], "qualification": "pending",
                 "auto_update": {"verified": False, "control": None},
                 "native_session_marker": None,
-                "session_markers": ["AEGIS_TEAM_HOST", "AEGIS_TEAM_SESSION"],
+                "session_markers": list(get("antigravity").session_markers),
                 "transcript_location": "~/.gemini/antigravity/brain/{session}/transcript.jsonl",
                 "transcript_evidence": "hook event contract; native admission probe pending",
                 "billing_variables": list(get("antigravity").billing_variables)}

@@ -11,7 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import hosts as registry, team_hosts as hosts, team_profile as profile
+from aegis_core import hosts as registry, team_host_agy, team_hosts as hosts, team_profile as profile
+from tools import hierarchy_hosts
 
 
 RESET = "2026-11-16T22:00:00Z"
@@ -77,15 +78,215 @@ def test_generic_scrub_uses_every_registry_row_and_prefix(monkeypatch):
     assert snapshot == source and snapshot is not source
 
 
-def test_registry_scrub_covers_legacy_host_environment_catalog():
-    from tools import hierarchy_hosts
+def _tools_environment_projection(rows):
+    expected = {}
+    for spec in rows:
+        expected[spec.id] = {
+            "billing_variables": spec.billing_variables,
+            "session_variable": {"name": spec.session_variable, "verified_for_mcp": False},
+            "session_markers": {
+                "names": tuple(name for name in spec.session_markers
+                               if name not in registry.TEAM_SESSION_MARKERS
+                               and not name.startswith(spec.session_marker_prefixes)),
+                "prefixes": spec.session_marker_prefixes}}
+    # The native legacy kind is a surface alias of the core Codex plane.
+    expected["codex"] = expected[registry.resolve("codex")]
+    return expected
+
+
+def _assert_tools_environment_projection(rows, catalog):
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+    if encoded(catalog) != encoded(_tools_environment_projection(rows)):
+        raise AssertionError("host environment catalog drift")
+
+
+def test_tools_environment_catalog_is_exact_core_projection():
+    _assert_tools_environment_projection(registry.all_hosts(), hierarchy_hosts.HOST_ENVIRONMENT)
+    for kind in hierarchy_hosts.HOST_KINDS:
+        row = hierarchy_hosts.entry(kind)
+        observed = {key: row[key] for key in ("billing_variables", "session_variable", "session_markers")}
+        assert json.dumps(observed, sort_keys=True) == json.dumps(hierarchy_hosts.HOST_ENVIRONMENT[kind], sort_keys=True)
+
+
+@pytest.mark.parametrize("side", ("core", "tools", "both"))
+def test_projection_guard_detects_future_hosts_in_either_catalog(side):
+    rows = registry.all_hosts()
+    catalog = deepcopy(hierarchy_hosts.HOST_ENVIRONMENT)
+    if side in ("core", "both"):
+        rows += (replace(registry.get("windsurf"), id="future-host", billing_variables=("FUTURE_KEY",),
+                         session_variable="FUTURE_SESSION", session_markers=("FUTURE_SESSION",),
+                         session_marker_prefixes=("FUTURE_CHILD_",)),)
+    if side in ("tools", "both"):
+        catalog["future-host"] = {
+            "billing_variables": ("FUTURE_KEY",),
+            "session_variable": {"name": "FUTURE_SESSION", "verified_for_mcp": False},
+            "session_markers": {"names": ("FUTURE_SESSION",), "prefixes": ("FUTURE_CHILD_",)}}
+    if side == "both":
+        _assert_tools_environment_projection(rows, catalog)
+    else:
+        with pytest.raises(AssertionError, match="^host environment catalog drift$"):
+            _assert_tools_environment_projection(rows, catalog)
+
+
+@pytest.mark.parametrize("field", ("billing_variables", "session_variable", "session_markers", "session_marker_prefixes"))
+@pytest.mark.parametrize("direction", ("missing", "extra"))
+def test_projection_guard_detects_name_drift(field, direction):
+    catalog = deepcopy(hierarchy_hosts.HOST_ENVIRONMENT)
+    row = catalog["codex-cli"]
+    if field == "billing_variables":
+        row[field] = row[field][1:] if direction == "missing" else (*row[field], "FUTURE_KEY")
+    elif field == "session_variable":
+        row[field]["name"] = "" if direction == "missing" else "FUTURE_SESSION"
+    elif field == "session_markers":
+        names = row[field]["names"]
+        row[field]["names"] = names[1:] if direction == "missing" else (*names, "FUTURE_MARKER")
+    else:
+        markers = catalog["claude-code"]["session_markers"]
+        prefixes = markers["prefixes"]
+        markers["prefixes"] = prefixes[1:] if direction == "missing" else (*prefixes, "FUTURE_CHILD_")
+    with pytest.raises(AssertionError, match="^host environment catalog drift$"):
+        _assert_tools_environment_projection(registry.all_hosts(), catalog)
+
+
+def test_tools_only_registry_import_has_no_core_dependency():
+    script = """import importlib.util, json, sys
+sys.path.insert(0, sys.argv[1])
+assert importlib.util.find_spec('aegis_core') is None
+import hierarchy_hosts
+assert importlib.util.find_spec('aegis_core') is None
+assert 'aegis_core' not in sys.modules
+print(json.dumps(hierarchy_hosts.describe()))
+"""
+    result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", script,
+                             str(Path(__file__).resolve().parents[3] / "tools")],
+                            capture_output=True, text=True, timeout=10)
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == json.dumps(hierarchy_hosts.describe()) + "\n"
+
+
+@pytest.mark.parametrize("direction", ("core-to-tools", "tools-to-core"))
+@pytest.mark.parametrize("future", (False, True))
+def test_registry_scrub_covers_legacy_host_environment_catalog(monkeypatch, direction, future):
+    rows = registry.all_hosts()
+    catalog = deepcopy(hierarchy_hosts.HOST_ENVIRONMENT)
+    if future:
+        rows += (replace(registry.get("windsurf"), id="future-host",
+                         billing_variables=("FUTURE_KEY",), session_variable="FUTURE_SESSION",
+                         session_markers=("FUTURE_SESSION",),
+                         session_marker_prefixes=("FUTURE_CHILD_",)),)
+        catalog["future-host"] = {
+            "billing_variables": ["FUTURE_KEY"],
+            "session_variable": {"name": "FUTURE_SESSION", "verified_for_mcp": False},
+            "session_markers": {"names": ["FUTURE_SESSION"], "prefixes": ["FUTURE_CHILD_"]}}
+    monkeypatch.setattr(hosts, "host_registry", SimpleNamespace(all_hosts=lambda: rows))
+    monkeypatch.setattr(hierarchy_hosts, "HOST_ENVIRONMENT", catalog)
+    monkeypatch.setattr(hierarchy_hosts, "os", SimpleNamespace(name="posix"))
     source = {"PATH": "bin"}
-    for row in hierarchy_hosts.describe()["hosts"].values():
-        source.update({key.lower(): "foreign" for key in row["billing_variables"]})
-        source.update({key.lower(): "foreign" for key in row["session_markers"]["names"]})
-        source[row["session_variable"]["name"].lower()] = "foreign"
-        source.update({prefix.lower() + "child": "foreign" for prefix in row["session_markers"]["prefixes"]})
-    assert hosts.scrub_child_environment(source)[1] == {"PATH": "bin"}
+    if direction == "tools-to-core":
+        for row in catalog.values():
+            source.update({key.lower(): "foreign" for key in row["billing_variables"]})
+            source.update({key.lower(): "foreign" for key in row["session_markers"]["names"]})
+            if row["session_variable"]["name"]:
+                source[row["session_variable"]["name"].lower()] = "foreign"
+            source.update({prefix.lower() + "child": "foreign" for prefix in row["session_markers"]["prefixes"]})
+        assert hosts.scrub_child_environment(source)[1] == {"PATH": "bin"}
+    else:
+        for row in rows:
+            source.update({key: "foreign" for key in row.billing_variables})
+            if row.session_variable:
+                source[row.session_variable] = "foreign"
+            source.update({key: "foreign" for key in row.session_markers
+                           if key not in ("AEGIS_TEAM_HOST", "AEGIS_TEAM_SESSION")})
+            source.update({prefix + "CHILD": "foreign" for prefix in row.session_marker_prefixes})
+        assert hierarchy_hosts.child_environment(source, "no-host") == {"PATH": "bin"}
+
+
+@pytest.mark.parametrize("kind", ("claude-code", "codex-cli", "codex"))
+@pytest.mark.parametrize("platform", ("posix", "nt"))
+@pytest.mark.parametrize("purpose", ("no-host", "host-cli"))
+def test_legacy_environment_projection_preserves_policy(monkeypatch, kind, platform, purpose):
+    from types import MappingProxyType
+
+    monkeypatch.setattr(hierarchy_hosts, "os", SimpleNamespace(name=platform))
+    billing, markers = {
+        "claude-code": (("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                         "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"),
+                        ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT",
+                         "CLAUDE_CODE_FUTURE_MARKER")),
+        "codex-cli": (("OPENAI_API_KEY", "CODEX_API_KEY"),
+                      ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED",
+                       "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_VERSION")),
+        "codex": (("OPENAI_API_KEY", "CODEX_API_KEY"),
+                  ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED",
+                   "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_VERSION")),
+    }[kind]
+    kept = {"PATH": "bin", "AEGIS_TEAM_HOST": "retained", "AEGIS_TEAM_SESSION": "retained",
+            "TEAMS_GEMINI_MODE": "retained", "TEAMS_GEMINI_KEY_FILE": "retained"}
+    source = {**kept, **{name: "modelled-value" for name in (*billing, *markers,
+                                                           "GEMINI_API_KEY", "GOOGLE_API_KEY")}}
+    source.update({name.lower(): value for name, value in list(source.items())})
+    expected = dict(kept)
+    expected.update({name.lower(): value for name, value in kept.items()})
+    if platform == "posix":
+        expected.update({name: value for name, value in source.items() if name.islower()})
+    if purpose == "host-cli":
+        allowed = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if kind == "claude-code" else billing
+        expected.update({name: source[name] for name in (*allowed, "GEMINI_API_KEY", "GOOGLE_API_KEY")})
+        if platform == "nt":
+            expected.update({name.lower(): value for name, value in list(expected.items())})
+    before = dict(source)
+    for _ in range(2):
+        child = hierarchy_hosts.child_environment(MappingProxyType(source), purpose)
+        assert child == expected
+        child["CALLER_CHANGE"] = "private"
+        assert source == before
+    assert hosts.scrub_child_environment(source)[1] == {"PATH": "bin", "path": "bin"}
+    assert hierarchy_hosts.HOST_KINDS == ("claude-code", "codex-cli", "codex")
+
+
+@pytest.mark.parametrize("platform", ("posix", "nt"))
+def test_catalog_scrub_retries_and_concurrent_purposes_are_private(monkeypatch, platform):
+    from concurrent.futures import ThreadPoolExecutor
+    from types import MappingProxyType
+
+    monkeypatch.setattr(hierarchy_hosts, "os", SimpleNamespace(name=platform))
+    catalog = deepcopy(hierarchy_hosts.HOST_ENVIRONMENT)
+    catalog["future-host"] = {
+        "billing_variables": ("FUTURE_KEY",),
+        "session_variable": {"name": "FUTURE_SESSION", "verified_for_mcp": False},
+        "session_markers": {"names": ("FUTURE_SESSION",), "prefixes": ("FUTURE_CHILD_",)}}
+    monkeypatch.setattr(hierarchy_hosts, "HOST_ENVIRONMENT", catalog)
+    source = MappingProxyType({"PATH": "bin", "GEMINI_API_KEY": "modelled-value",
+                               "GOOGLE_API_KEY": "modelled-value", "FUTURE_KEY": "modelled-value",
+                               "FUTURE_SESSION": "foreign", "FUTURE_CHILD_ID": "foreign"})
+
+    def observe(index):
+        purpose = "host-cli" if index % 2 else "no-host"
+        result = hierarchy_hosts.child_environment(source, purpose)
+        expected = {"PATH": "bin"}
+        if purpose == "host-cli":
+            expected.update({name: source[name] for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "FUTURE_KEY")})
+        assert result == expected
+        result["CALLER_CHANGE"] = "private"
+        assert "CALLER_CHANGE" not in source
+        return result
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(observe, range(12)))
+    assert observe(0) == results[0]
+    assert observe(1) == results[1]
+
+
+def test_candidate_description_projects_registry_markers(monkeypatch):
+    row = replace(registry.get("antigravity"), session_markers=("FUTURE_SESSION",))
+    monkeypatch.setattr(team_host_agy, "get", lambda kind: row)
+    adapter = hosts.host_adapter("antigravity")
+    first = adapter.describe()
+    assert first["session_markers"] == ["FUTURE_SESSION"]
+    first["session_markers"].append("CALLER_CHANGE")
+    assert adapter.describe()["session_markers"] == ["FUTURE_SESSION"]
 
 
 @pytest.mark.parametrize("cycle_size", (2, 4, 8))

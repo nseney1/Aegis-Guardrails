@@ -39,9 +39,15 @@ sys.dont_write_bytecode = True
 # With -I the script directory is absent from sys.path. Add only this reviewed directory.
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
-from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, Mailbox, encoded, fields,  # noqa: E402
-                               integer, matching, parse_time, publish_file, read_json, require, safe_path, strings,
+from hierarchy_mailbox import (GIT_ID, MAX_BYTES, MAX_RECORDS, MAX_WRITERS, SHA256, SLUG, Mailbox, encoded,  # noqa: E402
+                               integer, matching, parse_time, publish_file, read_json, safe_path, strings,
                                strict_json, text, timestamp)
+
+from hierarchy_workspace_display import (MAX_DISPLAY, _ArgumentParser, _AUTH_SCHEME, _DISPLAY_ALLOWLIST,  # noqa: E402
+                                         _DISPLAY_CREDENTIALS, _DISPLAY_HASH_CHUNK, _KEYS, _NB, _PEM_HEAD,
+                                         _PEM_TAIL, _Refusal, _SCHEMES, _SECRET_REDACTIONS, _UNTRUSTED_DISPLAY_FIELDS,
+                                         _credential_match, _display, _display_fields, _display_refusals,
+                                         _display_response, require)
 
 
 EVENT_SCHEMA = "aegis.hierarchy-workspace-event/v1"
@@ -64,6 +70,28 @@ MAX_EVIDENCE_BYTES = 67108864
 KINDS = ("writer", "heavy", "heavy-tests")
 INITIATIVE_STATES = {"active", "paused", "done"}
 EVENT_NAME = re.compile(r"(\d{8})\.json")
+# Pinned mailbox validators can include paths or JSON keys in their exceptions.
+# Keep their validation and portable I/O behavior, but own diagnostics locally.
+_PATH_REFUSAL_PREFIXES = ("symlink paths are not supported: ", "file unavailable: ")
+safe_path = _display_refusals(safe_path, trusted_values=True, value_prefixes=_PATH_REFUSAL_PREFIXES)
+read_json = _display_refusals(read_json, trusted_values=True,
+                              value_prefixes=(*_PATH_REFUSAL_PREFIXES, "duplicate JSON key: "))
+strict_json = _display_refusals(strict_json, trusted_values=True, value_prefixes=("duplicate JSON key: ",))
+# Labels passed to these validators are source literals, never request values.
+text = _display_refusals(text, trusted_values=True)
+integer = _display_refusals(integer, trusted_values=True)
+matching = _display_refusals(matching, trusted_values=True)
+strings = _display_refusals(strings, trusted_values=True)
+parse_time = _display_refusals(parse_time, trusted_values=True)
+
+
+def fields(value, required, optional=()):
+    """Keep the pinned field contract, displaying each unexpected raw key."""
+    require(isinstance(value, dict), "expected a JSON object")
+    require(set(required) <= value.keys(), "missing fields: " + ", ".join(sorted(set(required) - value.keys())))
+    require(value.keys() <= set(required) | set(optional),
+            "unexpected fields: " + ", ".join(_display(key) for key in sorted(
+                value.keys() - set(required) - set(optional))))
 
 
 def absolute(value, label):
@@ -85,8 +113,10 @@ def verify_evidence(value):
         path = safe_path(value["path"])
         require(path.stat().st_size <= MAX_EVIDENCE_BYTES, "terminal evidence exceeds the size limit")
         raw = path.read_bytes()
-    except OSError as exc:
-        raise ValueError("terminal evidence is unavailable: " + value["path"]) from exc
+    except (OSError, _Refusal) as exc:
+        if isinstance(exc, _Refusal) and not isinstance(exc.__cause__, OSError):
+            raise
+        raise _Refusal("terminal evidence is unavailable: " + _display(value["path"]), displayed=True) from exc
     require(hashlib.sha256(raw).hexdigest() == value["sha256"], "terminal evidence does not match its hash")
 
 
@@ -131,11 +161,11 @@ class Ledger:
         self.granted_counts = dict.fromkeys(KINDS, 0)
 
     def initiative(self, identifier):
-        require(identifier in self.initiatives, "initiative is not registered: " + str(identifier))
+        require(identifier in self.initiatives, "initiative is not registered: " + _display(identifier))
         return self.initiatives[identifier]
 
     def request(self, identifier):
-        require(identifier in self.requests, "unknown request: " + str(identifier))
+        require(identifier in self.requests, "unknown request: " + _display(identifier))
         return self.requests[identifier]
 
     def held(self, kind):
@@ -146,7 +176,7 @@ class Ledger:
                 if b not in self.initiatives or self.initiatives[b]["state"] != "done"]
 
     def apply(self, event):
-        require(event["kind"] in APPLY, "unknown workspace event: " + str(event["kind"]))
+        require(event["kind"] in APPLY, "unknown workspace event: " + _display(event["kind"]))
         require(event["kind"] == "init" or self.limits is not None, "workspace store is not initialized")
         APPLY[event["kind"]](self, event["data"], event)
         self.seq = event["seq"]
@@ -186,7 +216,8 @@ def require_unclaimed_lanes(ledger, repository, lanes, identifier):
     for other in ledger.initiatives.values():
         if other["id"] != identifier and other["repository"] == repository:
             taken = sorted(set(lanes) & set(other["lanes"]))
-            require(not taken, "lane already belongs to initiative " + other["id"] + ": " + ", ".join(taken))
+            require(not taken, "lane already belongs to initiative " + other["id"] + ": "
+                    + ", ".join(_display(lane) for lane in taken))
 
 
 def apply_register(ledger, data, event):
@@ -251,7 +282,7 @@ def apply_withdraw(ledger, data, event):
     fields(data, {"request_id", "source"})
     text(data["source"], "source")
     request = ledger.request(data["request_id"])
-    require(request["state"] == "queued", "request is not queued: " + data["request_id"])
+    require(request["state"] == "queued", "request is not queued: " + _display(data["request_id"]))
     request.update(state="withdrawn", closed_at=event["at"])
     ledger.open_holders.remove((request["kind"], request["holder"]))
 
@@ -259,7 +290,7 @@ def apply_withdraw(ledger, data, event):
 def apply_grant(ledger, data, event):
     fields(data, {"request_id"})
     request = ledger.request(data["request_id"])
-    require(request["state"] == "queued", "request is not queued: " + data["request_id"])
+    require(request["state"] == "queued", "request is not queued: " + _display(data["request_id"]))
     require(ledger.granted_counts[request["kind"]] < ledger.limits[request["kind"]], "ledger grant exceeds capacity")
     request.update(state="granted", granted_at=event["at"])
     ledger.granted_counts[request["kind"]] += 1
@@ -269,7 +300,7 @@ def apply_release(ledger, data, event):
     fields(data, {"request_id", "evidence"})
     evidence_reference(data["evidence"])
     request = ledger.request(data["request_id"])
-    require(request["state"] == "granted", "request is not granted: " + data["request_id"])
+    require(request["state"] == "granted", "request is not granted: " + _display(data["request_id"]))
     request.update(state="released", closed_at=event["at"], evidence=data["evidence"])
     ledger.open_holders.remove((request["kind"], request["holder"]))
     ledger.granted_counts[request["kind"]] -= 1
@@ -336,14 +367,14 @@ class Store:
                 ancestors.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid))
                 child = os.open(component, flags if index == len(self.events.parts) - 1 else search_flags,
                                 dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
+                parent, descriptor = descriptor, child
+                os.close(parent)
             info = os.fstat(descriptor)
             ancestors.append((info.st_dev, info.st_ino, info.st_mode, info.st_uid))
             credentials = (os.getuid(), os.geteuid(), os.getgid(), os.getegid(), tuple(os.getgroups()))
             yield descriptor, (tuple(ancestors), credentials)
         except OSError as exc:
-            raise ValueError("workspace event directory is unavailable") from exc
+            raise _Refusal("workspace event directory is unavailable", displayed=True) from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -371,7 +402,7 @@ class Store:
                     "workspace event changed while reading")
             return strict_json(raw.decode("utf-8"))
         except OSError as exc:
-            raise ValueError("workspace event is unavailable") from exc
+            raise _Refusal("workspace event is unavailable", displayed=True) from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -382,13 +413,16 @@ class Store:
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
-            raise ValueError("workspace store is busy; inspect an abandoned lock before retrying") from exc
+            raise _Refusal("workspace store is busy; inspect an abandoned lock before retrying", displayed=True) from exc
         try:
-            with os.fdopen(fd, "wb") as stream:
+            with os.fdopen(fd, "wb", closefd=False) as stream:
                 stream.write(encoded({"pid": os.getpid(), "created_at": timestamp()}))
             yield
         finally:
-            lock.unlink()
+            try:
+                os.close(fd)
+            finally:
+                lock.unlink()
 
     def load(self, *, for_report=False):
         """Replay strictly; reports alone may represent damaged request-event times as null.
@@ -416,7 +450,7 @@ class Store:
             keys = []
             for path in paths:
                 info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-                require(not stat.S_ISLNK(info.st_mode), "symlink paths are not supported: " + str(path))
+                require(not stat.S_ISLNK(info.st_mode), "symlink paths are not supported: " + _display(path))
                 keys.append((path.name, _event_key(info)))
             previous, self._memo = self._memo, None
             ledger = None
@@ -444,10 +478,10 @@ class Store:
                 safe_path(path)
                 continue
             name = EVENT_NAME.fullmatch(path.name)
-            require(name is not None, "unexpected workspace store entry: " + path.name)
+            require(name is not None, "unexpected workspace store entry: " + _display(path.name))
             count += 1
             require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
-            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + path.name)
+            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + _display(path.name))
             if count <= replayed:
                 continue
             try:
@@ -462,7 +496,8 @@ class Store:
                     event = {**event, "at": None}
                 ledger.apply(event)
             except (ValueError, TypeError, KeyError, UnicodeError) as exc:
-                raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
+                detail = exc.message if isinstance(exc, _Refusal) else _display(exc)
+                raise _Refusal("malformed workspace event: " + _display(path) + ": " + detail, displayed=True) from exc
         require(ledger.limits is not None, "workspace store is not initialized")
         return ledger
 
@@ -504,6 +539,7 @@ def initiative_view(ledger, identifier):
         "blocked_by": ledger.unresolved(initiative), "holds": counts["granted"], "queued": counts["queued"]}
 
 
+@_display_response
 def grant_next(store, kind, outside=None):
     """`outside` counts heavy work this ledger does not hold. It runs inside the same lock as the grant, so two
     callers counting at the same moment cannot both see room for one slot."""
@@ -572,11 +608,12 @@ def lease_tools():
     try:
         from aegis_core import match, team, team_paths
     except ImportError as exc:
-        raise ValueError(error) from exc
+        raise _Refusal(error, displayed=True) from exc
     check_loaded()
     return match, team, team_paths
 
 
+@_display_response
 def check_paths(ledger, identifier, paths):
     initiative = ledger.initiative(identifier)
     require(isinstance(paths, list) and bool(paths) and len(paths) <= 256, "invalid paths")
@@ -584,8 +621,12 @@ def check_paths(ledger, identifier, paths):
     for path in paths:
         text(path, "path")
         require(team.glob_problem(path) is None and not path.startswith(("/", "\\")) and ":" not in path
-                and "\\" not in path and ".." not in path.split("/"), "invalid path: " + path)
-    requested = team_paths.stored_paths(paths)
+                and "\\" not in path and ".." not in path.split("/"), "invalid path: " + _display(path))
+    try:
+        requested = team_paths.stored_paths(paths)
+    except team_paths.LeasePathError as exc:
+        # stored_paths owns this fixed diagnostic and never includes the input.
+        raise _Refusal(team_paths.STORED_PATH_ERROR, displayed=True) from exc
     now = int(time.time())
     peers = [i for i in ledger.initiatives.values()
              if i["repository"] == initiative["repository"] and i["state"] != "done"]
@@ -601,7 +642,7 @@ def check_paths(ledger, identifier, paths):
             try:
                 found = team.read_leases(Path(checkout))
             except Exception as exc:  # Any failure to read counts as a conflict: unsure means conflict.
-                unreadable_checkouts.append({"initiative": peer["id"], "checkout": checkout, "error": str(exc)[:512]})
+                unreadable_checkouts.append({"initiative": peer["id"], "checkout": checkout, "error": str(exc)})
                 continue
             checked += 1
             for lease in found.leases:
@@ -619,8 +660,8 @@ def check_paths(ledger, identifier, paths):
                 key = (bad.lane, bad.oid)
                 if key not in seen:
                     seen.add(key)
-                    conflicts.append({"lane": bad.lane, "initiative": peer["id"], "checkout": checkout,
-                                      "unreadable": bad.error[:512]})
+                    conflicts.append({"lane": bad.lane, "initiative": peer["id"],
+                                      "checkout": checkout, "unreadable": bad.error})
     declared = [peer["id"] for peer in peers if peer["id"] != identifier
                 and match.sets_overlap(peer["touched_paths"], paths)]
     # A lease's expiry or a successor's updated declaration is not terminal evidence for
@@ -638,6 +679,7 @@ def check_paths(ledger, identifier, paths):
         "note": "A clear result is advice, not a lock: run the check and the lease claim one after another."}
 
 
+@_display_response
 def check_delivery(ledger, identifier):
     initiative = ledger.initiative(identifier)
     blockers = ledger.unresolved(initiative)
@@ -659,7 +701,7 @@ def mailbox_facts(initiative):
             facts["unread"] = sum(row["unread_count"] for row in summary.values())
         return facts
     except (ValueError, OSError, UnicodeError, RecursionError) as exc:
-        return {"error": str(exc)[:512]}
+        return {"error": _display(exc)}
 
 
 def queue_facts(ledger, now):
@@ -742,6 +784,7 @@ def report_text(data):
     return "\n".join(lines)
 
 
+@_display_refusals
 def run(args):
     store = Store(args.store)
     command = args.command
@@ -803,7 +846,7 @@ def run(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = _ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--store", required=True, help="Absolute path to the workspace store")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("init", "register", "update", "request", "withdraw", "release", "check-paths", "mark-merge",
@@ -813,11 +856,14 @@ def main(argv=None):
     commands.add_parser("status")
     commands.add_parser("check-delivery").add_argument("--initiative", required=True)
     commands.add_parser("report").add_argument("--format", choices=("json", "text"), default="json")
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         code, result = run(args)
-    except (ValueError, OSError, TypeError, UnicodeError, RecursionError) as exc:
-        code, result = 2, {"error": str(exc)}
+    except _Refusal as exc:
+        code, result = 2, {"error": exc.message}
+    except Exception:
+        code, result = 2, {"error": "WORKSPACE_REFUSED",
+                           "next_action": "inspect the workspace inputs and retry"}
     print(result if isinstance(result, str) else json.dumps(result, sort_keys=True))
     return code
 

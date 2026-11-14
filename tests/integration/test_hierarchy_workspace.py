@@ -9,9 +9,11 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 import venv
@@ -20,6 +22,7 @@ import pytest
 
 from tools import hierarchy_workspace as controller
 from aegis_core import team as lease_reader
+from aegis_core.redaction import SECRET_REPLACEMENTS, redact_command_secrets
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke, message
 from tests.integration.test_hierarchy_scenario import aegis
 
@@ -27,6 +30,12 @@ from tests.integration.test_hierarchy_scenario import aegis
 CONTROLLER = ROOT / "tools" / "hierarchy_workspace.py"
 COMMIT = "a" * 40
 LATER_COMMIT = "b" * 40
+FIXED_REFUSAL = {"error": "WORKSPACE_REFUSED", "next_action": "inspect the workspace inputs and retry"}
+
+
+def fingerprint(value):
+    raw = value if isinstance(value, bytes) else value.encode("utf-8", errors="surrogatepass")
+    return "<redacted len=%d sha256=%s>" % (len(value), hashlib.sha256(raw).hexdigest()[:12])
 
 
 @pytest.mark.parametrize("kind", controller.KINDS)
@@ -84,7 +93,8 @@ class Workspace:
         return argv
 
     def run(self, command, request=None, *, expect=0, raw=False, **flags):
-        result = subprocess.run(self.argv(command, request, **flags), capture_output=True, text=True, timeout=30,
+        argv = self.argv(command, request, **flags)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30,
                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
         assert not result.stderr, result.stderr
         assert result.returncode == expect, result.stdout
@@ -558,7 +568,7 @@ def test_concurrent_grants_never_exceed_the_cap(workspace):
     assert {code for _, code in results} <= {0, 2, 3}
     for (stdout, _), code in results:
         if code == 2:
-            assert "workspace store is busy" in json.loads(stdout)["error"]
+            assert json.loads(stdout) == {"error": "workspace store is busy; inspect an abandoned lock before retrying"}
     assert workspace.run("status")["capacity"]["writer"]["used"] <= 3
 
 
@@ -597,14 +607,23 @@ def two_clones(workspace, tmp_path):
     return first, second
 
 
-def test_a_real_lease_in_another_clone_conflicts_though_that_clone_cannot_see_it(workspace, two_clones):
-    first, second = two_clones
+@pytest.mark.parametrize("checkout_component", ["clones", "clones with space"])
+def test_a_real_lease_in_another_clone_conflicts_though_that_clone_cannot_see_it(workspace, checkout_component):
+    checkout_root = workspace.tmp / checkout_component
+    checkout_root.mkdir()
+    first, second = clone_pair(checkout_root)
+    workspace.register("first", checkouts=[str(first)])
+    workspace.register("second", checkouts=[str(second)])
     aegis(first, "team", "claim", "first-lane", "--paths", "src/a/**")
     assert aegis(second, "team", "list").get("leases", []) == []
     conflict = workspace.run("check-paths", {"initiative": "second", "paths": ["src/a/value.txt"]}, expect=3)
     assert conflict["conflict"] is True
     row = conflict["conflicts"][0]
-    assert row["lane"] == "first-lane" and row["initiative"] == "first" and row["checkout"] == str(first)
+    checkout = str(first)
+    displayed_checkout = controller._display(checkout)
+    if " " in checkout:
+        assert displayed_checkout == fingerprint(checkout)
+    assert row["lane"] == "first-lane" and row["initiative"] == "first" and row["checkout"] == displayed_checkout
     clear = workspace.run("check-paths", {"initiative": "second", "paths": ["src/b/**"]})
     assert clear["conflict"] is False and clear["conflicts"] == []
 
@@ -843,7 +862,7 @@ def test_a_missing_lease_reader_is_a_clear_error(workspace, tmp_path):
     workspace.register("first")
     copy = tmp_path / "copied-tools"
     copy.mkdir()
-    for name in ("hierarchy_mailbox.py", "hierarchy_workspace.py"):
+    for name in ("hierarchy_mailbox.py", "hierarchy_workspace_display.py", "hierarchy_workspace.py"):
         (copy / name).write_bytes((CONTROLLER.parent / name).read_bytes())
     request = tmp_path / "paths.json"
     request.write_text(json.dumps({"initiative": "first", "paths": ["x.txt"]}), encoding="utf-8")
@@ -851,7 +870,7 @@ def test_a_missing_lease_reader_is_a_clear_error(workspace, tmp_path):
                              "check-paths", "--request", str(request)], capture_output=True, text=True, timeout=20,
                             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     assert result.returncode == 2 and not result.stderr
-    assert json.loads(result.stdout)["error"] == "the Aegis lease reader is unavailable from this checkout"
+    assert json.loads(result.stdout) == {"error": "the Aegis lease reader is unavailable from this checkout"}
 
 
 @pytest.mark.parametrize("checkout_reader,preloaded", [
@@ -877,7 +896,7 @@ def test_path_checks_use_only_the_reader_from_the_tools_checkout(workspace, tmp_
     source = tmp_path / "source"
     copied_tools = source / "tools"
     copied_tools.mkdir(parents=True)
-    for name in ("hierarchy_mailbox.py", "hierarchy_workspace.py"):
+    for name in ("hierarchy_mailbox.py", "hierarchy_workspace_display.py", "hierarchy_workspace.py"):
         shutil.copyfile(CONTROLLER.parent / name, copied_tools / name)
     if checkout_reader:
         shutil.copytree(ROOT / "aegis_core", source / "aegis_core", ignore=shutil.ignore_patterns("__pycache__"))
@@ -900,7 +919,7 @@ def test_path_checks_use_only_the_reader_from_the_tools_checkout(workspace, tmp_
         assert json.loads(result.stdout)["conflict"] is False
     else:
         assert result.returncode == 2, result.stdout
-        assert json.loads(result.stdout)["error"] == "the Aegis lease reader is unavailable from this checkout"
+        assert json.loads(result.stdout) == {"error": "the Aegis lease reader is unavailable from this checkout"}
     assert marker.exists() is (preloaded == "package")
     assert before == {p.name: p.read_bytes() for p in (workspace.store / "events").iterdir()}
 
@@ -1262,3 +1281,784 @@ def test_store_load_completes_short_reads_and_retries_eintr(workspace, monkeypat
         with pytest.raises(OSError) as error:
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("value", [
+    "/token=SYNTHETIC-S1", '/{"token":"SYNTHETIC-S2"}', "/password=SYNTHETIC-S3",
+    "/ｔｏｋｅｎ=SYNTHETIC-S1", "/to\x1b[31mken=SYNTHETIC-S1", "/to\u200bken=SYNTHETIC-S1",
+    "/token=" + "SYNTHETIC-S1" * 900, "/token=SYNTHETIC-S1\n\r\t\udcff",
+    "/to\nken=SYNTHETIC-S1", "/pass\rword=SYNTHETIC-S3",
+    "/to\x1b\u200b[31mken=SYNTHETIC-S1", "/prefix\nBearer SYNTHETIC_OPAQUE_1234567890",
+    "/prefix\tghp_SYNTHETIC123456789012", "/auth=Bearer SYNTHETIC-S1",
+    "/Authorization: Bearer SYNTHETIC-S1", "/prefixBearer SYNTHETIC_OPAQUE_1234567890",
+    "/prefixghp_SYNTHETIC123456789012",
+], ids=["token", "json", "password", "nfkc", "ansi", "format", "long", "non-utf8", "newline", "return",
+        "ansi-format", "bearer-boundary", "token-boundary", "short-bearer-assignment", "header-bearer",
+        "adjacent-bearer", "adjacent-token"])
+def test_workspace_refusal_path_is_displayed(workspace, value):
+    workspace.register("a1")
+    ledger = controller.Store(workspace.store).load()
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(ledger, "a1", [value])
+    message = str(error.value)
+    assert "SYNTHETIC" not in message
+    assert len(message) <= 600 and message.isprintable()
+    raw = workspace.run("check-paths", {"initiative": "a1", "paths": [value]}, expect=2, raw=True)
+    assert "SYNTHETIC" not in raw and raw.count("\n") == 1 and len(raw) <= 900
+
+
+@pytest.mark.parametrize("command", ["init", "register", "update", "request", "withdraw", "release",
+                                     "check-paths", "mark-merge", "clear-base-moved", "set-limits"])
+@pytest.mark.parametrize("field", ["token=SYNTHETIC-S1", '{"token":"SYNTHETIC-S2"}',
+                                   "password=SYNTHETIC-S3\n\x1b[31m"])
+def test_workspace_request_refusals_do_not_echo_fields(workspace, tmp_path, command, field):
+    space = Workspace(tmp_path / "fresh") if command == "init" else workspace
+    if command == "init":
+        space.tmp.mkdir()
+    bodies = {
+        "init": {"writer_limit": 3, "heavy_limit": 1},
+        "register": {"id": "a1", "project": "aegis", "repository": "aegis", "priority": 1,
+                     "target_branch": "develop"},
+        "update": {"initiative": "a1", "source": "fixture"},
+        "request": {"initiative": "a1", "kind": "writer", "holder": "fixture"},
+        "withdraw": {"request_id": "req-00000001", "source": "fixture"},
+        "release": {"request_id": "req-00000001", "evidence": space.evidence()},
+        "check-paths": {"initiative": "a1", "paths": ["a.py"]},
+        "mark-merge": {"repository": "aegis", "branch": "develop", "commit": COMMIT, "source": "fixture"},
+        "clear-base-moved": {"initiative": "a1", "base_commit": COMMIT, "evidence": space.evidence(),
+                             "source": "fixture"},
+        "set-limits": {"source": "fixture", "writer_limit": 3},
+    }
+    raw = space.run(command, {**bodies[command], field: "unused"}, expect=2, raw=True)
+    assert "SYNTHETIC" not in raw and raw.count("\n") == 1 and len(raw) <= 900
+    assert not (space.store / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("failure", [ValueError, OSError, TypeError, UnicodeError, RecursionError, RuntimeError, KeyError])
+def test_workspace_unexpected_main_exception_is_fixed(workspace, monkeypatch, capsys, failure):
+    def refuse(args):
+        raise failure("token=SYNTHETIC-S1\npassword=SYNTHETIC-S3")
+
+    monkeypatch.setattr(controller, "run", refuse)
+    assert controller.main(["--store", str(workspace.store), "status"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == json.dumps(FIXED_REFUSAL, sort_keys=True) + "\n"
+
+
+@pytest.mark.parametrize("method", ["initiative", "request", "apply"])
+def test_workspace_ledger_refusals_display_untrusted_values(method):
+    ledger = controller.Ledger()
+    value = '{"token":"SYNTHETIC-S2"}\n'
+    argument = {"kind": value} if method == "apply" else value
+    with pytest.raises(ValueError) as error:
+        if method == "initiative":
+            ledger.initiative(argument)
+        elif method == "request":
+            ledger.request(argument)
+        else:
+            ledger.apply(argument)
+    assert "SYNTHETIC" not in str(error.value) and str(error.value).isprintable()
+
+
+@pytest.mark.parametrize("name", ["token=SYNTHETIC-S1", 'password=SYNTHETIC-S3'], ids=["token", "password"])
+def test_workspace_store_entry_refusals_display_names(workspace, name):
+    (workspace.store / "events" / name).write_bytes(b"{}")
+    with pytest.raises(ValueError) as error:
+        controller.Store(workspace.store).load()
+    assert "SYNTHETIC" not in str(error.value)
+    raw = workspace.run("status", expect=2, raw=True)
+    assert "SYNTHETIC" not in raw and raw.count("\n") == 1
+
+
+def test_workspace_evidence_refusal_displays_untrusted_path(tmp_path):
+    with pytest.raises(ValueError) as error:
+        controller.verify_evidence({"path": str(tmp_path / "token=SYNTHETIC-S1"), "sha256": "a" * 64})
+    assert "SYNTHETIC" not in str(error.value)
+
+
+@pytest.mark.parametrize("site", ["checkout", "unreadable", "mailbox"])
+def test_workspace_returned_errors_display_before_truncation(workspace, monkeypatch, site):
+    marker = 'ｔｏｋｅｎ="' + "SYNTHETIC-S1" * 100 + '"\n\x1b[31m'
+
+    def refuse(*args):
+        raise ValueError(marker)
+
+    if site == "mailbox":
+        monkeypatch.setattr(controller, "Mailbox", refuse)
+        result = controller.mailbox_facts({"mailbox_root": str(workspace.store)})
+    else:
+        workspace.register("a1", checkouts=[str(workspace.tmp)])
+        match, team, paths = controller.lease_tools()
+        reader = SimpleNamespace(read_leases=refuse)
+        if site == "unreadable":
+            reader.read_leases = lambda path: SimpleNamespace(
+                leases=[], unreadable=[SimpleNamespace(lane="lane", oid="a" * 40, error=marker)])
+        reader.glob_problem = team.glob_problem
+        monkeypatch.setattr(controller, "lease_tools", lambda: (match, reader, paths))
+        code, result = controller.check_paths(controller.Store(workspace.store).load(), "a1", ["a.py"])
+        assert code == 3
+    raw = json.dumps(result)
+    assert "SYNTHETIC" not in raw and len(raw) < 1800
+    def check_lines(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                check_lines(item)
+        elif isinstance(value, list):
+            for item in value:
+                check_lines(item)
+        elif isinstance(value, str):
+            assert "\n" not in value and "\r" not in value
+    check_lines(json.loads(raw))
+
+
+@pytest.mark.parametrize("failure", ["fdopen", "write", "encode", "body"])
+def test_workspace_lock_failure_closes_descriptor_and_allows_retry(workspace, monkeypatch, failure):
+    store = controller.Store(workspace.store)
+    opened, closed = [], []
+
+    def open_fd(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def close_fd(descriptor):
+        closed.append(descriptor)
+        return os.close(descriptor)
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EIO, "fixture lock failure")
+
+    class FailingStream:
+        def __init__(self, closefd):
+            self.closefd = closefd
+
+        def __enter__(self):
+            return self
+
+        def write(self, raw):
+            refuse()
+
+        def __exit__(self, *args):
+            if self.closefd:
+                os.close(opened[-1])
+                closed.append(opened[-1])
+
+    def fdopen(descriptor, mode, **kwargs):
+        if failure == "fdopen":
+            refuse()
+        if failure == "write":
+            return FailingStream(kwargs.get("closefd", True))
+        return os.fdopen(descriptor, mode, **kwargs)
+
+    original_encoded = controller.encoded
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_fd, "close": close_fd,
+                                                           "fdopen": fdopen}))
+    if failure == "encode":
+        monkeypatch.setattr(controller, "encoded", refuse)
+    try:
+        with pytest.raises(OSError, match="fixture lock failure"):
+            with store.lock():
+                assert failure == "body"
+                refuse()
+        for descriptor in opened:
+            with pytest.raises(OSError) as error:
+                os.fstat(descriptor)
+            assert error.value.errno == errno.EBADF
+        assert not (store.path / ".write.lock").exists()
+    finally:
+        # The RED fdopen reproducer must not leak into the test worker itself.
+        for descriptor in opened:
+            if descriptor not in closed:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    assert error.errno == errno.EBADF
+        monkeypatch.setattr(controller, "os", os)
+        monkeypatch.setattr(controller, "encoded", original_encoded)
+    with store.lock():
+        assert (store.path / ".write.lock").exists()
+    assert not (store.path / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("site", ["anchor", "child", "leaf", "event"])
+def test_workspace_descriptor_read_failure_closes_every_open(workspace, monkeypatch, site):
+    store = memo_store(workspace)
+    opened, closed = [], []
+
+    def open_fd(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def close_fd(descriptor):
+        closed.append(descriptor)
+        return os.close(descriptor)
+
+    def fstat(descriptor):
+        fail_at = {"anchor": 1, "child": 2, "leaf": len(store.events.parts)}
+        if site != "event" and len(opened) == fail_at[site]:
+            raise OSError(errno.EIO, "fixture fstat failure")
+        if site == "event" and len(opened) == len(store.events.parts) + 1:
+            raise OSError(errno.EIO, "fixture event fstat failure")
+        return os.fstat(descriptor)
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_fd, "close": close_fd,
+                                                           "fstat": fstat}))
+    with pytest.raises(ValueError, match="workspace event (directory is unavailable|is unavailable)"):
+        store.load()
+    assert len(opened) == len(closed)
+    for descriptor in opened:
+        with pytest.raises(OSError) as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+    assert not (store.path / ".write.lock").exists()
+
+
+def test_workspace_lock_busy_release_retry_uses_latches(workspace, monkeypatch, capsys):
+    store = controller.Store(workspace.store)
+    busy, released, acquired = threading.Event(), threading.Event(), threading.Event()
+    errors, opened = [], []
+
+    def open_fd(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_fd}))
+
+    def contender():
+        try:
+            with pytest.raises(ValueError, match="^workspace store is busy; inspect an abandoned lock before retrying$"):
+                with store.lock():
+                    pytest.fail("busy lock was acquired")
+            busy.set()
+            assert released.wait(10), "holder did not release"
+            with store.lock():
+                acquired.set()
+        except BaseException as error:
+            errors.append(error)
+            busy.set()
+
+    worker = threading.Thread(target=contender)
+    try:
+        with store.lock():
+            worker.start()
+            assert busy.wait(10), "contender did not observe busy"
+            assert not acquired.is_set()
+    finally:
+        released.set()
+        if worker.ident is not None:
+            worker.join(10)
+    assert not worker.is_alive() and not errors and acquired.is_set()
+    assert not (store.path / ".write.lock").exists()
+    assert len(opened) == 2
+    for descriptor in opened:
+        with pytest.raises(OSError) as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_workspace_fdopen_failure_keeps_cli_refusal_and_closes_fd(workspace, monkeypatch, capsys):
+    opened = []
+
+    def open_fd(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EIO, "token=SYNTHETIC-S1")
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_fd, "fdopen": refuse}))
+    assert controller.main(workspace.argv("update", {"initiative": "a1", "source": "fixture"})[3:]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == json.dumps({"error": fingerprint(str(OSError(errno.EIO, "token=SYNTHETIC-S1")))}) + "\n"
+    assert not (workspace.store / ".write.lock").exists()
+    assert len(opened) == 1
+    for descriptor in opened:
+        with pytest.raises(OSError) as error:
+            os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+
+
+def test_workspace_directory_parent_close_failure_also_closes_child(workspace, monkeypatch):
+    store = memo_store(workspace)
+    opened, live = [], set()
+    failed = []
+
+    def open_fd(*args, **kwargs):
+        descriptor = os.open(*args, **kwargs)
+        opened.append(descriptor)
+        live.add(descriptor)
+        return descriptor
+
+    def close_fd(descriptor):
+        if len(opened) == 2 and not failed:
+            failed.append(True)
+            os.close(descriptor)
+            live.remove(descriptor)
+            raise OSError(errno.EIO, "fixture parent close failure")
+        os.close(descriptor)
+        live.remove(descriptor)
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "open": open_fd, "close": close_fd}))
+    try:
+        with pytest.raises(ValueError, match="^workspace event directory is unavailable$"):
+            store.load()
+        assert not live
+    finally:
+        for descriptor in live:
+            os.close(descriptor)
+
+
+def test_workspace_conflict_response_displays_every_untrusted_field(workspace, monkeypatch):
+    workspace.register("a1")
+    match, team, paths = controller.lease_tools()
+    lease = SimpleNamespace(lane="token=SYNTHETIC-S1", oid="a" * 40, paths=["password=SYNTHETIC-S3"],
+                            path_set=paths.stored_paths(["a.py"]), owner='{"token":"SYNTHETIC-S2"}',
+                            expired=lambda now: False, expires_at=123)
+    reader = SimpleNamespace(glob_problem=team.glob_problem,
+                             read_leases=lambda path: SimpleNamespace(leases=[lease], unreadable=[]))
+    monkeypatch.setattr(controller, "lease_tools", lambda: (match, reader, paths))
+    ledger = controller.Store(workspace.store).load()
+    ledger.initiatives["a1"]["checkouts"] = [str(workspace.tmp / "token=SYNTHETIC-S1")]
+    code, result = controller.check_paths(ledger, "a1", ["a.py"])
+    assert code == 3
+    assert "SYNTHETIC" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("command", ["init", "register", "update", "request", "withdraw", "release",
+                                     "check-paths", "mark-merge", "clear-base-moved", "set-limits"])
+def test_workspace_missing_request_path_is_displayed(workspace, command):
+    argv = [sys.executable, "-I", str(CONTROLLER), "--store", str(workspace.store), command,
+            "--request", str(workspace.tmp / "token=SYNTHETIC-S1")]
+    result = subprocess.run(argv, capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    assert b"SYNTHETIC" not in result.stdout and result.stdout.count(b"\n") == 1
+    refusal = json.loads(result.stdout)
+    assert set(refusal) == {"error"} and refusal["error"].startswith("file unavailable: ")
+    assert len(result.stdout) <= 900 and not (workspace.store / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("arguments", [
+    ["token=SYNTHETIC-S1"], ["status", "--token=SYNTHETIC-S1"],
+    ["report", "--format", 'password=SYNTHETIC-S3\n'],
+], ids=["command", "option", "choice"])
+def test_workspace_parser_refuses_without_echoing_arguments(workspace, arguments):
+    result = subprocess.run([sys.executable, "-I", str(CONTROLLER), "--store", str(workspace.store)] + arguments,
+                            capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    assert result.stdout == (b'{"error": "WORKSPACE_REFUSED", '
+                             b'"next_action": "inspect the workspace inputs and retry"}' + os.linesep.encode("ascii"))
+
+
+_CREDENTIAL_CORPUS = [
+    ("bearer-assignment", "authorization=Bearer SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
+    ("basic-assignment", "authorization=Basic SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
+    ("digest-assignment", "authorization=Digest SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
+    ("token-assignment", "authorization=Token SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
+    ("negotiate-assignment", "authorization=Negotiate SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
+    ("url", "https://fixture:SYNTHETIC_PASSWORD@example.test/path", "SYNTHETIC_PASSWORD"),
+    ("jwt", "eyJSYNTHETIC1234.SYNTHETIC5678.SYNTHETIC9012", "eyJSYNTHETIC1234.SYNTHETIC5678.SYNTHETIC9012"),
+    ("pem", "key=-----BEGIN PRIVATE KEY-----SYNTHETIC_PEM_BODY-----END PRIVATE KEY-----", "SYNTHETIC_PEM_BODY"),
+    ("prose", "the password is SYNTHETIC_PASSWORD", "SYNTHETIC_PASSWORD"),
+    ("json", '{"token":"SYNTHETIC_PASSWORD"}', "SYNTHETIC_PASSWORD"),
+]
+_CREDENTIAL_CORPUS += [(prefix, prefix + "A" * size, prefix + "A" * size) for prefix, size in (
+    ("AKIA", 16), ("ASIA", 16), ("AGPA", 16), ("AIDA", 16), ("AROA", 16), ("ANPA", 16),
+    ("ANVA", 16), ("AIPA", 16), ("ghp_", 20), ("gho_", 20), ("ghu_", 20), ("ghs_", 20),
+    ("ghr_", 20), ("github_pat_", 20), ("glpat-", 16), ("sk_live_", 16), ("rk_test_", 16),
+    ("pk_live_", 16), ("sk-", 20), ("sk-proj-", 20), ("sk-ant-", 20), ("AIza", 25),
+    ("xoxa-", 10), ("xoxb-", 10), ("xoxp-", 10), ("xoxr-", 10), ("xoxs-", 10),
+    ("npm_", 20), ("pypi-", 20))]
+
+
+@pytest.mark.parametrize("label,value,credential", _CREDENTIAL_CORPUS, ids=[row[0] for row in _CREDENTIAL_CORPUS])
+def test_workspace_credential_grammar_parity_and_public_refusal(workspace, label, value, credential):
+    assert [(pattern.pattern, pattern.flags, replacement) for pattern, replacement, _ in controller._SECRET_REDACTIONS] == [
+        (pattern.pattern, pattern.flags, replacement) for pattern, replacement in SECRET_REPLACEMENTS]
+    reference = redact_command_secrets(value)
+    assert reference != value
+    with pytest.raises(ValueError) as error:
+        controller.Ledger().initiative(value)
+    assert str(error.value) == "initiative is not registered: " + fingerprint(value)
+    workspace.register("a1")
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(controller.Store(workspace.store).load(), "a1", ["/" + value])
+    assert str(error.value) == "invalid path: " + fingerprint("/" + value)
+    result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": ["/" + value]}),
+                            capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    refusal = json.loads(result.stdout)
+    assert refusal == {"error": "invalid path: " + fingerprint("/" + value)}
+    assert credential not in refusal["error"]
+
+
+@pytest.mark.parametrize("scheme", ["Basic", "Digest", "Token", "Negotiate"])
+def test_workspace_bare_auth_scheme_credential_is_hidden(scheme):
+    with pytest.raises(ValueError) as error:
+        controller.Ledger().initiative(scheme + " SYNTHETIC_OPAQUE_1234567890")
+    assert "SYNTHETIC_OPAQUE" not in str(error.value)
+
+
+@pytest.mark.parametrize("identifier", ["sk-runner", "asia-launch", "ghp-docs", "akia-sync"])
+def test_workspace_validated_ids_survive_delivery_requests_and_capacity(workspace, identifier):
+    assert redact_command_secrets(identifier) == identifier
+    workspace.register(identifier, blocked_by=["asia-launch"])
+    code, result = controller.check_delivery(controller.Store(workspace.store).load(), identifier)
+    assert code == 3 and result["initiative"] == identifier and result["blocked_by"] == ["asia-launch"]
+    workspace.run("update", {"initiative": identifier, "source": "fixture", "state": "paused"})
+    ledger = controller.Store(workspace.store).load()
+    with pytest.raises(ValueError) as error:
+        controller.apply_request(ledger, {"initiative": identifier, "request_id": "req-00000004",
+                                         "kind": "writer", "holder": identifier}, {})
+    assert str(error.value) == "initiative is not active: " + identifier
+    workspace.run("update", {"initiative": identifier, "source": "fixture", "state": "active", "blocked_by": []})
+    workspace.ask(identifier, "heavy", identifier)
+    workspace.grant("heavy")
+    workspace.ask(identifier, "heavy", identifier + "/next")
+    answer = workspace.run("grant-next", kind="heavy", expect=3)
+    assert answer["holders"][0]["initiative"] == identifier and answer["holders"][0]["holder"] == identifier
+    workspace.run("update", {"initiative": identifier, "source": "fixture", "state": "paused"})
+    answer = workspace.run("grant-next", kind="heavy", expect=3)
+    assert answer["waiting"][0]["initiative"] == identifier
+    assert answer["waiting"][0]["reason"] == "initiative is paused"
+
+
+@pytest.mark.parametrize("identifier", ["sk-runner", "asia-launch", "ghp-docs", "akia-sync"])
+def test_workspace_mcp_overlap_keeps_ids_and_protocol_length_paths(tmp_path, identifier):
+    from tests.integration.test_hierarchy_role_tools import Team
+
+    built = Team(tmp_path)
+    first, second = clone_pair(tmp_path)
+    built.workspace.register(identifier, checkouts=[str(first)])
+    built.workspace.register("peer", checkouts=[str(second)])
+    path = "src/" + "a" * 1017 + ".py"
+    assert len(path) == 1024
+    write_lease(second, identifier, [path])
+    response = built.responses("a/lane/f2", [("workspace_path_overlap", {"paths": [path]})],
+                               initiative=identifier)[-1]["result"]
+    assert not response.get("isError", False)
+    result = json.loads(response["content"][0]["text"])
+    assert result["conflict"] is True and result["initiative"] == identifier
+    assert result["paths"] == [fingerprint(path)]
+    assert result["conflicts"][0]["lane"] == identifier
+    assert result["conflicts"][0]["paths"] == [fingerprint(path)]
+
+
+@pytest.mark.parametrize("prefix", ["", "prefix "], ids=["single-atom", "with-head"])
+def test_workspace_display_bounds_input_before_unicode_expansion(prefix):
+    value = prefix + "\ufdfa" * 87000
+    with pytest.raises(ValueError) as error:
+        controller.Ledger().initiative(value)
+    assert str(error.value) == "initiative is not registered: " + fingerprint(value)
+
+
+def test_workspace_byte_budget_cannot_expose_a_partial_credential():
+    budget = 8 * controller.MAX_DISPLAY
+    prefix = b"prefix " + "\u200b".encode("utf-8") * ((budget - len(b"prefix ") - 12) // 3)
+    value = prefix + b"ghp_" + b"A" * 20 + b"\xff"
+    assert len(value) > budget
+    with pytest.raises(ValueError) as error:
+        controller.Ledger().initiative(value)
+    assert str(error.value) == "initiative is not registered: " + fingerprint(value)
+
+
+def test_workspace_evidence_keeps_oserror_diagnostic(workspace, monkeypatch):
+    def refuse(path):
+        raise controller._Refusal("permission denied") from PermissionError(errno.EACCES, "fixture permission error")
+
+    monkeypatch.setattr(controller, "safe_path", refuse)
+    with pytest.raises(ValueError) as error:
+        controller.verify_evidence({"path": str(workspace.tmp / "token=SYNTHETIC-S1"), "sha256": "a" * 64})
+    assert str(error.value).startswith("terminal evidence is unavailable: ")
+    assert "SYNTHETIC" not in str(error.value)
+
+
+def test_workspace_lock_wrapper_never_owns_raw_descriptor(workspace, monkeypatch):
+    modes = []
+
+    def fdopen(descriptor, mode, **kwargs):
+        modes.append(kwargs.get("closefd", True))
+        return os.fdopen(descriptor, mode, **kwargs)
+
+    monkeypatch.setattr(controller, "os", SimpleNamespace(**{**vars(os), "fdopen": fdopen}))
+    with controller.Store(workspace.store).lock():
+        pass
+    assert modes == [False]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode denial required")
+def test_workspace_evidence_permission_denial_keeps_unavailable_refusal(workspace):
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory mode denial")
+    sealed = workspace.tmp / "sealed"
+    sealed.mkdir()
+    evidence = sealed / "token=SYNTHETIC-S1"
+    evidence.write_bytes(b"fixture")
+    sealed.chmod(0)
+    try:
+        with pytest.raises(ValueError) as error:
+            controller.verify_evidence({"path": str(evidence), "sha256": "a" * 64})
+        assert str(error.value).startswith("terminal evidence is unavailable: ")
+        assert "SYNTHETIC" not in str(error.value)
+    finally:
+        sealed.chmod(0o700)
+
+
+@pytest.mark.parametrize("failure", ["exception", "unreadable"])
+def test_workspace_checkout_refusals_keep_protocol_length_paths(workspace, monkeypatch, failure):
+    checkout = str(workspace.tmp / ("a" * 1024))
+    workspace.register("a1", checkouts=[checkout])
+    match, team, paths = controller.lease_tools()
+
+    def read_leases(path):
+        if failure == "exception":
+            raise ValueError("fixture unavailable")
+        return SimpleNamespace(leases=[], unreadable=[SimpleNamespace(lane="lane", oid="a" * 40,
+                                                                       error="fixture unreadable")])
+
+    reader = SimpleNamespace(glob_problem=team.glob_problem, read_leases=read_leases)
+    monkeypatch.setattr(controller, "lease_tools", lambda: (match, reader, paths))
+    code, result = controller.check_paths(controller.Store(workspace.store).load(), "a1", ["a.py"])
+    assert code == 3
+    rows = result["unreadable_checkouts"] if failure == "exception" else result["conflicts"]
+    assert rows[0]["checkout"] == fingerprint(checkout)
+
+
+@pytest.mark.parametrize("field", ["blocked_by", "request_id"])
+def test_workspace_unvalidated_blocker_and_event_request_text_is_displayed(workspace, field):
+    workspace.register("a1", blocked_by=["token=SYNTHETIC-S1"] if field == "blocked_by" else [])
+    if field == "blocked_by":
+        code, result = controller.check_delivery(controller.Store(workspace.store).load(), "a1")
+        assert code == 3 and "SYNTHETIC" not in json.dumps(result)
+        return
+    request_id = workspace.ask("a1", "heavy")
+    event = event_files(workspace)[-1]
+    document = json.loads(event.read_text())
+    assert document["data"]["request_id"] == request_id
+    document["data"]["request_id"] = "token=SYNTHETIC-S1"
+    event.write_text(json.dumps(document))
+    workspace.grant("heavy")
+    workspace.ask("a1", "heavy", "next")
+    code, result = controller.grant_next(controller.Store(workspace.store), "heavy")
+    assert code == 3 and "SYNTHETIC" not in json.dumps(result)
+
+
+def test_workspace_known_cli_refusal_preserves_validated_identifier(workspace):
+    identifier = "sk-" + "a" * 24
+    workspace.register(identifier)
+    workspace.run("update", {"initiative": identifier, "state": "paused", "source": "fixture"})
+    result = subprocess.run(workspace.argv("request", {"initiative": identifier, "kind": "writer", "holder": "fixture"}),
+                            capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    assert json.loads(result.stdout) == {"error": "initiative is not active: " + identifier}
+
+
+def assert_path_refusal_fingerprints_raw_value(workspace, value):
+    workspace.register("a1")
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(controller.Store(workspace.store).load(), "a1", [value])
+    expected = {"error": "invalid path: " + fingerprint(value)}
+    assert str(error.value) == expected["error"]
+    result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": [value]}),
+                            capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    assert b"SYNTHETIC" not in result.stdout
+    assert result.stdout == (json.dumps(expected, sort_keys=True) + os.linesep).encode("utf-8")
+
+
+_AUTH_SCHEMES = ["Bearer", "Basic", "Digest", "Token", "Negotiate"]
+_SEPARATORS = [pytest.param("\t", id="tab"), pytest.param("\r", id="cr"),
+               pytest.param("\n", id="lf"), pytest.param(" ", id="space")]
+
+
+@pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
+@pytest.mark.parametrize("separator", _SEPARATORS)
+def test_workspace_scheme_separators_fingerprint_whole_raw_path(workspace, scheme, separator):
+    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + separator + "SYNTHETIC_OPAQUE_1234567890")
+
+
+@pytest.mark.parametrize("key", ["password", "passwd", "pwd", "secret", "token", "api key", "private key"])
+@pytest.mark.parametrize("separator", _SEPARATORS)
+@pytest.mark.parametrize("position", ["before-is", "after-is", "both"])
+def test_workspace_prose_separators_fingerprint_whole_raw_path(workspace, key, separator, position):
+    before = separator if position in ("before-is", "both") else " "
+    after = separator if position in ("after-is", "both") else " "
+    assert_path_refusal_fingerprints_raw_value(workspace, "/the " + key + before + "is" + after + "SYNTHETIC_PASSWORD")
+
+
+@pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
+@pytest.mark.parametrize("size", [513, 1025, 1536])
+def test_workspace_oversize_scheme_fingerprints_tail_too(workspace, scheme, size):
+    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + " " + "A" * size + "SYNTHETIC_TAIL")
+
+
+@pytest.mark.parametrize("scheme", _AUTH_SCHEMES)
+@pytest.mark.parametrize("label,token,credential", _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:],
+                         ids=[row[0] for row in _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:]])
+def test_workspace_embedded_tokens_cannot_expose_scheme_suffix(workspace, scheme, label, token, credential):
+    assert_path_refusal_fingerprints_raw_value(workspace, "/" + scheme + " " + token + "/SYNTHETIC_SUFFIX")
+
+
+@pytest.mark.parametrize("value", [
+    "/clean/./File_01.py:part-", "/" + "a" * 255, "/" + "a" * 256,
+    "/clean path", "/clean\tpath", "/clean=path", '/clean"path', "/clean[path]",
+    "/ｃｌｅａｎ/path", "/clean\x1b[31mpath", "/clean\u200bpath", "/clean\udcffpath",
+    "/clean'path", "/clean@path", "/clean%path", "/clean\\path", "/clean;path", "/clean#path", "/clean&path",
+    "/" + "*" * 255, "/" + "*" * 256,
+], ids=["clean", "limit", "over-limit", "space", "tab", "equals", "quote", "brackets",
+        "nfkc", "ansi", "format", "surrogate", "single-quote", "at", "percent", "backslash", "semicolon",
+        "hash", "ampersand", "glob-limit", "glob-over-limit"])
+def test_workspace_refusal_echoes_only_unchanged_conservative_paths(workspace, value):
+    workspace.register("a1")
+    expected = value if len(value) <= 256 and value.isascii() and all(
+        char.isalnum() or char in "/._-:*?[]{},!" for char in value) else fingerprint(value)
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(controller.Store(workspace.store).load(), "a1", [value])
+    assert str(error.value) == "invalid path: " + expected
+    assert workspace.run("check-paths", {"initiative": "a1", "paths": [value]}, expect=2) == {
+        "error": "invalid path: " + expected}
+
+
+@pytest.mark.parametrize("checkout_component", ["checkout", "checkout with space"])
+def test_workspace_json_conflict_fingerprints_each_raw_slot_once(workspace, monkeypatch, capsys, checkout_component):
+    value = "sk_live_" + "A" * 16 + "/SYNTHETIC_SUFFIX"
+    checkout_path = workspace.tmp / checkout_component
+    checkout_path.mkdir()
+    workspace.register("a1", checkouts=[str(checkout_path)])
+    match, team, paths = controller.lease_tools()
+    lease = SimpleNamespace(lane=value, oid="a" * 40, paths=[value], path_set=paths.stored_paths([value]),
+                            owner=value, expired=lambda now: False, expires_at=123)
+    bad = SimpleNamespace(lane=value, oid="b" * 40, error=value)
+    reader = SimpleNamespace(glob_problem=team.glob_problem,
+                             read_leases=lambda path: SimpleNamespace(leases=[lease], unreadable=[bad]))
+    monkeypatch.setattr(controller, "lease_tools", lambda: (match, reader, paths))
+    assert controller.main(workspace.argv("check-paths", {"initiative": "a1", "paths": [value]})[3:]) == 3
+    captured = capsys.readouterr()
+    assert captured.err == "" and "SYNTHETIC" not in captured.out
+    result = json.loads(captured.out)
+    assert result["paths"] == [fingerprint(value)]
+    assert result["conflicts"][0]["lane"] == fingerprint(value)
+    assert result["conflicts"][0]["owner"] == fingerprint(value)
+    assert result["conflicts"][0]["paths"] == [fingerprint(value)]
+    assert result["conflicts"][1]["lane"] == fingerprint(value)
+    assert result["conflicts"][1]["unreadable"] == fingerprint(value)
+    checkout = str(checkout_path)
+    displayed_checkout = controller._display(checkout)
+    if " " in checkout:
+        assert displayed_checkout == fingerprint(checkout)
+    assert [row["checkout"] for row in result["conflicts"]] == [displayed_checkout] * 2
+
+
+def test_workspace_long_initiative_cli_fingerprints_the_complete_raw_value(workspace):
+    value = "/" + " " * 4084 + "token=SYN\nTHETIC-S1"
+    assert len(value) > 4096
+    result = subprocess.run(workspace.argv("check-delivery", initiative=value), capture_output=True, timeout=30)
+    assert result.returncode == 2 and result.stderr == b""
+    assert b"SYN" not in result.stdout and b"THETIC" not in result.stdout
+    expected = {"error": "initiative is not registered: " + fingerprint(value)}
+    assert result.stdout == (json.dumps(expected, sort_keys=True) + os.linesep).encode("utf-8")
+
+
+def detector_parity_samples():
+    values = [value for _, value, _ in _CREDENTIAL_CORPUS]
+    values += ["src/**", "docs/{a,b}/*.md", "tests/[ab]?_x.py", "!vendor/**", "", "src/file.py",
+               "src/" + "a" * 252, "C:/src/file.py", "src/authorship:clean", "src/auth:SYNTHETIC_CREDENTIAL",
+               "src/" + "x" * 33 + "token:SYNTHETIC_CREDENTIAL", "a" * 256,
+               "src/Bearer\tSYNTHETIC_CREDENTIAL", "the password\nis\nSYNTHETIC_PASSWORD",
+               "https://fixture:SYNTHETIC_PASSWORD@example.test/path"]
+    rng = random.Random(2021)
+    alphabet = "abcXYZ0123/._-:*?[]{},!"
+    for _ in range(200):
+        value = "".join(rng.choice(alphabet) for _ in range(rng.randrange(257)))
+        values += [value, value + "token:SYNTHETIC_CREDENTIAL"]
+    return values
+
+
+_DETECTOR_PARITY_SAMPLES = detector_parity_samples()
+
+
+@pytest.mark.parametrize("value", _DETECTOR_PARITY_SAMPLES,
+                         ids=["sample-%d" % index for index in range(len(_DETECTOR_PARITY_SAMPLES))])
+def test_workspace_detector_decisions_match_original_grammar(value):
+    reference = tuple(re.compile(pattern.pattern.replace(r"(?<![A-Za-z0-9])", ""))
+                      for pattern, _, _ in controller._SECRET_REDACTIONS) + (
+        re.compile(r"(?i)(Bearer|Basic|Digest|Token|Negotiate)(\s{1,8})[A-Za-z0-9._~+/=-]{4,512}"),)
+    matched = any(pattern.search(value) for pattern in reference)
+    assert any(pattern.search(value) for pattern in controller._DISPLAY_CREDENTIALS) is matched
+    assert controller._credential_match(value) is matched
+    allowlisted = re.fullmatch(r"[A-Za-z0-9/._:*?\[\]{},!-]*", value) is not None
+    expected = value if len(value) <= 256 and allowlisted and not matched else fingerprint(value)
+    with pytest.raises(ValueError) as error:
+        controller.Ledger().initiative(value)
+    assert str(error.value) == "initiative is not registered: " + expected
+
+
+def test_workspace_clean_conflict_paths_have_bounded_display_cost(workspace, monkeypatch):
+    workspace.register("a1", checkouts=[str(workspace.tmp)])
+    match, team, paths = controller.lease_tools()
+    clean = []
+    for index in range(256):
+        prefix, suffix = "src/%03d/" % index, "/file.py"
+        clean.append(prefix + "a" * (256 - len(prefix) - len(suffix)) + suffix)
+    parsed = paths.stored_paths(clean)
+    leases = [SimpleNamespace(lane="lane-%d" % index, oid="%040x" % index, paths=clean, path_set=parsed,
+                              owner="fixture", expired=lambda now: False, expires_at=123)
+              for index in range(100)]
+    reader = SimpleNamespace(glob_problem=team.glob_problem,
+                             read_leases=lambda path: SimpleNamespace(leases=leases, unreadable=[]))
+    monkeypatch.setattr(controller, "lease_tools", lambda: (match, reader, paths))
+    ledger = controller.Store(workspace.store).load()
+    started = time.perf_counter()
+    code, result = controller.check_paths(ledger, "a1", ["src/**"])
+    elapsed = time.perf_counter() - started
+    assert code == 3 and len(result["conflicts"]) == 100
+    assert sum(len(row["paths"]) for row in result["conflicts"]) == 25600
+    assert all(row["paths"] == clean for row in result["conflicts"])
+    assert elapsed < 20, "25,600 clean paths exceeded the generous 20-second guard: %.3fs" % elapsed
+
+
+@pytest.mark.parametrize("value", [
+    "/the password\nis SYNTHETIC_PASSWORD",
+    "/" + "x" * 33 + "token=SYNTHETIC_PASSWORD",
+    "/Authorization:Bearer SYNTHETIC:OPAQUE_1234567890",
+    "/authorization=Bearer SYNTHETIC:OPAQUE_1234567890",
+    "/Bearer SYNTHETIC:OPAQUE_1234567890",
+], ids=["prose-boundary", "assignment-prefix-33", "colon-header", "colon-assignment", "colon-bearer"])
+def test_workspace_argon_variants_fingerprint_the_complete_raw_path(workspace, value):
+    assert_path_refusal_fingerprints_raw_value(workspace, value)
+
+
+@pytest.mark.parametrize("glob", ["src/**", "docs/{a,b}/*.md", "tests/[ab]?_x.py", "!vendor/**"])
+def test_workspace_clean_globs_echo_unchanged_in_cli_refusal_and_conflict(workspace, glob):
+    workspace.register("a1")
+    refused = workspace.run("check-paths", {"initiative": "a1", "paths": ["/" + glob]}, expect=2)
+    assert refused == {"error": "invalid path: /" + glob}
+    workspace.register("owner", touched_paths=[glob])
+    request_id = workspace.ask("owner")
+    workspace.grant()
+    report = workspace.run("check-paths", {"initiative": "a1", "paths": [glob]}, expect=3)
+    assert report["paths"] == [glob]
+    assert report["reserved_conflicts"] == [{"request_id": request_id, "initiative": "owner",
+                                              "holder": "owner/lane", "paths": [glob]}]
+
+
+@pytest.mark.parametrize("label,token,credential", _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:],
+                         ids=[row[0] for row in _CREDENTIAL_CORPUS[6:7] + _CREDENTIAL_CORPUS[10:]])
+def test_workspace_token_globs_fingerprint_whole_in_cli_refusal_and_conflict(workspace, label, token, credential):
+    glob = "src/*/" + token + "/**"
+    assert_path_refusal_fingerprints_raw_value(workspace, "/" + glob)
+    workspace.register("owner", touched_paths=[glob])
+    request_id = workspace.ask("owner")
+    workspace.grant()
+    report = workspace.run("check-paths", {"initiative": "a1", "paths": [glob]}, expect=3)
+    assert report["paths"] == [fingerprint(glob)]
+    assert report["reserved_conflicts"] == [{"request_id": request_id, "initiative": "owner",
+                                              "holder": "owner/lane", "paths": [fingerprint(glob)]}]
+    raw = json.dumps(report)
+    assert credential not in raw and "SYNTHETIC" not in raw

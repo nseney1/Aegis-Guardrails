@@ -7868,11 +7868,74 @@ def jobs2_2i_claim_payload(claim, variant):
     return json.dumps(claim).encode()
 
 
+@pytest.mark.parametrize("variant", JOBS2_2I_VARIANTS)
+def test_jobs2_2i_claim_verifier_matrix_without_shop(tmp_path, monkeypatch, variant):
+    jobs = jobs2_module
+    # Plan discovery selects custody guidance; this verifier needs no ledger or admission.
+    (tmp_path / jobs.hierarchy_hosts.PLAN_FILE).write_text("{}")
+    initiative = {"id": "pilot", "mailbox_root": str(tmp_path / "mailbox")}
+    job = jobs.Job(tmp_path / "store", initiative, {"message_id": "job-1"})
+    job.execution_claim_name = "execution.json"
+    job.folder.mkdir(parents=True)
+    candidate = job.execution_path
+    claim = live_claim(jobs, os.getpid(), job.id)
+    claim["recipes_sha256"] = "a" * 64
+    if variant == "directory":
+        candidate.mkdir()
+    elif variant in ("dangling", "symlink"):
+        other = tmp_path / "claim-target"
+        if variant == "symlink":
+            other.write_bytes(jobs2_2i_claim_payload(claim, "valid"))
+        symlink_or_skip(other, candidate)
+    else:
+        candidate.write_bytes(b"x" * (jobs.MAX_BYTES + 1) if variant == "oversized"
+                              else jobs2_2i_claim_payload(claim, variant))
+    original_open = os.open
+    denied = []
+
+    def open_claim(path, flags, *args, **kwargs):
+        if variant == "unreadable" and Path(path).name == candidate.name:
+            denied.append(True)
+            raise PermissionError(errno.EACCES, "fixture claim unreadable")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim}))
+    observation = job.observe_fence()
+    assert observation.present is True
+    if variant.startswith("valid"):
+        assert observation.state == jobs.FENCE_VERIFIED
+        assert observation.value == json.loads(jobs2_2i_claim_payload(claim, variant))
+        assert job.recorded_execution_fence() is True
+    else:
+        assert observation.state == jobs.FENCE_UNCERTAIN
+        assert job.recorded_execution_fence() is None
+        assert jobs.unknown_custody_row(job)["next_action"] == JOBS2_UNVERIFIED_ACTION
+    assert bool(denied) is (variant == "unreadable")
+
+
+def test_jobs2_2i_claim_verifier_refuses_unsupported_descriptors(tmp_path, monkeypatch):
+    jobs = jobs2_module
+    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "job-1"})
+    job.folder.mkdir(parents=True)
+    job.claim_path.write_bytes(jobs2_2i_claim_payload(live_claim(jobs, os.getpid(), job.id), "valid"))
+
+    def unsupported():
+        raise ValueError("secure brief publication requires directory descriptor support")
+
+    monkeypatch.setattr(jobs2_fresh_brief, "require_secure_publication", unsupported)
+    observation = job.observe_fence()
+    assert observation.state == jobs.FENCE_UNCERTAIN and observation.present is None
+    assert isinstance(observation.read_error, ValueError)
+    assert str(observation.read_error) == "secure brief publication requires directory descriptor support"
+
+
+# Payload and filesystem shapes are covered above without rebuilding a Shop per shape.
+# Each route still meets both a valid claim and a semantically invalid job binding.
 @pytest.mark.usefixtures("jobs2_fresh_cache")
 @pytest.mark.parametrize("kind", ["heavy", "heavy-tests"])
 @pytest.mark.parametrize("entry", ["existing", "closed-execution", "closed-claim", "taken", "lost-link", "own-publication", "released", "refusal"])
-@pytest.mark.parametrize("variant", JOBS2_2I_VARIANTS)
-def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monkeypatch, capsys, kind, entry, variant):
+@pytest.mark.parametrize("variant", ["valid", "bad-job-value"])
+def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, capsys, kind, entry, variant):
     from types import SimpleNamespace
     from tests.conftest import symlink_or_skip
     from tests.integration.test_hierarchy_jobs_derive import edit_source, host_plan, request_derive
@@ -7908,8 +7971,9 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monk
     candidate = folder / filename
     original_run, original_grant, original_load = jobs.run_job, jobs.grant_next, jobs.Store.load
     original_refuse = jobs.refuse
-    original_open, original_link, original_unlink = os.open, os.link, os.unlink
-    created, acknowledged, reads, swapped = [], [], [], []
+    original_link, original_unlink = os.link, os.unlink
+    original_observe = jobs.Job.observe_fence
+    created, acknowledged, reads, swapped, observed = [], [], [], [], []
 
     def put_candidate(claim=None):
         folder.mkdir(parents=True, exist_ok=True)
@@ -7920,16 +7984,7 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monk
             claim["recipes_sha256"] = hashlib.sha256(shop.recipes_path.read_bytes()).hexdigest()
         if candidate.exists() or candidate.is_symlink():
             candidate.unlink()
-        if variant == "directory":
-            candidate.mkdir()
-        elif variant in ("dangling", "symlink"):
-            other = shop.tmp / "matrix-link-target"
-            if variant == "symlink":
-                other.write_bytes(jobs2_2i_claim_payload(claim, "valid"))
-            symlink_or_skip(other, candidate)
-        else:
-            candidate.write_bytes(b"x" * (jobs.MAX_BYTES + 1) if variant == "oversized"
-                                  else jobs2_2i_claim_payload(claim, variant))
+        candidate.write_bytes(jobs2_2i_claim_payload(claim, variant))
         created.append(True)
 
     if entry == "existing" or entry.startswith("closed-"):
@@ -7966,10 +8021,11 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monk
                 symlink_or_skip(retained, store, target_is_directory=True)
         return original_load(current)
 
-    def open_claim(path, flags, *args, **kwargs):
-        if variant == "unreadable" and created and Path(path).name == filename:
-            raise PermissionError(errno.EACCES, "fixture claim unreadable")
-        return original_open(path, flags, *args, **kwargs)
+    def observe(job, name=None, directory=None):
+        observation = original_observe(job, name, directory)
+        if created and job.id == target and (job.execution_claim_name if name is None else name) == filename:
+            observed.append(observation.state)
+        return observation
 
     def link(source, destination, *args, **kwargs):
         answer = original_link(source, destination, *args, **kwargs)
@@ -7987,7 +8043,8 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monk
 
     try:
         with ExitStack() as patch:
-            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "open": open_claim, "link": link, "unlink": unlink})))
+            patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "link": link, "unlink": unlink})))
+            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_fence", observe))
             patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
             patch.enter_context(jobs2_patch.object(jobs2_module, "refuse", refuse))
             patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
@@ -8003,8 +8060,10 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, monk
     owned = [row for row in report["rows"] if row.get("job") == target]
     assert owned and owned[-1]["state"] == "settle_pending", report
     if variant.startswith("valid"):
+        assert jobs.FENCE_VERIFIED in observed, "the route must verify the candidate through observe_fence"
         assert "original fence" in owned[-1]["next_action"] or "preserve the running job" in owned[-1]["next_action"]
     else:
+        assert observed and set(observed) == {jobs.FENCE_UNCERTAIN}, "the route must refuse the invalid candidate"
         assert owned[-1]["next_action"] == JOBS2_UNVERIFIED_ACTION
         if not entry.startswith("closed-"):
             assert owned[0]["state"] == "abandoned" and owned[0]["next_action"] == JOBS2_UNVERIFIED_ACTION

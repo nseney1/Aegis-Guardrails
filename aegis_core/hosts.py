@@ -26,7 +26,7 @@ experimental hosts, v4.1-v4.2 spec).
 """
 from __future__ import annotations
 
-__all__ = ["APP_DIRS", "GENERIC", "HOSTS", "INSTRUCTION_MODES", "HostSpec", "Registration", "all_hosts",
+__all__ = ["APP_DIRS", "GENERIC", "HOSTS", "INSTRUCTION_MODES", "TEAM_SESSION_MARKERS", "HostSpec", "Registration", "all_hosts",
            "app_paths", "get", "identify", "resolve"]
 
 from dataclasses import dataclass, field
@@ -53,14 +53,16 @@ APP_DIRS = {
     "win32": ("%LOCALAPPDATA%/Programs",),
 }
 
-_TEAM_MARKERS = ("AEGIS_TEAM_HOST", "AEGIS_TEAM_SESSION")
+TEAM_SESSION_MARKERS = ("AEGIS_TEAM_HOST", "AEGIS_TEAM_SESSION")
 _CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
-_CODEX_MARKERS = _TEAM_MARKERS + (
+_CODEX_SESSION_VARIABLE = "CODEX_THREAD_ID"
+_CODEX_MARKERS = TEAM_SESSION_MARKERS + (
     "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_VERSION")
+    "CODEX_SESSION_ID", _CODEX_SESSION_VARIABLE, "CODEX_TOOL_CALL_ID", "CODEX_VERSION")
 _CLAUDE_BILLING = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
-_CLAUDE_MARKERS = _TEAM_MARKERS + ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
+_CLAUDE_SESSION_VARIABLE = "CLAUDE_CODE_SESSION_ID"
+_CLAUDE_MARKERS = TEAM_SESSION_MARKERS + (_CLAUDE_SESSION_VARIABLE, "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
 
 
 @dataclass(frozen=True)
@@ -120,9 +122,12 @@ class HostSpec:
     #: Inherited credential/billing names to scrub from every host child.
     #: Empty means no measured names, not runtime qualification of that host.
     billing_variables: Tuple[str, ...] = ()
+    #: Observed host session variable; empty when none has been measured.
+    #: This name alone does not verify propagation into MCP children.
+    session_variable: str = ""
     #: Every registry row includes the common Aegis markers. Additional names
     #: and prefixes mirror the observed legacy host environment catalog.
-    session_markers: Tuple[str, ...] = _TEAM_MARKERS
+    session_markers: Tuple[str, ...] = TEAM_SESSION_MARKERS
     session_marker_prefixes: Tuple[str, ...] = ()
     #: Launcher-local auth overrides must not cross a child boundary either.
     environment_overrides: Tuple[str, ...] = ()
@@ -132,6 +137,7 @@ HOSTS: Tuple[HostSpec, ...] = (
     HostSpec(
         id="codex-cli",
         billing_variables=_CODEX_BILLING,
+        session_variable=_CODEX_SESSION_VARIABLE,
         session_markers=_CODEX_MARKERS,
         display_name="Codex CLI",
         vendor="OpenAI",
@@ -159,6 +165,7 @@ HOSTS: Tuple[HostSpec, ...] = (
     HostSpec(
         id="claude-code",
         billing_variables=_CLAUDE_BILLING,
+        session_variable=_CLAUDE_SESSION_VARIABLE,
         session_markers=_CLAUDE_MARKERS,
         session_marker_prefixes=("CLAUDE_CODE_",),
         display_name="Claude Code",
@@ -183,6 +190,7 @@ HOSTS: Tuple[HostSpec, ...] = (
     HostSpec(
         id="claude-desktop",
         billing_variables=_CLAUDE_BILLING,
+        session_variable=_CLAUDE_SESSION_VARIABLE,
         session_markers=_CLAUDE_MARKERS,
         session_marker_prefixes=("CLAUDE_CODE_",),
         display_name="Claude Desktop",
