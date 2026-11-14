@@ -20,14 +20,25 @@ aegis team hosts usage --json
 `--force` is supplied. It writes a version and a preset reference, so future
 readers can refuse unsupported versions before interpreting settings. Force
 replaces a valid profile; malformed, oversized or unsafe files still refuse.
-Files use descriptor-relative operations from a trusted absolute root. The user
-directory chain through `~/.config/aegis` is resolved once, supporting symlinked
-homes and GNU Stow directory folding. The opened, resolved `aegis` directory must
-be owned by the current uid and must not be group/other-writable. `team.json`
-itself is opened no-follow: Stow `--no-folding` file links are refused. Canonical
+Files use descriptor-relative operations from a trusted absolute root. A
+relative or malformed user root, including an empty string, refuses with
+`user profile root unavailable; configure a home directory` before resolution.
+The user directory chain through `~/.config/aegis` is resolved once, supporting
+symlinked homes and GNU Stow directory folding. The opened, resolved `aegis`
+directory must be owned by the current uid and must not be group/other-writable.
+The opened `team.json` descriptor must also show the current uid and no
+group/other write bits, before any bytes are parsed. Otherwise it refuses with
+`user profile file must be owned by the current user and not group/other-writable`.
+`team.json` itself is opened no-follow: Stow `--no-folding` file links are refused. Canonical
 directory components and repository paths retain descriptor-based no-follow
 protection, including during concurrent renames.
 Special files and platforms without these operations refuse clearly.
+Repository roots accept absolute strings or native `Path` values. Validation
+converts their checked spelling once. Custom path-like objects and `Path`
+subclasses refuse before conversion hooks run, with
+`unsafe profile root; use an absolute trusted directory`.
+A failed home-directory lookup remains a user-layer refusal on Python 3.9 and
+newer versions.
 
 This feature-owned I/O boundary and its five exact storage-ratchet registrations
 remain until **STORE-API-1** supplies the shared confined-file API and migration.
@@ -39,7 +50,7 @@ remain available there. Finding a CLI does not bypass this platform refusal.
 ## Documents and layers
 
 Version 1 has exactly these top-level keys: `version`, `preset`, `policy`,
-`model_settings`, `run_config`. On disk, `version: 1` is mandatory. Unknown keys
+`model_settings`, `run_config`, `supervisor`. On disk, `version: 1` is mandatory. Unknown keys
 refuse with their full key path, and wrong types refuse without coercion. The
 closed repository/flag JSON schema is `aegis_core.team_profile.JSON_SCHEMA`
 (`aegis.team.profile/v1`); the user schema is `USER_JSON_SCHEMA`
@@ -50,6 +61,36 @@ The exact names `hold` and `skip` are reserved for fallback terminals and cannot
 be host aliases or capacity keys. Aliases use case-sensitive, JSON-decoded
 identities, so escaped spellings of those reserved names also refuse. Terminals
 are recognized before host lookup, including when a raw plan is inspected.
+
+Refusal order is independent of object insertion order. Schema checks consider
+version and preset, then model settings, policy, run configuration and supervisor.
+Within model settings, hosts precede roles and capacity. Other object fields and
+semantic host/role/capacity checks use identifier order. Resolved consumers check
+the profile before provenance metadata, using the same schema paths as resolution.
+Missing required supervisor fields refuse before present sibling values at every
+object level; complete supervisor objects retain identifier-order checks.
+Resolved envelopes require `profile`, `values` and `write_scope`. Validation
+finishes the profile's required fields, host/route policy and supervisor
+cross-field conflicts before checking `values`, then `write_scope`. Missing
+envelope keys refuse at their fixed field names. Display, doctor, host advice
+and supervisor health use this gate before indexing snapshot fields; malformed
+snapshots do not reach state access. Display also accepts the existing command
+views: `config show` carries the resolved envelope, while `config init` carries
+only a complete profile body and cannot carry resolved provenance or write scope.
+Argument/workspace refusals, presets, doctor and host diagnostics retain their
+existing formats. Display first copies bounded native JSON and renders that
+validated copy. Dictionaries require exact string keys; lists and exact native
+strings, integers, finite floats, booleans and null are supported. User objects,
+subclasses and non-finite numbers refuse with `invalid value: profile display`,
+without calling conversion hooks. Diagnostics allow depth 16, 4,096 entries per
+container, 131,072 characters per string, 1,048,576 nodes (including keys), and
+67,108,864 string characters in total. Integers are limited to 4,096 bits.
+These copy limits accommodate resolved profile/provenance data; profile schema
+bounds remain unchanged. Diagnostic text retains its shared redaction policy.
+Arrays retain their declared order, including host bindings and fallback chains.
+Supervisor fragments participate in that traversal; no preliminary supervisor
+screen takes precedence over an earlier field. Flags still refuse supervisor
+settings when the traversal reaches that field.
 
 Layers are applied in this order:
 
@@ -73,6 +114,13 @@ and `write_scope`. Dotted aliases remain single components. The usual dotted
 display keys are retained; if two paths have the same display key, their keys
 are serialized component arrays so neither record is lost. Consumers use `path`
 for identity. Array values retain one provenance record for the replacing layer.
+Resolved validation checks each copied provenance value against its source
+field's schema, including numeric bounds and the separate user schema for
+`user.*` records. The resolved profile has a bounded node budget for the built-in
+base plus three override layers (four times the per-document 4,096-node budget).
+Metadata has separate bounds, and each copied leaf has its own per-document
+budget, so copies do not consume the source profile's budget again. Duplicate
+provenance paths refuse.
 Credentials are always redacted.
 Display text is canonicalized, then secret values are redacted, then text is
 truncated, including JSON text. Schema-constrained identifiers and keys are not
@@ -109,10 +157,12 @@ objects add no user origin. Valid global
 preferences cannot introduce incomplete hosts or roles or invalidate repository
 routes, so one user file works across ci-only, solo, pair and mixed repositories.
 
-Every `model_settings` and `run_config` value is marked frozen at run start.
+Every `model_settings`, `run_config` and `supervisor` value is marked frozen at run start.
 Consumers must resolve once at startup and retain that snapshot; flag changes
 to these sections or the preset refuse when resolving a live run. Inspection
-does not reconfigure an existing run.
+does not reconfigure an existing run. Supervisor settings are not part of the
+generic object merge: the repository layer may only narrow them. See
+[Supervisor profile](teams-supervisor.md).
 
 ## Schema areas
 
@@ -128,6 +178,7 @@ does not reconfigure an existing run.
 | `run_config` | `autopilot` | queue_full_on_ready, claim_next, resume_writer booleans; rulings |
 | `run_config` | `limits` | Repository-only writers_max, votes_max, research_max |
 | `run_config` | `token_budgets` | User-only map of per-role positive integer token budgets |
+| `supervisor` | `components`, `pauses`, `health` | Five components, all disabled until the owner file enables one; closed pauses; restart and health floors. The repository may narrow a limit and may add a pause. It cannot clear a pause or widen a ceiling. |
 
 Positive integer settings are capped at 1,000,000; budget values are finite
 numbers in [0, 1,000,000]; percentages are finite numbers in [0, 100]. Routing
@@ -141,8 +192,12 @@ apply to the merged profile and are checked before route planning, including
 when a consumer revalidates a resolved profile. Larger profiles refuse with
 their input layer, file and field path. Presets and the examples below fit.
 Other arrays and named maps hold at most 64 entries. Strings hold at most 4,096
-characters. Files hold at most 128 KiB, nesting at most 16, and resolution at
-most 4,096 nodes.
+characters. Map limits count preset entries and additions from every layer:
+for example, 63 distinct runner aliases plus the default `local` runner fill
+the 64-entry map. `resolve` and `load` check merged bounds before returning,
+so CLI and MCP adapters report their normal refusal envelopes before display.
+Files hold at most 128 KiB, nesting at most 16, and each input document at
+most 4,096 nodes; the resolved-source budget is described above.
 Duplicate JSON keys refuse. Native `codex` app threads remain registry entries
 that cannot bind team-run roles. `codex-cli` and `claude-code` retain the registry's
 qualification boundaries; finding a CLI proves neither login nor OS isolation.
@@ -302,15 +357,16 @@ repository-local documentation. Configuration and doctor exit codes are 0 done,
 Config without a verb and an invalid init preset/host return usage (2), without
 echoing the invalid input.
 
-Refusal attribution resolves the repository with defaults and its preset again,
-without the user layer. If that refuses too, the repository-only refusal and
-repository file are reported. Only a valid repository-only profile permits a
-user refusal to name the user file. The next check adds the user layer without
-flags; if that refuses, its user refusal wins even over a later flag-validation
-error. Only when both earlier prefixes are valid does the refusal name flags
-and `<command-line>`. This rule also covers malformed user JSON; provenance path
-strings never decide ownership. Invalid preset/host command usage remains a
-flag-layer usage refusal.
+Refusal attribution first checks intrinsic repository schema and policy against
+defaults and its preset. Supervisor bounds are checked here, but its narrowing
+is compared only against the effective ceiling after user settings are applied.
+An intrinsic repository failure names the repository file. Otherwise, a failure
+in the user layer names the user file, including malformed JSON or unsafe file
+custody. With both layers available, supervisor widening or conflicts attributed
+to the repository still name the repository. Only when the combined repository
+and user settings succeed does a later refusal name flags and `<command-line>`.
+Provenance path strings never decide ownership. Invalid preset/host command
+usage remains a flag-layer usage refusal.
 
 Doctor lists every declared host, its registered CLI and whether it is found on
 PATH. It evaluates every preset with each installed qualified writer kind using
@@ -369,6 +425,20 @@ Loading the profile validates the same plan from every bound or admitted host:
 each plan must respect family rules and pins, required votes, and destination
 admission. If restarting a plan exposes a forbidden terminal or a destination
 that cannot itself be checked for that job, the profile refuses at load.
+
+Route refusals use the same order in loading, host check/status, doctor and
+supervisor health. Review routes check reviewer independence (cross-family),
+destination admission, pinned-family fallback, then forbidden `skip`. Writer
+routes check destination admission, then forbidden `skip`; the reviewer rule
+does not apply to writer routes. Other non-voting routes check admission and may
+use `skip`. Only admitted writer destinations establish the writer families
+against which reviews are checked. A destination exposed only by an invalid
+writer restart cannot make an otherwise valid reviewer appear dependent.
+
+Checks within each route kind run across its restarted plans in that order.
+Pinned routes retain their existing rule: fallback admission is inactive, and
+review fallbacks are still checked against the pinned family. Profile bounds,
+declarations, role-family pins and required review bindings are checked first.
 
 Check exits are 0 `go`, 3 `hold`, 4 `fallback:HOST`, 5 `skip`, 1 refusal or 2 usage.
 Each decision includes its reason and next action. Writer decisions identify
