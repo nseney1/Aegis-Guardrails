@@ -3,9 +3,9 @@
 The caller supplies the trusted absolute git common directory, outside role-writable
 roots. This module runs neither git nor gh nor an effect callback. A *new*, durable
 IntentReceipt permits the caller's one attempt; an existing receipt never does.
-Every process that may perform the effect must hold the receipt's effect-lock
-descriptor; pass receipt.inheritable_fds() as subprocess pass_fds. Each process
-closes its copy after its effect has stopped. After a lost reply, reconcile uses
+The effect transport passes receipt.inheritable_fds() only to its custody holder.
+Supply effect_fds and the owner-bound worktree_root; the holder retains the lock
+until every effect descendant exits. After a lost reply, reconcile uses
 only the caller's read-only observer. Unknown
 is terminal only for an observed foreign state. Unavailable observations keep
 the intent pending; neither condition authorizes another effect attempt.
@@ -128,9 +128,9 @@ class GitOpsError(ValueError):
 class IntentReceipt:
     """One attempt's ownership, independent of the GitOpsJournal instance.
 
-    Every process that may perform the effect must hold this descriptor. Pass
-    inheritable_fds() to subprocess pass_fds; a child may finish with
-    record_result(effect_fd=fd), then must close its inherited copy. The parent
+    One custody holder retains this descriptor until all effect descendants exit.
+    inheritable_fds() exports a close-on-exec tuple; pass it as effect_fds to
+    the admitted transport. Effect programs receive no descriptor; the parent
     closes its receipt after all of its own effect activity has stopped.
     The shared lock descriptor is read-only: children cannot write checkpoints.
     Closing an abandoned receipt never grants a retry of the durable intent.
@@ -144,12 +144,8 @@ class IntentReceipt:
     _token: object = field(default=None, repr=False, compare=False)
 
     def inheritable_fds(self):
-        with _OWNER_GUARD:
-            held = _OWNERS.get(self._key)
-            if (not self.created or held is None or held[1] != os.getpid()
-                    or held[2] is not self._token):
-                raise GitOpsError("effect_busy")
-            return (held[0],)
+        from aegis_core import gitops_fds
+        return gitops_fds.export_receipt(self, _OWNERS, _OWNER_GUARD, GitOpsError)
 
     def release(self):
         with _refusals(None):
