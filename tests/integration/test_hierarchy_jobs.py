@@ -5656,7 +5656,7 @@ def test_jobs2_derived_publication_failure_tracks_only_this_attempts_fence(
     jobs = jobs2_module
     mailbox = jobs2_mailbox
     original_open = jobs.os.open
-    original_execution_publish = jobs.Job.publish_execution_claim
+    original_execution_publish = jobs.PlannedJob.publish_execution_claim
     original_run_job = jobs.run_job
     folder = shop.workspace.store / "jobs/pilot/job-1"
     execution = folder / "execution.json"
@@ -5740,7 +5740,7 @@ def test_jobs2_derived_publication_failure_tracks_only_this_attempts_fence(
 
     try:
         with ExitStack() as patch:
-            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "publish_execution_claim", publish))
+            patch.enter_context(jobs2_patch.object(jobs2_module.PlannedJob, "publish_execution_claim", publish))
             patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
@@ -7557,7 +7557,7 @@ def test_jobs2_argon0057_closed_job_retains_observed_execution_evidence(
         if evidence == "derived-publication":
             (folder / "execution.json").write_text("{")
     original_grant, original_load, original_settle = jobs.grant_next, jobs.Store.load, jobs.settle
-    original_observe = jobs.Job.observe_existing_fence
+    original_observe = (jobs.PlannedJob if planned else jobs.Job).observe_existing_fence
     acknowledged, swapped, unsupported = [], [], []
 
     def unavailable():
@@ -7591,7 +7591,10 @@ def test_jobs2_argon0057_closed_job_retains_observed_execution_evidence(
 
     try:
         with ExitStack() as patch:
-            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_existing_fence", observe))
+            if planned:
+                patch.enter_context(jobs2_patch.object(jobs2_module.PlannedJob, "observe_existing_fence", observe))
+            else:
+                patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_existing_fence", observe))
             patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
             patch.enter_context(jobs2_patch.object(jobs2_module.Store, "load", load))
             patch.enter_context(jobs2_patch.object(jobs2_module, "settle", settle))
@@ -7874,7 +7877,7 @@ def test_jobs2_2i_claim_verifier_matrix_without_shop(tmp_path, monkeypatch, vari
     # Plan discovery selects custody guidance; this verifier needs no ledger or admission.
     (tmp_path / jobs.hierarchy_hosts.PLAN_FILE).write_text("{}")
     initiative = {"id": "pilot", "mailbox_root": str(tmp_path / "mailbox")}
-    job = jobs.Job(tmp_path / "store", initiative, {"message_id": "job-1"})
+    job = jobs.PlannedJob(tmp_path / "store", initiative, {"message_id": "job-1"})
     job.execution_claim_name = "execution.json"
     job.folder.mkdir(parents=True)
     candidate = job.execution_path
@@ -7913,9 +7916,11 @@ def test_jobs2_2i_claim_verifier_matrix_without_shop(tmp_path, monkeypatch, vari
     assert bool(denied) is (variant == "unreadable")
 
 
-def test_jobs2_2i_claim_verifier_refuses_unsupported_descriptors(tmp_path, monkeypatch):
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
+def test_jobs2_2i_claim_verifier_refuses_unsupported_descriptors(tmp_path, monkeypatch, planned):
     jobs = jobs2_module
-    job = jobs.Job(tmp_path / "store", {"id": "pilot"}, {"message_id": "job-1"})
+    job_class = jobs.PlannedJob if planned else jobs.Job
+    job = job_class(tmp_path / "store", {"id": "pilot"}, {"message_id": "job-1"})
     job.folder.mkdir(parents=True)
     job.claim_path.write_bytes(jobs2_2i_claim_payload(live_claim(jobs, os.getpid(), job.id), "valid"))
 
@@ -7972,7 +7977,7 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, caps
     original_run, original_grant, original_load = jobs.run_job, jobs.grant_next, jobs.Store.load
     original_refuse = jobs.refuse
     original_link, original_unlink = os.link, os.unlink
-    original_observe = jobs.Job.observe_fence
+    original_observe = jobs.PlannedJob.observe_fence
     created, acknowledged, reads, swapped, observed = [], [], [], [], []
 
     def put_candidate(claim=None):
@@ -8044,7 +8049,7 @@ def test_jobs2_2i_claim_matrix_uses_only_verified_regular_claims(kind_shop, caps
     try:
         with ExitStack() as patch:
             patch.enter_context(jobs2_patch.object(jobs2_module, "os", SimpleNamespace(**{**vars(os), "link": link, "unlink": unlink})))
-            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_fence", observe))
+            patch.enter_context(jobs2_patch.object(jobs2_module.PlannedJob, "observe_fence", observe))
             patch.enter_context(jobs2_patch.object(jobs2_module, "run_job", run_job))
             patch.enter_context(jobs2_patch.object(jobs2_module, "refuse", refuse))
             patch.enter_context(jobs2_patch.object(jobs2_module, "grant_next", grant))
@@ -8813,7 +8818,7 @@ def test_jobs2_2m_uncertain_result_probe_never_attempts_settlement(kind_shop, ca
     identifier, folder, _, reservation = jobs2_2l_result_setup(shop, entry, "directory", True)
     (folder / "result.json").rmdir()
     saved, missing = shop.tmp / "uncertain-original-job", shop.tmp / "missing-job"
-    original_existing, original_result = jobs2_module.Job.observe_existing_fence, jobs2_module.Job.observe_result
+    original_existing, original_result = jobs2_module.PlannedJob.observe_existing_fence, jobs2_module.PlannedJob.observe_result
     captured, changed, first, refused = [], [], [], []
 
     def unavailable():
@@ -8847,8 +8852,8 @@ def test_jobs2_2m_uncertain_result_probe_never_attempts_settlement(kind_shop, ca
 
     try:
         with ExitStack() as patch:
-            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_existing_fence", existing))
-            patch.enter_context(jobs2_patch.object(jobs2_module.Job, "observe_result", result))
+            patch.enter_context(jobs2_patch.object(jobs2_module.PlannedJob, "observe_existing_fence", existing))
+            patch.enter_context(jobs2_patch.object(jobs2_module.PlannedJob, "observe_result", result))
             assert jobs2_module.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
         action = JOBS2_UNVERIFIED_ACTION if entry == "closed" else JOBS2_2M_FENCED_UNKNOWN_ACTION
