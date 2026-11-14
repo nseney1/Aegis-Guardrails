@@ -1,10 +1,12 @@
 """Opt-in record tools through the caller-bound mailbox MCP surface."""
+import ast
 import gc
 import hashlib
 import errno
 import inspect
 import json
 import os
+import re
 from contextlib import contextmanager
 from pathlib import Path
 import subprocess
@@ -24,10 +26,12 @@ from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message, pi
 sys.path.insert(0, str(HELPER.parent))
 import hierarchy_mailbox_mcp as mcp
 import hierarchy_mailbox_records as records
+import hierarchy_mailbox_records_guidance as records_guidance
 import hierarchy_mailbox as mailbox_module
 from aegis_core import message_codec as codec
 from aegis_core import message_codec_store as codec_store
 from aegis_core import message_codec_views as codec_views
+from aegis_core import message_codec_format as codec_format
 
 
 def make_store(root):
@@ -177,7 +181,14 @@ def test_selectors_output_limits_and_legacy_digest(bound):
     invoke(root, "publish", message(recipient="a/lane/review", identifier="legacy", body="ordinary\u202etext"))
     for name, args in [("mailbox_read_record", {"message_id": "record-1"}), ("mailbox_digest", {})]:
         assert data(call(reader, name, dict(args, fields=["not_a_field"]))) == codec.CodecError("E_SELECTOR").as_dict()
-        assert data(call(reader, name, dict(args, max_chars=10))) == codec.CodecError("E_LIMIT").as_dict()
+        if name == "mailbox_digest":
+            floor = data(call(reader, name, dict(args, max_chars=10)))
+            assert _assert_measured_budget(floor)
+            _assert_closed(name, floor)
+            followed = data(call(reader, name, dict(args, max_chars=records.MAX_CHARS)))
+            assert followed["messages"]
+        else:
+            assert data(call(reader, name, dict(args, max_chars=10))) == limit_error(name)
     result = call(reader, "mailbox_digest", {"fields": ["body"]})
     rows = data(result)["messages"]
     assert len(rows) == 2 and next(r for r in rows if r["message_id"] == "legacy")["body"] == "ordinary\u202etext"
@@ -698,7 +709,73 @@ def publish_limit(grants=False, history=False):
                           "next_action": "ask the owner to resolve the mailbox history limit"}}
     return {"error": {"code": "E_LIMIT", "message": "record grant limit exceeded" if grants else "record publication limit exceeded",
                       "next_action": "reduce delegated references or ask the owner to inspect the grant index" if grants else
-                      "split the record or reduce its body, fields or references"}}
+                      "split the record or reduce its body or references"}}
+
+
+def digest_page_error():
+    return {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                      "next_action": "reduce limit to 1 and keep after_message_id",
+                      "retry": {"tool": "mailbox_digest", "options": {"limit": 1}}}}
+
+
+def _assert_measured_budget(payload):
+    error = payload["error"]
+    assert error["code"] == "E_LIMIT" and error["message"] == "digest output limit exceeded"
+    assert set(error) <= {"code", "message", "next_action", "retry", "minimum_max_chars"}
+    retry = error["retry"]
+    assert {"tool", "options"} <= set(retry) <= {"tool", "options", "target"}
+    assert retry["tool"] in ("mailbox_digest", "mailbox_read_record")
+    assert set(retry["options"]) <= _RECORD_ARGUMENTS[retry["tool"]]
+    if retry["tool"] == "mailbox_read_record":
+        target = retry["target"]
+        assert set(target) == {"collection", "index"}
+        assert target["collection"] in ("messages", "records")
+        assert type(target["index"]) is int and 0 <= target["index"] < 100
+    if "minimum_max_chars" in error:
+        assert retry["options"]["max_chars"] == error["minimum_max_chars"]
+        assert "increase max_chars to at least " + str(error["minimum_max_chars"]) in error["next_action"]
+    _assert_closed("mailbox_digest", payload)
+    return payload
+
+
+def digest_inbox_error():
+    return {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                      "next_action": "read the ordinary message through the inbox path"}}
+
+
+def digest_view_error():
+    return {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                      "next_action": "request fewer refs, or narrow fields (for example body) or outline, "
+                                     "or use mailbox_read_record with narrower fields"}}
+
+
+def digest_floor_error():
+    return {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                      "next_action": "pass max_chars large enough for the digest page, as an integer from 0 to "
+                                     + str(records.MAX_CHARS)}}
+
+
+def digest_invalid_limit():
+    return {"error": {"code": "E_LIMIT", "message": "invalid limit",
+                      "next_action": "pass limit as an integer from 1 to 100"}}
+
+
+def digest_invalid_max_chars():
+    return {"error": {"code": "E_LIMIT", "message": "invalid max_chars",
+                      "next_action": "pass max_chars as an integer from 0 to " + str(records.MAX_CHARS)}}
+
+
+def limit_error(tool):
+    """Read keeps the codec envelope. Digest overflow is per case, not this helper."""
+    assert tool != "mailbox_digest"
+    return codec.CodecError("E_LIMIT").as_dict()
+
+
+def digest_range_error(tool):
+    """Out-of-range max_chars names the digest range. A read keeps the codec envelope."""
+    if tool == "mailbox_digest":
+        return digest_invalid_max_chars()
+    return codec.CodecError("E_LIMIT").as_dict()
 
 
 @pytest.mark.parametrize("verdict", ["ACCEPT", "REQUEST_CHANGES"])
@@ -864,7 +941,8 @@ def test_r3_store_descriptor_alias_identity_is_refused_before_store_binding(boun
     def forbidden(*args, **kwargs):
         raise AssertionError("aliased store reached codec binding")
     monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "open": aliased}))
-    monkeypatch.setattr(codec, "Store", forbidden)
+    toolbox = SimpleNamespace(**{**vars(codec), "Store": forbidden})
+    monkeypatch.setattr(records, "codec_tools", lambda: toolbox, raising=True)
     assert data(call(connection(root), "mailbox_publish_record", request())) == codec.CodecError("E_AUTH").as_dict()
 
 
@@ -1160,8 +1238,9 @@ def test_r4_grant_failures_are_bounded_local_and_close_descriptors(bound, monkey
             stream.truncate(codec.MAX_BYTES + 1)
         def parsed(*args, **kwargs):
             raise AssertionError("oversized grant was parsed")
-        real_parse = codec.parse
-        monkeypatch.setattr(codec, "parse", parsed)
+        real_codec_tools = records.codec_tools
+        toolbox = SimpleNamespace(**{**vars(codec), "parse": parsed})
+        monkeypatch.setattr(records, "codec_tools", lambda: toolbox, raising=True)
     elif failure == "symlink":
         saved = store / "grant-backup"
         grant.rename(saved)
@@ -1176,7 +1255,7 @@ def test_r4_grant_failures_are_bounded_local_and_close_descriptors(bound, monkey
                             "close": close, "fdopen": refused}))
     assert data(call(reader, "mailbox_read_record", {"message_id": "record-1"})) == auth_error("reference")
     if failure == "oversize":
-        monkeypatch.setattr(codec, "parse", real_parse)
+        monkeypatch.setattr(records, "codec_tools", real_codec_tools, raising=True)
     if failure == "fdopen":
         monkeypatch.setattr(records, "os", os)
         assert sorted(opened) == sorted(closed)
@@ -1789,8 +1868,30 @@ def test_r7_large_delegated_record_has_its_own_selectors_and_outline(bound, monk
         assert len(json.dumps(actual)) <= 60000
         assert "outline" in actual_view
     assert "outline" in expected
-    assert data(call(reviewer, tool, dict(args, fields=["fields"]))) == codec.CodecError("E_LIMIT").as_dict()
-    assert data(call(reviewer, tool, dict(args, fields=["body"], max_chars=10))) == codec.CodecError("E_LIMIT").as_dict()
+    refused = data(call(reviewer, tool, dict(args, fields=["fields"])))
+    if tool == "mailbox_digest":
+        assert _assert_measured_budget(refused)
+        _assert_closed("mailbox_digest", refused)
+        assert "after_message_id" not in refused["error"]["next_action"]
+        narrowed = data(call(reviewer, "mailbox_digest", {"refs": [rid], "fields": ["body"], "limit": 1}))
+        assert narrowed["records"][0]["data"]["body"] == "small delegated body"
+        outlined = data(call(reviewer, "mailbox_digest", {"refs": [rid], "outline": True, "limit": 1}))
+        assert "outline" in outlined["records"][0]
+        fewer = data(call(reviewer, "mailbox_digest", {"limit": 20, "fields": ["fields"]}))
+        assert [row["message_id"] for row in fewer["messages"]] == ["wrapper", "later", "last"]
+        assert "records" not in fewer
+    else:
+        assert refused == limit_error(tool)
+        assert "narrow the selectors" in refused["error"]["message"]
+        repaired = data(call(reviewer, tool, dict(args, fields=["body"])))
+        assert repaired["data"]["body"] == "small delegated body"
+    if tool == "mailbox_digest":
+        assert _assert_measured_budget(data(call(reviewer, tool, dict(args, fields=["body"], max_chars=10))))
+        followed = data(call(reviewer, "mailbox_digest", {"refs": [rid], "fields": ["body"], "limit": 1,
+                                                         "max_chars": records.MAX_CHARS}))
+        assert followed["records"][0]["data"]["body"] == "small delegated body"
+    else:
+        assert data(call(reviewer, tool, dict(args, fields=["body"], max_chars=10))) == limit_error(tool)
     outsider = connection(root, "a/lane/f2")
     reads.clear()
     answers = []
@@ -1976,7 +2077,10 @@ def test_r8_default_delegated_view_withholds_ungranted_children_per_row(bound, m
         selected = data(call(reviewer, tool, dict(args, fields=["body"])))
         selected_view = selected if tool == "mailbox_read_record" else selected["records"][0]
         assert selected_view["data"]["body"] == "parent body" and "refs_withheld" not in selected_view
-        assert data(call(reviewer, tool, dict(args, max_chars=10))) == codec.CodecError("E_LIMIT").as_dict()
+        if tool == "mailbox_digest":
+            assert _assert_measured_budget(data(call(reviewer, tool, dict(args, max_chars=10))))
+        else:
+            assert data(call(reviewer, tool, dict(args, max_chars=10))) == limit_error(tool)
     assert index.read_bytes() == original_index, "a read silently created a transitive grant"
     assert data(call(lead, tool, args)) == before
 
@@ -1994,7 +2098,9 @@ def test_r8_explicit_ungranted_refs_have_distinct_guidance(bound, monkeypatch, t
     # refs.private is a selector for parent; do not apply it to the inbox wrapper.
     if tool == "mailbox_digest" and fields != ["refs"]:
         args["after_message_id"] = "later"
-    assert data(call(reviewer, tool, dict(args, fields=fields))) == auth_error("cited_reference")
+    cited = data(call(reviewer, tool, dict(args, fields=fields)))
+    assert cited == auth_error("cited_reference")
+    _assert_closed(tool, cited)
 
 
 @pytest.mark.parametrize("options", [{"expand": ["private"]}, {"fields": ["body"], "expand": ["private"]}])
@@ -2126,7 +2232,8 @@ def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, mo
             assert leaf in reads[before:]
         else:
             refusal = data(result)
-            assert result.get("isError") is True and refusal == expected
+            expected_tool = digest_range_error(tool) if code == "E_LIMIT" else expected
+            assert result.get("isError") is True and refusal == expected_tool
             if code == "E_LIMIT":
                 assert list(options) == ["max_chars"]
                 assert options["max_chars"] == records.MAX_CHARS + 1
@@ -2138,7 +2245,7 @@ def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, mo
             else:
                 assert leaf not in reads[before:]
             retry = call(lead, tool, dict(args, **options))
-            assert retry.get("isError") is True and data(retry) == expected
+            assert retry.get("isError") is True and data(retry) == expected_tool
             if code != "E_HASH":
                 assert leaf not in reads
     if expected is None:
@@ -2155,7 +2262,8 @@ def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, mo
         return
     for tool, args in _mc4b_reviewer_views(parent):
         result = call(reviewer, tool, dict(args, **options))
-        assert result.get("isError") is True and data(result) == expected
+        expected_tool = digest_range_error(tool) if code == "E_LIMIT" else expected
+        assert result.get("isError") is True and data(result) == expected_tool
         assert "TAMPERED_CHILD" not in result["content"][0]["text"]
     assert leaf not in reads
 
@@ -2180,7 +2288,8 @@ def test_mc4b_concurrent_malformed_views_do_not_read_a_tampered_child(bound, mon
     with ThreadPoolExecutor(max_workers=len(workers)) as pool:
         jobs = [pool.submit(call, who, tool, dict(args, **options)) for who, tool, args in workers]
         results = [job.result(timeout=10) for job in jobs]
-    assert [data(result) for result in results] == [expected] * len(workers)
+    assert [data(result) for result in results] == [
+        digest_range_error(tool) if code == "E_LIMIT" else expected for _who, tool, _args in workers]
     assert all(result.get("isError") is True and "TAMPERED_CHILD" not in result["content"][0]["text"]
                for result in results)
     assert leaf not in reads
@@ -2345,7 +2454,7 @@ def test_mc_records_perf_digest_bytes_limits_and_render_count(bound, monkeypatch
     empty_text = empty["content"][0]["text"]
     assert _perf_sha(empty_text) == _PERF_DIGEST_SHA[0]
     assert data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "max_chars": len(empty_text)})) == json.loads(empty_text)
-    assert data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "max_chars": len(empty_text) - 1})) == codec.CodecError("E_LIMIT").as_dict()
+    assert _assert_measured_budget(data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "max_chars": len(empty_text) - 1})))
     identifiers = []
     for number in range(65):
         identifiers.append(data(call(writer, "mailbox_publish_record", _perf_request("r%02d" % number)))["id"])
@@ -2366,16 +2475,16 @@ def test_mc_records_perf_digest_bytes_limits_and_render_count(bound, monkeypatch
     exact = len(texts[65])
     assert data(call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact})) == parsed
     refused = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact - 1})
-    assert data(refused) == codec.CodecError("E_LIMIT").as_dict()
+    assert data(refused) == digest_page_error()
     assert "HOSTILE_MARKER" not in refused["content"][0]["text"]
     # One under the 64-row same-envelope size reads the crossing row and not the next one.
     reads = _perf_count_payloads(monkeypatch)
     early = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": limit_64 - 1})
-    assert data(early) == codec.CodecError("E_LIMIT").as_dict()
+    assert data(early) == digest_page_error()
     assert identifiers[63] in reads and identifiers[64] not in reads
     reads.clear()
     boundary = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": limit_64})
-    assert data(boundary) == codec.CodecError("E_LIMIT").as_dict()
+    assert data(boundary) == digest_page_error()
     assert identifiers[64] in reads
     retried = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact})
     assert retried["content"][0]["text"] == texts[65]
@@ -2572,3 +2681,2061 @@ def test_mc_records_perf_publish_rollback_restores_original_bytes(bound, monkeyp
     assert source_grant.read_bytes() != original
     assert unrelated_grant.read_bytes() == unrelated_bytes
     assert data(call(reader, "mailbox_read_record", {"message_id": "source", "fields": ["body"]}))["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+
+
+_RECORD_ARGUMENTS = {
+    "mailbox_publish_record": {"message_id", "to", "type", "kind", "content", "brief", "in_reply_to",
+                               "acknowledgment", "readiness", "result", "receipt"},
+    "mailbox_read_record": {"message_id", "ref", "fields", "outline", "expand", "max_chars"},
+    "mailbox_digest": {"after_message_id", "refs", "fields", "outline", "expand", "limit", "max_chars"},
+}
+_ALL_RECORD_ARGUMENTS = set().union(*_RECORD_ARGUMENTS.values())
+_DIGEST_PAGE_NEXT = ("reduce limit, keep after_message_id, and read an individually oversized "
+                     "ordinary message through the inbox path")
+_DIGEST_INBOX_NEXT = "read the ordinary message through the inbox path"
+_DIGEST_VIEW_NEXT = ("request fewer refs, or narrow fields (for example body) or outline, "
+                     "or use mailbox_read_record with narrower fields")
+
+
+# "to" and "type" are ordinary words in existing refusal prose, not parameter mentions.
+_ARGUMENT_WORD_COLLISIONS = {"to", "type"}
+# Record keys a fields selector may name. `refs` collides with the digest argument.
+_FIELD_SELECTORS = {"schema", "kind", "meta", "fields", "body", "spans", "refs"}
+
+
+def _tool_schemas():
+    properties = {"message_id": {"type": "string", "maxLength": 80}, "to": {"type": "string"},
+                  "type": {"type": "string"}, "body": {"type": "string"}, "brief": {"type": "object"},
+                  "in_reply_to": {"type": "string"}, "acknowledgment": {"type": "string"},
+                  "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"}}
+    return {name: schema for name, _readonly, _description, schema, _required in
+            records.tool_specs(properties, 262144)}
+
+
+def _accepted_names(tool):
+    schema = _tool_schemas()[tool]
+    accepted = set(schema)
+    if "fields" in schema:
+        accepted |= _FIELD_SELECTORS
+    return accepted
+
+
+def _advice_arguments(text):
+    # "history limit" is the owner phrase, not the digest limit argument.
+    scrubbed = text.replace("history limit", "history ceiling")
+    return {token for token in re.findall(r"[a-z_][a-z0-9_]*", scrubbed)
+            if token in _ALL_RECORD_ARGUMENTS and token not in _ARGUMENT_WORD_COLLISIONS}
+
+
+def _assert_closed(tool, payload):
+    action = payload["error"].get("next_action")
+    if action is None:
+        return
+    extra = _advice_arguments(action) - _accepted_names(tool)
+    assert extra == set(), (tool, sorted(extra), action)
+
+
+def test_record_tool_guidance_names_only_accepted_actions(bound, monkeypatch):
+    """Each refusal names an action that tool accepts, including field selectors.
+
+    Digest cursor advice is only the aggregate page. Record views and refs narrow
+    fields or outline. Publish does not grow a fields selector.
+    """
+    root, writer, reader = bound
+    properties = {"message_id": {"type": "string", "maxLength": 80}, "to": {"type": "string"},
+                  "type": {"type": "string"}, "body": {"type": "string"}, "brief": {"type": "object"},
+                  "in_reply_to": {"type": "string"}, "acknowledgment": {"type": "string"},
+                  "readiness": {"type": "object"}, "result": {"type": "object"}, "receipt": {"type": "object"}}
+    specs = {name: (description, schema) for name, _readonly, description, schema, _required in
+             records.tool_specs(properties, 262144)}
+    for name, (_description, schema) in specs.items():
+        assert set(schema) == _RECORD_ARGUMENTS[name], name
+    assert "narrow fields" in specs["mailbox_read_record"][0]
+    assert "narrow" not in specs["mailbox_publish_record"][0]
+    assert "narrow fields" in specs["mailbox_digest"][0]
+    assert "E_SELECTOR" not in specs["mailbox_publish_record"][0]
+    assert "E_SELECTOR" not in specs["mailbox_digest"][0]
+    digest_description = specs["mailbox_digest"][0]
+    assert _DIGEST_PAGE_NEXT in digest_description
+    assert _DIGEST_INBOX_NEXT in digest_description
+    assert _DIGEST_VIEW_NEXT in digest_description
+    assert records.DIGEST_VIEW_MINIMUM_NEXT in digest_description
+    assert "1 to 100" in digest_description
+    assert "0 to " + str(records.MAX_CHARS) in digest_description
+    assert getattr(records, "DIGEST_PAGE_NEXT", None) == _DIGEST_PAGE_NEXT
+    assert getattr(records, "DIGEST_VIEW_NEXT", None) == _DIGEST_VIEW_NEXT
+    assert _advice_arguments(_DIGEST_PAGE_NEXT) == {"limit", "after_message_id"}
+    assert _advice_arguments(_DIGEST_VIEW_NEXT) == {"refs", "fields", "outline"}
+    assert _advice_arguments(records.DIGEST_VIEW_MINIMUM_NEXT) == {"max_chars"}
+    assert _advice_arguments(_DIGEST_INBOX_NEXT) == set()
+
+    oversized = data(call(writer, "mailbox_publish_record", request(content="x" * 262145)))
+    assert oversized["error"]["code"] == "E_LIMIT" and "narrow" not in json.dumps(oversized)
+    _assert_closed("mailbox_publish_record", oversized)
+    scope = data(call(reader, "mailbox_publish_record", request("off-route", to="b/front-door")))
+    assert scope == auth_error("scope")
+    _assert_closed("mailbox_publish_record", scope)
+    ungranted = data(call(writer, "mailbox_publish_record", request(
+        "ungranted", content=json.dumps({"fields": {}, "body": "probe", "refs": {"target": "0" * 64}}))))
+    assert ungranted == auth_error("reference")
+    _assert_closed("mailbox_publish_record", ungranted)
+    assert "0" * 64 not in json.dumps(ungranted)
+    conflict = data(call(writer, "mailbox_publish_record", request("bad-kind", kind=[])))
+    assert conflict["error"]["code"] == "E_FORMAT" and "next_action" not in conflict["error"]
+    monkeypatch.setattr(records, "MAX_CHARS", 10)
+    limited = data(call(writer, "mailbox_publish_record", request("too-wide")))
+    assert limited == publish_limit()
+    _assert_closed("mailbox_publish_record", limited)
+    assert not writer.checked_mailbox().messages()
+    monkeypatch.setattr(records, "MAX_CHARS", 60000)
+
+    assert "id" in data(call(writer, "mailbox_publish_record", request("kept")))
+    read_limit = data(call(reader, "mailbox_read_record", {"message_id": "kept", "max_chars": 10}))
+    assert read_limit == codec.CodecError("E_LIMIT").as_dict()
+    assert "narrow the selectors" in read_limit["error"]["message"]
+    assert "after_message_id" not in json.dumps(read_limit)
+    missing = data(call(reader, "mailbox_read_record", {"message_id": "missing-id"}))
+    assert missing == auth_error("reference")
+    _assert_closed("mailbox_read_record", missing)
+    selected = data(call(reader, "mailbox_read_record", {"message_id": "kept", "fields": ["not_a_field"]}))
+    assert selected == codec.CodecError("E_SELECTOR").as_dict()
+    assert "not_a_field" not in json.dumps(selected)
+
+    for arguments in ({"limit": 0}, {"limit": 101}, {"limit": -1}, {"limit": True},
+                      {"limit": "HOSTILE\nMARKER"}):
+        refused = call(reader, "mailbox_digest", arguments)
+        assert data(refused) == digest_invalid_limit()
+        _assert_closed("mailbox_digest", data(refused))
+        assert "HOSTILE" not in refused["content"][0]["text"]
+        assert "digest output limit exceeded" not in refused["content"][0]["text"]
+        assert "\n" not in data(refused)["error"]["next_action"]
+    repaired_limit = data(call(reader, "mailbox_digest", {"limit": 1}))
+    assert repaired_limit["messages"][0]["message_id"] == "kept"
+    too_small = call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1})
+    assert _assert_measured_budget(data(too_small))
+    _assert_closed("mailbox_digest", data(too_small))
+    assert "invalid max_chars" not in too_small["content"][0]["text"]
+    fitted = data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))
+    assert fitted["messages"][0]["message_id"] == "kept"
+    kept_body = data(call(reader, "mailbox_read_record", {"message_id": "kept", "fields": ["body"]}))
+    assert "HOSTILE_MARKER" in kept_body["data"]["body"]
+    multiline = call(reader, "mailbox_digest", {"after_message_id": "bad\nid", "limit": 1})
+    assert data(multiline)["error"]["code"] == "E_REF"
+    assert "bad\nid" not in multiline["content"][0]["text"] and "\n" not in data(multiline)["error"]["message"]
+    ordinary = "OVERSIZE_ORDINARY-" + ("n" * 4000)
+    assert not call(writer, "mailbox_publish", {"message_id": "ordinary-1", "to": "a/lane/review",
+                                               "type": "info", "body": ordinary}).get("isError")
+    first = data(call(reader, "mailbox_digest", {"limit": 1}))
+    cursor = first["next_after"]
+    assert cursor == first["messages"][0]["message_id"] == "kept"
+    refused = call(reader, "mailbox_digest", {"limit": 1, "after_message_id": cursor, "max_chars": 80})
+    assert data(refused) == digest_inbox_error()
+    _assert_closed("mailbox_digest", data(refused))
+    assert "after_message_id" not in data(refused)["error"]["next_action"]
+    assert ordinary not in refused["content"][0]["text"] and "OVERSIZE_ORDINARY" not in refused["content"][0]["text"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest",
+                            {"limit": 1, "after_message_id": cursor, "max_chars": 80}) for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [data(refused), data(refused)]
+    retried = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": cursor}))
+    assert retried["messages"][0]["message_id"] == "ordinary-1"
+    assert retried["messages"][0]["body"] == ordinary
+    inbox = data(call(reader, "mailbox_inbox", {"limit": 100}))
+    bodies = {row["message"]["message_id"]: row["message"]["body"] for row in inbox["messages"]}
+    assert bodies["ordinary-1"] == ordinary
+    assert bodies["kept"].startswith("aegis-record/1 sha256=")
+    assert "id" in data(call(writer, "mailbox_publish_record", request("kept")))
+
+
+def test_opt_in_record_guide_examples_run_against_a_temp_store(bound):
+    """The one guide subsection's requests are the calls a record peer can run."""
+    guide = Path(__file__).resolve().parents[2].joinpath("docs/agent-hierarchies.md").read_text(encoding="utf-8")
+    marker = "### Opt-in record tools\n"
+    assert guide.count(marker) == 1
+    start = guide.index(marker)
+    rest = guide[start + len(marker):]
+    end = len(rest)
+    for heading in ("\n## ", "\n### "):
+        at = rest.find(heading)
+        if at != -1:
+            end = min(end, at)
+    section = rest[:end]
+    for phrase in ("hierarchy_mailbox_mcp.py", "--records", "ROOT takes no record tools",
+                   "records require a mailbox connection", "acknowledged", "aegis-record/1",
+                   "source checkout", "mailbox_inbox", _DIGEST_PAGE_NEXT, _DIGEST_INBOX_NEXT,
+                   _DIGEST_VIEW_NEXT, records.DIGEST_VIEW_MINIMUM_NEXT, "fewer refs", "narrow fields",
+                   "1 to 100", "0 to 60000"):
+        assert phrase in section, phrase
+    examples = [json.loads(block) for block in re.findall(r"```json\n(.*?)\n```", section, re.S)]
+    assert len(examples) == 4
+    publish, read, digest, continuation = examples
+    root, writer, reader = bound
+    published = data(call(writer, "mailbox_publish_record", publish))
+    assert "id" in published
+    body = data(call(reader, "mailbox_read_record", read))
+    assert body["data"]["body"] == "note"
+    page = data(call(reader, "mailbox_digest", digest))
+    assert [row["message_id"] for row in page["messages"]] == ["guide-1"]
+    assert page["messages"][0]["record"]["data"]["body"] == "note"
+    assert page["next_after"] is None
+    assert data(call(reader, "mailbox_digest", continuation))["messages"] == []
+    inbox = invoke(root, "inbox", endpoint="a/lane/review")
+    stub = next(row["message"] for row in inbox["messages"] if row["message"]["message_id"] == "guide-1")
+    assert stub["body"].startswith("aegis-record/1 sha256=" + published["id"] + " kind=text")
+    assert "note" not in stub["body"]
+    refused = call(reader, "mailbox_digest", {"limit": 0, "after_message_id": "guide-1"})
+    assert data(refused) == digest_invalid_limit()
+    assert "guide-1" not in refused["content"][0]["text"]
+    assert "\n" not in data(refused)["error"]["next_action"]
+    again = data(call(reader, "mailbox_digest", {"limit": 20, "after_message_id": "guide-1"}))
+    assert again["messages"] == []
+
+
+def _ordinary(writer, identifier, body):
+    result = call(writer, "mailbox_publish", {"message_id": identifier, "to": "a/lane/review",
+                                              "type": "info", "body": body})
+    assert not result.get("isError"), result
+
+
+def test_digest_inbox_page_overflow_recovers_by_reducing_limit(bound, monkeypatch):
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T04:10:00Z")
+    for identifier, body in (("page-1", "alpha"), ("page-2", "bravo"), ("page-3", "charlie")):
+        _ordinary(writer, identifier, body)
+    one = call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-1"})
+    assert not one.get("isError"), one
+    fit = len(one["content"][0]["text"])
+    arguments = {"limit": 2, "after_message_id": "page-1", "max_chars": fit}
+    refused = call(reader, "mailbox_digest", arguments)
+    assert data(refused) == digest_page_error()
+    _assert_closed("mailbox_digest", data(refused))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest", arguments)
+                for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [digest_page_error(), digest_page_error()]
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-1", "max_chars": fit}))
+    assert [row["message_id"] for row in repaired["messages"]] == ["page-2"]
+    assert repaired["messages"][0]["body"] == "bravo"
+
+
+def test_digest_reference_overflow_with_no_inbox_recovers_by_fewer_refs(bound):
+    root, writer, _reader = bound
+    content = json.dumps({"fields": {}, "body": "REF-BODY-" + ("q" * 400), "refs": {}})
+    first = data(call(writer, "mailbox_publish_record", request("ref-a", content=content)))["id"]
+    second = data(call(writer, "mailbox_publish_record", request("ref-b", content=content)))["id"]
+    alone = call(writer, "mailbox_digest", {"limit": 1, "refs": [first], "fields": ["body"]})
+    assert not alone.get("isError"), alone
+    parsed = data(alone)
+    assert parsed["messages"] == []
+    assert parsed["records"][0]["data"]["body"].startswith("REF-BODY-")
+    fit = len(alone["content"][0]["text"])
+    arguments = {"limit": 1, "refs": [first, second], "fields": ["body"], "max_chars": fit}
+    refused = call(writer, "mailbox_digest", arguments)
+    assert _assert_measured_budget(data(refused))
+    _assert_closed("mailbox_digest", data(refused))
+    assert "after_message_id" not in data(refused)["error"]["next_action"]
+    assert "REF-BODY-" not in refused["content"][0]["text"]
+    assert _assert_measured_budget(data(call(writer, "mailbox_digest", dict(arguments, limit=1))))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root), "mailbox_digest", arguments) for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [data(refused), data(refused)]
+    _follow_measured_retry(writer, data(refused), arguments, reference=first)
+    fewer = data(call(writer, "mailbox_digest",
+                      {"limit": 1, "refs": [first], "fields": ["body"], "max_chars": fit}))
+    assert fewer["messages"] == []
+    assert fewer["records"][0]["data"]["body"].startswith("REF-BODY-")
+    narrowed = data(call(writer, "mailbox_read_record", {"ref": first, "fields": ["body"]}))
+    assert narrowed["data"]["body"].startswith("REF-BODY-")
+
+
+def test_digest_mixed_inbox_and_refs_overflow_recovers_by_fewer_refs(bound, monkeypatch):
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T04:20:00Z")
+    _ordinary(writer, "m-plain", "plain-inbox")
+    content = json.dumps({"fields": {}, "body": "MIX-BODY-" + ("r" * 400), "refs": {}})
+    rid = data(call(writer, "mailbox_publish_record", request("m-rec", content=content)))["id"]
+    inbox_only = call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"]})
+    assert not inbox_only.get("isError"), inbox_only
+    ref_only = call(writer, "mailbox_digest", {"limit": 1, "refs": [rid], "fields": ["body"]})
+    assert not ref_only.get("isError"), ref_only
+    assert data(ref_only)["messages"] == []
+    combined = call(reader, "mailbox_digest", {"limit": 1, "refs": [rid], "fields": ["body"]})
+    assert not combined.get("isError"), combined
+    budget = max(len(inbox_only["content"][0]["text"]), len(ref_only["content"][0]["text"]))
+    assert len(combined["content"][0]["text"]) > budget
+    arguments = {"limit": 1, "refs": [rid], "fields": ["body"], "max_chars": budget}
+    refused = call(reader, "mailbox_digest", arguments)
+    assert _assert_measured_budget(data(refused))
+    _assert_closed("mailbox_digest", data(refused))
+    assert "after_message_id" not in data(refused)["error"]["next_action"]
+    assert "MIX-BODY-" not in refused["content"][0]["text"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest", arguments)
+                for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [data(refused), data(refused)]
+    _follow_measured_retry(reader, data(refused), arguments, reference=rid)
+    fewer = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"], "max_chars": budget}))
+    assert [row["message_id"] for row in fewer["messages"]] == ["m-plain"]
+    assert fewer["messages"][0]["body"] == "plain-inbox"
+    narrowed = data(call(reader, "mailbox_read_record", {"ref": rid, "fields": ["body"]}))
+    assert narrowed["data"]["body"].startswith("MIX-BODY-")
+
+
+def test_digest_limit_zero_names_the_valid_range_and_retry_succeeds(bound):
+    root, writer, reader = bound
+    assert "id" in data(call(writer, "mailbox_publish_record", request("ranged")))
+    for arguments in ({"limit": 0}, {"limit": 101}, {"limit": -1}, {"limit": True},
+                      {"limit": "HOSTILE\nMARKER"}):
+        refused = call(reader, "mailbox_digest", arguments)
+        assert data(refused) == digest_invalid_limit(), arguments
+        _assert_closed("mailbox_digest", data(refused))
+        assert "HOSTILE" not in refused["content"][0]["text"]
+        assert "\n" not in data(refused)["error"]["message"]
+        assert "\n" not in data(refused)["error"]["next_action"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest", {"limit": 0})
+                for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [digest_invalid_limit(), digest_invalid_limit()]
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1}))
+    assert repaired["messages"][0]["message_id"] == "ranged"
+
+
+def test_digest_max_chars_out_of_range_names_the_valid_range(bound, monkeypatch):
+    root, writer, reader = bound
+    assert "id" in data(call(writer, "mailbox_publish_record", request("ranged-chars")))
+    original = records.record_store
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid max_chars reached the record store")
+
+    monkeypatch.setattr(records, "record_store", forbidden)
+    for value in (records.MAX_CHARS + 1, -1, True):
+        refused = call(reader, "mailbox_digest", {"max_chars": value, "limit": 1})
+        assert data(refused) == digest_invalid_max_chars(), value
+        _assert_closed("mailbox_digest", data(refused))
+        assert "digest output limit exceeded" not in refused["content"][0]["text"]
+        assert str(value) not in data(refused)["error"]["message"]
+        assert str(value) not in data(refused)["error"]["next_action"]
+    read_refused = data(call(reader, "mailbox_read_record",
+                             {"message_id": "ranged-chars", "max_chars": records.MAX_CHARS + 1}))
+    assert read_refused == codec.CodecError("E_LIMIT").as_dict()
+    assert "next_action" not in read_refused["error"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest",
+                            {"max_chars": records.MAX_CHARS + 1}) for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [digest_invalid_max_chars(), digest_invalid_max_chars()]
+    monkeypatch.setattr(records, "record_store", original)
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))
+    assert repaired["messages"][0]["message_id"] == "ranged-chars"
+
+
+def test_digest_max_chars_too_small_recovers_through_the_inbox(bound, monkeypatch):
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T04:30:00Z")
+    body = "TOO-SMALL-" + ("m" * 1500)
+    _ordinary(writer, "budget-1", body)
+    full = call(reader, "mailbox_digest", {"limit": 1})
+    assert not full.get("isError"), full
+    fit = len(full["content"][0]["text"])
+    assert 0 < fit - 1 <= records.MAX_CHARS
+    for limit in (2, 1):
+        refused = call(reader, "mailbox_digest", {"limit": limit, "max_chars": fit - 1})
+        assert data(refused) == digest_inbox_error()
+        _assert_closed("mailbox_digest", data(refused))
+        assert "after_message_id" not in data(refused)["error"]["next_action"]
+        assert "TOO-SMALL-" not in refused["content"][0]["text"]
+        assert "invalid max_chars" not in refused["content"][0]["text"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest",
+                            {"limit": 1, "max_chars": fit - 1}) for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [data(refused), data(refused)]
+    inbox = data(call(reader, "mailbox_inbox", {"limit": 20}))
+    assert inbox["messages"][0]["message"]["body"] == body
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": fit}))
+    assert repaired["messages"][0]["body"] == body
+
+
+def test_digest_history_limit_keeps_the_owner_guidance(bound, monkeypatch):
+    root, writer, reader = bound
+    assert "id" in data(call(writer, "mailbox_publish_record", request("hist-1")))
+    _ordinary(writer, "hist-2", "second")
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 1)
+    refused = call(reader, "mailbox_digest", {"limit": 1})
+    assert data(refused) == publish_limit(history=True)
+    _assert_closed("mailbox_digest", data(refused))
+    assert "reduce limit" not in refused["content"][0]["text"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest", {"limit": 1})
+                for _ in range(2)]
+        concurrent = [job.result(timeout=15) for job in jobs]
+    assert [data(item) for item in concurrent] == [publish_limit(history=True), publish_limit(history=True)]
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 10000)
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1}))
+    assert [row["message_id"] for row in repaired["messages"]] == ["hist-1"]
+
+
+def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trace=None):
+    """Follow actual codec imports, method calls, callbacks and saved Store.read.
+
+    Constant public options prune unavailable CLI/span/cursor/format branches.
+    Store paths and full IDs have already passed the adapter's lexical/grant
+    gates; their validated shapes, rather than arbitrary Store API inputs, enter
+    this graph. Other storage branches (including concurrent mode/IO failures)
+    remain live. No refusal-code/detail allowlist is used.
+    """
+    module_names = {"codec": "aegis_core.message_codec", "format": "aegis_core.message_codec_format",
+                    "store": "aegis_core.message_codec_store", "views": "aegis_core.message_codec_views"}
+    if sources is None:
+        sources = {"codec": Path(codec.__file__).read_text(encoding="utf-8"),
+                   "format": Path(codec_format.__file__).read_text(encoding="utf-8"),
+                   "store": Path(codec_store.__file__).read_text(encoding="utf-8"),
+                   "views": Path(codec_views.__file__).read_text(encoding="utf-8")}
+    functions, imports, constants, patterns, external_names = {}, {}, {}, {}, {}
+    for namespace, source in sources.items():
+        tree = ast.parse(source)
+        imports[namespace] = {}
+        constants[namespace], patterns[namespace], external_names[namespace] = {}, {}, set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                external_names[namespace].update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                if isinstance(node.value, ast.Constant):
+                    constants[namespace][node.targets[0].id] = node.value.value
+                elif (isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                      and node.value.func.attr == "compile" and node.value.args
+                      and isinstance(node.value.args[0], ast.Constant)):
+                    patterns[namespace][node.targets[0].id] = node.value.args[0].value
+            if isinstance(node, ast.ImportFrom):
+                target = next((name for name, module in module_names.items()
+                               if node.module and module.endswith(node.module)), None)
+                for alias in node.names:
+                    if target:
+                        imports[namespace][alias.asname or alias.name] = target + "." + alias.name
+                    else:
+                        found = next((name for name, module in module_names.items() if module.endswith(alias.name)), None)
+                        if found:
+                            imports[namespace][alias.asname or alias.name] = found
+                        else:
+                            external_names[namespace].add(alias.asname or alias.name)
+
+        def index(node, prefix):
+            for child in ast.iter_child_nodes(node):
+                scope = prefix
+                if isinstance(child, (ast.FunctionDef, ast.ClassDef)):
+                    scope += "." + child.name
+                    functions[scope] = child
+                index(child, scope)
+        index(tree, namespace)
+    unknown, canonical_path = object(), object()
+    fixed = {"cli": False, "spans": (), "since": None, "row_limit": None, "format": "json", "unknown": {}}
+
+    def constant(namespace, name, table):
+        if name in table[namespace]:
+            return table[namespace][name]
+        imported = imports[namespace].get(name, "")
+        owner, _, member = imported.partition(".")
+        return table[owner].get(member, unknown) if owner in table else unknown
+
+    def value(node, env, namespace):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            builtins = {"list": list, "tuple": tuple, "dict": dict, "str": str, "int": int, "bool": bool}
+            return env.get(node.id, builtins.get(node.id, constant(namespace, node.id, constants)))
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            items = [value(item, env, namespace) for item in node.elts]
+            if any(item is unknown for item in items):
+                return unknown
+            return tuple(items) if isinstance(node, ast.Tuple) else items
+        if isinstance(node, ast.Dict):
+            items = [(value(key, env, namespace), value(item, env, namespace))
+                     for key, item in zip(node.keys, node.values) if key is not None]
+            return dict(items) if len(items) == len(node.keys) and all(k is not unknown for k, _ in items) else unknown
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Call) and node.attr == "planned" and env.get("selectors", unknown) == ():
+                return {}
+            owner = value(node.value, env, namespace)
+            if owner is canonical_path and node.attr in ("parent", "root"):
+                return canonical_path
+            if owner is canonical_path and node.attr == "parts":
+                return ("trusted", "root")
+            if owner is canonical_path and node.attr == "name":
+                return "mailbox-records"
+            if isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr == "detail":
+                return env.get("detail", None)
+            return unknown
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            item = value(node.operand, env, namespace)
+            return not item if item is not unknown else unknown
+        if isinstance(node, ast.IfExp):
+            condition = value(node.test, env, namespace)
+            return value(node.body if condition else node.orelse, env, namespace) if condition is not unknown else unknown
+        if isinstance(node, ast.BoolOp):
+            items = [value(item, env, namespace) for item in node.values]
+            known = [bool(item) for item in items if item is not unknown]
+            if isinstance(node.op, ast.And):
+                return False if False in known else (True if len(known) == len(items) else unknown)
+            return True if True in known else (False if len(known) == len(items) else unknown)
+        if isinstance(node, ast.Compare):
+            items = [value(item, env, namespace) for item in [node.left, *node.comparators]]
+            if any(item is unknown for item in items):
+                return unknown
+            outcomes = []
+            for left, operator, right in zip(items, node.ops, items[1:]):
+                if isinstance(operator, ast.Is):
+                    outcomes.append(left is right)
+                elif isinstance(operator, ast.IsNot):
+                    outcomes.append(left is not right)
+                elif isinstance(operator, (ast.Eq, ast.NotEq)):
+                    outcomes.append((left == right) if isinstance(operator, ast.Eq) else (left != right))
+                elif isinstance(operator, (ast.In, ast.NotIn)) and isinstance(right, (tuple, list, dict, str)):
+                    outcomes.append((left in right) if isinstance(operator, ast.In) else (left not in right))
+                elif isinstance(operator, (ast.Lt, ast.LtE, ast.Gt, ast.GtE)) and type(left) is type(right) and type(left) in (int, str):
+                    outcomes.append(left < right if isinstance(operator, ast.Lt) else left <= right if isinstance(operator, ast.LtE)
+                                    else left > right if isinstance(operator, ast.Gt) else left >= right)
+                else:
+                    return unknown
+            return all(outcomes)
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            iterable = value(node.generators[0].iter, env, namespace)
+            return [] if isinstance(iterable, (tuple, list)) and not iterable else unknown
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else None
+            args = [value(arg, env, namespace) for arg in node.args]
+            if name in ("len", "bool", "type", "all", "any") and len(args) == 1 and args[0] is not unknown:
+                if name == "type":
+                    return type(args[0])
+                if isinstance(args[0], (tuple, list, dict, str, bool)):
+                    return {"len": len, "bool": bool, "all": all, "any": any}.get(name, bool)(args[0])
+            if name == "Path" and args and args[0] is canonical_path:
+                return canonical_path
+            if name == "_read_selectors" and args and args[0] == ():
+                return ()
+            if name == "_options" and env.get("selectors", unknown) == ():
+                return {}
+            if isinstance(node.func, ast.Attribute):
+                owner = value(node.func.value, env, namespace)
+                if owner is canonical_path:
+                    return True if node.func.attr == "is_absolute" else canonical_path
+                if node.func.attr == "fullmatch" and args and type(args[0]) is str:
+                    pattern = constant(namespace, getattr(node.func.value, "id", ""), patterns)
+                    if type(pattern) is str:
+                        return re.fullmatch(pattern, args[0]) is not None
+        return unknown
+
+    def resolve(node, current, state=None):
+        namespace = current.split(".")[0]
+        if isinstance(node, ast.Name):
+            target = imports[namespace].get(node.id)
+            if target is None:
+                scope = current.rsplit(".", 1)[0]
+                while scope:
+                    if scope + "." + node.id in functions:
+                        target = scope + "." + node.id
+                        break
+                    scope = scope.rpartition(".")[0]
+        elif isinstance(node, ast.Attribute):
+            if state is not None and value(node.value, state, namespace) is canonical_path:
+                return None
+            if isinstance(node.value, ast.Name):
+                if node.value.id in external_names[namespace]:
+                    return None
+            if isinstance(node.value, ast.Name) and node.value.id == "self":
+                target = current.rsplit(".", 1)[0] + "." + node.attr
+            elif isinstance(node.value, ast.Name) and node.value.id == "store" and node.attr in ("read", "describe"):
+                return "store.Store.read"
+            else:
+                owner = resolve(node.value, current, state)
+                target = owner + "." + node.attr if owner else None
+                if target not in functions:
+                    found = [key for key, fn in functions.items()
+                             if isinstance(fn, ast.FunctionDef) and key.endswith("." + node.attr)]
+                    target = found[0] if len(found) == 1 else None
+        else:
+            target = None
+        return target
+
+    def strings(node, env, namespace):
+        item = value(node, env, namespace)
+        if item is None:
+            return {""}
+        if type(item) is str:
+            return {item}
+        if isinstance(node, ast.IfExp):
+            test = value(node.test, env, namespace)
+            return (strings(node.body, env, namespace) if test is not unknown and test else
+                    strings(node.orelse, env, namespace) if test is not unknown else
+                    strings(node.body, env, namespace) | strings(node.orelse, env, namespace))
+        if isinstance(node, ast.Attribute) and node.attr == "detail":
+            # Budget defaults to no detail; compose and canonical parsing also
+            # construct record budgets. Both are real constructor bindings.
+            return {"", "record"}
+        raise AssertionError("unresolved codec error value: " + ast.dump(node))
+
+    public_options = {}
+
+    def explore(target, arguments, seen):
+        if target not in functions or target.endswith(("CodecError", ".require")):
+            return set()
+        fn = functions[target]
+        if isinstance(fn, ast.ClassDef):
+            return explore(target + ".__init__", arguments, seen)
+        namespace = target.split(".")[0]
+        params = [*fn.args.posonlyargs, *fn.args.args]
+        env = {param.arg: value(default, {}, namespace) for param, default in
+               zip(params[-len(fn.args.defaults):], fn.args.defaults)} if fn.args.defaults else {}
+        env.update({param.arg: value(default, {}, namespace) for param, default in
+                    zip(fn.args.kwonlyargs, fn.args.kw_defaults) if default is not None})
+        env.update(arguments)
+        if namespace == "codec":
+            env.update(fixed)
+            env.update(public_options)
+        if target == "store.Store.__init__":
+            env["root"] = canonical_path
+        if target in ("store.Store.read", "store.Store._verified", "store.Store._resolve"):
+            env["reference"] = "0" * 64
+        fingerprint = (target, tuple((key, repr(item) if item not in (unknown, canonical_path) else
+                                      "unknown" if item is unknown else "canonical")
+                                     for key, item in sorted(env.items()) if key in set(fixed) | {"code", "detail", "verbatim_numbers"}))
+        if fingerprint in seen:
+            return set()
+        seen.add(fingerprint)
+        pairs = set()
+
+        def active(node, state):
+            yield node
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                iterable = value(node.generators[0].iter, state, namespace)
+                if isinstance(iterable, (tuple, list)) and not iterable:
+                    return
+            if isinstance(node, ast.IfExp):
+                condition = value(node.test, state, namespace)
+                if condition is not unknown:
+                    yield from active(node.body if condition else node.orelse, state)
+                    return
+            for child in ast.iter_child_nodes(node):
+                yield from active(child, state)
+
+        def calls(node, state):
+            for item in active(node, state):
+                if not isinstance(item, ast.Call):
+                    continue
+                name = item.func.id if isinstance(item.func, ast.Name) else getattr(item.func, "attr", None)
+                if name in ("require", "need", "CodecError"):
+                    position = 0 if name == "CodecError" else 1
+                    codes = strings(item.args[position], state, namespace) if len(item.args) > position else {"E_FORMAT"}
+                    if name != "CodecError" and item.args and value(item.args[0], state, namespace) is True:
+                        continue
+                    detail = next((keyword.value for keyword in item.keywords if keyword.arg == "detail"), ast.Constant(None))
+                    pairs.update((code, cause) for code in codes for cause in strings(detail, state, namespace))
+                    continue
+                callee = resolve(item.func, target, state)
+                if callee in functions:
+                    child = functions[callee]
+                    if isinstance(child, ast.ClassDef):
+                        child = functions.get(callee + ".__init__")
+                    if isinstance(child, ast.FunctionDef):
+                        names = [param.arg for param in [*child.args.posonlyargs, *child.args.args]]
+                        if names and names[0] == "self":
+                            names = names[1:]
+                        bindings = {key: value(arg, state, namespace) for key, arg in zip(names, item.args)}
+                        bindings.update({keyword.arg: value(keyword.value, state, namespace)
+                                         for keyword in item.keywords if keyword.arg is not None})
+                        pairs.update(explore(callee, bindings, seen))
+                for argument in [*item.args, *(keyword.value for keyword in item.keywords)]:
+                    callback = resolve(argument, target, state)
+                    if callback in functions and isinstance(functions[callback], ast.FunctionDef):
+                        pairs.update(explore(callback, {}, seen))
+
+        def statements(nodes, state):
+            for node in nodes:
+                if isinstance(node, ast.If):
+                    calls(node.test, state)
+                    condition = value(node.test, state, namespace)
+                    if condition is not unknown:
+                        statements(node.body if condition else node.orelse, state)
+                    else:
+                        statements(node.body, dict(state))
+                        statements(node.orelse, dict(state))
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    calls(node.iter, state)
+                    iterable = value(node.iter, state, namespace)
+                    if iterable is unknown or bool(iterable):
+                        statements(node.body, dict(state))
+                    statements(node.orelse, state)
+                elif isinstance(node, ast.While):
+                    calls(node.test, state)
+                    condition = value(node.test, state, namespace)
+                    if condition is unknown or condition:
+                        statements(node.body, dict(state))
+                    statements(node.orelse, state)
+                elif isinstance(node, ast.Try):
+                    statements(node.body, state)
+                    for handler in node.handlers:
+                        statements(handler.body, dict(state))
+                    statements(node.orelse + node.finalbody, state)
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        calls(item.context_expr, state)
+                    statements(node.body, state)
+                elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                    continue
+                else:
+                    calls(node, state)
+                    if isinstance(node, ast.Assign):
+                        for name in node.targets:
+                            if isinstance(name, ast.Name):
+                                state[name.id] = value(node.value, state, namespace)
+        statements(fn.body, env)
+        if target == "store.Store.read":
+            pairs = {("E_AUTH", "reference") if code == "E_REF" else (code, detail) for code, detail in pairs}
+        return pairs
+
+    def boundaries(entry, writing, seen):
+        key = (entry, writing)
+        if key in seen:
+            return set()
+        seen.add(key)
+        found = set()
+        for node in ast.walk(local_functions[entry]):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+                receiver = node.func.value
+                is_codec = isinstance(receiver, ast.Name) and receiver.id == "codec" or (
+                    isinstance(receiver, ast.Attribute) and receiver.attr == "codec")
+                if is_codec:
+                    target = resolve(ast.Name(id=name), "codec.read_view")
+                    if target in functions:
+                        found.add(target)
+                elif name == "original_read":
+                    found.add("store.Store.read")
+                elif name == "write" and isinstance(receiver, ast.Name) and receiver.id == "store":
+                    found.add("store.Store.write")
+                elif name in ("render", "measure", "json_size", "json_array_extra"):
+                    found.add("views.Renderer." + name)
+        for child, node, gated in local_edges[entry]:
+            if not gated or writing:
+                child_writing = any(keyword.arg == "write" and isinstance(keyword.value, ast.Constant)
+                                    and keyword.value.value is True for keyword in node.keywords)
+                found |= boundaries(child, child_writing, seen)
+        return found
+
+    # These summaries correspond to the adapter gates, not the unrestricted CLI
+    # Store interface: canonical absolute paths and grant-checked full hashes.
+    assert "root.is_absolute()" in ast.unparse(local_functions["_store_path"])
+    result = {}
+    for tool, entry in roots.items():
+        public_options = ({"selectors": (), "expand": (), "outline": False} if tool == "mailbox_publish_record"
+                          else {"selectors": unknown, "expand": unknown, "outline": unknown})
+        pairs = set()
+        for boundary in boundaries(entry, False, set()):
+            emitted = explore(boundary, {}, set())
+            if boundary == "store.Store.read":
+                emitted = {("E_AUTH", "reference") if code == "E_REF" else (code, detail)
+                           for code, detail in emitted}
+            if trace is not None:
+                trace.append((tool, boundary, sorted(emitted)))
+            pairs |= emitted
+        result[tool] = pairs
+    return result
+
+
+def _reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=None):
+    """Every (code, detail) from the adapter and guidance module's error sites.
+
+    The call graph is the source. A hand list of tools cannot drop a pair that a
+    tool function reaches. Mailbox history is included where a reachable function
+    calls messages(). Binding history is included where call() checks the binding
+    through _checked before that tool. A handler that replaces an empty E_LIMIT
+    keeps the replacement detail only.
+    """
+    if sources is None:
+        sources = [Path(module.__file__).read_text(encoding="utf-8")
+                   for module in (records, records_guidance)]
+    tree = ast.Module(body=[node for source in sources for node in ast.parse(source).body], type_ignores=[])
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def qualified(fn):
+        owner = parents.get(fn)
+        if isinstance(owner, ast.ClassDef):
+            return owner.name + "." + fn.name
+        return fn.name
+
+    functions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions[qualified(node)] = node
+    by_tail = {}
+    for name in functions:
+        by_tail.setdefault(name.split(".")[-1], []).append(name)
+
+    def resolve(node, owner):
+        if isinstance(node.func, ast.Name) and node.func.id in functions:
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            receiver = node.func.value
+            if isinstance(receiver, ast.Name) and receiver.id == "self" and "." in owner:
+                member = owner.split(".")[0] + "." + node.func.attr
+                if member in functions:
+                    return member
+            # _RecordAccess.__init__ rebinds Store.read for the per-call access
+            # object. Calls through store.read must reach that method too.
+            if node.func.attr == "read" and (
+                    isinstance(receiver, ast.Name) and receiver.id == "store"
+                    or isinstance(receiver, ast.Attribute) and receiver.attr == "store"):
+                return "_RecordAccess.read"
+        found = by_tail.get(called(node) or "", [])
+        return found[0] if len(found) == 1 else None
+
+    def const(node):
+        return node.value if isinstance(node, ast.Constant) and type(node.value) is str else None
+
+    def assigned(fn, name):
+        found = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        found |= literal_strings(node.value)
+        return found
+
+    def literal_strings(node):
+        if const(node) is not None:
+            return {const(node)}
+        if isinstance(node, ast.IfExp):
+            return literal_strings(node.body) | literal_strings(node.orelse)
+        return set()
+
+    def detail_values(fn, keywords):
+        for keyword in keywords:
+            if keyword.arg != "detail":
+                continue
+            text = const(keyword.value)
+            if text is not None:
+                return {text}
+            if isinstance(keyword.value, ast.Name):
+                found = assigned(fn, keyword.value.id)
+                parameters = [parameter.arg for parameter in [*fn.args.posonlyargs, *fn.args.args]]
+                if keyword.value.id in parameters:
+                    position = parameters.index(keyword.value.id)
+                    for caller in ast.walk(tree):
+                        if isinstance(caller, ast.Call) and called(caller) == fn.name and len(caller.args) > position:
+                            argument = caller.args[position]
+                            found |= literal_strings(argument)
+                            if isinstance(argument, ast.Name):
+                                owner = parents.get(caller)
+                                while owner is not None and not isinstance(owner, ast.FunctionDef):
+                                    owner = parents.get(owner)
+                                if owner is not None:
+                                    found |= assigned(owner, argument.id)
+                return found
+            return set()
+        return {""}
+
+    def called(node):
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return None
+
+    pinned_history, pinned_history_messages, pinned = set(), [], []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "PINNED_REFUSALS":
+                for row in node.value.elts:
+                    message, code, cause = const(row.elts[0]), const(row.elts[1]), row.elts[2]
+                    detail = "" if isinstance(cause, ast.Constant) and cause.value is None else const(cause)
+                    pinned.append((message, code, detail))
+                    if detail == "history" and message is not None and code is not None:
+                        pinned_history.add((code, "history"))
+                        pinned_history_messages.append(message)
+
+    def write_gated(node):
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, ast.IfExp) and isinstance(current.test, ast.Name) and current.test.id == "write":
+                return True
+        return False
+
+    def empty_limit_replacement(fn, node):
+        current = node
+        while current in parents and current is not fn:
+            current = parents[current]
+            if not isinstance(current, ast.Try):
+                continue
+            body = ast.Module(body=current.body, type_ignores=[])
+            if not any(item is node for item in ast.walk(body)):
+                continue
+            for handler in current.handlers:
+                if handler.name is None:
+                    continue
+                for statement in handler.body:
+                    if not isinstance(statement, ast.If):
+                        continue
+                    dumped = ast.dump(statement.test)
+                    if "E_LIMIT" not in dumped or "detail" not in dumped:
+                        continue
+                    found = set()
+                    branch = ast.Module(body=statement.body, type_ignores=[])
+                    for item in ast.walk(branch):
+                        if (isinstance(item, ast.Raise) and isinstance(item.exc, ast.Call)
+                                and called(item.exc) == "CodecError"):
+                            found |= detail_values(fn, item.exc.keywords)
+                    if found:
+                        return found
+        return None
+
+    direct, edges, sees_messages = {}, {}, set()
+    for name, fn in functions.items():
+        sites, links = set(), []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            name_called = called(node)
+            if name_called == "messages":
+                sees_messages.add(name)
+            if name_called == "require" and (len(node.args) < 2 or const(node.args[1]) is not None):
+                code = const(node.args[1]) if len(node.args) >= 2 else "E_FORMAT"
+                for detail in detail_values(fn, node.keywords):
+                    sites.add((code, detail, node))
+            elif name_called == "CodecError" and node.args and const(node.args[0]) is not None:
+                for detail in detail_values(fn, node.keywords):
+                    sites.add((const(node.args[0]), detail, node))
+            resolved = resolve(node, name)
+            if resolved and resolved != name:
+                links.append((resolved, node, write_gated(node)))
+        direct[name] = sites
+        edges[name] = links
+
+    def propagate(name, writing, seen):
+        key = (name, writing)
+        if key in seen:
+            return set()
+        seen.add(key)
+        fn = functions[name]
+        pairs = set()
+        for code, detail, node in direct[name]:
+            replacement = empty_limit_replacement(fn, node)
+            if replacement is not None and (code, detail) == ("E_LIMIT", ""):
+                pairs.update(("E_LIMIT", item) for item in replacement)
+            else:
+                pairs.add((code, detail))
+        for callee, node, gated in edges[name]:
+            if gated and not writing:
+                continue
+            child_writing = any(
+                keyword.arg == "write" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+                for keyword in node.keywords)
+            child = propagate(callee, child_writing, seen)
+            replacement = empty_limit_replacement(fn, node)
+            for code, detail in child:
+                if replacement is not None and (code, detail) == ("E_LIMIT", ""):
+                    pairs.update(("E_LIMIT", item) for item in replacement)
+                else:
+                    pairs.add((code, detail))
+        if name in sees_messages:
+            pairs.update(pinned_history)
+        return pairs
+
+    tools = {
+        "mailbox_publish_record": propagate("publish", False, set()),
+        "mailbox_read_record": propagate("read", False, set()),
+        "mailbox_digest": propagate("digest", False, set()),
+    }
+    history_messages = {name: set() for name in tools}
+    direct_names = {"mailbox_publish_record": "publish", "mailbox_read_record": "read",
+                    "mailbox_digest": "digest"}
+
+    # ValueError adapters carry dynamic code/detail values. Follow their real
+    # mailbox/connection callees and match the pinned vocabulary to the source
+    # strings, rather than assigning a hand-maintained set of details per tool.
+    boundary_functions = {}
+    for namespace, module in (("mailbox", mailbox_module), ("mcp", mcp)):
+        parsed = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        for item in parsed.body:
+            if isinstance(item, ast.FunctionDef):
+                boundary_functions[namespace + "." + item.name] = item
+            elif isinstance(item, ast.ClassDef):
+                for fn in item.body:
+                    if isinstance(fn, ast.FunctionDef):
+                        boundary_functions[namespace + "." + item.name + "." + fn.name] = fn
+
+    def boundary_strings(entry, seen):
+        if entry in seen or entry not in boundary_functions:
+            return set()
+        seen.add(entry)
+        fn = boundary_functions[entry]
+        namespace, *owner, _name = entry.split(".")
+        strings = {node.value for node in ast.walk(fn)
+                   if isinstance(node, ast.Constant) and type(node.value) is str}
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            target = None
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "Mailbox":
+                    target = "mailbox.Mailbox.__init__"
+                else:
+                    target = namespace + "." + node.func.id
+            elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                if node.func.value.id == "self" and owner:
+                    target = namespace + "." + owner[0] + "." + node.func.attr
+                elif node.func.value.id == "mailbox":
+                    target = "mailbox.Mailbox." + node.func.attr
+            if target is not None:
+                strings |= boundary_strings(target, seen)
+        return strings
+
+    def local_boundaries(entry, seen):
+        if entry in seen:
+            return set()
+        seen.add(entry)
+        found = set()
+        for node in ast.walk(functions[entry]):
+            # _accepted_publish keeps mailbox.publish as a bound method before
+            # executing its bytecode; it is deliberately not a direct Call.
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id == "mailbox"):
+                found.add("mailbox.Mailbox." + node.attr)
+        for callee, _node, _gated in edges[entry]:
+            found |= local_boundaries(callee, seen)
+        return found
+
+    for tool, entry in direct_names.items():
+        tools[tool].update((code, detail) for code, detail, _node in direct["call"])
+        tools[tool] |= propagate("_checked", False, set())
+        tools[tool] |= propagate("_store_path", False, set())
+        # _checked passes E_AUTH as _pinned_error's default: an unmapped
+        # binding refusal also has the binding action.
+        checked = functions["_checked"]
+        for node in ast.walk(checked):
+            if isinstance(node, ast.Call) and called(node) == "_pinned_error":
+                if len(node.args) > 2 and const(node.args[2]) == "E_AUTH":
+                    tools[tool].add(("E_AUTH", "binding"))
+        entries = local_boundaries(entry, set()) | {"mcp.Connection.checked_mailbox"}
+        if tool == "mailbox_publish_record":
+            assert any(isinstance(node, ast.Call) and called(node) == "writer_lock"
+                       for node in ast.walk(functions["call"]))
+            entries.add("mailbox.writer_lock")
+        strings = set().union(*(boundary_strings(name, set()) for name in entries))
+        for message, code, detail in pinned:
+            if message in strings:
+                tools[tool].add((code, detail))
+                if detail == "history":
+                    history_messages[tool].add(message)
+    for tool, pairs in _codec_refusal_pairs(functions, edges, direct_names, codec_sources, codec_trace).items():
+        tools[tool] |= pairs
+    return tools, history_messages
+
+
+def test_digest_refusal_precedence_matches_the_pre_item_order(bound, monkeypatch):
+    """Small budgets and invalid options do not outrank the refusal they used to follow."""
+    root, writer, reader = bound
+    stamp = {"n": 0}
+
+    def timestamp():
+        stamp["n"] += 1
+        return "2026-11-14T16:17:%02dZ" % stamp["n"]
+
+    monkeypatch.setattr(mailbox_module, "timestamp", timestamp)
+    format_error = codec.CodecError("E_FORMAT").as_dict()
+    selector_error = codec.CodecError("E_SELECTOR").as_dict()
+
+    cursor = call(reader, "mailbox_digest", {"max_chars": records.MAX_CHARS + 1, "after_message_id": "bad\nid"})
+    assert data(cursor) == digest_invalid_max_chars()
+    assert "bad" not in cursor["content"][0]["text"] and "\n" not in data(cursor)["error"]["message"]
+    limited = call(reader, "mailbox_digest", {"max_chars": records.MAX_CHARS + 1, "limit": 0})
+    assert data(limited) == digest_invalid_max_chars()
+    assert data(limited) != digest_invalid_limit()
+    grammar = call(reader, "mailbox_digest", {"fields": ["***"], "after_message_id": "bad\nid", "limit": 0})
+    assert data(grammar) == selector_error
+    assert "bad" not in grammar["content"][0]["text"]
+    grammar_limit = call(reader, "mailbox_digest", {"fields": ["***"], "limit": 0})
+    assert data(grammar_limit) == selector_error
+    assert data(grammar_limit) != digest_invalid_limit()
+    # Explicit refs are shaped and authorized before options, and the page limit
+    # still runs before those options.
+    ungranted = "0" * 64
+    refused = call(reader, "mailbox_digest", {"refs": [ungranted], "max_chars": records.MAX_CHARS + 1})
+    assert data(refused) == auth_error("reference")
+    assert ungranted not in refused["content"][0]["text"]
+    paged = call(reader, "mailbox_digest", {"refs": [ungranted], "fields": ["***"], "limit": 0,
+                                            "max_chars": records.MAX_CHARS + 1})
+    assert data(paged) == digest_invalid_limit()
+    granted = data(call(writer, "mailbox_publish_record", request("precedence-owned")))["id"]
+    followed = data(call(writer, "mailbox_digest", {"refs": [granted], "limit": 1, "fields": ["body"],
+                                                   "max_chars": records.MAX_CHARS}))
+    assert followed["records"][0]["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+
+    _ordinary(writer, "precedence-broken", "aegis-record/1 broken")
+    broken = call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1, "after_message_id": "precedence-owned"})
+    assert data(broken) == format_error
+    assert "digest output limit exceeded" not in broken["content"][0]["text"]
+    assert "broken" not in broken["content"][0]["text"]
+    still = call(reader, "mailbox_digest", {"max_chars": records.MAX_CHARS, "limit": 1,
+                                            "after_message_id": "precedence-owned"})
+    assert data(still) == format_error
+
+    owned = data(call(writer, "mailbox_publish_record", request("precedence-record")))
+    assert "id" in owned
+    selected = call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1, "fields": ["not_a_field"],
+                                              "after_message_id": "precedence-broken"})
+    assert data(selected) == selector_error
+    assert "not_a_field" not in selected["content"][0]["text"]
+    assert data(selected) != digest_floor_error()
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"],
+                                                   "after_message_id": "precedence-broken",
+                                                   "max_chars": records.MAX_CHARS}))
+    assert repaired["messages"][0]["message_id"] == "precedence-record"
+    assert repaired["messages"][0]["record"]["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+
+    private = data(call(writer, "mailbox_publish_record", request("precedence-private", to="a/front-door")))["id"]
+    stub = "aegis-record/1 sha256=" + private + " kind=text"
+    _ordinary(writer, "precedence-ungranted", stub)
+    hidden = call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1,
+                                             "after_message_id": "precedence-record"})
+    assert data(hidden) == auth_error("reference")
+    assert private not in hidden["content"][0]["text"]
+    assert "max_chars" not in hidden["content"][0]["text"]
+    widened = call(reader, "mailbox_digest", {"max_chars": records.MAX_CHARS, "limit": 1,
+                                              "after_message_id": "precedence-record"})
+    assert data(widened) == auth_error("reference")
+    visible = data(call(reader, "mailbox_read_record", {"message_id": "precedence-record", "fields": ["body"]}))
+    assert visible["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+
+
+def test_refusal_inventory_includes_shared_boundaries():
+    required, _history = _reachable_refusal_pairs()
+    for tool, pairs in required.items():
+        assert ("E_AUTH", "binding") in pairs, tool
+    assert ("E_AUTH", "mailbox_lock") in required["mailbox_publish_record"]
+
+
+@pytest.mark.parametrize("site,tools", [
+    ("_checked", tuple(_RECORD_ARGUMENTS)),
+    ("_RecordAccess.read", tuple(_RECORD_ARGUMENTS)),
+    ("call", tuple(_RECORD_ARGUMENTS)),
+    ("_pinned_error", tuple(_RECORD_ARGUMENTS)),
+    ("_DigestSize.add", ("mailbox_digest",)),
+    ("measured_refusal", ("mailbox_digest",)),
+])
+def test_refusal_inventory_detects_a_new_reachable_site(site, tools):
+    """New refusals in either module cannot silently lose public-call coverage."""
+    sources = [Path(module.__file__).read_text(encoding="utf-8")
+               for module in (records, records_guidance)]
+    for index, original in enumerate(sources):
+        tree = ast.parse(original)
+        candidates = tree.body
+        name = site
+        if "." in site:
+            owner, name = site.split(".")
+            candidates = [child for node in tree.body
+                          if isinstance(node, ast.ClassDef) and node.name == owner for child in node.body]
+        target = next((node for node in candidates
+                       if isinstance(node, ast.FunctionDef) and node.name == name), None)
+        if target is not None:
+            break
+    assert target is not None, site
+    # Inspect an in-memory source variant only; no product function is executed.
+    line = target.body[0].lineno - 1
+    lines = original.splitlines(keepends=True)
+    indent = " " * target.body[0].col_offset
+    lines.insert(line, indent + 'codec.require(False, "E_AUTH", detail="inventory_probe")\n')
+    sources[index] = "".join(lines)
+    required, _history = _reachable_refusal_pairs(sources=sources)
+    for tool in tools:
+        assert ("E_AUTH", "inventory_probe") in required[tool], (site, tool)
+
+
+def test_digest_later_record_view_overflow_recovers_by_reducing_limit(bound, monkeypatch):
+    """The later view can exceed its own budget before the row accountant runs."""
+    _root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T16:31:00Z")
+    _ordinary(writer, "m1", "alpha")
+    assert "id" in data(call(writer, "mailbox_publish_record", request("m2", content=json.dumps({
+        "fields": {}, "body": "LARGE_RECORD_" + "n" * 4000, "refs": {}}))))
+    arguments = {"limit": 2, "fields": ["body"], "max_chars": 220}
+    refused = data(call(reader, "mailbox_digest", arguments))
+    assert refused == digest_page_error()
+    _assert_closed("mailbox_digest", refused)
+    repaired = data(call(reader, "mailbox_digest", dict(arguments, limit=1)))
+    assert [row["message_id"] for row in repaired["messages"]] == ["m1"]
+    assert repaired["messages"][0]["body"] == "alpha"
+
+
+def _follow_measured_retry(conn, refusal, arguments, *, message_id=None, reference=None):
+    error = refusal["error"]
+    retry = error["retry"]
+    tool, options = retry["tool"], retry["options"]
+    assert set(options) <= _RECORD_ARGUMENTS[tool]
+    assert "max_chars" not in options or 0 <= options["max_chars"] <= records.MAX_CHARS
+    if tool == "mailbox_digest":
+        request_args = dict(arguments, **options)
+    else:
+        assert tool == "mailbox_read_record"
+        target = retry["target"]
+        if target["collection"] == "records":
+            request_args = dict(options, ref=arguments["refs"][target["index"]])
+        else:
+            assert message_id is not None
+            request_args = dict(options, message_id=message_id)
+    result = call(conn, tool, request_args)
+    assert not result.get("isError"), result
+    return tool, data(result)
+
+
+@pytest.mark.parametrize("budget,fields", [(110, ["body"]), (120, ["body"]), (120, ["refs"]), (220, ["body"])])
+def test_digest_first_record_advice_is_a_measured_successful_retry(bound, budget, fields):
+    _root, writer, reader = bound
+    assert "id" in data(call(writer, "mailbox_publish_record", request("minimum", content=json.dumps({
+        "fields": {}, "body": "note", "refs": {}}))))
+    arguments = {"limit": 1, "fields": fields, "max_chars": budget}
+    refused = data(call(reader, "mailbox_digest", arguments))
+    assert refused["error"]["code"] == "E_LIMIT"
+    _assert_closed("mailbox_digest", refused)
+    tool, retried = _follow_measured_retry(reader, refused, arguments, message_id="minimum")
+    view = retried if tool == "mailbox_read_record" else retried["messages"][0]["record"]
+    assert view["attribution"] == "match" and view["mailbox_from"] == "a/orchestrator"
+    if budget <= 120:
+        minimum = refused["error"]["minimum_max_chars"]
+        assert minimum > budget
+        assert refused["error"]["retry"]["options"]["max_chars"] == minimum
+        assert "increase max_chars to at least " + str(minimum) in refused["error"]["next_action"]
+        assert not any(word in refused["error"]["next_action"] for word in
+                       ("mailbox_read_record", "fields", "outline", "fewer refs"))
+        options = refused["error"]["retry"]["options"]
+        too_small = call(reader, tool, dict(dict(arguments, **options) if tool == "mailbox_digest" else
+                                           dict(options, message_id="minimum"), max_chars=minimum - 1))
+        assert data(too_small)["error"]["code"] == "E_LIMIT"
+
+
+@pytest.mark.parametrize("companion", ["broken", "record", "reference"])
+@pytest.mark.parametrize("planned", [False, True])
+def test_digest_ordinary_overflow_uses_inbox_despite_other_records(bound, monkeypatch, companion, planned):
+    root, writer, reader = bound
+    if planned:
+        import hierarchy_hosts
+        plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+        (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T19:24:00Z")
+    ordinary = "h" * 61000
+    _ordinary(writer, "a-ordinary", ordinary)
+    arguments = {"limit": 2, "max_chars": records.MAX_CHARS}
+    if companion == "broken":
+        _ordinary(writer, "z-other", "aegis-record/1 broken")
+    else:
+        published = data(call(writer, "mailbox_publish_record", request("z-other", content=json.dumps({
+            "fields": {}, "body": "note", "refs": {}}))))
+        assert "id" in published
+        if companion == "reference":
+            arguments.update(limit=1, refs=[published["id"]])
+    before = data(call(reader, "mailbox_self", {}))
+    pager_before = reader._pager
+    original_reader = records._view
+    original_inbox = records._inbox_retry
+    inbox_calls = []
+
+    def measured_inbox(conn, options, target):
+        inbox_calls.append(dict(options))
+        return original_inbox(conn, options, target)
+
+    def no_other_record(*args, **kwargs):
+        raise AssertionError("ordinary overflow considered another record")
+
+    monkeypatch.setattr(records, "_view", no_other_record, raising=True)
+    monkeypatch.setattr(records, "_inbox_retry", measured_inbox, raising=True)
+    refused = call(reader, "mailbox_digest", arguments)
+    assert data(refused) == digest_inbox_error()
+    _assert_closed("mailbox_digest", data(refused))
+    assert "h" * 8 not in refused["content"][0]["text"]
+    assert reader.returned == []
+    assert inbox_calls == [{"limit": 100}]
+    assert reader._pager is pager_before
+    assert data(call(reader, "mailbox_self", {})) == before
+    monkeypatch.setattr(records, "_view", original_reader, raising=True)
+    inbox = data(call(reader, "mailbox_inbox", {"limit": 100}))
+    assert next(item["message"]["body"] for item in inbox["messages"]
+                if item["message"]["message_id"] == "a-ordinary") == ordinary
+
+
+def test_digest_single_ordinary_message_keeps_inbox_recovery(bound):
+    _root, writer, reader = bound
+    body = "x" * 1500
+    _ordinary(writer, "a-ord", body)
+    refused = data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": 100}))
+    assert refused == digest_inbox_error()
+    _assert_closed("mailbox_digest", refused)
+    inbox = data(call(reader, "mailbox_inbox", {"limit": 100}))
+    assert inbox["messages"][0]["message"]["message_id"] == "a-ord"
+    assert inbox["messages"][0]["message"]["body"] == body
+
+
+@pytest.mark.parametrize("walk", [{"order": "newest"}, {"since": "current_generation"},
+                                  {"order": "newest", "since": "current_generation"}])
+@pytest.mark.parametrize("history", [2, 101])
+def test_digest_inbox_recovery_restarts_a_committed_cursor_walk(bound, monkeypatch, walk, history):
+    root, writer, reader = bound
+    import hierarchy_hosts
+    plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+    (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    # Equal timestamps make the new message immediately follow either issued
+    # cursor in digest's oldest ordering, including the filtered oldest walk.
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2099-01-01T00:00:00Z")
+    identifiers = ["m0", "m1"] if history == 2 else ["seed-" + str(index).zfill(3) for index in range(history)]
+    for identifier in identifiers:
+        _ordinary(writer, identifier, "small")
+    # With 101 messages, newest's committed cursor is also the first fresh
+    # oldest page's cursor, so continuing requires its newly issued context.
+    first = call(reader, "mailbox_inbox", dict(walk, limit=2 if history > 100 else 1))
+    assert not first.get("isError"), first
+    cursor = data(first)["next_after"]
+    assert cursor is not None
+    reader.record_inbox_page()  # The transport calls this only after stdout flush.
+    target = "m2" if history == 2 and walk.get("order") == "newest" else cursor + "-overflow"
+    body = "h" * 61000
+    _ordinary(writer, target, body)
+    incompatible = {"limit": 100, "after_message_id": cursor}
+    rejected = data(call(reader, "mailbox_inbox", incompatible))
+    assert rejected == {"error": "inbox cursor does not match this walk; restart the walk without after_message_id"}
+    before = data(call(reader, "mailbox_self", {}))
+    refused = data(call(reader, "mailbox_digest", {"after_message_id": cursor, "limit": 1,
+                                                   "max_chars": records.MAX_CHARS}))
+    assert refused["error"]["code"] == "E_LIMIT"
+    action = refused["error"]["next_action"]
+    assert "mailbox_inbox" in action and "restart" in action
+    assert "without after_message_id" in action and "from the start" in action
+    assert "availability" not in action and "mailbox_read_record" not in action
+    _assert_closed("mailbox_digest", refused)
+    assert reader.returned == []
+    assert data(call(reader, "mailbox_self", {})) == before
+    assert data(call(reader, "mailbox_inbox", incompatible)) == rejected
+    # Follow the restart advice and only cursors issued by this fresh walk.
+    arguments = {"limit": 100}
+    for _ in range(3):
+        response = call(reader, "mailbox_inbox", arguments)
+        assert not response.get("isError"), response
+        page = data(response)
+        reader.record_inbox_page()
+        found = [row["message"] for row in page["messages"] if row["message"]["message_id"] == target]
+        if found:
+            assert found[0]["body"] == body
+            break
+        assert page["next_after"] is not None
+        arguments["after_message_id"] = page["next_after"]
+    else:
+        pytest.fail("fresh inbox walk did not retrieve the overflowing message")
+
+
+@pytest.mark.parametrize("size,walk,planned", [
+    pytest.param(10000, {}, True, id="ceiling-oldest"),
+    pytest.param(3, {"order": "newest"}, True, id="newest"),
+    pytest.param(3, {"since": "current_generation"}, True, id="generation"),
+    pytest.param(3, {"order": "newest", "since": "current_generation"}, True, id="combined"),
+    pytest.param(101, {"order": "newest"}, True, id="newest-continuation"),
+    pytest.param(101, {"since": "current_generation"}, True, id="generation-continuation"),
+    pytest.param(101, {"order": "newest", "since": "current_generation"}, True, id="combined-continuation"),
+    pytest.param(101, None, True, id="no-cursor"),
+    pytest.param(101, {}, False, id="legacy-cursor"),
+    pytest.param(101, None, False, id="legacy-no-cursor"),
+])
+def test_digest_inbox_recovery_loads_history_once(bound, monkeypatch, size, walk, planned):
+    root, writer, reader = bound
+    if planned:
+        import hierarchy_hosts
+        plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+        (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    # Seed retained files directly, then exercise real whole-history validation.
+    # Publishing every seed through the writer would itself rescan the history.
+    _ordinary(writer, "retained-00000", "small")
+    seed = writer.checked_mailbox().messages()["retained-00000"]
+    folder = Path(seed["path"]).parent
+    identifiers = ["retained-" + str(index).zfill(5) for index in range(size)]
+    target = identifiers[0] if walk is None else identifiers[-1]
+    body = "h" * 61000
+    for identifier in identifiers:
+        header = {key: value for key, value in seed["message"].items() if key != "body"}
+        header.update(message_id=identifier, created_at="2099-01-01T00:00:00Z")
+        content = body if identifier == target else "small"
+        path = Path(seed["path"]) if identifier == identifiers[0] else folder / (identifier + ".md")
+        path.write_bytes(
+            b"---\n" + mailbox_module.encoded(header) + b"\n---\n\n" + content.encode("utf-8"))
+    arguments = {"limit": 1, "max_chars": 60000}
+    delivery = root.parent / "recovery-delivery"
+    reader.delivery_dir = reader.checked_mailbox().delivery_directory(delivery)
+    if walk is not None:
+        cursor = identifiers[-2]
+        if size <= 101:
+            first = call(reader, "mailbox_inbox", dict(walk, limit=2 if walk.get("order") == "newest" else size - 1))
+            assert not first.get("isError"), first
+            assert data(first)["next_after"] == cursor
+            reader.record_inbox_page()
+        arguments["after_message_id"] = cursor
+    from copy import deepcopy
+    reader.begin_response()  # Discard response-local staging, as the transport does.
+    pager_before = reader._pager
+    pager_mode_before = reader.inbox_pager
+
+    def pager_state():
+        pager = reader._pager
+        if pager is None:
+            return None
+        return deepcopy((pager.session, pager.briefs_session, pager.offered, pager.pending,
+                         pager.cutoffs, pager.cursors, pager.retained_cursor_pairs))
+
+    state_before = pager_state()
+    original_mailbox = mcp.Mailbox
+    loads = []
+
+    class CountingMailbox(original_mailbox):
+        def messages(self):
+            loads.append(self.root)
+            # Fail before another disk scan, also bounding the RED reproducer.
+            assert len(loads) == 1, "recovery reloaded the entire mailbox history"
+            history = super().messages()
+            assert len(history) == size
+            return history
+
+    # Replace this consumer's public read class, never the shared os module.
+    monkeypatch.setattr(mcp, "Mailbox", CountingMailbox, raising=True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        refused = pool.submit(call, reader, "mailbox_digest", arguments).result(timeout=30)
+    assert len(loads) == 1
+    assert not delivery.exists()
+    assert reader.returned == [] and reader._pager is pager_before
+    assert reader.inbox_pager == pager_mode_before
+    assert pager_state() == state_before
+    if planned and walk is not None:
+        assert data(refused) == {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                                          "next_action": records_guidance.DIGEST_INBOX_RESTART_NEXT}}
+    else:
+        assert data(refused) == digest_inbox_error()
+    assert "h" * 8 not in refused["content"][0]["text"]
+    monkeypatch.setattr(mcp, "Mailbox", original_mailbox, raising=True)
+
+
+@pytest.mark.parametrize("failure", ["malformed", "history", "binding", "manifest", "io"])
+def test_digest_inbox_snapshot_preserves_validation_and_fences(bound, monkeypatch, failure):
+    root, writer, reader = bound
+    import hierarchy_hosts
+    plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+    (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    _ordinary(writer, "a-overflow", "h" * 61000)
+    _ordinary(writer, "z-outside-page", "small")
+    outside = Path(writer.checked_mailbox().messages()["z-outside-page"]["path"])
+    if failure == "malformed":
+        outside.write_bytes(b"HOSTILE")
+    elif failure == "history":
+        monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 1, raising=True)
+    original_mailbox = mcp.Mailbox
+    loads = []
+
+    class ChangingMailbox(original_mailbox):
+        def messages(self):
+            loads.append(self.root)
+            assert len(loads) == 1
+            if failure == "io":
+                raise OSError(errno.EIO, "HOSTILE")
+            history = super().messages()
+            # Model an owner-control change after validation, before recovery.
+            if failure == "binding":
+                path = root / "bindings" / "a" / "lane" / "review" / "000001.json"
+                binding = json.loads(path.read_text(encoding="utf-8"))
+                binding["session"] = "HOSTILE"
+                path.write_text(json.dumps(binding), encoding="utf-8")
+            elif failure == "manifest":
+                path = root / "manifest.json"
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                manifest["writer_limit"] = 2
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+            return history
+
+    monkeypatch.setattr(mcp, "Mailbox", ChangingMailbox, raising=True)
+    refused = call(reader, "mailbox_digest", {"limit": 1, "max_chars": 60000})
+    expected = {
+        "malformed": codec.CodecError("E_FORMAT").as_dict(),
+        "history": publish_limit(history=True),
+        "io": codec.CodecError("E_AUTH").as_dict(),
+    }.get(failure, {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                             "next_action": "inbox retry could not be verified; ask the owner to inspect mailbox availability"}})
+    assert refused.get("isError") is True and data(refused) == expected
+    assert len(loads) == 1 and reader.returned == [] and reader._pager is None
+    assert "HOSTILE" not in refused["content"][0]["text"]
+
+
+def test_digest_unavailable_inbox_probe_keeps_the_ordinary_failure(bound, monkeypatch):
+    _root, writer, reader = bound
+    _ordinary(writer, "a-ordinary", "h" * 61000)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("z-record")))
+
+    def unavailable(*args, **kwargs):
+        raise OSError(errno.EIO, "HOSTILE")
+
+    def no_record(*args, **kwargs):
+        raise AssertionError("unavailable inbox fell through to a different record")
+
+    monkeypatch.setattr(records, "_inbox_retry", unavailable, raising=True)
+    monkeypatch.setattr(records, "_view", no_record, raising=True)
+    refused = data(call(reader, "mailbox_digest", {"limit": 2}))
+    assert refused == {"error": {"code": "E_LIMIT", "message": "digest output limit exceeded",
+                                "next_action": "inbox retry could not be verified; ask the owner to inspect mailbox availability"}}
+    _assert_closed("mailbox_digest", refused)
+    assert "HOSTILE" not in json.dumps(refused) and reader.returned == []
+
+
+def test_digest_record_retry_identifies_the_failing_reference(bound):
+    root, writer, _reader = bound
+    identifiers = []
+    for name, body in (("small", "small"), ("large", "x" * 65000), ("bad", "bad")):
+        identifiers.append(data(call(writer, "mailbox_publish_record", request(name, content=json.dumps({
+            "fields": {}, "body": body, "refs": {}}))))["id"])
+    (root.parent / "mailbox-records" / (identifiers[2] + ".json")).write_bytes(b"broken")
+    arguments = {"refs": identifiers, "fields": ["body"], "max_chars": 400}
+    refused = data(call(writer, "mailbox_digest", arguments))
+    _assert_measured_budget(refused)
+    assert refused["error"]["retry"]["tool"] == "mailbox_read_record"
+    assert refused["error"]["retry"]["target"] == {"collection": "records", "index": 1}
+    _tool, view = _follow_measured_retry(writer, refused, arguments)
+    assert view["ref"] == identifiers[1][:16]
+    assert view["attribution"] == "grant-index"
+
+
+def test_refusal_inventory_includes_reachable_codec_boundaries():
+    required, _history = _reachable_refusal_pairs()
+    for tool in required:
+        assert ("E_HASH", "") in required[tool], tool
+        assert ("E_AUTH", "operation") in required[tool], tool
+    for tool in ("mailbox_read_record", "mailbox_digest"):
+        assert ("E_SELECTOR", "") in required[tool], tool
+        assert ("E_LIMIT", "record") in required[tool], tool
+    assert ("E_FORMAT", "number") in required["mailbox_publish_record"]
+
+
+def test_digest_minimum_retry_can_read_first_record_before_a_later_bad_stub(bound, monkeypatch):
+    _root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T18:23:00Z")
+    assert "id" in data(call(writer, "mailbox_publish_record", request("a-large", content=json.dumps({
+        "fields": {}, "body": "x" * 65000, "refs": {}}))))
+    _ordinary(writer, "z-broken", "aegis-record/1 broken")
+    arguments = {"limit": 2, "fields": ["body"], "max_chars": 120}
+    refused = data(call(reader, "mailbox_digest", arguments))
+    assert refused["error"]["code"] == "E_LIMIT"
+    assert refused["error"]["minimum_max_chars"] > 120
+    tool, view = _follow_measured_retry(reader, refused, arguments, message_id="a-large")
+    assert tool == "mailbox_read_record" and view["attribution"] == "match"
+
+
+@pytest.mark.parametrize("namespace,site,tools", [
+    ("codec", "preflight_read", tuple(_RECORD_ARGUMENTS)),
+    ("codec", "_read_selectors", tuple(_RECORD_ARGUMENTS)),
+    ("format", "compose", ("mailbox_publish_record",)),
+    ("store", "Store.read", tuple(_RECORD_ARGUMENTS)),
+    ("store", "_store_error", tuple(_RECORD_ARGUMENTS)),
+])
+def test_refusal_inventory_detects_a_new_codec_error_site(namespace, site, tools):
+    modules = {"codec": codec, "format": codec_format, "store": codec_store, "views": codec_views}
+    sources = {name: Path(module.__file__).read_text(encoding="utf-8") for name, module in modules.items()}
+    source = sources[namespace]
+    tree = ast.parse(source)
+    candidates = tree.body
+    name = site
+    if "." in site:
+        owner, name = site.split(".")
+        candidates = [child for node in tree.body if isinstance(node, ast.ClassDef) and node.name == owner
+                      for child in node.body]
+    target = next(node for node in candidates if isinstance(node, ast.FunctionDef) and node.name == name)
+    lines = source.splitlines(keepends=True)
+    lines.insert(target.body[0].lineno - 1,
+                 " " * target.body[0].col_offset + 'raise CodecError("E_AUTH", detail="codec_probe")\n')
+    sources[namespace] = "".join(lines)
+    required, _history = _reachable_refusal_pairs(codec_sources=sources)
+    for tool in tools:
+        assert ("E_AUTH", "codec_probe") in required[tool], (namespace, site, tool)
+
+
+def test_every_emitted_refusal_names_an_accepted_action(bound, monkeypatch):
+    """Public calls cover every refusal the record tools can emit, then follow it."""
+    from aegis_core.message_codec_format import KEYS
+    assert _FIELD_SELECTORS == set(KEYS)
+    required, history_messages = _reachable_refusal_pairs()
+    assert ("E_LIMIT", "history") in required["mailbox_read_record"]
+    assert any(message.startswith("mailbox") for message in history_messages["mailbox_read_record"])
+    assert any(message.startswith("binding") for message in history_messages["mailbox_read_record"])
+    assert ("E_AUTH", "attribution") in required["mailbox_publish_record"]
+    assert ("E_AUTH", "cited_reference") not in required["mailbox_publish_record"]
+    covered = set()
+    covered_history = set()
+    observed = {}
+    error_result = records._error_result
+
+    def observe_error(error, *, tool):
+        observed["pair"] = (tool, error.code, error.detail)
+        return error_result(error, tool=tool)
+
+    monkeypatch.setattr(records, "_error_result", observe_error, raising=True)
+    pinned_error = records._pinned_error
+    last_pinned = {"message": None}
+
+    def observe_pinned(codec, error, default="E_FORMAT"):
+        last_pinned["message"] = str(error)
+        return pinned_error(codec, error, default)
+
+    monkeypatch.setattr(records, "_pinned_error", observe_pinned)
+
+    def cover(tool, code, detail, payload):
+        actual = observed["pair"]
+        expected = error_result(codec.CodecError(code, detail=detail or None), tool=tool)
+        if "retry" in payload["error"]:
+            _assert_measured_budget(payload)
+            assert actual[:2] == (tool, code)
+        else:
+            assert actual == (tool, code, detail)
+            assert payload == expected, (tool, code, detail, payload, expected)
+        _assert_closed(tool, payload)
+        text = json.dumps(payload)
+        assert "\n" not in text and "HOSTILE" not in text
+        covered.add(actual)
+        if detail == "history":
+            assert last_pinned["message"] in history_messages[tool]
+            covered_history.add((tool, last_pinned["message"]))
+
+    root, writer, reader = bound
+    empty_floor = data(call(reader, "mailbox_digest", {"max_chars": 10}))
+    cover("mailbox_digest", "E_LIMIT", "digest_floor", empty_floor)
+    assert _follow_measured_retry(reader, empty_floor, {"max_chars": 10})[1]["messages"] == []
+    assert "id" in data(call(writer, "mailbox_publish_record", request("base")))
+
+    for identifier, invalid, valid in (("number", "1e0", "1"), ("nested-number", '{"n":1e0}', '{"n":1}')):
+        numeric = request(identifier, kind="record", content='{"fields":{"value":' + invalid + '},"body":"","refs":{}}')
+        cover("mailbox_publish_record", "E_FORMAT", "number", data(call(writer, "mailbox_publish_record", numeric)))
+        assert "id" in data(call(writer, "mailbox_publish_record", dict(numeric,
+            content='{"fields":{"value":' + valid + '},"body":"","refs":{}}')))
+    for tool, arguments in (("mailbox_read_record", {"message_id": "base"}), ("mailbox_digest", {"limit": 1})):
+        for fields in (["not_a_field"], ["***"]):
+            cover(tool, "E_SELECTOR", "", data(call(reader, tool, dict(arguments, fields=fields))))
+            assert not call(reader, tool, dict(arguments, fields=["body"])).get("isError")
+
+    base_id = data(call(writer, "mailbox_publish_record", request("base")))["id"]
+    record_path = root.parent / "mailbox-records" / (base_id + ".json")
+    record_bytes = record_path.read_bytes()
+    retry_calls = ((writer, "mailbox_publish_record", request("base")),
+                   (reader, "mailbox_read_record", {"message_id": "base"}),
+                   (reader, "mailbox_digest", {"limit": 1}))
+    for damaged, code, detail in ((b"HOSTILE", "E_HASH", ""),
+                                  (b"x" * (codec.MAX_BYTES + 1), "E_LIMIT", "record")):
+        record_path.write_bytes(damaged)
+        for who, tool, arguments in retry_calls:
+            cover(tool, code, detail, data(call(who, tool, arguments)))
+            # Repeating the unchanged damaged record remains a refusal.
+            assert data(call(who, tool, arguments))["error"]["code"] == code
+        record_path.write_bytes(record_bytes)
+        for who, tool, arguments in retry_calls:
+            assert not call(who, tool, arguments).get("isError")
+
+    real_open, real_fstat = os.open, os.fstat
+    store_identity = record_path.parent.stat()
+
+    def unavailable(path, *args, **kwargs):
+        if str(path) == base_id + ".json":
+            raise OSError(errno.EIO, "HOSTILE")
+        return real_open(path, *args, **kwargs)
+
+    def private_mode(fd):
+        info = real_fstat(fd)
+        if (info.st_dev, info.st_ino) == (store_identity.st_dev, store_identity.st_ino):
+            values = list(info)
+            values[0] |= 0o022
+            return os.stat_result(values)
+        return info
+
+    for replacement, detail in ((SimpleNamespace(**{**vars(os), "open": unavailable}), "operation"),
+                                (SimpleNamespace(**{**vars(os), "fstat": private_mode}), "private")):
+        monkeypatch.setattr(codec_store, "os", replacement, raising=True)
+        for who, tool, arguments in retry_calls:
+            cover(tool, "E_AUTH", detail, data(call(who, tool, arguments)))
+        monkeypatch.setattr(codec_store, "os", os, raising=True)
+        for who, tool, arguments in retry_calls:
+            assert not call(who, tool, arguments).get("isError")
+
+    kind = data(call(writer, "mailbox_publish_record", request("bad-kind", kind=[])))
+    cover("mailbox_publish_record", "E_FORMAT", "", kind)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("kind-ok")))
+    huge = data(call(writer, "mailbox_publish_record", request("huge", content="x" * 262145)))
+    cover("mailbox_publish_record", "E_LIMIT", "record", huge)
+    assert "next_action" not in huge["error"]
+    assert "id" in data(call(writer, "mailbox_publish_record", request("huge-ok", content=json.dumps(
+        {"fields": {}, "body": "small", "refs": {}}))))
+    bad_id = data(call(writer, "mailbox_publish_record", request("bad\nid")))
+    cover("mailbox_publish_record", "E_REF", "", bad_id)
+    assert "bad" not in json.dumps(bad_id)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("id-ok")))
+    missing_ref = data(call(writer, "mailbox_publish_record", request(
+        "no-ref", content=json.dumps({"fields": {}, "body": "x", "refs": {"missing": "0" * 64}}))))
+    cover("mailbox_publish_record", "E_AUTH", "reference", missing_ref)
+    assert "0" * 64 not in json.dumps(missing_ref)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("ref-ok")))
+    off_route = data(call(reader, "mailbox_publish_record", request("off-route", to="b/front-door")))
+    cover("mailbox_publish_record", "E_AUTH", "scope", off_route)
+    assert "id" in data(call(reader, "mailbox_publish_record", request("on-route", to="a/orchestrator")))
+    foreign = data(call(reader, "mailbox_publish_record", request("base", to="a/orchestrator")))
+    cover("mailbox_publish_record", "E_AUTH", "message_id", foreign)
+    assert "id" in data(call(reader, "mailbox_publish_record", request("reader-own", to="a/orchestrator")))
+
+    manifest_path = root / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    manifest["writer_limit"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    for who, tool, arguments in (
+            (writer, "mailbox_publish_record", request("binding-retry")),
+            (reader, "mailbox_read_record", {"message_id": "base"}),
+            (reader, "mailbox_digest", {"limit": 1})):
+        refused = data(call(who, tool, arguments))
+        cover(tool, "E_AUTH", "binding", refused)
+        assert refused == auth_error("binding")
+    manifest_path.write_bytes(manifest_bytes)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("binding-retry")))
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+
+    with mcp.writer_lock(root):
+        locked_mailbox = data(call(writer, "mailbox_publish_record", request("mailbox-lock-retry")))
+        cover("mailbox_publish_record", "E_AUTH", "mailbox_lock", locked_mailbox)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("mailbox-lock-retry")))
+
+    # Corrupt only a disposable mailbox fixture at its storage boundary. Both
+    # read tools traverse the same pinned reply validation as publication.
+    assert not call(writer, "mailbox_publish", {"message_id": "scope-history", "to": "a/lane/review",
+        "type": "info", "body": "reply", "in_reply_to": "reader-own"}).get("isError")
+    scope_path = Path(writer.checked_mailbox().messages()["scope-history"]["path"])
+    scope_bytes = scope_path.read_bytes()
+    damaged = scope_bytes.replace(b'"reader-own"', b'"base"')
+    assert damaged != scope_bytes
+    scope_path.write_bytes(damaged)
+    for tool, arguments in (("mailbox_read_record", {"message_id": "base"}),
+                            ("mailbox_digest", {"limit": 1})):
+        cover(tool, "E_AUTH", "scope", data(call(reader, tool, arguments)))
+    scope_path.write_bytes(scope_bytes)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+
+    base_path = Path(writer.checked_mailbox().messages()["base"]["path"])
+    base_bytes = base_path.read_bytes()
+    base_path.write_bytes(b"x" * (mailbox_module.MAX_BYTES + 1))
+    cover("mailbox_digest", "E_LIMIT", "", data(call(reader, "mailbox_digest", {"limit": 1})))
+    base_path.write_bytes(base_bytes)
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+
+    bad_cursor = data(call(reader, "mailbox_digest", {"after_message_id": "bad\nid"}))
+    cover("mailbox_digest", "E_REF", "", bad_cursor)
+    assert "bad" not in json.dumps(bad_cursor)
+    repaired = data(call(reader, "mailbox_digest", {"limit": 1}))
+    assert repaired["messages"][0]["message_id"] == "base"
+    invalid_limit = data(call(reader, "mailbox_digest", {"limit": 0}))
+    cover("mailbox_digest", "E_LIMIT", "digest_limit", invalid_limit)
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"][0]["message_id"] == "base"
+    invalid_chars = data(call(reader, "mailbox_digest", {"max_chars": records.MAX_CHARS + 1, "limit": 1}))
+    cover("mailbox_digest", "E_LIMIT", "digest_max_chars", invalid_chars)
+    assert data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))["messages"]
+    floor = data(call(reader, "mailbox_digest", {"max_chars": 10, "limit": 1}))
+    cover("mailbox_digest", "E_LIMIT", "digest_floor", floor)
+    _follow_measured_retry(reader, floor, {"max_chars": 10, "limit": 1}, message_id="base")
+    assert data(call(reader, "mailbox_digest", {"limit": 1, "max_chars": records.MAX_CHARS}))["messages"][0]["message_id"] == "base"
+
+    for identifier, body in (("page-1", "alpha"), ("page-2", "bravo"), ("page-3", "charlie")):
+        _ordinary(writer, identifier, body)
+    one = call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-1"})
+    assert not one.get("isError"), one
+    fit = len(one["content"][0]["text"])
+    page = data(call(reader, "mailbox_digest", {"limit": 2, "after_message_id": "page-1", "max_chars": fit}))
+    cover("mailbox_digest", "E_LIMIT", "digest_page", page)
+    assert "after_message_id" in page["error"]["next_action"]
+    narrowed = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-1", "max_chars": fit}))
+    assert [row["message_id"] for row in narrowed["messages"]] == ["page-2"]
+    assert narrowed["messages"][0]["body"] == "bravo"
+
+    ordinary = "OVERSIZE_ORDINARY-" + ("n" * 4000)
+    _ordinary(writer, "budget-1", ordinary)
+    shown = call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-3"})
+    assert data(shown)["messages"][0]["message_id"] == "budget-1"
+    budget = len(shown["content"][0]["text"])
+    inbox_row = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-3", "max_chars": budget - 1}))
+    cover("mailbox_digest", "E_LIMIT", "digest_inbox", inbox_row)
+    assert "after_message_id" not in inbox_row["error"]["next_action"]
+    inbox = data(call(reader, "mailbox_inbox", {"limit": 100}))
+    assert next(row["message"]["body"] for row in inbox["messages"]
+                if row["message"]["message_id"] == "budget-1") == ordinary
+    restored = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "page-3", "max_chars": budget}))
+    assert restored["messages"][0]["body"] == ordinary
+
+    view_body = json.dumps({"fields": {}, "body": "REF-BODY-" + ("q" * 400), "refs": {}})
+    first = data(call(writer, "mailbox_publish_record", request("ref-a", content=view_body)))["id"]
+    second = data(call(writer, "mailbox_publish_record", request("ref-b", content=view_body)))["id"]
+    alone = call(writer, "mailbox_digest", {"limit": 1, "refs": [first], "fields": ["body"]})
+    assert not alone.get("isError"), alone
+    view_fit = len(alone["content"][0]["text"])
+    view = data(call(writer, "mailbox_digest", {"limit": 1, "refs": [first, second], "fields": ["body"],
+                                               "max_chars": view_fit}))
+    cover("mailbox_digest", "E_LIMIT", "digest_view", view)
+    _follow_measured_retry(writer, view,
+                           {"limit": 1, "refs": [first, second], "fields": ["body"], "max_chars": view_fit},
+                           message_id=data(alone)["messages"][0]["message_id"] if data(alone)["messages"] else None,
+                           reference=first)
+    assert "after_message_id" not in view["error"]["next_action"]
+    fewer = data(call(writer, "mailbox_digest", {"limit": 1, "refs": [first], "fields": ["body"],
+                                                "max_chars": view_fit}))
+    assert fewer["records"][0]["data"]["body"].startswith("REF-BODY-")
+    ungranted_ref = data(call(reader, "mailbox_digest", {"refs": ["0" * 64], "limit": 1}))
+    cover("mailbox_digest", "E_AUTH", "reference", ungranted_ref)
+    assert "0" * 64 not in json.dumps(ungranted_ref)
+    cited_back = data(call(reader, "mailbox_digest", {"refs": [first], "fields": ["body"], "limit": 1}))
+    assert cited_back["records"][0]["data"]["body"].startswith("REF-BODY-")
+
+    missing = data(call(reader, "mailbox_read_record", {"message_id": "missing-id"}))
+    cover("mailbox_read_record", "E_AUTH", "reference", missing)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))["data"]["body"]
+    bad_read = data(call(reader, "mailbox_read_record", {"message_id": "bad\nid"}))
+    cover("mailbox_read_record", "E_REF", "", bad_read)
+    assert "bad" not in json.dumps(bad_read)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    read_limit = data(call(reader, "mailbox_read_record", {"message_id": "base", "max_chars": records.MAX_CHARS + 1}))
+    cover("mailbox_read_record", "E_LIMIT", "", read_limit)
+    assert "next_action" not in read_limit["error"]
+    assert "narrow the selectors" in read_limit["error"]["message"]
+    narrowed_read = data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))
+    assert narrowed_read["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+
+    source = connection(root, "b/orchestrator")
+    leaf = data(call(source, "mailbox_publish_record", request("leaf", to="b/front-door")))["id"]
+    parent = data(call(source, "mailbox_publish_record", request("parent", to="a/orchestrator", content=json.dumps({
+        "fields": {}, "body": "parent body", "refs": {"private": leaf}}))))["id"]
+    assert "id" in data(call(writer, "mailbox_publish_record", request("wrap", content=json.dumps({
+        "fields": {}, "body": "wrap body", "refs": {"parent": parent}}))))
+    cited = data(call(reader, "mailbox_read_record", {"ref": parent, "fields": ["refs"]}))
+    cover("mailbox_read_record", "E_AUTH", "cited_reference", cited)
+    assert data(call(reader, "mailbox_read_record", {"ref": parent, "fields": ["body"]}))["data"]["body"] == "parent body"
+    cited_digest = data(call(reader, "mailbox_digest", {"refs": [parent], "fields": ["refs"],
+                                                      "after_message_id": "wrap", "limit": 1}))
+    cover("mailbox_digest", "E_AUTH", "cited_reference", cited_digest)
+    assert data(call(reader, "mailbox_digest", {"refs": [parent], "fields": ["body"], "limit": 1}))["records"][0]["data"]["body"] == "parent body"
+
+    stub = reader.checked_mailbox().messages()["base"]["message"]["body"]
+    assert not call(reader, "mailbox_publish", {"message_id": "pasted", "to": "a/orchestrator",
+                                               "type": "info", "body": stub}).get("isError")
+    pasted = request("pasted", to="a/orchestrator", content=json.dumps({"fields": {}, "body": "x", "refs": {}}))
+    publish_attr = data(call(reader, "mailbox_publish_record", pasted))
+    cover("mailbox_publish_record", "E_AUTH", "attribution", publish_attr)
+    original = data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))
+    assert original["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
+    assert data(call(reader, "mailbox_publish_record", pasted)) == auth_error("attribution")
+    read_attr = data(call(writer, "mailbox_read_record", {"message_id": "pasted"}))
+    cover("mailbox_read_record", "E_AUTH", "attribution", read_attr)
+    assert data(call(writer, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    received = [row["message"] for row in data(call(writer, "mailbox_inbox", {"limit": 100}))["messages"]]
+    received.sort(key=lambda message: (message["created_at"], message["message_id"]))
+    pasted_at = [message["message_id"] for message in received].index("pasted")
+    digest_args = {"limit": 1}
+    if pasted_at:
+        digest_args["after_message_id"] = received[pasted_at - 1]["message_id"]
+    digest_attr = data(call(writer, "mailbox_digest", digest_args))
+    cover("mailbox_digest", "E_AUTH", "attribution", digest_attr)
+    assert data(call(writer, "mailbox_read_record", {"message_id": "ref-a", "fields": ["body"]}))["data"]["body"].startswith("REF-BODY-")
+
+    original_supported = records.supported
+    monkeypatch.setattr(records, "supported", lambda: False)
+    bare_publish = data(call(writer, "mailbox_publish_record", request("unsupported")))
+    cover("mailbox_publish_record", "E_AUTH", "", bare_publish)
+    bare_read = data(call(reader, "mailbox_read_record", {"message_id": "base"}))
+    cover("mailbox_read_record", "E_AUTH", "", bare_read)
+    bare_digest = data(call(reader, "mailbox_digest", {"limit": 1}))
+    cover("mailbox_digest", "E_AUTH", "", bare_digest)
+    monkeypatch.setattr(records, "supported", original_supported)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("supported-again")))
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+
+    identity = root / ".root-id"
+    identity_bytes = identity.read_bytes()
+    identity.write_bytes(b"")
+    ident_read = data(call(reader, "mailbox_read_record", {"message_id": "base"}))
+    cover("mailbox_read_record", "E_AUTH", "identity", ident_read)
+    ident_digest = data(call(reader, "mailbox_digest", {"limit": 1}))
+    cover("mailbox_digest", "E_AUTH", "identity", ident_digest)
+    ident_publish = data(call(writer, "mailbox_publish_record", request("ident-blocked")))
+    cover("mailbox_publish_record", "E_AUTH", "identity", ident_publish)
+    identity.write_bytes(identity_bytes)
+    identity.chmod(0o600)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base"}))["from"] == "a/orchestrator"
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+    assert "id" in data(call(writer, "mailbox_publish_record", request("ident-ok")))
+
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 1)
+    hist_read = data(call(reader, "mailbox_read_record", {"message_id": "base"}))
+    cover("mailbox_read_record", "E_LIMIT", "history", hist_read)
+    hist_digest = data(call(reader, "mailbox_digest", {"limit": 1}))
+    cover("mailbox_digest", "E_LIMIT", "history", hist_digest)
+    hist_publish = data(call(writer, "mailbox_publish_record", request("hist-blocked")))
+    cover("mailbox_publish_record", "E_LIMIT", "history", hist_publish)
+    assert "reduce limit" not in json.dumps(hist_digest)
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 10000)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))["data"]["body"]
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"][0]["message_id"]
+    assert "id" in data(call(writer, "mailbox_publish_record", request("hist-ok")))
+
+    history_capacity = len(writer.checked_mailbox().messages())
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", history_capacity)
+    full_history = data(call(writer, "mailbox_publish_record", request("hist-capacity")))
+    cover("mailbox_publish_record", "E_LIMIT", "history", full_history)
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 10000)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("hist-capacity")))
+
+    original_messages = mailbox_module.Mailbox.messages
+
+    def blocked_messages(self):
+        raise AssertionError("binding history reached mailbox messages")
+
+    monkeypatch.setattr(mailbox_module.Mailbox, "messages", blocked_messages)
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 0)
+    binding_read = data(call(reader, "mailbox_read_record", {"message_id": "base"}))
+    cover("mailbox_read_record", "E_LIMIT", "history", binding_read)
+    assert "reduce limit" not in json.dumps(binding_read)
+    binding_digest = data(call(reader, "mailbox_digest", {"limit": 1}))
+    cover("mailbox_digest", "E_LIMIT", "history", binding_digest)
+    binding_publish = data(call(writer, "mailbox_publish_record", request("bind-hist")))
+    cover("mailbox_publish_record", "E_LIMIT", "history", binding_publish)
+    monkeypatch.setattr(mailbox_module.Mailbox, "messages", original_messages)
+    monkeypatch.setattr(mailbox_module, "MAX_RECORDS", 10000)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))["data"]["body"]
+    assert data(call(reader, "mailbox_digest", {"limit": 1}))["messages"]
+    assert "id" in data(call(writer, "mailbox_publish_record", request("bind-ok")))
+
+    maximum = records.MAX_CHARS
+    monkeypatch.setattr(records, "MAX_CHARS", 10)
+    wide = data(call(writer, "mailbox_publish_record", request("too-wide")))
+    cover("mailbox_publish_record", "E_LIMIT", "", wide)
+    assert "too-wide" not in writer.checked_mailbox().messages()
+    monkeypatch.setattr(records, "MAX_CHARS", maximum)
+    assert "id" in data(call(writer, "mailbox_publish_record", request("too-wide")))
+
+    source_id = data(call(writer, "mailbox_publish_record", request("grant-source", to="a/front-door")))["id"]
+    grant_path = root.parent / "mailbox-records" / (".grants-" + source_id)
+    grant_bytes = grant_path.read_bytes()
+    envelope = codec.parse(grant_bytes)
+    entry = envelope["fields"]["value"]
+    owner = next(row for row in entry["grants"] if row["endpoint"] == "a/orchestrator")
+    entry["grants"] = [owner] + [{"root": owner["root"], "endpoint": "a/lane/slot-" + str(n)} for n in range(1023)]
+    grant_path.write_bytes(codec.canonical(envelope))
+    delegated = request("too-many", content=json.dumps({"fields": {}, "body": "delegate", "refs": {"source": source_id}}))
+    grants = data(call(writer, "mailbox_publish_record", delegated))
+    cover("mailbox_publish_record", "E_LIMIT", "grants", grants)
+    grant_path.write_bytes(grant_bytes)
+    assert "id" in data(call(writer, "mailbox_publish_record", delegated))
+
+    lock_path = root.parent / "mailbox-records" / ".publish.lock"
+    store_lock = root.parent / ".records-store.lock"
+    lock_path.write_bytes(b"held")
+    store_lock.write_bytes(b"held")
+    lock_path.chmod(0o600)
+    store_lock.chmod(0o600)
+    # The store lease is acquired before the publish lease. Both reservations
+    # are already held, so the first deadline check is the refusal.
+    clock = {"n": 0}
+
+    def monotonic():
+        clock["n"] += 1
+        return 0 if clock["n"] == 1 else 6
+
+    original_time = records.time
+    monkeypatch.setattr(records, "time", SimpleNamespace(monotonic=monotonic, sleep=lambda _seconds: None))
+    locked = data(call(writer, "mailbox_publish_record", request("locked")))
+    cover("mailbox_publish_record", "E_AUTH", "lock", locked)
+    monkeypatch.setattr(records, "time", original_time)
+    lock_path.unlink()
+    store_lock.unlink()
+    assert "id" in data(call(writer, "mailbox_publish_record", request("unlocked")))
+
+    prior = data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"]}))
+    last = prior["messages"][-1]["message_id"]
+    _ordinary(writer, "broken-stub", "aegis-record/1 broken")
+    broken_read = data(call(reader, "mailbox_read_record", {"message_id": "broken-stub"}))
+    cover("mailbox_read_record", "E_FORMAT", "", broken_read)
+    assert "broken" not in json.dumps(broken_read)
+    assert data(call(reader, "mailbox_read_record", {"message_id": "base", "fields": ["body"]}))["data"]["body"]
+    broken_digest = data(call(reader, "mailbox_digest", {"after_message_id": last, "limit": 1}))
+    cover("mailbox_digest", "E_FORMAT", "", broken_digest)
+    assert "broken" not in json.dumps(broken_digest)
+    still_broken = data(call(reader, "mailbox_digest", {"after_message_id": last, "limit": 1,
+                                                       "max_chars": records.MAX_CHARS}))
+    assert still_broken == codec.CodecError("E_FORMAT").as_dict()
+    assert data(call(reader, "mailbox_read_record", {"message_id": "kind-ok"}))["from"] == "a/orchestrator"
+
+    # Aggregate overflow keeps the rows already accepted. A minimum record view
+    # names a larger max_chars. A later ordinary body is a page, not an inbox row.
+    # broken-stub is the last received row; a full-page digest no longer fits.
+    cursor = "broken-stub"
+    _ordinary(writer, "m1", "alpha")
+    assert "id" in data(call(writer, "mailbox_publish_record", request("m2", content=json.dumps({
+        "fields": {}, "body": "note", "refs": {}}))))
+    aggregate = data(call(reader, "mailbox_digest", {"limit": 2, "fields": ["body"], "max_chars": 220,
+                                                    "after_message_id": cursor}))
+    cover("mailbox_digest", "E_LIMIT", "digest_page", aggregate)
+    assert "after_message_id" in aggregate["error"]["next_action"]
+    first_row = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"], "max_chars": 220,
+                                                    "after_message_id": cursor}))
+    assert [row["message_id"] for row in first_row["messages"]] == ["m1"]
+    assert first_row["messages"][0]["body"] == "alpha"
+    minimum = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"], "max_chars": 80,
+                                                  "after_message_id": "m1"}))
+    cover("mailbox_digest", "E_LIMIT", "digest_view_minimum", minimum)
+    _follow_measured_retry(reader, minimum,
+                           {"limit": 1, "fields": ["body"], "max_chars": 80, "after_message_id": "m1"},
+                           message_id="m2")
+    outlined = data(call(reader, "mailbox_digest", {"limit": 1, "outline": True, "max_chars": 80,
+                                                   "after_message_id": "m1"}))
+    assert outlined["error"]["code"] == "E_LIMIT"
+    read_minimum = data(call(reader, "mailbox_read_record", {"message_id": "m2", "fields": ["body"],
+                                                            "max_chars": 80}))
+    assert read_minimum == codec.CodecError("E_LIMIT").as_dict()
+    assert "next_action" not in read_minimum["error"]
+    widened = data(call(reader, "mailbox_digest", {"limit": 1, "fields": ["body"],
+                                                  "max_chars": records.MAX_CHARS, "after_message_id": "m1"}))
+    assert widened["messages"][0]["message_id"] == "m2"
+    assert widened["messages"][0]["record"]["data"]["body"] == "note"
+    assert "id" in data(call(writer, "mailbox_publish_record", request("fit-rec", content=json.dumps({
+        "fields": {}, "body": "note", "refs": {}}))))
+    _ordinary(writer, "huge-ordinary", "h" * 61000)
+    later_body = data(call(reader, "mailbox_digest", {"limit": 2, "after_message_id": "m2"}))
+    cover("mailbox_digest", "E_LIMIT", "digest_page", later_body)
+    assert "h" * 8 not in json.dumps(later_body)
+    reduced = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "m2"}))
+    assert reduced["messages"][0]["message_id"] == "fit-rec"
+    assert reduced["messages"][0]["record"]["data"]["body"] == "note"
+    huge_alone = data(call(reader, "mailbox_digest", {"limit": 1, "after_message_id": "fit-rec"}))
+    cover("mailbox_digest", "E_LIMIT", "digest_inbox", huge_alone)
+    inbox_huge = data(call(reader, "mailbox_inbox", {"limit": 100}))
+    assert next(row["message"]["body"] for row in inbox_huge["messages"]
+                if row["message"]["message_id"] == "huge-ordinary") == "h" * 61000
+
+    missing_pairs = {(tool, code, detail)
+                     for tool, pairs in required.items()
+                     for code, detail in pairs
+                     if (tool, code, detail) not in covered}
+    assert missing_pairs == set(), sorted(missing_pairs)
+    missing_history = {(tool, message) for tool, messages in history_messages.items()
+                       for message in messages} - covered_history
+    assert missing_history == set(), sorted(missing_history)
