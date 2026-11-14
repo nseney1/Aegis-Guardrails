@@ -43,6 +43,11 @@ determine), ``checks_ok`` (no blocking check failed; it says nothing about the h
 ``human_gate`` (the tier, the evidence it rests on and why it is not higher), ``state_modes``
 (how many entries of the shared state are looser than 0700/0600; a count, never names),
 ``findings``, and with ``--fix`` the ``fixes`` it applied and its ``backup_dir``.
+The same document carries ``git_hygiene`` (schema ``aegis.doctor.git/v1``): approval modes,
+signer presence where a signature mode exists, ``gc.worktreePruneExpire``, the prunable
+worktree count, and scratch and disk budget. Those rows are advisory and do not change
+the exit code. Doctor does not delete, prune, gc or rewrite refs, and every row names
+the owner action.
 
 The trust tier (``aegis_core.human_gate``, v4.3 §2.2) is printed on every full report: A,
 separation of duties; B, solo with signed approvals; C, self-attested; ``--drivers`` and
@@ -115,6 +120,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from aegis_cli import doctor_base as _base
 from aegis_cli import doctor_findings as _findings
 from aegis_cli import doctor_render as _render
+from aegis_cli import doctor_git
 from aegis_cli import doctor_repair as _repair
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.formatters.text import render_release
@@ -832,7 +838,7 @@ def run_doctor(args: argparse.Namespace) -> int:
                     declined = True
                     print("No changes made.")
 
-    payload = _render._payload(diag, checks)
+    payload = doctor_git.with_report(_render._payload(diag, checks), root, ui, use_json)
     failed = payload["summary"]["failed"] > 0 or declined or any(r["status"] != "applied" for r in results)
     if use_json:
         if fix:

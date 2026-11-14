@@ -25,6 +25,7 @@ __all__ = [
     "fingerprint",
     "aegis_import_root",
     "is_within",
+    "json_preflight",
     "key_within",
     "normalize_text",
     "occurrence_index",
@@ -143,6 +144,108 @@ def strict_loads(text: Union[str, bytes]) -> Any:
     (``duplicate key 'k'``, ``NaN is not allowed``): readers echo them in their refusals.
     RecursionError passes through."""
     return json.loads(text, object_pairs_hook=_unique_object, parse_constant=_no_constant, parse_float=_finite)
+
+
+def _json_text(raw: Union[str, bytes], max_bytes: int) -> str:
+    if type(raw) not in (str, bytes):
+        raise ValueError("invalid")
+    if len(raw) > max_bytes:
+        raise ValueError("size")
+    if type(raw) is bytes:
+        # Strict UTF-8 has one canonical encoding: the checked raw length is
+        # already the UTF-8 byte count. Do not encode or recount decoded bytes.
+        try:
+            return raw.decode("utf-8")
+        except UnicodeError:
+            raise ValueError("invalid") from None
+    size = 0
+    for char in raw:
+        code = ord(char)
+        if 0xD800 <= code <= 0xDFFF:
+            raise ValueError("invalid")
+        size += 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
+        if size > max_bytes:
+            raise ValueError("size")
+    return raw
+
+
+def json_preflight(raw: Union[str, bytes], *, max_bytes: int, max_depth: int,
+                   max_nodes: int, max_items: int, max_string: int,
+                   string_units: str = "escaped", max_atom: Optional[int] = None) -> str:
+    """Bound JSON before parsing; return text, without allocating a JSON tree.
+
+    ValueError reasons are fixed: invalid, size, nesting, nodes, container,
+    string, atom. Syntax remains the parser's responsibility. ``escaped``
+    counts each escape as one string unit; ``source`` counts every source
+    character after the opening quote, including the closing quote. These
+    retain the profile and queue lexical policies, including malformed input.
+    """
+    text = _json_text(raw, max_bytes)
+    if string_units not in ("escaped", "source"):
+        raise ValueError("invalid")
+    depth, nodes, chars, unicode_left, atom_chars = 0, 0, 0, 0, 0
+    quoted, escaped, atom = False, False, False
+    containers = []  # [entry count, awaiting first token of the next entry]
+    for char in text:
+        if not quoted and containers and containers[-1][1] and char not in " \t\r\n]}":
+            containers[-1][0] += 1
+            containers[-1][1] = False
+            if containers[-1][0] > max_items:
+                raise ValueError("container")
+        if quoted:
+            if string_units == "source":
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+                chars += 1
+            elif unicode_left:
+                unicode_left -= 1
+            elif escaped:
+                escaped = False
+                if char == "u":
+                    unicode_left = 4
+            elif char == "\\":
+                escaped = True
+                chars += 1
+            elif char == '"':
+                quoted = False
+            else:
+                chars += 1
+            if chars > max_string:
+                raise ValueError("string")
+        elif char == '"':
+            quoted, atom, chars = True, False, 0
+            nodes += 1
+        elif char in "[{":
+            nodes += 1
+            atom = False
+            depth += 1
+            if depth > max_depth:
+                raise ValueError("nesting")
+            containers.append([0, True])
+        elif char in "]}":
+            depth -= 1
+            atom = False
+            if containers:
+                containers.pop()
+        elif char in " \t\r\n,:":
+            atom = False
+            if char == "," and containers:
+                containers[-1][1] = True
+        elif not atom:
+            nodes += 1
+            atom = True
+            atom_chars = 1
+        else:
+            atom_chars += 1
+            if max_atom is not None and atom_chars > max_atom:
+                raise ValueError("atom")
+        if nodes > max_nodes:
+            raise ValueError("nodes")
+    return text
 
 
 # ── Finding identity (the baseline fingerprint) ──────────────────────────────
