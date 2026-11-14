@@ -21,6 +21,44 @@ def supervisor():
     return team_supervisor
 
 
+@pytest.mark.parametrize("defect,reason,path", [
+    ("native_type", "wrong type: supervisor", "supervisor"),
+    ("required_first", "invalid value: supervisor", "supervisor"),
+    ("array_limit", "profile array size limit exceeded: supervisor.pauses", "supervisor.pauses"),
+    ("unknown_key", "unknown key: supervisor.components.extra", "supervisor.components.extra"),
+])
+def test_schema_extraction_supervisor_public_refusals(tmp_path, defect, reason, path):
+    root = make_store(tmp_path)
+    _config(root)
+    loaded = profile.resolve()
+    body = loaded["profile"]["supervisor"]
+    required = copy.deepcopy(body)
+    if defect == "native_type":
+        body = None
+        loaded["profile"]["supervisor"] = body
+    elif defect == "required_first":
+        del body["components"]
+        body["pauses"] = ["bad"]
+    elif defect == "array_limit":
+        body["pauses"] = ["owner"] * (len(team_supervisor.PAUSES) + 1)
+    else:
+        body["components"]["extra"] = {}
+    before = copy.deepcopy(loaded)
+    for _ in range(2):
+        with pytest.raises(team_supervisor.SupervisorError) as refused:
+            team_supervisor.validate_input(body, team_supervisor.SUPERVISOR_SCHEMA,
+                                           "supervisor", "repo", required=required)
+        assert (str(refused.value), refused.value.layer, refused.value.path) == (reason, "repo", path)
+        assert team_supervisor.plan(loaded["profile"], team_supervisor.empty_state(), [], 0) == {
+            "status": "refused", "reason": "invalid value: supervisor", "layer": "repo",
+            "starts_nothing": True, "start": []}
+        health = team_supervisor.report(lambda *args, **kwargs: loaded, root, 0, user_root=root)
+        assert (health["profile"], health["reason"], health["layer"], health["path"]) == (
+            "refused", "invalid value: supervisor", "repo", None)
+        assert health["start"] == [] and "components" not in health and "observations" not in health
+        assert loaded == before
+
+
 def make_store(root):
     if not supervisor().descriptor_supported():
         pytest.skip("requires descriptor-relative nofollow operations")
