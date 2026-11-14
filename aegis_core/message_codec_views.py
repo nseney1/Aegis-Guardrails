@@ -164,6 +164,15 @@ class Renderer:
     def json_size(self, value, limit=None):
         return self._measure(self._json(value), self.limit if limit is None else limit)[0]
 
+    def json_array_extra(self, value, populated, limit=None):
+        # Brackets stay in the envelope. The renderer emits no spaces, so each
+        # later element adds one comma. The element is measured against the full
+        # maximum; the caller enforces the aggregate, including that comma.
+        extra = self.json_size(value, limit)
+        if populated:
+            extra += 1
+        return extra
+
     def _columns(self, value, remaining):
         columns, cost = set(), 0
         for row in value:
