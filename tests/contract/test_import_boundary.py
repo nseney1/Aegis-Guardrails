@@ -72,6 +72,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
     "aegis_core.primitives": 0,
+    "aegis_core.proposals": 2,
     # The one secret-redaction table and its entry points (stdlib only).
     "aegis_core.redaction": 0,
     "aegis_core.config": 0,
