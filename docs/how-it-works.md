@@ -196,6 +196,10 @@ Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-
 
 The owner can register a separate queue connection with an isolated interpreter command
 (`python -I -c 'from aegis_mcp.queue_owner import main; raise SystemExit(main())' ID`).
+Launch needs exactly one registration id. Anything else exits 2 and prints one fixed line,
+`aegis-mcp-queue: invalid_arguments: Launch with exactly one registration id.`
+That sentence is launch usage. A claim's `invalid_arguments` sentence (id, expect and lane) is a different
+recovery and is not printed here. The process does not print the supplied arguments or an exception.
 It exposes only `aegis_team_queue` and `aegis_team_queue_claim`; the ordinary connection's tool list is unchanged.
 Claim accepts exactly `id`, `expect` (the queue revision), and `lane`. Only an owner-bound `orchestrator` may
 claim an admitted lane. Its capability labels, branch and claim TTL come from the pinned registration;
@@ -220,7 +224,18 @@ database, never HOME, USERPROFILE or XDG configuration. The exact registration s
 }
 ```
 
-Both TTLs are integers from 1 through 86400 seconds. The launch entry writes a create-only session record
+Both TTLs are integers from 1 through 86400 seconds. `workspace` is a POSIX absolute path in the
+filesystem encoding, at most 4096 encoded bytes, with no `..` component and no C0, DEL or C1 control.
+Unicode is accepted, including characters outside ASCII. Launch uses the same `valid_workspace_spelling`
+check as the core queue, before a session is issued: at most 256 slash, backslash or colon separators,
+and no `..` component after a split on those separators. A backslash or colon does not hide `..`.
+A workspace the core rejects is `role_invalid` and is not echoed. Launch does not create a session or
+`.aegis/state` for it, so list and claim never see a half-created workspace. A lone surrogate, a
+relative path, a path over that byte bound, or a control is the same refusal. The length bound is
+applied before the path is encoded or parsed. `endpoint` and the role id stay printable ASCII; lane
+names keep the queue lane grammar. Identity is the directory's device and inode from a descriptor walk
+that does not follow symlinks, so a later rename or symlink at the same spelling does not retarget the pin.
+The launch entry writes a create-only session record
 for its Linux boot ID, PID and process start ticks, pins the registration digest and a new MCP session UUID,
 and enters the server in that same process. The server independently binds this record before requests.
 Reads walk descriptors without following symlinks, refuse files above 64 KiB before parsing, and enforce
@@ -241,7 +256,16 @@ Records are retained as owner evidence; remove expired records only under the au
 bound process has ended. No automatic directory scan or historical-record garbage collection occurs.
 
 New fixed refusal reasons are `role_missing`, `role_invalid`, `role_foreign`, `role_stale`, `role_forbidden`,
-`role_lock_timeout`, `role_io_unavailable`, and `unsupported_platform`. Malformed client arguments return
+`role_lock_timeout`, `role_io_unavailable`, and `unsupported_platform`. Launch refuses with exactly the
+codes session issuance can raise. `invalid_arguments` exits 2 with the usage sentence above. Launch exits
+1 and prints `aegis-mcp-queue: <code>: <one fixed sentence>` for `role_missing`, `role_invalid`,
+`role_stale`, `role_lock_timeout`, `role_io_unavailable` and `unsupported_platform`. `role_lock_timeout`
+means wait for the authority writer, then restart the queue connection. `role_stale` means retry the
+launch. The other launch sentences are that code's usual recovery text. A claim keeps its own
+`role_stale` sentence (restart with a fresh session record) and `role_lock_timeout` sentence (list the
+queue and retry the current revision); those claim sentences are not printed at launch. An unexpected
+launch error uses `role_io_unavailable` and that code's fixed sentence, never the exception or the path.
+Malformed client arguments return
 `invalid_arguments` before any binding or authority IO. Workspace/dispatch failures return
 `queue_io_unavailable`; core queue refusal reasons remain intact. Refusals use the queue claim envelope,
 `isError: true`, and exit code 2 for malformed arguments or 1 otherwise, without echoing input or OS errors.
