@@ -126,6 +126,43 @@ def checked_path(path):
     return Path(path)
 
 
+def _validate_captured_recipes(raw, *, admitted_hash_matches=True):
+    """Keep path guards in the validator's order without duplicating its schema checks."""
+    try:
+        declarations = strict_json(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return jobs.validate_recipes(raw)
+    if not isinstance(declarations, dict):
+        return jobs.validate_recipes(raw)
+    # Source order: tools/hierarchy_jobs.py:278-317 (validate_recipes): header,
+    # hide, ro_binds, then prefix/env/recipes/identity. Neutralize later checks
+    # so the public validator establishes each stage before any next path guard.
+    staged = {key: value for key, value in declarations.items()
+              if key not in {"hide", "ro_binds", "prefix", "env", "identity"}}
+    if "recipes" in staged:
+        staged["recipes"] = {"preflight": {"kind": "command", "timeout_seconds": 1, "sandbox": "none",
+                                           "heavy": False, "steps": [["$python", "-c", "pass"]]}}
+    jobs.validate_recipes(staged)
+    for label in ("hide", "ro_binds"):
+        folders = declarations.get(label, [])
+        jobs.strings(folders, label)
+        staged[label] = []
+        for folder in folders:
+            if Path(folder).is_absolute():
+                checked_path(folder)
+            # A successful stage establishes only this entry. Keep earlier
+            # entries out of later stages so metadata work stays linear.
+            staged[label] = [folder]
+            jobs.validate_recipes(staged)
+        staged[label] = []
+    if not admitted_hash_matches:
+        # Earlier folder refusals keep their precedence. Check the remaining
+        # lexical rules without another filesystem pass before refusing drift.
+        jobs.validate_recipes({key: value for key, value in declarations.items() if key not in {"hide", "ro_binds"}})
+        raise Hold("small_change_recipe_mismatch", "admitted recipe file changed")
+    return jobs.validate_recipes(raw)
+
+
 def _attachment(mailbox, ref):
     fields(ref, {"path", "sha256"})
     checked_path(ref["path"])
@@ -680,47 +717,18 @@ class Row:
             require(self.reference(ref["path"]) == ref, "evidence reference hash mismatch")
             return ref
 
-    def recipe_file(self):
+    def recipe_file(self, admitted_sha256=None):
         with self.operation.capture():
             path = checked_path(self.recipes)
         if path in self.operation.parsed:
             return self.operation.parsed[path]
         raw = self.operation.read(path)[1]
-        recipes = strict_json(raw.decode("utf-8"))
-        fields(recipes, {"schema", "python", "path", "recipes"}, {"identity", "env", "hide", "ro_binds", "prefix", "min_free_gigabytes"})
-        if "min_free_gigabytes" in recipes:
-            jobs.integer(recipes["min_free_gigabytes"], "min_free_gigabytes", minimum=0)
-        require(recipes["schema"] == jobs.RECIPES_SCHEMA, "unsupported recipes schema")
-        require(isinstance(recipes["python"], str) and Path(recipes["python"]).is_absolute(), "python must be an absolute path")
-        jobs.strings(recipes["path"], "path", nonempty=True)
-        require(all(Path(folder).is_absolute() for folder in recipes["path"]), "path must list absolute folders")
-        for label in ("hide", "ro_binds"):
-            folders = recipes.get(label, [])
-            jobs.strings(folders, label)
-            for folder in folders:
-                checked_path(folder)
-            jobs.existing_folders(folders, label)
-        prefix = recipes.get("prefix", [])
-        jobs.strings(prefix, "prefix")
-        require(not prefix or Path(prefix[0]).is_absolute(), "prefix must start with an absolute command")
-        env = recipes.get("env", {})
-        require(isinstance(env, dict) and all(isinstance(value, str) for value in env.values()), "invalid env")
-        for key, value in env.items():
-            require(re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is not None, "invalid env name: " + key)
-            require("$" not in value or value in jobs.ENV_TOKENS, "unsupported token in env: " + value)
-        table = recipes["recipes"]
-        require(isinstance(table, dict) and table, "recipes must not be empty")
-        for name, recipe in table.items():
-            jobs.validate_recipe(name, recipe)
-        if any(recipe["kind"] in ("commit", "merge") for recipe in table.values()):
-            identity = recipes.get("identity")
-            require(isinstance(identity, dict), "a commit or merge recipe needs an identity")
-            fields(identity, {"name", "email"})
-            jobs.text(identity["name"], "identity name", 256)
-            jobs.text(identity["email"], "identity email", 256)
+        recipes_sha256 = hashlib.sha256(raw).hexdigest()
+        recipes = _validate_captured_recipes(raw, admitted_hash_matches=(
+            admitted_sha256 is None or recipes_sha256 == admitted_sha256))
         # Hashed from the bytes that were parsed, so a result names exactly the recipe file it ran under. The key cannot come
-        # from the file: fields() above refuses it there.
-        recipes["recipes_sha256"] = hashlib.sha256(raw).hexdigest()
+        # from the file: validate_recipes() refuses it there.
+        recipes["recipes_sha256"] = recipes_sha256
         self.operation.parsed[path] = recipes
         ref, _raw, witness = self.operation.files[path]
         self.operation.files[path] = ref, None, witness
@@ -1315,7 +1323,7 @@ class Row:
 
     def configured_recipe(self, admission):
         require(self.recipes is not None, "dispatch requires configured recipes")
-        recipes = self.recipe_file()
+        recipes = self.recipe_file(admission["recipes_sha256"])
         check(recipes["recipes_sha256"] == admission["recipes_sha256"], "small_change_recipe_mismatch", "admitted recipe file changed")
         recipe = recipes["recipes"].get(admission["recipe"])
         check(recipe is not None and recipe["kind"] == "command" and recipe.get("require_clean") is True
