@@ -5,6 +5,7 @@ initiative's mailbox. The router actor and the borrowed `<team>/router` binding 
 authenticated identities. These tests show what the code delivers, records and refuses on fixtures; they
 make no claim about what a real host lets a Router session do.
 """
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -24,6 +25,19 @@ from tests.integration.test_hierarchy_workspace import Workspace
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="durable lifecycle mutation requires POSIX directory fsync")
 TOOL = ROOT / "tools" / "hierarchy_router.py"
 TEAM_ENDPOINTS = ("front-door", "orchestrator", "root", "router")
+
+
+# Share one clock across routing and lifecycle recording in this subprocess.
+# Separate fixture CLI processes and monotonic timeouts keep their real clocks.
+ROUTER_CLOCK = r'''
+import sys
+tools, at = sys.argv[1:3]
+sys.path.insert(0, tools)
+import hierarchy_mailbox as protocol
+protocol.timestamp = lambda: at
+import hierarchy_router as router
+sys.exit(router.main(sys.argv[3:]))
+'''
 
 
 @pytest.mark.parametrize("command", ["status","route"])
@@ -174,8 +188,9 @@ class Loop:
         self.ledger.approve(value)
         return value
 
-    def run(self, command, *args, expect=0):
-        proc = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--lifecycle", str(self.ledger.path),
+    def run(self, command, *args, expect=0, at=None):
+        entry = [str(TOOL)] if at is None else ["-c", ROUTER_CLOCK, str(ROOT / "tools"), at]
+        proc = subprocess.run([sys.executable, "-I", "-B", *entry, "--lifecycle", str(self.ledger.path),
                                "--store", str(self.workspace.store), command, *args],
                               capture_output=True, text=True, timeout=30,
                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
@@ -183,11 +198,11 @@ class Loop:
         assert proc.returncode == expect, proc.stdout
         return json.loads(proc.stdout)
 
-    def route(self, *args, actor="router-1", expect=0):
-        return self.run("route", "--actor", actor, "--evidence-only", "--wait", "0.2", *args, expect=expect)
+    def route(self, *args, actor="router-1", expect=0, at=None, wait="0.2"):
+        return self.run("route", "--actor", actor, "--evidence-only", "--wait", str(wait), *args, expect=expect, at=at)
 
-    def status(self):
-        return {row["request_id"]: row for row in self.run("status")["requests"]}
+    def status(self, *, at=None):
+        return {row["request_id"]: row for row in self.run("status", at=at)["requests"]}
 
     def inbox(self, team, endpoint="orchestrator"):
         return invoke(self.mailboxes[team], "inbox", endpoint=team + "/" + endpoint)["messages"]
@@ -521,17 +536,34 @@ def test_only_approved_live_authority_requests_are_routed(loop):
 
 
 def test_an_expired_approval_is_held(loop):
-    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+    expiry = time.time() + 3600
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry))
+    after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry + 1))
     value = request("feature-1", continuation={"members": [], "max_starts": 1, "expires_at": expires})
     loop.approved(value)
-    time.sleep(2.2)
+    assert loop.status()["feature-1"]["state"] == "ready"
+    journal = loop.ledger.files()
 
-    result = loop.route()
+    for _ in range(2):
+        result = loop.route(at=after)
+        assert "report_error" not in result, result
+        assert result["routed"] == []
+        assert [(row["state"], row.get("reason")) for row in result["requests"]] == [("held", "approval_expired")]
+        row = loop.status(at=after)["feature-1"]
+        assert (row["state"], row["reason"]) == ("held", "approval_expired")
 
-    assert result["routed"] == []
-    row = loop.status()["feature-1"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        route = pool.submit(loop.route, at=after, wait=5)
+        status = pool.submit(loop.status, at=after)
+        result = route.result(timeout=30)
+        assert "report_error" not in result, result
+        assert result["routed"] == []
+        assert [(row["state"], row.get("reason")) for row in result["requests"]] == [("held", "approval_expired")]
+        row = status.result(timeout=30)["feature-1"]
     assert (row["state"], row["reason"]) == ("held", "approval_expired")
     assert loop.inbox("engine") == []
+    assert loop.ledger.files() == journal
+    assert loop.status()["feature-1"]["state"] == "ready"
 
 
 def test_a_deny_after_routing_stays_routed_and_is_reported(loop):
@@ -749,14 +781,34 @@ def test_a_lost_journal_write_then_a_deny_still_shows_the_delivery_and_records_i
 
 
 def test_a_lost_journal_write_on_an_expired_approval_is_still_recorded(loop):
-    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+    expiry = time.time() + 3600
+    expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry))
+    after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry + 1))
     value = loop.approved(request("feature-1", continuation={"members": [], "max_starts": 1, "expires_at": expires}))
+    loop.approved(request("undelivered", continuation={"members": [], "max_starts": 1, "expires_at": expires}))
     deliver_without_recording(loop, value)
-    time.sleep(2.2)
 
-    assert loop.status()["feature-1"]["state"] == "delivered_unrecorded"
-    assert [r["request_id"] for r in loop.route()["routed"]] == ["feature-1"]
+    rows = loop.status(at=after)
+    assert (rows["undelivered"]["state"], rows["undelivered"].get("reason")) == ("held", "approval_expired")
+    assert rows["feature-1"]["state"] == "delivered_unrecorded"
+    result = loop.route(at=after)
+    assert "report_error" not in result, result
+    assert {(row["request_id"], row["state"], row.get("reason")) for row in result["requests"]} == {
+        ("feature-1", "routed", None), ("undelivered", "held", "approval_expired")}
+    recovered = result["routed"]
+    assert [(row["request_id"], row["delivered"]) for row in recovered] == [("feature-1", False)]
     assert loop.row(value)["routed"]["to"] == "engine/orchestrator"
+    assert loop.row(value)["routed"]["at"] == after
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        routes = [pool.submit(loop.route, at=after, wait=5) for _ in range(2)]
+        for route in routes:
+            result = route.result(timeout=30)
+            assert "report_error" not in result, result
+            assert result["routed"] == []
+            assert {(row["request_id"], row["state"], row.get("reason")) for row in result["requests"]} == {
+                ("feature-1", "routed", None), ("undelivered", "held", "approval_expired")}
+    assert loop.status(at=after)["feature-1"]["state"] == "routed"
+    assert len(loop.inbox("engine")) == 1
 
 
 def test_a_router_at_its_active_cap_delivers_nothing(loop):
