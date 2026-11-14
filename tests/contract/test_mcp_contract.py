@@ -16,6 +16,7 @@ import sys
 import aegis_mcp.server as server
 
 SNAPSHOT = Path(__file__).with_name("mcp_tools.json")
+QUEUE_SNAPSHOT = Path(__file__).with_name("mcp_queue_tools.json")
 
 
 def live_tools_list() -> dict:
@@ -31,9 +32,25 @@ def test_tools_list_matches_the_contract_snapshot(monkeypatch):
     assert live_tools_list() == expected
 
 
+def test_queue_tools_list_matches_the_contract_snapshot(monkeypatch):
+    # Exercise the advertised schema of a refused queue connection, granting no
+    # authority and reading no real account-home records (cross-platform).
+    monkeypatch.setattr(server, "_session_id", None)
+    monkeypatch.setattr(server, "_queue_initialized", False)
+    monkeypatch.setattr(server, "_queue_grant", None)
+    monkeypatch.setattr(server, "_queue_registration", "alpha")
+    assert live_tools_list() == json.loads(QUEUE_SNAPSHOT.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--write"]:
-        sys.exit("usage: PYTHONPATH=. python3 tests/contract/test_mcp_contract.py --write")
-    SNAPSHOT.write_text(json.dumps(live_tools_list(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"wrote {SNAPSHOT}")
+    if sys.argv[1:] == ["--write-queue"]:
+        from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS
+
+        QUEUE_SNAPSHOT.write_text(json.dumps({"tools": QUEUE_TOOL_DEFINITIONS}, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {QUEUE_SNAPSHOT}")
+    elif sys.argv[1:] == ["--write"]:
+        SNAPSHOT.write_text(json.dumps(live_tools_list(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"wrote {SNAPSHOT}")
+    else:
+        sys.exit("usage: PYTHONPATH=. python3 tests/contract/test_mcp_contract.py --write|--write-queue")
 
