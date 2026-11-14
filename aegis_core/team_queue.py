@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 
-from aegis_core import events, gitsafe, primitives, storage, team, team_paths, team_profile
+from aegis_core import events, gitsafe, primitives, storage, team, team_claims, team_paths, team_profile
 from aegis_core.atomicio import atomic_write_bytes
 from aegis_core.redaction import redact_command_secrets
 from aegis_core.storage import locked
@@ -25,7 +25,7 @@ from aegis_core.workspace.layout import AEGIS_DIRNAME
 __all__ = [
     "MAX_BYTES", "MAX_ITEMS", "MAX_FIELDS", "MAX_TEXT", "MAX_COMPLETED", "QueueRefusal",
     "descriptor_supported", "valid_workspace_spelling", "parse_item", "list_argument_refusal", "refusal", "add", "list", "claim",
-    "release", "done", "audit", "compact",
+    "release", "unclaim", "done", "audit", "compact",
 ]
 
 MAX_BYTES = 1048576
@@ -61,6 +61,10 @@ _NEXT = {
     "capability_mismatch": "Select an item matching the team's declared capability labels.",
     "capacity_full": "Release or complete live work before claiming another writer slot.",
     "blocked": "Resolve the listed blockers, then list and retry the current revision.",
+    "unclaim_lease_refused": "Inspect the named lease and its release command; reconcile ownership, then retry unclaim with the unchanged queue revision.",
+    "writer_not_stopped": "Stop the lane's writer and queued jobs, verify their liveness in the host layer, then explicitly acknowledge this with --writer-stopped.",
+    "unclaim_event_unavailable": "Ask the coordinator to reconcile the unreadable or oversized events log from trusted evidence before retrying unclaim; its bounded reader accepts at most 16 MiB.",
+    "unclaim_recovery_required": "Use the concrete unclaim retry command and recorded caller in blockers after reconciling changed leases or unreadable events; pending intent remains reserved.",
 }
 
 
@@ -260,7 +264,7 @@ def refusal(reason, *, verb="usage"):
     """Fixed, non-echoing envelope for failures before a service operation runs."""
     if type(reason) is not str or reason not in _NEXT:
         reason = "invalid_arguments"
-    if type(verb) is not str or verb not in ("add", "list", "claim", "release", "done", "audit", "compact", "usage"):
+    if type(verb) is not str or verb not in ("add", "list", "claim", "release", "unclaim", "done", "audit", "compact", "usage"):
         verb = "usage"
     payload = primitives.envelope("aegis team queue " + verb, {}, schema="aegis.team.queue." + verb + "/v1")
     payload.update(refused=True, status="refused", reason=reason, next_action=_NEXT[reason],
@@ -327,7 +331,7 @@ def _decode_state(raw):
     try:
         value = _json(raw, "invalid_queue_state")
         required = {"version", "items", "milestones"}
-        _require(type(value) is dict and required <= value.keys() <= required | {"completed"})
+        _require(type(value) is dict and required <= value.keys() <= required | {"completed", "unclaim"})
         _require(type(value["version"]) is int and value["version"] == 1)
         _strings(value["milestones"])
         _require(type(value["items"]) is dict)
@@ -354,6 +358,7 @@ def _decode_state(raw):
                 _require(row["lane"] is not None and row["expires_at"] is not None)
             elif row["state"] == "queued":
                 _require(row["lane"] is None and row["expires_at"] is None)
+        _require(team_claims.validate_pending(value, _key, _text))
         return value
     except QueueRefusal:
         raise QueueRefusal("invalid_queue_state") from None
@@ -383,9 +388,10 @@ def _serialized_size(value, remaining):
     return size
 
 
-def _publish(root, state):
-    _serialized_size(state, MAX_BYTES)
-    raw = json.dumps(state, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+def _publish(root, state, *, raw=None, before_publish=None):
+    if raw is None:
+        _serialized_size(state, MAX_BYTES)
+        raw = json.dumps(state, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     _require(len(raw) <= MAX_BYTES, "queue_size_limit")
     try:
         _decode_state(raw)
@@ -393,6 +399,8 @@ def _publish(root, state):
         raise QueueRefusal("queue_size_limit") from None
     # Only this fixed owner-managed record is published. No item field supplies
     # a pathname. Concurrent owner-UID rewriting of run controls is out of scope.
+    if before_publish is not None:
+        before_publish()
     atomic_write_bytes(storage.state_dir(root) / "team-queue.json", raw, mode=0o600, follow_links=False)
 
 
@@ -469,16 +477,18 @@ def _branch_evidence(value):
         return False, None
 
 
-def _preflight(item, found, lane, now):
-    """Typed brief declarations are data, never paths to open or execute."""
-    blockers = []
-    scope = team_paths.claim_paths(item["paths"])
+def _claim_constraints(row, state, lanes, found, now, queue_paths, index, blockers=None):
+    """Evaluate item-wide conditions once; typed paths remain inert globs."""
+    item = row["item"]
+    blockers = (_blockers(item, state, lanes, found, now, queue_paths)
+                if blockers is None else array(blockers))
+    scope = queue_paths[item["id"]]
     if any(team_paths.first_match(scope, path) is None for path in item.get("brief_paths", [])):
         blockers.append(_block("brief_outside_scope", "Correct brief_paths to name only files admitted by the item's paths before claiming."))
-    if found.unreadable or any(lease.lane != lane and not lease.expired(now) and
-                              team_paths.overlap(scope, lease.path_set) for lease in found.leases):
-        blockers.append(_block("foreign_lease", "Wait for foreign repository leases to expire or be released; repair unreadable leases, then retry the current revision."))
-    return blockers
+    overlaps = [_block("scope_overlap", "Release the overlapping queue claim before retrying.", item_id=other["item"]["id"])
+                for other in index["live"] if team_paths.overlap(queue_paths[other["item"]["id"]], scope)]
+    covering = {lease.lane for lease in index["leases"] if team_paths.overlap(scope, lease.path_set)}
+    return {"blockers": blockers, "overlaps": overlaps, "covering": covering}
 
 
 def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=None, capabilities=None, ttl_s=3600, branch=None, lanes=None, found=None, root=None, queue_paths=None):
@@ -493,27 +503,7 @@ def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=N
     row = state["items"][identifier]
     _require(row["revision"] == expect, "stale_revision")
     if verb == "claim":
-        _require(row["state"] != "done", "item_done")
-        _require(not _live(row, now), "already_claimed")
-        _require(not any(_live(other, now) and other["lane"] == lane
-                         for other in state["items"].values()), "lane_busy")
-        _require(set(row["item"]["capabilities"]) <= set(capabilities), "capability_mismatch")
-        blockers = _blockers(row["item"], state, lanes, found, now, queue_paths)
-        blockers.extend(_preflight(row["item"], found, lane, now))
-        if lanes and lane not in lanes:
-            blockers.append(_block("coordinator", "Ask the coordinator to configure the requested lane in .aegis/team.json."))
-        for other in state["items"].values():
-            if _live(other, now) and team_paths.overlap(queue_paths[other["item"]["id"]], queue_paths[identifier]):
-                blockers.append(_block("scope_overlap", "Release the overlapping queue claim before retrying.", item_id=other["item"]["id"]))
-        if blockers:
-            raise QueueRefusal("blocked", blockers=blockers)
-        try:
-            limit = team_profile.load(root)["profile"]["run_config"]["limits"]["writers_max"]
-        except team_profile.ProfileError:
-            raise QueueRefusal("profile_unavailable") from None
-        occupied = {other["lane"] for other in state["items"].values() if _live(other, now)}
-        occupied.update(lease.lane for lease in found.leases if not lease.expired(now))
-        _require(not found.unreadable and len(occupied | {lane}) <= limit, "capacity_full")
+        _check_claim(root, state, row, lane, capabilities, lanes, found, now, queue_paths)
         row.update(state="claimed", lane=lane, expires_at=now + ttl_s, branch=branch)
     else:
         _require(row["state"] == "claimed", "not_claimed")
@@ -530,6 +520,73 @@ def _change(state, verb, now, *, item=None, identifier=None, expect=None, lane=N
             row.pop("branch", None)
     row["revision"] = secrets.token_hex(32)
     return row
+
+
+def _claim_policy(root):
+    try:
+        limit = team_profile.load(root)["profile"]["run_config"]["limits"]["writers_max"]
+        return {"valid": True, "writers_max": limit}
+    except team_profile.ProfileError:
+        return {"valid": False}
+
+
+def _claim_index(state, found, now):
+    live = tuple(row for row in state["items"].values() if _live(row, now))
+    leases = tuple(lease for lease in found.leases if not lease.expired(now))
+    busy = {row["lane"] for row in live}
+    return {"live": live, "leases": leases, "busy": busy,
+            "occupied": busy | {lease.lane for lease in leases}}
+
+
+def _foreign_lease(covering, lane, found):
+    return bool(found.unreadable) or len(covering) > 1 or (bool(covering) and lane not in covering)
+
+
+def _capacity(index, lane, policy):
+    return len(index["occupied"]) + (lane not in index["occupied"]) <= policy["writers_max"]
+
+
+def _check_claim(root, state, row, lane, capabilities, lanes, found, now, queue_paths):
+    """Claims and fingerprints share item constraints and lane predicates."""
+    _require(row["state"] != "done", "item_done")
+    _require(not _live(row, now), "already_claimed")
+    index = _claim_index(state, found, now)
+    _require(lane not in index["busy"], "lane_busy")
+    _require(set(row["item"]["capabilities"]) <= set(capabilities), "capability_mismatch")
+    constraints = _claim_constraints(row, state, lanes, found, now, queue_paths, index)
+    blockers = constraints["blockers"]
+    if _foreign_lease(constraints["covering"], lane, found):
+        blockers.append(_block("foreign_lease", "Wait for foreign repository leases to expire or be released; repair unreadable leases, then retry the current revision."))
+    if lanes and lane not in lanes:
+        blockers.append(_block("coordinator", "Ask the coordinator to configure the requested lane in .aegis/team.json."))
+    blockers.extend(constraints["overlaps"])
+    if blockers:
+        raise QueueRefusal("blocked", blockers=blockers)
+    policy = _claim_policy(root)
+    _require(policy["valid"], "profile_unavailable")
+    _require(not found.unreadable and _capacity(index, lane, policy), "capacity_full")
+
+
+def _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked, item_blockers):
+    result = []
+    if not leases_checked or not policy["valid"]:
+        return result
+    index = _claim_index(state, found, moment)
+    lane_names = sorted(lanes or {})
+    for identifier, row in sorted(state["items"].items()):
+        if row["state"] == "done" or _live(row, moment):
+            continue
+        constraints = _claim_constraints(row, state, lanes, found, moment, queue_paths, index,
+                                         item_blockers[identifier])
+        if constraints["blockers"] or constraints["overlaps"] or found.unreadable:
+            continue
+        for lane in lane_names:
+            if (lane in index["busy"] or _foreign_lease(constraints["covering"], lane, found)
+                    or not _capacity(index, lane, policy)):
+                continue
+            result.append([identifier, row["revision"]])
+            break
+    return result
 
 
 def _lanes(root):
@@ -633,15 +690,17 @@ def _lease_findings(state, found, moment):
     return findings
 
 
-def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done):
-    rows, findings = [], []
+def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked):
+    rows, findings, item_blockers = [], [], {}
     for identifier in sorted(state["items"]):
         row = state["items"][identifier]
+        blockers = (_blockers(row["item"], state, lanes, found, moment, queue_paths,
+                             leases_checked=leases_checked) if row["state"] != "done" else [])
+        item_blockers[identifier] = blockers
         if row["state"] == "done" and not include_done:
             continue
         if capabilities is not None and not set(row["item"]["capabilities"]) <= set(capabilities):
             continue
-        blockers = _blockers(row["item"], state, lanes, found, moment, queue_paths) if row["state"] != "done" else []
         rows.append(_view(row, moment, blockers))
         if row["state"] == "done" or _live(row, moment):
             continue
@@ -655,7 +714,29 @@ def _observe(root, state, verb, moment, lanes, found, queue_paths, capabilities,
         result["completed_ids"] = sorted(state["completed"])
     if verb == "audit":
         result["findings"] = findings + _lease_findings(state, found, moment)
+    if verb == "list":
+        policy = _claim_policy(root)
+        claimable = _claimable(state, lanes, found, moment, queue_paths, policy, leases_checked, item_blockers)
+        result["claimable_fingerprint"] = team_claims.fingerprint(
+            state, found, moment, claimable, dict(lanes) if lanes is not None else None, policy, leases_checked)
     return result
+
+
+def _unclaim(root, state, moment, caller, arguments):
+    original = _read(root, (AEGIS_DIRNAME, "state", "team-queue.json"))
+    def restore():
+        _publish(root, state, raw=original)
+    try:
+        result = team_claims.transition(root, state, now=moment, caller=caller,
+                                       publish=_publish, restore=restore, shown=_shown, decode=_json, **arguments)
+    except team_claims.ClaimRefusal as error:
+        raise QueueRefusal(error.reason, blockers=error.blockers) from None
+    row = result.pop("row")
+    final = result.pop("state")
+    queue_paths = {key: team_paths.claim_paths(value["item"]["paths"]) for key, value in final["items"].items()}
+    blockers = _blockers(row["item"], final, None, team.LeaseSet((), ()), moment, queue_paths,
+                         config_checked=False, leases_checked=False)
+    return {**result, "item": _view(row, moment, blockers)}
 
 
 def _run(root, verb, now=None, caller=None, **arguments):
@@ -671,7 +752,7 @@ def _run(root, verb, now=None, caller=None, **arguments):
         _require(type(include_done) is bool, "invalid_arguments")
         if verb == "add":
             arguments["item"] = _item(arguments["item"])
-        if verb in ("claim", "release", "done"):
+        if verb in ("claim", "release", "unclaim", "done"):
             _require(_key(arguments.get("identifier")), "invalid_arguments")
             expected = arguments.get("expect")
             _require(type(expected) is str and len(expected) == 64 and _REVISION.fullmatch(expected) is not None, "invalid_arguments")
@@ -682,9 +763,13 @@ def _run(root, verb, now=None, caller=None, **arguments):
                 _strings(capabilities)
             except QueueRefusal:
                 raise QueueRefusal("invalid_arguments") from None
-        if verb in ("claim", "release", "done"):
+        if verb in ("claim", "release", "unclaim", "done"):
             lane = arguments.get("lane")
-            _require((lane is None and verb != "claim") or _lane(lane), "invalid_arguments")
+            _require((lane is None and verb not in ("claim", "unclaim")) or _lane(lane), "invalid_arguments")
+        if verb == "unclaim":
+            _require(type(arguments.get("writer_stopped")) is bool, "invalid_arguments")
+            _require(arguments["writer_stopped"], "writer_not_stopped")
+            arguments["reason"] = _text(arguments.get("reason", ""), empty=True)
         if verb == "claim":
             lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
             _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
@@ -695,12 +780,17 @@ def _run(root, verb, now=None, caller=None, **arguments):
         write = verb not in ("list", "audit")
         if write:
             try:
-                caller = _text(team.default_owner() if caller is None else caller, 256)
+                caller = _text(team.default_owner() if caller is None else caller, 200 if verb == "unclaim" else 256)
             except QueueRefusal:
                 raise QueueRefusal("invalid_arguments") from None
         root = _root(root)
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
+            if "unclaim" in state and verb != "unclaim":
+                raise team_claims.recovery_refusal(state["unclaim"])
+            if verb == "unclaim":
+                payload.update(_unclaim(root, state, moment, caller, arguments))
+                return _shown(payload)
             if verb == "compact":
                 payload.update(_compact(root, state, caller))
                 return _shown(payload)
@@ -709,14 +799,15 @@ def _run(root, verb, now=None, caller=None, **arguments):
             queue_paths = {key: team_paths.claim_paths(row["item"]["paths"])
                            for key, row in state["items"].items()}
             lanes = _lanes(root) if verb in ("claim", "list", "audit") else None
-            needs_leases = verb in ("claim", "audit") or (verb == "list" and any(condition["kind"] == "lease_free"
-                for row in state["items"].values() for condition in row["item"].get("hold_until", [])))
-            found = team.read_leases(root) if needs_leases else team.LeaseSet((), ())
+            leases_checked = verb in ("claim", "audit")
+            found = team.read_leases(root) if leases_checked else team.LeaseSet((), ())
+            if verb == "list":
+                found, leases_checked = team_claims.observe_leases(root)
             if write:
                 payload.update(_mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments))
             else:
-                payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done))
-    except QueueRefusal as error:
+                payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked))
+    except (QueueRefusal, team_claims.ClaimRefusal) as error:
         payload.update(refused=True, status="refused", reason=error.reason, next_action=_NEXT[error.reason],
                        exit_code=2 if error.reason in ("invalid_item", "invalid_arguments", "credential_like_text", "brief_outside_scope") else 1)
         if error.blockers is not None:
@@ -757,6 +848,11 @@ def claim(root, identifier, *, expect, lane, capabilities=(), ttl_s=3600, branch
 
 def release(root, identifier, *, expect, lane=None, now=None, caller=None):
     return _run(root, "release", now, caller=caller, identifier=identifier, expect=expect, lane=lane)
+
+
+def unclaim(root, identifier, *, expect, lane, reason="", writer_stopped=False, now=None, caller=None):
+    return _run(root, "unclaim", now, caller=caller, identifier=identifier, expect=expect, lane=lane,
+                reason=reason, writer_stopped=writer_stopped)
 
 
 def done(root, identifier, *, expect, lane=None, now=None, caller=None):
