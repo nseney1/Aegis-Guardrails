@@ -262,6 +262,13 @@ def test_oversized_config_refuses_init_with_bounded_allocation(project, capsys, 
     import tracemalloc
     from aegis_core.config import MAX_CONFIG_BYTES
 
+    # Exclude lazy CLI imports without initializing the measured project.
+    warmup = project.parent / "warmup"
+    warmup.mkdir()
+    assert main(["init", "--workspace", str(warmup), "--json", "--no-hooks", "--yes", "--host", "codex-cli"]) == 0
+    capsys.readouterr()
+    assert list(project.iterdir()) == []
+
     config = project / ".aegis/config.json"
     config.parent.mkdir()
     with config.open("wb") as stream:
