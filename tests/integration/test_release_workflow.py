@@ -113,6 +113,24 @@ def test_wheel_smoke_expected_tools_match_the_shipped_registry():
     assert expectations == [tuple(sorted(tool["name"] for tool in TOOL_DEFINITIONS))]
 
 
+def test_wheel_smoke_queue_registry_and_modules(wheel_smoke):
+    from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS
+
+    assert wheel_smoke.EXPECTED_QUEUE_MCP_TOOLS == tuple(sorted(t["name"] for t in QUEUE_TOOL_DEFINITIONS))
+    wheel_smoke.check_queue_tools(QUEUE_TOOL_DEFINITIONS)
+    assert {"aegis_mcp.queue_role", "aegis_mcp.queue_owner"} <= set(wheel_smoke.EXPECTED_MODULES)
+
+
+@pytest.mark.parametrize("tools", [None, [], [{"name": "token=private-value"}]])
+def test_wheel_smoke_queue_registry_refuses_fixed(wheel_smoke, tools, capsys):
+    with pytest.raises(SystemExit) as exc:
+        wheel_smoke.check_queue_tools(tools)
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "queue MCP tools mismatch" in output.err
+    assert "private-value" not in output.err + output.out
+
+
 @pytest.fixture
 def wheel_smoke():
     spec = importlib.util.spec_from_file_location("wheel_smoke", SMOKE)

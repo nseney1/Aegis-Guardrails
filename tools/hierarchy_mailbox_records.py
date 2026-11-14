@@ -459,25 +459,29 @@ def _grant_entry(codec, store, rid):
 
 class _RecordAccess:
     """The grant index is authority; mailbox bodies are only locators, never grants."""
-    def __init__(self, codec, store, root, sender):
+    def __init__(self, codec, store, root, sender, *, rollback=False):
         self.codec, self.store, self.endpoint = codec, store, sender["from"]
         self.original_read, self.cache = store.read, {}
         self.io = codec.Budget(codec.MAX_REF_BYTES)
         self.root = _root_identity(codec, root)
-        self.entries = {}
-        self.activations = {}
+        # Read paths keep the authorization fact. Publication keeps entry and raw bytes.
+        self.rollback, self.facts, self.entries, self.activations = rollback, {}, {}, {}
         # Per-instance bindings preserve the core's exact Store type contract.
         store.read, store.describe = self.read, self.describe
 
     def authorize(self, rid):
         codec = self.codec
         codec.require(self.root is not None, "E_AUTH", detail="reference")
-        if rid not in self.entries:
-            self.entries[rid] = _grant_entry(codec, self.store, rid)
-        entry, _raw = self.entries[rid]
-        codec.require(entry is not None and self.permitted(entry, self.endpoint),
-                      "E_AUTH", detail="reference")
-        return entry
+        if rid not in self.facts:
+            entry, raw = _grant_entry(codec, self.store, rid)
+            allowed = entry is not None and self.permitted(entry, self.endpoint)
+            if self.rollback:
+                self.entries[rid] = (entry, raw)
+            author = entry["author"] if allowed else None
+            self.facts[rid] = None if not allowed else {
+                "author": dict(author) if type(author) is dict else author, "kind": entry["kind"]}
+        codec.require(self.facts[rid] is not None, "E_AUTH", detail="reference")
+        return self.facts[rid]
 
     def permitted(self, entry, endpoint):
         direct = {"root": self.root, "endpoint": endpoint}
@@ -704,11 +708,30 @@ def _reference_view(codec, store, access, reference, options):
     return _value_view(codec, store, None, value, options, access)
 
 
-def _bounded(codec, value, maximum):
-    # Core's renderer accounts before allocating the final output and escapes controls.
+def _digest_renderer(codec, maximum):
     renderer = importlib.import_module("aegis_core.message_codec_views").Renderer
     fmt = importlib.import_module("aegis_core.message_codec_format")
-    return renderer(codec.require, fmt.escape_char, fmt.neutral_text, maximum).render(value, "json")
+    return renderer(codec.require, fmt.escape_char, fmt.neutral_text, maximum)
+
+
+def _bounded(codec, value, maximum):
+    # Core's renderer accounts before allocating the final output and escapes controls.
+    return _digest_renderer(codec, maximum).render(value, "json")
+
+
+class _DigestSize:
+    def __init__(self, codec, maximum):
+        self.codec, self.maximum, self.total = codec, maximum, None
+        self.renderer, self.counts = _digest_renderer(codec, maximum), {"messages": 0, "records": 0}
+
+    def add(self, result, row, key):
+        # Skeleton is measured after this row is built, so its refusal still precedes E_LIMIT.
+        if self.total is None:
+            self.total = self.renderer.json_size(result, self.maximum)
+        extra = self.renderer.json_array_extra(row, self.counts[key] > 0, self.maximum)
+        self.codec.require(self.total + extra <= self.maximum, "E_LIMIT")
+        self.total += extra
+        self.counts[key] += 1
 
 
 def _staged_exists(codec, directory, name):
@@ -801,7 +824,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
         _bounded(codec, _value_view(codec, None, sender, value, options, None), MAX_CHARS)
     with record_store(codec, mailbox.root, write=True, state=state) as store:
         with _publication_lock(codec, store.fd) as lease, _directory(codec, path.parent) as destination:
-            access = _RecordAccess(codec, store, mailbox.root, sender)
+            access = _RecordAccess(codec, store, mailbox.root, sender, rollback=True)
             for reference in set(value["refs"].values()):
                 access.authorize(reference)
             # Exactly the default read's accounting, including the wrapper itself.
@@ -956,6 +979,7 @@ def digest(codec, mailbox, sender, arguments):
         if references:
             store, access = stack.enter_context(_reference_store(codec, mailbox.root, sender, references))
             options = _options(codec, arguments)
+        accounted = _DigestSize(codec, options["max_chars"])
         for message in selected:
             row = {key: message[key] for key in ("message_id", "from", "type")}
             row["untrusted"] = True
@@ -965,10 +989,11 @@ def digest(codec, mailbox, sender, arguments):
                 row["record"] = _view(codec, store, message, options, access)
             else:
                 row["body"] = message["body"]
+            # Account this row before retaining it or building the next one.
+            accounted.add(result, row, "messages")
             result["messages"].append(row)
-            # Check the aggregate before retaining another row's view.
-            _bounded(codec, result, options["max_chars"])
         for reference in references:
-            result["records"].append(_reference_view(codec, store, access, reference, options))
-            _bounded(codec, result, options["max_chars"])
+            row = _reference_view(codec, store, access, reference, options)
+            accounted.add(result, row, "records")
+            result["records"].append(row)
     return _bounded(codec, result, options["max_chars"]), [message["message_id"] for message in selected]
