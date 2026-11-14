@@ -121,6 +121,19 @@ def test_tools_list_declares_no_output_schema(tools):
     assert len(json.dumps(list(tools.values()))) <= 11_500  # MR-3b adds the selector schema.
 
 
+def test_queue_connection_annotations_and_budget():
+    from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS
+
+    queue, claim = QUEUE_TOOL_DEFINITIONS
+    assert queue["annotations"] == {**_READ_HINTS, "title": "Team Queue"}
+    assert claim["annotations"] == {"readOnlyHint": False, "title": "Claim Queue Item"}
+    assert len(json.dumps(QUEUE_TOOL_DEFINITIONS).encode("utf-8")) <= 11500
+    assert all("outputSchema" not in tool for tool in QUEUE_TOOL_DEFINITIONS)
+    for tool in QUEUE_TOOL_DEFINITIONS:
+        assert tool["inputSchema"]["additionalProperties"] is False
+        assert all(0 < len(spec["description"]) <= 160 for spec in tool["inputSchema"]["properties"].values())
+
+
 @pytest.fixture
 def governed(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
