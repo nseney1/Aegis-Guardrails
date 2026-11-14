@@ -140,8 +140,14 @@ terminal/result; live plan approval and no canonical deny; expiry; current parti
 supported recipes/hashes; packet sizes/attachments, binding readiness, existing same/conflict messages and record-limit headroom for the entire
 missing set. Failure publishes none of that set. Prepare deterministic packets in memory/content-addressed briefs, without descriptors. Then
 publish missing IDs in sorted check order in that lock. Immediately before EACH message, reload journal and require last_decision(request_id) !=
-deny (`tools/hierarchy_router.py:79-82`) and recheck expiry. R8 captures/parses/hashes the configured recipe file once per operation, using the
-same schema validation as load_recipes; require each check's admitted hash and revalidate the captured file witness at each effect boundary.
+deny (`tools/hierarchy_router.py:79-82`) and recheck expiry. Capture/hash the configured recipe file once per operation. A bounded parse supplies
+staged objects to jobs.validate_recipes in its order: header, hide entries, ro_binds entries, then the remaining checks on the original bytes.
+Before each folder stage, guard only the absolute string entry the validator can reach next; relative entries retain the public refusal.
+Each stage contains only its new folder; clear it before the next list. The final original-byte validation adds one pass over both lists,
+so folder metadata work is linear in their combined size.
+On a hash mismatch, finish the remaining lexical checks with the folder lists omitted, then refuse before the final filesystem pass.
+Earlier schema and path refusals keep their precedence; the ordered folder stages remain necessary to preserve those refusals.
+Cache the validated object, require each check's admitted hash and revalidate the captured file witness at each effect boundary.
 A concurrent denial after the live check remains a race like canonical
 routing (`tools/hierarchy_router.py:285-290`).
 
@@ -367,8 +373,11 @@ history. Candidate paths still normalize lexically and refuse before metadata; U
 password-database home plus registry declarations revalidate with captured witnesses before effects. Windows uses the OS current-user profile
 location (CSIDL_PROFILE), with the same registry-declared owner folders even when home override variables are absent. Never infer the owner's
 default profile from HOME/USERPROFILE; an unavailable profile location refuses before input discovery. No global cache or authority is created.
-Whole-file recipe-parser parity (including census_outside_policy) is explicitly deferred by R15 until JOBS-1's public validate_recipes(data)
-lands. recipe_file is unchanged this round; its dedicated strict xfail records this known gap, not activation or recipe qualification.
+Whole-file recipe schema validation (including census_outside_policy) uses JOBS-1's public validate_recipes(data).
+The dispatcher stages the public validator so earlier refusals precede path checks: unreachable folders receive no guard or metadata probe.
+Reachable absolute folder entries retain private-path checks before metadata; malformed parses defer to the public validator's own refusal.
+Hash the original captured bytes and reuse only the final validated object without reopening the file. Parser parity tests provide no activation
+or native qualification. These host-neutral schema fixes also apply when no host plan is configured, per the owner's DISP-RECIPE ruling.
 
 ## 5. Loop-only skips, reporting and holds
 
