@@ -45,14 +45,47 @@ SESSION_UUID = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
 SESSION_UUID_OCCURRENCE = re.compile(r"(?:(?<![0-9a-fA-F])|(?<=-[A-Za-z]))" + SESSION_UUID.pattern +
                                      r"(?![0-9a-fA-F])")
 CODEX_TRANSCRIPTS = ("sessions/**/rollout-*{session}.jsonl", "archived_sessions/**/rollout-*{session}.jsonl")
-CODEX_BILLING = ("OPENAI_API_KEY", "CODEX_API_KEY")
-# Spec rule 3 is not enforced in T2(a) (owner decision B): no MCP child has been shown to carry either variable.
-CLAUDE_SESSION_VARIABLE = {"name": "CLAUDE_CODE_SESSION_ID", "verified_for_mcp": False}
-CODEX_SESSION_VARIABLE = {"name": "CODEX_THREAD_ID", "verified_for_mcp": False}
-# Names observed in the HOSTENV-1 writer's inherited environment (2026-11-11); no broad config prefix.
-CODEX_SESSION_MARKERS = {"names": ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI",
-                                    "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
-                                    "CODEX_TOOL_CALL_ID", "CODEX_VERSION"), "prefixes": ()}
+
+
+# Literal projection of aegis_core/hosts.py, enforced in both directions by
+# test_tools_environment_catalog_is_exact_core_projection. Exported runtimes
+# ship tools only, so this module must not import the core package. Omit common
+# Aegis markers, auth overrides and prefix-covered names; preserve the v1 shape.
+_CLAUDE_ENVIRONMENT = {
+    "billing_variables": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                          "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"),
+    "session_variable": {"name": "CLAUDE_CODE_SESSION_ID", "verified_for_mcp": False},
+    "session_markers": {"names": ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT"), "prefixes": ("CLAUDE_CODE_",)}}
+_CODEX_ENVIRONMENT = {
+    "billing_variables": ("OPENAI_API_KEY", "CODEX_API_KEY"),
+    "session_variable": {"name": "CODEX_THREAD_ID", "verified_for_mcp": False},
+    "session_markers": {"names": ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "CODEX_CI",
+                                  "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+                                  "CODEX_TOOL_CALL_ID", "CODEX_VERSION"), "prefixes": ()}}
+_GEMINI_ENVIRONMENT = {
+    "billing_variables": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "session_variable": {"name": "", "verified_for_mcp": False},
+    "session_markers": {"names": (), "prefixes": ()}}
+_EMPTY_ENVIRONMENT = {
+    "billing_variables": (), "session_variable": {"name": "", "verified_for_mcp": False},
+    "session_markers": {"names": (), "prefixes": ()}}
+HOST_ENVIRONMENT = {
+    CODEX: _CODEX_ENVIRONMENT,
+    CLAUDE: _CLAUDE_ENVIRONMENT,
+    "claude-desktop": _CLAUDE_ENVIRONMENT,
+    "antigravity": _GEMINI_ENVIRONMENT,
+    "gemini-cli": _GEMINI_ENVIRONMENT,
+    "kiro": _EMPTY_ENVIRONMENT,
+    "cursor": _EMPTY_ENVIRONMENT,
+    "copilot": _EMPTY_ENVIRONMENT,
+    "windsurf": _EMPTY_ENVIRONMENT,
+    NATIVE: _CODEX_ENVIRONMENT,
+}
+# Retained public aliases use the same projection as the legacy registry.
+CODEX_BILLING = _CODEX_ENVIRONMENT["billing_variables"]
+CLAUDE_SESSION_VARIABLE = _CLAUDE_ENVIRONMENT["session_variable"]
+CODEX_SESSION_VARIABLE = _CODEX_ENVIRONMENT["session_variable"]
+CODEX_SESSION_MARKERS = _CODEX_ENVIRONMENT["session_markers"]
 CLAUDE_USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
 CODEX_USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
 CLAUDE_INIT_KEYS = (("session_id", "session_id"), ("tools", "tools"), ("model", "model"),
@@ -125,10 +158,9 @@ _HOSTS = {
                               "prompt_options": ("-p", "--print")},
         "team_start": "print",
         "home": {"variable": "CLAUDE_CONFIG_DIR", "run_folder": "claude-home", "owner_folder": ".claude"},
-        "billing_variables": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-                              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"),
+        "billing_variables": _CLAUDE_ENVIRONMENT["billing_variables"],
         "session_variable": CLAUDE_SESSION_VARIABLE,
-        "session_markers": {"names": ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT"), "prefixes": ("CLAUDE_CODE_",)},
+        "session_markers": _CLAUDE_ENVIRONMENT["session_markers"],
         "transcripts": ("projects/*/{session}.jsonl",),
         "usage": "claude-stream-json-result",
         "write_scope": {"boundary": "permission rules, not OS-enforced", "mechanism": "claude --restricted",
@@ -200,8 +232,11 @@ def child_environment(environ, purpose):
     if purpose not in ("no-host", "host-cli"):
         raise ValueError("unsupported child environment purpose")
     names, prefixes = set(), []
-    for host in describe()["hosts"].values():
-        names.add(host["session_variable"]["name"])
+    # Include every projected row, even hosts the legacy launcher cannot run. Keep
+    # describe() consumers in this union so extensions to that surface still scrub.
+    for host in (*describe()["hosts"].values(), *HOST_ENVIRONMENT.values()):
+        if host["session_variable"]["name"]:
+            names.add(host["session_variable"]["name"])
         names.update(host["session_markers"]["names"])
         prefixes.extend(host["session_markers"]["prefixes"])
         if purpose == "no-host":
