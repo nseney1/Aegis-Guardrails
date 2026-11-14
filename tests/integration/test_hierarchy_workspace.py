@@ -38,6 +38,13 @@ def fingerprint(value):
     return "<redacted len=%d sha256=%s>" % (len(value), hashlib.sha256(raw).hexdigest()[:12])
 
 
+def claim_path_refusal(workspace, paths):
+    # Invalid paths are refused by the real public claim before repository I/O.
+    with pytest.raises(lease_reader.TeamUsageError) as error:
+        lease_reader.claim(workspace.tmp, "candidate", paths)
+    return str(error.value)
+
+
 @pytest.mark.parametrize("kind", controller.KINDS)
 def test_request_replay_has_linear_request_visits(kind):
     class CountedRequests(dict):
@@ -607,6 +614,291 @@ def two_clones(workspace, tmp_path):
     return first, second
 
 
+@pytest.mark.parametrize("held,wanted,reason", [
+    (None, "docs/a b.md", "usage"),
+    (None, "docs/a\tb.md", "usage"),
+    (None, "docs/a\nb.md", "usage"),
+    (["docs/a.py / src/b.py"], "other/file.py", "overlap"),
+    (["docs/a.py src/b.py"], "src/b.py", "overlap"),
+    (["src/**"], "src/nested/file.py", "overlap"),
+    (["src/*.py"], "src/file.txt", "overlap"),
+    (["src/a?.py"], "src/ab.py", "overlap"),
+    (["/docs/"], "docs/guide.md", "overlap"),
+    (["/Docs/"], "docs/guide.md", "overlap"),
+    (["src/**"], "docs/guide.md", "clear"),
+    (["/docs/"], "nested/docs/guide.md", "clear"),
+    (None, "/docs/", "clear"),
+    (None, "docs\\guide.md", "clear"),
+    (None, "docs/file:part.md", "clear"),
+    (None, "docs/" + "a" * 4096, "clear"),
+], ids=["space", "tab", "newline", "legacy-slash", "legacy-union", "double-star", "star", "question",
+        "directory", "case", "disjoint", "anchored-disjoint", "request-anchor", "backslash", "colon", "long"])
+def test_workspace_path_check_agrees_with_real_claim(workspace, tmp_path, held, wanted, reason):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("a1", checkouts=[str(checkout)])
+    if held is not None:
+        write_lease(checkout, "foreign", held)
+    before = {p.name: p.read_bytes() for p in event_files(workspace)}
+    ledger = controller.Store(workspace.store).load()
+    for _ in range(2):
+        if reason == "usage":
+            with pytest.raises(lease_reader.TeamUsageError) as claim_error:
+                lease_reader.claim(checkout, "candidate", [wanted])
+            with pytest.raises(ValueError) as check_error:
+                controller.check_paths(ledger, "a1", [wanted])
+            assert str(check_error.value) == str(claim_error.value)
+            assert workspace.run("check-paths", {"initiative": "a1", "paths": [wanted]}, expect=2) == {
+                "error": str(claim_error.value)}
+        else:
+            code, result = controller.check_paths(ledger, "a1", [wanted])
+            assert code == (3 if reason == "overlap" else 0)
+            assert result["conflict"] is (reason == "overlap")
+            if reason == "overlap":
+                with pytest.raises(lease_reader.LeaseRefused) as claim_error:
+                    lease_reader.claim(checkout, "candidate", [wanted])
+                assert claim_error.value.reason == "overlap"
+                assert [row["lane"] for row in result["conflicts"]] == ["foreign"]
+            else:
+                change = lease_reader.claim(checkout, "candidate", [wanted])
+                lease_reader.release(checkout, "candidate", change.oid)
+    assert before == {p.name: p.read_bytes() for p in event_files(workspace)}
+
+
+def test_workspace_path_check_and_claim_reread_a_concurrent_foreign_lease(workspace, tmp_path, monkeypatch):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("a1", checkouts=[str(checkout)])
+    write_lease(checkout, "foreign", ["/docs/"])
+    read_leases = lease_reader.read_leases
+    replaced = []
+
+    def read_then_replace(root):
+        found = read_leases(root)
+        if not replaced:
+            write_lease(checkout, "foreign", ["/src/"])
+            replaced.append(True)
+        return found
+
+    monkeypatch.setattr(lease_reader, "read_leases", read_then_replace)
+    ledger = controller.Store(workspace.store).load()
+    assert controller.check_paths(ledger, "a1", ["src/file.py"])[0] == 0
+    for _ in range(2):
+        with pytest.raises(lease_reader.LeaseRefused) as error:
+            lease_reader.claim(checkout, "candidate", ["src/file.py"])
+        assert error.value.reason == "overlap"
+        code, result = controller.check_paths(ledger, "a1", ["src/file.py"])
+        assert code == 3 and result["conflicts"][0]["lane"] == "foreign"
+    assert replaced == [True]
+
+
+@pytest.mark.parametrize("reserved", [False, True], ids=["declared", "reserved"])
+@pytest.mark.parametrize("held,wanted,overlap", [
+    (["/docs/"], "nested/docs/file.md", False),
+    (["/Docs/"], "docs/file.md", True),
+    (["docs/a.md src/b.py"], "src/b.py", True),
+    (["src/a?.py"], "src/abc.txt", True),
+    (["src/**"], "docs/file.md", False),
+    ([], "src/file.py", False),
+], ids=["anchor-disjoint", "case", "legacy-union", "conservative-glob", "disjoint", "empty"])
+def test_workspace_declared_and_reserved_overlap_agrees_with_real_claim(
+        workspace, tmp_path, reserved, held, wanted, overlap):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("owner", touched_paths=held)
+    workspace.register("a1", checkouts=[str(checkout)])
+    if held:
+        write_lease(checkout, "foreign", held)
+        if overlap:
+            with pytest.raises(lease_reader.LeaseRefused) as error:
+                lease_reader.claim(checkout, "candidate", [wanted])
+            assert error.value.reason == "overlap"
+        else:
+            change = lease_reader.claim(checkout, "candidate", [wanted])
+            lease_reader.release(checkout, "candidate", change.oid)
+        lease_reader.release(checkout, "foreign", git(checkout, "rev-parse", "refs/aegis/lanes/foreign"))
+    if reserved:
+        workspace.ask("owner")
+        workspace.grant()
+    for _ in range(2):
+        result = workspace.run("check-paths", {"initiative": "a1", "paths": [wanted]},
+                               expect=3 if reserved and overlap else 0)
+        assert result["declared_overlaps"] == (["owner"] if overlap else [])
+        assert bool(result["reserved_conflicts"]) is (reserved and overlap)
+        assert result["conflicts"] == []
+
+
+@pytest.mark.parametrize("paths", [
+    None, "docs/**", [], [None], [1], [""], ["/"], ["../escape"], ["docs/\x00name"],
+    ["docs/\udcffname"], ["x" * (lease_reader.MAX_LEASE_BYTES + 1)],
+    ["a" * (lease_reader.MAX_LEASE_BYTES // 2 + 1), "b" * (lease_reader.MAX_LEASE_BYTES // 2 + 1)],
+    ["docs/good.md", "docs/../escape"],
+], ids=["null", "not-list", "empty-list", "null-glob", "number-glob", "empty-glob", "empty-anchor",
+        "traversal", "nul", "surrogate", "oversize", "aggregate-oversize", "late-invalid"])
+def test_workspace_invalid_paths_use_claim_refusal_before_lease_io(workspace, paths, monkeypatch):
+    workspace.register("a1", checkouts=[str(workspace.tmp)])
+
+    def unexpected_read(*args):
+        raise AssertionError("invalid paths reached the lease reader")
+
+    monkeypatch.setattr(lease_reader, "read_leases", unexpected_read)
+    expected = claim_path_refusal(workspace, paths)
+    ledger = controller.Store(workspace.store).load()
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            controller.check_paths(ledger, "a1", paths)
+        assert str(error.value) == expected
+
+
+@pytest.mark.parametrize("paths", [["docs/a.md"] * 257, ("docs/a.md",), ("docs/token=SYNTHETIC_GM3_SECRET",)],
+                         ids=["many-globs", "tuple", "tuple-secret"])
+def test_workspace_claim_valid_path_collections_are_not_locally_restricted(workspace, tmp_path, paths):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("a1", checkouts=[str(checkout)])
+    code, result = controller.check_paths(controller.Store(workspace.store).load(), "a1", paths)
+    assert code == 0 and result["conflict"] is False
+    change = lease_reader.claim(checkout, "candidate", paths)
+    try:
+        code, result = controller.check_paths(controller.Store(workspace.store).load(), "a1", paths)
+        assert code == 3 and result["conflict"] is True
+        assert result["paths"] == [fingerprint(path) if "SYNTHETIC" in path else path for path in paths]
+        assert "SYNTHETIC" not in json.dumps(result)
+        with pytest.raises(lease_reader.LeaseRefused) as error:
+            lease_reader.claim(checkout, "contender", paths)
+        assert error.value.reason == "overlap"
+    finally:
+        lease_reader.release(checkout, "candidate", change.oid)
+    assert controller.check_paths(controller.Store(workspace.store).load(), "a1", paths)[0] == 0
+
+
+@pytest.mark.parametrize("reserved", [False, True], ids=["declared", "reserved"])
+@pytest.mark.parametrize("held", [["docs/a.md / src/b.py"], ["../escape"], [" "]],
+                         ids=["legacy-slash", "traversal", "empty-legacy"])
+def test_workspace_unreadable_stored_scopes_conservatively_overlap(workspace, tmp_path, reserved, held):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("owner", touched_paths=held)
+    workspace.register("a1", checkouts=[str(checkout)])
+    write_lease(checkout, "foreign", held)
+    with pytest.raises(lease_reader.LeaseRefused) as error:
+        lease_reader.claim(checkout, "candidate", ["other/file.md"])
+    assert error.value.reason == "overlap"
+    lease_reader.release(checkout, "foreign", git(checkout, "rev-parse", "refs/aegis/lanes/foreign"))
+    if reserved:
+        workspace.ask("owner")
+        workspace.grant()
+    for _ in range(2):
+        result = workspace.run("check-paths", {"initiative": "a1", "paths": ["other/file.md"]},
+                               expect=3 if reserved else 0)
+        assert result["declared_overlaps"] == ["owner"]
+        assert bool(result["reserved_conflicts"]) is reserved
+
+
+@pytest.fixture
+def recovery_jobs(monkeypatch):
+    from tools import hierarchy_jobs
+
+    # Replace the external process census, keeping recovery and real store/lease
+    # reads portable on hosts without /proc. No global OS reference is patched.
+    def census(store_path, ledger, fixture, kind):
+        return {"limit": ledger.limits[kind], "held": len(ledger.held(kind)),
+                "external_roots": [], "census": "fixture"}
+
+    monkeypatch.setattr("tools.hierarchy_jobs.census", census)
+    return hierarchy_jobs
+
+
+@pytest.mark.parametrize("stored,expected", [
+    (["docs/a.md src/b.py"], 0),
+    (["docs/a.md / src/b.py"], 3),
+    (["../token=SYNTHETIC_GM5_SECRET"], 3),
+    (["docs/a.md"], 0),
+    (["/docs/"], 0),
+    ([], 0),
+], ids=["legacy", "unparseable", "unparseable-secret", "valid", "anchor", "empty"])
+def test_recovery_inventory_reads_stored_scope_and_keeps_new_requests_strict(
+        workspace, recovery_jobs, capsys, stored, expected):
+    workspace.register("a1", touched_paths=stored)
+    before = {path.name: path.read_bytes() for path in event_files(workspace)}
+    new_paths = ["docs/a.md src/b.py"]
+    refusal = {"error": claim_path_refusal(workspace, new_paths)}
+    for _ in range(2):
+        code = recovery_jobs.main(["--store", str(workspace.store), "recovery-status"])
+        raw = capsys.readouterr().out
+        report = json.loads(raw)
+        assert code == expected, report
+        assert set(report) == {"schema", "read_only", "seq", "capacity", "capacity_scope", "process_census",
+                               "initiatives", "jobs", "blockers", "native_qualification"}
+        assert report["schema"] == "aegis.hierarchy-recovery-status/v1" and report["read_only"] is True
+        assert report["jobs"] == [] and report["native_qualification"] == "not_established"
+        assert [row["id"] for row in report["initiatives"]] == ["a1"]
+        assert [row["reason"] for row in report["blockers"]] == (["path_conflict"] if expected == 3 else [])
+        team = report["initiatives"][0]
+        if stored:
+            paths = team["paths"]
+            assert paths["conflict"] is (expected == 3)
+            assert set(paths) >= {"initiative", "paths", "conflict", "conflicts", "reserved_conflicts",
+                                  "unreadable_checkouts", "own_overlaps", "declared_overlaps", "checked_checkouts"}
+            if expected == 3:
+                assert paths["reason"] == "stored_paths_unreadable"
+                # The path-conflict subreport owns the refusal display boundary;
+                # recovery also inventories the separately registered metadata.
+                assert "SYNTHETIC" not in json.dumps(paths)
+                if "SYNTHETIC" in stored[0]:
+                    assert paths["paths"] == [fingerprint(stored[0])]
+            else:
+                assert paths["paths"] == stored
+        else:
+            assert "paths" not in team
+        assert workspace.run("check-paths", {"initiative": "a1", "paths": new_paths}, expect=2) == refusal
+        assert {path.name: path.read_bytes() for path in event_files(workspace)} == before
+
+
+def test_recovery_stored_scope_rechecks_a_concurrent_foreign_lease(
+        workspace, tmp_path, recovery_jobs, monkeypatch, capsys):
+    checkout, _ = clone_pair(tmp_path)
+    workspace.register("a1", checkouts=[str(checkout)], touched_paths=["docs/a.md src/b.py"])
+    write_lease(checkout, "foreign", ["other/**"])
+    read_leases = lease_reader.read_leases
+    replaced = []
+
+    def read_then_replace(root):
+        found = read_leases(root)
+        if not replaced:
+            write_lease(checkout, "foreign", ["src/b.py"])
+            replaced.append(True)
+        return found
+
+    monkeypatch.setattr(lease_reader, "read_leases", read_then_replace)
+    before = {path.name: path.read_bytes() for path in event_files(workspace)}
+    for expected in (0, 3, 3):
+        code = recovery_jobs.main(["--store", str(workspace.store), "recovery-status"])
+        report = json.loads(capsys.readouterr().out)
+        assert code == expected, report
+        paths = report["initiatives"][0]["paths"]
+        assert paths["conflict"] is (expected == 3)
+        assert [row["lane"] for row in paths["conflicts"]] == (["foreign"] if expected == 3 else [])
+        assert [row["reason"] for row in report["blockers"]] == (["path_conflict"] if expected == 3 else [])
+    assert replaced == [True]
+    assert {path.name: path.read_bytes() for path in event_files(workspace)} == before
+
+
+def test_registered_empty_scope_is_clear_while_empty_new_request_is_refused(workspace, monkeypatch):
+    workspace.register("a1", checkouts=[str(workspace.tmp / "unavailable")])
+    workspace.register("peer", touched_paths=["../escape"])
+    workspace.ask("peer")
+    workspace.grant()
+
+    def unexpected_read(*args):
+        raise AssertionError("an empty stored scope reached the lease reader")
+
+    monkeypatch.setattr(lease_reader, "read_leases", unexpected_read)
+    ledger = controller.Store(workspace.store).load()
+    code, report = controller.check_initiative_paths(ledger, "a1")
+    assert code == 0 and report["paths"] == [] and report["conflict"] is False
+    assert report["checked_checkouts"] == 0 and report["declared_overlaps"] == []
+    assert report["reserved_conflicts"] == [] and report["unreadable_checkouts"] == []
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(ledger, "a1", [])
+    assert str(error.value) == claim_path_refusal(workspace, [])
+
+
 @pytest.mark.parametrize("checkout_component", ["clones", "clones with space"])
 def test_a_real_lease_in_another_clone_conflicts_though_that_clone_cannot_see_it(workspace, checkout_component):
     checkout_root = workspace.tmp / checkout_component
@@ -637,7 +929,6 @@ def test_a_real_lease_in_another_clone_conflicts_though_that_clone_cannot_see_it
     (["/docs/"], "nested/docs/guide.md", False, False),
     (["README.md"], "nested/README.md", False, True),
     (["docs/a.py src/b.py"], "src/b.py", False, True),
-    (["src/b.py"], "docs/a.py src/b.py", False, True),
     ([".//pyproject.toml"], "nested/pyproject.toml", False, True),
     (["src/**"], "src/value.txt", True, False),
     ([" "], "other/value.txt", True, True),
@@ -717,17 +1008,20 @@ def test_workspace_lease_parser_rechecks_a_replaced_lease_on_the_next_observatio
     assert replaced == [True]
 
 
-@pytest.mark.parametrize("raw", ["a.py /", "a.py ..", " "], ids=["empty-component", "parent", "empty-split"])
+@pytest.mark.parametrize("raw", ["a.py /", "a.py ..", " ", "docs/a.py src/b.py"],
+                         ids=["empty-component", "parent", "empty-split", "whitespace-request"])
 def test_workspace_lease_parser_refuses_invalid_request_components_before_reading_leases(
         workspace, two_clones, raw, monkeypatch):
     def unexpected_read(*args):
         raise AssertionError("invalid request reached the lease reader")
 
     monkeypatch.setattr(lease_reader, "read_leases", unexpected_read)
-    with pytest.raises(ValueError, match=r"\Apaths is not a non-empty list of globs\Z"):
+    expected = claim_path_refusal(workspace, [raw])
+    with pytest.raises(ValueError) as error:
         controller.check_paths(controller.Store(workspace.store).load(), "second", [raw])
+    assert str(error.value) == expected
     response = workspace.run("check-paths", {"initiative": "second", "paths": [raw]}, expect=2)
-    assert response == {"error": "paths is not a non-empty list of globs"}
+    assert response == {"error": expected}
 
 
 def test_an_expired_lease_does_not_conflict(workspace, two_clones):
@@ -850,12 +1144,11 @@ def test_declared_paths_warn_without_refusing(workspace):
     assert result["conflict"] is False and result["declared_overlaps"] == ["first"]
 
 
-@pytest.mark.parametrize("paths,error", [
-    (["/absolute/path"], "invalid path"), (["../escape"], "invalid path"), ([], "invalid paths"), ("tools/**", "invalid paths"),
-])
-def test_malformed_path_checks_are_refused(workspace, paths, error):
+@pytest.mark.parametrize("paths", [["/../escape"], ["../escape"], [], "tools/**"])
+def test_malformed_path_checks_are_refused(workspace, paths):
     workspace.register("first")
-    assert error in workspace.run("check-paths", {"initiative": "first", "paths": paths}, expect=2)["error"]
+    expected = claim_path_refusal(workspace, paths)
+    assert workspace.run("check-paths", {"initiative": "first", "paths": paths}, expect=2) == {"error": expected}
 
 
 def test_a_missing_lease_reader_is_a_clear_error(workspace, tmp_path):
@@ -1296,11 +1589,13 @@ def test_store_load_completes_short_reads_and_retries_eintr(workspace, monkeypat
         "ansi-format", "bearer-boundary", "token-boundary", "short-bearer-assignment", "header-bearer",
         "adjacent-bearer", "adjacent-token"])
 def test_workspace_refusal_path_is_displayed(workspace, value):
+    value = "../" + value
     workspace.register("a1")
     ledger = controller.Store(workspace.store).load()
     with pytest.raises(ValueError) as error:
         controller.check_paths(ledger, "a1", [value])
     message = str(error.value)
+    assert message == claim_path_refusal(workspace, [value])
     assert "SYNTHETIC" not in message
     assert len(message) <= 600 and message.isprintable()
     raw = workspace.run("check-paths", {"initiative": "a1", "paths": [value]}, expect=2, raw=True)
@@ -1687,14 +1982,16 @@ def test_workspace_credential_grammar_parity_and_public_refusal(workspace, label
         controller.Ledger().initiative(value)
     assert str(error.value) == "initiative is not registered: " + fingerprint(value)
     workspace.register("a1")
+    invalid = "../" + value
+    expected = claim_path_refusal(workspace, [invalid])
     with pytest.raises(ValueError) as error:
-        controller.check_paths(controller.Store(workspace.store).load(), "a1", ["/" + value])
-    assert str(error.value) == "invalid path: " + fingerprint("/" + value)
-    result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": ["/" + value]}),
+        controller.check_paths(controller.Store(workspace.store).load(), "a1", [invalid])
+    assert str(error.value) == expected
+    result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": [invalid]}),
                             capture_output=True, timeout=30)
     assert result.returncode == 2 and result.stderr == b""
     refusal = json.loads(result.stdout)
-    assert refusal == {"error": "invalid path: " + fingerprint("/" + value)}
+    assert refusal == {"error": expected}
     assert credential not in refusal["error"]
 
 
@@ -1860,10 +2157,17 @@ def test_workspace_known_cli_refusal_preserves_validated_identifier(workspace):
 
 
 def assert_path_refusal_fingerprints_raw_value(workspace, value):
+    value = "../" + value
     workspace.register("a1")
+    ledger = controller.Store(workspace.store).load()
+    # Echoed refusal slots still fingerprint the entire original value. Path
+    # validation itself now uses the claim's trusted, non-echoing diagnostic.
     with pytest.raises(ValueError) as error:
-        controller.check_paths(controller.Store(workspace.store).load(), "a1", [value])
-    expected = {"error": "invalid path: " + fingerprint(value)}
+        controller.check_paths(ledger, value, [value])
+    assert str(error.value) == "initiative is not registered: " + fingerprint(value)
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(ledger, "a1", [value])
+    expected = {"error": claim_path_refusal(workspace, [value])}
     assert str(error.value) == expected["error"]
     result = subprocess.run(workspace.argv("check-paths", {"initiative": "a1", "paths": [value]}),
                             capture_output=True, timeout=30)
@@ -1906,23 +2210,30 @@ def test_workspace_embedded_tokens_cannot_expose_scheme_suffix(workspace, scheme
 
 
 @pytest.mark.parametrize("value", [
-    "/clean/./File_01.py:part-", "/" + "a" * 255, "/" + "a" * 256,
+    "/clean/./File_01.py:part-", "/" + "a" * 252, "/" + "a" * 253,
     "/clean path", "/clean\tpath", "/clean=path", '/clean"path', "/clean[path]",
     "/ｃｌｅａｎ/path", "/clean\x1b[31mpath", "/clean\u200bpath", "/clean\udcffpath",
     "/clean'path", "/clean@path", "/clean%path", "/clean\\path", "/clean;path", "/clean#path", "/clean&path",
-    "/" + "*" * 255, "/" + "*" * 256,
+    "/" + "*" * 252, "/" + "*" * 253,
 ], ids=["clean", "limit", "over-limit", "space", "tab", "equals", "quote", "brackets",
         "nfkc", "ansi", "format", "surrogate", "single-quote", "at", "percent", "backslash", "semicolon",
         "hash", "ampersand", "glob-limit", "glob-over-limit"])
 def test_workspace_refusal_echoes_only_unchanged_conservative_paths(workspace, value):
+    value = "../" + value
     workspace.register("a1")
     expected = value if len(value) <= 256 and value.isascii() and all(
         char.isalnum() or char in "/._-:*?[]{},!" for char in value) else fingerprint(value)
+    ledger = controller.Store(workspace.store).load()
     with pytest.raises(ValueError) as error:
-        controller.check_paths(controller.Store(workspace.store).load(), "a1", [value])
-    assert str(error.value) == "invalid path: " + expected
-    assert workspace.run("check-paths", {"initiative": "a1", "paths": [value]}, expect=2) == {
-        "error": "invalid path: " + expected}
+        controller.check_paths(ledger, value, [value])
+    assert str(error.value) == "initiative is not registered: " + expected
+    assert workspace.run("check-paths", {"initiative": value, "paths": [value]}, expect=2) == {
+        "error": "initiative is not registered: " + expected}
+    refusal = claim_path_refusal(workspace, [value])
+    with pytest.raises(ValueError) as error:
+        controller.check_paths(ledger, "a1", [value])
+    assert str(error.value) == refusal
+    assert workspace.run("check-paths", {"initiative": "a1", "paths": [value]}, expect=2) == {"error": refusal}
 
 
 @pytest.mark.parametrize("checkout_component", ["checkout", "checkout with space"])
@@ -2037,8 +2348,11 @@ def test_workspace_argon_variants_fingerprint_the_complete_raw_path(workspace, v
 @pytest.mark.parametrize("glob", ["src/**", "docs/{a,b}/*.md", "tests/[ab]?_x.py", "!vendor/**"])
 def test_workspace_clean_globs_echo_unchanged_in_cli_refusal_and_conflict(workspace, glob):
     workspace.register("a1")
-    refused = workspace.run("check-paths", {"initiative": "a1", "paths": ["/" + glob]}, expect=2)
-    assert refused == {"error": "invalid path: /" + glob}
+    invalid = "../" + glob
+    refused = workspace.run("check-paths", {"initiative": "a1", "paths": [invalid]}, expect=2)
+    assert refused == {"error": claim_path_refusal(workspace, [invalid])}
+    echoed = workspace.run("check-paths", {"initiative": invalid, "paths": [invalid]}, expect=2)
+    assert echoed == {"error": "initiative is not registered: " + invalid}
     workspace.register("owner", touched_paths=[glob])
     request_id = workspace.ask("owner")
     workspace.grant()

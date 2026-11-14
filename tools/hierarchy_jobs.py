@@ -88,6 +88,7 @@ from hierarchy_mailbox import (GIT_ID, GIT_STATUS_TIMEOUT_SECONDS, MAX_BYTES, SH
                                status_entries, writer_lock)
 from hierarchy_wake import stop_group  # noqa: E402
 from hierarchy_workspace import (KINDS as LEDGER_KINDS, MAX_HEAVY, MAX_HEAVY_TESTS, Store, absolute, capacity_view,  # noqa: E402
+                                 check_initiative_paths,
                                  check_paths, grant_next, initiative_view, verify_evidence)
 
 
@@ -4685,7 +4686,7 @@ def recovery_status(store_path, chosen=(), recipes_path=None):
                                  "reason": "source_unavailable" if source_unavailable else row["state"],
                                  "next_action": row["next_action"]})
         if initiative["touched_paths"]:
-            _, team["paths"] = check_paths(ledger, initiative["id"], initiative["touched_paths"])
+            _, team["paths"] = check_initiative_paths(ledger, initiative["id"])
             if team["paths"]["conflict"]:
                 blockers.append({"initiative": initiative["id"], "owner": owner, "reason": "path_conflict",
                                  "next_action": "Agree path ownership with the retaining team before admission."})
