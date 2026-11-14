@@ -33,12 +33,21 @@ MESSAGES = {
 }
 
 
-def make_store(root):
+def make_store(root, *, fixture_owned=False):
     capabilities = {function.__name__ for function in os.supports_dir_fd}
     if not ({"open", "stat", "link", "unlink"} <= capabilities and
             hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")):
         pytest.skip("anchored store operations unavailable on this platform (end-of-build platform pass)")
-    return codec.Store(root)
+    store = codec.Store(root)
+    complete = False
+    try:
+        if fixture_owned:
+            _own_root(store)
+        complete = True
+        return store
+    finally:
+        if not complete:
+            store.close()
 
 
 @contextmanager
@@ -3309,103 +3318,474 @@ def _store_os(base, **overrides):
     return SimpleNamespace(**copied)
 
 
-def _descriptor_live(identity):
-    root = "/proc/self/fd"
-    if os.path.isdir(root):
-        for name in os.listdir(root):
-            try:
-                info = os.stat(os.path.join(root, name))
-            except OSError:
-                continue
-            if (info.st_dev, info.st_ino) == identity:
-                return True
-        return False
-    return None
+@contextmanager
+def _foreign_descriptor_churn(directory, ledger, opener=None, closer=None,
+                              thread_factory=None):
+    """Open and close foreign descriptors while one recorded generation is live.
 
-
-def _proc_fd_count():
-    root = "/proc/self/fd"
-    if not os.path.isdir(root):
-        return None
-    return len(os.listdir(root))
-
-
-def _watch_store_descriptors(monkeypatch, failure):
-    """Track descriptors Store opens while failure is injected once.
-
-    os.close is the product's Python closer. A stream that already closed the
-    same inode makes a later os.close observe a dead or reused number; that is
-    a second closer. /proc/self/fd (when present) is the leak oracle.
+    The finalizer target stays alive until a recorded open has started. Churn
+    and the finalizer then run during that open, before it returns. Each wait
+    is at most 2 seconds. Fixture failures raise AssertionError.
     """
+    from threading import Event, Thread
+    import weakref
+    if opener is None:
+        opener = os.open
+    if closer is None:
+        closer = os.close
+    if thread_factory is None:
+        thread_factory = Thread
+    stop = Event()
+    recorded = Event()
+    overlapped = Event()
+    report = SimpleNamespace(callback_ran=False, callback_while_outstanding=False,
+                             churn_while_outstanding=False)
+    root = Path(directory)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    errors = []
+    thread_started = False
+    overlap_started = False
+    foreign_owner = None
+    held_owner = None
+    overlap_thread = None
+    finalizer = None
+    yielded = False
+
+    def churn():
+        path = os.fspath(root / "foreign-churn")
+        while not stop.is_set():
+            try:
+                owner = _FixtureOwner(opener(path, flags, 0o600), closer)
+                owner.release()
+            except OSError as error:
+                errors.append(error)
+                return
+            if stop.wait(0.002):
+                return
+
+    def outstanding():
+        with ledger._lock:
+            return any(row["good"] == 0 for row in ledger.rows)
+
+    try:
+        held_owner = _FixtureOwner(
+            opener(os.fspath(root / "foreign-held"), flags, 0o600), closer)
+        thread = thread_factory(target=churn, name="foreign-fd-churn")
+        ledger.arm_overlap(recorded, overlapped)
+        thread.start()
+        thread_started = True
+        foreign_owner = _FixtureOwner(
+            opener(os.fspath(root / "foreign-finalizer"), flags, 0o600), closer)
+        holder = []
+
+        def _finalize(owner=foreign_owner):
+            report.callback_ran = True
+            report.callback_while_outstanding = outstanding()
+            try:
+                owner.release()
+            except OSError as error:
+                errors.append(error)
+            return None
+
+        class _Box:
+            pass
+
+        box = _Box()
+        finalizer = weakref.finalize(box, _finalize)
+        holder.append(box)
+        del box
+
+        def overlap():
+            try:
+                if not recorded.wait(2):
+                    if not stop.is_set():
+                        errors.append(AssertionError(
+                            "descriptor recording did not start within 2s"))
+                    return None
+                if stop.is_set() and not outstanding():
+                    return None
+                path = os.fspath(root / "foreign-overlap")
+                try:
+                    owner = _FixtureOwner(opener(path, flags, 0o600), closer)
+                    owner.release()
+                except OSError as error:
+                    errors.append(error)
+                    return None
+                report.churn_while_outstanding = outstanding()
+                if holder:
+                    holder.pop()
+                finalizer()
+                return None
+            finally:
+                overlapped.set()
+
+        overlap_thread = thread_factory(target=overlap, name="foreign-fd-overlap")
+        overlap_thread.start()
+        overlap_started = True
+        yielded = True
+        yield report
+    except (OSError, ValueError, RuntimeError) as error:
+        if yielded:
+            raise
+        raise AssertionError("foreign descriptor setup failed") from error
+    finally:
+        stop.set()
+        recorded.set()
+        ledger.disarm_overlap()
+        if finalizer is not None:
+            finalizer.detach()
+        if thread_started:
+            thread.join(5)
+            if thread.is_alive():
+                errors.append(AssertionError("foreign descriptor thread did not stop"))
+        if overlap_started:
+            overlap_thread.join(5)
+            if overlap_thread.is_alive():
+                errors.append(AssertionError("foreign overlap thread did not stop"))
+        for owner in (held_owner, foreign_owner):
+            if owner is None:
+                continue
+            try:
+                owner.release()
+            except OSError as error:
+                errors.append(error)
+        if errors:
+            raise AssertionError("foreign descriptor interference failed") from errors[0]
+
+
+class _FixtureOwner:
+    """One descriptor this fixture opened. The flag clears at its one close."""
+
+    def __init__(self, fd, close):
+        from threading import Lock
+        self.fd = fd
+        self._close = close
+        self.owned = True
+        self._lock = Lock()
+
+    def release(self):
+        with self._lock:
+            if not self.owned:
+                return False
+            self.owned = False
+        self._close(self.fd)
+        return True
+
+
+def _cleanup_and_reraise(error, operations):
+    """Run every cleanup and retain the original failure, chaining cleanup errors."""
+    failure = None
+    for operation in operations:
+        try:
+            operation()
+        except BaseException as cleanup_error:
+            if cleanup_error is error:
+                continue
+            if failure is not None:
+                cleanup_error.__cause__ = failure
+            failure = cleanup_error
+    if failure is not None:
+        raise error from failure
+    raise error
+
+
+class _DescriptorLedger:
+    """The sole raw closer for recorded provisional, live and retired generations."""
+
+    def __init__(self):
+        from threading import RLock
+        self.rows = []
+        self.bad = []
+        self._live = {}
+        self._lock = RLock()
+        self._overlap_recorded = None
+        self._overlap_done = None
+        self._overlap_fired = False
+        self._overlap_timeout = None
+        self.forwarded = []
+
+    def new_generation(self, flags):
+        """Allocate ownership bookkeeping before acquiring a process descriptor."""
+        return {"fd": None, "gen": object(), "good": 0, "state": "provisional",
+                "owner": None, "claimed": False, "creat": bool(flags & os.O_CREAT)}
+
+    def record_open(self, row):
+        """Publish an already owned provisional generation; abort retains this token."""
+        with self._lock:
+            assert row["state"] == "provisional"
+            self.rows.append(row)
+            self._live[row["fd"]] = row
+            row["state"] = "live"
+        return row
+
+    def arm_overlap(self, recorded, done):
+        with self._lock:
+            self._overlap_recorded = recorded
+            self._overlap_done = done
+            self._overlap_fired = False
+
+    def disarm_overlap(self):
+        with self._lock:
+            self._overlap_recorded = None
+            self._overlap_done = None
+
+    def wait_for_overlap(self):
+        """Wait only after the caller has retained its opening generation."""
+        with self._lock:
+            fire = self._overlap_recorded is not None and not self._overlap_fired
+            if fire:
+                self._overlap_fired = True
+            recorded, done = self._overlap_recorded, self._overlap_done
+            timeout = 2 if self._overlap_timeout is None else self._overlap_timeout
+        if fire:
+            recorded.set()
+            if not done.wait(timeout):
+                raise AssertionError("foreign descriptor overlap exceeded 2s")
+
+    def facade_row(self, fd):
+        """Resolve a facade API's number; deferred cleanup retains the returned token."""
+        with self._lock:
+            row = self._live.get(fd)
+            if row is None:
+                row = next((row for row in reversed(self.rows) if row["fd"] == fd), None)
+            if row is not None:
+                return row
+            self.bad.append(fd)
+            raise OSError(errno.EBADF, "retired descriptor generation")
+
+    def _matches(self, row, owner):
+        live = self._live.get(row["fd"])
+        available = (row["state"] == "provisional" and (live is None or live is row)
+                     or row["state"] == "live" and live is row)
+        return available and not row["claimed"] and row["owner"] is owner
+
+    def _duplicate(self, row):
+        self.bad.append(row["fd"])
+        row["good"] += 1
+        raise OSError(errno.EBADF, "retired descriptor generation")
+
+    def require_owner(self, row, *, owner=None):
+        """Validate without transferring ownership to a non-owning stream."""
+        with self._lock:
+            if not self._matches(row, owner):
+                self._duplicate(row)
+        return row
+
+    def claim(self, row, *, owner=None, missing="duplicate"):
+        """Atomically claim this exact provisional or live token before raw close."""
+        with self._lock:
+            if self._matches(row, owner):
+                if self._live.get(row["fd"]) is row:
+                    self._live.pop(row["fd"])
+                row["claimed"] = True
+                return row
+            if missing == "absent":
+                return None
+            self._duplicate(row)
+
+    def _record_closed(self, row):
+        """Attempt every diagnostic after the raw close, retaining recording failures."""
+        with self._lock:
+            failure = None
+            for operation in (
+                    lambda: row.__setitem__("state", "retired"),
+                    lambda: self.forwarded.append(row["fd"]),
+                    lambda: row.__setitem__("good", row["good"] + 1)):
+                try:
+                    operation()
+                except BaseException as error:
+                    if failure is not None and error is not failure:
+                        error.__cause__ = failure
+                    failure = error
+            if failure is not None:
+                raise failure
+
+    def close_generation(self, row, real_close, *, owner=None, missing="duplicate"):
+        """A successful claim always reaches raw close before fallible diagnostics."""
+        fd, close_error = row["fd"], None
+        claimed = self.claim(row, owner=owner, missing=missing)
+        if claimed is None:
+            return False
+        try:
+            real_close(fd)
+        except BaseException as error:
+            close_error = error
+        finally:
+            try:
+                self._record_closed(claimed)
+            except BaseException as recording_error:
+                if close_error is not None:
+                    raise close_error from recording_error
+                raise
+        if close_error is not None:
+            raise close_error
+        return True
+
+    def abort_open(self, row, real_close, *, owner=None):
+        return self.close_generation(row, real_close, owner=owner)
+
+    def reserve_stream(self, row):
+        """The ledger keeps the raw descriptor; this token authorizes its stream closer."""
+        with self._lock:
+            self.require_owner(row)
+            owner = object()
+            row["owner"] = owner
+        return owner
+
+    def transfer_to_stream(self, row, stream, real_close, *, owner):
+        """Wrap a non-owning stream; the ledger alone closes its raw generation."""
+        self.require_owner(row, owner=owner)
+        stream_close = stream.close
+
+        def close(*args, **kwargs):
+            self.require_owner(row, owner=owner)
+            try:
+                result = stream_close(*args, **kwargs)
+            except BaseException as error:
+                if stream.closed:
+                    _cleanup_and_reraise(error, [
+                        lambda: self.close_generation(row, real_close, owner=owner)])
+                raise
+            if stream.closed:
+                self.close_generation(row, real_close, owner=owner)
+            return result
+
+        try:
+            stream.close = close
+        except BaseException as error:
+            _cleanup_and_reraise(error, [stream_close])
+        return row
+
+    def release_if_live(self, row, real_close):
+        return self.close_generation(row, real_close, missing="absent")
+
+    def wrap_open(self, real_open, real_close):
+        def opened(path, flags, *args, **kwargs):
+            row = self.new_generation(flags)
+            row["fd"] = real_open(path, flags, *args, **kwargs)
+            try:
+                self.record_open(row)
+                self.wait_for_overlap()
+            except BaseException as error:
+                _cleanup_and_reraise(error, [lambda: self.abort_open(row, real_close)])
+            return row["fd"]
+        return opened
+
+    def wrap_close(self, real_close, on_owned=None):
+        def closed(fd):
+            row = self.facade_row(fd)
+            self.close_generation(row, real_close)
+            if on_owned is not None:
+                on_owned(row)
+            return None
+        return closed
+
+
+def _drain_store_finalizers():
+    """Run unreachable store finalizers before the facade exists.
+
+    A later collection must not close a foreign descriptor through the ledger.
+    """
+    import gc
+    gc.collect()
+
+
+def _watch_store_descriptors(monkeypatch, failure, fdopen_hook=None, *, stream_factory=None):
+    """All constructors and hooks receive non-owning streams; the ledger owns raw fds."""
+    _drain_store_finalizers()
     real_open, real_close = os.open, os.close
-    real_fdopen, real_fsync, real_unlink = os.fdopen, os.fsync, os.unlink
-    rows, bad, preclosed = [], [], []
+    real_fdopen = os.fdopen if stream_factory is None else stream_factory
+    real_fsync, real_unlink = os.fsync, os.unlink
+    ledger = _DescriptorLedger()
     fired = {"fdopen": False, "fsync": False, "close": False, "unlink": False}
 
-    def opened(path, flags, *args, **kwargs):
-        fd = real_open(path, flags, *args, **kwargs)
-        info = os.fstat(fd)
-        rows.append({"fd": fd, "ident": (info.st_dev, info.st_ino), "good": 0,
-                     "creat": bool(flags & os.O_CREAT)})
-        return fd
+    def on_owned(row):
+        if failure == "fdopen-memory-closeerr" and row["creat"] and not fired["close"]:
+            fired["close"] = True
+            raise OSError(errno.EBUSY, MARKER)
 
-    def closed(fd):
-        try:
-            info = os.fstat(fd)
-            ident = (info.st_dev, info.st_ino)
-        except OSError:
-            ident = None
-        pending = [row for row in rows if ident is not None and row["ident"] == ident and row["good"] == 0]
-        if pending:
-            pending[0]["good"] += 1
-            real_close(fd)
-            if failure == "fdopen-memory-closeerr" and pending[0]["creat"] and not fired["close"]:
-                fired["close"] = True
-                raise OSError(errno.EBUSY, MARKER)
-            return None
-        if ident is None and any(row["fd"] == fd for row in rows):
-            bad.append(fd)
-        return real_close(fd)
+    opened = ledger.wrap_open(real_open, real_close)
+    closed = ledger.wrap_close(real_close, on_owned)
+
+    def closefd_requested(args, kwargs):
+        if "closefd" in kwargs:
+            return bool(kwargs["closefd"])
+        return bool(args[4]) if len(args) >= 5 else True
+
+    def nonowning_arguments(args, kwargs):
+        args, kwargs = list(args), dict(kwargs)
+        if len(args) >= 5:
+            args[4] = False
+        if len(args) < 5 or "closefd" in kwargs:
+            kwargs["closefd"] = False
+        return tuple(args), kwargs
 
     def fdopen(fd, mode="r", *args, **kwargs):
-        closefd = kwargs.get("closefd", True)
-        if not fired["fdopen"] and failure != "success":
-            fired["fdopen"] = True
-            if failure == "fdopen-late":
-                if closefd:
-                    real_close(fd)
-                    preclosed.append(fd)
-                raise MemoryError()
-            if failure in ("fdopen-oserror", "fdopen-oserror-closeerr"):
-                raise OSError(errno.EIO, MARKER)
-            if failure in ("fdopen-memory", "fdopen-memory-closeerr", "memory-unlink"):
-                raise MemoryError()
-            if failure == "fdopen-interrupt":
-                raise KeyboardInterrupt()
-            stream = real_fdopen(fd, mode, *args, **kwargs)
-            if failure == "write":
-                def refused(_data):
-                    raise OSError(errno.EIO, MARKER)
-                stream.write = refused
-            elif failure in ("write-memory-close", "close"):
-                real_stream_close = stream.close
+        closefd = closefd_requested(args, kwargs)
+        row = ledger.facade_row(fd)
+        owner = ledger.reserve_stream(row) if closefd else None
+        if not closefd:
+            ledger.require_owner(row)
+        constructed = []
 
-                def close_and_fail():
-                    real_stream_close()
-                    raise OSError(errno.EBUSY if failure == "write-memory-close" else errno.EIO, MARKER)
-                stream.close = close_and_fail
-                if failure == "write-memory-close":
-                    def refused(_data):
-                        raise MemoryError()
-                    stream.write = refused
+        def constructor(fd, mode="r", *args, **kwargs):
+            args, kwargs = nonowning_arguments(args, kwargs)
+            stream = real_fdopen(fd, mode, *args, **kwargs)
+            constructed.append((stream, stream.close))
             return stream
-        return real_fdopen(fd, mode, *args, **kwargs)
+
+        try:
+            args, kwargs = nonowning_arguments(args, kwargs)
+            injected = not fired["fdopen"] and failure != "success"
+            if fdopen_hook is not None:
+                stream = fdopen_hook(fd, mode, args, kwargs, constructor)
+            elif injected:
+                fired["fdopen"] = True
+                if failure == "fdopen-late":
+                    if closefd:
+                        constructor(fd, mode, *args, **kwargs)
+                    raise MemoryError()
+                if failure in ("fdopen-oserror", "fdopen-oserror-closeerr"):
+                    raise OSError(errno.EIO, MARKER)
+                if failure in ("fdopen-memory", "fdopen-memory-closeerr", "memory-unlink"):
+                    raise MemoryError()
+                if failure == "fdopen-interrupt":
+                    raise KeyboardInterrupt()
+                stream = constructor(fd, mode, *args, **kwargs)
+            else:
+                stream = constructor(fd, mode, *args, **kwargs)
+            assert stream is not None, "fdopen must return a stream"
+            if closefd:
+                ledger.transfer_to_stream(row, stream, real_close, owner=owner)
+            if injected and fdopen_hook is None:
+                if failure == "write":
+                    def refused(_data):
+                        raise OSError(errno.EIO, MARKER)
+                    stream.write = refused
+                elif failure in ("write-memory-close", "close"):
+                    stream_close = stream.close
+
+                    def close_and_fail():
+                        stream_close()
+                        raise OSError(
+                            errno.EBUSY if failure == "write-memory-close" else errno.EIO, MARKER)
+                    stream.close = close_and_fail
+                    if failure == "write-memory-close":
+                        def refused(_data):
+                            raise MemoryError()
+                        stream.write = refused
+            return stream
+        except BaseException as error:
+            operations = [closer for stream, closer in reversed(constructed) if not stream.closed]
+            if closefd:
+                operations.append(lambda: ledger.abort_open(row, real_close, owner=owner))
+            _cleanup_and_reraise(error, operations)
 
     def fsync(fd):
-        info = os.fstat(fd)
-        ident = (info.st_dev, info.st_ino)
-        if (failure == "fsync" and not fired["fsync"]
-                and any(row["creat"] and row["ident"] == ident for row in rows)):
+        with ledger._lock:
+            row = ledger._live.get(fd)
+            created = row is not None and row["creat"]
+        if failure == "fsync" and not fired["fsync"] and created:
             fired["fsync"] = True
             raise OSError(errno.ENOSPC, MARKER)
         return real_fsync(fd)
@@ -3418,21 +3798,39 @@ def _watch_store_descriptors(monkeypatch, failure):
 
     monkeypatch.setattr(codec_store, "os", _store_os(
         os, open=opened, close=closed, fdopen=fdopen, fsync=fsync, unlink=unlink))
-    return rows, bad, preclosed
+    return ledger
 
 
-def _assert_descriptors_closed(rows, bad, preclosed, before):
-    assert bad == []
+def _assert_descriptors_closed(rows, bad):
+    """Each recorded generation is closed exactly once. The message names that fd."""
     for row in rows:
-        live = _descriptor_live(row["ident"])
-        if live is not None:
-            assert live is False
-        assert row["good"] <= 1
-        if row["creat"] and row["fd"] in preclosed:
-            assert row["good"] == 0
-    after = _proc_fd_count()
-    if before is not None and after is not None:
-        assert after == before
+        assert row["good"] == 1, row["fd"]
+    assert bad == [], bad[0] if bad else None
+
+
+def _own_root(store, close=os.close):
+    """One owner for the root. Store's finalizer is detached; every close uses owner."""
+    import weakref
+    owner = _FixtureOwner(store.fd, close)
+    store._finalizer.detach()
+    store._fixture_owner = owner
+    store._fixture_finalizer = weakref.finalize(store, owner.release)
+
+    def close_owned():
+        with store._lock:
+            store.fd = None
+            finalizer = store._fixture_finalizer
+            if finalizer is not None:
+                finalizer.detach()
+        owner.release()
+
+    store.close = close_owned
+    return store
+
+
+def _close_store(store):
+    """Close the root once through the single owner. The ledger is not involved."""
+    store.close()
 
 
 def _refuse_write(failure, store, value):
@@ -3453,101 +3851,88 @@ def _refuse_write(failure, store, value):
     "success",
 ])
 def test_store_write_raw_descriptor_has_one_closer(tmp_path, monkeypatch, failure):
+    _drain_store_finalizers()
     root = tmp_path / "store"
     root.mkdir(mode=0o700)
-    store = make_store(root)
+    store = make_store(root, fixture_owned=True)
     value = record(body="closer-" + failure)
-    before = _proc_fd_count()
-    rows, bad, preclosed = _watch_store_descriptors(monkeypatch, failure)
+    ledger = _watch_store_descriptors(monkeypatch, failure)
+    rows, bad = ledger.rows, ledger.bad
     try:
-        if failure == "success":
-            rid = store.write(value)
-            assert store.read(rid) == value
-            assert store.write(value) == rid
-            assert [path.name for path in root.iterdir()] == [rid + ".json"]
-        else:
-            _refuse_write(failure, store, value)
-            names = [path.name for path in root.iterdir()]
-            assert all(not name.endswith(".json") for name in names)
-            if failure == "memory-unlink":
-                assert len(names) == 1 and names[0].startswith(".msg-")
+        with _foreign_descriptor_churn(tmp_path, ledger) as interference:
+            if failure == "success":
+                rid = store.write(value)
+                assert store.read(rid) == value
+                assert store.write(value) == rid
+                assert [path.name for path in root.iterdir()] == [rid + ".json"]
             else:
-                assert names == []
-            rid = store.write(value)
-            assert store.read(rid) == value
-            leftover = [path.name for path in root.iterdir() if path.name != rid + ".json"]
-            assert leftover == ([names[0]] if failure == "memory-unlink" else [])
-        creat = [row for row in rows if row["creat"]]
-        if failure in ("fdopen-oserror", "fdopen-memory", "fdopen-memory-closeerr",
-                       "fdopen-interrupt", "memory-unlink"):
-            assert creat and all(row["good"] == 1 for row in creat[:1])
-        _assert_descriptors_closed(rows, bad, preclosed, before)
+                _refuse_write(failure, store, value)
+                names = [path.name for path in root.iterdir()]
+                assert all(not name.endswith(".json") for name in names)
+                if failure == "memory-unlink":
+                    assert len(names) == 1 and names[0].startswith(".msg-")
+                else:
+                    assert names == []
+                rid = store.write(value)
+                assert store.read(rid) == value
+                leftover = [path.name for path in root.iterdir() if path.name != rid + ".json"]
+                assert leftover == ([names[0]] if failure == "memory-unlink" else [])
+            creat = [row for row in rows if row["creat"]]
+            if failure in ("fdopen-oserror", "fdopen-memory", "fdopen-memory-closeerr",
+                           "fdopen-interrupt", "memory-unlink"):
+                assert creat and all(row["good"] == 1 for row in creat[:1])
+            assert interference.callback_ran
+            assert interference.callback_while_outstanding
+            assert interference.churn_while_outstanding
+            _assert_descriptors_closed(rows, bad)
     finally:
-        store.close()
+        _close_store(store)
 
 
 @pytest.mark.parametrize("failure", ["fdopen-oserror", "fdopen-memory", "fdopen-late"])
 @pytest.mark.parametrize("operation", ["read", "describe"])
 def test_store_read_fdopen_failure_closes_descriptor(tmp_path, monkeypatch, failure, operation):
+    _drain_store_finalizers()
     root = tmp_path / "store"
     root.mkdir(mode=0o700)
-    store = make_store(root)
+    store = make_store(root, fixture_owned=True)
     value = record(body="read-closer-" + failure + operation)
     rid = store.write(value)
-    before = _proc_fd_count()
-    rows, bad, preclosed = _watch_store_descriptors(monkeypatch, failure)
+    ledger = _watch_store_descriptors(monkeypatch, failure)
+    rows, bad = ledger.rows, ledger.bad
     try:
-        action = (lambda: store.read(rid)) if operation == "read" else (lambda: store.describe(rid))
-        if failure == "fdopen-oserror":
-            assert_error("E_AUTH", action, _OPERATION)
-        else:
-            with pytest.raises(MemoryError):
-                action()
-        assert (root / (rid + ".json")).is_file()
-        opened = [row for row in rows if row["good"] == 0 or row["fd"] not in preclosed]
-        assert opened and opened[0]["good"] == (0 if opened[0]["fd"] in preclosed else 1)
-        if operation == "read":
-            assert store.read(rid) == value
-        else:
-            assert store.describe(rid)["kind"] == value["kind"]
-        _assert_descriptors_closed(rows, bad, preclosed, before)
+        with _foreign_descriptor_churn(tmp_path, ledger) as interference:
+            action = (lambda: store.read(rid)) if operation == "read" else (lambda: store.describe(rid))
+            if failure == "fdopen-oserror":
+                assert_error("E_AUTH", action, _OPERATION)
+            else:
+                with pytest.raises(MemoryError):
+                    action()
+            assert (root / (rid + ".json")).is_file()
+            assert rows and rows[0]["good"] == 1
+            if operation == "read":
+                assert store.read(rid) == value
+            else:
+                assert store.describe(rid)["kind"] == value["kind"]
+            assert interference.callback_ran
+            assert interference.callback_while_outstanding
+            assert interference.churn_while_outstanding
+            _assert_descriptors_closed(rows, bad)
     finally:
-        store.close()
+        _close_store(store)
 
 
 def test_store_write_fdopen_failure_unblocks_waiting_writer(tmp_path, monkeypatch):
+    _drain_store_finalizers()
     from threading import Event, Thread
     import time
     root = tmp_path / "store"
     root.mkdir(mode=0o700)
-    store = make_store(root)
+    store = make_store(root, fixture_owned=True)
     entered, release = Event(), Event()
-    real_open, real_close, real_fdopen = os.open, os.close, os.fdopen
-    rows, bad = [], []
     first = {"done": False}
 
-    def opened(path, flags, *args, **kwargs):
-        fd = real_open(path, flags, *args, **kwargs)
-        info = os.fstat(fd)
-        rows.append({"fd": fd, "ident": (info.st_dev, info.st_ino), "good": 0,
-                     "creat": bool(flags & os.O_CREAT)})
-        return fd
-
-    def closed(fd):
-        try:
-            info = os.fstat(fd)
-            ident = (info.st_dev, info.st_ino)
-        except OSError:
-            ident = None
-        pending = [row for row in rows if ident is not None and row["ident"] == ident and row["good"] == 0]
-        if pending:
-            pending[0]["good"] += 1
-            return real_close(fd)
-        if ident is None and any(row["fd"] == fd for row in rows):
-            bad.append(fd)
-        return real_close(fd)
-
-    def fdopen(fd, mode="r", *args, **kwargs):
+    def blocking_fdopen(fd, mode, args, kwargs, real_fdopen):
         if not first["done"]:
             first["done"] = True
             entered.set()
@@ -3566,8 +3951,10 @@ def test_store_write_fdopen_failure_unblocks_waiting_writer(tmp_path, monkeypatc
             return inner.__exit__(*args)
 
     store._lock = _Contended()
-    monkeypatch.setattr(codec_store, "os", _store_os(os, open=opened, close=closed, fdopen=fdopen))
-    before, box = _proc_fd_count(), []
+    ledger = _watch_store_descriptors(
+        monkeypatch, "success", fdopen_hook=blocking_fdopen)
+    rows, bad = ledger.rows, ledger.bad
+    box = []
 
     def run(body):
         try:
@@ -3577,32 +3964,1229 @@ def test_store_write_fdopen_failure_unblocks_waiting_writer(tmp_path, monkeypatc
 
     first_writer, second_writer = Thread(target=run, args=("first",)), Thread(target=run, args=("second",))
     try:
-        first_writer.start()
-        assert entered.wait(5)
-        second_writer.start()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and len(enters) < 2:
-            time.sleep(0.01)
-        assert enters == [False, True]
-        assert second_writer.is_alive()
-        release.set()
-        first_writer.join(5)
-        second_writer.join(5)
-        assert not first_writer.is_alive() and not second_writer.is_alive()
-        errors = [item for item in box if item[0] == "err"]
-        written = [item[1] for item in box if item[0] == "ok"]
-        assert len(errors) == 1 and len(written) == 1
-        assert errors[0][1] is codec.CodecError and errors[0][2].code == "E_AUTH"
-        assert str(errors[0][2]) == _OPERATION
-        assert MARKER not in json.dumps(errors[0][2].as_dict())
-        assert store.read(written[0]) == record(body="second")
-        assert [path.name for path in root.iterdir()] == [written[0] + ".json"]
-        creat = [row for row in rows if row["creat"]]
-        assert len(creat) == 2 and creat[0]["good"] == 1
-        _assert_descriptors_closed(rows, bad, [], before)
+        with _foreign_descriptor_churn(tmp_path, ledger) as interference:
+            first_writer.start()
+            assert entered.wait(5)
+            second_writer.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and len(enters) < 2:
+                time.sleep(0.01)
+            assert enters == [False, True]
+            assert second_writer.is_alive()
+            release.set()
+            first_writer.join(5)
+            second_writer.join(5)
+            assert not first_writer.is_alive() and not second_writer.is_alive()
+            errors = [item for item in box if item[0] == "err"]
+            written = [item[1] for item in box if item[0] == "ok"]
+            assert len(errors) == 1 and len(written) == 1
+            assert errors[0][1] is codec.CodecError and errors[0][2].code == "E_AUTH"
+            assert str(errors[0][2]) == _OPERATION
+            assert MARKER not in json.dumps(errors[0][2].as_dict())
+            assert store.read(written[0]) == record(body="second")
+            assert [path.name for path in root.iterdir()] == [written[0] + ".json"]
+            creat = [row for row in rows if row["creat"]]
+            assert len(creat) == 2 and creat[0]["good"] == 1
+            assert interference.callback_ran
+            assert interference.callback_while_outstanding
+            assert interference.churn_while_outstanding
+            _assert_descriptors_closed(rows, bad)
     finally:
         release.set()
         first_writer.join(5)
         second_writer.join(5)
         store._lock = inner
+        _close_store(store)
+
+
+def test_descriptor_ledger_names_a_leaked_fd(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("leaked", 0)
+    try:
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        assert ledger.release_if_live(ledger.rows[0], boundary.close) is True
+    assert boundary.calls == [fd] and fd not in boundary.live
+
+
+def test_descriptor_ledger_names_a_double_close(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("twice", 0)
+    try:
+        codec_store.os.close(fd)
+        with pytest.raises(OSError):
+            codec_store.os.close(fd)
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+        assert boundary.calls == [fd]
+    finally:
+        ledger.release_if_live(ledger.rows[0], boundary.close)
+
+
+def _close_from_finalizer(fd):
+    """Run one weakref finalizer that closes fd through the store facade."""
+    import weakref
+    ran = {"yes": False}
+
+    def callback(fd=fd):
+        ran["yes"] = True
+        try:
+            codec_store.os.close(fd)
+        except OSError:
+            return None
+        return None
+
+    class _Box:
+        pass
+
+    box = _Box()
+    finalizer = weakref.finalize(box, callback)
+    del box
+    finalizer()
+    assert ran["yes"] and not finalizer.alive
+    return ran
+
+
+def test_duplicate_close_of_a_retired_generation_is_not_forwarded(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("retired", 0)
+    try:
+        gen = ledger.rows[0]["gen"]
+        codec_store.os.close(fd)
+        assert boundary.calls == [fd]
+        with pytest.raises(OSError):
+            codec_store.os.close(fd)
+        assert boundary.calls == [fd]
+        assert ledger.rows[0]["gen"] is gen and ledger.rows[0]["good"] == 2
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        ledger.release_if_live(ledger.rows[0], boundary.close)
+
+
+def test_finalizer_duplicate_of_a_retired_generation_fails(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("finalizer-retired", 0)
+    try:
+        codec_store.os.close(fd)
+        assert boundary.calls == [fd]
+        _close_from_finalizer(fd)
+        assert boundary.calls == [fd]
+        assert fd in ledger.bad
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        ledger.release_if_live(ledger.rows[0], boundary.close)
+
+
+def test_finalizer_close_of_a_live_generation_is_owned(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("finalizer-live", 0)
+    try:
+        gen = ledger.rows[0]["gen"]
+        _close_from_finalizer(fd)
+        assert boundary.calls == [fd] and fd not in boundary.live
+        assert ledger.rows[0]["gen"] is gen and ledger.rows[0]["good"] == 1
+        _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        ledger.release_if_live(ledger.rows[0], boundary.close)
+
+
+class _OsBoundary:
+    """Descriptor numbers owned by this table. Reuse never calls the process."""
+
+    def __init__(self):
+        self.live = {}
+        self.calls = []
+        self._freed = []
+        self._next = 1 << 20
+
+    def open(self, path, flags, *args, **kwargs):
+        if self._freed:
+            fd = self._freed.pop(0)
+        else:
+            fd = self._next
+            self._next += 1
+        self.live[fd] = object()
+        return fd
+
+    def reuse(self, number):
+        self._freed = [fd for fd in self._freed if fd != number]
+        self.live[number] = object()
+        return number
+
+    def close(self, fd):
+        self.calls.append(fd)
+        if self.live.pop(fd, None) is None:
+            raise OSError(errno.EBADF, "boundary")
+        self._freed.append(fd)
+        return None
+
+
+def _boundary_facade(monkeypatch, ledger, boundary, *, store_surface=False):
+    _drain_store_finalizers()
+    overrides = {"open": ledger.wrap_open(boundary.open, boundary.close),
+                 "close": ledger.wrap_close(boundary.close)}
+    surface = _store_os(os, **overrides) if store_surface else SimpleNamespace(**overrides)
+    monkeypatch.setattr(codec_store, "os", surface)
+
+
+def test_duplicate_facade_close_leaves_a_reused_number_untouched(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("recorded", 0)
+    gen = ledger.rows[0]["gen"]
+    codec_store.os.close(fd)
+    assert boundary.calls == [fd] and fd not in boundary.live
+    boundary.reuse(fd)
+    token = boundary.live[fd]
+    with pytest.raises(OSError):
+        codec_store.os.close(fd)
+    assert boundary.live[fd] is token
+    assert boundary.calls == [fd]
+    assert ledger.rows[0]["gen"] is gen and ledger.rows[0]["good"] == 2
+    assert fd in ledger.bad
+
+
+def test_recorded_reuse_is_a_new_generation_closed_once(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("recorded", 0)
+    first = ledger.rows[0]["gen"]
+    codec_store.os.close(fd)
+    fd2 = codec_store.os.open("again", 0)
+    assert fd2 == fd
+    assert ledger.rows[1]["gen"] is not first and ledger.rows[1]["good"] == 0
+    codec_store.os.close(fd2)
+    assert ledger.rows[0]["good"] == 1 and ledger.rows[1]["good"] == 1
+    assert ledger.bad == []
+    assert boundary.calls == [fd, fd2] and fd2 not in boundary.live
+    _assert_descriptors_closed(ledger.rows, ledger.bad)
+
+
+def _require_store_os_surface():
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        pytest.skip("anchored store operations unavailable on this platform "
+                    "(end-of-build platform pass)")
+
+
+def test_fdopen_late_then_release_records_a_duplicate(tmp_path, monkeypatch):
+    """fdopen-late closes the descriptor, then Store._release is a duplicate."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "fdopen-late")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "late"), flags, 0o600)
+    try:
+        with pytest.raises(MemoryError):
+            codec_store.os.fdopen(fd, "wb", closefd=True)
+        codec_store._release(fd)
+        assert ledger.rows[0]["good"] == 2
+        assert fd in ledger.bad
+    finally:
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_unclosed_owning_stream_is_a_leak(tmp_path, monkeypatch):
+    """A closefd=True stream still owns the generation until that stream closes."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "held-stream"), flags, 0o600)
+    stream = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", closefd=True)
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+        stream.close()
+        _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def _open_closefd_stream(monkeypatch, tmp_path, branch):
+    """One recorded descriptor through one transfer_to_stream return.
+
+    hook: fdopen_hook returns the stream, then the hook return transfers it.
+    injected: a non-success fdopen returns the stream on the injected-failure return.
+    normal: the success return transfers it. "write" replaces stream.write only.
+    """
+    _require_store_os_surface()
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if branch == "hook":
+        def hook(fd, mode, args, kwargs, real_fdopen):
+            return real_fdopen(fd, mode, *args, **kwargs)
+        ledger = _watch_store_descriptors(monkeypatch, "success", fdopen_hook=hook)
+    elif branch == "injected":
+        ledger = _watch_store_descriptors(monkeypatch, "write")
+    elif branch == "normal":
+        ledger = _watch_store_descriptors(monkeypatch, "success")
+    else:
+        raise AssertionError(branch)
+    fd = codec_store.os.open(os.fspath(tmp_path / "owned-stream"), flags, 0o600)
+    stream = codec_store.os.fdopen(fd, "rb", closefd=True)
+    return ledger, fd, stream
+
+
+@pytest.mark.parametrize("branch", ["hook", "injected", "normal"])
+def test_failed_stream_close_does_not_retire_the_generation(tmp_path, monkeypatch, branch):
+    """close(1) raises before the descriptor closes, so the generation stays open."""
+    ledger, fd, stream = _open_closefd_stream(monkeypatch, tmp_path, branch)
+    try:
+        with pytest.raises(TypeError, match="takes no arguments") as raised:
+            stream.close(1)
+        assert raised.value.__cause__ is None
+        assert stream.closed is False
+        assert ledger.rows[0]["good"] == 0
+        with pytest.raises(AssertionError, match=r"\b%d\b" % fd):
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+        stream.close()
+        _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+@pytest.mark.parametrize("branch", ["hook", "injected", "normal"])
+def test_raising_close_after_the_stream_closes_retires_the_generation(
+        tmp_path, monkeypatch, branch):
+    """A close that leaves the stream closed still retires, and the error propagates."""
+    ledger, fd, stream = _open_closefd_stream(monkeypatch, tmp_path, branch)
+    try:
+        def flush_fails():
+            raise OSError(errno.EIO, "flush")
+        stream.flush = flush_fails
+        with pytest.raises(OSError) as raised:
+            stream.close()
+        assert raised.value.errno == errno.EIO
+        assert raised.value.__cause__ is None
+        assert stream.closed is True
+        assert ledger.rows[0]["good"] == 1
+        _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_facade_close_while_stream_owns_the_fd_is_not_forwarded(tmp_path, monkeypatch):
+    """A facade close while the stream owns the generation is a duplicate and is not forwarded."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "stream-owns"), flags, 0o600)
+    stream = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", closefd=True)
+        with pytest.raises(OSError):
+            codec_store.os.close(fd)
+        assert fd in ledger.bad
+        assert ledger.forwarded == []
+        stream.close()
+        assert ledger.rows[0]["good"] == 2
+        assert ledger.forwarded == [fd]
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_stream_closefd_then_finish_records_a_duplicate(tmp_path, monkeypatch):
+    """The stream close retires the generation. The raw close in _finish_stream is a duplicate."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "stream"), flags, 0o600)
+    stream = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", closefd=True)
+        codec_store._finish_stream(stream, fd, True)
+        assert ledger.rows[0]["good"] == 2
+        assert fd in ledger.bad
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_cleanup_skips_a_retired_boundary_generation(monkeypatch):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("recorded", 0)
+    codec_store.os.close(fd)
+    boundary.reuse(fd)
+    token = boundary.live[fd]
+    assert ledger.release_if_live(ledger.rows[0], boundary.close) is False
+    assert boundary.live[fd] is token
+    assert boundary.calls == [fd]
+
+
+def test_fixture_cleanup_skips_a_retired_owner():
+    boundary = _OsBoundary()
+    fd = boundary.open("foreign", 0)
+    owner = _FixtureOwner(fd, boundary.close)
+    assert owner.release() is True
+    boundary.reuse(fd)
+    token = boundary.live[fd]
+    assert owner.release() is False
+    assert boundary.live[fd] is token
+    assert boundary.calls == [fd]
+
+
+def test_second_closefd_fdopen_is_a_duplicate(tmp_path, monkeypatch):
+    """A second closefd fdopen claims nothing and does not call the OS."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "second-fdopen"), flags, 0o600)
+    stream = None
+    second = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", closefd=True)
+        with pytest.raises(OSError) as raised:
+            second = codec_store.os.fdopen(fd, "rb", closefd=True)
+        assert raised.value.errno == errno.EBADF
+        assert raised.value.args[1] == "retired descriptor generation"
+        os.fstat(fd)
+        assert stream.closed is False
+        assert fd in ledger.bad
+        assert ledger.forwarded == []
+        stream.close()
+        assert ledger.rows[0]["good"] == 2
+    finally:
+        if second is not None and not second.closed:
+            second.close()
+        elif stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_fdopen_of_a_retired_generation_does_not_reach_the_os(tmp_path, monkeypatch):
+    """After the generation is closed, closefd fdopen raises before the hook."""
+    _require_store_os_surface()
+    calls = []
+
+    def hook(fd, mode, args, kwargs, real_fdopen):
+        calls.append(fd)
+        return None
+
+    ledger = _watch_store_descriptors(monkeypatch, "success", fdopen_hook=hook)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "retired-fdopen"), flags, 0o600)
+    try:
+        codec_store.os.close(fd)
+        assert calls == []
+        with pytest.raises(OSError) as raised:
+            codec_store.os.fdopen(fd, "rb", closefd=True)
+        assert raised.value.errno == errno.EBADF
+        assert raised.value.args[1] == "retired descriptor generation"
+        assert calls == []
+        assert ledger.forwarded == [fd]
+        assert fd in ledger.bad
+    finally:
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_fdopen_late_of_an_unrecorded_fd_does_not_close_it(tmp_path, monkeypatch):
+    """fdopen-late claims before real_close, so a foreign descriptor stays open."""
+    _require_store_os_surface()
+    _watch_store_descriptors(monkeypatch, "fdopen-late")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    foreign = os.open(os.fspath(tmp_path / "foreign-late"), flags, 0o600)
+    try:
+        with pytest.raises(OSError) as raised:
+            codec_store.os.fdopen(foreign, "wb", closefd=True)
+        assert raised.value.errno == errno.EBADF
+        assert raised.value.args[1] == "retired descriptor generation"
+        os.fstat(foreign)
+    finally:
+        os.close(foreign)
+
+
+def test_positional_closefd_false_keeps_the_facade_close(tmp_path, monkeypatch):
+    """args[4] is closefd. False leaves the generation with the facade."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "positional"), flags, 0o600)
+    stream = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", -1, None, None, None, False)
+        stream.close()
+        assert stream.closed is True
+        assert ledger.rows[0]["good"] == 0
+        os.fstat(fd)
+        codec_store.os.close(fd)
+        assert ledger.rows[0]["good"] == 1
+        assert ledger.bad == []
+        assert ledger.forwarded == [fd]
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_keyword_closefd_false_keeps_the_facade_close(tmp_path, monkeypatch):
+    """Keyword closefd=False does not claim. The facade close is the one close."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "keyword"), flags, 0o600)
+    stream = None
+    try:
+        stream = codec_store.os.fdopen(fd, "rb", closefd=False)
+        stream.close()
+        assert ledger.rows[0]["good"] == 0
+        codec_store.os.close(fd)
+        assert ledger.rows[0]["good"] == 1
+        assert ledger.bad == []
+        assert ledger.forwarded == [fd]
+    finally:
+        if stream is not None and not stream.closed:
+            stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_pre_stream_fdopen_error_retires_the_owned_generation(tmp_path, monkeypatch):
+    """An owning constructor failure closes through the ledger and never restores."""
+    _require_store_os_surface()
+    ledger = _watch_store_descriptors(monkeypatch, "fdopen-oserror")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = codec_store.os.open(os.fspath(tmp_path / "retired"), flags, 0o600)
+    try:
+        with pytest.raises(OSError) as raised:
+            codec_store.os.fdopen(fd, "rb", closefd=True)
+        assert raised.value.errno == errno.EIO
+        assert ledger.rows[0]["good"] == 1
+        assert ledger.rows[0]["state"] == "retired"
+        assert fd not in ledger.bad
+        with pytest.raises(OSError) as duplicate:
+            codec_store.os.close(fd)
+        assert duplicate.value.errno == errno.EBADF
+        assert ledger.rows[0]["good"] == 2
+        assert ledger.bad == [fd]
+        assert ledger.forwarded == [fd]
+    finally:
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_overlap_timeout_is_assertion_and_retires_the_open(monkeypatch):
+    """The overlap wait is not an OSError, and the opened fd is retired before close."""
+    from threading import Event
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    ledger.arm_overlap(Event(), Event())
+    ledger._overlap_timeout = 0.05
+    with pytest.raises(AssertionError, match="overlap"):
+        codec_store.os.open("stalled", 0)
+    assert ledger._live == {}
+    assert ledger.rows[0]["good"] == 1
+    assert boundary.calls == [ledger.rows[0]["fd"]]
+
+
+def test_overlap_timeout_inside_store_write_is_assertion(tmp_path, monkeypatch):
+    """Store must not map the overlap failure to CodecError E_AUTH."""
+    from threading import Event
+    _drain_store_finalizers()
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    store = make_store(root, fixture_owned=True)
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    done = Event()
+    ledger.arm_overlap(Event(), done)
+    ledger._overlap_timeout = 0.05
+    try:
+        with pytest.raises(AssertionError, match="overlap"):
+            store.write(record(body="timeout-assert"))
+        assert ledger._live == {}
+        assert ledger.rows and all(row["good"] == 1 for row in ledger.rows)
+        assert ledger.bad == []
+    finally:
+        done.set()
+        ledger.disarm_overlap()
+        _close_store(store)
+
+
+@pytest.mark.parametrize("first_close", ["store", "fixture", "finalizer"])
+def test_root_cleanup_skips_a_retired_owner(first_close):
+    """One owner closes the root once. A later close leaves a reused number alone."""
+    from threading import Lock
+    import weakref
+
+    class _Root:
+        pass
+
+    boundary = _OsBoundary()
+    fd = boundary.open("root", 0)
+    store = _Root()
+    store.fd = fd
+    store._lock = Lock()
+    store._finalizer = weakref.finalize(store, boundary.close, fd)
+    _own_root(store, close=boundary.close)
+    assert store._finalizer.alive is False
+    if first_close == "store":
         store.close()
+    elif first_close == "fixture":
+        _close_store(store)
+    else:
+        store._fixture_finalizer()
+    assert boundary.calls == [fd]
+    boundary.reuse(fd)
+    token = boundary.live[fd]
+    _close_store(store)
+    store.close()
+    assert store.fd is None
+    assert boundary.live[fd] is token
+    assert boundary.calls == [fd]
+
+
+def test_foreign_interference_overlaps_the_recorded_open(tmp_path, monkeypatch):
+    _drain_store_finalizers()
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    store = make_store(root, fixture_owned=True)
+    value = record(body="overlap-generation")
+    ledger = _watch_store_descriptors(monkeypatch, "success")
+    try:
+        with _foreign_descriptor_churn(tmp_path, ledger) as interference:
+            rid = store.write(value)
+            assert store.read(rid) == value
+            assert interference.callback_ran
+            assert interference.callback_while_outstanding
+            assert interference.churn_while_outstanding
+            _assert_descriptors_closed(ledger.rows, ledger.bad)
+    finally:
+        _close_store(store)
+
+
+def test_churn_start_failure_releases_the_held_descriptor(tmp_path):
+    """thread.start sits inside the cleanup, so a start failure closes the held fd."""
+    ledger = _DescriptorLedger()
+    closed = []
+
+    def closer(fd):
+        closed.append(fd)
+        os.close(fd)
+
+    class _StartFails:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("start failed")
+
+    with pytest.raises(AssertionError, match="^foreign descriptor setup failed$") as raised:
+        with _foreign_descriptor_churn(
+                tmp_path, ledger, closer=closer, thread_factory=_StartFails):
+            pass
+    assert type(raised.value.__cause__) is RuntimeError
+    assert str(raised.value.__cause__) == "start failed"
+    assert closed
+    assert ledger._overlap_recorded is None
+
+
+def test_churn_open_failure_is_recorded(tmp_path):
+    """An os.open failure inside the churn thread is stored, not discarded."""
+    from threading import Event
+    ledger = _DescriptorLedger()
+    failed = Event()
+
+    def opener(path, flags, *args, **kwargs):
+        if str(path).endswith("foreign-churn"):
+            failed.set()
+            raise OSError(errno.EIO, "churn open")
+        return os.open(path, flags, *args, **kwargs)
+
+    with pytest.raises(AssertionError, match="^foreign descriptor interference failed$") as raised:
+        with _foreign_descriptor_churn(tmp_path, ledger, opener=opener):
+            assert failed.wait(2)
+    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.__cause__.errno == errno.EIO
+    assert ledger._overlap_recorded is None
+
+
+def test_churn_constructor_failure_releases_the_held_descriptor(tmp_path):
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+
+    def refused_thread(**kwargs):
+        raise AssertionError("thread construction failed")
+
+    with pytest.raises(AssertionError, match="^thread construction failed$"):
+        with _foreign_descriptor_churn(
+                tmp_path, ledger, opener=boundary.open, closer=boundary.close,
+                thread_factory=refused_thread):
+            pytest.fail("thread construction must fail before yielding")
+    assert boundary.live == {}
+    assert len(boundary.calls) == 1
+    assert ledger._overlap_recorded is None
+
+
+def test_second_stream_close_does_not_close_a_reused_boundary_number():
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    fd = ledger.wrap_open(boundary.open, boundary.close)("stream", 0)
+    row = ledger.rows[0]
+
+    class Stream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream()
+    owner = ledger.reserve_stream(row)
+    ledger.transfer_to_stream(row, stream, boundary.close, owner=owner)
+    stream.close()
+    boundary.reuse(fd)
+    foreign = boundary.live[fd]
+    with pytest.raises(OSError) as raised:
+        stream.close()
+    assert raised.value.errno == errno.EBADF
+    assert boundary.live[fd] is foreign
+    assert boundary.calls == [fd]
+    assert ledger.bad == [fd]
+    assert row["good"] == 2
+
+
+def test_aborted_open_does_not_close_an_already_retired_generation(monkeypatch):
+    from threading import Event
+    ledger = _DescriptorLedger()
+    boundary = _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+
+    class RetireDuringWait:
+        def wait(self, timeout):
+            fd = ledger.rows[-1]["fd"]
+            codec_store.os.close(fd)
+            boundary.reuse(fd)
+            return False
+
+    ledger.arm_overlap(Event(), RetireDuringWait())
+    with pytest.raises(AssertionError, match="^foreign descriptor overlap exceeded 2s$") as raised:
+        codec_store.os.open("aborted", 0)
+    fd = ledger.rows[0]["fd"]
+    assert type(raised.value.__cause__) is OSError
+    assert raised.value.__cause__.errno == errno.EBADF
+    assert fd in boundary.live
+    assert boundary.calls == [fd]
+    assert ledger.bad == [fd]
+
+
+@pytest.mark.parametrize("failure", ["success", "fdopen-late"])
+@pytest.mark.parametrize("positional", [False, True])
+def test_closefd_fdopen_refuses_foreign_reuse_before_the_hook(
+        tmp_path, monkeypatch, failure, positional):
+    _require_store_os_surface()
+    calls = []
+
+    def hook(fd, mode, args, kwargs, real_fdopen):
+        calls.append(fd)
+        raise AssertionError("retired descriptor reached fdopen hook")
+
+    ledger = _watch_store_descriptors(monkeypatch, failure, fdopen_hook=hook)
+    boundary = _OsBoundary()
+    fd = ledger.wrap_open(boundary.open, boundary.close)("recorded", 0)
+    ledger.wrap_close(boundary.close)(fd)
+    boundary.reuse(fd)
+    foreign = boundary.live[fd]
+    with pytest.raises(OSError) as raised:
+        if positional:
+            codec_store.os.fdopen(fd, "rb", -1, None, None, None, True)
+        else:
+            codec_store.os.fdopen(fd, "rb", closefd=True)
+    assert raised.value.errno == errno.EBADF
+    assert raised.value.args[1] == "retired descriptor generation"
+    assert calls == []
+    assert boundary.live[fd] is foreign
+    assert boundary.calls == [fd]
+    assert ledger.bad == [fd]
+
+
+def test_churn_arm_failure_disarms_and_closes_the_held_descriptor(tmp_path):
+    class RefusedLedger(_DescriptorLedger):
+        def arm_overlap(self, recorded, done):
+            super().arm_overlap(recorded, done)
+            raise AssertionError("arming failed")
+
+    ledger = RefusedLedger()
+    boundary = _OsBoundary()
+    with pytest.raises(AssertionError, match="^arming failed$"):
+        with _foreign_descriptor_churn(
+                tmp_path, ledger, opener=boundary.open, closer=boundary.close):
+            pytest.fail("arming must fail before yielding")
+    assert boundary.live == {}
+    assert len(boundary.calls) == 1
+    assert ledger._overlap_recorded is None
+
+
+def test_overlap_thread_open_failure_reaches_the_caller(tmp_path):
+    ledger = _DescriptorLedger()
+
+    def opener(path, flags, *args, **kwargs):
+        if str(path).endswith("foreign-overlap"):
+            raise OSError(errno.EIO, "overlap open")
+        return os.open(path, flags, *args, **kwargs)
+
+    row = None
+    try:
+        with pytest.raises(AssertionError, match="^foreign descriptor interference failed$") as raised:
+            with _foreign_descriptor_churn(tmp_path, ledger, opener=opener):
+                ledger.wrap_open(os.open, os.close)(
+                    os.fspath(tmp_path / "recorded"), os.O_RDWR | os.O_CREAT, 0o600)
+                row = ledger.rows[-1]
+        assert isinstance(raised.value.__cause__, OSError)
+        assert raised.value.__cause__.errno == errno.EIO
+    finally:
+        if row is not None:
+            ledger.release_if_live(row, os.close)
+
+
+@pytest.mark.parametrize("entry", ["facade", "store"])
+@pytest.mark.parametrize("recorded_replacement", [False, True])
+@pytest.mark.parametrize("wait_times_out", [False, True])
+def test_aborted_open_preserves_its_generation_and_original_exception(
+        tmp_path, monkeypatch, entry, recorded_replacement, wait_times_out):
+    from threading import Event
+
+    class Boundary(_OsBoundary):
+        def open(self, path, flags, *args, **kwargs):
+            if str(path).endswith(".json"):
+                raise FileNotFoundError(errno.ENOENT, "missing record")
+            return super().open(path, flags, *args, **kwargs)
+
+    store = None
+    if entry == "store":
+        root = tmp_path / "store"
+        root.mkdir(mode=0o700)
+        store = make_store(root, fixture_owned=True)
+    ledger, boundary = _DescriptorLedger(), Boundary()
+    original = AssertionError("fixture rendezvous failed")
+    replacement = []
+
+    class RetireDuringWait:
+        def wait(self, timeout):
+            row = ledger.rows[0]
+            codec_store.os.close(row["fd"])
+            if recorded_replacement:
+                fd = codec_store.os.open("replacement", 0)
+                assert fd == row["fd"]
+            else:
+                fd = boundary.reuse(row["fd"])
+            replacement.append(boundary.live[fd])
+            if wait_times_out:
+                return False
+            raise original
+
+    try:
+        _boundary_facade(monkeypatch, ledger, boundary, store_surface=entry == "store")
+        ledger.arm_overlap(Event(), RetireDuringWait())
+        expected = "foreign descriptor overlap exceeded 2s" if wait_times_out else "fixture rendezvous failed"
+        with pytest.raises(AssertionError, match="^" + expected + "$") as raised:
+            if entry == "store":
+                store.write(record(body="generation-bound-abort"))
+            else:
+                codec_store.os.open("aborted", 0)
+        if not wait_times_out:
+            assert raised.value is original
+        assert type(raised.value.__cause__) is OSError
+        assert raised.value.__cause__.errno == errno.EBADF
+        row = ledger.rows[0]
+        assert boundary.live[row["fd"]] is replacement[0]
+        assert boundary.calls == [row["fd"]]
+        assert ledger.bad == [row["fd"]]
+        assert row["good"] == 2
+        if recorded_replacement:
+            assert ledger._live[row["fd"]] is ledger.rows[1]
+            assert ledger.rows[1]["good"] == 0
+        else:
+            assert ledger._live == {}
+    finally:
+        if store is not None:
+            _close_store(store)
+
+
+@pytest.mark.parametrize("entry", ["facade", "store"])
+def test_aborted_open_chains_close_failure_without_replacing_the_fixture_error(
+        tmp_path, monkeypatch, entry):
+    from threading import Event
+    cleanup_error = OSError(errno.EIO, "boundary close failed")
+    original = AssertionError("fixture rendezvous failed")
+
+    class Boundary(_OsBoundary):
+        def open(self, path, flags, *args, **kwargs):
+            if str(path).endswith(".json"):
+                raise FileNotFoundError(errno.ENOENT, "missing record")
+            return super().open(path, flags, *args, **kwargs)
+
+        def close(self, fd):
+            super().close(fd)
+            raise cleanup_error
+
+    class RefusedWait:
+        def wait(self, timeout):
+            raise original
+
+    store = None
+    if entry == "store":
+        root = tmp_path / "store"
+        root.mkdir(mode=0o700)
+        store = make_store(root, fixture_owned=True)
+    ledger, boundary = _DescriptorLedger(), Boundary()
+    try:
+        _boundary_facade(monkeypatch, ledger, boundary, store_surface=entry == "store")
+        ledger.arm_overlap(Event(), RefusedWait())
+        with pytest.raises(AssertionError, match="^fixture rendezvous failed$") as raised:
+            if entry == "store":
+                store.write(record(body="aborted-close-error"))
+            else:
+                codec_store.os.open("aborted", 0)
+        assert raised.value is original
+        assert raised.value.__cause__ is cleanup_error
+        assert boundary.live == {}
+        assert boundary.calls == [ledger.rows[0]["fd"]]
+        assert ledger.rows[0]["good"] == 1
+        assert ledger.bad == []
+    finally:
+        if store is not None:
+            _close_store(store)
+
+
+def test_generation_sweep_leaves_a_replacement_facade_generation_open(monkeypatch):
+    ledger, boundary = _DescriptorLedger(), _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("first", 0)
+    first = ledger.rows[0]
+    codec_store.os.close(fd)
+    assert codec_store.os.open("replacement", 0) == fd
+    replacement = boundary.live[fd]
+    assert ledger.release_if_live(first, boundary.close) is False
+    assert boundary.live[fd] is replacement
+    assert boundary.calls == [fd]
+    assert first["good"] == 1
+    assert ledger.rows[1]["good"] == 0
+    assert ledger.bad == []
+
+
+def test_retired_stream_credits_its_own_generation_after_facade_reuse(monkeypatch):
+    ledger, boundary = _DescriptorLedger(), _OsBoundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("stream", 0)
+    first = ledger.rows[0]
+
+    class Stream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream()
+    owner = ledger.reserve_stream(first)
+    ledger.transfer_to_stream(first, stream, boundary.close, owner=owner)
+    stream.close()
+    assert codec_store.os.open("replacement", 0) == fd
+    replacement = boundary.live[fd]
+    with pytest.raises(OSError) as raised:
+        stream.close()
+    assert raised.value.errno == errno.EBADF
+    assert boundary.live[fd] is replacement
+    assert boundary.calls == [fd]
+    assert first["good"] == 2
+    assert ledger.rows[1]["good"] == 0
+    assert ledger.bad == [fd]
+
+
+@pytest.mark.parametrize("entry", ["facade", "store"])
+@pytest.mark.parametrize("stage", ["before-record", "append-before", "append-after",
+                                   "publish-before", "publish-after"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_provisional_open_failure_closes_its_token_and_preserves_the_error(
+        tmp_path, monkeypatch, entry, stage, cleanup_fails):
+    original = AssertionError("publication failed")
+    cleanup_error = OSError(errno.EIO, "provisional close failed")
+
+    class Ledger(_DescriptorLedger):
+        def new_generation(self, flags):
+            self.token = super().new_generation(flags)
+            return self.token
+
+        def record_open(self, *args, **kwargs):
+            if stage == "before-record":
+                raise original
+            return super().record_open(*args, **kwargs)
+
+    class Rows(list):
+        def append(self, row):
+            if stage == "append-before":
+                raise original
+            super().append(row)
+            if stage == "append-after":
+                raise original
+
+    class Live(dict):
+        def __setitem__(self, key, row):
+            if stage == "publish-before":
+                raise original
+            super().__setitem__(key, row)
+            if stage == "publish-after":
+                raise original
+
+    class Boundary(_OsBoundary):
+        def open(self, path, flags, *args, **kwargs):
+            if str(path).endswith(".json"):
+                raise FileNotFoundError(errno.ENOENT, "missing record")
+            return super().open(path, flags, *args, **kwargs)
+
+        def close(self, fd):
+            super().close(fd)
+            if cleanup_fails:
+                raise cleanup_error
+
+    store = None
+    if entry == "store":
+        root = tmp_path / "store"
+        root.mkdir(mode=0o700)
+        store = make_store(root, fixture_owned=True)
+    ledger, boundary = Ledger(), Boundary()
+    ledger.rows, ledger._live = Rows(), Live()
+    try:
+        _boundary_facade(monkeypatch, ledger, boundary, store_surface=entry == "store")
+        with pytest.raises(AssertionError, match="^publication failed$") as raised:
+            if entry == "store":
+                store.write(record(body="publication-failure"))
+            else:
+                codec_store.os.open("provisional", 0)
+        assert raised.value is original
+        assert raised.value.__cause__ is (cleanup_error if cleanup_fails else None)
+        assert boundary.live == {}
+        assert boundary.calls == [ledger.token["fd"]]
+        assert ledger.token["state"] == "retired"
+        assert ledger.token["good"] == 1
+        assert ledger._live == {}
+        assert ledger.bad == []
+        assert all(row["good"] == 1 for row in ledger.rows)
+    finally:
+        if store is not None:
+            _close_store(store)
+
+
+@pytest.mark.parametrize("branch", ["hook", "injected", "normal"])
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("closefd", [False, True])
+def test_failure_after_stream_acquisition_never_gives_the_stream_the_descriptor(
+        tmp_path, monkeypatch, branch, positional, closefd):
+    _require_store_os_surface()
+    original = AssertionError("after stream acquisition")
+    created = []
+
+    def factory(fd, mode, *args, **kwargs):
+        actual = kwargs.get("closefd", args[4] if len(args) >= 5 else True)
+        assert actual is False, "constructor received an owning descriptor"
+        stream = os.fdopen(fd, mode, *args, **kwargs)
+        created.append(stream)
+        if branch != "hook":
+            stream.close()
+            raise original
+        return stream
+
+    def hook(fd, mode, args, kwargs, constructor):
+        actual = kwargs.get("closefd", args[4] if len(args) >= 5 else True)
+        assert actual is False, "hook received an owning descriptor"
+        stream = constructor(fd, mode, closefd=True)
+        stream.close()
+        raise original
+
+    ledger = _watch_store_descriptors(
+        monkeypatch, "write" if branch == "injected" else "success",
+        fdopen_hook=hook if branch == "hook" else None, stream_factory=factory)
+    fd = codec_store.os.open(os.fspath(tmp_path / "acquired"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with pytest.raises(AssertionError, match="^after stream acquisition$") as raised:
+            if positional:
+                codec_store.os.fdopen(fd, "rb", -1, None, None, None, closefd)
+            else:
+                codec_store.os.fdopen(fd, "rb", closefd=closefd)
+        assert raised.value is original
+        assert created and all(stream.closed for stream in created)
+        row = ledger.rows[0]
+        if closefd:
+            assert row["state"] == "retired" and row["good"] == 1
+            with pytest.raises(OSError) as duplicate:
+                codec_store.os.close(fd)
+            assert duplicate.value.errno == errno.EBADF
+            assert ledger.forwarded == [fd]
+        else:
+            assert row["state"] == "live" and row["good"] == 0
+            codec_store.os.close(fd)
+            assert ledger.forwarded == [fd]
+            assert ledger.bad == []
+    finally:
+        for stream in created:
+            if not stream.closed:
+                stream.close()
+        ledger.release_if_live(ledger.rows[0], os.close)
+
+
+def test_generation_allocation_failure_precedes_descriptor_acquisition(monkeypatch):
+    original = AssertionError("generation allocation failed")
+
+    class Ledger(_DescriptorLedger):
+        def new_generation(self, flags):
+            raise original
+
+    class Boundary(_OsBoundary):
+        opened = False
+
+        def open(self, path, flags, *args, **kwargs):
+            self.opened = True
+            return super().open(path, flags, *args, **kwargs)
+
+    ledger, boundary = Ledger(), Boundary()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    with pytest.raises(AssertionError, match="^generation allocation failed$") as raised:
+        codec_store.os.open("unallocated", 0)
+    assert raised.value is original
+    assert not boundary.opened
+    assert boundary.live == {} and boundary.calls == []
+    assert ledger.rows == [] and ledger._live == {} and ledger.bad == []
+
+
+@pytest.mark.parametrize("path,entry", [
+    ("provisional", "facade"), ("provisional", "store"),
+    ("live", "facade"), ("live", "store"),
+    ("stream", "facade"), ("sweep", "facade"), ("facade", "facade"),
+])
+@pytest.mark.parametrize("recording", ["forwarded", "credit", "state"])
+def test_recording_failure_never_prevents_raw_close_or_replaces_the_original(
+        tmp_path, monkeypatch, path, entry, recording):
+    from threading import Event
+    original = (MemoryError("original fixture failure") if path == "provisional"
+                else AssertionError("original fixture failure"))
+    diagnostic = MemoryError("close recording failed")
+
+    class Row(dict):
+        def __setitem__(self, key, value):
+            if recording == "credit" and key == "good" and value > 0:
+                raise diagnostic
+            if recording == "state" and key == "state" and value == "retired":
+                raise diagnostic
+            super().__setitem__(key, value)
+
+    class Forwarded(list):
+        def append(self, fd):
+            if recording == "forwarded":
+                raise diagnostic
+            super().append(fd)
+
+    class Ledger(_DescriptorLedger):
+        def new_generation(self, flags):
+            self.token = Row(super().new_generation(flags))
+            return self.token
+
+        def record_open(self, row):
+            if path == "provisional":
+                raise original
+            return super().record_open(row)
+
+    class Boundary(_OsBoundary):
+        def open(self, name, flags, *args, **kwargs):
+            if str(name).endswith(".json"):
+                raise FileNotFoundError(errno.ENOENT, "missing record")
+            return super().open(name, flags, *args, **kwargs)
+
+        def close(self, fd):
+            super().close(fd)
+            if path in ("sweep", "facade"):
+                raise original
+
+    class RefusedWait:
+        def wait(self, timeout):
+            raise original
+
+    class Stream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+            raise original
+
+    store = None
+    if entry == "store":
+        root = tmp_path / "store"
+        root.mkdir(mode=0o700)
+        store = make_store(root, fixture_owned=True)
+    ledger, boundary = Ledger(), Boundary()
+    ledger.forwarded = Forwarded()
+    try:
+        _boundary_facade(monkeypatch, ledger, boundary, store_surface=entry == "store")
+        if path == "live":
+            ledger.arm_overlap(Event(), RefusedWait())
+        with pytest.raises(type(original), match="^original fixture failure$") as raised:
+            if path in ("provisional", "live"):
+                if entry == "store":
+                    store.write(record(body="recording-failure"))
+                else:
+                    codec_store.os.open("recording-failure", 0)
+            else:
+                fd = codec_store.os.open("recorded", 0)
+                row = ledger.token
+                if path == "stream":
+                    stream = Stream()
+                    owner = ledger.reserve_stream(row)
+                    ledger.transfer_to_stream(row, stream, boundary.close, owner=owner)
+                    stream.close()
+                elif path == "sweep":
+                    ledger.release_if_live(row, boundary.close)
+                else:
+                    codec_store.os.close(fd)
+        assert raised.value is original
+        assert raised.value.__cause__ is diagnostic
+        row = ledger.token
+        assert boundary.live == {}
+        assert boundary.calls == [row["fd"]]
+        assert row["claimed"] is True and ledger._live == {}
+        assert row["good"] == (0 if recording == "credit" else 1)
+        assert ledger.forwarded == ([] if recording == "forwarded" else [row["fd"]])
+        if recording != "state":
+            assert row["state"] == "retired"
+        assert ledger.release_if_live(row, boundary.close) is False
+        assert boundary.calls == [row["fd"]]
+    finally:
+        if store is not None:
+            _close_store(store)
+
+
+def test_recording_failure_after_successful_raw_close_is_reported(monkeypatch):
+    diagnostic = MemoryError("close recording failed")
+
+    class Forwarded(list):
+        def append(self, fd):
+            raise diagnostic
+
+    ledger, boundary = _DescriptorLedger(), _OsBoundary()
+    ledger.forwarded = Forwarded()
+    _boundary_facade(monkeypatch, ledger, boundary)
+    fd = codec_store.os.open("recorded", 0)
+    with pytest.raises(MemoryError, match="^close recording failed$") as raised:
+        codec_store.os.close(fd)
+    assert raised.value is diagnostic
+    assert boundary.live == {} and boundary.calls == [fd]
+    assert ledger.rows[0]["state"] == "retired"
+    assert ledger.rows[0]["good"] == 1
