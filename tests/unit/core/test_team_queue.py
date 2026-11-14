@@ -1,5 +1,5 @@
 """Queue behaviour through its service, with real storage and process races."""
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 import os
 import shutil
@@ -9,7 +9,143 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import symlink_or_skip
-from aegis_core import atomicio, storage, storage_confined, team, team_queue as queue
+from aegis_core import atomicio, primitives, storage, storage_confined, team, team_queue as queue
+
+
+@pytest.mark.parametrize("limit,bound", [("bytes", 0), ("depth", 2), ("nodes", 11),
+                                         ("items", 4), ("string", 13)])
+@pytest.mark.parametrize("as_bytes", [False, True])
+@pytest.mark.parametrize("over", [False, True])
+def test_json_preflight_inline_boundaries(monkeypatch, limit, bound, as_bytes, over):
+    value = item(title="Work")
+    raw = json.dumps(value, separators=(",", ":"))
+    if limit == "bytes":
+        bound = len(raw.encode("utf-8"))
+    limits = dict(bytes=1000, depth=16, nodes=100, items=100, string=100)
+    limits[limit] = bound - int(over)
+    monkeypatch.setattr(queue, "MAX_BYTES", limits["bytes"])
+    monkeypatch.setattr(queue, "MAX_JSON_DEPTH", limits["depth"])
+    monkeypatch.setattr(queue, "MAX_JSON_NODES", limits["nodes"])
+    monkeypatch.setattr(queue, "MAX_JSON_ITEMS", limits["items"])
+    monkeypatch.setattr(queue, "MAX_JSON_STRING", limits["string"])
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    if as_bytes:
+        raw = raw.encode("utf-8")
+    for _ in range(2):
+        result = queue.parse_item(raw)
+        if over:
+            assert result == {"refused": True, "reason": "invalid_item",
+                              "next_action": "Supply a bounded queue item with the documented fields and single-line values."}
+        else:
+            assert result == {"refused": False, "item": value}
+    assert len(parsed) == (0 if over else 2)
+
+
+@pytest.mark.parametrize("string_units", ["escaped", "source"])
+@pytest.mark.parametrize("raw,limit,bound", [
+    ('"é"', "bytes", 4), ('[[0]]', "depth", 2), ('[0,0]', "nodes", 3),
+    ('[0,0]', "items", 2), ('{"a":0,"b":0}', "items", 2),
+    ('"abcd"', "string", 4), ('"\\u0061\\u0062"', "string", 2),
+    ('"\\\\\\""', "string", 2), ('1234', "atom", 4),
+])
+@pytest.mark.parametrize("over", [False, True])
+def test_shared_json_preflight_boundaries(string_units, raw, limit, bound, over):
+    if limit == "string" and string_units == "source":
+        bound = len(raw) - 1  # Includes the closing quote, as the queue always has.
+    limits = dict(max_bytes=100, max_depth=16, max_nodes=100, max_items=100,
+                  max_string=100, max_atom=64)
+    limits["max_" + limit] = bound - int(over)
+    for value in (raw, raw.encode("utf-8")):
+        if over:
+            reason = {"bytes": "size", "depth": "nesting", "items": "container"}.get(limit, limit)
+            with pytest.raises(ValueError, match="^" + reason + "$"):
+                primitives.json_preflight(value, string_units=string_units, **limits)
+        else:
+            assert primitives.json_preflight(value, string_units=string_units, **limits) == raw
+
+
+@pytest.mark.parametrize("over", [False, True])
+def test_json_atom_limit_precedes_parser(monkeypatch, over):
+    raw = json.dumps(item(hold=True))
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "MAX_JSON_ATOM", 4 - int(over))
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    assert queue.parse_item(raw)["reason"] == "invalid_item"
+    assert parsed == ([] if over else [raw])
+
+
+@pytest.mark.parametrize("raw", ['"é"', '"😀"'])
+@pytest.mark.parametrize("as_bytes", [False, True])
+def test_shared_json_byte_limit_is_utf8_before_parsing(raw, as_bytes):
+    value = raw.encode("utf-8") if as_bytes else raw
+    limits = dict(max_bytes=len(raw.encode("utf-8")), max_depth=16,
+                  max_nodes=100, max_items=100, max_string=100)
+    assert primitives.json_preflight(value, **limits) == raw
+    limits["max_bytes"] -= 1
+    with pytest.raises(ValueError, match="^size$"):
+        primitives.json_preflight(value, **limits)
+
+
+def test_json_preflight_callers_share_no_concurrent_state(make_store):
+    from aegis_core import team_profile
+    root = make_store
+    target = root.joinpath(*team_profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(b'{"version":1}')
+    expected = team_profile.load(root, user_root=root)
+    def observe(index):
+        raw = json.dumps(item()) if index % 2 else "["
+        inline = queue.parse_item(raw)
+        loaded = team_profile.load(root, user_root=root)
+        assert loaded == expected
+        return inline["refused"]
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        assert list(workers.map(observe, range(24))) == [i % 2 == 0 for i in range(24)]
+
+
+@pytest.mark.parametrize("verb", ["add", "list", "audit", "compact", "claim", "release", "unclaim", "done"])
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b'{"version":NaN}', b'{"version":1,"version":1}', b" " * 101])
+def test_json_caller_refusal_golden(make_store, monkeypatch, verb, raw):
+    root = make_store
+    add(root)
+    target = root / ".aegis/state/team-queue.json"
+    target.write_bytes(raw)
+    monkeypatch.setattr(queue, "MAX_BYTES", 100)
+    arguments = {"now": 100}
+    if verb == "add":
+        arguments["item"] = item("TWO")
+    elif verb in ("claim", "release", "unclaim", "done"):
+        arguments.update(identifier="ONE", expect="a" * 64, lane="alpha")
+        if verb == "unclaim":
+            arguments["writer_stopped"] = True
+    for _ in range(2):
+        result = getattr(queue, verb)(root, **arguments)
+        assert result == {
+            "schema": "aegis.team.queue." + verb + "/v1",
+            "source": "aegis team queue " + verb, "aegis_version": result["aegis_version"],
+            "checked_at": "1970-01-01T00:01:40Z", "scope": {},
+            "refused": True, "status": "refused", "exit_code": 1,
+            "reason": "invalid_queue_state",
+            "next_action": "Ask the coordinator to repair the queue state from trusted evidence.",
+        }
+        assert target.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b"NaN", b'{"id":1,"id":1}', "\ud800", None])
+def test_json_inline_refusal_golden(raw):
+    assert queue.parse_item(raw) == {
+        "refused": True, "reason": "invalid_item",
+        "next_action": "Supply a bounded queue item with the documented fields and single-line values.",
+    }
 
 
 @pytest.fixture

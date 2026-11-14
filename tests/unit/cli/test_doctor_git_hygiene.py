@@ -1729,133 +1729,22 @@ def test_scratch_requires_ownership_and_actual_write_access(tmp_path, monkeypatc
     assert report["disk"]["budget_slots"] is None
 
 
-@pytest.mark.parametrize("case,mode,admitted", [
-    ("shared_members", 0o770, False),
-    ("shared_setgid", 0o2770, False),
-    ("owner_supplementary_member", 0o770, False),
-    ("private_770", 0o770, False),
-    ("private_775", 0o775, False),
-    ("private_setgid", 0o2770, False),
-    ("partial_accounts_owner_present", 0o770, False),
-    ("partial_accounts_owner_present", 0o775, False),
-    ("partial_accounts_owner_present", 0o2770, False),
-    ("partial_groups_owner_present", 0o770, False),
-    ("partial_groups_owner_present", 0o775, False),
-    ("partial_groups_owner_present", 0o2770, False),
-    ("wrong_primary_gid", 0o770, False),
-    ("wrong_group_name", 0o770, False),
-    ("other_primary_account", 0o770, False),
-    ("same_uid_other_account", 0o770, False),
-    ("accounts_empty", 0o770, False),
-    ("accounts_owner_missing", 0o770, False),
-    ("duplicate_gid", 0o770, False),
-    ("boolean_fields", 0o770, False),
-    ("groups_lookup_error", 0o770, False),
-    ("groups_api_unavailable", 0o770, False),
-    ("foreign_owner_gid", 0o770, False),
-    ("foreign_group_members", 0o770, False),
-    ("foreign_account_gid", 0o770, False),
-    ("foreign_accounts_none", 0o770, False),
-    ("foreign_accounts_text", 0o770, False),
-    ("foreign_accounts_mapping", 0o770, False),
-    ("foreign_accounts_number", 0o770, False),
-    ("group_lookup_missing", 0o770, False),
-    ("group_lookup_error", 0o770, False),
-    ("owner_lookup_error", 0o770, False),
-    ("accounts_lookup_error", 0o770, False),
-    ("group_api_unavailable", 0o770, False),
-    ("passwd_api_unavailable", 0o770, False),
-    ("world_writable", 0o777, False),
-    ("sticky", 0o1770, False),
-    ("owner_only", 0o700, True),
-    ("owner_group_read", 0o750, True),
+@pytest.mark.parametrize("mode,admitted", [
+    (0o770, False),
+    (0o775, False),
+    (0o2770, False),
+    (0o777, False),
+    (0o1770, False),
+    (0o700, True),
+    (0o750, True),
 ])
-def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, case, mode, admitted):
+def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, admitted):
     if not doctor_git.descriptor_support() or not os.path.isdir("/proc/self/fd"):
         pytest.skip("scratch custody descriptors unsupported")
     scratch = _outside_dir(tmp_path, "shared-group-")
     scratch.chmod(mode)
     info = scratch.stat()
-    if case == "boolean_fields":
-        def file_stat(fd):
-            raw = os.fstat(fd)
-            return types.SimpleNamespace(st_dev=raw.st_dev, st_ino=raw.st_ino, st_mode=raw.st_mode,
-                                         st_uid=1, st_gid=1, st_size=raw.st_size)
-
-        def absent(fd, name):
-            raise OSError(errno.ENODATA, "no extended ACL")
-
-        info = types.SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_uid=1, st_gid=1)
-        monkeypatch.setattr(doctor_git, "os", types.SimpleNamespace(**{**vars(os), "fstat": file_stat,
-                                                                     "geteuid": lambda: 1, "getxattr": absent}))
-    owner = types.SimpleNamespace(pw_uid=info.st_uid, pw_gid=info.st_gid, pw_name="owner")
-    group = types.SimpleNamespace(gr_gid=info.st_gid, gr_name="owner", gr_mem=[])
-    accounts = [owner]
-    groups = [group]
-    seen = {"lookups": [], "custody": [], "disk": [], "invoke": []}
-    secret = "password=hunter2hunter"
-    if case in ("shared_members", "shared_setgid"):
-        group.gr_mem = ["another"]
-    elif case == "owner_supplementary_member":
-        group.gr_mem = ["owner"]
-    elif case == "wrong_primary_gid":
-        owner.pw_gid += 1
-    elif case == "wrong_group_name":
-        group.gr_name = "shared"
-    elif case in ("other_primary_account", "same_uid_other_account"):
-        accounts.append(types.SimpleNamespace(pw_uid=info.st_uid + (case == "other_primary_account"),
-                                              pw_gid=info.st_gid, pw_name="another"))
-    elif case == "accounts_empty":
-        accounts = []
-    elif case == "accounts_owner_missing":
-        accounts = [types.SimpleNamespace(pw_uid=info.st_uid + 1, pw_gid=info.st_gid + 1, pw_name="another")]
-    elif case == "duplicate_gid":
-        groups.append(types.SimpleNamespace(gr_gid=info.st_gid, gr_name="shared", gr_mem=["another"]))
-    elif case == "boolean_fields":
-        owner.pw_uid = True
-        group.gr_gid = True
-    elif case == "foreign_owner_gid":
-        owner.pw_gid = str(info.st_gid)
-    elif case == "foreign_group_members":
-        group.gr_mem = None
-    elif case == "foreign_account_gid":
-        accounts = [types.SimpleNamespace(pw_uid=info.st_uid, pw_gid=str(info.st_gid), pw_name="owner")]
-    elif case == "foreign_accounts_none":
-        accounts = None
-    elif case == "foreign_accounts_text":
-        accounts = ""
-    elif case == "foreign_accounts_mapping":
-        accounts = {}
-    elif case == "foreign_accounts_number":
-        accounts = 42
-
-    def owner_lookup(uid):
-        seen["lookups"].append("owner")
-        assert uid == info.st_uid
-        if case == "owner_lookup_error":
-            raise KeyError(secret)
-        return owner
-
-    def group_lookup(gid):
-        seen["lookups"].append("group")
-        assert gid == info.st_gid
-        if case == "group_lookup_missing":
-            raise KeyError(secret)
-        if case == "group_lookup_error":
-            raise OSError(secret)
-        return group
-
-    def account_lookup():
-        seen["lookups"].append("accounts")
-        if case == "accounts_lookup_error":
-            raise OSError(secret)
-        return accounts
-
-    def group_enumeration():
-        seen["lookups"].append("groups")
-        if case == "groups_lookup_error":
-            raise OSError(secret)
-        return groups
+    seen = {"custody": [], "disk": [], "invoke": []}
 
     @contextmanager
     def custody(**kwargs):
@@ -1874,12 +1763,6 @@ def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, case,
         seen["invoke"].append(args)
         return _cp(args, code=128)
 
-    # Reproduce the former NSS boundary when present; the AST test below pins its removal.
-    # Partial-enumeration cases expose just the owner despite omitted sharing records.
-    if hasattr(doctor_git, "grp"):
-        monkeypatch.setattr(doctor_git, "grp", None if case == "group_api_unavailable" else types.SimpleNamespace(getgrgid=group_lookup, getgrall=None if case == "groups_api_unavailable" else group_enumeration))
-    if hasattr(doctor_git, "pwd"):
-        monkeypatch.setattr(doctor_git, "pwd", None if case == "passwd_api_unavailable" else types.SimpleNamespace(getpwuid=owner_lookup, getpwall=account_lookup))
     monkeypatch.setattr(doctor_git, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
     monkeypatch.setattr(doctor_git, "_invoke", invoke)
     monkeypatch.setattr(doctor_git, "_custody", custody)
@@ -1897,7 +1780,6 @@ def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, case,
         }
     finally:
         scratch.chmod(0o700)
-    assert secret not in _blob(report)
     if admitted:
         assert "scratch_outside" in _codes(report) and "scratch_unknown" not in _codes(report)
         assert report["disk"]["budget_slots"] == 1
@@ -1911,7 +1793,6 @@ def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, case,
                            "leases": "git_failed", "refs": "git_failed", "branch": (None, "git_failed")}
         assert not seen["custody"] and not seen["disk"] and not seen["invoke"]
         assert standalone == "git_failed"
-    assert not seen["lookups"]
 
 
 def test_doctor_scratch_never_imports_account_or_group_databases():
@@ -1984,8 +1865,6 @@ def test_scratch_acl_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, c
     scratch.chmod(mode)
     admitted = admitted and not mode & stat.S_IWGRP
     info = scratch.stat()
-    owner = types.SimpleNamespace(pw_uid=info.st_uid, pw_gid=info.st_gid, pw_name="owner")
-    group = types.SimpleNamespace(gr_gid=info.st_gid, gr_name="owner", gr_mem=[])
     seen = {"acl": [], "custody": [], "disk": [], "invoke": []}
     secret = "password=hunter2hunter"
 
@@ -2017,10 +1896,6 @@ def test_scratch_acl_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, c
 
     monkeypatch.setattr(doctor_git, "os", types.SimpleNamespace(**{**vars(os), "getxattr": None if case == "missing_api" else attributes}))
     monkeypatch.setattr(doctor_git, "sys", types.SimpleNamespace(**{**vars(sys), "platform": "darwin" if case == "unsupported_platform" else "linux"}))
-    if hasattr(doctor_git, "grp"):
-        monkeypatch.setattr(doctor_git, "grp", types.SimpleNamespace(getgrgid=lambda gid: group, getgrall=lambda: [group]))
-    if hasattr(doctor_git, "pwd"):
-        monkeypatch.setattr(doctor_git, "pwd", types.SimpleNamespace(getpwuid=lambda uid: owner, getpwall=lambda: [owner]))
     monkeypatch.setattr(doctor_git, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
     monkeypatch.setattr(doctor_git, "_custody", custody)
     monkeypatch.setattr(doctor_git, "_disk_usage", usage)
