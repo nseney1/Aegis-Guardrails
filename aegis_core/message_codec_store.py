@@ -32,6 +32,33 @@ def _release(fd):
         os.close(fd)
 
 
+def _discard(operation):
+    try:
+        operation()
+    except OSError as error:
+        return error
+    return None
+
+
+def _finish_stream(stream, fd, failed):
+    """Close stream, then the raw descriptor, once.
+
+    os.fdopen is given closefd=False so a failure before the stream exists,
+    or after the stream has accepted the descriptor, leaves that descriptor
+    with this closer only. A close error never replaces the caller's error.
+    """
+    try:
+        stream_error = _discard(stream.close)
+    finally:
+        raw_error = _discard(lambda: os.close(fd))
+    if failed:
+        return
+    if stream_error is not None:
+        raise stream_error
+    if raw_error is not None:
+        raise raw_error
+
+
 class Store:
     """Existing caller-bound root; all entry operations require anchored primitives."""
     def __init__(self, root):
@@ -153,7 +180,13 @@ class Store:
 
     def _read_bytes(self, rid, rootfd, budget=None, expected_size=None):
         fd = self._open(rid + ".json", os.O_RDONLY, rootfd)
-        with os.fdopen(fd, "rb") as stream:
+        try:
+            stream = os.fdopen(fd, "rb", closefd=False)
+        except BaseException:
+            _release(fd)
+            raise
+        failed = True
+        try:
             before = os.fstat(stream.fileno())
             if expected_size is not None:
                 require(before.st_size == expected_size, "E_HASH")
@@ -177,6 +210,9 @@ class Store:
             # Link-count/ctime changes during publication do not alter content.
             require((before.st_dev, before.st_ino, before.st_size) ==
                   (after.st_dev, after.st_ino, after.st_size), "E_HASH")
+            failed = False
+        finally:
+            _finish_stream(stream, fd, failed)
         data = b"".join(chunks)
         require(len(data) == before.st_size and hashlib.sha256(data).hexdigest() == rid, "E_HASH")
         return data, len(data)
@@ -210,10 +246,19 @@ class Store:
             name, temporary = rid + ".json", ".msg-" + uuid.uuid4().hex
             fd = self._open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, rootfd)
             try:
-                with os.fdopen(fd, "wb") as stream:
+                try:
+                    stream = os.fdopen(fd, "wb", closefd=False)
+                except BaseException:
+                    _release(fd)
+                    raise
+                failed = True
+                try:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
+                    failed = False
+                finally:
+                    _finish_stream(stream, fd, failed)
                 try:
                     os.link(temporary, name, follow_symlinks=False, **_at(rootfd, "src_dir_fd", "dst_dir_fd"))
                 except FileExistsError:
