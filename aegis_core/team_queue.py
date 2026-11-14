@@ -33,6 +33,12 @@ MAX_ITEMS = 256
 MAX_FIELDS = 128
 MAX_TEXT = 4096
 MAX_COMPLETED = 8192
+MAX_JSON_DEPTH = 16
+MAX_JSON_NODES = 65536
+MAX_JSON_ITEMS = 65536
+# An astral codepoint is two six-byte escapes; the closing quote also counts.
+MAX_JSON_STRING = 12 * MAX_TEXT + 1
+MAX_JSON_ATOM = 64
 _KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z", re.ASCII)
 _REVISION = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _NEXT = {
@@ -192,61 +198,11 @@ def _item(value):
 
 def _json(raw, reason):
     """Preflight byte, nesting, node, string and container limits before parsing."""
-    _require(type(raw) in (bytes, str) and len(raw) <= MAX_BYTES, reason)
     try:
-        text = raw.decode("utf-8") if type(raw) is bytes else raw
-        # Count UTF-8 bytes without allocating an encoded copy just to refuse it.
-        size = 0
-        for char in text:
-            code = ord(char)
-            _require(not 0xD800 <= code <= 0xDFFF, reason)
-            size += 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4
-            _require(size <= MAX_BYTES, reason)
-        depth, nodes, chars, atom_chars = 0, 0, 0, 0
-        quoted, escaped, atom = False, False, False
-        containers = []
-        for char in text:
-            if not quoted and containers and containers[-1][1] and char not in " \t\r\n]}":
-                containers[-1][0] += 1
-                containers[-1][1] = False
-                _require(containers[-1][0] <= 65536, reason)
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    quoted = False
-                chars += 1
-                # An astral codepoint is two six-byte JSON escapes. Include
-                # the closing quote counted by this lexical preflight.
-                _require(chars <= 12 * MAX_TEXT + 1, reason)
-            elif char == '"':
-                quoted, atom, chars = True, False, 0
-                nodes += 1
-            elif char in "[{":
-                depth += 1
-                nodes += 1
-                atom = False
-                _require(depth <= 16, reason)
-                containers.append([0, True])
-            elif char in "]}":
-                depth -= 1
-                atom = False
-                if containers:
-                    containers.pop()
-            elif char in " \t\r\n,:":
-                atom = False
-                if char == "," and containers:
-                    containers[-1][1] = True
-            elif not atom:
-                atom = True
-                nodes += 1
-                atom_chars = 1
-            else:
-                atom_chars += 1
-                _require(atom_chars <= 64, reason)
-            _require(nodes <= 65536, reason)
+        text = primitives.json_preflight(
+            raw, max_bytes=MAX_BYTES, max_depth=MAX_JSON_DEPTH, max_nodes=MAX_JSON_NODES,
+            max_items=MAX_JSON_ITEMS, max_string=MAX_JSON_STRING,
+            string_units="source", max_atom=MAX_JSON_ATOM)
         return primitives.strict_loads(text)
     except (UnicodeError, ValueError, RecursionError):
         raise QueueRefusal(reason) from None
