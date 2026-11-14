@@ -817,7 +817,10 @@ def test_invalid_mutation_root_refuses_before_allocation(tmp_path, monkeypatch, 
     for _ in range(2):
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
         assert result.verdict is False
-        assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+        assert result.detail == (
+            "could not assess: mutation scratch root is not usable: "
+            "choose an existing, accessible directory outside the checkout"
+        )
         assert result.lines == [-1]
 
 
