@@ -157,8 +157,9 @@ def test_the_overlap_check_reports_a_real_conflict_as_a_normal_answer(team, tmp_
 
 
 @pytest.mark.parametrize("arguments,error", [
-    ({}, "missing fields"), ({"paths": []}, "invalid paths"), ({"paths": "src/**"}, "invalid paths"),
-    ({"paths": ["/absolute"]}, "invalid path"), ({"paths": ["../escape"]}, "invalid path"),
+    ({}, "missing fields"), ({"paths": []}, "paths: give at least one glob"), ({"paths": "src/**"}, "invalid paths"),
+    ({"paths": ["docs/\x01control"]}, "paths: glob 1 has a control character"),
+    ({"paths": ["../escape"]}, "paths: glob 1 climbs out of the workspace with '..'"),
     ({"paths": ["x" * 2000]}, "invalid path"), ({"paths": ["ok"] * 65}, "invalid paths"),
     ({"paths": ["ok"], "initiative": "other"}, "unexpected fields"),
 ])
