@@ -436,6 +436,45 @@ registry role, host, session and generation, whether the binding has acknowledge
 and the tools offered. Like every other call it is refused for a replaced session, so an answer
 always means `current: true`. The identity is configuration (`authenticated: false`).
 
+### Opt-in record tools
+
+Record tools are off until a non-ROOT mailbox role launches this source checkout's adapter with `--records`. The pinned `tools/hierarchy_mailbox.py serve` has no record tools. Without `--records`, `tools/hierarchy_mailbox_mcp.py` refuses every endpoint that is not `<hierarchy>/root`. ROOT with `--records` is refused at startup with `ROOT takes no record tools`. A board connection with `--records` is refused with `records require a mailbox connection`. Every other mailbox role may opt in. Replace the absolute mailbox, endpoint, host, session and generation; do not add `--board`.
+
+```sh
+python3 -I -B tools/hierarchy_mailbox_mcp.py --root /abs/mailbox serve --records \
+  --endpoint <hierarchy>/<role> --host <host> --session <session> --generation <n>
+```
+
+Launch that command from this source checkout. The adapter loads `aegis_core` only from the checkout that contains `tools/hierarchy_mailbox_records.py`. The installed wheel does not include these tools. Another checkout, a symlink escape, or a missing codec refuses with E_AUTH and the fixed text `record codec unavailable from this checkout`, and does not echo the path.
+
+The acknowledged binding is unchanged. `mailbox_publish_record` uses the same write fence as `mailbox_publish`: the process sender must be the endpoint's current binding, and that binding must have acknowledged its handoff checkpoint. `mailbox_read_record` and `mailbox_digest` require the current binding and do not require acknowledgment, so a successor can read the checkpoint it still has to acknowledge. Tool arguments cannot choose the sender, host, session, or mailbox root.
+
+A successful publish also writes a legacy v1 mailbox message. Its body is one stub line, `aegis-record/1 sha256=<id> kind=<kind>`, and a second `verdict:` line only when the record has a single-line verdict. `mailbox_inbox` and legacy `mailbox_publish` show that stub, not the record body. `mailbox_read_record`, and a digest row's `record`, return the record body. An ordinary message has no stub: digest keeps its body on the row. Record bytes live in the parent directory's `mailbox-records` store, outside the mailbox root.
+
+The sender calls `mailbox_publish_record`. The peer named by `to` calls `mailbox_read_record` and `mailbox_digest`. `after_message_id` is an exclusive cursor: pass the previous response's `next_after` and keep `limit` fixed. These four requests are complete against a temporary store whose peer is `a/lane/review`:
+
+```json
+{"message_id": "guide-1", "to": "a/lane/review", "type": "info", "kind": "text", "content": "{\"fields\": {}, \"body\": \"note\", \"refs\": {}}"}
+```
+
+```json
+{"message_id": "guide-1"}
+```
+
+```json
+{"limit": 20}
+```
+
+```json
+{"limit": 20, "after_message_id": "guide-1"}
+```
+
+If `mailbox_digest` returns E_LIMIT because an aggregate message page does not fit, reduce limit, keep after_message_id, and read an individually oversized ordinary message through the inbox path. The inbox path is `mailbox_inbox`. One ordinary message that does not fit: read the ordinary message through the inbox path. A record view or explicit refs that do not fit: request fewer refs, or narrow fields (for example body) or outline, or use mailbox_read_record with narrower fields. That selector recovery is valid on `mailbox_digest` itself. A max_chars below the minimum record view: pass max_chars large enough for the record view, as an integer from 0 to 60000. max_chars below the page envelope: pass max_chars large enough for the digest page, as an integer from 0 to 60000. An invalid limit is not an integer from 1 to 100. An invalid max_chars is not an integer from 0 to 60000. Either invalid option refuses E_LIMIT and names that range. A history-limit refusal keeps its owner guidance. A digest refusal does not join a multi-line cursor into one line and does not echo the message body.
+
+For a record-view budget refusal, follow `error.retry.tool` and merge `error.retry.options` into the retry request. A digest retry keeps its existing cursor and references. A `mailbox_read_record` retry uses `retry.target.collection` and its zero-based `retry.target.index` to identify the failing received message or explicit reference, rather than another record in the request. Use that message's ID or reference for the read. The adapter renders the proposed complete retry before offering it, including attribution and digest row overhead. If no candidate fits the current budget, `error.minimum_max_chars` gives a measured budget and the advice says to increase `max_chars` to at least that number. Selector and outline advice is offered only when that retry fits the current budget. Ordinary-message failures verify inbox recovery before considering any record candidate; a later record or explicit reference never replaces that recovery. The earlier repair forms above describe possible actions; the refusal selects the verified one.
+
+For ordinary-message recovery on a planned inbox, a digest cursor does not carry the ordering or generation filter of an inbox walk. Restart `mailbox_inbox` from the start without `after_message_id`, `order`, or `since`, using `limit:100`. Follow only the new oldest-first pages' `next_after` cursors until the message is retrieved. The helper verifies this fresh walk through the target message, including any additional pages; it does not commit cursors or delivery state on the caller's connection. This also recovers a message after a cursor previously flushed by a newest-first or current-generation walk.
+
 **ROOT's read tools.** They change nothing and are marked `readOnlyHint`. Each reads the journal under its writer
 lock, as router `status` does, through `tools/hierarchy_team_view.py`; `hierarchy_team.py status` calls the same
 functions, so the owner and ROOT read one JSON contract.
