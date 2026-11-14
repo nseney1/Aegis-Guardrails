@@ -51,8 +51,8 @@ def scrub_child_environment(environment):
     snapshot = copy_environment(environment)
     names, prefixes = set(), []
     for spec in host_registry.all_hosts():
-        names.update(name.upper() for name in (*spec.billing_variables, *spec.session_markers,
-                                               *spec.environment_overrides))
+        names.update(name.upper() for name in (*spec.billing_variables, spec.session_variable,
+                                               *spec.session_markers, *spec.environment_overrides) if name)
         prefixes.extend(prefix.upper() for prefix in spec.session_marker_prefixes)
     prefixes = tuple(prefixes)
     child = {key: value for key, value in snapshot.items()
