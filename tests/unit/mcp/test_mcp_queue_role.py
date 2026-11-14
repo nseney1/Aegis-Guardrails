@@ -1,4 +1,6 @@
 """Owner-bound queue connections: hostile inputs never enroll a caller."""
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 import sys
@@ -10,6 +12,18 @@ from conftest import symlink_or_skip
 
 import aegis_mcp.server as server
 import aegis_mcp.queue_role as queue_role
+from aegis_core._version import __version__
+
+
+QUEUE_INSTRUCTIONS = "Use aegis_team_queue to list and aegis_team_queue_claim to claim under owner policy."
+
+
+def queue_initialize_response(instructions=QUEUE_INSTRUCTIONS):
+    return {"jsonrpc": "2.0", "id": 1, "result": {
+        "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+        "serverInfo": {"name": "aegis-mcp-queue", "version": __version__},
+        "instructions": instructions,
+    }}
 
 
 @pytest.fixture
@@ -58,6 +72,107 @@ def start_owner(registration="alpha"):
     queue_role.issue(registration)
     server._start(queue_registration=registration)
     rpc("initialize")
+
+
+def test_ordinary_initialize_and_tools_list_bytes_unchanged():
+    # Captured from 0b0310f4 before the product edit. No git history is needed.
+    server._start(environ={})
+    initialized = rpc("initialize")
+    initialized["result"]["serverInfo"]["version"] = "<version>"
+    raw = json.dumps(initialized).encode("utf-8")
+    assert len(raw) == 558
+    assert hashlib.sha256(raw).hexdigest() == "a80c0f890703c21d02db8d54cbdf628a6d18b6453e37dea45355db5d91004e5e"
+    listed = rpc("tools/list")
+    raw = json.dumps(listed).encode("utf-8")
+    assert len(listed["result"]["tools"]) == 10
+    assert len(raw) == 11267
+    assert hashlib.sha256(raw).hexdigest() == "77a29feb7616930a79f4977448e8c784834ebf2de00bee0615a44356b9b07197"
+
+
+@pytest.mark.parametrize("count", [1, queue_role.MAX_LANES], ids=["one", "max"])
+def test_initialize_names_exact_startup_lanes_only(owner_factory, monkeypatch, count):
+    lanes = {"lane-" + str(i).zfill(2) + "." + "x" * 54: {
+        "capabilities": ["private-capability"], "branch": "refs/heads/private-branch"}
+        for i in reversed(range(count))}
+    role, root, path, workspace, policy = owner_factory(lanes=lanes)
+    role.issue("alpha")
+    server._start(queue_registration="alpha")
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    def unexpected():
+        raise AssertionError("initialize must use the validated startup snapshot without authority IO")
+    original = queue_role.authority
+    monkeypatch.setattr(queue_role, "authority", unexpected)
+    response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "lanes": ["forged"], "workspace": "forged", "capabilities": {"private": {}},
+        "_meta": {"lane": "forged"}}})
+    monkeypatch.setattr(queue_role, "authority", original)
+    expected = (QUEUE_INSTRUCTIONS + " Startup lane ids (information only; grants no authority): "
+                + json.dumps(list(lanes), separators=(",", ":"))
+                + ". Claims revalidate owner policy, expiry and queue state.")
+    assert response == queue_initialize_response(expected)
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+@pytest.mark.parametrize("mode,reason", [("missing", "role_missing"), ("invalid", "role_invalid"),
+                                         ("too-many-lanes", "role_invalid")])
+def test_refused_queue_initialize_bytes_unchanged(owner_factory, mode, reason):
+    role, root, path, workspace, policy = owner_factory()
+    if mode == "invalid":
+        path.write_text("{}", encoding="utf-8")
+    elif mode == "too-many-lanes":
+        policy["lanes"] = {"lane" + str(i): policy["lanes"]["alpha"]
+                           for i in range(role.MAX_LANES + 1)}
+        path.write_text(json.dumps(policy), encoding="utf-8")
+    server._start(queue_registration="alpha")
+    assert json.dumps(rpc("initialize")).encode() == json.dumps(queue_initialize_response()).encode()
+    for _ in range(2):
+        result = claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})
+        assert result["reason"] == reason and result["exit_code"] == 1
+
+
+@pytest.mark.parametrize("mode", ["revoke", "remove-lane"])
+@pytest.mark.parametrize("when", ["before-initialize", "after-initialize"])
+def test_initialize_is_startup_information_after_policy_changes(owner_factory, mode, when):
+    role, root, path, workspace, policy = owner_factory()
+    role.issue("alpha")
+    server._start(queue_registration="alpha")
+    original = path.read_bytes()
+    if mode == "revoke":
+        policy["role"] = "reviewer"
+    else:
+        policy["lanes"] = {"beta": policy["lanes"]["alpha"]}
+    if when == "before-initialize":
+        path.write_text(json.dumps(policy), encoding="utf-8")
+    response = rpc("initialize")
+    assert 'Startup lane ids (information only; grants no authority): ["alpha"]' in response["result"]["instructions"]
+    if when == "after-initialize":
+        path.write_text(json.dumps(policy), encoding="utf-8")
+    result = claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})
+    assert result["reason"] == "role_stale" and result["exit_code"] == 1
+    path.write_bytes(original)
+    assert claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})["reason"] == "role_stale"
+    assert not (workspace / ".aegis" / "state").exists()
+
+
+def test_startup_lane_is_revalidated_after_waiting_for_queue_lock(owner_factory, monkeypatch):
+    role, root, path, workspace, policy = owner_factory()
+    role.issue("alpha")
+    server._start(queue_registration="alpha")
+    assert '["alpha"]' in rpc("initialize")["result"]["instructions"]
+    real = role.storage
+    @contextmanager
+    def changed_while_waiting(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            policy["lanes"] = {"beta": policy["lanes"]["alpha"]}
+            path.write_text(json.dumps(policy), encoding="utf-8")
+            yield held
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=changed_while_waiting, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    for _ in range(2):
+        result = claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})
+        assert result["reason"] == "role_stale" and result["exit_code"] == 1
+    assert not (workspace / ".aegis" / "state" / "team-queue.json").exists()
 
 
 def test_ordinary_connection_has_no_grant(owner_factory, tmp_path, monkeypatch):
@@ -268,7 +383,7 @@ def test_second_initialize_invalidates(owner_factory, tmp_path, monkeypatch):
 def test_unsupported_probe_is_fixed(monkeypatch):
     monkeypatch.setattr(queue_role, "supported", lambda: False)
     server._start(queue_registration="alpha")
-    rpc("initialize")
+    assert json.dumps(rpc("initialize")).encode() == json.dumps(queue_initialize_response()).encode()
     assert claim({"id": "ONE", "expect": "a" * 64, "lane": "alpha"})["reason"] == "unsupported_platform"
 
 
