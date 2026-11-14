@@ -36,10 +36,6 @@
       "lines": 134,
       "stmts": 57
     },
-    "aegis_core/migrate.py:_plan_config": {
-      "lines": 112,
-      "stmts": 95
-    },
     "aegis_core/sync.py:sync": {
       "lines": 102,
       "stmts": 72
@@ -61,8 +57,8 @@
       "stmts": 113
     },
     "aegis_core/verification/import_guard.py:check": {
-      "lines": 113,
-      "stmts": 56
+      "lines": 66,
+      "stmts": 27
     },
     "aegis_core/verification/mutation_tester.py:check": {
       "lines": 134,
@@ -81,22 +77,61 @@
       "stmts": 68
     }
   },
+  "grandfathered": {
+    "functions": {
+      "tools/hierarchy_candidate_status.py:Observer.suite": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_candidate_status.py:markup_region": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py:lifecycle_records": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py:mailbox_records": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_host_authority.py:OwnedHostBinding.from_owned_channels": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:admit": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:run_job": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py:run_kind": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py:signal_process": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py:stop_owned": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py:ProtectedCanonicalDecisionWriter.commit_decision": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py:reduce_event": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox.py:main": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox_index.py:MailboxIndex._scan": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py:Runner.cleanup": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py:Runner.role_steps": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_provision.py:team_settings": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_small_change_dispatch.py:Row.check_receipts": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_team.py:owned_model_turn": "M69 in-flight lane pr6; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_wake.py:wake": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass"
+    },
+    "modules": {
+      "tools/hierarchy_candidate_status.py": "M69 in-flight lane f2; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_fresh_brief.py": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_host_authority.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_jobs.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_launcher.py": "M69 in-flight lane pr4b; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_lifecycle.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_mailbox.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_native_probe.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_provision.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_root.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_small_change_dispatch.py": "M69 in-flight lane dispatcher; exact shrink-only pin deferred to end-of-build pass",
+      "tools/hierarchy_team.py": "RF-40 existing tools entry; exact shrink-only pin deferred to end-of-build pass"
+    }
+  },
   "modules": {
     "aegis_cli/install_hosts.py": {
-      "lines": 1037,
-      "stmts": 632
+      "lines": 1034,
+      "stmts": 630
     },
     "aegis_core/gitsafe.py": {
-      "lines": 1250,
-      "stmts": 709
+      "lines": 1173,
+      "stmts": 653
     },
     "aegis_core/human_gate.py": {
-      "lines": 1211,
-      "stmts": 751
+      "lines": 1073,
+      "stmts": 637
     },
     "aegis_core/migrate.py": {
-      "lines": 1151,
-      "stmts": 770
+      "lines": 273,
+      "stmts": 213
     },
     "aegis_core/verification/runner.py": {
       "lines": 986,

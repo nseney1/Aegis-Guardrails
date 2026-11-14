@@ -1,0 +1,314 @@
+{
+  "schema": "aegis.model-bindings/v1",
+  "roles": [
+    {
+      "kind": "orchestrator",
+      "model_class": "coding",
+      "band": {
+        "floor": "light",
+        "default": "standard",
+        "ceiling": "standard"
+      }
+    },
+    {
+      "kind": "decider",
+      "model_class": "coding",
+      "band": {
+        "floor": "light",
+        "default": "standard",
+        "ceiling": "standard"
+      }
+    },
+    {
+      "kind": "implementer",
+      "model_class": "coding",
+      "band": {
+        "floor": "standard",
+        "default": "deep",
+        "ceiling": "max"
+      }
+    },
+    {
+      "kind": "integrator",
+      "model_class": "coding",
+      "band": {
+        "floor": "standard",
+        "default": "deep",
+        "ceiling": "max"
+      }
+    },
+    {
+      "kind": "reviewer",
+      "model_class": "coding",
+      "band": {
+        "floor": "deep",
+        "default": "deep",
+        "ceiling": "max"
+      }
+    }
+  ],
+  "hosts": [
+    {
+      "host": "claude-code",
+      "class": "coding",
+      "model": "claude-opus-5-5",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "admitted",
+        "standard": "admitted",
+        "deep": "admitted",
+        "extended": "admitted",
+        "max": "admitted",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "claude-code",
+      "class": "frontier",
+      "model": "claude-fable-5-1",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "claude-code",
+      "class": "scout",
+      "model": "claude-sonnet-5-5",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "claude-code",
+      "class": "mechanical",
+      "model": "claude-haiku-5-5",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "codex-cli",
+      "class": "coding",
+      "model": "gpt-6.1-sol",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "admitted",
+        "standard": "admitted",
+        "deep": "admitted",
+        "extended": "admitted",
+        "max": "admitted",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "codex-cli",
+      "class": "frontier",
+      "model": "gpt-6-astra",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "codex-cli",
+      "class": "scout",
+      "model": "gpt-6.1-terra",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "codex-cli",
+      "class": "mechanical",
+      "model": "gpt-6-luna",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": "max",
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "frontier",
+      "model": "gemini-4-carbon",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "scout",
+      "model": "gemini-4-argon",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "antigravity",
+      "host_status": "planned",
+      "class": "mechanical",
+      "model": "gemini-3.8-flash",
+      "effort_encoding": "model_suffix",
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": null,
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    },
+    {
+      "host": "grok",
+      "host_status": "planned",
+      "class": "coding",
+      "model": "grok-4.7",
+      "served_aliases": [
+        "grok-4.7-build"
+      ],
+      "levels": {
+        "light": "low",
+        "standard": "medium",
+        "deep": "high",
+        "extended": "xhigh",
+        "max": null,
+        "ultra": null
+      },
+      "admission": {
+        "light": "unprobed",
+        "standard": "unprobed",
+        "deep": "unprobed",
+        "extended": "unprobed",
+        "max": "unprobed",
+        "ultra": "unprobed"
+      }
+    }
+  ]
+}

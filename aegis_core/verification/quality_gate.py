@@ -179,17 +179,7 @@ def _evidence(tool: str, test_file: str, offenders: List[Tuple[str, int]], fail:
     return ToolEvidence(tool=tool, target=test_file, verdict=True, detail=ok, lines=[])
 
 
-# ── Public API ─────────────────────────────────────────────────────────────
-
-
-def check_assertion_density(test_file: str) -> ToolEvidence:
-    """Check that every ``test_*`` function in *test_file* has ≥1 assertion.
-
-    Syntactic, so these limits are accepted: an assertion anywhere in the body counts,
-    including one in a nested def that is never called or under ``if False:``, and any
-    call named ``assert*`` counts as an assertion helper.
-    """
-    tree = _parse(test_file)
+def _assertion_density(tree: ast.Module, test_file: str) -> ToolEvidence:
     placeholders = _environment_placeholders(tree)
     missing = [
         (f.name, f.lineno)
@@ -199,7 +189,33 @@ def check_assertion_density(test_file: str) -> ToolEvidence:
     return _evidence("assertion_density", test_file, missing, "Tests lacking assertions", "All tests have assertions")
 
 
+def _no_bare_pass(tree: ast.Module, test_file: str) -> ToolEvidence:
+    stubs = [(f.name, f.lineno) for f in _collect_test_functions(tree) if _is_bare_pass_func(f)]
+    return _evidence("no_bare_pass", test_file, stubs, "Bare pass/ellipsis stubs", "No bare pass stubs found")
+
+
+# ── Public API ─────────────────────────────────────────────────────────────
+
+
+def check_test_quality(test_file: str) -> Tuple[ToolEvidence, ToolEvidence]:
+    """Read and parse once, returning density then bare-pass evidence.
+
+    The tree is local to this call; input errors propagate to the caller.
+    """
+    tree = _parse(test_file)
+    return _assertion_density(tree, test_file), _no_bare_pass(tree, test_file)
+
+
+def check_assertion_density(test_file: str) -> ToolEvidence:
+    """Check that every ``test_*`` function in *test_file* has ≥1 assertion.
+
+    Syntactic, so these limits are accepted: an assertion anywhere in the body counts,
+    including one in a nested def that is never called or under ``if False:``, and any
+    call named ``assert*`` counts as an assertion helper.
+    """
+    return _assertion_density(_parse(test_file), test_file)
+
+
 def check_no_bare_pass(test_file: str) -> ToolEvidence:
     """Check that no ``test_*`` function is a bare pass/ellipsis stub."""
-    stubs = [(f.name, f.lineno) for f in _collect_test_functions(_parse(test_file)) if _is_bare_pass_func(f)]
-    return _evidence("no_bare_pass", test_file, stubs, "Bare pass/ellipsis stubs", "No bare pass stubs found")
+    return _no_bare_pass(_parse(test_file), test_file)

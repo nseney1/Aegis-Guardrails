@@ -14,8 +14,8 @@
   aegis check --write-baseline        record the current findings (aegis_core.baseline)
   aegis check --prune-baseline        drop the baseline entries whose findings are fixed
   aegis check --record [--tests] [--base REF] [--json]
-                                      bind the work tree to a git tree, run Layer 1 (and the user-scope
-                                      tests.command) on a snapshot of it, write one ledger check row
+                                      bind the work tree to a git tree, run Layer 1 and optional language tests
+                                      (or the user-scope tests.command) on a snapshot, write one ledger check row
   aegis check --card [--json]         the day-0 card (aegis_core.card); changes nothing
   aegis check --calibration [--json]  the calibration of the logged Layer 2 predictions per backend and
                                       observable kind (.aegis/state/arbiter_predictions.jsonl); log-only
@@ -45,6 +45,11 @@ from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
 __all__ = ["CheckCommand", "run_check"]
+
+
+# Drift contract: tests/unit/cli/test_check_explain.py::test_record_language_hint_set_matches_testplans.
+_RECORD_TEST_LANGUAGES = frozenset(("ts", "go", "rust"))
+_RECORD_FIELD_MAX_CHARS = 8 * 1024
 
 
 # Every other mode and the options a --record run would silently ignore.
@@ -78,6 +83,115 @@ def _record_conflict(args: argparse.Namespace) -> str:
     return next(iter(_given(args, _NOT_WITH_RECORD)), "")
 
 
+def _test_refusal(tests: dict) -> str:
+    """Explain the TestsRun evidence predicate, including legacy/global receipts."""
+    if tests.get("timed_out"):
+        return "timeout"
+    if not tests.get("complete", True):
+        return "incomplete_report"
+    if tests.get("failed", 0):
+        return "failed_tests"
+    if not tests.get("passed", 0):
+        return "no_tests_passed"
+    return "nonzero_exit" if tests.get("exit", 0) else ""
+
+
+def _record_components(row: dict, *, failing: bool):
+    """Select failures before advisory notes without copying omitted entries."""
+    tests = row.get("tests")
+    if tests and failing:
+        languages = tests.get("languages")
+        if languages:
+            for language in languages:
+                if not language.get("evidence"):
+                    yield "tests", language
+        elif _test_refusal(tests):
+            yield "tests", tests
+    for evidence in row.get("layer1", {}).get("evidence", ()):
+        if (not evidence.get("verdict")) == failing and (failing or evidence.get("reason")):
+            yield "Layer 1", evidence
+
+
+def _receipt_text(value: str, limit: int = 120, *, identifier: bool = False) -> str:
+    # Omit the whole oversized field: controls could expose a token cut by a raw slice.
+    if len(value) > _RECORD_FIELD_MAX_CHARS:
+        return "[diagnostic omitted: too_large]"
+
+    from aegis_cli import sanitize_display
+    from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets, redact_insight_text
+
+    # Controls can split a secret; canonicalize the whole field before any redaction or cut.
+    canonical = sanitize_display(value, max_len=None)
+    if identifier:
+        # Keep repository names intact while still masking known credentials, keys and URLs.
+        for pattern, replacement in TOKEN_REDACTIONS:
+            canonical = pattern.sub(replacement, canonical)
+        redacted = redact_command_secrets(canonical)
+    else:
+        # A display-sized max_len would let the redactor discard input before masking it.
+        redacted = redact_insight_text(canonical, max_len=max(len(canonical), limit))
+    return redacted[:limit]
+
+
+def _record_config_hint(reason: str, language: str = "", *, detail: str = "", incomplete_errors=()) -> str:
+    if reason == "no_driver:.go" or (reason == "no_driver" and language == "go"):
+        return "; config: .aegis/config.json: ast.packaged_drivers"
+    if reason.startswith("no_driver:") and len(reason) <= 27:
+        extension = reason[len("no_driver:"):]
+        if re.fullmatch(r"\.[a-zA-Z0-9_+-]{1,16}", extension):
+            return f"; config: ~/.aegis/config.json: drivers.{extension[1:]}"
+    prefix = f"tests.languages.{language}" if language in _RECORD_TEST_LANGUAGES else "tests"
+    if reason == "tests_runner_not_configured" and language == "ts" and detail in (
+            "TS/JS requires a user-scoped runner", "tests_runner_not_configured: TS/JS requires a user-scoped runner"):
+        return f"; config: ~/.aegis/config.json: {prefix}.command"
+    if (reason == "timeout" and prefix != "tests" and not detail
+            and "deadline_exceeded" not in incomplete_errors):
+        return f"; config: ~/.aegis/config.json: {prefix}.timeout_s"
+    return ""
+
+
+def _record_component_text(kind: str, component: dict) -> str:
+    reason = component.get("reason", "")
+    if kind == "Layer 1":
+        tool = _receipt_text(component.get("tool", "unknown"), identifier=True)
+        target = _receipt_text(component.get("target", ""), identifier=True)
+        config = _record_config_hint(reason)
+        return f"Layer 1: {tool} ({target}): {_receipt_text(reason) or 'finding'}{config}"
+    language = component.get("language", "")
+    label = f"tests[{_receipt_text(language, 40)}]" if language else "tests"
+    if language == "python" or reason in ("", "ok", "failed_tests", "no_tests_passed"):
+        reason = _test_refusal(component) or "unavailable"
+    config = _record_config_hint(reason, language, detail=component.get("detail", ""),
+                                 incomplete_errors=component.get("incomplete_errors", ()))
+    detail = _receipt_text(component.get("detail", ""), 160)
+    return f"{label}: {_receipt_text(reason, 80)}{config}" + (f"; {detail}" if detail else "")
+
+
+def _print_record_receipt(row: dict) -> None:
+    """Keep successful receipts concise; bound failure detail to eight single-line rows."""
+    tests = row.get("tests")
+    detail = f", tests {tests['passed']} passed, {tests['failed']} failed" if tests else ", Layer 1 only"
+    print(f"recorded: tree {row['tree'][:12]} {'passed' if row['passed'] else 'FAILED'}{detail}"
+          + ("; protected paths changed: no credit until approved" if row["protected_changed"] else ""))
+    if row["passed"]:
+        return
+    layer1 = row.get("layer1", {})
+    if layer1.get("findings"):
+        print(f"  Layer 1: {layer1['findings']} finding(s)")
+    shown = 0
+    for failing in (True, False):
+        omitted = 0
+        for kind, component in _record_components(row, failing=failing):
+            if shown < 8:
+                # Each field is already canonical and redacted; only bound the assembled line.
+                print("  " + _record_component_text(kind, component)[:398])
+                shown += 1
+            else:
+                omitted += 1
+        if omitted:
+            print(f"  {omitted} {'failing' if failing else 'advisory'} diagnostic(s) omitted")
+
+
 def _run_record(args: argparse.Namespace) -> int:
     """`aegis check --record [--tests]`: 0 recorded and passed, 1 failed or could not run, 2 usage."""
     from aegis_cli import sanitize_display
@@ -103,10 +217,7 @@ def _run_record(args: argparse.Namespace) -> int:
                         tree=outcome.binding.as_dict() if outcome.binding else None)
         print(json.dumps(document, indent=2))
     elif outcome.status == "recorded":
-        tests = row.get("tests")
-        detail = f", tests {tests['passed']} passed, {tests['failed']} failed" if tests else ", Layer 1 only"
-        print(f"recorded: tree {row['tree'][:12]} {'passed' if row['passed'] else 'FAILED'}{detail}"
-              + ("; protected paths changed: no credit until approved" if row["protected_changed"] else ""))
+        _print_record_receipt(row)
         if outcome.hint:
             print(f"hint: {outcome.hint}")
     else:
@@ -160,31 +271,52 @@ def run_check(args: argparse.Namespace) -> int:
 
 _LOGIN = re.compile(r"[A-Za-z0-9-]{1,39}")
 _FULL_SHA = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+_MAX_EVENT_BYTES = 25 * 1024 * 1024
 
 
-def _event_pull() -> dict:
+class _CiEventError(ValueError):
+    """Event input cannot safely identify the comparison or its target."""
+
+
+_CI_EVENT_ERROR = "invalid_ci_event: invalid event data; next_action: provide a valid CI event or run locally with --base"
+
+
+def _event_pull(field="pull_request", *, strict=False) -> dict:
     """The ``pull_request`` object of the event file GitHub Actions names in $GITHUB_EVENT_PATH; {} anywhere else."""
     path = os.environ.get("GITHUB_EVENT_PATH")
     if not path:
         return {}
     try:
-        with open(path, encoding="utf-8") as handle:
-            pull = json.load(handle).get("pull_request") or {}
-    except (OSError, ValueError, TypeError, AttributeError):
+        with open(path, "rb") as handle:
+            # The runner supplies this path; only its contents are repository-controlled.
+            if os.fstat(handle.fileno()).st_size > _MAX_EVENT_BYTES:
+                raise _CiEventError(_CI_EVENT_ERROR)
+            data = handle.read(_MAX_EVENT_BYTES + 1)
+            if len(data) > _MAX_EVENT_BYTES:
+                if strict:
+                    raise _CiEventError(_CI_EVENT_ERROR)
+                return {}
+            document = json.loads(data.decode("utf-8"))
+            if strict and not isinstance(document, dict):
+                raise _CiEventError(_CI_EVENT_ERROR)
+            pull = (document if field is None else document.get(field)) or {}
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        if strict:
+            raise _CiEventError(_CI_EVENT_ERROR) from None
         return {}
     return pull if isinstance(pull, dict) else {}
 
 
-def _event_shas() -> tuple[str | None, str | None]:
+def _event_shas(document=None) -> tuple[str | None, str | None]:
     """(base, head) commit ids of the pull request this CI job runs for; (None, None) anywhere else."""
     try:
-        pull = _event_pull()
+        pull = _event_pull() if document is None else document.get("pull_request")
         return pull["base"]["sha"], pull["head"]["sha"]
     except (KeyError, TypeError):
         return None, None
 
 
-def _event_pull_request():
+def _event_pull_request(document=None):
     """The pull request of a ``pull_request`` or ``pull_request_target`` run (the base-sourced governance
     job), for tier A's review approval: its number, author, full head commit id and base branch, each
     checked; None for any other event or any value in doubt (no gh call then)."""
@@ -193,7 +325,7 @@ def _event_pull_request():
     if os.environ.get("GITHUB_EVENT_NAME") not in ("pull_request", "pull_request_target"):
         return None
     try:
-        pull = _event_pull()
+        pull = _event_pull() if document is None else document.get("pull_request")
         number, login, sha, ref = pull["number"], pull["user"]["login"], pull["head"]["sha"], pull["base"]["ref"]
     except (KeyError, TypeError):
         return None
@@ -201,6 +333,72 @@ def _event_pull_request():
             or not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha) or not human_gate.is_branch_name(ref):
         return None
     return human_gate.PullRequest(number, login, sha.lower(), ref)
+
+
+def _ci_policy_context(root, base, explicit_base, document=None, head="HEAD", *, resolved_target=None):
+    """Resolve comparison and landing identity without changing no-map behavior."""
+    from aegis_core import approval_policy, human_gate
+
+    event = os.environ.get("GITHUB_EVENT_NAME")
+    strict = approval_policy.policy_present(root, base)
+    if event in ("pull_request", "pull_request_target"):
+        pull = _event_pull(strict=strict) if document is None else document.get("pull_request")
+        pull = pull if isinstance(pull, dict) else {}
+        anchor, candidate = pull.get("base"), pull.get("head")
+        anchor = anchor if isinstance(anchor, dict) else {}
+        candidate = candidate if isinstance(candidate, dict) else {}
+        if strict and (not isinstance(anchor.get("sha"), str) or not _FULL_SHA.fullmatch(anchor["sha"])
+                       or not isinstance(candidate.get("sha"), str) or not _FULL_SHA.fullmatch(candidate["sha"])):
+            raise _CiEventError(_CI_EVENT_ERROR)
+        ref = anchor.get("ref")
+        if strict and "ref" in anchor and not isinstance(ref, str):
+            raise _CiEventError(_CI_EVENT_ERROR)
+        if explicit_base:
+            return base, resolved_target if resolved_target == ref else None
+        return base, ref if human_gate.is_branch_name(ref) else None
+    if event == "push":
+        full_ref = os.environ.get("GITHUB_REF", "")
+        ref = (full_ref[len("refs/heads/"):] if len(full_ref) <= len("refs/heads/") + 255
+               and full_ref.startswith("refs/heads/") else None)
+        if explicit_base:
+            return base, resolved_target if resolved_target == ref else None
+        return base, ref if human_gate.is_branch_name(ref) else None
+    return base, resolved_target
+
+
+def _ci_inputs(root, args):
+    """Use one event snapshot for the comparison, target and review identity."""
+    from aegis_core import approval_policy, gitsafe
+
+    strict = os.environ.get("GITHUB_EVENT_NAME") in ("push", "pull_request", "pull_request_target")
+    malformed = False
+    try:
+        document = _event_pull(None, strict=strict)
+    except _CiEventError:
+        document, malformed = {}, True
+    event_base, event_head = _event_shas(document)
+    event_base = event_base if isinstance(event_base, str) else None
+    event_head = event_head if isinstance(event_head, str) else None
+    head = getattr(args, "head", None) or event_head or "HEAD"
+    with gitsafe.scrubbed():
+        explicit = getattr(args, "base", None)
+        if explicit == "":
+            explicit = None
+        selector = explicit if explicit is not None else event_base or gitsafe.resolve_base_ref(root)
+        resolved = approval_policy.resolve_comparison(root, selector, discovered=explicit is None)
+        base = resolved.commit
+        if malformed and approval_policy.policy_present(root, base):
+            raise _CiEventError(_CI_EVENT_ERROR)
+        if os.environ.get("GITHUB_EVENT_NAME") == "push":
+            base = approval_policy.push_base(root, document.get("before"), base, head,
+                                             explicit=explicit is not None, label=selector)
+        if selector is not None and not base:
+            raise approval_policy.BaseUnavailable("base_unavailable: comparison branch is unavailable",
+                explicit_base=selector if explicit is not None else None, comparison_base=selector)
+        base, target = _ci_policy_context(root, base, explicit, document, head, resolved_target=resolved.target)
+        if approval_policy.policy_present(root, base):
+            head = gitsafe.resolve_commit(root, head) or head
+    return base, head, _event_pull_request(document), target
 
 
 # What --no-exec leaves out: both rerun the pull request's code (snapshot tests, fix-commit tests).
@@ -241,6 +439,12 @@ def _ci_blocking(report, reg_report=None, perf_report=None, trailer_checks=None,
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
                        skipped=(), scanner_results=None) -> dict:
     document = report.as_dict(root)
+    if report.approval_policy is not None and report.approval_policy.mode is not None:
+        document.update(report.approval_policy.as_dict(display=_receipt_text))
+        document["weakenings"] = [{key: _receipt_text(value, 400, identifier=True) for key, value in item.items()}
+                                  for item in document["weakenings"]]
+        document["governance"]["paths"] = [{key: _receipt_text(value, 400, identifier=True) for key, value in item.items()}
+                                          for item in document["governance"]["paths"]]
     if reg_report is not None:
         document["regression"] = reg_report.as_dict(root)
     if cov_report is not None:
@@ -260,11 +464,54 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
     return document
 
 
+def _print_policy(document, fmt, blocking, span):
+    """Render policy notices and permitted findings, retaining the ordinary verdict otherwise."""
+    mode = document.get("approval_mode")
+    if mode == "review" and fmt != "github":
+        print("  owner review required")
+    if mode is not None and document.get("approval_target") is None:
+        print("  note: target unknown; using the strictest declared mode; pass --base origin/<branch>")
+    if document.get("approval_policy_error"):
+        print(f"  note: {document['approval_policy_error']}")
+    if mode not in ("none", "review"):
+        return False
+    cause = f": {blocking[0]}" if blocking else ""
+    print(f"aegis check --ci: {'FAILED' if blocking else 'PASSED'}, approval mode {mode} ({span}){cause}")
+    for item in document["weakenings"]:
+        print(_receipt_text(f"  [{item['code']}] {item['rule']} ({item['path']}): {item['message']}", 400, identifier=True))
+    for entry in document["governance"]["paths"]:
+        print(_receipt_text(f"  [governance:{entry['category']}] {entry['path']}", 400, identifier=True))
+    return True
+
+
+def _approval_command(document):
+    command = "aegis approve"
+    if document.get("approval_mode") == "signature" and document.get("approval_target") is not None:
+        command += f" --base origin/{_receipt_text(document['approval_target'], 255, identifier=True)}"
+    return command
+
+
+def _print_ci_findings(report, document, gated):
+    from aegis_cli import sanitize_display
+
+    if document.get("approval_mode") is not None:
+        for item in document["weakenings"]:
+            print(_receipt_text(f"  [{item['code']}] {item['rule']} ({item['path']}): {item['message']}", 400, identifier=True))
+        for entry in document["governance"]["paths"] if gated else ():
+            print(_receipt_text(f"  [governance:{entry['category']}] {entry['path']}", 400, identifier=True))
+    else:
+        for item in report.weakenings:
+            print(sanitize_display(f"  [{item.code}] {item.rule} ({item.path}): {item.message}", 400))
+        for path, category in report.governance_paths if gated else ():
+            print(sanitize_display(f"  [governance:{category}] {path}", 400))
+
+
 def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
               skipped=(), scanner_results=None) -> list:
     """Print the ``check --ci`` result in ``fmt`` and append the step summary; return the blocking causes."""
     from aegis_cli import sanitize_display
-    from aegis_cli.formatters.report import format_sarif_report, github_annotation_lines, governance_note, perf_line
+    from aegis_cli.formatters.report import (coverage_explanation, coverage_omitted_count, coverage_reason, format_sarif_report,
+                                             github_annotation_lines, governance_note, perf_line)
     from aegis_cli.verify import _append_step_summary
     from aegis_core import regression
 
@@ -285,14 +532,15 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         for line in github_annotation_lines(document):
             print(line)
     span = f"{report.merge_base[:10]}..{report.head[:10]}"
-    if not report.weakenings and not gated:
+    policy_rendered = _print_policy(document, fmt, blocking, span)
+    if not policy_rendered and not report.weakenings and not gated:
         if blocking:
             print(f"aegis check --ci: FAILED: {blocking[0]}")
         elif report.merge_base == report.head:  # a push to the base branch, a dispatch run, a stale branch
             print(f"aegis check --ci: note: base and head are the same commit; nothing was compared ({span})")
         else:
             print(f"aegis check --ci: PASSED, no rule weakened ({report.rules_checked} binding rule(s) at the merge base, {span})")
-    else:
+    elif not policy_rendered:
         what, _counted, done = _weakening_terms(report)
         if blocking:  # an approved change and another blocker: say which, not "without approval"
             print(f"aegis check --ci: FAILED: {blocking[0]}" + (f"; {done} approved" if report.passed else ""))
@@ -301,12 +549,10 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             signer = (f"review of {approval.signer}" if approval.source == "review"
                       else approval.signer or "a key in the base allowed_signers")
             print(f"aegis check --ci: PASSED, {done} approved by {sanitize_display(signer, 120)} ({span})")
-        for item in report.weakenings:
-            print(sanitize_display(f"  [{item.code}] {item.rule} ({item.path}): {item.message}", 400))
-        for path, category in report.governance_paths if gated else ():
-            print(sanitize_display(f"  [governance:{category}] {path}", 400))
+        _print_ci_findings(report, document, gated)
         if not report.passed:
-            print(f"  A {what} passes only with a signed approval: aegis approve (a key listed in allowed_signers on the base "
+            command = _approval_command(document)
+            print(f"  A {what} passes only with a signed approval: {command} (a key listed in allowed_signers on the base "
                   "branch), or at tier A with an approving review of the head commit by someone other than its author.")
     if note:
         print(sanitize_display(f"  note: {note}", 400))
@@ -351,29 +597,49 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         ratio = cov_report.get("ratio")
         print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
                                f"{cov_report.get('executable_lines', 0)} changed executable lines "
-                               f"({len(cov_report.get('unmeasured') or ())} file(s) not measured)", 400))
+                               f"({coverage_omitted_count(cov_report)} file(s) not measured)", 400))
     elif cov_report is not None:
-        print(sanitize_display(f"  coverage: UNVERIFIED ({cov_report.get('reason', '')})", 400))
+        print(f"  coverage: UNVERIFIED ({coverage_reason(cov_report)})")
+    if cov_report is not None:
+        print(f"  {coverage_explanation(cov_report)}")
     if skipped:
         print("  note: --no-exec: the regression and Aegis-Check trailer checks were not run")
     return blocking
 
 
-def _ci_error(message: str, fmt: str) -> int:
+def _ci_error(message: str, fmt: str, *, code=None, next_action=None) -> int:
     """A run that could not be judged: exit 1 with the reason, and in SARIF a valid log that says the run
     did not complete, so an upload step that always runs never meets an empty or invalid file."""
     from aegis_cli.formatters.report import format_sarif_report
 
     print(f"Error: {message}", file=sys.stderr)
+    if fmt == "json" and code is not None:
+        print(json.dumps({"status": "fail", "code": code, "approval": None,
+                          "next_action": next_action or "provide a valid CI event or run locally with --base"}))
     if fmt == "sarif":
         print(format_sarif_report({}, error=message))
     return 1
 
 
+def _ci_base_error(exc, fmt):
+    from aegis_core import approval_policy
+
+    action = approval_policy.BASE_UNAVAILABLE_ACTION
+    if exc.code == "comparison_unavailable":
+        action = "pass --base that is a proper ancestor of the head"
+    else:
+        selector = exc.explicit_base if exc.explicit_base is not None else exc.comparison_base
+        if selector is not None:
+            base = _receipt_text(selector, 255, identifier=True)
+            origin = "fetch origin; " if selector.startswith(("origin/", "refs/remotes/origin/")) else ""
+            action = f"cannot resolve the base {base!r}; {origin}fetch it or pass the full commit id"
+    return _ci_error(f"{exc.code}: {action}", fmt, code=exc.code, next_action=action)
+
+
 def _run_ci(args: argparse.Namespace) -> int:
     """`aegis check --ci`: 0 nothing weakened or every weakening approved, 1 otherwise, 2 usage."""
     from aegis_cli import sanitize_display
-    from aegis_core import checkrun, gitsafe, regression, rule_integrity
+    from aegis_core import approval_policy, checkrun, gitsafe, regression, rule_integrity
 
     from aegis_cli.verify import _resolve_git_cwd
 
@@ -398,21 +664,31 @@ def _run_ci(args: argparse.Namespace) -> int:
         return 2
     fmt = "json" if getattr(args, "json", False) else str(getattr(args, "format", None) or "text").lower()
     root = _resolve_git_cwd(args)
-    event_base, event_head = _event_shas()
-    with gitsafe.scrubbed():  # the default base is evidence about root, as check_ci's own git is
-        base = getattr(args, "base", None) or event_base or gitsafe.resolve_base_ref(root)
-    head = getattr(args, "head", None) or event_head or "HEAD"
-    if not base:
-        return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
-                         fmt)
     try:
-        report = rule_integrity.check_ci(root, base, head, pull_request=_event_pull_request())
+        base, head, pull, target = _ci_inputs(root, args)
+        if not base:
+            return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
+                             fmt)
+        report = rule_integrity.check_ci(root, base, head, pull_request=pull, target=target)
         # The reruns can take long; progress goes to stderr so the json and github stdout stay unchanged.
         progress = lambda line: print(f"aegis check --ci: {sanitize_display(line, 300)}", file=sys.stderr, flush=True)  # noqa: E731
         reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, progress=progress)
         trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head, progress=progress)
+    except _CiEventError:
+        return _ci_error(_CI_EVENT_ERROR, fmt, code="invalid_ci_event")
+    except approval_policy.BaseUnavailable as exc:
+        return _ci_base_error(exc, fmt)
+    except approval_policy.InvalidApprovalPolicy as exc:
+        unavailable = isinstance(exc, approval_policy.PolicyUnavailable)
+        if fmt == "json":
+            print(json.dumps({"status": "fail", "code": "invalid_approval_policy", "path": approval_policy.CONFIG_PATH,
+                              "key": "approvals", "next_action": approval_policy.POLICY_UNAVAILABLE_ACTION
+                              if unavailable else "fix the committed configuration"}))
+        return _ci_error(approval_policy.POLICY_UNAVAILABLE_DETAIL if unavailable else approval_policy.INVALID_DETAIL, fmt)
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
-        return _ci_error(sanitize_display(str(exc), 400), fmt)
+        coded = isinstance(exc, rule_integrity.IntegrityError)
+        return _ci_error(sanitize_display(str(exc), 400), fmt, code=exc.code if coded else None,
+                         next_action=exc.next_action if coded else None)
 
     cov_report = None
     if getattr(args, "coverage", False):
@@ -512,9 +788,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--tests",
             action="store_true",
-            help="With --record: also run the test command from the user-scope config (tests.command in "
-            "~/.aegis/config.json, default python -m pytest, never the repository's) in the snapshot with a "
-            "fixed environment; exit 5 or zero passed tests is never evidence",
+            help="With --record: run automatically selected languages in a fixed snapshot environment; user-scope "
+            "tests.command takes precedence and runs once, never the repository's. Python defaults to pytest; "
+            "native runners: user-scope tests.languages.{go,rust,ts}.command (required for TS/JS). See docs/languages.md; exit 5 or zero passed is never evidence",
         )
         parser.add_argument("--format", choices=("text", "json", "github", "sarif"), default="text",
                             help="Output format. github|sarif: workflow-command annotations or SARIF 2.1.0 for --ci or "
@@ -635,9 +911,9 @@ class CheckCommand(AegisCommand):
         parser.add_argument(
             "--coverage",
             action="store_true",
-            help="With --ci only: report-only diff coverage, the share of the executable lines changed since "
-            "merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes "
-            "the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
+            help="With --ci only: report-only diff coverage by language. Python uses pytest-based tests.command; "
+            "Go defaults to go test -coverprofile; configure native coverage with coverage.languages.ts.command "
+            "or coverage.languages.rust.command (LCOV), in user scope only. See docs/languages.md. Exit unchanged; unavailable: UNVERIFIED",
         )
         parser.add_argument(
             "--perf",

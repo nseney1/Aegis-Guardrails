@@ -102,7 +102,8 @@ Read [How Aegis works](https://github.com/nseney1/Aegis-Guardrails/blob/main/doc
 
 ## What's included
 
-- **A CLI** with 15 commands (`init`, `uninstall`, `doctor`, `migrate`, `check`, `approve`, `scan`, `status`, `rule`, `sync`, `hook`, `team`, `skills`, `benchmark`, `package`) and **an MCP server** with 5 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`, `aegis_capture_insight`).
+- **A CLI** with 17 commands (`init`, `uninstall`, `doctor`, `migrate`, `check`, `approve`, `scan`, `status`, `rule`, `sync`, `hook`, `team`, `skills`, `benchmark`, `package`, `workspace`, `msg`) and **an MCP server** with 7 tools (`aegis_scan`, `aegis_report_outcome`, `aegis_create_rule`, `aegis_list_rules`, `aegis_capture_insight`, `aegis_msg_read`, `aegis_msg_write`).
+- **Opt-in manager audit prototype:** `aegis workspace` prepares a separate manager registration with owner-approved management policy and zero fitness credit. See the [team surface chooser](https://github.com/nseney1/Aegis-Guardrails/blob/main/README.md#agent-teams) for setup and capability boundaries; native Teams enforcement remains unavailable.
 - **12 starter [rules](https://github.com/nseney1/Aegis-Guardrails/tree/main/rules)**: grounding claims in code, dry runs before destructive commands, behavioral tests, TDD, git hygiene and more (`aegis init --rules minimal|standard|full` seeds 2, 5 or all 12; set `target_paths` to activate them).
 - **15 [skills](https://github.com/nseney1/Aegis-Guardrails/tree/main/skills)**: `SKILL.md` playbooks synced by `aegis skills sync` (or `aegis init --skills`) into `.claude/skills/` and `.agents/skills/`.
 - **Built-in security checks**: language security packs and a known-format secret scan check what your change introduces; explicit allow comments record suppressions.
@@ -119,9 +120,17 @@ Go parsing needs Go ≥1.21. JS/TS and Rust parsing need no Node or Rust toolcha
 
 ## Agent teams
 
-When parallel agents work in separate worktrees (lanes), declare each lane's path scope with `aegis team claim docs --paths 'docs/**' README.md`. A lease is cooperative conflict input — not a lock, not an identity, and not proof an agent is still running — and overlapping live claims are refused.
+Choose the surface for your task:
 
-Verify containment with `aegis check --lane docs`: every path changed since the merge base must stay inside the lane's scope, and no Python test may disappear or gain a skip. With a lease or `--paths` the check is self-attested; with `--base-policy` it reads `.aegis/team.json` from the base branch and is witnessed. In CI it is advisory (not a required check). See [Agent teams](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md) for lease refs and `aegis team metrics`.
+- [Repository lanes](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md) — `aegis team` leases and `aegis check --lane` for committed path scopes.
+- [Management audit](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/manager-workspaces.md) — `aegis workspace` serves management rules and records decision claims.
+- [Runtime team prototype](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/agent-hierarchies.md) — source-checkout tools set up runs and start or stop supported CLI sessions.
+
+See [setup and limits](https://github.com/nseney1/Aegis-Guardrails/blob/main/docs/teams.md#setup-and-limits-of-each-surface) for installation, authority and runtime prerequisites.
+
+Declare a lane with `aegis team claim docs --paths 'docs/**'`. A lease is cooperative conflict input, not a lock, identity or proof of liveness; overlapping live claims are refused. Root-file work needs coordination: a bare `README.md` pattern conservatively overlaps every scope.
+
+Verify containment with `aegis check --lane docs`: changed paths must stay within scope, and no Python test may disappear or gain a skip. With a lease or `--paths` the check is self-attested; with `--base-policy` it reads `.aegis/team.json` from the base branch and is witnessed. In CI it is advisory (not a required check).
 
 ## Limits and trust
 

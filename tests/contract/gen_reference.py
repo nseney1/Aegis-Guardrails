@@ -41,8 +41,8 @@ PYTHONPATH=. python3 tests/contract/gen_reference.py --write
 """
 
 
-def _cell(text: Any) -> str:
-    """Text for one markdown table cell: one line, with `|` escaped."""
+def _table_text(text: Any) -> str:
+    """Text for one markdown table field: one line, with `|` escaped."""
     if text is None or text == SUPPRESS:
         return ""
     return " ".join(str(text).split()).replace("|", "\\|")
@@ -73,7 +73,7 @@ def _default_column(arg: Dict[str, Any]) -> str:
 
 def _argument_row(arg: Dict[str, Any]) -> str:
     name = ", ".join(_code(f) for f in arg["flags"]) or _code(arg["dest"])
-    help_text = _cell(arg.get("help"))
+    help_text = _table_text(arg.get("help"))
     if not arg["flags"] and arg.get("required"):
         help_text = f"{help_text} (required)".strip()
     return f"| {name} | {_value_column(arg)} | {_default_column(arg)} | {help_text} |"
@@ -92,10 +92,10 @@ def _arguments_table(arguments: List[Dict[str, Any]], skip_common: bool) -> List
 
 
 def _command(path: List[str], node: Dict[str, Any], registry: Dict[str, Dict[str, Any]]) -> List[str]:
-    lines = [f"### `aegis {' '.join(path)}`", "", _cell(node.get("help")) or "(no help text)", ""]
+    lines = [f"### `aegis {' '.join(path)}`", "", _table_text(node.get("help")) or "(no help text)", ""]
     description = node.get("description")
     if description and description != SUPPRESS and description != node.get("help"):
-        lines += [_cell(description), ""]
+        lines += [_table_text(description), ""]
     facts = []
     entry = registry.get(path[0]) if len(path) == 1 else None
     if entry is not None:
@@ -140,7 +140,7 @@ def _tool(tool: Dict[str, Any]) -> List[str]:
         "",
         f"**{title}**" + (f" ({', '.join(traits)})" if traits else ""),
         "",
-        _cell(tool.get("description")),
+        _table_text(tool.get("description")),
         "",
     ]
     schema = tool.get("inputSchema", {})
@@ -150,8 +150,8 @@ def _tool(tool: Dict[str, Any]) -> List[str]:
         lines += ["| Parameter | Type | Required | Description |", "| --- | --- | --- | --- |"]
         for name, prop in properties.items():
             lines.append(
-                f"| {_code(name)} | {_cell(_schema_type(prop))} | {'yes' if name in required else 'no'} "
-                f"| {_cell(prop.get('description'))} |"
+                f"| {_code(name)} | {_table_text(_schema_type(prop))} | {'yes' if name in required else 'no'} "
+                f"| {_table_text(prop.get('description'))} |"
             )
         lines.append("")
     else:
@@ -165,11 +165,12 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
     registry = {entry["name"]: entry for entry in cli.get("registry", [])}
     lines = [HEADER, "## Command line: `aegis`", ""]
     if parser.get("description"):
-        lines += [_cell(parser["description"]), ""]
+        lines += [_table_text(parser["description"]), ""]
     lines += [
         "### Global options",
         "",
-        "Every command also accepts `-h/--help`, `--json`, `--plain` and `--workspace`.",
+        "Repository commands also accept `-h/--help`, `--json`, `--plain` and `--workspace`.",
+        "The manager `workspace` namespace requires `--config` and refuses `--workspace`.",
         "",
         *_arguments_table(parser["arguments"], skip_common=False),
         "### Commands",
@@ -186,7 +187,7 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
 
     for name in sorted(commands, key=order):
         category = registry.get(name, {}).get("category", "")
-        lines.append(f"| `aegis {name}` | {category} | {_cell(commands[name].get('help'))} |")
+        lines.append(f"| `aegis {name}` | {category} | {_table_text(commands[name].get('help'))} |")
     lines.append("")
     for name in sorted(commands, key=order):
         lines += _command([name], commands[name], registry)
@@ -199,10 +200,13 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
             "",
             "| Command | Instead |",
             "| --- | --- |",
-            *[f"| `aegis {name}` | {_cell(pointer)} |" for name, pointer in removed.items()],
+            *[f"| `aegis {name}` | {_table_text(pointer)} |" for name, pointer in removed.items()],
             "",
         ]
-    lines += ["## MCP server: `aegis-mcp`", ""]
+    lines += ["## MCP server: `aegis-mcp`", "",
+              "This section describes repository mode. The separately registered manager audit surface is",
+              "documented in [Manager workspaces](manager-workspaces.md) and pinned in",
+              "`tests/contract/manager_mcp_tools.json`.", ""]
     tools = mcp.get("tools", [])
     if tools:
         lines += [
@@ -211,7 +215,7 @@ def render(cli: Dict[str, Any], mcp: Dict[str, Any]) -> str:
             "",
             "| Tool | Title |",
             "| --- | --- |",
-            *[f"| `{t['name']}` | {_cell(t.get('annotations', {}).get('title'))} |" for t in tools],
+            *[f"| `{t['name']}` | {_table_text(t.get('annotations', {}).get('title'))} |" for t in tools],
             "",
         ]
     for tool in tools:

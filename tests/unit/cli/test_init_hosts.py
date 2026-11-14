@@ -233,13 +233,15 @@ class TestExactFilesPerHostSelection:
         assert data["mcpServers"]["aegis"]["command"] == env.mcp
 
     def test_existing_antigravity_servers_are_kept(self, env):
+        from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, _word_counts
+
         cfg = env.home / ".gemini" / "config" / "mcp_config.json"
         cfg.parent.mkdir(parents=True)
         cfg.write_text(json.dumps({"mcpServers": {"github": {"command": "gh"}}, "other": True}), encoding="utf-8")
         assert init(env, "--host", "antigravity") == 0
         data = json.loads(cfg.read_text(encoding="utf-8"))
         assert data["other"] is True and data["mcpServers"]["github"] == {"command": "gh"}
-        assert "soma" not in data["mcpServers"]
+        assert not any(_word_counts(data["mcpServers"], REQUIRED_WORDS).values())
 
 
 class TestBootstrapAndClaudeShim:

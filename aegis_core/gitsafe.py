@@ -1,11 +1,8 @@
 """Every git subprocess Aegis runs, except treeid's (scrubbed environment, private index;
 SECURITY.md). D20, host-matrix §3.7, v4.3 spec §10.1.
 
-A repository's own config is attacker-controlled: ``core.fsmonitor`` names a program
-that ``git status``/``git diff`` run, hooks run on many commands, a clean filter
-(``filter.<driver>.clean``) runs whenever git hashes a working-tree file that
-``.gitattributes`` assigns to that driver, and remotes can prompt for credentials. So
-every call here:
+Repository config can run fsmonitor, hooks, clean filters (through .gitattributes)
+and remote credential helpers. Each call uses these defenses:
 
 - runs ``git`` as an argv list (no shell) with a timeout;
 - passes ``-c core.fsmonitor=false -c core.hooksPath=<devnull> -c protocol.allow=never
@@ -13,6 +10,7 @@ every call here:
   signature programs (``gpg.program``, ``gpg.openpgp.program``, ``gpg.x509.program``) at
   <devnull> (command-line config beats repo config);
 - sets ``GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 LC_ALL=C``.
+  ``GIT_ALLOW_PROTOCOL= GIT_NO_LAZY_FETCH=1`` blocks fetches; validated sync push opts in.
   The system config is read, as git reads it: the machine's administrator writes it,
   and Git for Windows keeps ``core.autocrlf=true`` there, without which every file of a
   Windows checkout (CRLF in the work tree, LF in the repository) looks modified;
@@ -44,7 +42,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -55,7 +52,11 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from aegis_core import atomicio, pathlookup
+from aegis_core import atomicio, pathlookup, gitsafe_run
+from aegis_core.gitsafe_run import custody_active, scrubbed
+from aegis_core.gitsafe_run import BASE_ENV as _ENV, LOCAL_ENV as _LOCAL_ENV
+from aegis_core.gitsafe_run import DEFAULT_HARDENING as _HARDENING
+from aegis_core.gitsafe_run import HARDENING_KEEP_HOOKS_PATH as _HARDENING_KEEP_HOOKS_PATH
 from aegis_core.errors import AegisError
 from aegis_core.primitives import is_within, safe_parts
 
@@ -77,6 +78,9 @@ __all__ = [
     "blob_sizes",
     "changed_files",
     "common_dir",
+    "custody",
+    "custody_active",
+    "custody_program",
     "diff_entries",
     "export_tree",
     "filter_overrides",
@@ -85,6 +89,7 @@ __all__ = [
     "git_version",
     "head_commit",
     "in_memo",
+    "iter_objects",
     "layout",
     "list_files",
     "list_refs",
@@ -96,6 +101,7 @@ __all__ = [
     "read_blob",
     "read_blobs",
     "read_object",
+    "read_private_object", "private_object_headers", "read_private_objects",
     "read_ref",
     "relative_to_prefix",
     "resolve_base_ref",
@@ -120,41 +126,9 @@ MERGE_TREE_MIN_VERSION = (2, 38)
 #: The only ref hierarchy update_ref writes: never a branch, a tag or a remote ref.
 _WRITABLE_REFS = "refs/aegis/"
 _ACMR = "--diff-filter=ACMR"
-# git takes a signature's format from its armor, so a PGP or X.509 signature runs gpg.program
-# or gpg.x509.program, which repository config can set (log.showSignature makes plain ``git
-# log`` check them). Aegis checks SSH signatures only, through the gpg.ssh.program human_gate
-# pins. <devnull>, not a bare ``false``: git looks a bare name up on PATH, where a relative or
-# empty entry finds a program planted in the work tree.
-_HARDENING_KEEP_HOOKS_PATH = (
-    "-c", "core.fsmonitor=false",
-    "-c", "protocol.allow=never",
-    "-c", "core.sshCommand=false",
-    "-c", "credential.helper=",
-    "-c", "log.showSignature=false",
-    "-c", f"gpg.program={os.devnull}",
-    "-c", f"gpg.openpgp.program={os.devnull}",
-    "-c", f"gpg.x509.program={os.devnull}",
-)
-_HARDENING = ("-c", f"core.hooksPath={os.devnull}", *_HARDENING_KEEP_HOOKS_PATH)
-_ENV = {
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_NO_REPLACE_OBJECTS": "1",
-    "LC_ALL": "C",
-}
-# What ``git rev-parse --local-env-vars`` lists: each points git at another repository, index or
-# object store. Identity, SSH and the config-scope variables (how a HOME is faked) are not here.
-_LOCAL_ENV = frozenset((
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
-    "GIT_COMMON_DIR",
-))
-_SCRUB: "contextvars.ContextVar[bool]" = contextvars.ContextVar("aegis_git_scrub", default=False)
 
 
-class GitError(AegisError):
-    """git is missing, timed out, or gave an answer that cannot be trusted."""
+GitError = gitsafe_run.GitError
 
 
 class RefNameError(GitError):
@@ -187,20 +161,33 @@ def _reset_for_tests() -> None:
     _GIT_FOUND.clear()
 
 
-def git_executable() -> str:
-    """The git ``run`` starts, looked up once per PATH value; a git removed since raises GitError."""
-    # Absolute PATH entries only: an empty or relative entry names the cwd (the
-    # repository, where a clone can plant a git), and so does the current directory
-    # the standard library's lookup searches first on Windows.
-    key = (os.environ.get("PATH"), os.environ.get("PATHEXT"))
-    found = _GIT_FOUND.get(key)
-    if not (found and os.path.isfile(found) and os.access(found, os.X_OK)):
-        _GIT_FOUND.clear()
-        found = pathlookup.which("git")
-        if not found:
-            raise GitError("git is not installed or not on PATH")
-        _GIT_FOUND[key] = found
-    return found
+def git_executable(*, environ=None, cwd=None) -> str:
+    """Resolve Git centrally; effects use their environment/fence and a fresh cache."""
+    return gitsafe_run.find_executable(_GIT_FOUND if environ is None else {}, environ,
+        lambda effective: pathlookup.which("git",
+            **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {})),
+        error=GitError, cwd=cwd)
+
+
+def custody_program(cwd, *, environ=None) -> Optional[str]:
+    """Strict custody resolves Git outside the owner-bound worktree."""
+    return gitsafe_run.find_executable({}, environ, lambda effective: pathlookup.which("git", outside=getattr(effective, "root", cwd), path=effective.get("PATH", os.defpath)), error=GitError, cwd=cwd, profile="strict/effect", missing_ok=True)
+
+
+def lane_runner(cwd, scratch, *, effect_fds=None, environ=None, write_roots=(), worktree_root=None):
+    """Packaged explicit lane runner; Team constructs it only at its operation entry."""
+    return gitsafe_run.issue_runner(cwd, scratch,
+        gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable), effect_fds, environ=environ, write_roots=write_roots, worktree_root=worktree_root)
+
+
+@contextmanager
+def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
+            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, worktree_root=None):
+    """Bounded custody; strict scopes receive only the packaged facade services."""
+    with gitsafe_run.custody(scratch=scratch, env=env, stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit, strict_lane=strict_lane,
+            _services=gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable), worktree_root=worktree_root):
+        yield
 
 
 def run(
@@ -210,59 +197,24 @@ def run(
     stdin: Optional[bytes] = None,
     _hardening: Sequence[str] = _HARDENING,
     _env: Optional[Mapping[str, str]] = None,
-    tty: bool = False,
+    tty: bool = False, *, effect_fds=None, _environ=None, write_roots=(), worktree_root=None,
 ) -> subprocess.CompletedProcess:
     """Run ``git <args>`` hardened as described above; return the completed process (bytes).
 
-    A non-zero exit is returned, not raised. Raises GitError when git cannot be started
-    or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
+    Nonzero exits are returned; spawn/timeout raises GitError. tty permits caller stdin.
+    Effects require effect_fds and an owner-bound worktree_root; the caller owns the receipt.
     """
-    argv = [git_executable(), *_hardening, *args]
-    scrub = _SCRUB.get()
-    env = {k: v for k, v in os.environ.items() if not (scrub and k.upper() in _LOCAL_ENV)}
-    env.update(_ENV)
-    if _env is not None:
-        env.update(_env)
-    try:
-        return subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            input=stdin,
-            stdin=None if stdin is not None or tty else subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {args[0] if args else ''} timed out after {timeout:g}s") from exc
-    except OSError as exc:
-        raise GitError(f"cannot run git: {exc}") from exc
-
-
-@contextmanager
-def scrubbed() -> Iterator[None]:
-    """Inside the block (or a function decorated with ``@scrubbed()``) ``run`` drops the caller's
-    ``_LOCAL_ENV``, so evidence is about the repository at ``cwd``; ``_env`` still wins. Not the
-    default: git hands a hook its index in GIT_INDEX_FILE (and a linked worktree its GIT_DIR)."""
-    token = _SCRUB.set(True)
-    try:
-        yield
-    finally:
-        _SCRUB.reset(token)
+    return gitsafe_run.execute(args, cwd, executable=git_executable, legacy_runner=subprocess.run,
+                               error=GitError, environ=_environ, timeout=timeout, stdin=stdin,
+                               hardening=_hardening, env=_env, tty=tty, legacy_namespace=subprocess, effect_fds=effect_fds, write_roots=write_roots, worktree_root=worktree_root)
 
 
 def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
                 timeout: float = GIT_TIMEOUT_SECONDS, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
     """``run`` that answers only a zero exit: git that cannot start, times out or exits non-zero raises
     ``error`` (GitError unless named), with git's stderr whitespace-collapsed and cut to 200 characters."""
-    try:
-        res = run(args, cwd, timeout=timeout, stdin=stdin)
-    except GitError as exc:
-        raise error(str(exc)) from exc
-    if res.returncode != 0:
-        raise error(f"git {args[0]} failed: {' '.join(res.stderr.decode('utf-8', 'replace').split())[:200]}")
-    return res
+    return gitsafe_run.checked(args, cwd, runner=run, error=error, git_error=GitError,
+                               timeout=timeout, stdin=stdin)
 
 
 def add_trailer(message_file: Path | str, trailer: str) -> bool:
@@ -280,24 +232,16 @@ def add_trailer(message_file: Path | str, trailer: str) -> bool:
 
 def _completed(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[subprocess.CompletedProcess]:
     """The completed call, or None (git is missing or timed out)."""
-    try:
-        return run(args, cwd, **kwargs)
-    except GitError:
-        return None
+    return gitsafe_run.completed(args, cwd, runner=run, error=GitError, **kwargs)
 
 
 def _out(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[bytes]:
     """stdout of a successful call, or None (git failed, is missing or timed out)."""
-    res = _completed(args, cwd, **kwargs)
-    return res.stdout if res is not None and res.returncode == 0 else None
+    return gitsafe_run.output(args, cwd, completed=_completed, **kwargs)
 
 
 def _text(args: Sequence[str], cwd: Path | str, **kwargs) -> Optional[str]:
-    out = _out(args, cwd, **kwargs)
-    if out is None:
-        return None
-    text = os.fsdecode(out.strip())
-    return text or None
+    return gitsafe_run.text(args, cwd, output=_out, **kwargs)
 
 
 def _z_paths(out: Optional[bytes]) -> Optional[List[str]]:
@@ -334,7 +278,7 @@ def memoized(key: Tuple[Any, ...], produce: Callable[[], Any]) -> Any:
     store = _MEMO.get()
     if store is None:
         return produce()
-    key = (_SCRUB.get(), *key)  # an answer under the caller's GIT_DIR is not the scrubbed one
+    key = (gitsafe_run.memo_context(), *key)  # private custody stores never share memo entries
     if key not in store:
         store[key] = produce()
     return store[key]
@@ -352,8 +296,11 @@ class Layout(NamedTuple):
 
 def _layout(cwd: Path | str) -> Optional[Layout]:
     try:
-        res = run(["rev-parse", "--git-common-dir", "--show-prefix", "--is-shallow-repository", "--show-toplevel"], cwd)
+        res = gitsafe_run.query_result(run(["rev-parse", "--git-common-dir", "--show-prefix",
+                                           "--is-shallow-repository", "--show-toplevel"], cwd), error=GitError)
     except GitError:
+        if custody_active():
+            raise
         return None
     # In a bare repository or inside .git, git dies on --show-toplevel after the first three lines.
     lines = [os.fsdecode(line) for line in res.stdout.split(b"\n")[:-1]]
@@ -429,16 +376,9 @@ def git_version(cwd: Path | str) -> Optional[Tuple[int, int, int]]:
 
 
 def git_path(cwd: Path | str, name: str) -> Optional[Path]:
-    """``git rev-parse --git-path <name>`` as an absolute path (e.g. the hooks dir), or None.
-
-    This one call omits the ``core.hooksPath`` override: it asks where hooks live, and
-    rev-parse runs no hook.
-    """
-    text = _text(["rev-parse", "--git-path", name], cwd, _hardening=_HARDENING_KEEP_HOOKS_PATH)
-    if not text:
-        return None
-    path = Path(text)
-    return path if path.is_absolute() else (Path(cwd) / path).resolve()
+    """Absolute Git service path, preserving the legacy hooks-path query."""
+    return gitsafe_run.git_path(cwd, name, runner=_text,
+        hardening=_HARDENING if gitsafe_run.strict_active() else _HARDENING_KEEP_HOOKS_PATH)
 
 
 def resolve_commit(cwd: Path | str, ref: str) -> Optional[str]:
@@ -468,7 +408,7 @@ def resolve_base_ref(cwd: Path | str, environ: Optional[dict] = None) -> Optiona
     ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, the branch ``refs/remotes/origin/HEAD``
     names (``origin/<name>``, ``<name>``), ``origin/main``, ``main``, ``origin/develop``,
     ``develop``, ``origin/master``, ``master``. Returns the ref name, or None."""
-    env = os.environ if environ is None else environ
+    env = gitsafe_run.request_environment(environ, profile="ordinary", base={})
     base = (env.get("GITHUB_BASE_REF") or "").strip()  # set by GitHub Actions on pull requests
     for ref in [f"origin/{base}", base] if base else []:
         if resolve_commit(cwd, ref):
@@ -496,9 +436,8 @@ def _head_or_empty_tree(cwd: Path | str) -> Optional[str]:
 
 def blob_id(data: bytes, oid_length: int = 40) -> str:
     """The git blob object id of ``data`` (40-char SHA-1 or 64-char SHA-256)."""
-    header = b"blob %d\0" % len(data)
-    digest = hashlib.sha256 if oid_length == 64 else hashlib.sha1
-    return digest(header + data).hexdigest()
+    from aegis_core.workspace import git_objects
+    return git_objects.object_id(data, oid_length)
 
 
 # Config scopes the user or the machine's administrator wrote. A filter driver defined in
@@ -557,24 +496,12 @@ def _work_tree_bytes(path: Path, mode: str) -> Tuple[Optional[bytes], bool]:
     return None, False
 
 
-def _c_quoted(path: str) -> bytes:
-    """``path`` as one C-quoted line, which ``hash-object --stdin-paths`` unquotes."""
-    quoted = bytearray(b'"')
-    for byte in os.fsencode(path):
-        if byte in b'"\\':
-            quoted += b"\\" + bytes([byte])
-        elif byte < 0x20 or byte == 0x7F:
-            quoted += b"\\%03o" % byte
-        else:
-            quoted.append(byte)
-    return bytes(quoted + b'"')
-
-
 def _clean_blob_ids(root: Path, paths: Sequence[str], hardening: Sequence[str]) -> Optional[List[str]]:
     """The blob ids ``git add`` would store for these work-tree files, after git's clean
     conversion (core.autocrlf and core.eol, the text, eol, ident and
     working-tree-encoding attributes); None when git cannot say. Writes nothing."""
-    stdin = b"".join(_c_quoted(path) + b"\n" for path in paths)
+    from aegis_core.workspace.git_objects import c_quoted
+    stdin = b"".join(c_quoted(path) + b"\n" for path in paths)
     out = _out(["hash-object", "--stdin-paths"], root, stdin=stdin, _hardening=hardening)
     ids = None if out is None else out.decode("ascii", "replace").split()
     return ids if ids is not None and len(ids) == len(paths) else None
@@ -733,52 +660,56 @@ def read_blob(cwd: Path | str, rev: str, path: str) -> Optional[bytes]:
     fields = header.split()
     if len(fields) != 3 or fields[1] != b"blob":
         return None
-    size = _blob_size(header, entry.oid)  # a size that is not a number is git's error, not a ValueError
+    from aegis_core.workspace import git_objects
+    size = git_objects.object_size(header, entry.oid, "blob", GitError)  # Malformed sizes raise GitError.
     data = rest[:size]
     if len(data) != size or blob_id(data, len(entry.oid)) != entry.oid:
         raise GitError(f"git returned content for {path} at {rev} that does not match object {entry.oid}")
     return data
 
 
-def _blob_size(header: bytes, oid: str) -> int:
-    """The size a ``cat-file --batch``/``--batch-check`` header line gives blob ``oid``, else GitError."""
-    fields = header.split()
-    if len(fields) != 3 or fields[0].decode("ascii", "replace") != oid or fields[1] != b"blob" or not fields[2].isdigit():
-        raise GitError(f"git cannot read object {oid}")
-    return int(fields[2])
-
-
-def _parse_cat_file_batch(out: bytes, wanted: Sequence[str]) -> Dict[str, bytes]:
-    blobs: Dict[str, bytes] = {}
-    position = 0
-    for oid in wanted:
-        end = out.find(b"\n", position)
-        size = _blob_size(out[position:end] if end >= 0 else b"", oid)
-        data = out[end + 1 : end + 1 + size]
-        if len(data) != size or blob_id(data, len(oid)) != oid:
-            raise GitError(f"git returned content for {oid} that does not match the object id")
-        blobs[oid] = data
-        position = end + 1 + size + 1
-    return blobs
-
-
-def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, bytes]:
-    """Batch-read git blob objects via ``cat-file --batch``, verifying each object's type, size, and hash."""
-    wanted = list(dict.fromkeys(oids))
+def read_blobs(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0,
+               kind: str = "blob") -> Dict[str, bytes]:
+    """Read declared blob or commit objects via ``cat-file --batch``; verify type, size and hash."""
+    from aegis_core.workspace import git_objects
+    wanted = git_objects.requests(oids, kind, GitError)
     if not wanted:
         return {}
     res = run_checked(["cat-file", "--batch"], cwd, timeout=timeout, stdin=("\n".join(wanted) + "\n").encode("ascii"))
-    return _parse_cat_file_batch(res.stdout, wanted)
+    return git_objects.parse_objects(res.stdout, wanted, kind, GitError)
 
 
-def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0) -> Dict[str, int]:
-    """The size of each blob from ``cat-file --batch-check`` (no content is read); GitError as ``read_blobs``."""
-    wanted = list(dict.fromkeys(oids))
+def blob_sizes(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, timeout: float = 60.0,
+               kind: str = "blob") -> Dict[str, int]:
+    """Sizes from ``cat-file --batch-check``, with the same declared kind and GitError as ``read_blobs``."""
+    from aegis_core.workspace import git_objects
+    wanted = git_objects.requests(oids, kind, GitError)
     if not wanted:
         return {}
-    lines = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
-                        stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout.split(b"\n")
-    return {oid: _blob_size(lines[i] if i < len(lines) else b"", oid) for i, oid in enumerate(wanted)}
+    out = run_checked(["cat-file", "--batch-check"], cwd, timeout=timeout,
+                      stdin=("\n".join(wanted) + "\n").encode("ascii")).stdout
+    return git_objects.object_sizes(out, wanted, kind, GitError)
+
+
+def iter_objects(cwd: Union[str, os.PathLike[str]], oids: Iterable[str], *, kind: str = "blob",
+                 byte_budget: int = 16 * 1024 * 1024, timeout: float = 60.0) -> Iterator[Tuple[str, bytes]]:
+    """Yield checked objects in request order, sizing all objects before capturing any content.
+
+    Each capture holds at most ``byte_budget`` payload bytes, or one larger object, plus
+    framing. Release each yielded value before advancing to keep retained content bounded.
+    Raises GitError for invalid requests or unavailable, mistyped or corrupt objects.
+    """
+    if not isinstance(byte_budget, int) or isinstance(byte_budget, bool) or byte_budget <= 0:
+        raise GitError("byte budget must be a positive integer")
+    from aegis_core.workspace import git_objects
+    sizes = blob_sizes(cwd, oids, kind=kind, timeout=timeout)
+    for chunk in git_objects.object_chunks(sizes, byte_budget):
+        objects = read_blobs(cwd, chunk, kind=kind, timeout=timeout)
+        for oid in chunk:
+            if len(objects[oid]) != sizes[oid]:
+                raise GitError(f"git cannot read object {oid}")
+            yield oid, objects.pop(oid)
+        del objects
 
 
 def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[str] = (), include_symlinks: bool = False,
@@ -808,25 +739,9 @@ def tree_blobs(cwd: Union[str, os.PathLike[str]], rev: str, *, paths: Sequence[s
 
 
 def parse_name_status_z(raw: bytes) -> List[Tuple[str, str, Optional[str]]]:
-    """Parse NUL-delimited ``--name-status -z`` (or ``--raw -z``) output into
-    ``(status, path, new_path)`` records without desynchronizing on 3-token ``R*``/``C*`` records.
-    """
-    fields = raw.split(b"\0")
-    records: List[Tuple[str, str, Optional[str]]] = []
-    index = 0
-    while index < len(fields):
-        parts = fields[index].split()
-        if not parts:
-            index += 1
-            continue
-        status = parts[-1].decode("ascii", "replace")
-        width = 3 if status[:1] in ("R", "C") else 2  # a rename or copy names two paths
-        paths = fields[index + 1:index + width]
-        if len(paths) < width - 1 or not all(paths):
-            break
-        records.append((status, os.fsdecode(paths[0]), os.fsdecode(paths[1]) if width == 3 else None))
-        index += width
-    return records
+    """Parse Git name-status records, including rename and copy destinations."""
+    from aegis_core.workspace.git_objects import parse_name_status_z as parse
+    return parse(raw)
 
 
 def _on_windows() -> bool:
@@ -921,16 +836,7 @@ def _full_oid(value: object) -> str:
 
 
 def _hashed_blob(cwd: Path | str, data: bytes, write: bool) -> str:
-    # From stdin with no --path, hash-object applies no attribute, filter or line-ending
-    # conversion: the blob is exactly ``data``, named in the repository's hash format.
-    args = ["hash-object", *(["-w"] if write else []), "--no-filters", "--stdin"]
-    out = _out(args, cwd, stdin=bytes(data))
-    oid = (out or b"").strip().decode("ascii", "replace")
-    if not _OID.match(oid):
-        raise GitError(f"git hash-object {'-w ' if write else ''}failed in {cwd}")
-    if blob_id(bytes(data), len(oid)) != oid:
-        raise GitError(f"git named the blob {oid}, which does not hash its content")
-    return oid
+    return gitsafe_run.hashed_blob(cwd, data, write, runner=_out, hasher=blob_id, error=GitError)
 
 
 def blob_oid(cwd: Path | str, data: bytes) -> str:
@@ -955,19 +861,7 @@ def _check_ref_name(cwd: Path | str, ref: object, what: str = "ref name") -> str
     """``ref`` when it is a full ref under ``refs/`` that ``git check-ref-format``
     accepts; RefNameError otherwise. Nothing that git could read as an option, a
     pattern or a stdin record separator gets through."""
-    ok = (
-        isinstance(ref, str)
-        and ref.startswith("refs/")
-        and not any(ch in ref for ch in "\0\n\r")
-    )
-    if ok:
-        res = _completed(["check-ref-format", ref], cwd)
-        if res is None:
-            raise GitError(f"git cannot check the {what} {ref!r}")
-        ok = res.returncode == 0
-    if not ok:
-        raise RefNameError(f"invalid {what}: {ref!r}")
-    return ref  # type: ignore[return-value]
+    return gitsafe_run.check_ref_name(cwd, ref, what, runner=_completed, error=GitError, ref_error=RefNameError)
 
 
 _REF_FORMAT = "--format=%(objectname)%00%(symref)%00%(refname)"
@@ -1049,15 +943,17 @@ def _never_writable(cwd: Path | str, ref: str, new: Optional[str]) -> Optional[s
     return None
 
 
-def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]) -> None:
+def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str], *, single_attempt: bool = False) -> Optional[str]:
     """Compare-and-swap ``ref`` from ``old`` to ``new`` (object ids; None means absent).
+
+    Custody/single_attempt returns updated or already; the legacy default returns None.
 
     - ``old`` None, ``new`` set: create; fails if the ref exists.
     - both set: update; fails unless the ref holds ``old``.
     - ``new`` None, ``old`` set: delete; fails unless the ref holds ``old``.
 
-    ``ref`` must be under ``refs/aegis/``: a branch, a tag or any other ref is refused.
-    One ``update-ref --no-deref --stdin`` transaction with the ``create``, ``update`` or
+    Outside strict custody, ``ref`` must be under ``refs/aegis/``. Strict custody also
+    permits ``refs/heads/lane/`` commit fast-forwards, with no deletes. One transaction with the
     ``delete`` verb, so no all-zero id is spelled and SHA-1 and SHA-256 repositories
     behave alike. A symbolic ref is never written through: an update or delete of one
     is refused (GitError), and a link that appears after that check, or a dangling one
@@ -1078,12 +974,16 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
     written), ValueError for a malformed object id or for ``new`` and ``old`` both None
     (an unconditional write is no CAS).
     """
-    if new is None and old is None:
-        raise ValueError("update_ref needs a new value, an expected old value, or both")
+    gitsafe_run.validate_update_input(single_attempt, new, old, error=GitError)
+    if gitsafe_run.strict_active():
+        return gitsafe_run.lane_update_ref(cwd, ref, new, old)
     if new is not None:
         _full_oid(new)
     if old is not None:
         _full_oid(old)
+    if single_attempt or custody_active():
+        if not isinstance(ref, str) or not ref.startswith(_WRITABLE_REFS):
+            raise RefNameError("ref not allowed", code="ref_not_allowed")
     _check_ref_name(cwd, ref)
     if not ref.startswith(_WRITABLE_REFS):
         raise RefNameError(f"refusing to write {ref!r}: aegis writes only refs under {_WRITABLE_REFS}")
@@ -1099,6 +999,10 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
         command = b"create " + name + b"\0" + new.encode() + b"\0"
     else:
         command = b"delete " + name + b"\0" + old.encode() + b"\0"  # type: ignore[union-attr]
+
+    if single_attempt or custody_active():
+        return gitsafe_run.update_once(cwd, ref, new, old, command, runner=run,
+                                       observer=read_ref, error=GitError, conflict=RefConflict)
 
     delay = UPDATE_REF_BACKOFF_SECONDS
     detail = ""
@@ -1125,6 +1029,25 @@ def update_ref(cwd: Path | str, ref: str, new: Optional[str], old: Optional[str]
         f"git update-ref {ref} failed {UPDATE_REF_ATTEMPTS} times while the ref still held the "
         f"expected value" + (f": {detail}" if detail else "")
     )
+
+
+def private_object_headers(cwd, oids, *, env, scratch):
+    """Bounded mixed metadata for full OIDs; missing objects are explicit None values."""
+    return gitsafe_run.private_headers(cwd, oids, env=env, scratch=scratch, runner=run_checked,
+        batch=["cat-file", "--batch-check"], custody=custody, error=GitError)
+
+
+def read_private_object(cwd, oid: str, *, kind: str, max_bytes: int, env: Mapping[str, str], scratch: Path) -> bytes:
+    """Size/type/hash-verified private object; legacy object readers remain unchanged."""
+    return gitsafe_run.private_object(cwd, oid, kind=kind, max_bytes=max_bytes, env=env, scratch=scratch,
+        headers=private_object_headers, runner=run_checked, custody=custody, error=GitError)
+
+
+def read_private_objects(cwd, oids, *, max_bytes, max_object_bytes, env, scratch):
+    """Batch mixed objects, checking all sizes before capture and every payload's hash."""
+    return gitsafe_run.private_objects(cwd, oids, max_bytes=max_bytes, max_object_bytes=max_object_bytes,
+        env=env, scratch=scratch, headers=private_object_headers, runner=run_checked,
+        batch=["cat-file", "--batch"], custody=custody, error=GitError)
 
 
 def read_object(cwd: Path | str, oid: str, max_bytes: int) -> bytes:

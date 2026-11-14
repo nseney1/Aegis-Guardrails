@@ -1,8 +1,8 @@
 """Terminal text for the reports aegis_core returns as data.
 
 Each renderer takes a report's ``as_dict()`` document, the same one ``--json`` prints, and returns
-its lines; the caller strips terminal controls when it prints them (repository text is not
-sanitized here). Core computes, the CLI renders: the five reports carry no text method. The
+its lines; the caller strips terminal controls when it prints them. Could-not-run details are
+also canonicalized, redacted and bounded here. Core computes, the CLI renders: the five reports carry no text method. The
 report modules are imported when a report is rendered, so importing this module costs nothing on
 paths that print none of them (the pre-commit check).
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping
 
-__all__ = ["render_card", "render_lane", "render_partition", "render_release", "render_tier"]
+__all__ = ["render_card", "render_lane", "render_partition", "render_release", "render_team_status", "render_tier"]
 
 # Why a release report printed before the trust tier could be read has none.
 _NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
@@ -19,7 +19,9 @@ _NO_TIER_WHY = {"gh_missing": "gh unavailable", "gh_too_old": "gh unavailable",
 
 def render_card(doc: Mapping[str, Any]) -> List[str]:
     """The day-0 card (``aegis check --card``, the end of ``aegis init``)."""
+    from aegis_cli import sanitize_display
     from aegis_core.card import NEXT_RULE
+    from aegis_core.redaction import redact_command_secrets
 
     scope, rules, layer1 = doc["scope"], doc["rules"], doc["layer1"]
     lines = ["Aegis day-0 card", f"  workspace: {scope['workspace']}"]
@@ -28,7 +30,7 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
         lines.append(f"  files: {scope['files']} ({origin}). Sampled {scope['files_analyzed']} of {scope['files']} files "
                      "for Layer 1")
     else:
-        lines.append(f"  files: {scope['files']} ({origin}), all analyzed")
+        lines.append(f"  files: {scope['files']} ({origin}), all considered for Layer 1")
     if doc["languages"]:
         lines.append("  languages: " + ", ".join(f"{row['language']} {row['files']}" for row in doc["languages"]))
     else:
@@ -48,11 +50,28 @@ def render_card(doc: Mapping[str, Any]) -> List[str]:
                      "(served and targeting a file)")
     if not layer1["checked"]:
         lines.append("  Layer 1: no file to check")
+    elif layer1["pass_rate"] is None:
+        lines.append(f"  Layer 1: unavailable; {layer1['checked']} file(s) selected")
     else:
-        percent = int(layer1["pass_rate"] * 100) if layer1["pass_rate"] is not None else 0
-        lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files pass "
+        percent = int(layer1["pass_rate"] * 100)
+        lines.append(f"  Layer 1: {percent}% of {layer1['checked']} files without blocking findings "
                      f"({layer1['passed']} of {layer1['checked']}); "
                      f"{layer1['findings']} finding(s) in {layer1['failed']} file(s)")
+    unavailable = layer1.get("checks_that_could_not_run", [])
+    if unavailable:
+        lines.append("  checks that could not run:")
+        for detail in unavailable[:20]:
+            clean = redact_command_secrets(sanitize_display(detail, max_len=None))
+            lines.append("    " + sanitize_display(clean, max_len=300))
+        if len(unavailable) > 20:
+            lines.append(f"    ... and {len(unavailable) - 20} more")
+    not_analyzed = layer1.get("not_analyzed", [])
+    if not_analyzed:
+        coverage = "Layer 1 coverage" if layer1["pass_rate"] is None else "AST coverage"
+        lines.append(f"  {coverage}: {len(not_analyzed)} file(s) not analyzed:")
+        lines.extend(f"    {item['path']}: {item['reason']}" for item in not_analyzed[:20])
+        if len(not_analyzed) > 20:
+            lines.append(f"    ... and {len(not_analyzed) - 20} more")
     if doc["top_files"]:
         lines.append("  files with the most findings:")
         lines.extend(f"    {row['findings']:>5}  {row['path']}" for row in doc["top_files"])
@@ -110,6 +129,10 @@ def render_partition(doc: Mapping[str, Any]) -> List[str]:
 def _lane_source(source: str, base: str) -> str:
     if source.startswith("base@"):
         return f"team.json at {base} {source[len('base@'):][:12]}"
+    if source.startswith("tip@"):
+        return f"team.json at tip {source[len('tip@'):][:12]}"
+    if source.startswith("lease@"):
+        return f"the captured lease {source[len('lease@'):][:12]}"
     return {"lease": "the lane's lease", "cli": "--paths", "worktree": "the working tree's team.json"}[source]
 
 
@@ -148,6 +171,31 @@ def render_lane(doc: Mapping[str, Any]) -> List[str]:
         lines.append(f"  not checked: {item['path']} ({item['reason']})")
     lines.extend(f"warning: {warning}" for warning in doc["warnings"])
     lines.extend(doc["notes"])  # the label's note, then the exemption note
+    return lines
+
+
+def render_team_status(doc: Mapping[str, Any]) -> List[str]:
+    """Repository lane declarations and captured branch tips; no liveness inference."""
+    base = doc["scope"]["base"] or "unavailable"
+    lines = [f"Lane status (base {base}, checked {doc['checked_at']}):"]
+    if not doc["lanes"]:
+        lines.append("  No lane leases.")
+    for row in doc["lanes"]:
+        lines.append(f"  {row['lane']}  {row['state']}  owner {row['owner'] or '(unknown)'}  "
+                     f"expires {row['expires_at'] or '(unknown)'}")
+        lines.append(f"    branch: {row['branch'] or '(unrecorded)'} ({row['branch_state']})  "
+                     f"ahead {row['ahead'] if row['ahead'] is not None else '?'}  "
+                     f"behind {row['behind'] if row['behind'] is not None else '?'}")
+        if row["overlaps"]:
+            lines.append("    overlaps live: " + ", ".join(row["overlaps"]))
+        if row["unknown_overlaps"]:
+            lines.append("    unknown overlap with unreadable: " + ", ".join(row["unknown_overlaps"]))
+        if row["error"]:
+            lines.append("    unavailable: " + row["error"])
+        if row["check"] is not None:
+            lines.append("    check " + row["check"]["status"] +
+                         (": " + row["check"]["error"] if "error" in row["check"] else ""))
+    lines.append(doc["note"])
     return lines
 
 

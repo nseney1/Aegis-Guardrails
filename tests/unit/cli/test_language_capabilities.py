@@ -114,6 +114,38 @@ def test_existing_workflow_is_preserved_when_go_is_enabled(project, capsys):
     assert target.read_bytes() == before
 
 
+@pytest.mark.parametrize('language', ['python', 'go', 'configured-go', 'python-invalid-config', 'go-invalid-config'])
+def test_init_prints_the_same_language_aware_workflow_it_writes(project, capsys, language):
+    from aegis_cli import __version__
+
+    if language.startswith('go'):
+        (project / 'go.mod').write_text('module example.com/app\ngo 1.21\n', encoding='utf-8')
+    elif language.startswith('python'):
+        (project / 'main.py').write_text('value = 1\n', encoding='utf-8')
+    if language == 'configured-go':
+        (project / '.aegis').mkdir()
+        (project / '.aegis/config.json').write_text(
+            json.dumps({'v': 1, 'ast': {'packaged_drivers': ['go']}}), encoding='utf-8')
+    elif language.endswith('invalid-config'):
+        (project / '.aegis').mkdir()
+        (project / '.aegis/config.json').write_text('{invalid json', encoding='utf-8')
+
+    out = _init(project, capsys)
+    snippet = out.split('write it:\n\n', 1)[1].split('\n  Governance files', 1)[0]
+    lines = snippet.rstrip('\n').splitlines()
+    assert all(not line or line.startswith('      ') for line in lines)
+    printed = '\n'.join(line[6:] for line in lines) + '\n'
+    target = project / '.github/workflows/aegis.yml'
+    assert not target.exists()
+
+    _init(project, capsys, '--ci')
+    assert target.read_bytes() == printed.encode('utf-8')
+    assert printed.count('actions/setup-go@') == (0 if language.startswith('python') else 2)
+    assert f'pip install aegis-guardrails=={__version__}' in printed
+    if language.endswith('invalid-config'):
+        assert (project / '.aegis/config.json').read_text(encoding='utf-8') == '{invalid json'
+
+
 def test_jest_suggestion_keeps_paths_as_argv_and_sets_junit_contract(project, tmp_path):
     import subprocess
 
@@ -185,3 +217,33 @@ def test_native_coverage_ignores_unsupported_global_coverage_command(project):
     user.parent.mkdir(parents=True, exist_ok=True)
     user.write_text(json.dumps({'v': 1, 'coverage': {'command': 'ignored global'}}))
     assert 'coverage not configured' in '\n'.join(capability_lines(project))
+
+
+@pytest.mark.parametrize('component', [
+    'ghp_' + 'a' * 24,
+    'ghp_' + 'a' * 12 + '\x1b[31m' + 'a' * 12,
+    'line\nbreak',
+    'x' * 5000,
+    'x' * 4000 + '/ghp_' + 'a' * 24,
+], ids=['secret', 'ansi-secret', 'newline', 'oversized', 'late-secret'])
+def test_runner_data_refuses_paths_that_cannot_be_safely_displayed(monkeypatch, component):
+    from aegis_cli import language_capabilities
+
+    # No filesystem operation: these spellings include unsupported Windows names.
+    monkeypatch.setattr(language_capabilities, '_package',
+                        lambda root: ({'devDependencies': {'vitest': '1'}}, None))
+    data = language_capabilities.runner_suggestion(Path(component), structured=True)
+    assert data == {
+        'status': 'unavailable', 'runner': None, 'configuration': None,
+        'messages': ['  Runner suggestion unavailable: workspace path cannot be safely displayed'],
+    }
+    assert component not in json.dumps(data)
+
+
+def test_init_json_oversized_package_is_a_bounded_diagnostic(project, capsys):
+    (project / 'package.json').write_bytes(b' ' * ((1 << 20) + 1))
+    data = json.loads(_init(project, capsys, '--dry-run', '--json'))
+    assert data['runner_suggestion'] == {
+        'status': 'unavailable', 'runner': None, 'configuration': None,
+        'messages': ['  Runner suggestion unavailable: package.json exceeds 1 MiB'],
+    }

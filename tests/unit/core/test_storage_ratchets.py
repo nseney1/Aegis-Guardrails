@@ -1,17 +1,41 @@
 """Ratchets for the L0 storage layer (ADR 0005 AD-3, build-sheet D12).
 
-1. Every write of Aegis state or rule files goes through aegis_core.storage: no
-   ``open(..., "w"|"a"|"x")``, ``write_text``, ``write_bytes`` or ``shutil.copy*``
-   anywhere else in aegis_core/aegis_cli/aegis_mcp/aegis_sdk, except the writers listed below,
-   which write files outside ``.aegis/``.
+1. In aegis_core/aegis_cli/aegis_mcp/aegis_sdk, literal write-mode ``open``/
+   ``fdopen``, ``write_text``, ``write_bytes`` and ``shutil.copy*`` calls outside
+   storage require a named non-state writer exemption. Direct ``os.open``,
+   ``os.replace``, ``os.rename``, ``os.link``, single-target bound path rename/
+   replace calls, and declared forwarding-opener calls require exact reviewed
+   counts. Declared openers resolve direct imports, straight-line re-exports,
+   constructors and declared methods; their direct call arguments are counted.
+   Constructor class identity comparisons remain permitted; other opener loads
+   fail. OS imports cannot alias operations; bare module
+   loads allow only attribute bases and literal hasattr/getattr probes (getattr
+   cannot retrieve a detected operation). Operation loads allow only direct
+   calls, reviewed callbacks, direct comparisons and registered capability probes.
+   Nonconstant flags passed to os.open or a declared flag-taking opener discover
+   forwarding definitions. Every discovered definition must be declared.
 2. aegis_core/workspace/layout.py is the only module that spells an ``.aegis`` path.
    User-facing sentences may mention one; a string literal that *is* a path may not.
+
+RF-82b owns the runtime write census for other operation families (shutil.move,
+os.renames, os.symlink, Path.symlink_to/hardlink_to, io.open), inherited forwarding
+methods, re-exports under module-level control flow or wildcard imports, unbound
+Path.replace/rename(src, dst), bound path-method aliases, and ** destination
+expansion. Other indirect destination-writer wrappers and alternate module
+access (for example posix.open or os.path.os) also belong to RF-82b. This static
+ratchet does not claim to see every filesystem write.
 """
 from __future__ import annotations
 
 import ast
+from collections import defaultdict
 from pathlib import Path
 import re
+import sys
+
+import pytest
+
+from tests.contract.test_process_ratchets import ScopedNames, import_bindings
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
 PACKAGES = ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk")
@@ -22,6 +46,7 @@ NON_AEGIS_WRITERS = {
     ("aegis_cli/hooks/commitmsg.py", "install"): "the git prepare-commit-msg hook (.git/hooks)",
     ("aegis_core/baseline.py", "Sources._ast"): "a staged non-Python blob copied into a temporary directory for the AST driver",
     ("aegis_core/ast/gobuild.py", "_build"): "the compiled executable in a confined private user-cache build directory; writable handle only for fsync before atomic publication",
+    ("aegis_core/message_codec_store.py", "Store.write"): "content-addressed message records in a caller-bound directory; stdlib-only MC-1 leaf",
     ("aegis_core/verification/runner.py", "snapshot_index"): "staged blobs in a temporary directory (aegis check --hook)",
     ("aegis_core/testexec.py", "run_tests"): "the test run's output in a temporary directory (aegis check --record)",
     ("aegis_core/unittest_runner.py", "_JUnitRunner.run"): "a unittest JUnit report in the caller's temporary directory",
@@ -31,6 +56,553 @@ NON_AEGIS_WRITERS = {
 }
 _WRITE_MODE = re.compile(r"[wax+]")
 _COPIES = {"copy", "copy2", "copyfile", "copytree"}
+_OS_OPERATIONS = {"os.open", "os.replace", "os.rename", "os.link"}
+_DESCRIPTOR_OPERATIONS = _OS_OPERATIONS | {"path.rename", "path.replace"}
+
+# RF-82b baseline of existing metadata, scratch and tool writers. These literal
+# entries grant runtime scope only; descriptor operations retain their static
+# exact-count ceilings. New writers are never learned automatically by the hook.
+# This file is the single registry read by both the static ratchet and census.
+AUDIT_WRITERS = {
+    ("aegis_core/gitsafe_run.py", "capture"): "GM-5 bounded custody: anonymous capped stdin scratch and subprocess DEVNULL; handles closed on failure and completion",
+    ("aegis_core/gitsafe_run.py", "execute"): "GM-5 extracted legacy subprocess DEVNULL recipe; unchanged default behavior",
+    ("aegis_cli/doctor_repair.py", "_apply_files"): "existing unlink; source lines 236",
+    ("aegis_cli/doctor_repair.py", "_backup_root"): "existing mkdir; source lines 39",
+    ("aegis_cli/doctor.py", "_run_host_cli"): "existing subprocess DEVNULL; source lines 489",
+    ("aegis_cli/hooks/commitmsg.py", "uninstall"): "existing unlink; source lines 189",
+    ("aegis_cli/hooks/management.py", "_back_up_hook"): "existing mkdir; source lines 149",
+    ("aegis_cli/hooks/management.py", "install_hook"): "existing unlink, mkdir; source lines 248, 250",
+    ("aegis_cli/hooks/management.py", "uninstall_hook"): "existing unlink; source lines 287, 336, 340, 344",
+    ("aegis_cli/hooks/registrar.py", "_probe"): "existing TemporaryDirectory, subprocess DEVNULL; source lines 273, 274",
+    ("aegis_cli/hooks/registrar.py", "_restore"): "existing unlink; source lines 494",
+    ("aegis_cli/hooks/registrar.py", "uninstall"): "existing unlink; source lines 798",
+    ("aegis_cli/install_hosts.py", "_run_cli"): "existing TemporaryDirectory, subprocess DEVNULL; source lines 942, 943",
+    ("aegis_cli/install_hosts.py", "private_dirs"): "existing mkdir; source lines 462",
+    ("aegis_cli/install_hosts.py", "remove_managed_block"): "existing unlink; source lines 376",
+    ("aegis_core/ast/batch.py", "BatchDriver._start"): "existing TemporaryDirectory; source lines 82",
+    ("aegis_core/ast/batch.py", "BatchDriver.close"): "cleans the aegis-ast-v2-* TemporaryDirectory allocated by BatchDriver._start after stopping the driver and readers",
+    ("aegis_core/ast/gobuild.py", "_cache_directory"): "existing mkdir; source lines 96",
+    ("aegis_core/ast/gobuild.py", "_run"): "existing subprocess DEVNULL; source lines 120",
+    ("aegis_core/ast/gobuild.py", "prepare_go_driver"): "existing mkdtemp, rmtree; source lines 267, 290",
+    ("aegis_core/ast/runner.py", "_run_driver"): "existing subprocess DEVNULL; source lines 533",
+    ("aegis_core/ast/runner.py", "ASTDriverRunner.parse_file"): "existing TemporaryDirectory; source lines 513",
+    ("aegis_core/benchmark.py", "measure_hook"): "existing mkdtemp, rmtree; source lines 258, 294",
+    ("aegis_core/benchmark.py", "measure_hook.once"): "opens writable subprocess stdin for the hook payload using the neutral aegis-bench-home-* mkdtemp HOME created and cleaned by measure_hook",
+    ("aegis_core/benchmark.py", "run_benchmark"): "existing mkdtemp, rmtree; source lines 325, 333",
+    ("aegis_core/checkrun.py", "_snapshot_check"): "existing mkdtemp, rmtree; source lines 155, 168",
+    ("aegis_core/credit_memo.py", "filesystem_now"): "existing utime; source lines 48",
+    ("aegis_core/ghcli.py", "default_gh_runner"): "existing mkdtemp, subprocess DEVNULL, rmtree; source lines 71, 84, 99",
+    ("aegis_core/gitsafe.py", "add_trailer"): "existing TemporaryDirectory; source lines 273",
+    ("aegis_core/gitsafe.py", "export_tree"): "existing mkdir, mkdtemp, chmod, rmtree; source lines 859, 865, 867, 890, 899, 908",
+    ("aegis_core/human_gate.py", "_signature"): "existing mkdtemp, chmod, rmtree; source lines 856, 858, 877",
+    ("aegis_core/inference_provider.py", "CommandBackend.generate"): "existing mkdtemp, rmtree; source lines 74, 88",
+    ("aegis_core/insights/keys.py", "_ensure_private_dir"): "existing mkdir, fchmod; source lines 58, 77",
+    ("aegis_core/insights/keys.py", "create_link_key"): "existing fchmod; source lines 106",
+    ("aegis_core/insights/review.py", "write_proposal"): "existing mkdir; source lines 492",
+    ("aegis_core/language_runtime.py", "_base"): "existing mkdir; source lines 53, 54",
+    ("aegis_core/language_runtime.py", "_probe"): "existing mkdir; source lines 88",
+    ("aegis_core/language_runtime.py", "prepare_language_runtime"): "existing mkdir; source lines 124",
+    ("aegis_core/lifecycle/creation.py", "create_rule"): "existing mkdir; source lines 168",
+    ("aegis_core/lifecycle/promotion.py", "_move"): "existing mkdir; source lines 121",
+    ("aegis_core/lifecycle/selection.py", "_park"): "existing mkdir, replace; source lines 87, 93",
+    ("aegis_core/manager_config.py", "initialize.create"): "existing mkdir; source lines 110, 116",
+    ("aegis_core/manager_config.py", "verify_owner"): "existing TemporaryDirectory; source lines 144",
+    ("aegis_core/manager_store.py", "ManagerStore._anchor"): "existing mkdir; source lines 138",
+    ("aegis_core/manager_store.py", "ManagerStore._append"): "existing _audit; source lines 257",
+    ("aegis_core/manager_store.py", "ManagerStore._check"): "existing mkdir; source lines 82",
+    ("aegis_core/migrate.py", "apply"): "existing mkdtemp, chmod; source lines 250, 251",
+    ("aegis_core/model_select.py", "_publish"): "existing fchmod; source lines 906",
+    ("aegis_core/packs.py", "_write"): "existing unlink, rmdir; source lines 561, 566",
+    ("aegis_core/packs.py", "_write.make_dir"): "existing mkdir; source lines 540",
+    ("aegis_core/regression.py", "_run_pr_level"): "existing mkdtemp, chmod, rmtree; source lines 473, 475, 492",
+    ("aegis_core/sync.py", "_commit"): "existing TemporaryDirectory; source lines 450",
+    ("aegis_core/sync.py", "_restore"): "existing , rmdir; source lines 423, 426, 432",
+    ("aegis_core/sync.py", "_write_examples"): "existing mkdir; source lines 265",
+    ("aegis_core/team_gitops.py", "GitOpsJournal._transaction"): "GM-4: open the private no-follow journal under its descriptor-relative writer lock and enforce file mode 0600",
+    ("aegis_core/team_gitops.py", "_try_effect"): "GM-4: create and chmod a private single-link per-request kernel flock below the anchored journal directory",
+    ("aegis_core/team_gitops.py", "_clear_retired_checkpoint"): "GM-4e: truncate and fsync a retired request checkpoint through a verified same-inode no-follow descriptor, only for a newly admitted intent",
+    ("aegis_core/team_gitops.py", "_observation_checkpoint"): "GM-4e: persist observation reservations/results in the held private effect descriptor; clear unavailable/invalid callback reservations and best-effort roll back failed reservations before observe runs",
+    ("aegis_core/team_gitops.py", "_open_receipt_lock"): "GM-4e: create the private 0600 per-request effect lock read-only below the anchored journal directory for a new intent",
+    ("aegis_core/team_gitops.py", "_quarantine"): "GM-4: truncate an uncommitted journal tail and flush a fixed quarantine marker under the writer lock",
+    ("aegis_core/team_queue.py", "_publish"): "Publishes bounded owner-managed team-queue.json through the reviewed atomic storage writer; callers hold the workspace lock.",
+    ("aegis_core/testexec.py", "run_pytest_snapshot"): "existing mkdir; source lines 464, 465",
+    ("aegis_core/treeid.py", "_spawn"): "existing subprocess DEVNULL; source lines 160",
+    ("aegis_core/treeid.py", "BoundTree.__init__"): "existing mkdir; source lines 258",
+    ("aegis_core/treeid.py", "BoundTree.export"): "existing mkdir; source lines 317",
+    ("aegis_core/verification/coverage_check.py", "_native_coverage"): "existing TemporaryDirectory; source lines 250, 253",
+    ("aegis_core/verification/coverage_check.py", "_python_coverage"): "existing TemporaryDirectory; source lines 145",
+    ("aegis_core/verification/language_tests.py", "_dependencies"): "existing symlink_to, rmdir, unlink; source lines 194, 208, 208",
+    ("aegis_core/verification/language_tests.py", "_fresh"): "existing mkdir; source lines 86",
+    ("aegis_core/verification/mutation_tester.py", "_ModuleSwap.stage"): "existing Path; source lines 358",
+    ("aegis_core/verification/mutation_tester.py", "check"): "existing TemporaryDirectory, Path; source lines 662, 673, 707",
+    ("aegis_core/verification/perf_check.py", "run_perf_check"): "existing mkdtemp, rmtree; source lines 128, 149",
+    ("aegis_core/verification/regression_commands.py", "run_configured_snapshot"): "existing mkdir; source lines 46, 48, 49",
+    ("aegis_core/verification/regression_identity.py", "_metadata"): "existing mkdir; source lines 74",
+    ("aegis_core/verification/regression_languages.py", "run_native_regressions"): "existing TemporaryDirectory; source lines 92",
+    ("aegis_core/verification/runner.py", "run_layer1_on_index"): "existing TemporaryDirectory; source lines 981",
+    ("aegis_core/verification/scanners.py", "run_preset"): "existing TemporaryDirectory; source lines 703",
+    ("aegis_core/verification/security_pack.py", "_base_tree"): "existing TemporaryDirectory; source lines 132",
+    ("aegis_core/verification/snapshot_tests.py", "_python"): "existing mkdir; source lines 39, 41, 42",
+    ("aegis_core/verification/test_runner.py", "run_external_cmd"): "existing subprocess DEVNULL; source lines 198",
+    ("aegis_core/verification/windows_junction.py", "create_directory_junction"): "existing mkdir, rmdir; source lines 107, 136",
+    ("aegis_core/workspace/confinement.py", "finish_file_move"): "existing unlink, rmdir; source lines 163, 165",
+    ("aegis_core/workspace/scaffold.py", "scaffold_workspace"): "existing mkdir; source lines 39",
+    ("tools/hierarchy_board.py", "Board.initialize"): "existing mkdir; source lines 347, 348, 349, 350",
+    ("tools/hierarchy_board.py", "Board.lock"): "existing open, unlink; source lines 285, 297",
+    ("tools/hierarchy_board.py", "Board.move_position"): "existing write_bytes; source lines 438",
+    ("tools/hierarchy_board.py", "Board.publish"): "existing unlink; source lines 518",
+    ("tools/hierarchy_board.py", "Board.tombstone"): "existing unlink; source lines 569, 572",
+    ("tools/hierarchy_container.py", "main"): "existing subprocess DEVNULL; source lines 390",
+    ("tools/hierarchy_fixture_broker.py", "serve"): "existing mkdir; source lines 395",
+    ("tools/hierarchy_fixture_broker.py", "Work.__init__"): "existing mkdir; source lines 219",
+    ("tools/hierarchy_fixture_broker.py", "worker"): "existing subprocess DEVNULL; source lines 461",
+    ("tools/hierarchy_foundation_acceptance.py", "inspect_legacy"): "existing TemporaryDirectory, ; source lines 287, 290, 291, 294",
+    ("tools/hierarchy_fresh_brief.py", "publish"): "existing mkdir, open, replace, unlink; source lines 2020, 2058, 2068, 2088",
+    ("tools/hierarchy_fresh_brief.py", "remove_written_file"): "existing unlink; source lines 1991",
+    ("tools/hierarchy_jobs.py", "commit_steps"): "existing mkdir, write_text; source lines 1937, 1938",
+    ("tools/hierarchy_jobs.py", "copy_kept"): "existing mkdir, open; source lines 1677, 1678",
+    ("tools/hierarchy_jobs.py", "export_commit"): "existing mkdir, TemporaryFile, chmod; source lines 697, 700, 745",
+    ("tools/hierarchy_jobs.py", "job_environment"): "existing , mkdir; source lines 1789, 1791, 1802",
+    ("tools/hierarchy_jobs.py", "Job.claim"): "existing mkdir; source lines 1416, 1418",
+    ("tools/hierarchy_jobs.py", "Job.disposition"): "existing open; source lines 1449",
+    ("tools/hierarchy_jobs.py", "Job.publish_execution_claim"): "JOBS-2 descriptor-anchored execution-claim publication: bounded private open, no-replace link and pending-file cleanup",
+    ("tools/hierarchy_jobs.py", "keep_evidence"): "existing unlink; source lines 1716",
+    ("tools/hierarchy_jobs.py", "merge_steps"): "existing mkdir, write_text; source lines 1963, 1964",
+    ("tools/hierarchy_jobs.py", "python_info"): "existing subprocess DEVNULL; source lines 321",
+    ("tools/hierarchy_jobs.py", "record_process"): "existing write_bytes; source lines 2006",
+    ("tools/hierarchy_jobs.py", "remove_work_folders"): "existing chmod, rmtree; source lines 1663, 1668, 1669",
+    ("tools/hierarchy_jobs.py", "run_step"): "existing open, subprocess DEVNULL; source lines 2022, 2022, 2022, 2023",
+    ("tools/hierarchy_jobs.py", "write_entry"): "existing mkdir, symlink, open; source lines 603, 609, 611",
+    ("tools/hierarchy_jobs.py", "write_git_stub"): "existing mkdir, open, chmod; source lines 678, 680, 682, 685",
+    ("tools/hierarchy_launcher.py", "FencedWakeProcesses.Popen"): "opens a writable stdin pipe or the platform null device for the pinned wake producer's turn; stdout/stderr use its wake-logs/<endpoint>/<wake_id> files",
+    ("tools/hierarchy_launcher.py", "FencedWakeProcesses.run"): "opens the platform null device for the pinned wake producer's background launch/control stdin",
+    ("tools/hierarchy_launcher.py", "Launches.make"): "existing mkdir; source lines 182",
+    ("tools/hierarchy_launcher.py", "Launches.write"): "existing open, link, unlink; source lines 189, 196, 198",
+    ("tools/hierarchy_launcher.py", "StopCustody.lock"): "opens launches/<quoted endpoint>/.stop-custody/lock for the endpoint's exclusive custody lock",
+    ("tools/hierarchy_launcher.py", "StopCustody.prepare"): "creates and pins the directory chain through launches/<quoted endpoint>/.stop-custody, including mkdir attempts on existing directories",
+    ("tools/hierarchy_launcher.py", "StopCustody.save"): "writes .<uuid>.tmp and atomically replaces state.json inside launches/<quoted endpoint>/.stop-custody, then removes its temporary file",
+    ("tools/hierarchy_launcher.py", "admitted_wake_locked"): "the verified pinned wake producer claims/removes mailbox/.wake-<quoted endpoint>.lock and publishes delivery wake receipts; foreign-source frames are attributed to this rooted caller",
+    ("tools/hierarchy_launcher.py", "clear_running_wake"): "removes only the matching launches/<quoted endpoint>/.running-wake marker",
+    ("tools/hierarchy_launcher.py", "descriptor_stream"): "wraps caller-owned wb descriptors for launcher .resume-admissions, .running-wake and .stop-custody/state.json temporary files, closing every raw descriptor in finally",
+    ("tools/hierarchy_launcher.py", "directory_descriptor"): "creates the pinned launches/<quoted endpoint>, .resume-admissions and mailbox bindings/<endpoint> directory chains when create=True, including mkdir attempts on existing directories",
+    ("tools/hierarchy_launcher.py", "fenced_wake_turn.admitted_turn"): "the verified pinned start_turn creates delivery_dir/wake-logs/<endpoint> and exclusive <wake_id>.stdout/.stderr logs; foreign-source frames are attributed to this rooted caller",
+    ("tools/hierarchy_launcher.py", "locked_start"): "existing open; source lines 530",
+    ("tools/hierarchy_launcher.py", "publish_wake_record"): "writes launches/<quoted endpoint>/.running-wake-<uuid>.tmp, links or renames it to .running-wake and removes temporary or rollback markers",
+    ("tools/hierarchy_launcher.py", "resume"): "existing subprocess DEVNULL; source lines 605",
+    ("tools/hierarchy_launcher.py", "resume_locked"): "opens the platform null device for the fenced resume driver's stdin; its endpoint admission evidence lives in launches/<quoted endpoint>/.resume-admissions",
+    ("tools/hierarchy_launcher.py", "run_start"): "existing open; source lines 251, 251",
+    ("tools/hierarchy_launcher.py", "start_lock"): "existing open, unlink; source lines 300, 309",
+    ("tools/hierarchy_launcher.py", "write_resume_admission"): "writes .admission-<uuid>, renames it to the admission identifier and removes leftovers inside launches/<quoted endpoint>/.resume-admissions",
+    ("tools/hierarchy_lifecycle.py", "initialize"): "existing mkdir, ; source lines 1466, 1467",
+    ("tools/hierarchy_lifecycle.py", "ProtectedCanonicalEnrollmentWriter.initialize_reserved_genesis"): "existing mkdir, ; source lines 1138, 1144",
+    ("tools/hierarchy_loop.py", "run_child"): "existing subprocess DEVNULL; source lines 339",
+    ("tools/hierarchy_loop.py", "serve"): "existing mkdir; source lines 789",
+    ("tools/hierarchy_loop.py", "write_status"): "existing mkstemp, replace, Path; source lines 701, 707, 709",
+    ("tools/hierarchy_mailbox_mcp.py", "serve"): "existing open; source lines 946",
+    ("tools/hierarchy_mailbox_records.py", "record_store"): "creates the admitted sibling store and atomically links one synced root identity bundle through held descriptors; under the parent reservation, reclaims stale staging and rolls back only its identity inode and empty newly created store on definite refusal",
+    ("tools/hierarchy_mailbox_records.py", "_publication_lock"): "creates/removes fixed shared-store publication and parent lifetime reservations through held store/parent descriptors",
+    ("tools/hierarchy_mailbox_records.py", "_commit_record"): "reclaims abandoned staging, stages/removes the fixed pending stub through the held destination descriptor and reclaims a newly created record after a definite pre-commit failure",
+    ("tools/hierarchy_mailbox_records.py", "_link_message"): "atomically replaces provisional reference grants then the activating wrapper entry last through the held store descriptor, restores prior entries on definite failure and links the accepted stub within the held destination directory",
+    ("tools/hierarchy_mailbox.py", "_writer_stream"): "owns a fixed wb stream over the caller-opened mailbox lock/publication descriptor with closefd=False and always closes the raw descriptor in finally",
+    ("tools/hierarchy_mailbox.py", "initialize"): "existing mkdir, ; source lines 1135, 1138, 1140",
+    ("tools/hierarchy_mailbox.py", "Mailbox.write_delivery_receipt"): "existing mkdir; source lines 1050",
+    ("tools/hierarchy_mailbox.py", "publish_file"): "existing mkdir, open, link, unlink; source lines 306, 309, 314, 317",
+    ("tools/hierarchy_mailbox.py", "writer_lock"): "existing open, unlink; source lines 260, 270",
+    ("tools/hierarchy_router.py", "writer_lock"): "NEW no-follow, descriptor-anchored .write.lock creation and unlink; private identity checks precede directory opens; exclusive lock and failure cleanup",
+    ("tools/hierarchy_native_probe.py", "cleanup_command"): "existing unlink; source lines 1671",
+    ("tools/hierarchy_native_probe.py", "clear_folder"): "existing rmdir; source lines 1459",
+    ("tools/hierarchy_native_probe.py", "end_hold"): "existing open; source lines 470",
+    ("tools/hierarchy_native_probe.py", "git"): "existing subprocess DEVNULL; source lines 173",
+    ("tools/hierarchy_native_probe.py", "owned_stream"): "wraps writable descriptors for write_private's probe JSON files (including report.json) and run's .run.lock with closefd=False, retaining raw ownership and closing the descriptor in finally even when fdopen fails",
+    ("tools/hierarchy_native_probe.py", "plan"): "existing mkdir, , copyfile, chmod, rmtree; source lines 273, 276, 277, 278, 279, 281, 282, 320",
+    ("tools/hierarchy_native_probe.py", "remove_login"): "existing unlink; source lines 1393",
+    ("tools/hierarchy_native_probe.py", "run"): "existing open, unlink; source lines 1528, 1536",
+    ("tools/hierarchy_native_probe.py", "Runner.cleanup"): "existing subprocess DEVNULL; source lines 1343",
+    ("tools/hierarchy_native_probe.py", "Runner.hold"): "existing mkdir, open, subprocess DEVNULL; source lines 1230, 1231, 1231, 1232",
+    ("tools/hierarchy_native_probe.py", "Runner.login"): "opens a writable stdin pipe for the probe's codex login --with-api-key; the child writes auth.json in the planned isolated codex_home",
+    ("tools/hierarchy_native_probe.py", "Runner.role_steps"): "existing ; source lines 1142",
+    ("tools/hierarchy_native_probe.py", "Runner.run_turn"): "existing mkdir, open, subprocess DEVNULL; source lines 1008, 1009, 1009, 1010",
+    ("tools/hierarchy_native_probe.py", "tool"): "existing subprocess DEVNULL; source lines 192",
+    ("tools/hierarchy_native_probe.py", "unlink_at"): "existing unlink; source lines 1427",
+    ("tools/hierarchy_native_probe.py", "write_private"): "existing mkdir, open; source lines 165, 166",
+    ("tools/hierarchy_provision.py", "add_role"): "existing link, unlink; source lines 1215, 1218",
+    ("tools/hierarchy_provision.py", "build_base"): "existing mkdir, rename, rmtree; source lines 346, 348, 354, 356",
+    ("tools/hierarchy_provision.py", "claude_start"): "existing mkdir, write_text; source lines 1388, 1389",
+    ("tools/hierarchy_provision.py", "session_folder"): "existing mkdir; source lines 1095",
+    ("tools/hierarchy_provision.py", "write_role_file"): "existing mkdir, write_text; source lines 1100, 1101",
+    ("tools/hierarchy_review.py", "export"): "existing mkdir, TemporaryFile, open; source lines 85, 86, 101, 103",
+    ("tools/hierarchy_review.py", "lock_down"): "existing chmod; source lines 153, 155",
+    ("tools/hierarchy_review.py", "prepare"): "existing mkdir, write_text, rename, chmod, rmtree; source lines 185, 187, 192, 211, 212, 216",
+    ("tools/hierarchy_review.py", "remove"): "existing rmtree; source lines 315",
+    ("tools/hierarchy_review.py", "unlock"): "existing chmod; source lines 159, 162, 166",
+    ("tools/hierarchy_review.py", "write_output"): "existing open; source lines 143",
+    ("tools/hierarchy_root.py", "_temp_beside"): "existing open; source lines 161",
+    ("tools/hierarchy_root.py", "atomic_write_json"): "existing link, replace, unlink; source lines 201, 207, 210",
+    ("tools/hierarchy_root.py", "cas_update_json"): "existing replace, unlink; source lines 237, 240",
+    ("tools/hierarchy_root.py", "create_file"): "existing link, unlink; source lines 604, 608",
+    ("tools/hierarchy_root.py", "git_state.git"): "existing subprocess DEVNULL; source lines 1332",
+    ("tools/hierarchy_root.py", "probe_folder_writable"): "existing unlink; source lines 180",
+    ("tools/hierarchy_root.py", "run_claude"): "existing subprocess DEVNULL; source lines 277",
+    ("tools/hierarchy_runtime_source.py", "git"): "existing subprocess DEVNULL; source lines 34",
+    ("tools/hierarchy_runtime_source.py", "run"): "existing TemporaryDirectory; source lines 152",
+    ("tools/hierarchy_small_change_dispatch.py", "_git_read"): "existing subprocess DEVNULL; source lines 47",
+    ("tools/hierarchy_source.py", "SourceViews.bounded"): "existing TemporaryFile; source lines 106",
+    ("tools/hierarchy_team.py", "aegis"): "existing subprocess DEVNULL; source lines 786",
+    ("tools/hierarchy_team.py", "append_evidence"): "existing mkdir, open; source lines 720, 721",
+    ("tools/hierarchy_team.py", "approve"): "existing subprocess DEVNULL; source lines 1725",
+    ("tools/hierarchy_team.py", "collect"): "existing mkdir, copy2; source lines 2011, 2032",
+    ("tools/hierarchy_team.py", "copy_tree"): "existing rmtree, copytree, mkdir; source lines 1912, 1914, 1916",
+    ("tools/hierarchy_team.py", "discard_claude_login_evidence"): "existing ; source lines 1308",
+    ("tools/hierarchy_team.py", "git"): "existing subprocess DEVNULL; source lines 772",
+    ("tools/hierarchy_team.py", "init"): "existing mkdir; source lines 1134",
+    ("tools/hierarchy_team.py", "log_command"): "existing open; source lines 2271",
+    ("tools/hierarchy_team.py", "login_claude"): "existing subprocess DEVNULL; source lines 1341",
+    ("tools/hierarchy_team.py", "login_lock"): "existing open; source lines 1166",
+    ("tools/hierarchy_team.py", "make_home"): "existing mkdir, chmod; source lines 846, 850, 851",
+    ("tools/hierarchy_team.py", "purge"): "existing rmtree; source lines 2185",
+    ("tools/hierarchy_team.py", "purge_claude"): "existing rmtree; source lines 2193",
+    ("tools/hierarchy_team.py", "remove_login_credentials"): "existing ; source lines 1301",
+    ("tools/hierarchy_team.py", "start_loop"): "existing mkdir, open, subprocess DEVNULL; source lines 1547, 1550, 1551",
+    ("tools/hierarchy_team.py", "step_worktrees.add"): "existing mkdir; source lines 976, 979",
+    ("tools/hierarchy_team.py", "tool"): "existing subprocess DEVNULL; source lines 753",
+    ("tools/hierarchy_team.py", "turn"): "existing subprocess DEVNULL, unlink; source lines 1783, 1787",
+    ("tools/hierarchy_team.py", "update_state"): "existing open; source lines 658",
+    ("tools/hierarchy_team.py", "write_atomic"): "existing mkdir, write_bytes, replace; source lines 136, 138, 139",
+    ("tools/hierarchy_templates/native-probe-attempt.py", "main"): "existing open; source lines 18",
+    ("tools/hierarchy_wake.py", "claim_wake"): "existing open; source lines 292",
+    ("tools/hierarchy_wake.py", "control_command"): "existing subprocess DEVNULL; source lines 101",
+    ("tools/hierarchy_wake.py", "finish_background"): "existing unlink; source lines 429",
+    ("tools/hierarchy_wake.py", "launch_background"): "existing unlink; source lines 397",
+    ("tools/hierarchy_wake.py", "save_terminal_output"): "existing open; source lines 223",
+    ("tools/hierarchy_wake.py", "start_background"): "existing mkdir, open, subprocess DEVNULL; source lines 362, 364, 364, 365",
+    ("tools/hierarchy_wake.py", "start_turn"): "existing mkdir, open, subprocess DEVNULL; source lines 331, 335, 335, 336",
+    ("tools/hierarchy_wake.py", "wake"): "existing unlink; source lines 527, 544",
+    ("tools/hierarchy_watch_bridge.py", "ProcessBridge.__init__"): "existing mkdir; source lines 80",
+    ("tools/hierarchy_watch_bridge.py", "ProcessBridge._call"): "existing mkdir, ; source lines 132, 133, 211",
+    ("tools/hierarchy_watch_supervisor.py", "initialize"): "existing mkdir, connect; source lines 53, 57",
+    ("tools/hierarchy_watch_supervisor.py", "Supervisor.database"): "existing connect; source lines 91",
+    ("tools/hierarchy_watch_supervisor.py", "Supervisor.worker"): "existing open; source lines 110",
+    ("tools/hierarchy_workspace.py", "run"): "existing mkdir; source lines 551",
+    ("tools/hierarchy_workspace.py", "Store.lock"): "existing open, unlink; source lines 284, 292",
+}
+
+# Shared runtime boundaries and classifications. Descriptor reviews do not
+# imply write authority. Every approval needs an explicit classification.
+AUDIT_STORAGE_MODULES = (
+    "aegis_core/storage.py", "aegis_core/atomicio.py", "aegis_core/storage_shared.py",
+    "aegis_core/storage_confined.py",
+)
+AUDIT_FORWARDER_OPERATIONS = {
+    ("aegis_core/atomicio.py", "_replace_with_retry", "os.replace"): ("os.rename", "reviewed atomic publication delegate; rename effects are owned by its caller"),
+    ("aegis_core/atomicio.py", "_open_regular", "os.open"): ("open", "flag-taking regular opener; writable access is owned by its caller"),
+    ("aegis_core/atomicio.py", "open_regular", "aegis_core.atomicio._open_regular"): ("open", "flag-taking regular opener delegation; writable access is owned by its caller"),
+    ("aegis_core/manager_store.py", "ManagerStore._audit", "os.open"): ("open", "flag-taking manager audit opener; writable access is owned by its caller"),
+    ("aegis_core/message_codec_store.py", "Store._open", "os.open"): ("open", "flag-taking message opener; writable access is owned by its caller"),
+}
+# These operations do not own a mutation in the approving frame: read-only I/O
+# or delegation to an independently registered writer/storage boundary.
+AUDIT_READ_ONLY_OPERATIONS = {
+    ("aegis_core/team_git.py", "_read_path", "os.open"): "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; read-only snapshot inspection, every descriptor closed",
+    ("aegis_core/team_git.py", "snapshot_tree", "os.open"): "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; read-only, closed in finally",
+    ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_cli/init.py", "_link_key_step", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/language_capabilities.py", "runner_suggestion", "aegis_cli.language_capabilities._package"): "read package metadata for the suggested language runner; this approved call requests read-only inspection",
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.message_codec_store.Store.__init__"): "bind the explicit caller-selected message store through its public re-export; this approved call requests read-only inspection",
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.storage.message_store"): "use the required storage boundary for a workspace-bound message store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/verify.py", "_run_calibration", "aegis_core.storage.read_jsonl"): "read calibration predictions through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "RepoConfig.load", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "UserConfig.load", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "read_user_config", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): "read-only bounded repository or user config inspection; this approved call requests read-only inspection",
+    ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): "read earlier check records through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): "read credit ledger events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): "O_RDONLY ancestor walk and regular-file snapshot",
+    ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "remember", "aegis_core.credit_memo._snapshot"): "read-only persisted-ledger generation snapshot; this approved call requests read-only inspection",
+    ("aegis_core/events.py", "read", "aegis_core.storage.read_jsonl"): "read stored events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/fitness.py", "_collect_t4_events_for_rules", "aegis_core.storage.read_jsonl"): "read fitness ledger events through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.insights.keys._ensure_private_dir"): "create private user insight directories and verify descriptor permissions; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/gitops_fds.py", "_root_facts", "os.open"): "GM-4c: read-only O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory binding relative to held root/current/common descriptors; no creation or mutation; descriptors close through ExitStack.",
+    ("aegis_core/gitsafe_run.py", "_pin_program", "os.open"): "GM-4c r15: read-only O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC regular executable leaf open relative to the storage_confined borrowed parent; leaf symlink refused; closed through ExitStack on success and failure.",
+    ("aegis_core/insights/capture.py", "_known_inventory_revs", "aegis_core.storage.read_jsonl"): "read stored inventory revisions through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "_read_rows_of_session", "aegis_core.storage.read_jsonl"): "read session insight rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.storage.read_jsonl"): "read existing suggestions and hooks through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "_append_user_insights", "aegis_core.insights.keys._ensure_private_dir"): "create private user insight directories and verify descriptor permissions; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.create_link_key"): "initialize the user link key through storage and verify an existing key; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.read_link_key"): "read-only user link key for session hashing; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "session_hs", "aegis_core.insights.keys.read_link_key"): "read-only user link key for session hashing; this approved call requests read-only inspection",
+    ("aegis_core/insights/keys.py", "read_insight_rows", "aegis_core.storage.read_jsonl"): "read stored insight rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/lane_gate.py", "check_lane", "aegis_core.team.load_team"): "read-only team policy for lane admission; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "initialize", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "load_config", "aegis_core.manager_config.public_file"): "read-only bounded public signer or private manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_store.py", "ManagerStore._locked", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): "passes O_RDONLY to the generic audit opener; no append/create flags",
+    ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): "bind directory descriptors for the separate manager audit store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): "passes O_RDONLY to Store._open; never requests record creation",
+    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): "read-only bounded existing config or migration source bytes; this approved call requests read-only inspection",
+    ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): "bounded migration rule and target reads through the declared partial; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): "read-only anchored decision log generation check before atomic publication; closes the inspected stream without mutation",
+    ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): "read-only bounded decision input config inspection; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._decision_directory"): "bind the caller-selected directory through an O_RDONLY directory walk; locking effects belong to the deeper file_lock boundary",
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._open_log"): "read-only decision log existence probe before lock creation; closes the probe and returns without side effects when the log is missing",
+    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._open_log"): "read-only replay of the bound decision log; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "append_decision", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): "atomic publication of the caller-selected decision log; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): "read the existing export manifest through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): "read-only bounded stable rule inventory bytes; this approved call requests read-only inspection",
+    ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded compliance evidence through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): "read stored scan activity through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): "read derived metadata through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/team_gitops.py", "_directory", "os.open"): "GM-4: read-only no-follow child directory open below the existing storage helper's anchored common-directory descriptor",
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.atomicio.open_regular"): "read-only regular-file descriptor for bounded ledger or SARIF inspection; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.credit_memo.filesystem_now"): "sample the held lock file's filesystem clock for ledger evidence; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_core/team_supervisor.py", "_open_leaf", "os.open"): "BL-16e: read-only no-follow leaf open of the supervisor state file relative to its held parent descriptor; owner-only regular file required; no mutation.",
+    ("aegis_core/telemetry_engine/ledger.py", "_read_worktree_ledger", "aegis_core.storage.read_jsonl"): "read the worktree ledger through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "merge_rows_report", "aegis_core.storage.read_jsonl"): "read existing merge rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/telemetry_engine/ledger.py", "read", "aegis_core.storage.read_jsonl"): "read ledger rows through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "_tail", "aegis_core.storage.read_tail_bytes"): "read bounded test output through the storage boundary; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "parse_junit_cases", "aegis_core.testexec._inspect_junit"): "read-only bounded JUnit report inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/coverage_check.py", "_module_prefix", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/language_tests.py", "run_language_snapshot", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/regression_identity.py", "_module_files", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/regression_identity.py", "_rust", "aegis_core.language_runtime.read_runtime_report"): "read-only bounded runtime, coverage or test-runner report; this approved call requests read-only inspection",
+    ("aegis_core/verification/runner.py", "_t7_on_index", "aegis_core.verification.runner._identical_work_file"): "read-only comparison of worktree bytes with the selected git object; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "aegis_core.verification.scanners._sarif_open_artifact"): "read-only descriptor-confined SARIF artifact inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_sarif_open_by_path", "aegis_core.atomicio.open_regular"): "read-only regular-file descriptor for bounded ledger or SARIF inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "ingest_sarif", "aegis_core.verification.scanners._SarifLineCache.fill"): "read-only batched source excerpts for SARIF findings; this approved call requests read-only inspection",
+    ("aegis_mcp/handlers/msg.py", "_store", "aegis_core.storage.message_store"): "use the required storage boundary for a workspace-bound message store; any mutation belongs to the deeper registered writer/storage frame",
+    ("aegis_cli/language_capabilities.py", "_package", "os.open"): "read-only package metadata inspection; this approved call requests read-only inspection",
+    ("aegis_core/config.py", "_read_json", "os.open"): "read-only bounded config inspection; this approved call requests read-only inspection",
+    ("aegis_core/credit_memo.py", "_snapshot", "os.open"): "O_RDONLY ancestor walk and regular-file snapshot",
+    ("aegis_core/insights/keys.py", "read_link_key", "os.open"): "read-only link key inspection; this approved call requests read-only inspection",
+    ("aegis_core/language_runtime.py", "read_runtime_report", "os.open"): "read-only bounded runtime report inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_config.py", "public_file", "os.open"): "read-only public manager config inspection; this approved call requests read-only inspection",
+    ("aegis_core/manager_store.py", "_sync_directory", "os.open"): "read-only directory descriptor for audit durability; this approved call requests read-only inspection",
+    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): "read-only directory walk binding the message store root; this approved call requests read-only inspection",
+    ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): "read-only directory descriptor for message reference lookup; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_decision_directory", "os.open"): "read-only directory walk binding the caller's decision log directory; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_open_log", "os.open"): "read-only decision log inspection; this approved call requests read-only inspection",
+    ("aegis_core/model_select.py", "_open_regular", "os.open"): "read-only ancestor walk and decision config inspection; this approved call requests read-only inspection",
+    ("aegis_core/rule_inventory.py", "_read_stable_file", "os.open"): "read-only stable rule snapshot; this approved call requests read-only inspection",
+    ("aegis_core/team.py", "load_team", "os.open"): "read-only team metadata inspection; this approved call requests read-only inspection",
+    ("aegis_core/testexec.py", "_inspect_junit", "os.open"): "read-only bounded test report inspection; this approved call requests read-only inspection",
+    ("aegis_core/verification/runner.py", "_identical_work_file", "os.open"): "read-only working file comparison; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): "read-only SARIF root directory descriptor; this approved call requests read-only inspection",
+    ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): "read-only confined SARIF artifact directory walk and file inspection; this approved call requests read-only inspection",
+    ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): "read-only bounded confined file inspection; this approved call requests read-only inspection",
+}
+
+# These atomicio wrappers expose its descriptor opener transitively. Other
+# forwarding functions are discovered from nonconstant flags below.
+_ATOMIC_WRAPPERS = {
+    "aegis_core.atomicio.open_regular", "aegis_core.atomicio.create_private_file",
+    "aegis_core.atomicio.atomic_write_bytes", "aegis_core.atomicio.atomic_write_text",
+    "aegis_core.atomicio.atomic_write_and_unlink",
+}
+# Opener -> flags position in a function/bound-method call; None means no flags
+# parameter. Fixed-flag readers may remain declared so their calls stay reviewed.
+FORWARDING_OPENERS = dict.fromkeys(_ATOMIC_WRAPPERS, None) | {
+    "aegis_cli.language_capabilities._package": None,
+    "aegis_core.atomicio._open_regular": 1,
+    "aegis_core.atomicio.open_regular": 1,
+    "aegis_core.config._read_json": None,
+    "aegis_core.credit_memo._snapshot": None,
+    "aegis_core.credit_memo.filesystem_now": None,
+    "aegis_core.insights.keys._ensure_private_dir": None,
+    "aegis_core.insights.keys.create_link_key": None,
+    "aegis_core.insights.keys.read_link_key": None,
+    "aegis_core.language_runtime.read_runtime_report": None,
+    "aegis_core.manager_config.public_file": None,
+    "aegis_core.manager_store.ManagerStore._anchor": None,
+    "aegis_core.manager_store.ManagerStore._audit": 0,
+    "aegis_core.manager_store._sync_directory": None,
+    "aegis_core.message_codec_store.Store.__init__": None,
+    "aegis_core.message_codec_store.Store._open": 1,
+    "aegis_core.migrate._input": None,
+    "aegis_core.model_select._decision_directory": None,
+    "aegis_core.model_select._open_log": None,
+    "aegis_core.model_select._open_regular": None,
+    "aegis_core.model_select._publish": None,
+    "aegis_core.rule_inventory._read_stable_file": None,
+    "aegis_core.storage._chmod_exact": None,
+    "aegis_core.storage._file_lock_at": None,
+    "aegis_core.storage.message_store": None,
+    "aegis_core.storage.read_json_dict": None,
+    "aegis_core.storage.read_jsonl": None,
+    "aegis_core.storage.read_tail_bytes": None,
+    "aegis_core.team.load_team": None,
+    "aegis_core.testexec._inspect_junit": None,
+    "aegis_core.verification.runner._identical_work_file": None,
+    "aegis_core.verification.scanners._SarifLineCache.fill": None,
+    "aegis_core.verification.scanners._sarif_open_artifact": None,
+    "aegis_core.workspace.confinement.read_confined_bytes": None,
+}
+_PARTIAL_OPENERS = {
+    "aegis_core.migrate._input": "aegis_core.workspace.confinement.read_confined_bytes",
+}
+CAPABILITY_REFERENCES = {
+    ("aegis_core/model_select.py", "<module>", "os.open"): "probe directory-descriptor support before any decision-log I/O",
+    ("aegis_core/model_select.py", "<module>", "os.rename"): "probe anchored rename support before decision-log publication",
+}
+_CAPABILITY_PROBE = ast.dump(ast.parse(
+    "all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.rename, os.unlink))",
+    mode="eval",
+).body)
+CALLBACK_EXCEPTIONS = {
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call"): (
+        3, "O_RDONLY|O_DIRECTORY|O_NOFOLLOW directory walk through the reviewed path-error boundary",
+    ),
+    ("aegis_core/model_select.py", "_open_log", "os.open", "_path_call"): (
+        1, "reviewed decision-log reader opens O_RDONLY|O_NOFOLLOW|O_NONBLOCK through the path-error boundary",
+    ),
+    ("aegis_core/model_select.py", "_publish", "os.open", "_path_call"): (
+        1, "reviewed writer exclusively creates the temporary decision log within its bound directory",
+    ),
+    ("aegis_core/model_select.py", "_publish", "os.rename", "_path_call"): (
+        1, "reviewed writer publishes the temporary decision log within the same bound directory",
+    ),
+    ("aegis_core/model_select.py", "_publish", "os.unlink", "_path_call"): (
+        1, "reviewed writer removes its unpublished temporary log through the deferred cleanup boundary",
+    ),
+}
+
+# (file, scope, operation) -> (exact call sites, reason). No scope-wide bypass:
+# another call in an already reviewed function still requires explicit review.
+REVIEWED_DESCRIPTOR_OPERATIONS = {
+    ("aegis_core/team_git.py", "_read_path", "os.open"): (2, "GM-5 O_RDONLY no-follow parent and regular-leaf opens from the held trusted root; every descriptor closed"),
+    ("aegis_core/team_git.py", "snapshot_tree", "os.open"): (1, "GM-5 O_RDONLY no-follow trusted root descriptor for private snapshots; closed in finally"),
+    ("aegis_cli/hooks/registrar.py", "install_insight_hook", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),
+    ("aegis_cli/init.py", "_config_hosts", "aegis_core.workspace.confinement.read_confined_bytes"): (2, "read-only bounded existing config or migration source bytes"),
+    ("aegis_cli/init.py", "_link_key_step", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),
+    ("aegis_cli/language_capabilities.py", "runner_suggestion", "aegis_cli.language_capabilities._package"): (1, "read package metadata for the suggested language runner"),
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.message_codec_store.Store.__init__"): (1, "bind the explicit caller-selected message store through its public re-export"),
+    ("aegis_cli/msg.py", "_open_store", "aegis_core.storage.message_store"): (1, "use the required storage boundary for a workspace-bound message store"),
+    ("aegis_cli/verify.py", "_run_calibration", "aegis_core.storage.read_jsonl"): (1, "read calibration predictions through the storage boundary"),
+    ("aegis_core/atomicio.py", "atomic_write_and_unlink", "aegis_core.atomicio.atomic_write_text"): (1, "atomic L0 publication delegated to by atomic_write_and_unlink"),
+    ("aegis_core/atomicio.py", "atomic_write_text", "aegis_core.atomicio.atomic_write_bytes"): (1, "atomic L0 publication for the delegate or git tree export targets"),
+    ("aegis_core/atomicio.py", "create_private_file", "aegis_core.atomicio._open_regular"): (1, "shared L0 regular-file descriptor delegate; caller supplies the reviewed read or private-create flags"),
+    ("aegis_core/atomicio.py", "open_regular", "aegis_core.atomicio._open_regular"): (1, "shared L0 regular-file descriptor delegate; caller supplies the reviewed read or private-create flags"),
+    ("aegis_core/config.py", "RepoConfig.load", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
+    ("aegis_core/config.py", "UserConfig.load", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
+    ("aegis_core/config.py", "read_user_config", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
+    ("aegis_core/config.py", "update_repo_config", "aegis_core.config._read_json"): (1, "read-only bounded repository or user config inspection"),
+    ("aegis_core/checkrun.py", "record", "aegis_core.storage.read_jsonl"): (1, "read earlier check records through the storage boundary"),
+    ("aegis_core/credit.py", "_read_ledger_events_with_report", "aegis_core.storage.read_jsonl"): (1, "read credit ledger events through the storage boundary"),
+    ("aegis_core/credit_memo.py", "_snapshot", "aegis_core.atomicio._open_regular"): (1, "shared L0 regular-file descriptor delegate; caller supplies the reviewed read or private-create flags"),
+    ("aegis_core/credit_memo.py", "before_read", "aegis_core.credit_memo.filesystem_now"): (1, "sample the held lock file's filesystem clock for ledger evidence"),
+    ("aegis_core/credit_memo.py", "contains", "aegis_core.credit_memo._snapshot"): (1, "read-only persisted-ledger generation snapshot"),
+    ("aegis_core/credit_memo.py", "remember", "aegis_core.credit_memo._snapshot"): (1, "read-only persisted-ledger generation snapshot"),
+    ("aegis_core/events.py", "read", "aegis_core.storage.read_jsonl"): (1, "read stored events through the storage boundary"),
+    ("aegis_core/fitness.py", "_collect_t4_events_for_rules", "aegis_core.storage.read_jsonl"): (1, "read fitness ledger events through the storage boundary"),
+    ("aegis_core/gitops_fds.py", "_root_facts", "os.open"): (3, "GM-4c: read-only O_RDONLY|O_DIRECTORY|O_NOFOLLOW child-directory opens relative to held root/current/common descriptors for cwd ancestry, owner .git and objects/refs; preserves binding across concurrent renames; every fd is closed by ExitStack. Confined storage has no dir_fd-relative directory opener."),
+    ("aegis_core/gitsafe.py", "export_tree", "aegis_core.atomicio.atomic_write_bytes"): (2, "atomic L0 publication for the delegate or git tree export targets"),
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.insights.keys._ensure_private_dir"): (2, "create private user insight directories and verify descriptor permissions"),
+    ("aegis_core/gitsafe_run.py", "_pin_program", "os.open"): (1, "GM-4c r15: one descriptor-relative read-only executable leaf open (O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC) under the storage_confined parent; no create, publication, deletion or mutation; fd held by ExitStack until spawn/collection and closed on every path; validated identity executes through procfs."),
+    ("aegis_core/insights/capture.py", "_known_inventory_revs", "aegis_core.storage.read_jsonl"): (1, "read stored inventory revisions through the storage boundary"),
+    ("aegis_core/insights/capture.py", "_read_rows_of_session", "aegis_core.storage.read_jsonl"): (1, "read session insight rows through the storage boundary"),
+    ("aegis_core/insights/capture.py", "capture_suggestion", "aegis_core.storage.read_jsonl"): (2, "read existing suggestions and hooks through the storage boundary"),
+    ("aegis_core/insights/keys.py", "_append_user_insights", "aegis_core.insights.keys._ensure_private_dir"): (2, "create private user insight directories and verify descriptor permissions"),
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.create_link_key"): (1, "initialize the user link key through storage and verify an existing key"),
+    ("aegis_core/insights/keys.py", "_ensure_hs", "aegis_core.insights.keys.read_link_key"): (2, "read-only user link key for session hashing"),
+    ("aegis_core/insights/keys.py", "create_link_key", "aegis_core.insights.keys._ensure_private_dir"): (1, "create private user insight directories and verify descriptor permissions"),
+    ("aegis_core/insights/keys.py", "session_hs", "aegis_core.insights.keys.read_link_key"): (1, "read-only user link key for session hashing"),
+    ("aegis_core/insights/keys.py", "read_insight_rows", "aegis_core.storage.read_jsonl"): (1, "read stored insight rows through the storage boundary"),
+    ("aegis_core/lane_gate.py", "check_lane", "aegis_core.team.load_team"): (1, "read-only team policy for lane admission"),
+    ("aegis_core/language_runtime.py", "_probe", "aegis_core.language_runtime.read_runtime_report"): (1, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/manager_config.py", "initialize", "aegis_core.manager_config.public_file"): (1, "read-only bounded public signer or private manager config inspection"),
+    ("aegis_core/manager_config.py", "initialize.create", "aegis_core.atomicio.create_private_file"): (2, "exclusive private manager config or temporary owner-signature verifier input"),
+    ("aegis_core/manager_config.py", "initialize.create", "aegis_core.manager_config.public_file"): (1, "read-only bounded public signer or private manager config inspection"),
+    ("aegis_core/manager_config.py", "load_config", "aegis_core.manager_config.public_file"): (2, "read-only bounded public signer or private manager config inspection"),
+    ("aegis_core/manager_config.py", "verify_owner", "aegis_core.atomicio.create_private_file"): (1, "exclusive private manager config or temporary owner-signature verifier input"),
+    ("aegis_core/manager_config.py", "verify_owner", "aegis_core.manager_config.public_file"): (1, "read-only bounded public signer or private manager config inspection"),
+    ("aegis_core/manager_store.py", "ManagerStore._append", "aegis_core.manager_store.ManagerStore._audit"): (1, "read or append the separate manager audit log with caller-selected flags"),
+    ("aegis_core/manager_store.py", "ManagerStore._append", "aegis_core.manager_store._sync_directory"): (1, "directory durability for the separate manager audit store"),
+    ("aegis_core/manager_store.py", "ManagerStore._check", "aegis_core.manager_store._sync_directory"): (1, "directory durability for the separate manager audit store"),
+    ("aegis_core/manager_store.py", "ManagerStore._locked", "aegis_core.manager_store.ManagerStore._anchor"): (1, "bind directory descriptors for the separate manager audit store"),
+    ("aegis_core/manager_store.py", "ManagerStore._read", "aegis_core.manager_store.ManagerStore._audit"): (1, "read or append the separate manager audit log with caller-selected flags"),
+    ("aegis_core/manager_store.py", "ManagerStore.read", "aegis_core.manager_store.ManagerStore._anchor"): (1, "bind directory descriptors for the separate manager audit store"),
+    ("aegis_core/message_codec_store.py", "Store._read_bytes", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
+    ("aegis_core/message_codec_store.py", "Store.write", "aegis_core.message_codec_store.Store._open"): (1, "read or exclusively create a message record in the bound private store"),
+    ("aegis_core/message_codec_store.py", "Store.write", "os.link"): (1, "publish a content-addressed message record within the bound private message store"),
+    ("aegis_core/migrate.py", "<module>", "aegis_core.workspace.confinement.read_confined_bytes"): (1, "read-only bounded existing config or migration source bytes"),
+    ("aegis_core/migrate.py", "_plan_rules", "aegis_core.migrate._input"): (2, "bounded migration rule and target reads through the declared partial"),
+    ("aegis_core/migrate.py", "apply", "aegis_core.migrate._input"): (2, "bounded config and unchanged-input reads through the declared partial"),
+    ("aegis_core/model_select.py", "_check_log_generation", "aegis_core.model_select._open_log"): (1, "read-only anchored decision log generation check before atomic publication"),
+    ("aegis_core/model_select.py", "_input", "aegis_core.model_select._open_regular"): (1, "read-only bounded decision input config inspection"),
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._decision_directory"): (1, "validate and bind the caller-selected decision log directory for the shared lock context"),
+    ("aegis_core/model_select.py", "_locked_log", "aegis_core.model_select._open_log"): (1, "read-only decision log existence probe before creating the shared lock"),
+    ("aegis_core/model_select.py", "_publish", "aegis_core.model_select._open_log"): (1, "read-only replay of the bound decision log"),
+    ("aegis_core/model_select.py", "_read_rows", "aegis_core.model_select._open_log"): (2, "read-only replay of the bound decision log"),
+    ("aegis_core/model_select.py", "append_decision", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
+    ("aegis_core/model_select.py", "select_and_append", "aegis_core.model_select._publish"): (1, "atomic publication of the caller-selected decision log"),
+    ("aegis_core/packaging.py", "_is_ours", "aegis_core.storage.read_json_dict"): (1, "read the existing export manifest through the storage boundary"),
+    ("aegis_core/rule_inventory.py", "inventory_rules", "aegis_core.rule_inventory._read_stable_file"): (1, "read-only bounded stable rule inventory bytes"),
+    ("aegis_core/scan_compliance.py", "_tail", "aegis_core.storage.read_tail_bytes"): (1, "read bounded compliance evidence through the storage boundary"),
+    ("aegis_core/scan_compliance.py", "report", "aegis_core.storage.read_jsonl"): (1, "read stored scan activity through the storage boundary"),
+    ("aegis_core/sync.py", "read_derived", "aegis_core.storage.read_json_dict"): (1, "read derived metadata through the storage boundary"),
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.atomicio.open_regular"): (1, "read-only regular-file descriptor for bounded ledger or SARIF inspection"),
+    ("aegis_core/telemetry_engine/ledger.py", "_unread", "aegis_core.credit_memo.filesystem_now"): (1, "sample the held lock file's filesystem clock for ledger evidence"),
+    ("aegis_core/team_queue.py", "_publish", "aegis_core.atomicio.atomic_write_bytes"): (1, "BL-16a fixed owner-managed queue-state publication through the reviewed atomic storage boundary"),
+    ("aegis_core/team_supervisor.py", "_open_leaf", "os.open"): (1, "BL-16e: one read-only O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC leaf open relative to the held supervisor-state parent descriptor; requires an owner-only regular file; no create, write or mutation. Confined storage has no dir_fd-relative read opener."),
+    ("aegis_core/telemetry_engine/ledger.py", "_read_worktree_ledger", "aegis_core.storage.read_jsonl"): (1, "read the worktree ledger through the storage boundary"),
+    ("aegis_core/telemetry_engine/ledger.py", "merge_rows_report", "aegis_core.storage.read_jsonl"): (1, "read existing merge rows through the storage boundary"),
+    ("aegis_core/telemetry_engine/ledger.py", "read", "aegis_core.storage.read_jsonl"): (1, "read ledger rows through the storage boundary"),
+    ("aegis_core/testexec.py", "_tail", "aegis_core.storage.read_tail_bytes"): (1, "read bounded test output through the storage boundary"),
+    ("aegis_core/testexec.py", "parse_junit_cases", "aegis_core.testexec._inspect_junit"): (1, "read-only bounded JUnit report inspection"),
+    ("aegis_core/testexec.py", "run_tests", "aegis_core.testexec._inspect_junit"): (1, "read-only bounded JUnit report inspection"),
+    ("aegis_core/verification/coverage_check.py", "_module_prefix", "aegis_core.language_runtime.read_runtime_report"): (1, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/coverage_check.py", "_native_coverage", "aegis_core.language_runtime.read_runtime_report"): (2, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/language_tests.py", "run_language_snapshot", "aegis_core.language_runtime.read_runtime_report"): (2, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/regression_identity.py", "_metadata", "aegis_core.language_runtime.read_runtime_report"): (2, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/regression_identity.py", "_module_files", "aegis_core.language_runtime.read_runtime_report"): (1, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/regression_identity.py", "_rust", "aegis_core.language_runtime.read_runtime_report"): (1, "read-only bounded runtime, coverage or test-runner report"),
+    ("aegis_core/verification/runner.py", "_t7_on_index", "aegis_core.verification.runner._identical_work_file"): (1, "read-only comparison of worktree bytes with the selected git object"),
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "aegis_core.verification.scanners._sarif_open_artifact"): (1, "read-only descriptor-confined SARIF artifact inspection"),
+    ("aegis_core/verification/scanners.py", "_sarif_open_by_path", "aegis_core.atomicio.open_regular"): (1, "read-only regular-file descriptor for bounded ledger or SARIF inspection"),
+    ("aegis_core/verification/scanners.py", "ingest_sarif", "aegis_core.verification.scanners._SarifLineCache.fill"): (1, "read-only batched source excerpts for SARIF findings"),
+    ("aegis_core/workspace/confinement.py", "finish_file_move", "path.rename"): (1, "normalize directory case for the same existing source and target directory during file migration"),
+    ("aegis_mcp/handlers/msg.py", "_store", "aegis_core.storage.message_store"): (1, "use the required storage boundary for a workspace-bound message store"),
+    ("aegis_cli/language_capabilities.py", "_package", "os.open"): (1, "read-only package metadata inspection"),
+    ("aegis_core/ast/gobuild.py", "_build", "os.replace"): (1, "publish the compiled executable in the private user-cache build directory"),
+    ("aegis_core/atomicio.py", "_open_regular", "os.open"): (1, "shared L0 regular-file opener delegated to by storage; flags belong to its callers"),
+    ("aegis_core/atomicio.py", "_replace_with_retry", "os.replace"): (1, "shared L0 atomic publication primitive delegated to by storage"),
+    ("aegis_core/atomicio.py", "atomic_write_bytes", "os.open"): (1, "shared L0 temporary-file writer re-exported by storage"),
+    ("aegis_core/atomicio.py", "fsync_dir", "os.open"): (1, "read-only directory descriptor for storage's durability primitive"),
+    ("aegis_core/config.py", "_read_json", "os.open"): (1, "read-only bounded config inspection"),
+    ("aegis_core/credit_memo.py", "_snapshot", "os.open"): (3, "read-only ancestor walk and credit memo snapshot"),
+    ("aegis_core/credit_memo.py", "filesystem_now", "os.open"): (3, "read-only ancestor walk and file timestamp inspection"),
+    ("aegis_core/insights/keys.py", "_ensure_private_dir", "os.open"): (1, "read-only directory descriptor for permission checks"),
+    ("aegis_core/insights/keys.py", "create_link_key", "os.open"): (1, "read-only verification of the key created through storage"),
+    ("aegis_core/insights/keys.py", "read_link_key", "os.open"): (1, "read-only link key inspection"),
+    ("aegis_core/language_runtime.py", "read_runtime_report", "os.open"): (1, "read-only bounded runtime report inspection"),
+    ("aegis_core/lifecycle/selection.py", "_park", "os.replace"): (1, "existing rule archival moves a rule into its archive; no new content is authored"),
+    ("aegis_core/manager_config.py", "public_file", "os.open"): (1, "read-only public manager config inspection"),
+    ("aegis_core/manager_store.py", "ManagerStore._anchor", "os.open"): (3, "read-only directory walk for the separate manager audit store"),
+    ("aegis_core/manager_store.py", "ManagerStore._audit", "os.open"): (1, "manager audit log outside repository worktrees; read/append flags supplied by callers"),
+    ("aegis_core/manager_store.py", "_sync_directory", "os.open"): (1, "read-only directory descriptor for audit durability"),
+    ("aegis_core/message_codec_store.py", "Store.__init__", "os.open"): (3, "read-only directory walk binding the message store root"),
+    ("aegis_core/message_codec_store.py", "Store._open", "os.open"): (1, "MC-1 stdlib-only message store opener used by its reviewed writer and readers"),
+    ("aegis_core/message_codec_store.py", "Store._resolve", "os.open"): (1, "read-only directory descriptor for message reference lookup"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open"): (3, "read-only directory walk binding the caller's decision log directory"),
+    ("aegis_core/model_select.py", "_open_log", "os.open"): (1, "read-only decision log inspection"),
+    ("aegis_core/model_select.py", "_open_regular", "os.open"): (3, "read-only ancestor walk and decision config inspection"),
+    ("aegis_core/model_select.py", "_publish", "os.open"): (1, "descriptor-confined temporary decision log in a caller-selected directory"),
+    ("aegis_core/model_select.py", "_publish", "os.rename"): (1, "publish the decision log within the same bound directory"),
+    ("aegis_core/rule_inventory.py", "_read_stable_file", "os.open"): (1, "read-only stable rule snapshot"),
+    ("aegis_core/team.py", "load_team", "os.open"): (1, "read-only team metadata inspection"),
+    ("aegis_core/team_gitops.py", "_clear_retired_checkpoint", "os.open"): (1, "GM-4e: same-inode write-only reset of a retired request's observation checkpoint under new-intent admission, while the read-only effect flock is held"),
+    ("aegis_core/team_gitops.py", "_directory", "os.open"): (1, "GM-4: read-only no-follow journal directory open below the helper-held trusted common directory"),
+    ("aegis_core/team_gitops.py", "GitOpsJournal._transaction", "os.open"): (2, "GM-4: separate bounded no-follow read and serialized write/create journal opens"),
+    ("aegis_core/team_gitops.py", "_open_receipt_lock", "os.open"): (1, "GM-4e: read-only no-follow creation of the private per-request effect lock for a new intent; the receipt and its children inherit this O_RDONLY description"),
+    ("aegis_core/team_gitops.py", "_try_effect", "os.open"): (1, "GM-4: private no-follow request-lock file held across intent, effect and terminal result"),
+    ("aegis_core/testexec.py", "_inspect_junit", "os.open"): (1, "read-only bounded test report inspection"),
+    ("aegis_core/verification/runner.py", "_identical_work_file", "os.open"): (1, "read-only working file comparison"),
+    ("aegis_core/verification/scanners.py", "_SarifLineCache.fill", "os.open"): (1, "read-only SARIF root directory descriptor"),
+    ("aegis_core/verification/scanners.py", "_sarif_open_artifact", "os.open"): (2, "read-only confined SARIF artifact directory walk and file inspection"),
+    ("aegis_core/workspace/confinement.py", "read_confined_bytes", "os.open"): (1, "read-only bounded confined file inspection"),
+}
 
 
 def _sources():
@@ -39,21 +611,188 @@ def _sources():
             yield path.relative_to(ROOT).as_posix(), ast.parse(path.read_text(encoding="utf-8"))
 
 
+def _forwarding_exports(sources):
+    exports = {}
+    known = FORWARDING_OPENERS.keys() | {name.removesuffix(".__init__") for name in FORWARDING_OPENERS}
+    bindings = []
+    for rel, tree in sources:
+        module = rel.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+        for node in tree.body:
+            for alias, target in import_bindings(node, rel).items():
+                # Public storage entry points are the required write boundary.
+                if rel != "aegis_core/storage.py" or alias.startswith("_"):
+                    bindings.append((module + "." + alias, target))
+    while True:
+        before = dict(exports)
+        for alias, target in bindings:
+            target = exports.get(target, target)
+            if target in known:
+                exports[alias] = target
+        if before == exports:
+            return exports
+
+
+def _forwarding_methods(sources):
+    classes = set()
+    def visit(node, scope):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope += "." + node.name
+            if isinstance(node, ast.ClassDef):
+                classes.add(scope)
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+    for rel, tree in sources:
+        visit(tree, rel.removesuffix(".py").replace("/", "."))
+    return {name for name in FORWARDING_OPENERS if name.rsplit(".", 1)[0] in classes}
+
+
 class _Writes(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, rel="<probe>", exports=None, methods=()) -> None:
+        self.rel = rel
+        self.module = rel.removesuffix(".py").replace("/", ".")
         self.stack: list[str] = []
         self.found: list[tuple[str, int, str]] = []
+        self.errors = []
+        self.references = []
+        self.callbacks = []
+        self.definitions = {}
+        self.forwarding = {}
+        self.functions = []
+        self.classes = []
+        self.exports = exports or {}
+        self.methods = methods
+
+    def visit_Module(self, node):
+        self.parents = {child: parent for parent in ast.walk(node) for child in ast.iter_child_nodes(parent)}
+        self.names = ScopedNames(node, self.rel)
+        self.generic_visit(node)
+
+    def _refuse(self, node, reason):
+        self.errors.append(f"{self.rel}:{node.lineno} {'.'.join(self.stack) or '<module>'}: {reason}")
+
+    def visit_Import(self, node):
+        if any(alias.name == "os" and alias.asname is not None for alias in node.names):
+            self._refuse(node, "forbidden OS import alias")
+
+    def visit_ImportFrom(self, node):
+        if node.module == "os" and any(f"os.{alias.name}" in _OS_OPERATIONS or alias.name == "*" for alias in node.names):
+            self._refuse(node, "forbidden OS operation import")
+
+    def _builtin(self, node, name):
+        if not isinstance(node, ast.Name) or node.id != name:
+            return False
+        scope = self.names.at[id(node)]
+        while scope is not None:
+            if name in scope.bound:
+                return False
+            scope = scope.parent
+        return True
+
+    def visit_Name(self, node):
+        if not isinstance(node.ctx, ast.Load):
+            return
+        if "os" in self.names.resolve(node):
+            parent = self.parents[node]
+            attribute_base = isinstance(parent, ast.Attribute) and parent.value is node
+            probe = (
+                isinstance(parent, ast.Call) and not parent.keywords
+                and len(parent.args) in (2, 3) and parent.args[0] is node
+                and isinstance(parent.args[1], ast.Constant) and isinstance(parent.args[1].value, str)
+                and ((self._builtin(parent.func, "hasattr") and len(parent.args) == 2)
+                     or (self._builtin(parent.func, "getattr") and f"os.{parent.args[1].value}" not in _OS_OPERATIONS))
+            )
+            if not attribute_base and not probe:
+                self._refuse(node, "forbidden OS module reference")
+        self._check_opener_reference(node)
+
+    def _check_opener_reference(self, node):
+        operation = self._forwarding_call(node)
+        if operation:
+            parent = self.parents[node]
+            # A constructor's class object is also used for identity checks;
+            # a direct comparison does not load or call its __init__ method.
+            class_object = operation.endswith(".__init__") and not (
+                isinstance(node, ast.Attribute) and node.attr == "__init__")
+            if class_object and isinstance(parent, ast.Compare):
+                return
+            if class_object and isinstance(parent, ast.Attribute) and self._forwarding_call(parent):
+                return  # Namespace of a declared method, checked at that load.
+            counted = isinstance(parent, ast.Call) and (parent.func is node or node in parent.args)
+            if isinstance(parent, ast.keyword) and parent.value is node:
+                counted = isinstance(self.parents[parent], ast.Call)
+            if not counted:
+                self._refuse(node, f"forbidden forwarding opener reference: {operation}")
+
+    def visit_Tuple(self, node):
+        # Publication cleanup defers (wrapper, positional args, keyword args).
+        # Count only this explicit unlink callback shape. It grants no writer
+        # scope and retains the file/caller/wrapper/exact-count ratchet.
+        if (len(node.elts) == 3 and isinstance(node.elts[0], ast.Name)
+                and isinstance(node.elts[1], ast.Tuple) and node.elts[1].elts
+                and isinstance(node.elts[2], ast.Dict)):
+            operation = node.elts[1].elts[0]
+            if (isinstance(operation, ast.Attribute) and operation.attr == 'unlink'
+                    and isinstance(operation.value, ast.Name) and operation.value.id == 'os'):
+                scope = '.'.join(self.stack) or '<module>'
+                self.callbacks.append((self.rel, scope, node.lineno, 'os.unlink', node.elts[0].id))
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        if not self.stack and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            qualified = self.module + "." + node.targets[0].id
+            value = node.value
+            if (qualified in _PARTIAL_OPENERS and isinstance(value, ast.Call)
+                    and "functools.partial" in self.names.resolve(value.func)
+                    and value.args and self._forwarding_call(value.args[0]) == _PARTIAL_OPENERS[qualified]):
+                self.forwarding[qualified] = node.lineno
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        operation = self._descriptor_operation(node)
+        if operation and isinstance(node.ctx, ast.Load):
+            parent = self.parents[node]
+            if isinstance(parent, ast.Call) and parent.func is node:
+                allowed = True
+            else:
+                scope = ".".join(self.stack) or "<module>"
+                allowed = isinstance(parent, ast.Compare) and node in [parent.left, *parent.comparators]
+                # Only a direct first argument has the reviewed callback shape.
+                if (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                        and parent.args and parent.args[0] is node):
+                    key = (self.rel, scope, operation, parent.func.id)
+                    self.callbacks.append((self.rel, scope, node.lineno, operation, parent.func.id))
+                    allowed |= key in CALLBACK_EXCEPTIONS
+                while parent is not None:
+                    if isinstance(parent, ast.Call) and ast.dump(parent) == _CAPABILITY_PROBE:
+                        self.references.append((self.rel, scope, node.lineno, operation))
+                        allowed = True
+                        break
+                    parent = self.parents.get(parent)
+            if not allowed:
+                self._refuse(node, f"forbidden OS operation reference: {operation}")
+        if isinstance(node.ctx, ast.Load):
+            self._check_opener_reference(node)
+        self.generic_visit(node)
 
     def _scope(self, node) -> None:
         self.stack.append(node.name)
+        qualified = self.module + "." + ".".join(self.stack)
+        self.definitions[qualified] = node.lineno
+        is_class = isinstance(node, ast.ClassDef)
+        (self.classes if is_class else self.functions).append(qualified)
+        if qualified in _ATOMIC_WRAPPERS:
+            self.forwarding[qualified] = node.lineno
         self.generic_visit(node)
+        (self.classes if is_class else self.functions).pop()
         self.stack.pop()
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scope
 
     def visit_Call(self, node: ast.Call) -> None:
         func, what = node.func, None
-        if isinstance(func, ast.Name) and func.id == "open":
+        if self._descriptor_operation(func):
+            what = self._descriptor_operation(func)
+        elif isinstance(func, ast.Name) and func.id == "open":
             what = self._mode(node, 1)
         elif isinstance(func, ast.Attribute):
             if func.attr in ("write_text", "write_bytes"):
@@ -64,9 +803,76 @@ class _Writes(ast.NodeVisitor):
                 what = self._mode(node, 1)
             elif func.attr in _COPIES and isinstance(func.value, ast.Name) and func.value.id == "shutil":
                 what = f"shutil.{func.attr}"
+            elif func.attr in ("rename", "replace") and (
+                    (len(node.args) == 1 and not node.keywords)
+                    or any(kw.arg == "target" for kw in node.keywords)):
+                what = f"path.{func.attr}"
+        forwarded = self._forwarding_call(func)
+        if forwarded:
+            what = forwarded
         if what:
             self.found.append((".".join(self.stack) or "<module>", node.lineno, what))
+        if what == "os.open":
+            self._check_flags(node, 1)
+        elif forwarded and FORWARDING_OPENERS[forwarded] is not None:
+            self._check_flags(node, self._flags_position(func, forwarded))
+        # Count the existing boundary's operation as well as refusing an
+        # unregistered non-call reference. An unseen form must fail closed.
+        for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+            operation = self._descriptor_operation(argument) or self._forwarding_call(argument)
+            if operation:
+                self.found.append((".".join(self.stack) or "<module>", node.lineno, operation))
+                if operation == "os.open":
+                    self._check_flags(node, node.args.index(argument) + 2 if argument in node.args else len(node.args))
+                elif operation in FORWARDING_OPENERS and FORWARDING_OPENERS[operation] is not None:
+                    offset = node.args.index(argument) + 1 if argument in node.args else len(node.args)
+                    self._check_flags(node, offset + self._flags_position(argument, operation))
         self.generic_visit(node)
+
+    def _flags_position(self, func, operation):
+        index = FORWARDING_OPENERS[operation]
+        if (operation in self.methods and isinstance(func, ast.Attribute)
+                and operation.rsplit(".", 1)[0] in self.names.resolve(func.value)):
+            index += 1  # Explicit class.method(self, ...) keeps the receiver.
+        return index
+
+    def _forwarding_call(self, node):
+        resolved = set(self.names.resolve(node))
+        if isinstance(node, ast.Name):
+            resolved |= {self.module + "." + node.id}
+        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+              and node.value.id in ("self", "cls") and self.classes):
+            resolved |= {self.classes[-1] + "." + node.attr}
+        elif isinstance(node, ast.Attribute) and not resolved and node.attr != "__init__":
+            # An arbitrary receiver has no statically known type. Review all
+            # matching declared method forms instead of silently losing a call.
+            resolved |= {name for name in self.methods if name.endswith("." + node.attr)}
+        resolved = {self.exports.get(name, name) for name in resolved}
+        resolved |= {name + ".__init__" for name in resolved}
+        found = resolved & FORWARDING_OPENERS.keys()
+        if len(found) > 1:
+            self._refuse(node, "ambiguous forwarding opener call")
+        return sorted(found)[0] if found else None
+
+    def _check_flags(self, node, index):
+        flags = next((kw.value for kw in node.keywords if kw.arg == "flags"),
+                     node.args[index] if len(node.args) > index else None)
+        # Expansion can move runtime flags away from this AST position. Flags
+        # supplied only through **kwargs already remain unknown (None).
+        if any(isinstance(argument, ast.Starred) for argument in node.args[:index + 1]):
+            flags = None
+        if self.functions:
+            function = self.functions[-1]
+            if function in FORWARDING_OPENERS or not _constant_flags(flags):
+                self.forwarding[function] = self.definitions[function]
+
+    @staticmethod
+    def _descriptor_operation(node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os":
+            operation = f"os.{node.attr}"
+            if operation in _OS_OPERATIONS:
+                return operation
+        return None
 
     @staticmethod
     def _mode(node: ast.Call, index: int):
@@ -79,29 +885,667 @@ class _Writes(ast.NodeVisitor):
         return None
 
 
+def _constant_flags(node):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id == "os" and node.attr.startswith("O_")
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+            and not node.keywords and len(node.args) == 3
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == "os"
+            and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
+            and node.args[1].value.startswith("O_")
+            and isinstance(node.args[2], ast.Constant) and type(node.args[2].value) is int):
+        return True
+    return (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
+            and _constant_flags(node.left) and _constant_flags(node.right))
+
+
+def _reviewed_operation(what):
+    return what in _DESCRIPTOR_OPERATIONS or what in FORWARDING_OPENERS
+
+
+def _descriptor_errors(sites, reviewed):
+    observed = defaultdict(list)
+    for rel, scope, lineno, operation in sites:
+        observed[(rel, scope, operation)].append(lineno)
+    errors = []
+    for key, lines in sorted(observed.items()):
+        rel, scope, operation = key
+        location = f"{rel}:{','.join(map(str, lines))} {scope} {operation}"
+        if key not in reviewed:
+            errors.append(f"{location}: unreviewed descriptor operation")
+        elif len(lines) > reviewed[key][0]:
+            errors.append(f"{location}: reviewed count {reviewed[key][0]} -> {len(lines)}")
+        elif len(lines) < reviewed[key][0]:
+            errors.append(f"{location}: lower to {len(lines)} (reviewed {reviewed[key][0]})")
+    for rel, scope, operation in sorted(reviewed.keys() - observed.keys()):
+        errors.append(f"{rel} {scope} {operation}: stale: remove")
+    return errors
+
+
+def _callback_errors(sites, reviewed, scopes=None):
+    observed = defaultdict(list)
+    for rel, scope, line, operation, callee in sites:
+        observed[(rel, scope, operation, callee)].append(line)
+    errors = []
+    for (rel, scope, operation, callee), lines in sorted(observed.items()):
+        location = f"{rel}:{','.join(map(str, lines))} {scope} {operation} via {callee}"
+        key = (rel, scope, operation, callee)
+        if key not in reviewed:
+            errors.append(f"{location}: unreviewed OS callback")
+        elif len(lines) != reviewed[key][0]:
+            errors.append(f"{location}: reviewed callback count {reviewed[key][0]} -> {len(lines)}")
+    for rel, scope, operation, callee in sorted(reviewed.keys() - observed.keys()):
+        line = (scopes or {}).get((rel, scope), 1)
+        errors.append(f"{rel}:{line} {scope} {operation} via {callee}: stale callback: remove")
+    return errors
+
+
+def _capability_errors(sites, reviewed, scopes):
+    observed = {(rel, scope, operation) for rel, scope, _line, operation in sites}
+    errors = [
+        f"{rel}:{line} {scope} {operation}: unreviewed capability reference"
+        for rel, scope, line, operation in sites if (rel, scope, operation) not in reviewed
+    ]
+    for rel, scope, operation in sorted(reviewed.keys() - observed):
+        line = scopes.get((rel, scope), 1)
+        errors.append(f"{rel}:{line} {scope} {operation}: stale capability reference: remove")
+    return errors
+
+
+@pytest.mark.parametrize("operation", ["open", "replace", "rename", "link"])
+def test_descriptor_operations_are_reviewed(operation):
+    arguments = "path, flags=os.O_CREAT | os.O_WRONLY" if operation == "open" else "src=old, dst=new"
+    call = f"os.{operation}({arguments})"
+    visitor = _Writes()
+    visitor.visit(ast.parse(f"class Store:\n    async def publish(self):\n        {call}\n"))
+    assert visitor.found == [("Store.publish", 3, f"os.{operation}")]
+
+
+@pytest.mark.parametrize("flags", [
+    "os.O_CREAT", "os.O_WRONLY", "os.O_RDWR", "os.O_APPEND", "os.O_TRUNC",
+    "os.O_WRONLY | os.O_CREAT | os.O_TRUNC", "flags", "0", "os.O_RDONLY",
+])
+def test_descriptor_open_flags_cannot_hide_a_site(flags):
+    # Even an apparently read-only opener is reviewed: helper parameters and
+    # later flag changes must not silently introduce an unregistered writer.
+    visitor = _Writes()
+    visitor.visit(ast.parse(f"os.open(path, {flags})"))
+    assert visitor.found == [("<module>", 1, "os.open")]
+
+
+def test_descriptor_detection_preserves_string_modes_and_ignores_other_methods():
+    visitor = _Writes()
+    visitor.visit(ast.parse("\n".join([
+        "open(path, 'w')", "path.open(mode='a')", "os.fdopen(fd, 'wb')",
+        "open(path, 'r')", "path.open('rb')", "text.replace('a', 'b')",
+        "path.rename(destination)", "other.open(path, flags)",
+    ])))
+    assert visitor.found == [
+        ("<module>", 1, "open('w')"), ("<module>", 2, "open('a')"),
+        ("<module>", 3, "open('wb')"), ("<module>", 7, "path.rename"),
+    ]
+
+
+def test_descriptor_counts_refuse_new_sites_and_growth_but_allow_reduction():
+    key = ("aegis_core/example.py", "publish", "os.open")
+    reviewed = {key: (1, "a reviewed temporary output")}
+    site = (*key[:2], 4, key[2])
+    assert _descriptor_errors([site], reviewed) == []
+    assert _descriptor_errors([], reviewed) == [
+        "aegis_core/example.py publish os.open: stale: remove",
+    ]
+    assert _descriptor_errors([site], {key: (2, "reviewed output")}) == [
+        "aegis_core/example.py:4 publish os.open: lower to 1 (reviewed 2)",
+    ]
+    assert _descriptor_errors([site, site], reviewed) == [
+        "aegis_core/example.py:4,4 publish os.open: reviewed count 1 -> 2",
+    ]
+    assert _descriptor_errors([site], {}) == [
+        "aegis_core/example.py:4 publish os.open: unreviewed descriptor operation",
+    ]
+
+
+@pytest.mark.parametrize("operation", ["open", "replace", "rename", "link"])
+@pytest.mark.parametrize("form", [
+    "import os as low; low.{op}(path, flags)",
+    "from os import {op} as operation; operation(path, flags)",
+    "import os as low; boundary(low.{op}, path, flags)",
+    "_OP = os.{op}", "def publish(operation=os.{op}): pass",
+    "operations = (os.{op},)", "operations = {{'write': os.{op}}}",
+    "boundary(os.{op}, path, flags)", "boundary(operation=os.{op})",
+])
+def test_aliases_and_noncall_os_references_are_refused(monkeypatch, operation, form):
+    tree = ast.parse(form.format(op=operation))
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", tree)])
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:1 .*forbidden"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_reviewed_callbacks_are_allowed_and_still_counted_as_operations():
+    visitor = _Writes("aegis_core/model_select.py")
+    visitor.visit(ast.parse("def _decision_directory():\n" + "    _path_call(os.open, path, flags)\n" * 3))
+    assert visitor.errors == []
+    assert visitor.found == [("_decision_directory", line, "os.open") for line in (2, 3, 4)]
+    key = ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call")
+    assert _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}) == []
+
+
+def test_deferred_publication_cleanup_callback_is_counted():
+    visitor = _Writes('aegis_core/model_select.py')
+    visitor.visit(ast.parse('def _publish():\n'
+                            '    cleanup.append((_path_call, (os.unlink, temporary), {"dir_fd": directory}))\n'))
+    key = ('aegis_core/model_select.py', '_publish', 'os.unlink', '_path_call')
+    assert visitor.callbacks == [('aegis_core/model_select.py', '_publish', 2, 'os.unlink', '_path_call')]
+    assert _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}) == []
+
+
+@pytest.mark.parametrize('scope,wrapper,count,reason', [
+    ('new_scope', '_path_call', 1, 'unreviewed OS callback'),
+    ('_publish', '_other_helper', 1, 'unreviewed OS callback'),
+    ('_publish', '_path_call', 2, 'reviewed callback count 1 -> 2'),
+    ('_publish', '_path_call', 0, 'stale callback: remove'),
+])
+def test_deferred_cleanup_callback_refuses_other_contexts_and_counts(scope, wrapper, count, reason):
+    visitor = _Writes('aegis_core/model_select.py')
+    visitor.visit(ast.parse('def %s():\n    pass\n' % scope +
+                            ('    cleanup.append((%s, (os.unlink, temporary), {"dir_fd": directory}))\n' % wrapper) * count))
+    key = ('aegis_core/model_select.py', '_publish', 'os.unlink', '_path_call')
+    errors = _callback_errors(visitor.callbacks, {key: CALLBACK_EXCEPTIONS[key]}, {key[:2]: 1})
+    assert any(reason in error for error in errors), errors
+
+
+@pytest.mark.parametrize("rel,scope,operation,callee,count,reason", [
+    ("aegis_core/model_select.py", "new_scope", "os.open", "_path_call", 1, "unreviewed OS callback"),
+    ("aegis_core/new.py", "_decision_directory", "os.open", "_path_call", 3, "unreviewed OS callback"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call", 4, "reviewed callback count 3 -> 4"),
+    ("aegis_core/model_select.py", "_decision_directory", "os.open", "_path_call", 2, "reviewed callback count 3 -> 2"),
+    ("aegis_core/model_select.py", "_publish", "os.rename", "_other_helper", 1, "unreviewed OS callback"),
+])
+def test_callback_exceptions_refuse_other_sites_callees_and_counts(monkeypatch, rel, scope, operation, callee, count, reason):
+    source = f"def {scope}():\n" + f"    {callee}({operation}, path, flags)\n" * count
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [(rel, ast.parse(source))])
+    with pytest.raises(AssertionError, match=re.escape(rel) + r":\d[^\n]*" + re.escape(reason)):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_removed_callback_exception_is_stale_with_a_source_location():
+    key = ("aegis_core/model_select.py", "_open_log", "os.open", "_path_call")
+    assert _callback_errors([], {key: (1, "reviewed log opener")}, {key[:2]: 836}) == [
+        "aegis_core/model_select.py:836 _open_log os.open via _path_call: stale callback: remove",
+    ]
+
+
+@pytest.mark.parametrize("call", [
+    "_path_call(os.replace if overwrite else os.rename, src, dst)",
+    "_path_call((os.replace if overwrite else os.rename,), src, dst)",
+    "_path_call(*(os.replace if overwrite else os.rename, src, dst))",
+    "_path_call(lambda: os.replace if overwrite else os.rename, src, dst)",
+])
+def test_nested_argon_operation_loads_are_refused_inside_reviewed_scope(monkeypatch, call):
+    source = f"def _publish():\n    {call}\n"
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/model_select.py", ast.parse(source))])
+    with pytest.raises(AssertionError) as refusal:
+        test_state_and_rule_writes_go_through_storage()
+    for operation in ("os.replace", "os.rename"):
+        assert f"aegis_core/model_select.py:2 _publish: forbidden OS operation reference: {operation}" in str(refusal.value)
+
+
+def test_callback_exception_preserves_the_operation_ceiling(monkeypatch):
+    reviewed = dict(REVIEWED_DESCRIPTOR_OPERATIONS)
+    del reviewed[("aegis_core/model_select.py", "_publish", "os.open")]
+    monkeypatch.setattr(sys.modules[__name__], "REVIEWED_DESCRIPTOR_OPERATIONS", reviewed)
+    with pytest.raises(AssertionError, match=r"aegis_core/model_select\.py:\d+ _publish os\.open: unreviewed descriptor operation"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_capability_exception_cannot_authorize_an_alias_at_the_same_location():
+    visitor = _Writes("aegis_core/model_select.py")
+    visitor.visit(ast.parse("_OPEN = os.open"))
+    assert visitor.errors == [
+        "aegis_core/model_select.py:1 <module>: forbidden OS operation reference: os.open",
+    ]
+
+
+def test_capability_probes_and_comparisons_remain_allowed():
+    visitor = _Writes("aegis_core/model_select.py")
+    visitor.visit(ast.parse("supported = all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.rename, os.unlink))"))
+    assert visitor.errors == []
+    visitor = _Writes()
+    visitor.visit(ast.parse("supported = os.open in os.supports_dir_fd"))
+    assert visitor.errors == []
+
+
+@pytest.mark.parametrize("call,operation", [
+    ("Path(tmp).replace(state)", "path.replace"),
+    ("source.parent.rename(target.parent)", "path.rename"),
+    ("path.rename(target=destination)", "path.rename"),
+    ("path.replace(target=destination)", "path.replace"),
+    ("os.link(src, dst)", "os.link"),
+])
+def test_destination_publication_is_detected(call, operation):
+    visitor = _Writes()
+    visitor.visit(ast.parse(call))
+    assert visitor.found == [("<module>", 1, operation)]
+
+
+@pytest.mark.parametrize("source", [
+    "import os\nfrom aegis_core import atomicio\natomicio.open_regular(p, os.O_WRONLY | os.O_CREAT)",
+    "import os\nfrom aegis_core.atomicio import open_regular as regular\nregular(p, os.O_WRONLY | os.O_CREAT)",
+])
+def test_new_forwarding_opener_call_is_refused(monkeypatch, source):
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", ast.parse(source))])
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:3 .*unreviewed descriptor operation"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_new_store_method_calling_forwarding_opener_is_refused(monkeypatch):
+    source = "class Store:\n    def new_method(self):\n        self._open(n, os.O_WRONLY | os.O_CREAT, fd)\n"
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/message_codec_store.py", ast.parse(source))])
+    with pytest.raises(AssertionError, match=r"aegis_core/message_codec_store\.py:3 .*unreviewed descriptor operation"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("call", ["regular(p, flags)", "boundary(regular, p, flags)"])
+def test_forwarding_reexports_and_callbacks_cannot_hide_calls(monkeypatch, call):
+    sources = [
+        ("aegis_core/bridge.py", ast.parse("from aegis_core.atomicio import open_regular as regular")),
+        ("aegis_core/probe.py", ast.parse(f"from aegis_core.bridge import regular\n{call}")),
+    ]
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: iter(sources))
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:2 .*unreviewed descriptor operation"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_undeclared_forwarding_opener_is_refused(monkeypatch):
+    source = "def new_opener(path, flags):\n    return os.open(path, flags)\n"
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", ast.parse(source))])
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:1 .*undeclared forwarding opener"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_removed_declared_forwarding_opener_is_refused(monkeypatch):
+    sources = list(_sources())
+    for rel, tree in sources:
+        if rel == "aegis_core/atomicio.py":
+            tree.body = [node for node in tree.body if not isinstance(node, ast.FunctionDef) or node.name != "open_regular"]
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: iter(sources))
+    with pytest.raises(AssertionError, match="stale forwarding opener: aegis_core.atomicio.open_regular"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_descriptor_cannot_mask_a_stale_string_mode_exemption(monkeypatch):
+    module = sys.modules[__name__]
+    source = "def _build():\n    os.replace(output, binary)\n"
+    monkeypatch.setattr(module, "_sources", lambda: [("aegis_core/ast/gobuild.py", ast.parse(source))])
+    monkeypatch.setattr(module, "NON_AEGIS_WRITERS", {("aegis_core/ast/gobuild.py", "_build"): "compiled output"})
+    with pytest.raises(AssertionError):
+        test_every_allowlisted_writer_still_exists()
+
+
+@pytest.mark.parametrize("rel,scope,statements,diagnostic", [
+    ("aegis_core/new.py", "publish", "os.open(path, flags)", "2 publish os.open: unreviewed descriptor operation"),
+    ("aegis_core/ast/gobuild.py", "_build", "os.replace(src, dst)\n    os.replace(src, dst)", "2,3 _build os.replace: reviewed count 1 -> 2"),
+    ("aegis_core/ast/gobuild.py", "_build", "os.open(path, flags)", "2 _build os.open: unreviewed descriptor operation"),
+    ("aegis_core/ast/gobuild.py", "new_build", "os.replace(src, dst)", "2 new_build os.replace: unreviewed descriptor operation"),
+])
+def test_storage_ratchet_refuses_descriptor_growth_even_in_allowlisted_scope(monkeypatch, rel, scope, statements, diagnostic):
+    tree = ast.parse(f"def {scope}():\n    {statements}\n")
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [(rel, tree)])
+    with pytest.raises(AssertionError, match=re.escape(rel + ":" + diagnostic)):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("statement", [
+    "low = os; low.open(p, os.O_WRONLY | os.O_CREAT)",
+    "low = os; low.replace(p, d)",
+    "low = os; low.rename(p, d)",
+    "low = os; low.link(p, d)",
+    "def w(o=os): o.replace(p, d)",
+    'getattr(os, "replace")(p, d)',
+    'getattr(os, "open", fallback)(p, flags)',
+    'getattr(os, "rename")(p, d)',
+    'getattr(os, "link")(p, d)',
+    "boundary(os)", "modules = [os]", "return_os = lambda: os",
+    "getattr(os, name)", "hasattr(os, name)",
+    'boundary(os, "O_RDONLY")', 'getattr(other, "attr", os)',
+    'def getattr(*args): pass\ngetattr(os, "O_RDONLY", 0)',
+    'import helpers as h\nh.getattr(os, "O_RDONLY", 0)',
+    'import os as low\nmodule = low',
+])
+def test_bare_os_loads_are_allowlisted(monkeypatch, statement):
+    source = "import os\n" + statement
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", ast.parse(source))])
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:\d+ .*forbidden OS module reference"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("statement", [
+    'supported = hasattr(os, "open")',
+    'supported = getattr(os, "supports_dir_fd", ())',
+    'flags = getattr(os, "O_CLOEXEC", 0)',
+    'flags = getattr(os, "O_NOFOLLOW")',
+    'value = os.name',
+])
+def test_allowed_os_module_loads_remain_usable(statement):
+    visitor = _Writes()
+    visitor.visit(ast.parse("import os\n" + statement))
+    assert visitor.errors == []
+
+
+@pytest.mark.parametrize("statement,operations", [
+    ("_path_call(os.replace if overwrite else os.rename, src, dst) is None", ("replace", "rename")),
+    ("if (op := os.replace) is not None: op(p, d)", ("replace",)),
+    ('H.update({"mv": os.rename}) is None', ("rename",)),
+    ("(ops := (os.open, os.link)) is not None", ("open", "link")),
+    ("if (os.open,)[0](path, os.O_CREAT | os.O_WRONLY) >= 0: pass", ("open",)),
+])
+def test_only_direct_comparison_operands_are_exempt(monkeypatch, statement, operations):
+    source = "import os\n" + statement
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", ast.parse(source))])
+    with pytest.raises(AssertionError) as refusal:
+        test_state_and_rule_writes_go_through_storage()
+    for operation in operations:
+        assert f"aegis_core/probe.py:2 <module>: forbidden OS operation reference: os.{operation}" in str(refusal.value)
+
+
+@pytest.mark.parametrize("statement", [
+    "writer = atomicio.open_regular; writer(p, flags)",
+    "def writer(op=atomicio.open_regular): pass",
+    "writers = [atomicio.open_regular]",
+    "writers = {'open': atomicio.open_regular}",
+    "writer = atomicio.open_regular if enabled else fallback",
+    "boundary((atomicio.open_regular,), p, flags)",
+    "boundary(lambda: atomicio.open_regular, p, flags)",
+    "(op := atomicio.open_regular) is not None",
+    "writer = atomicio.atomic_write_bytes",
+    "atomicio.open_regular is None",
+    "from aegis_core.atomicio import open_regular as regular\nwriter = regular",
+])
+def test_declared_opener_noncall_loads_are_refused(monkeypatch, statement):
+    source = "from aegis_core import atomicio\n" + statement
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: [("aegis_core/probe.py", ast.parse(source))])
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:\d+ .*forbidden forwarding opener reference"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("call", [
+    "atomicio.open_regular(p, flags)",
+    "atomicio.open_regular(p, flags=flags)",
+    "atomicio._open_regular(p, flags)",
+    "boundary(atomicio.open_regular, p, flags)",
+    "store._audit(flags, fd)",
+    "store._open(p, flags, fd)",
+    "store._audit(flags=flags, anchor=fd)",
+    "store._open(p, flags=flags, rootfd=fd)",
+    "ManagerStore._audit(store, flags, fd)",
+    "Store._open(store, p, flags, fd)",
+])
+def test_flags_through_declared_openers_discover_new_forwarders(monkeypatch, call):
+    source = ("from aegis_core import atomicio\n"
+              "from aegis_core.manager_store import ManagerStore\n"
+              "from aegis_core.message_codec_store import Store\n"
+              "def open_state(p, flags):\n    return " + call)
+    sources = list(_sources()) + [("aegis_core/probe.py", ast.parse(source))]
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: iter(sources))
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:4 aegis_core\.probe\.open_state: undeclared forwarding opener"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("call", [
+    "atomicio.open_regular(p, os.O_RDONLY)",
+    "atomicio.open_regular(p, flags=os.O_RDONLY)",
+    "boundary(atomicio.open_regular, p, os.O_RDONLY)",
+    "store._audit(os.O_RDONLY, fd)",
+    "store._open(p, os.O_RDONLY, fd)",
+    "ManagerStore._audit(store, os.O_RDONLY, fd)",
+    "Store._open(store, p, os.O_RDONLY, fd)",
+])
+def test_declared_opener_flag_positions_preserve_constant_calls(call):
+    source = ("import os\nfrom aegis_core import atomicio\n"
+              "from aegis_core.manager_store import ManagerStore\n"
+              "from aegis_core.message_codec_store import Store\n"
+              "def reader(p, store, fd):\n    return " + call)
+    visitor = _Writes("aegis_core/probe.py", methods={
+        "aegis_core.manager_store.ManagerStore._audit", "aegis_core.message_codec_store.Store._open",
+    })
+    visitor.visit(ast.parse(source))
+    assert visitor.errors == []
+    assert visitor.forwarding == {}
+    assert len(visitor.found) == 1
+
+
+@pytest.mark.parametrize("call", [
+    "os.open(*(p, flags))",
+    "os.open(*(p, flags), 0o600)",
+    "os.open(p, **kw)",
+    "atomicio.open_regular(*(p, flags), 0o600)",
+    "atomicio._open_regular(*(p, flags), 0o600)",
+    "atomicio.open_regular(*args, flags=os.O_RDONLY)",
+    "open_regular(p, **kw)",
+    "store._open(p, **kw)",
+    "Store._open(store, p, **kw)",
+    "store._open(*args, 0)",
+    "store._open(*(p, flags), 0)",
+    "Store._open(store, *args, 0)",
+    "Store._open(store, *(p, flags), 0)",
+    "store._audit(*args, 0)",
+    "ManagerStore._audit(store, *args, 0)",
+    "boundary(atomicio.open_regular, *(p, flags), 0o600)",
+    "boundary(atomicio._open_regular, *(p, flags), 0o600)",
+    "boundary(store._open, *(p, flags), 0)",
+    "boundary(Store._open, store, *(p, flags), 0)",
+    "boundary(store._audit, *args, 0)",
+    "boundary(atomicio.open_regular, p, **kw)",
+    "boundary(os.open, *(p, flags), 0o600)",
+])
+def test_expanded_flags_require_the_undeclared_forwarder_diagnostic(monkeypatch, call):
+    source = ("import os\nfrom aegis_core import atomicio\n"
+              "from aegis_core.atomicio import open_regular\n"
+              "from aegis_core.manager_store import ManagerStore\n"
+              "from aegis_core.message_codec_store import Store\n"
+              "def open_state(p, flags, args, kw, store):\n    return " + call)
+    sources = [
+        ("aegis_core/manager_store.py", ast.parse("class ManagerStore: pass")),
+        ("aegis_core/message_codec_store.py", ast.parse("class Store: pass")),
+        ("aegis_core/probe.py", ast.parse(source)),
+    ]
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: iter(sources))
+    with pytest.raises(AssertionError, match=r"aegis_core/probe\.py:6 aegis_core\.probe\.open_state: undeclared forwarding opener"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_reviewed_unread_opener_cannot_hide_expanded_flags(monkeypatch):
+    sources = list(_sources())
+    tree = dict(sources)["aegis_core/telemetry_engine/ledger.py"]
+    unread = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_unread")
+    optional = ast.parse("def placeholder(flags=os.O_RDONLY): pass").body[0]
+    unread.args.args.append(optional.args.args[0])
+    unread.args.defaults.append(optional.args.defaults[0])
+    opener = next(node for node in ast.walk(unread) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute) and node.func.attr == "open_regular")
+    opener.args = ast.parse("atomicio.open_regular(*(path, flags), 0o600)").body[0].value.args
+    monkeypatch.setattr(sys.modules[__name__], "_sources", lambda: iter(sources))
+    with pytest.raises(AssertionError, match=r"aegis_core/telemetry_engine/ledger\.py:\d+ aegis_core\.telemetry_engine\.ledger\._unread: undeclared forwarding opener"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+@pytest.mark.parametrize("call", [
+    "os.open(p, os.O_RDONLY, *args)",
+    "atomicio.open_regular(p, os.O_RDONLY, *args)",
+    "atomicio._open_regular(p, os.O_RDONLY, *args)",
+    "store._open(p, os.O_RDONLY, *args)",
+    "Store._open(store, p, os.O_RDONLY, *args)",
+    "store._audit(os.O_RDONLY, *args)",
+    "ManagerStore._audit(store, os.O_RDONLY, *args)",
+    "boundary(atomicio.open_regular, p, os.O_RDONLY, *args)",
+    "boundary(store._open, p, os.O_RDONLY, *args)",
+    "boundary(Store._open, store, p, os.O_RDONLY, *args)",
+    "boundary(store._audit, os.O_RDONLY, *args)",
+    "os.open(p, os.O_RDONLY, **kw)",
+    "atomicio.open_regular(p, flags=os.O_RDONLY, **kw)",
+    "store._open(p, os.O_RDONLY, **kw)",
+    "boundary(atomicio.open_regular, p, os.O_RDONLY, **kw)",
+])
+def test_expansion_strictly_after_constant_flags_stays_constant(call):
+    source = ("import os\nfrom aegis_core import atomicio\n"
+              "from aegis_core.manager_store import ManagerStore\n"
+              "from aegis_core.message_codec_store import Store\n"
+              "def reader(p, store, args, kw):\n    return " + call)
+    visitor = _Writes("aegis_core/probe.py", methods={
+        "aegis_core.manager_store.ManagerStore._audit", "aegis_core.message_codec_store.Store._open",
+    })
+    visitor.visit(ast.parse(source))
+    assert visitor.errors == []
+    assert visitor.forwarding == {}
+    assert len(visitor.found) == 1
+
+
+@pytest.mark.parametrize("expression,allowed", [
+    ("type(store) is Store", True),
+    ("writer = Store", False),
+    ("(writer := Store) is not None", False),
+    ("Store.__init__ is not None", False),
+])
+def test_constructor_class_identity_is_distinct_from_opener_reference(expression, allowed):
+    visitor = _Writes("aegis_core/probe.py")
+    visitor.visit(ast.parse("from aegis_core.message_codec_store import Store\n" + expression))
+    assert bool(visitor.errors) is not allowed
+    if not allowed:
+        assert all("aegis_core/probe.py:2 <module>: forbidden forwarding opener reference" in error for error in visitor.errors)
+
+
+@pytest.mark.parametrize("flags,constant", [
+    ('getattr(os, "O_CLOEXEC", 0)', True),
+    ('os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)', True),
+    ('getattr(os, "O_CLOEXEC", flags)', False),
+    ('getattr(os, name, 0)', False),
+    ('getattr(os, "O_CLOEXEC", True)', False),
+])
+def test_constant_flag_probes_do_not_invent_forwarders(flags, constant):
+    visitor = _Writes("aegis_core/probe.py")
+    visitor.visit(ast.parse(f"import os\ndef reader(p):\n    return os.open(p, {flags})"))
+    assert bool(visitor.forwarding) is not constant
+
+
+def test_missing_and_unregistered_capability_probes_are_refused(monkeypatch):
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "CAPABILITY_REFERENCES", {})
+    with pytest.raises(AssertionError, match=r"aegis_core/model_select\.py:\d+ <module> os\.open: unreviewed capability reference"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_stale_capability_registration_is_refused(monkeypatch):
+    registered = dict(CAPABILITY_REFERENCES)
+    registered[("aegis_core/missing.py", "<module>", "os.open")] = "removed probe"
+    monkeypatch.setattr(sys.modules[__name__], "CAPABILITY_REFERENCES", registered)
+    with pytest.raises(AssertionError, match=r"aegis_core/missing\.py:1 <module> os\.open: stale capability reference"):
+        test_state_and_rule_writes_go_through_storage()
+
+
+def test_migration_partial_calls_are_counted():
+    sources = list(_sources())
+    visitor = _Writes("aegis_core/migrate.py", _forwarding_exports(sources), _forwarding_methods(sources))
+    visitor.visit(dict(sources)["aegis_core/migrate.py"])
+    calls = [(scope, operation) for scope, _line, operation in visitor.found if operation == "aegis_core.migrate._input"]
+    assert calls == [("_plan_rules", "aegis_core.migrate._input")] * 2 + [("apply", "aegis_core.migrate._input")] * 2
+    assert visitor.errors == []
+
+
+# RF-82b runtime write census owns these intentionally unasserted examples:
+# shutil.move(src, dst); os.renames(src, dst); os.symlink(src, dst);
+# Path(dst).symlink_to(src); Path(dst).hardlink_to(src); io.open(p, "w");
+# class Child(Store): def write(self): self._open(p, flags, fd)
+# if enabled: from aegis_core.atomicio import open_regular as regular
+# try: from aegis_core.atomicio import open_regular as regular
+# except ImportError: pass
+# from aegis_core.atomicio import *
+# Path.replace(src, dst); Path.rename(src, dst);
+# move = path.replace; move(dst)
+# path.replace(**{"target": dst}); path.rename(**{"target": dst}).
+# posix.open(p, flags); os.path.os.open(p, flags);
+# atomicio._replace_with_retry(src, dst, retries, delay).
+
+
 def test_state_and_rule_writes_go_through_storage():
     offenders = []
-    for rel, tree in _sources():
-        if rel == "aegis_core/storage.py":
-            continue
-        visitor = _Writes()
+    descriptor_sites = []
+    forwarding = {}
+    callback_sites = []
+    capability_sites = []
+    scopes = {}
+    sources = list(_sources())
+    exports = _forwarding_exports(sources)
+    methods = _forwarding_methods(sources)
+    for rel, tree in sources:
+        visitor = _Writes(rel, exports, methods)
         visitor.visit(tree)
+        offenders.extend(visitor.errors)
+        callback_sites.extend(visitor.callbacks)
+        capability_sites.extend(visitor.references)
+        scopes.update({(rel, name[len(visitor.module) + 1:]): line for name, line in visitor.definitions.items()})
+        forwarding.update({name: (rel, line) for name, line in visitor.forwarding.items()})
+        if rel in {"aegis_core/storage.py", "aegis_core/storage_confined.py"}:
+            continue
         for scope, lineno, what in visitor.found:
+            if _reviewed_operation(what):
+                descriptor_sites.append((rel, scope, lineno, what))
+                continue
             key = (rel, scope.split(".<")[0])
             if key in NON_AEGIS_WRITERS or (rel, scope) in NON_AEGIS_WRITERS:
                 continue
             offenders.append(f"{rel}:{lineno} {scope} {what}")
-    assert offenders == [], "write through aegis_core.storage, or list a non-.aegis writer"
+    offenders.extend(_descriptor_errors(descriptor_sites, REVIEWED_DESCRIPTOR_OPERATIONS))
+    offenders.extend(_callback_errors(callback_sites, CALLBACK_EXCEPTIONS, scopes))
+    offenders.extend(_capability_errors(capability_sites, CAPABILITY_REFERENCES, scopes))
+    for name in sorted(forwarding.keys() - FORWARDING_OPENERS.keys()):
+        rel, line = forwarding[name]
+        offenders.append(f"{rel}:{line} {name}: undeclared forwarding opener")
+    offenders.extend(f"stale forwarding opener: {name}" for name in sorted(FORWARDING_OPENERS.keys() - forwarding.keys()))
+    assert offenders == [], "write through aegis_core.storage, or list a non-.aegis writer\n" + "\n".join(offenders)
 
 
 def test_every_allowlisted_writer_still_exists():
     """A writer that was removed or renamed leaves a stale exemption behind."""
     present = set()
     for rel, tree in _sources():
-        visitor = _Writes()
+        visitor = _Writes(rel)
         visitor.visit(tree)
-        present |= {(rel, scope) for scope, _lineno, _what in visitor.found}
+        present |= {(rel, scope) for scope, _lineno, what in visitor.found if not _reviewed_operation(what)}
     assert set(NON_AEGIS_WRITERS) - present == set()
+
+
+def test_every_audit_writer_still_exists():
+    """A renamed/deleted runtime writer must not leave a reusable exemption."""
+    present = set()
+    for rel in {key[0] for key in AUDIT_WRITERS}:
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"), filename=rel)
+        present.add((rel, "<module>"))
+
+        def collect(node, parents):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                parents = parents + [node.name]
+                present.add((rel, ".".join(parents)))
+            for child in ast.iter_child_nodes(node):
+                collect(child, parents)
+
+        collect(tree, [])
+    assert set(AUDIT_WRITERS) - present == set()
+
+
+def test_every_descriptor_approval_has_runtime_classification():
+    writers = set(NON_AEGIS_WRITERS) | set(AUDIT_WRITERS)
+    forwarded = AUDIT_FORWARDER_OPERATIONS
+    readers = AUDIT_READ_ONLY_OPERATIONS
+    storage = AUDIT_STORAGE_MODULES
+    forwarder_scopes = {key[:2] for key in forwarded}
+    missing = [key for key in REVIEWED_DESCRIPTOR_OPERATIONS
+               if key[:2] not in writers and key not in readers and key not in forwarded
+               and not (key[0] in storage and key[:2] not in forwarder_scopes)]
+    assert not missing, 'descriptor approvals lack runtime classification: ' + repr(missing)
+    assert not (set(readers) | set(forwarded)) - set(REVIEWED_DESCRIPTOR_OPERATIONS)
+    assert all(readers.values()), 'read-only classifications need explicit reasons'
 
 
 _PATH_LITERAL = re.compile(r"^[~/\\]*\.aegis(?:[/\\][^\s]*)?$")

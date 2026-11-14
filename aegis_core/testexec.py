@@ -26,7 +26,6 @@ import ntpath
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -35,6 +34,7 @@ import sys
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from aegis_core.argv import split_command
 from aegis_core.config import read_user_config
 from aegis_core.primitives import is_within
 from aegis_core.storage import read_tail_bytes
@@ -103,15 +103,18 @@ class TestsRun:
 # ── The command ──────────────────────────────────────────────────────────────
 
 def user_test_command(workspace: Path) -> Optional[List[str]]:
-    """``tests.command`` of the user-scope config as an argv list, or None when unset or unusable."""
+    """User-scope ``tests.command`` as argv, or None when unset or unusable.
+
+    A string with malformed quoting raises ``ValueError("invalid tests.command")``.
+    """
     raw = read_user_config(workspace)
     tests = raw.get("tests") if raw else None
     command = tests.get("command") if isinstance(tests, dict) else None
     if isinstance(command, str) and command.strip():
         try:
-            words = shlex.split(command, posix=os.name != "nt")
+            words = split_command(command)
         except ValueError:
-            return None
+            raise ValueError("invalid tests.command") from None
         return words or None
     if isinstance(command, list) and command and all(isinstance(w, str) and w for w in command):
         return list(command)

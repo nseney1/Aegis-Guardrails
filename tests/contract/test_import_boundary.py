@@ -27,7 +27,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import pytest
 
@@ -42,16 +42,32 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core._version": 0,
     "aegis_core.errors": 0,
     "aegis_core.taxonomy": 0,
+    # Canonical message records and untrusted views (stdlib only).
+    "aegis_core.message_codec": 0,
+    # Shared format primitives and anchored content-addressed storage.
+    "aegis_core.message_codec_format": 0,
+    "aegis_core.message_codec_store": 0,
+    # Streaming message views and rendered-size preflight (stdlib only).
+    "aegis_core.message_codec_views": 0,
     # Pure data, no aegis imports: the host table and the bootstrap text.
     "aegis_core.hosts": 0,
     "aegis_core.bootstrap": 0,
     "aegis_core.storage": 0,
+    # STORE-API-1: the confined read/publish boundary storage.confined_file delegates to (stdlib only).
+    "aegis_core.storage_confined": 0,
+    "aegis_core.storage_shared": 0,
+    "aegis_core.gitops_fds": 0,
     "aegis_core.gitsafe": 0,
+    "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_claims": 2,
+    "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
     "aegis_core.gitevidence": 0,
     # The one PATH lookup of a program Aegis runs or registers (stdlib only).
     "aegis_core.pathlookup": 0,
+    # Operator command-string grammar shared by planners and process consumers.
+    "aegis_core.argv": 0,
     # GitHub CLI transport over gitsafe and pathlookup, with no trust-policy dependency.
     "aegis_core.ghcli": 0,
     # Path containment, strict JSON and UTC timestamps (stdlib only).
@@ -77,6 +93,24 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.command_safety": 1,
     # Team leases and team.json: gitsafe, config, events and the matcher.
     "aegis_core.team": 1,
+    "aegis_core.team_host_adapter": 0,
+    "aegis_core.team_host_agy": 1,
+    "aegis_core.team_metrics": 1,
+    "aegis_core.team_paths": 1,
+    "aegis_core.team_profile": 1,
+    "aegis_core.team_profile_display": 0,
+    "aegis_core.team_supervisor": 1,
+    "aegis_core.team_templates": 0,
+    "aegis_core.team_hosts": 2,
+    "aegis_core.team_gitops": 0,
+    "aegis_core.model_select": 1,
+    # Manager-only policy and append-only audit domain; no repository credit imports.
+    "aegis_core.manager_policy": 1,
+    "aegis_core.manager_store": 1,
+    # Startup-pinned configuration and owner approval over the audit domain.
+    "aegis_core.manager_config": 2,
+    # Shared manager decision/report service over the pinned activation service.
+    "aegis_core.manager": 3,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
     # Pure AST inspection of lane declarations and pytest configuration.
@@ -88,10 +122,15 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.governance": 1,
     "aegis_core.codeowners": 1,
     "aegis_core.human_gate": 1,
+    "aegis_core.approval_policy": 1,
+    "aegis_core.approval_shape": 0,
+    # Literal workflow parsing (text in, verdicts out; stdlib only).
+    "aegis_core.workflow_jobs": 0,
     # v4.3 verified checks: the tree identity (gitsafe, pathlookup), the credit state machine over the ledger
     # (ghcli, storage, gitsafe) and the hermetic run, which also runs Layer 1 (baseline).
     "aegis_core.treeid": 1,
     "aegis_core.credit": 1,
+    "aegis_core.credit_memo": 1,
     "aegis_core.checkrun": 2,
     "aegis_core.testexec": 1,
     # Standalone stdlib unittest reporting, launched by the L1 test execution service.
@@ -120,6 +159,10 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.baseline": 2,
     "aegis_core.card": 3,
     "aegis_core.partition": 3,
+    "aegis_core.team_publish": 2,
+    "aegis_core.team_queue": 2,
+    # Read-only lane status report over lease declarations and the existing tip gate.
+    "aegis_core.team_status": 3,
     # Rule packs (rule export/import): the loader, migrate's stripper, the lifecycle's id checks and events.
     "aegis_core.packs": 2,
     # The benchmark: scan, Layer 1 and events over a fixture corpus it ships as package data.
@@ -173,13 +216,19 @@ def _string_import(node: ast.Call) -> Optional[str]:
     return None
 
 
-def import_edges(root: Path = REPO) -> List[Edge]:
-    modules = _module_files(root)
+def module_inventory(root: Path = REPO) -> Dict[str, Tuple[Path, ast.Module]]:
+    """One scan-local inventory; consumers inspect the trees without modifying them."""
+    return {module: (path, ast.parse(path.read_text(encoding="utf-8"),
+                                    filename=path.relative_to(root).as_posix()))
+            for module, path in _module_files(root).items()}
+
+
+def import_edges(root: Path = REPO, *, inventory=None) -> List[Edge]:
+    modules = module_inventory(root) if inventory is None else inventory
     edges: List[Edge] = []
-    for module, path in modules.items():
+    for module, (path, tree) in modules.items():
         is_package = path.name == "__init__.py"
         rel = path.relative_to(root).as_posix()
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         for node in import_nodes(tree):
             targets: List[str] = []
             if isinstance(node, ast.Import):

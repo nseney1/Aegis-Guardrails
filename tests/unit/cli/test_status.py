@@ -1,31 +1,614 @@
-"""Tests for soma status — Phase C test gate.
+"""Tests for aegis status — Phase C test gate.
 
 All tests use tmp_path to avoid touching the real filesystem.
 """
 import argparse
 from datetime import date, timedelta
+import errno
 import json
+import os
+import re
 
+import pytest
 
 from pathlib import Path
 
 from aegis_cli.status import run_status
 
 REPO_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").is_file())
+_STATUS_TODAY = date(2026, 11, 10)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_status_today(monkeypatch):
+    """Freeze only the status clock, preserving the real date type."""
+    monkeypatch.setattr("aegis_cli.status._today", lambda: _STATUS_TODAY)
+
+
+@pytest.fixture
+def mixed_service_states(tmp_path, monkeypatch):
+    """One workspace lists served, retired, untargeted and shipped guidance."""
+    import aegis_cli.init as init_module
+
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    texts = {
+        "served": "---\nid: served\ntarget_paths: ['*.py']\n---\n# Apply café\n",
+        "retired": "---\nid: retired\ntarget_paths: ['*.py']\nexpired_at: 2026-01-01\n---\n" + "R" * 800,
+        "untargeted": "---\nid: untargeted\n---\n" + "U" * 1200,
+    }
+    for name, text in texts.items():
+        (rules / f"{name}.md").write_bytes(text.encode("utf-8-sig"))
+    core = tmp_path / "rules"
+    core.mkdir()
+    guide = core / "guide.md"
+    guide.write_text("---\nid: guide\n---\n" + "G" * 1600, encoding="utf-8")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: core)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"guide": guide})
+    return tmp_path, texts["served"]
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("has_served", [True, False], ids=["mixed", "none-served"])
+def test_status_cli_counts_only_served_rules(mixed_service_states, capsys, json_output, has_served):
+    from aegis_cli.cli import main
+    from aegis_core.taxonomy import CHARS_PER_TOKEN_ESTIMATE
+
+    workspace, served_text = mixed_service_states
+    if not has_served:
+        (workspace / ".aegis" / "rules" / "traps" / "served.md").unlink()
+    expected_count = int(has_served)
+    expected_tokens = len(served_text) // CHARS_PER_TOKEN_ESTIMATE if has_served else 0
+    states = {"guide": "not_loaded", "retired": "retired", "untargeted": "untargeted"}
+    if has_served:
+        states["served"] = "served"
+    argv = ["status", "--workspace", str(workspace), "--plain"]
+    if json_output:
+        argv.append("--json")
+
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["estimated_tokens"] == expected_tokens
+        assert payload["core_rules"] == 0
+        assert payload["adaptive_rules"] == expected_count
+        assert payload["core_rules_shown"] == 1
+        assert payload["adaptive_rules_shown"] == 2 + expected_count
+        assert {r["name"]: r["service_state"] for r in payload["rules"]} == states
+    else:
+        assert "Core rules:     1 shown, 0 served" in captured.out
+        assert f"Adaptive rules: {2 + expected_count} shown, {expected_count} served" in captured.out
+        assert f"Context load:   ~{expected_tokens:,} tokens (pre-JIT max)" in captured.out
+        budget = next(line for line in captured.out.splitlines() if "Token budget:" in line)
+        assert f"{expected_tokens:,}/2,000" in budget
+        for name, state in states.items():
+            row = next(line for line in captured.out.splitlines() if line.lstrip().startswith(name + " "))
+            assert re.split(r" {2,}", row.strip())[-2] == state
+
+
+@pytest.fixture
+def status_policy_repo(tmp_path, monkeypatch):
+    """Build our own reviewed history; never depend on checkout history."""
+    from tests import helpers_humangate as hg
+
+    if not hg.git_ok():
+        pytest.skip("needs git")
+    home = hg.Home(tmp_path / "home")
+    for name, value in home.env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    repo = hg.Repo(tmp_path / "project", home)
+    text = "---\nid: reviewed\nenforcement: gate\ntarget_paths: ['src/*.py']\n---\n# Reviewed\n"
+    repo.write(".aegis/rules/invariants/reviewed.md", text)
+    repo.write("src/app.py", "value = 1\n")
+    repo.commit("reviewed fixture policy")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    return repo, text
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("change", ["untargeted", "new-mandatory", "removed", "rewritten"])
+def test_status_cli_uses_reviewed_policy(status_policy_repo, capsys, json_output, change):
+    from aegis_cli.cli import main
+
+    repo, reviewed = status_policy_repo
+    path = ".aegis/rules/invariants/reviewed.md"
+    if change == "untargeted":
+        repo.write(path, reviewed.replace("target_paths: ['src/*.py']\n", ""))
+    elif change == "new-mandatory":
+        repo.write(".aegis/rules/invariants/pending.md", reviewed.replace("reviewed", "pending") + "pending\n" * 50)
+    elif change == "removed":
+        (repo.root / path).unlink()
+    else:
+        repo.write(path, reviewed + "branch-local body\n" * 50)
+    assert main(["scan", str(repo.root / "src/app.py"), "--workspace", str(repo.root), "--json"]) == 0
+    scan = json.loads(capsys.readouterr().out)
+    assert [r["name"] for r in scan["relevant_rules"]] == ["reviewed"]
+    expected_shown = 2 if change == "new-mandatory" else 0 if change == "removed" else 1
+    expected_tokens = len(reviewed) // 4
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["adaptive_rules"] == 1
+        assert payload["adaptive_rules_shown"] == expected_shown
+        assert payload["estimated_tokens"] == expected_tokens
+        assert payload["rules_base"] == scan["rules_base"]
+        expected_counts = {"new": 0, "changed": 0, "broken": 0, "removed": 0}
+        expected_counts[{"untargeted": "changed", "new-mandatory": "new",
+                         "removed": "removed", "rewritten": "changed"}[change]] = 1
+        assert payload["unreviewed_counts"] == expected_counts
+        assert "unreviewed_rules" not in payload
+        assert payload["unreviewed_total"] == len(scan["unreviewed_rules"])
+        assert payload["next_action"] == "Review rule changes with `aegis check --ci`."
+        expected_states = {} if change == "removed" else {"reviewed": "served"}
+        if change == "new-mandatory":
+            expected_states["pending"] = "not_loaded"
+        assert {r["name"]: r["service_state"] for r in payload["rules"]} == expected_states
+        assert payload["untargeted"] == []
+    else:
+        assert f"Adaptive rules: {expected_shown} shown, 1 served" in captured.out
+        assert f"Context load:   ~{expected_tokens} tokens (pre-JIT max)" in captured.out
+        assert scan["rules_base"]["commit"] in captured.out
+        assert "Unreviewed rules: 1 total" in captured.out
+        assert "Unreviewed rule:" not in captured.out
+        assert "No rules found" not in captured.out
+        assert "rule(s) apply to no file" not in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_without_repository_uses_workspace_policy(tmp_path, capsys, json_output):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / ".aegis/rules/invariants"
+    rules.mkdir(parents=True)
+    text = "---\nid: local\nenforcement: gate\ntarget_paths: ['*.py']\n---\n# Local\n"
+    (rules / "local.md").write_bytes(text.encode("utf-8"))
+    argv = ["status", "--workspace", str(tmp_path), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["adaptive_rules"] == payload["adaptive_rules_shown"] == 1
+        assert payload["estimated_tokens"] == len(text) // 4
+        assert payload["rules"][0]["service_state"] == "served"
+        assert "rules_base" not in payload and "unreviewed_counts" not in payload
+    else:
+        assert "Adaptive rules: 1 shown, 1 served" in captured.out
+        assert f"Context load:   ~{len(text) // 4} tokens (pre-JIT max)" in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("detail", ["cannot read object", "git command timed out"])
+def test_status_cli_refuses_unreadable_reviewed_policy(status_policy_repo, monkeypatch, capsys, json_output, detail):
+    from types import SimpleNamespace
+    from aegis_cli.cli import main
+    from aegis_core import gitsafe, rule_integrity
+
+    repo, reviewed = status_policy_repo
+    repo.write(".aegis/rules/invariants/reviewed.md", reviewed + "working text\n")
+
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError(detail)
+
+    monkeypatch.setattr(rule_integrity, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_blobs": refuse}))
+    expected = "the reviewed (base) version of the rules cannot be read, so none is served: " + detail
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["status"] == "FAIL"
+        assert payload["error"] == expected
+        assert payload["adaptive_rules"] == payload["estimated_tokens"] == 0
+        assert payload["adaptive_rules_shown"] == 1
+        assert payload["rules"][0]["service_state"] == "not_loaded"
+    else:
+        assert expected in captured.out
+        assert "Adaptive rules: 1 shown, 0 served" in captured.out
+        assert "Context load:   ~0 tokens (pre-JIT max)" in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_rule_error_serves_no_partial_policy(status_policy_repo, capsys, json_output):
+    from aegis_cli.cli import main
+
+    repo, reviewed = status_policy_repo
+    repo.write(".aegis/rules/invariants/broken.md", reviewed.replace("reviewed", "broken").replace(
+        "enforcement: gate\n", "enforcement: gate\nexpired_at: 2026-01-01\n"))
+    assert main(["scan", str(repo.root / "src/app.py"), "--workspace", str(repo.root), "--json"]) == 1
+    scan = json.loads(capsys.readouterr().out)
+    assert scan["rule_errors"][0]["error"] == (
+        "expired_at is not allowed on a rank 2+ rule (a gate, an invariant or enforcement: gate): "
+        "retire it with a reviewed change, not by expiry"
+    )
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["adaptive_rules"] == payload["estimated_tokens"] == 0
+        assert payload["adaptive_rules_shown"] == 1
+        assert payload["rule_errors"] == scan["rule_errors"]
+        assert payload["status"] == "FAIL" and payload["error"] == scan["error"]
+        assert payload["rules"][0]["service_state"] == "not_loaded"
+    else:
+        assert "Adaptive rules: 1 shown, 0 served" in captured.out
+        assert "Context load:   ~0 tokens (pre-JIT max)" in captured.out
+        assert "rule file(s) cannot be loaded" in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_redacts_policy_diagnostics_before_truncation(status_policy_repo, monkeypatch, capsys, json_output):
+    from types import SimpleNamespace
+    from aegis_cli.cli import main
+    from aegis_core import gitsafe, rule_integrity
+
+    repo, reviewed = status_policy_repo
+    repo.write(".aegis/rules/invariants/pending.md", reviewed.replace("reviewed", "pending").replace(
+        "# Reviewed", "# " + "A" * 68 + " token=ghp_" + "B" * 30))
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["unreviewed_counts"] == {"new": 1, "changed": 0, "broken": 0, "removed": 0}
+        assert "unreviewed_rules" not in payload
+    else:
+        assert "Unreviewed rules: 1 total (new: 1, changed: 0, broken: 0, removed: 0)" in captured.out
+    assert "A" * 68 not in captured.out
+    assert "ghp_" not in captured.out
+
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("cannot read object: password=\x1b[31mfixture-secret\x1b[0m " + "Z" * 1200)
+
+    monkeypatch.setattr(rule_integrity, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_blobs": refuse}))
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "fixture-secret" not in captured.out and "\\u001b" not in captured.out and "\x1b" not in captured.out
+    error = json.loads(captured.out)["error"] if json_output else next(
+        line.strip().removeprefix("❌ ") for line in captured.out.splitlines() if "cannot read object" in line
+    )
+    assert error.startswith("the reviewed (base) version of the rules cannot be read, so none is served: "
+                            "cannot read object: password=REDACTED ")
+    assert len(error) == 1024 and error.endswith("...")
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("extra_pending", [0, 10], ids=["short", "over-display-limit"])
+def test_status_cli_omits_all_unreviewed_rule_text(
+    status_policy_repo, capsys, json_output, extra_pending
+):
+    from aegis_cli.cli import main
+
+    repo, reviewed = status_policy_repo
+    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    # This is precisely the producer's lossy ESC -> space spelling. The printable
+    # filename also exercises the same path on Windows, where ESC names are invalid.
+    unsafe_id = "[31m" + token + " [0m"
+    removed_path = ".aegis/rules/invariants/" + unsafe_id + ".md"
+    repo.write(removed_path, reviewed.replace("id: reviewed\n", ""))
+    repo.commit("reviewed rule with unsafe diagnostic identity")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    (repo.root / removed_path).unlink()
+    for rule_id in ["Pending_84.v2"] + [f"pending-{index:02}" for index in range(extra_pending)]:
+        repo.write(".aegis/rules/invariants/" + rule_id + ".md", reviewed.replace(
+            "id: reviewed", "id: " + rule_id).replace("# Reviewed", "# \x1b[31m" + token + "\x1b[0m"))
+
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert token not in captured.out
+    assert unsafe_id not in captured.out
+    assert "\x1b" not in captured.out and "\\u001b" not in captured.out
+    if json_output:
+        payload = json.loads(captured.out)
+        assert payload["unreviewed_total"] == extra_pending + 2
+        assert payload["unreviewed_counts"] == {"new": extra_pending + 1, "changed": 0, "broken": 0, "removed": 1}
+        assert "unreviewed_rules" not in payload
+        assert "unreviewed_unnamed" not in payload
+        assert payload["next_action"] == "Review rule changes with `aegis check --ci`."
+        assert payload["adaptive_rules"] == 2
+        assert payload["adaptive_rules_shown"] == extra_pending + 2
+    else:
+        assert (f"Unreviewed rules: {extra_pending + 2} total "
+                f"(new: {extra_pending + 1}, changed: 0, broken: 0, removed: 1)") in captured.out
+        assert "Next action: Review rule changes with `aegis check --ci`." in captured.out
+        assert "Unreviewed rule:" not in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("unsafe_id", ["Well_formed-84.v2", "_leading", "embedded space", "pending+suffix", "A" * 81,
+                                       "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"])
+def test_status_cli_counts_removed_rules_without_identifiers(status_policy_repo, capsys, json_output, unsafe_id):
+    from aegis_cli.cli import main
+
+    repo, reviewed = status_policy_repo
+    path = ".aegis/rules/invariants/" + unsafe_id + ".md"
+    repo.write(path, reviewed.replace("id: reviewed\n", ""))
+    repo.commit("reviewed diagnostic identity")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    (repo.root / path).unlink()
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert unsafe_id not in captured.out
+    if json_output:
+        payload = json.loads(captured.out)
+        assert "unreviewed_rules" not in payload
+        assert payload["unreviewed_total"] == 1
+        assert payload["unreviewed_counts"] == {"new": 0, "changed": 0, "broken": 0, "removed": 1}
+        assert payload["next_action"] == "Review rule changes with `aegis check --ci`."
+    else:
+        assert "Unreviewed rule:" not in captured.out
+        assert "Unreviewed rules: 1 total (new: 0, changed: 0, broken: 0, removed: 1)" in captured.out
+        assert "Next action: Review rule changes with `aegis check --ci`." in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("escape", ["M", "c"], ids=["reverse-index", "reset"])
+def test_status_cli_omits_esc_filename_in_removed_diagnostic(status_policy_repo, capsys, json_output, escape):
+    from aegis_cli.cli import main
+
+    if os.name == "nt":
+        pytest.skip("Windows forbids ESC in filenames")
+    repo, reviewed = status_policy_repo
+    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    path = ".aegis/rules/invariants/\x1b" + escape + token + ".md"
+    try:
+        repo.write(path, reviewed.replace("id: reviewed\n", ""))
+    except OSError as exc:
+        if exc.errno in (errno.EINVAL, errno.ENOTSUP):
+            pytest.skip("filesystem forbids ESC in filenames")
+        raise
+    repo.commit("reviewed ESC filename fixture")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    (repo.root / path).unlink()
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "ghp_" not in captured.out
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in captured.out
+    assert "\x1b" not in captured.out and "\\u001b" not in captured.out
+    if json_output:
+        payload = json.loads(captured.out)
+        assert "unreviewed_rules" not in payload
+        assert payload["unreviewed_counts"] == {"new": 0, "changed": 0, "broken": 0, "removed": 1}
+        assert payload["unreviewed_total"] == 1
+        assert payload["next_action"] == "Review rule changes with `aegis check --ci`."
+        assert payload["adaptive_rules"] == 2
+        assert payload["adaptive_rules_shown"] == 1
+    else:
+        assert "Unreviewed rules: 1 total (new: 0, changed: 0, broken: 0, removed: 1)" in captured.out
+        assert "Next action: Review rule changes with `aegis check --ci`." in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_counts_every_unreviewed_state_without_titles(status_policy_repo, capsys, json_output):
+    from aegis_cli.cli import main
+
+    repo, reviewed = status_policy_repo
+    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    fixture_text = reviewed.replace("id: reviewed\n", "").replace("# Reviewed", "# \x1b[31m" + token + "\x1b[0m")
+    for name in ("changed", "broken", "removed"):
+        repo.write(f".aegis/rules/invariants/{name}.md", fixture_text)
+    repo.commit("reviewed diagnostic state fixtures")
+    repo.git("update-ref", "refs/remotes/origin/main", repo.head())
+    repo.write(".aegis/rules/invariants/changed.md", fixture_text + "branch-local addition\n")
+    repo.write(".aegis/rules/invariants/pending.md", fixture_text)
+    (repo.root / ".aegis/rules/invariants/broken.md").write_bytes(b"\xff")
+    (repo.root / ".aegis/rules/invariants/removed.md").unlink()
+    argv = ["status", "--workspace", str(repo.root), "--plain"] + (["--json"] if json_output else [])
+
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "ghp_" not in captured.out
+    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in captured.out
+    if json_output:
+        payload = json.loads(captured.out)
+        assert "unreviewed_rules" not in payload
+        assert payload["unreviewed_counts"] == {"new": 1, "changed": 1, "broken": 1, "removed": 1}
+        assert payload["unreviewed_total"] == 4
+        assert payload["next_action"] == "Review rule changes with `aegis check --ci`."
+        assert payload["status"] == "FAIL"
+        assert payload["adaptive_rules"] == payload["estimated_tokens"] == 0
+        assert "invalid UTF-8" in payload["error"]
+    else:
+        assert "Unreviewed rules: 4 total (new: 1, changed: 1, broken: 1, removed: 1)" in captured.out
+        assert "Unreviewed rule:" not in captured.out
+        assert "Next action: Review rule changes with `aegis check --ci`." in captured.out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "metadata,service_state,calendar_expiry,legacy_expiry",
+    [
+        ("created: 2020-01-01\nexpiry_days: 30\n", "served", "overdue (2475d)", "overdue (2475d)"),
+        ("created: 2026-11-10\nexpiry_days: 30\nexpired_at: 2026-01-01\n",
+         "retired", "30d", "expired"),
+        ("expiry_days: 30\n", "served", "—", "—"),
+        ("created: not-a-date\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: 20200101\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: 20200101.0\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: true\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: [2020-01-01]\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: {year: 2020}\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '20200101'\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '2020-W01-1'\nexpiry_days: 30\n", "served", "—", "—"),
+        ("created: '2026-11-10T11:59:11Z'\nexpiry_days: 30\n", "served", "30d", "30d"),
+        ("created: 2026-11-10\nexpiry_days: '30'\n", "served", "30d", "30d"),
+        ("created: 2026-11-10\nexpiry_days: 0\n", "served", "0d", "0d"),
+        ("created: 2026-11-10\nexpiry_days: yes\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: false\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: 30.0\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: 30.5\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: [30]\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: {days: 30}\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: -1\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '-1'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '30days'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '3_0'\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: ''\n", "served", "—", "—"),
+        ("created: 2026-11-10\nexpiry_days: '²'\n", "served", "—", "—"),
+        ("created: 2020-01-01\nexpiry_days: invalid\n", "served", "—", "—"),
+        ("created: 2020-01-01\nexpiry_days: 1.0e+999\nexpired_at: 2026-01-01\n",
+         "retired", "—", "expired"),
+        ("expiry_days: 30\n", "untargeted", "—", "—"),
+    ],
+    ids=["old-but-served", "retired", "missing-date", "malformed-date", "integer-date", "float-date", "bool-date",
+         "list-date", "mapping-date", "compact-date", "week-date", "timestamp-date", "string-days", "zero-days",
+         "bool-days", "false-days", "float-days", "fractional-days", "list-days", "mapping-days", "negative-days",
+         "negative-string-days", "non-digit-days", "underscore-days", "empty-days", "non-decimal-days",
+         "malformed-days", "retired-overflow",
+         "untargeted"],
+)
+def test_status_cli_service_state_is_independent_of_calendar(
+    tmp_path, capsys, json_output, metadata, service_state, calendar_expiry, legacy_expiry
+):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    targets = "" if service_state == "untargeted" else "target_paths: ['*.py']\n"
+    (rules / "example.md").write_text(
+        "---\nid: example\n" + targets + metadata + "---\n# Example\n",
+        encoding="utf-8",
+    )
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        (rule,) = json.loads(captured.out)["rules"]
+        assert rule["service_state"] == service_state
+        assert rule["calendar_expiry"] == calendar_expiry
+        assert rule["expiry"] == legacy_expiry  # Only retirement uses "expired".
+        assert rule["state"] == "insufficient"  # Fitness state remains separate.
+    else:
+        header = next(line for line in captured.out.splitlines() if line.lstrip().startswith("Rule "))
+        assert re.split(r" {2,}", header.strip())[-2:] == ["Service state", "Calendar (meta)"]
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("example "))
+        assert re.split(r" {2,}", row.strip())[-2:] == [service_state, calendar_expiry]
+        if service_state == "served":
+            assert "expired" not in row
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_packaged_guidance_is_not_loaded(tmp_path, monkeypatch, capsys, json_output):
+    from aegis_cli.cli import main
+    import aegis_cli.init as init_module
+
+    (tmp_path / ".aegis" / "rules").mkdir(parents=True)
+    core = tmp_path / "rules"
+    core.mkdir()
+    (core / "guide.md").write_text("---\nid: guide\n---\n# Guidance\n", encoding="utf-8")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: core)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"guide": core / "guide.md"})
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    assert main(argv) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        (rule,) = json.loads(captured.out)["rules"]
+        assert rule["service_state"] == "not_loaded"
+        assert rule["calendar_expiry"] == rule["expiry"] == "∞ (core)"
+    else:
+        assert "Core rules:     1 shown, 0 served (shipped; not_loaded: scan and check do not read them)" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("guide "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["not_loaded", "∞ (core)"]
+
+
+def test_status_cli_project_summary_explains_omitted_core_rules(tmp_path, monkeypatch, capsys):
+    from aegis_cli.cli import main
+    import aegis_cli.init as init_module
+
+    workspace = tmp_path / "project"
+    (workspace / ".aegis" / "rules").mkdir(parents=True)
+    packaged = tmp_path / "package" / "rules"
+    packaged.mkdir(parents=True)
+    guide = packaged / "guide.md"
+    guide.write_text("---\nid: guide\n---\n# Guidance\n", encoding="utf-8")
+    monkeypatch.setattr(init_module, "packaged_dir", lambda name: packaged)
+    monkeypatch.setattr(init_module, "packaged_rules", lambda: {"guide": guide})
+
+    assert main(["status", "--workspace", str(workspace), "--plain"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    summary = next(line for line in captured.out.splitlines() if "Core rules:" in line)
+    assert summary == "  Core rules:     listed only in the Aegis checkout (scan and check do not read them)"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_status_cli_calendar_uses_current_clock_on_each_call(tmp_path, monkeypatch, capsys, json_output):
+    from aegis_cli.cli import main
+
+    rules = tmp_path / ".aegis" / "rules" / "traps"
+    rules.mkdir(parents=True)
+    (rules / "example.md").write_text(
+        "---\nid: example\ntarget_paths: ['*.py']\ncreated: 2030-01-31\nexpiry_days: 30\n---\n# Example\n",
+        encoding="utf-8",
+    )
+    argv = ["status", "--workspace", str(tmp_path), "--plain"]
+    if json_output:
+        argv.append("--json")
+    for today, expected in [(date(2030, 2, 1), "29d"), (date(2030, 2, 2), "28d")]:
+        monkeypatch.setattr("aegis_cli.status._today", lambda: today)
+        assert main(argv) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        if json_output:
+            (rule,) = json.loads(captured.out)["rules"]
+            assert rule["calendar_expiry"] == rule["expiry"] == expected
+            assert rule["service_state"] == "served"
+        else:
+            row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("example "))
+            assert re.split(r" {2,}", row.strip())[-2:] == ["served", expected]
 
 
 class TestStatus:
-    """Test suite for the soma status subcommand."""
+    """Test suite for the aegis status subcommand."""
+
+    def test_status_output_no_biology_terms(self, tmp_path, capsys):
+        from aegis_core.telemetry_engine import ledger
+        from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, _word_counts
+
+        rules = tmp_path / ".aegis/rules/traps"
+        rules.mkdir(parents=True)
+        (rules / "rule-a.md").write_text("---\nid: rule-a\ntype: trap\n---\nBody\n")
+        ledger.append(tmp_path, [{"rule": "rule-a", "outcome": "tp", "source": "ci", "key": "k1"}])
+        assert run_status(argparse.Namespace(_root=tmp_path)) == 0
+        out = capsys.readouterr().out
+        assert "Aegis Workspace Status" in out and "rule-a" in out
+        assert not any(_word_counts([out], REQUIRED_WORDS).values()), out
 
     def test_status_no_rules(self, tmp_path, capsys):
-        """Empty dirs → '0 active' and helpful message."""
-        (tmp_path / "genome").mkdir()
+        """Empty projects explain where core rules are listed and give a helpful message."""
+        (tmp_path / "rules").mkdir()
         (tmp_path / ".aegis" / "rules").mkdir(parents=True)
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "0 active" in captured.out
+        assert "Core rules:     listed only in the Aegis checkout (scan and check do not read them)" in captured.out
         assert "No rules found" in captured.out
 
     def test_status_counts_core_rules(self, capsys):
@@ -35,22 +618,23 @@ class TestStatus:
         args = argparse.Namespace(_root=REPO_ROOT, json=True)
         assert run_status(args) in (0, 1)  # the checkout's own rules may need attention
         payload = json.loads(capsys.readouterr().out)
-        assert payload["core_rules"] == len(packaged_rules()) == 12
+        assert payload["core_rules"] == 0 and payload["core_rules_shown"] == len(packaged_rules()) == 12
         core = {r["name"] for r in payload["rules"] if r["type"] == "core"}
         assert {"providence", "testing", "tdd-protocol"} <= core and "META" not in core
 
-    def test_a_workspaces_own_rules_or_genome_dir_is_never_listed_as_core(self, tmp_path, capsys):
-        """Release review: status read <workspace>/rules (or genome/) as Aegis's shipped
+    def test_a_workspaces_own_rule_directories_are_never_listed_as_core(self, tmp_path, capsys):
+        """Release review: status read <workspace>/rules (or rules/) as Aegis's shipped
         rules, so a project's own markdown was listed and counted as active core rules."""
         marker = tmp_path / "PLANTED_RAN"
-        for name in ("rules", "genome"):
+        for name in ("rules", "project_rules"):
             (tmp_path / name).mkdir()
             (tmp_path / name / "pricing.md").write_text("# Pricing\n" + "x" * 400)
             (tmp_path / name / "__init__.py").write_text(f"open({str(marker)!r}, 'w').write('x')\n")
         (tmp_path / ".aegis" / "rules").mkdir(parents=True)
         assert run_status(argparse.Namespace(_root=tmp_path)) == 0
         out = capsys.readouterr().out
-        assert "Core rules:     0 active" in out and "pricing" not in out
+        assert "Core rules:     listed only in the Aegis checkout (scan and check do not read them)" in out
+        assert "pricing" not in out
         assert "~0 tokens" in out
         assert not marker.exists()
 
@@ -68,7 +652,7 @@ class TestStatus:
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "Adaptive rules: 2 (traps/patterns)" in captured.out
+        assert "Adaptive rules: 2 shown, 0 served" in captured.out
         assert ".aegis/rules/notes.md: not a rule: it is not in a rule type directory" in captured.out
         assert "README" not in captured.out
 
@@ -76,15 +660,15 @@ class TestStatus:
         """Nothing is excluded unseen: scan refuses these, so status names them."""
         rules = tmp_path / ".aegis" / "rules"
         (rules / "traps").mkdir(parents=True)
-        (rules / "walls").mkdir()
+        (rules / "unsupported").mkdir()
         (rules / "traps" / "ok.md").write_text("---\nid: ok\n---\n")
-        (rules / "walls" / "old.md").write_text("---\nid: old\ntype: wall\n---\n")
+        (rules / "unsupported" / "old.md").write_text("---\nid: old\ntype: invariant\n---\n")
 
         assert run_status(argparse.Namespace(_root=tmp_path)) == 1
         out = capsys.readouterr().out
         assert "1 rule file(s) cannot be loaded; aegis scan fails until they are fixed:" in out
-        assert ".aegis/rules/walls/old.md: not served: walls/ is not a rule type directory" in out
-        assert "Adaptive rules: 1 (traps/patterns)" in out
+        assert ".aegis/rules/unsupported/old.md: not served: unsupported/ is not a rule type directory" in out
+        assert "Adaptive rules: 1 shown, 0 served" in out
 
     def test_status_names_rules_that_still_carry_derived_counters(self, tmp_path, capsys):
         rules = tmp_path / ".aegis" / "rules" / "traps"
@@ -169,10 +753,10 @@ class TestStatus:
         evidence = tmp_path / ".aegis" / "evidence"
         evidence.mkdir(parents=True)
         records = [
-            {"cell": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:00:00Z"},
-            {"cell": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:01:00Z"},
-            {"cell": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:02:00Z"},
-            {"cell": "rule-b", "signal": "trigger", "timestamp": "2026-09-30T12:03:00Z"},
+            {"rule_id": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:00:00Z"},
+            {"rule_id": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:01:00Z"},
+            {"rule_id": "rule-a", "signal": "trigger", "timestamp": "2026-09-30T12:02:00Z"},
+            {"rule_id": "rule-b", "signal": "trigger", "timestamp": "2026-09-30T12:03:00Z"},
         ]
         state = tmp_path / ".aegis" / "state"
         state.mkdir(parents=True)
@@ -180,10 +764,10 @@ class TestStatus:
             "\n".join(json.dumps(r) for r in records) + "\n"
         )
         legacy_records = [
-            {"cell_id": "rule-a"},
-            {"cell_id": "rule-b"},
-            {"cell_id": "rule-b"},
-            {"cell_id": "rule-b"},
+            {"rule_id": "rule-a"},
+            {"rule_id": "rule-b"},
+            {"rule_id": "rule-b"},
+            {"rule_id": "rule-b"},
         ]
         (evidence / "fitness.jsonl").write_text(
             "\n".join(json.dumps(r) for r in legacy_records) + "\n"
@@ -208,37 +792,6 @@ class TestStatus:
         assert cols_b[0] == "rule-b"
         assert cols_b[1] == "1"
 
-    def test_status_output_no_biology_terms(self, tmp_path, capsys):
-        """Capture output, assert no 'enzyme', 'vacuole', 'genome', 'cell' in output."""
-        (tmp_path / ".aegis" / "rules" / "traps").mkdir(parents=True)
-        (tmp_path / ".aegis" / "rules" / "traps" / "rule-a.md").write_text("---\nid: rule-a\n---\n# Rule A\n")
-        cells = tmp_path / ".aegis" / "rules"
-        (cells / "rule-b.md").write_text(
-            "---\ncreated: 2026-09-01\nexpiry_days: 30\n---\n# Rule B\n"
-        )
-
-        state = tmp_path / ".aegis" / "state"
-        state.mkdir(parents=True)
-        (state / "ledger.jsonl").write_text(
-            json.dumps(
-                {
-                    "cell": "rule-a",
-                    "signal": "trigger",
-                    "timestamp": "2026-09-30T12:00:00Z",
-                }
-            ) + "\n"
-        )
-
-        args = argparse.Namespace(_root=tmp_path)
-        ret = run_status(args)
-        assert ret == 0
-        captured = capsys.readouterr()
-
-        out_lower = captured.out.lower()
-        for term in ["enzyme", "vacuole", "genome", "cell"]:
-            assert term not in out_lower, (
-                f"Biology term '{term}' found in user output:\n{captured.out}"
-            )
 
     def test_status_returns_zero(self, tmp_path):
         """run_status returns 0."""
@@ -264,38 +817,43 @@ class TestStatus:
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "~100 tokens (pre-JIT max)" in captured.out
+        assert "~0 tokens (pre-JIT max)" in captured.out
 
     def test_status_adaptive_rule_expiry_active(self, tmp_path, capsys):
-        """Active adaptive rules show remaining days."""
-        cells = tmp_path / ".aegis" / "rules" / "traps"
-        cells.mkdir(parents=True)
-        created = (date.today() - timedelta(days=10)).isoformat()
-        (cells / "pattern.md").write_text(
-            f"---\ncreated: {created}\nexpiry_days: 30\n---\n# Pattern\n"
+        """Active adaptive rules show service state; JSON keeps calendar metadata."""
+        rules = tmp_path / ".aegis" / "rules" / "traps"
+        rules.mkdir(parents=True)
+        created = (_STATUS_TODAY - timedelta(days=10)).isoformat()
+        (rules / "pattern.md").write_text(
+            f"---\ncreated: {created}\nexpiry_days: 30\ntarget_paths: ['*.py']\n---\n# Pattern\n"
         )
 
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        # 30 - 10 = 20 days remaining
-        assert "20d" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("pattern "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["served", "20d"]
+        assert run_status(argparse.Namespace(_root=tmp_path, json=True)) == 0
+        (rule,) = json.loads(capsys.readouterr().out)["rules"]
+        assert rule["calendar_expiry"] == rule["expiry"] == "20d"
 
-    def test_status_adaptive_rule_expiry_expired(self, tmp_path, capsys):
-        """Expired adaptive rules show 'expired'."""
-        cells = tmp_path / ".aegis" / "rules" / "traps"
-        cells.mkdir(parents=True)
-        created = (date.today() - timedelta(days=40)).isoformat()
-        (cells / "stale.md").write_text(
-            f"---\ncreated: {created}\nexpiry_days: 30\n---\n# Stale\n"
+    def test_status_adaptive_rule_past_calendar_expiry_is_still_served(self, tmp_path, capsys):
+        """A past calendar deadline does not retire an adaptive rule."""
+        rules = tmp_path / ".aegis" / "rules" / "traps"
+        rules.mkdir(parents=True)
+        created = (_STATUS_TODAY - timedelta(days=40)).isoformat()
+        (rules / "stale.md").write_text(
+            f"---\ncreated: {created}\nexpiry_days: 30\ntarget_paths: ['*.py']\n---\n# Stale\n"
         )
 
         args = argparse.Namespace(_root=tmp_path)
         ret = run_status(args)
         assert ret == 0
         captured = capsys.readouterr()
-        assert "expired" in captured.out
+        row = next(line for line in captured.out.splitlines() if line.lstrip().startswith("stale "))
+        assert re.split(r" {2,}", row.strip())[-2:] == ["served", "overdue (10d)"]
+        assert "expired" not in captured.out
 
     def test_status_command_contract(self):
         from unittest.mock import patch
@@ -309,8 +867,9 @@ class TestStatus:
             assert cmd.execute(parsed) == 0
             mock_run.assert_called_once_with(parsed)
 
-    def test_status_branded_aegis_header_and_no_soma(self, tmp_path, capsys):
-        """v3.0.0: status prints Aegis Workspace Status, token budget bar, and zero 'Soma' references."""
+    def test_status_branded_aegis_header(self, tmp_path, capsys):
+        """Status prints the Aegis header and token bar using current terminology."""
+        from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, _word_counts
         (tmp_path / "rules").mkdir()
         (tmp_path / ".aegis" / "rules").mkdir(parents=True)
         args = argparse.Namespace(_root=tmp_path)
@@ -319,12 +878,13 @@ class TestStatus:
         out = capsys.readouterr().out
         assert "Aegis Workspace Status" in out
         assert "Token budget:" in out
-        assert "soma" not in out.lower()
+        assert not any(_word_counts([out], REQUIRED_WORDS).values())
         assert "aegis init" in out
 
     def test_status_groups_rules_by_type_and_colors_fitness(self, tmp_path, capsys):
         """v3.0.0: rules are grouped by modern rule type with colored fitness in TTY and zero ANSI in plain mode."""
         from aegis_cli.ui.theme import OutputContext
+        from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, _word_counts
 
         rules_dir = tmp_path / ".aegis" / "rules"
         (rules_dir / "invariants").mkdir(parents=True)
@@ -354,17 +914,14 @@ class TestStatus:
         # 8 of 10 is below the one sample gate (MIN_N = 25, R-evidence-8): a label, never 0.54
         assert "insufficient (n=10)" in out_tty and "0.54" not in out_tty
         assert "0.11" not in out_tty and "0.13" not in out_tty
-        assert "wall" not in out_tty.lower()
-        assert "vacuole" not in out_tty.lower()
+        assert not any(_word_counts([out_tty], REQUIRED_WORDS).values())
 
         plain_ui = OutputContext(color_enabled=False, emoji_enabled=False, plain=True)
         args_plain = argparse.Namespace(_root=tmp_path, plain=True, ui=plain_ui)
         assert run_status(args_plain) == 0
         out_plain = capsys.readouterr().out
         assert "\x1b[" not in out_plain
-        assert "soma" not in out_plain.lower()
-
-
+        assert not any(_word_counts([out_plain], REQUIRED_WORDS).values())
 
 
 # ── `aegis status --compliance` through main() (more in test_status_compliance.py) ──
@@ -437,8 +994,8 @@ class TestStatusComplianceCLI:
 
 
 def _pinned_workspace(tmp_path, monkeypatch):
-    """PIN-1's workspace: the expired traps t-one and t-two, the gate invariant i-one, the trap
-    legacy with derived counters, walls/old.md, notes.md, blocked guard events for claude-code
+    """PIN-1's workspace: the old-but-served traps t-one and t-two, the gate invariant i-one, the trap
+    legacy with derived counters, invariants/old.md, notes.md, blocked guard events for claude-code
     twice and codex-cli once plus one recorded event, ledger rows, a claimed report, an agent
     suggestion in the user's insights log and one core rule."""
     import aegis_cli.init as init_module
@@ -448,7 +1005,7 @@ def _pinned_workspace(tmp_path, monkeypatch):
 
     ws = tmp_path / "ws"
     rules = ws / ".aegis" / "rules"
-    for kind in ("traps", "invariants", "walls"):
+    for kind in ("traps", "invariants", "unsupported"):
         (rules / kind).mkdir(parents=True)
     (rules / "traps" / "t-one.md").write_bytes(
         b"---\nid: t-one\ncreated: 2020-01-01\nexpiry_days: 30\ntarget_paths: ['src/*.py']\n---\n# One\n")
@@ -456,7 +1013,7 @@ def _pinned_workspace(tmp_path, monkeypatch):
     (rules / "invariants" / "i-one.md").write_bytes(
         b"---\nid: i-one\nenforcement: gate\ntarget_paths: ['src/*.py']\n---\n# Gate\n")
     (rules / "traps" / "legacy.md").write_bytes(b"---\nid: legacy\nfitness:\n  score: 0.9\ntriggers: 12\n---\n# Old\n")
-    (rules / "walls" / "old.md").write_bytes(b"---\nid: old\ntype: wall\n---\n")
+    (rules / "unsupported" / "old.md").write_bytes(b"---\nid: old\ntype: invariant\n---\n")
     (rules / "notes.md").write_bytes(b"# Not a rule\n")
     for host in ("claude-code", "claude-code", "codex-cli"):
         events.append(ws, "guard_match", "block", {"rule": "git-safety", "tier": "block", "action": "block"}, host=host)
@@ -484,22 +1041,29 @@ def _pinned_workspace(tmp_path, monkeypatch):
     return ws
 
 
-
-def _adaptive(name: str, kind: str, triggers: int, expiry: str) -> dict:
+def _adaptive(name: str, kind: str, triggers: int, expiry: str, service_state: str) -> dict:
     """One adaptive rule of the pinned JSON, every key in the order run_status writes them."""
     return {"name": name, "type": kind, "score": None, "state": "insufficient",
             "status_label": f"insufficient (n={triggers})", "evidence_available": True, "evidence_error": None,
             "contested": 0, "override_rate": 0.0, "flagged_for_review": False, "triggers": triggers,
-            "expiry": expiry, "is_core": False}
+            "expiry": expiry, "is_core": False, "service_state": service_state, "calendar_expiry": expiry}
+
+
+_PIN_RULE_REFUSAL = (
+    "1 rule file(s) cannot be served, so no partial rule set is returned: "
+    ".aegis/rules/unsupported/old.md: not served: unsupported/ is not a rule type directory "
+    "(expected .aegis/rules/<boundaries, contracts, gates, invariants, personas, traps>/<id>.md). "
+    "Fix or move them; `aegis status` lists them."
+)
 
 
 PIN_TEXT = (
     "Aegis Workspace Status\n"
     "\n"
-    "  Core rules:     1 active\n"
-    "  Adaptive rules: 4 (traps/patterns)\n"
-    "  Context load:   ~76 tokens (pre-JIT max)\n"
-    "  Token budget:   [#-------------------] 76/2,000 (4%)\n"
+    "  Core rules:     1 shown, 0 served (shipped; not_loaded: scan and check do not read them)\n"
+    "  Adaptive rules: 4 shown, 0 served\n"
+    "  Context load:   ~0 tokens (pre-JIT max)\n"
+    "  Token budget:   [--------------------] 0/2,000 (0%)\n"
     "  Last sync:      never (run aegis sync)\n"
     "\n"
     "  1 unconfirmed agent suggestions (not counted)\n"
@@ -508,38 +1072,37 @@ PIN_TEXT = (
     "\n"
     "  claimed (unwitnessed): 1 report(s) from 1 session(s), no rule's evidence\n"
     "\n"
+    f"  ❌ {_PIN_RULE_REFUSAL}\n"
     "  ❌ 1 rule file(s) cannot be loaded; aegis scan fails until they are fixed:\n"
-    "     .aegis/rules/walls/old.md: not served: walls/ is not a rule type directory (a v3 type directory: aegis m...\n"
+    "     .aegis/rules/unsupported/old.md: not served: unsupported/ is not a rule type directory (expected .aegis/rules/...\n"
     "  ⚠️  1 rule file(s) still carry derived counters or retired v3 keys (ignored; run aegis migrate --apply to "
     "strip them):\n"
     "     .aegis/rules/traps/legacy.md: fitness, triggers\n"
     "  ℹ️  1 file(s) under .aegis/rules are not rules:\n"
     "     .aegis/rules/notes.md: not a rule: it is not in a rule type directory\n"
-    "  ⚠️  2 rule(s) apply to no file (no target_paths), so scan and check never serve them:\n"
-    "     legacy: .aegis/rules/traps/legacy.md\n"
-    "     t-two: .aegis/rules/traps/t-two.md\n"
     "\n"
-    "  Rule      Triggers  Type       Fitness             Expiry  \n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  core-one  2         core       —                   ∞ (core)\n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  i-one     0         invariant  insufficient (n=0)  —       \n"
-    "  --------  --------  ---------  ------------------  --------\n"
-    "  t-two     1         trap       insufficient (n=1)  expired \n"
-    "  legacy    0         trap       insufficient (n=0)  —       \n"
-    "  t-one     0         trap       insufficient (n=0)  expired \n"
+    "  Rule      Triggers  Type       Fitness             Service state  Calendar (meta)\n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  core-one  2         core       —                   not_loaded     ∞ (core)       \n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  i-one     0         invariant  insufficient (n=0)  not_loaded     —              \n"
+    "  --------  --------  ---------  ------------------  -------------  ---------------\n"
+    "  t-two     1         trap       insufficient (n=1)  not_loaded     overdue (2475d)\n"
+    "  legacy    0         trap       insufficient (n=0)  not_loaded     —              \n"
+    "  t-one     0         trap       insufficient (n=0)  not_loaded     overdue (2475d)\n"
 )
 
 PIN_JSON = {
-    "core_rules": 1,
-    "adaptive_rules": 4,
-    "estimated_tokens": 76,
+    "core_rules": 0,
+    "adaptive_rules": 0,
+    "estimated_tokens": 0,
     "rules": [
-        {"name": "core-one", "type": "core", "score": None, "triggers": 2, "expiry": "∞ (core)", "is_core": True},
-        _adaptive("i-one", "invariant", 0, "—"),
-        _adaptive("t-two", "trap", 1, "expired"),
-        _adaptive("legacy", "trap", 0, "—"),
-        _adaptive("t-one", "trap", 0, "expired"),
+        {"name": "core-one", "type": "core", "score": None, "triggers": 2, "expiry": "∞ (core)", "is_core": True,
+         "service_state": "not_loaded", "calendar_expiry": "∞ (core)"},
+        _adaptive("i-one", "invariant", 0, "—", "not_loaded"),
+        _adaptive("t-two", "trap", 1, "overdue (2475d)", "not_loaded"),
+        _adaptive("legacy", "trap", 0, "—", "not_loaded"),
+        _adaptive("t-one", "trap", 0, "overdue (2475d)", "not_loaded"),
     ],
     "last_sync": None,
     "inventory_error": None,
@@ -549,21 +1112,24 @@ PIN_JSON = {
                          "label": "hook-observed"},
     "insights": {"rules": [], "unconfirmed_suggestions": 1,
                  "denominator": "sessions = all heartbeat-alive sessions in this workspace (not scope-filtered)"},
-    "rule_errors": [{"path": ".aegis/rules/walls/old.md",
-                     "error": "not served: walls/ is not a rule type directory (a v3 type directory: aegis migrate "
-                              "moves its rules to .aegis/rules/invariants/)"}],
+    "rule_errors": [{"path": ".aegis/rules/unsupported/old.md",
+                     "error": "not served: unsupported/ is not a rule type directory "
+                              "(expected .aegis/rules/<boundaries, contracts, gates, invariants, personas, traps>/<id>.md)"}],
     "ignored": [{"path": ".aegis/rules/notes.md", "reason": "not a rule: it is not in a rule type directory"}],
     "stale_rules": [],
     "needs_migrate": [{"path": ".aegis/rules/traps/legacy.md", "keys": ["fitness", "triggers"]}],
-    "untargeted": [{"id": "legacy", "path": ".aegis/rules/traps/legacy.md"},
-                   {"id": "t-two", "path": ".aegis/rules/traps/t-two.md"}],
+    "untargeted": [],
+    "core_rules_shown": 1,
+    "adaptive_rules_shown": 4,
+    "status": "FAIL",
+    "error": _PIN_RULE_REFUSAL,
 }
 
 PIN_EMPTY_TEXT = (
     "Aegis Workspace Status\n"
     "\n"
-    "  Core rules:     0 active\n"
-    "  Adaptive rules: 0 (traps/patterns)\n"
+    "  Core rules:     listed only in the Aegis checkout (scan and check do not read them)\n"
+    "  Adaptive rules: 0 shown, 0 served\n"
     "  Context load:   ~0 tokens (pre-JIT max)\n"
     "  Token budget:   [--------------------] 0/2,000 (0%)\n"
     "  Last sync:      never (run aegis sync)\n"
@@ -573,7 +1139,7 @@ PIN_EMPTY_TEXT = (
 
 
 class TestStatusPins:
-    """Characterization pins: green before run_status was split into helpers, unchanged after."""
+    """Characterization pins, updated for RF-45's service-state column and additive JSON fields."""
 
     def test_the_text_view_prints_every_section_in_its_fixed_order(self, tmp_path, monkeypatch, capsys):
         ws = _pinned_workspace(tmp_path, monkeypatch)
@@ -595,7 +1161,8 @@ class TestStatusPins:
         payload = json.loads(captured.out)
         assert list(payload) == ["core_rules", "adaptive_rules", "estimated_tokens", "rules", "last_sync",
                                  "inventory_error", "ledger", "claimed", "blocked_commands", "insights",
-                                 "rule_errors", "ignored", "stale_rules", "needs_migrate", "untargeted"]
+                                 "rule_errors", "ignored", "stale_rules", "needs_migrate", "untargeted",
+                                 "core_rules_shown", "adaptive_rules_shown", "status", "error"]
         assert [r["name"] for r in payload["rules"]] == ["core-one", "i-one", "t-two", "legacy", "t-one"]
         assert captured.out == json.dumps(PIN_JSON, indent=2) + "\n"
         assert captured.err == ""
@@ -680,7 +1247,7 @@ class TestStatusPins:
             "  ⚠️  The ledger is incomplete (1 unreadable line(s)): fitness counts only the rows that could be read, "
             "so moves that rely on it (sync --apply, rule archive, tier changes) are refused",
             "",
-            "  Rule   Triggers  Type  Fitness               Expiry",
-            "  -----  --------  ----  --------------------  ------",
-            "  t-one  1         trap  evidence unavailable  —     ",
+            "  Rule   Triggers  Type  Fitness               Service state  Calendar (meta)",
+            "  -----  --------  ----  --------------------  -------------  ---------------",
+            "  t-one  1         trap  evidence unavailable  served         —              ",
         ]

@@ -51,12 +51,195 @@ def test_oversized_native_file_is_advisory_for_rules_structural_checks_and_t7(tm
     assert any(row.get('reason') == 'too_large' for row in pack['unverified_findings'])
 
 
-def test_card_exposes_the_advisory_instead_of_reporting_full_verification(tmp_path):
-    source(tmp_path, 2 * 1024 * 1024 + 1)
+@pytest.mark.parametrize('count', [1, 3])
+def test_card_exposes_the_advisory_instead_of_reporting_full_verification(tmp_path, capsys, count):
+    import json
+
+    from aegis_cli.cli import main
+
+    for number in range(count):
+        source(tmp_path, 2 * 1024 * 1024 + 1).rename(tmp_path / f'bundle{number}.ts')
     rule(tmp_path)
     data = card.build(tmp_path).as_dict()
-    assert data['layer1']['failed'] == 0
-    assert any('too_large' in detail for detail in data['layer1']['checks_that_could_not_run'])
+    layer1 = data['layer1']
+    assert (layer1['checked'], layer1['passed'], layer1['failed'], layer1['pass_rate']) == (count, count, 0, 1.0)
+    assert layer1['findings'] == 0
+    assert any('too_large' in detail for detail in layer1['checks_that_could_not_run'])
+    assert layer1['not_analyzed'] == [
+        {'path': f'bundle{number}.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'}
+        for number in range(count)
+    ]
+    assert not any('does not count them' in note for note in data['notes'])
+    assert data['notes'][-1] == f'{count} size advisory check(s): AST coverage is incomplete (aegis check shows why).'
+    assert not any('fail aegis check' in note for note in data['notes'])
+    assert main(['check', '--card', '--workspace', str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert f'100% of {count} files without blocking findings' in output
+    assert f'AST coverage: {count} file(s) not analyzed' in output
+    assert 'bundle0.ts: size limit' in output
+    assert 'all analyzed' not in output
+    assert main(['check', '--card', '--workspace', str(tmp_path), '--json']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['layer1'] == layer1
+
+
+def test_card_separates_coverage_from_findings_in_a_mixed_workspace(tmp_path):
+    source(tmp_path, 2 * 1024 * 1024 + 1)
+    rule(tmp_path)
+    (tmp_path / 'good.ts').write_text('export const x = 1;\n', encoding='utf-8')
+    (tmp_path / 'bad.ts').write_text('eval("1");\n', encoding='utf-8')
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert (layer1['checked'], layer1['passed'], layer1['failed'], layer1['pass_rate']) == (3, 2, 1, 0.6667)
+    assert layer1['findings'] == 1
+    assert layer1['not_analyzed'] == [
+        {'path': 'app.ts', 'reason': 'size limit (too_large; exceeds 2 MiB)'}
+    ]
+
+
+@pytest.mark.parametrize('limit_mib', [1, 2])
+def test_card_size_reason_tracks_the_native_source_limit(tmp_path, monkeypatch, limit_mib):
+    from aegis_core.ast import runner as ast_runner
+
+    source(tmp_path, 2 * 1024 * 1024 + 1)
+    rule(tmp_path)
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', limit_mib * 1024 * 1024)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert layer1['not_analyzed'] == [
+        {'path': 'app.ts', 'reason': f'size limit (too_large; exceeds {limit_mib} MiB)'}
+    ]
+    assert layer1['checks_that_could_not_run'] == [
+        f'ast_unverified: unverified too_large: app.ts exceeds {limit_mib} MiB; '
+        'use target_paths to exclude generated bundles (aegis doctor)'
+    ]
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+@pytest.mark.parametrize('with_rule', [False, True])
+def test_card_reports_the_extractor_cap_when_the_runner_allows_more(tmp_path, monkeypatch, extension, with_rule):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    producer = extractor if extension == 'rs' else tokenizer
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+    target = source(tmp_path, 129, extension)
+    if with_rule:
+        rule(tmp_path, extension)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert (layer1['passed'], layer1['failed'], layer1['findings']) == (1, 0, 0)
+    assert layer1['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+    assert all('exceeds 0.00012207 MiB' in detail for detail in layer1['checks_that_could_not_run'])
+    assert layer1['checks_that_could_not_run']
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_card_retains_the_limit_from_the_refusal_even_if_configuration_changes(tmp_path, monkeypatch, extension):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers import js, rust
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    producer = extractor if extension == 'rs' else tokenizer
+    parser = rust if extension == 'rs' else js
+    parse = parser.parse
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+
+    def refuse_then_reconfigure(*args, **kwargs):
+        try:
+            return parse(*args, **kwargs)
+        except ASTDriverError:
+            monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 256)
+            raise
+
+    monkeypatch.setattr(parser, 'parse', refuse_then_reconfigure)
+    target = source(tmp_path, 129, extension)
+    layer1 = card.build(tmp_path).as_dict()['layer1']
+    assert producer.MAX_SOURCE_BYTES == 256
+    assert layer1['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+    assert layer1['checks_that_could_not_run'] == [
+        f'ast_unverified: unverified too_large: {target.name} exceeds 0.00012207 MiB; '
+        'use target_paths to exclude generated bundles (aegis doctor)'
+    ]
+
+
+def test_limit_words_in_the_filename_cannot_supply_the_reported_limit(tmp_path, monkeypatch):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(tokenizer, 'MAX_SOURCE_BYTES', 128)
+    target = tmp_path / 'app exceeds 9 MiB; fake.ts'
+    source(tmp_path, 129).rename(target)
+    assert card.build(tmp_path).as_dict()['layer1']['not_analyzed'] == [
+        {'path': target.name, 'reason': 'size limit (too_large; exceeds 0.00012207 MiB)'}
+    ]
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_security_pack_keeps_its_json_fields_while_carrying_the_refusing_limit(tmp_path, monkeypatch, extension):
+    from aegis_core.ast import runner as ast_runner
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 256)
+    monkeypatch.setattr(extractor if extension == 'rs' else tokenizer, 'MAX_SOURCE_BYTES', 128)
+    target = source(tmp_path, 129, extension)
+    limits = {}
+    pack = security_pack.evaluate_security_pack(tmp_path, [target.name], {}, size_limits=limits)
+    assert limits == {target.name: 128}
+    assert pack == {
+        'passed': True, 'violations': [], 'exempted_test_findings': [],
+        'unverified_findings': [{
+            'rule_id': '', 'file': target.name, 'line': 0, 'kind': 'file',
+            'status': 'unverified', 'reason': 'too_large', 'severity': 'high',
+        }],
+    }
+
+
+@pytest.mark.parametrize('entry', ['enforce_source_size', 'parse_file'])
+def test_runner_size_error_message_tracks_the_applied_limit(tmp_path, monkeypatch, entry):
+    from aegis_core.ast import runner as ast_runner
+
+    monkeypatch.setattr(ast_runner, 'SOURCE_LIMIT_BYTES', 128)
+    target = source(tmp_path, 129)
+    with pytest.raises(ASTDriverError, match='exceeds 0.00012207 MiB') as error:
+        if entry == 'enforce_source_size':
+            ast_runner.enforce_source_size(target)
+        else:
+            ASTDriverRunner().parse_file(target, workspace_root=tmp_path)
+    assert error.value.reason == 'too_large'
+
+
+def test_rust_size_error_message_tracks_the_extractor_limit(monkeypatch):
+    from aegis_core.ast.drivers.rust import extractor
+
+    monkeypatch.setattr(extractor, 'MAX_SOURCE_BYTES', 128)
+    with pytest.raises(ASTDriverError, match='exceeds 0.00012207 MiB') as error:
+        extractor.parse(' ' * 129, 'virtual.rs')
+    assert error.value.reason == 'too_large'
+
+
+@pytest.mark.parametrize('extension', ['rs', 'ts'])
+def test_extractors_refuse_oversized_text_before_encoding(monkeypatch, extension):
+    from aegis_core.ast.drivers.js import tokenizer
+    from aegis_core.ast.drivers.rust import extractor
+
+    class UnencodableOversize(str):
+        def encode(self, *args, **kwargs):
+            raise AssertionError('oversized source must be refused before allocation')
+
+    producer = extractor if extension == 'rs' else tokenizer
+    monkeypatch.setattr(producer, 'MAX_SOURCE_BYTES', 128)
+    parse = extractor.parse if extension == 'rs' else tokenizer.tokenize
+    with pytest.raises(ASTDriverError) as error:
+        parse(UnencodableOversize(' ' * 129), 'virtual.' + extension)
+    assert error.value.reason == 'too_large'
 
 
 def test_native_lexical_error_still_blocks(tmp_path):

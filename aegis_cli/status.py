@@ -37,7 +37,7 @@ def _project_root(args: argparse.Namespace) -> Path:
 
 
 def _parse_frontmatter(filepath: str) -> dict:
-    """Extract YAML frontmatter from a cell file using the canonical parser.
+    """Extract YAML frontmatter from a rule file using the canonical parser.
 
     Falls back to empty dict on any error.
     """
@@ -48,49 +48,46 @@ def _parse_frontmatter(filepath: str) -> dict:
         return {}
 
 
+def _today() -> date:
+    """The calendar clock, kept separate from date parsing."""
+    return date.today()
+
+
 def _parse_created_date(created_val) -> date | None:
-    """Parse a created date from frontmatter."""
-    if created_val is None:
+    """Parse string date metadata; other YAML values are unparseable."""
+    if not isinstance(created_val, str):
         return None
-    if isinstance(created_val, datetime):
-        return created_val.date()
-    if isinstance(created_val, date):
-        return created_val
-    if isinstance(created_val, (int, float)):
-        try:
-            return datetime.fromtimestamp(created_val).date()
-        except Exception:
-            return None
-    if isinstance(created_val, str):
-        s = created_val.strip().rstrip("Z")
-        try:
-            return date.fromisoformat(s[:10])
-        except Exception:
-            pass
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d").date()
-        except Exception:
-            pass
+    s = created_val.strip().rstrip("Z")
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        pass
     return None
 
 
 def _format_adaptive_expiry(created_val, expiry_days_val) -> str:
-    """Calculate remaining days for an adaptive rule."""
+    """Format calendar metadata, not whether the rule service has retired a rule."""
     if expiry_days_val is None or created_val is None:
+        return "—"
+    if isinstance(expiry_days_val, bool) or not isinstance(expiry_days_val, (int, str)):
+        return "—"
+    if isinstance(expiry_days_val, str) and not expiry_days_val.isdecimal():
         return "—"
     try:
         expiry_days = int(expiry_days_val)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        return "—"
+    if expiry_days < 0:
         return "—"
 
     created_date = _parse_created_date(created_val)
     if created_date is None:
         return "—"
 
-    days_elapsed = (date.today() - created_date).days
+    days_elapsed = (_today() - created_date).days
     remaining_days = expiry_days - days_elapsed
     if remaining_days < 0:
-        return "expired"
+        return f"overdue ({-remaining_days}d)"
     return f"{remaining_days}d"
 
 
@@ -128,6 +125,10 @@ class _StatusModel(NamedTuple):
     derived: Optional[Dict[str, Any]]
     stale: List[Dict[str, Any]]
     insights: Dict[str, Any]
+    effective: Dict[str, Any]
+    served: List[Any]
+    policy_notes: Dict[str, Any]
+    policy_error: Optional[str]
 
 
 def run_status(args: argparse.Namespace) -> int:
@@ -140,15 +141,15 @@ def run_status(args: argparse.Namespace) -> int:
     # Host-installed instruction rules ("core") list first, then the rule types in table order.
     _type_order = {"core": 0, **{name: spec.display_order for name, spec in RULE_TYPES.items()}}
 
-    core_rules, core_chars = _core_entries(model.core_files, model.view, model.proj_credits)
-    adaptive_rules, adaptive_chars = _adaptive_entries(model.loaded, model.fits)
+    core_rules = _core_entries(model.core_files, model.view, model.proj_credits)
+    adaptive_rules = _adaptive_entries(model.loaded, model.fits, model.effective)
+    total_chars = sum(len(rule.raw.decode("utf-8-sig", "replace")) for rule in model.served)
     all_rules = core_rules + adaptive_rules
-    total_chars = core_chars + adaptive_chars
-    problems = _status_problems(model.ruleset, model.stale)
+    problems = _status_problems(model.ruleset, model.stale, model.effective)
     ledger_health = model.view.health()
-    rc = 1 if (problems["rule_errors"] or model.inventory_error) else 0
+    rc = 1 if (problems["rule_errors"] or model.inventory_error or model.policy_error) else 0
 
-    # Context load: total characters / 4
+    # Context load: only characters of rules the service serves, before JIT selection.
     estimated_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
 
     # Sort rules grouped by modern type, then triggers descending, fitness descending, name
@@ -192,6 +193,35 @@ def _gather_status(root: Path, proj: Path) -> _StatusModel:
     except RuleInventoryError as exc:
         inventory_error = str(exc)
         ruleset = RuleSet(())
+    from aegis_core import rule_integrity
+
+    effective_rules = RuleSet(())
+    policy_error = None
+    policy_notes: Dict[str, Any] = {}
+    if inventory_error is None:
+        try:
+            policy = rule_integrity.effective(proj)
+        except RuleInventoryError as exc:
+            inventory_error = _policy_text(exc)
+        except rule_integrity.IntegrityError as exc:
+            policy_error = _policy_text(
+                f"the reviewed (base) version of the rules cannot be read, so none is served: {exc}"
+            )
+        else:
+            policy_notes = _integrity_notes(policy)
+            # Scan refuses the entire policy on a rule error, never a partial set.
+            if not policy.ruleset.errors:
+                effective_rules = policy.ruleset
+            else:
+                errors = policy.ruleset.errors
+                listed = "; ".join(f"{r.path}: {r.error or ''}" for r in errors[:5])
+                more = f" (and {len(errors) - 5} more)" if len(errors) > 5 else ""
+                policy_error = _policy_text(
+                    f"{len(errors)} rule file(s) cannot be served, so no partial rule set is returned: "
+                    f"{listed}{more}. Fix or move them; `aegis status` lists them."
+                )
+    effective = {r.id: r for r in effective_rules.rules if r.ok}
+    served = [r for r in effective_rules.served if r.target_paths]
     from aegis_core.telemetry_engine import ledger
 
     # One ledger read for every per-rule number below; what it could not use is shown.
@@ -211,7 +241,36 @@ def _gather_status(root: Path, proj: Path) -> _StatusModel:
     # The user-scope insights log, read once and offline; nothing when there is none.
     insights = insight_status(proj)
     return _StatusModel(core_files, ruleset, inventory_error, view, claimed, proj_credits, blocked_cmds, loaded,
-                        fits, derived, stale, insights)
+                        fits, derived, stale, insights, effective, served, policy_notes, policy_error)
+
+
+def _policy_text(value: object, max_len: int = 1024) -> str:
+    """Canonicalize, redact, then truncate new policy diagnostics in either view."""
+    from aegis_core.redaction import redact_command_secrets
+
+    text = sanitize_display(value, max_len=None)
+    return sanitize_display(redact_command_secrets(text), max_len=max_len)
+
+
+def _integrity_notes(policy: Any) -> Dict[str, Any]:
+    """Scan's base witness and unreviewed counts, without any rule text."""
+    from dataclasses import asdict
+
+    if policy.anchor is None:
+        return {}
+    notes: Dict[str, Any] = {"rules_base": {
+        k: _policy_text(v) if isinstance(v, str) else v for k, v in asdict(policy.anchor).items()
+    }}
+    if policy.unreviewed:
+        # Integrity normalizes identities before returning them. No spelling can
+        # prove the original was safe, so never read or display an ID or title.
+        notes["unreviewed_counts"] = {
+            state: sum(item.change == state for item in policy.unreviewed)
+            for state in ("new", "changed", "broken", "removed")
+        }
+        notes["unreviewed_total"] = len(policy.unreviewed)
+        notes["next_action"] = "Review rule changes with `aegis check --ci`."
+    return notes
 
 
 def _core_fitness(totals: Dict[str, Any], proj_credits: Any, *names: str) -> Tuple[int, Optional[float]]:
@@ -222,21 +281,15 @@ def _core_fitness(totals: Dict[str, Any], proj_credits: Any, *names: str) -> Tup
     return fit.triggers, fit.reported_score
 
 
-def _core_entries(core_files: List[Path], view: Any, proj_credits: Any) -> Tuple[List[dict], int]:
-    """The core rules' table entries, and their characters for the context load."""
+def _core_entries(core_files: List[Path], view: Any, proj_credits: Any) -> List[dict]:
+    """Shipped guidance is shown, but never contributes to served context load."""
     # 3. Ledger totals of the host-installed rules (they have no rule file here)
     from aegis_core.fitness import combined_totals
 
     totals = combined_totals(view, proj_credits)
-    total_chars = 0
     all_rules: list[dict] = []
 
     for f in core_files:
-        try:
-            content = f.read_text(encoding="utf-8-sig")
-        except Exception:
-            content = ""
-        total_chars += len(content)
         fm = _parse_frontmatter(str(f))
         rule_name = sanitize_display(str(fm.get("id") or f.stem))
         triggers, score = _core_fitness(totals, proj_credits, rule_name, f.stem)
@@ -247,17 +300,27 @@ def _core_entries(core_files: List[Path], view: Any, proj_credits: Any) -> Tuple
             "triggers": triggers,
             "expiry": "∞ (core)",
             "is_core": True,
+            "service_state": "not_loaded",
+            "calendar_expiry": "∞ (core)",
         })
-    return all_rules, total_chars
+    return all_rules
 
 
-def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any]) -> Tuple[List[dict], int]:
-    """The workspace rules' table entries, and their characters for the context load."""
-    total_chars = 0
+def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any], effective: Dict[str, Any]) -> List[dict]:
+    """The working inventory, with service state from scan's effective policy."""
     all_rules: list[dict] = []
     for rule in loaded:
-        total_chars += len(rule.raw.decode("utf-8-sig", "replace"))
         fit = fits[rule.id]
+        active = effective.get(rule.id)
+        if active is None:
+            service_state = "not_loaded"
+        elif active.expired:
+            service_state = "retired"
+        elif active.target_paths:
+            service_state = "served"
+        else:
+            service_state = "untargeted"
+        calendar_expiry = _format_adaptive_expiry(rule.meta.get("created"), rule.meta.get("expiry_days"))
         all_rules.append({
             "name": sanitize_display(rule.id),
             "type": rule.type,
@@ -270,30 +333,42 @@ def _adaptive_entries(loaded: List[Any], fits: Dict[str, Any]) -> Tuple[List[dic
             "override_rate": fit.override_rate,
             "flagged_for_review": fit.flagged_for_review,
             "triggers": fit.triggers,
-            "expiry": "expired" if rule.expired else _format_adaptive_expiry(
-                rule.meta.get("created"), rule.meta.get("expiry_days")),
+            # The existing key uses retirement wording only for retired rules.
+            "expiry": "expired" if service_state == "retired" else calendar_expiry,
             "is_core": False,
+            "service_state": service_state,
+            "calendar_expiry": calendar_expiry,
         })
-    return all_rules, total_chars
+    return all_rules
 
 
-def _status_problems(ruleset: Any, stale: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _status_problems(ruleset: Any, stale: List[Dict[str, Any]], effective: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "rule_errors": [{"path": r.path, "error": r.error} for r in ruleset.errors],
         "ignored": [{"path": i.path, "reason": i.reason} for i in ruleset.ignored],
         "stale_rules": stale,
         "needs_migrate": [{"path": r.path, "keys": list(r.legacy_keys)} for r in ruleset.needs_migrate],
-        "untargeted": [{"id": r.id, "path": r.path} for r in sorted(ruleset.served, key=lambda r: r.id)
-                       if not r.target_paths],
+        "untargeted": [{"id": r.id, "path": r.path} for r in sorted(effective.values(), key=lambda r: r.id)
+                       if r.served and not r.target_paths],
     }
+
+
+def _rule_counts(model: _StatusModel, all_rules: List[dict]) -> Dict[str, int]:
+    """Separate what the service serves from everything shown in the inventory."""
+    counts = {"core_rules": 0, "adaptive_rules": len(model.served), "core_rules_shown": 0, "adaptive_rules_shown": 0}
+    for rule in all_rules:
+        key = "core_rules" if rule["is_core"] else "adaptive_rules"
+        counts[key + "_shown"] += 1
+    return counts
 
 
 def _status_payload(model: _StatusModel, all_rules: List[dict], estimated_tokens: int, ledger_health: Dict[str, Any],
                     problems: Dict[str, Any]) -> Dict[str, Any]:
-    """The JSON document, its keys in the order the view has always written them."""
+    """The JSON document, preserving existing key order before additive shown counts."""
+    counts = _rule_counts(model, all_rules)
     return {
-        "core_rules": len(model.core_files),
-        "adaptive_rules": len(model.loaded),
+        "core_rules": counts["core_rules"],
+        "adaptive_rules": counts["adaptive_rules"],
         "estimated_tokens": estimated_tokens,
         "rules": all_rules,
         "last_sync": model.derived.get("synced_at") if model.derived else None,
@@ -303,13 +378,17 @@ def _status_payload(model: _StatusModel, all_rules: List[dict], estimated_tokens
         "blocked_commands": model.blocked_cmds,
         "insights": model.insights,
         **problems,
+        "core_rules_shown": counts["core_rules_shown"],
+        "adaptive_rules_shown": counts["adaptive_rules_shown"],
+        **model.policy_notes,
+        **({"status": "FAIL", "error": model.policy_error} if model.policy_error else {}),
     }
 
 
 def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all_rules: List[dict],
                   estimated_tokens: int, problems: Dict[str, Any], rc: int) -> int:
     """The text view: only it reads the token budget and the terminal's output settings."""
-    core_files, loaded, derived, insights = model.core_files, model.loaded, model.derived, model.insights
+    core_files, derived, insights = model.core_files, model.derived, model.insights
     blocked_cmds, claimed, inventory_error, view = model.blocked_cmds, model.claimed, model.inventory_error, model.view
     from aegis_cli.ui.table import Table
     from aegis_cli.ui.theme import OutputContext
@@ -323,8 +402,14 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
 
     header_title = "🛡️ Aegis Workspace Status" if ui.emoji_enabled else "Aegis Workspace Status"
     print(f"{ui.style(header_title, 'bold', 'cyan')}\n")
-    print(f"  {'Core rules:':<16}{len(core_files)} active")
-    print(f"  {'Adaptive rules:':<16}{len(loaded)} (traps/patterns)")
+    counts = _rule_counts(model, all_rules)
+    if core_files:
+        core_summary = (f"{counts['core_rules_shown']} shown, {counts['core_rules']} served "
+                        "(shipped; not_loaded: scan and check do not read them)")
+    else:
+        core_summary = "listed only in the Aegis checkout (scan and check do not read them)"
+    print(f"  {'Core rules:':<16}{core_summary}")
+    print(f"  {'Adaptive rules:':<16}{counts['adaptive_rules_shown']} shown, {counts['adaptive_rules']} served")
     print(f"  {'Context load:':<16}~{estimated_tokens:,} tokens (pre-JIT max)")
     print(f"  {'Token budget:':<16}{ui.format_budget_bar(estimated_tokens, max_budget)}")
     print(f"  {'Last sync:':<16}{derived.get('synced_at') if derived else 'never (run aegis sync)'}\n")
@@ -339,10 +424,25 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
     if claimed["claimed"]:
         print(f"  {claimed['label']}: {claimed['claimed']} report(s) from {claimed['sessions']} session(s), "
               "no rule's evidence\n")
+    if model.policy_error:
+        print(f"  ❌ {model.policy_error}")
+    if model.policy_notes:
+        anchor = model.policy_notes["rules_base"]
+        print(f"  Rules base: {anchor['commit']} ({anchor['label']})")
+        if "unreviewed_total" in model.policy_notes:
+            total = model.policy_notes["unreviewed_total"]
+            counts = model.policy_notes["unreviewed_counts"]
+            print(f"  Unreviewed rules: {total} total (new: {counts['new']}, changed: {counts['changed']}, "
+                  f"broken: {counts['broken']}, removed: {counts['removed']})")
+            print(f"  Next action: {model.policy_notes['next_action']}")
+        print()
     _print_problems(inventory_error, problems, view.incomplete)
 
     if not all_rules:
-        print("  No rules found. Run 'aegis init' to set up governance rules.")
+        if model.served:
+            print("  No working-tree rules found; reviewed rules remain served.")
+        else:
+            print("  No rules found. Run 'aegis init' to set up governance rules.")
         return rc
 
     tbl = Table(ctx=ui)
@@ -350,7 +450,8 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
     tbl.add_column("Triggers", no_wrap=True)
     tbl.add_column("Type", no_wrap=True)
     tbl.add_column("Fitness", no_wrap=True)
-    tbl.add_column("Expiry", no_wrap=True)
+    tbl.add_column("Service state", no_wrap=True)
+    tbl.add_column("Calendar (meta)", no_wrap=True)
 
     last_type: str | None = None
     for r in all_rules:
@@ -373,7 +474,8 @@ def _print_status(args: argparse.Namespace, proj: Path, model: _StatusModel, all
             str(r["triggers"]),
             type_str,
             score_str,
-            str(r["expiry"]),
+            str(r["service_state"]),
+            str(r["calendar_expiry"]),
         )
 
     for line in tbl.render(ui).splitlines():
@@ -489,4 +591,3 @@ class StatusCommand(AegisCommand):
         if getattr(args, "compliance", False):
             return run_compliance(args)
         return run_status(args)
-

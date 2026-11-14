@@ -12,7 +12,7 @@ dispatcher sets; nothing compares them) and not proof that an agent is alive. Th
 backstops are the post-lane gate (``aegis check --lane``) and ``merge_metrics``.
 
 - ``claim`` validates the lane name and globs, refuses when a live lease of another lane
-  may overlap (``match.sets_overlap``; an unreadable lease counts as overlapping
+  may overlap (``team_paths.overlap``; an unreadable lease counts as overlapping
   everything), then writes create-only. A live lease of the same lane is ``taken``; an
   expired one is taken over by compare-and-swap with ``gen`` + 1 and a new
   ``claim_id`` (16 random hex characters, so no blob ever repeats). A lease that
@@ -30,8 +30,9 @@ backstops are the post-lane gate (``aegis check --lane``) and ``merge_metrics``.
 **Events.** The events log's kinds are fixed: every lease change writes a
 ``lease_claimed`` row whose ``result`` names it (claimed, taken_over, renewed,
 transferred, released, collected; a release or collection records the caller's label),
-and a refused claim writes ``lease_denied`` with ``reason`` overlap or taken. An event
-that cannot be written is a warning on the change, never a failure.
+and a refused claim writes ``lease_denied`` with ``reason`` overlap or taken. Queue
+receipts reuse ``lease_claimed`` with ``detail.queue`` true and are excluded from
+lease metrics. An event that cannot be written is a warning on the change, never a failure.
 
 **team.json** (committed, optional): ``{"v":1,"shared":[globs],"lanes":{"<lane>":[globs]}}``.
 ``shared`` globs may be changed by any lane; ``lanes`` are committed per-lane path sets.
@@ -44,7 +45,7 @@ a common path and whether ``git merge-tree`` reports a conflict.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 import getpass
 import json
 import os
@@ -57,11 +58,13 @@ import time
 import types
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from aegis_core import events, gitsafe
+from aegis_core import events, gitsafe, team_paths
 from aegis_core.config import MAX_CONFIG_BYTES, ConfigError, read_capped
 from aegis_core.errors import AegisError, AegisValidationError
-from aegis_core.match import normalize_path, sets_overlap
+from aegis_core.match import normalize_path, require_rule_glob
 from aegis_core.primitives import DuplicateKeyError, is_within, strict_loads, utc_stamp
+from aegis_core.team_metrics import TeamUsageError, event_counts, merge_metrics, repository_root
+from aegis_core.team_paths import glob_problem
 from aegis_core.workspace.layout import AEGIS_DIRNAME
 
 __all__ = [
@@ -133,7 +136,6 @@ _LEASE_KEYS = ("v", "lane", "role", "owner", "claim_id", "gen", "branch", "paths
 # The last second datetime can print (9999-12-31T23:59:59Z), less the longest lease.
 _MAX_TS = 253402300799 - MAX_TTL_S
 _CLAIM_ATTEMPTS = 3
-_SYNTHETIC_MERGE = re.compile(r"\Arefs/(?:remotes/)?pull/[^/]+/merge\Z")
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -150,11 +152,6 @@ class TeamFileError(ConfigError):
         return (type(self), (self.reason,))
 
 
-class TeamUsageError(AegisValidationError):
-    """A lane name, glob, ttl, label, expected object id or base that cannot be used;
-    nothing was written."""
-
-
 class LeaseFormatError(AegisValidationError):
     """A lease blob that is not a v1 lease of the lane its ref names."""
 
@@ -165,20 +162,25 @@ class LeaseRefused(AegisError):
     ``reason``: ``overlap`` (``lanes`` names the live lanes in the way), ``taken`` (the
     lane holds a live or unreadable lease), ``stale`` (it holds something other than
     ``--expect``), ``absent`` (no lease), ``expired`` (a transfer of an expired lease) or
-    ``unreadable``. ``current`` is the object id the lane's ref holds (None when
+    ``unreadable`` or ``legacy_paths`` (renew/transfer require release and a new claim).
+    ``current`` is the object id the lane's ref holds (None when
     absent), ``lease`` the lease it names when readable. ``warnings`` says when the
     refusal's event could not be recorded.
     """
 
     def __init__(self, message: str, reason: str, lane: str, current: Optional[str] = None,
                  lease: Optional["Lease"] = None, lanes: Sequence[str] = (),
-                 warnings: Sequence[str] = ()) -> None:
+                 warnings: Sequence[str] = (), next_action: str = "") -> None:
+        if lease is not None:
+            recovery = team_paths.legacy_recovery(lease.path_set, lease.lane, lease.oid)
+            if recovery and not message.endswith(recovery):
+                message += recovery
         super().__init__(message, code="LEASE_REFUSED", reason=reason, lane=lane, current=current,
-                         lease=lease, lanes=tuple(lanes), warnings=tuple(warnings))
+                         lease=lease, lanes=tuple(lanes), warnings=tuple(warnings), next_action=next_action)
 
     def __reduce__(self):  # every field, so a refusal crosses a process boundary intact
         return (type(self), (self.message, self.reason, self.lane, self.current, self.lease, self.lanes,
-                             self.warnings))
+                             self.warnings, self.next_action))
 
 
 # ── team.json ────────────────────────────────────────────────────────────────
@@ -198,6 +200,7 @@ def _policy_globs(value: object, where: str) -> Tuple[str, ...]:
         raise TeamFileError(f"{where} must be a list of globs")
     out: List[str] = []
     for ordinal, glob in enumerate(value, 1):
+        require_rule_glob(glob)
         clean = normalize_path(glob) if isinstance(glob, str) else ""
         if not clean:
             raise TeamFileError(f"{where} glob {ordinal} must be a non-empty glob")
@@ -339,12 +342,22 @@ def lane_ref(lane: object) -> str:
 
 
 def _label_ok(value: object, spaces: bool = True) -> bool:
-    return (
-        isinstance(value, str)
-        and 1 <= len(value) <= LABEL_MAX
-        and _CONTROL.search(value) is None
-        and (spaces or not any(ch.isspace() for ch in value))
-    )
+    # Length is capped before encode so a hostile label cannot allocate an
+    # unbounded UTF-8 copy. Lone surrogates (POSIX argv surrogateescape) pass
+    # the control and space checks but are not UTF-8; the same probe as
+    # team_queue._text refuses them before any lease or queue state is written.
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= LABEL_MAX
+        or _CONTROL.search(value) is not None
+        or (not spaces and any(ch.isspace() for ch in value))
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
 
 
 def _check_label(value: object, what: str) -> str:
@@ -373,35 +386,11 @@ def default_owner() -> str:
     return label[:LABEL_MAX]
 
 
-def glob_problem(glob: object) -> Optional[str]:
-    if not isinstance(glob, str):
-        return "not_text"
-    if _CONTROL.search(glob):
-        return "control"
-    clean = normalize_path(glob)
-    if not clean:
-        return "empty"
-    if ".." in clean.split("/"):
-        return "climbs"
-    return None
-
-
-def _claim_paths(paths: object) -> Tuple[str, ...]:
-    if not isinstance(paths, (list, tuple)):  # a lone string is one glob's characters
-        raise TeamUsageError("paths: give a list of globs")
-    if not paths:
-        raise TeamUsageError("paths: give at least one glob")
-    out: List[str] = []
-    for ordinal, glob in enumerate(paths, 1):
-        problem = glob_problem(glob)
-        if problem:
-            message = {"not_text": "is not text", "control": "has a control character",
-                       "empty": "is empty", "climbs": "climbs out of the workspace with '..'"}[problem]
-            raise TeamUsageError(f"paths: glob {ordinal} {message}")
-        clean = normalize_path(glob)  # type: ignore[arg-type]
-        if clean not in out:
-            out.append(clean)
-    return tuple(out)
+def _claim_paths(paths: object) -> team_paths.PathSet:
+    try:
+        return team_paths.claim_paths(paths)
+    except team_paths.LeasePathError as exc:
+        raise TeamUsageError(str(exc)) from None
 
 
 def _ttl(value: object) -> int:
@@ -417,13 +406,6 @@ def _expect(value: object) -> str:
             "as claim, renew, transfer and list print it"
         )
     return value
-
-
-def _repository(root: Any) -> Path:
-    path = Path(os.fspath(root))
-    if gitsafe.common_dir(path) is None:
-        raise TeamUsageError("not in a git repository: aegis team keeps leases in git refs")
-    return path
 
 
 def _now(now: Optional[int]) -> int:
@@ -446,6 +428,13 @@ class Lease:
     ts: int
     ttl_s: int
     oid: str
+    parsed: InitVar[Optional[team_paths.PathSet]] = None
+    path_set: team_paths.PathSet = field(init=False, compare=False, repr=False)
+
+    def __post_init__(self, parsed: Optional[team_paths.PathSet]) -> None:
+        paths = parsed if parsed is not None else team_paths.stored_paths(self.paths)
+        object.__setattr__(self, "path_set", paths)
+        object.__setattr__(self, "paths", paths.raw)
 
     @property
     def expires_at(self) -> int:
@@ -502,16 +491,17 @@ def parse_lease(data: bytes, lane: str, oid: str) -> Lease:
         raise LeaseFormatError("gen is not a whole number from 1")
     if value["branch"] is not None and not _label_ok(value["branch"], spaces=False):
         raise LeaseFormatError("branch is not a label")
-    paths = value["paths"]
-    if not isinstance(paths, list) or not paths or any(glob_problem(g) for g in paths):
-        raise LeaseFormatError("paths is not a non-empty list of globs")
+    try:
+        paths = team_paths.stored_paths(value["paths"])
+    except team_paths.LeasePathError as exc:
+        raise LeaseFormatError(str(exc)) from None
     if not _whole(value["ts"], 0, _MAX_TS):
         raise LeaseFormatError("ts is not a whole number of epoch seconds")
     if not _whole(value["ttl_s"], 1, MAX_TTL_S):
         raise LeaseFormatError(f"ttl_s is not from 1 to {MAX_TTL_S}")
     return Lease(lane=lane, role=value["role"], owner=value["owner"], claim_id=value["claim_id"],
-                 gen=value["gen"], branch=value["branch"], paths=tuple(paths), ts=value["ts"],
-                 ttl_s=value["ttl_s"], oid=oid)
+                 gen=value["gen"], branch=value["branch"], paths=paths.raw, ts=value["ts"],
+                 ttl_s=value["ttl_s"], oid=oid, parsed=paths)
 
 
 @dataclass(frozen=True)
@@ -576,12 +566,12 @@ def _lease_at(root: Any, lane: str, oid: Optional[str]) -> Optional[Lease]:
         return None
 
 
-def _overlapping(found: LeaseSet, lane: str, paths: Sequence[str], now: int) -> Tuple[str, ...]:
+def _overlapping(found: LeaseSet, lane: str, paths: team_paths.PathSet, now: int) -> Tuple[str, ...]:
     """The other lanes a claim of ``paths`` may collide with: live leases whose paths may
     overlap, and every unreadable lease of a valid lane name (unsure means conflict)."""
     hits: Set[str] = {
         other.lane for other in found.leases
-        if other.lane != lane and not other.expired(now) and sets_overlap(other.paths, paths)
+        if other.lane != lane and not other.expired(now) and team_paths.overlap(other.path_set, paths)
     }
     hits.update(bad.lane for bad in found.unreadable if bad.lane != lane and valid_lane(bad.lane))
     return tuple(sorted(hits))
@@ -609,13 +599,13 @@ def lease_view(lease: Lease, now: int, overlaps: Iterable[str]) -> Dict[str, Any
 def describe(root: Any, now: Optional[int] = None) -> Dict[str, Any]:
     """Every lease's view (``overlaps``: the live lanes whose paths may intersect it) and
     every unreadable lane ref. Side-effect free."""
-    repo = _repository(root)
+    repo = repository_root(root)
     moment = _now(now)
     found = read_leases(repo)
     live = [lease for lease in found.leases if not lease.expired(moment)]
     views = [
         lease_view(lease, moment, sorted(
-            other.lane for other in live if other.lane != lease.lane and sets_overlap(other.paths, lease.paths)
+            other.lane for other in live if other.lane != lease.lane and team_paths.overlap(other.path_set, lease.path_set)
         ))
         for lease in found.leases
     ]
@@ -666,13 +656,13 @@ def _cas(root: Path, ref: str, new: Optional[str], old: Optional[str]) -> Tuple[
 
 
 def _write(root: Path, lane: str, role: str, owner: str, claim_id: str, gen: int, branch: Optional[str],
-           paths: Sequence[str], ts: int, ttl_s: int, old: Optional[str]) -> Tuple[bool, Optional[str], Lease]:
+           paths: team_paths.PathSet, ts: int, ttl_s: int, old: Optional[str]) -> Tuple[bool, Optional[str], Lease]:
     """Store the lease blob (its object id is known before the ref is touched), then CAS
     the lane's ref from ``old`` to it."""
-    data = _blob(lane, role, owner, claim_id, gen, branch, paths, ts, ttl_s)
+    data = _blob(lane, role, owner, claim_id, gen, branch, paths.raw, ts, ttl_s)
     oid = gitsafe.write_blob(root, data)
     lease = Lease(lane=lane, role=role, owner=owner, claim_id=claim_id, gen=gen, branch=branch,
-                  paths=tuple(paths), ts=ts, ttl_s=ttl_s, oid=oid)
+                  paths=paths.raw, ts=ts, ttl_s=ttl_s, oid=oid, parsed=paths)
     landed, holder = _cas(root, lane_ref(lane), oid, old)
     return landed, holder, lease
 
@@ -682,12 +672,16 @@ def _detail(lease: Lease, previous: Optional[str], **extra: Any) -> Dict[str, An
             "claim_id": lease.claim_id, "owner": lease.owner, "role": lease.role, **extra}
 
 
-def _refuse_overlap(root: Path, found: LeaseSet, lane: str, paths: Sequence[str], now: int) -> None:
+def _refuse_overlap(root: Path, found: LeaseSet, lane: str, paths: team_paths.PathSet, now: int,
+                    claiming: bool = False) -> None:
     lanes = _overlapping(found, lane, paths, now)
     if lanes:
         warnings = _record(root, "lease_denied", "refused", {"reason": "overlap", "lane": lane, "lanes": list(lanes)})
-        raise LeaseRefused(f"overlap: lane {lane} may overlap live lease(s) of {', '.join(lanes)}",
-                           "overlap", lane, lanes=lanes, warnings=warnings)
+        recovery = "".join(team_paths.legacy_recovery(other.path_set, other.lane, other.oid)
+                           for other in found.leases if other.lane == lane or other.lane in lanes)
+        raise LeaseRefused(f"overlap: lane {lane} may overlap live lease(s) of {', '.join(lanes)}{recovery}",
+                           "overlap", lane, lanes=lanes, warnings=warnings,
+                           next_action=team_paths.anchor_next_action(root, paths, found, lane, now) if claiming else "")
 
 
 def _taken(root: Path, lane: str, current: str, lease: Optional[Lease]) -> LeaseRefused:
@@ -714,6 +708,9 @@ def _expected(root: Path, found: LeaseSet, lane: str, expect: str) -> Lease:
             f"unreadable: lane {lane} holds {holder}, which is no readable lease; release it with --expect {holder}",
             "unreadable", lane, current=holder,
         )
+    if current.path_set.legacy:
+        raise LeaseRefused(f"legacy_paths: lane {lane} has legacy whitespace paths", "legacy_paths", lane,
+                           current=holder, lease=current)
     return current
 
 
@@ -727,11 +724,11 @@ def claim(root: Any, lane: str, paths: Sequence[str], role: Optional[str] = None
     label = _check_label(default_owner() if owner is None else owner, "owner")
     role = _check_label(DEFAULT_ROLE if role is None else role, "role")
     branch = _check_branch(branch)
-    repo = _repository(root)
+    repo = repository_root(root)
     moment = _now(now)
     for _ in range(_CLAIM_ATTEMPTS):
         found = read_leases(repo)
-        _refuse_overlap(repo, found, lane, globs, moment)
+        _refuse_overlap(repo, found, lane, globs, moment, claiming=True)
         current, bad = found.get(lane), found.unreadable_lane(lane)
         if bad is not None:
             raise _taken(repo, lane, bad.oid, None)
@@ -755,21 +752,21 @@ def renew(root: Any, lane: str, expect: str, ttl_s: Optional[int] = None, now: O
     """Renew ``lane``'s lease, which must be ``expect``: a live lease keeps its claim (gen
     + 1, ``ts`` now, ``ttl_s`` kept unless given); an expired one is re-claimed through
     the claim path (overlap check, new ``claim_id``). Raises TeamUsageError, LeaseRefused
-    (``absent``, ``stale``, ``unreadable``, ``overlap``) or GitError."""
+    (``absent``, ``stale``, ``unreadable``, ``legacy_paths``, ``overlap``) or GitError."""
     lane_ref(lane)
     expect = _expect(expect)
     ttl = None if ttl_s is None else _ttl(ttl_s)
-    repo = _repository(root)
+    repo = repository_root(root)
     moment = _now(now)
     found = read_leases(repo)
     current = _expected(repo, found, lane, expect)
     was_expired = current.expired(moment)
     claim_id = current.claim_id
     if was_expired:
-        _refuse_overlap(repo, found, lane, current.paths, moment)
+        _refuse_overlap(repo, found, lane, current.path_set, moment)
         claim_id = secrets.token_hex(8)
     landed, holder, lease = _write(repo, lane, current.role, current.owner, claim_id, current.gen + 1,
-                                   current.branch, current.paths, moment,
+                                   current.branch, current.path_set, moment,
                                    current.ttl_s if ttl is None else ttl, expect)
     if not landed:
         raise _stale(repo, lane, holder, expect)
@@ -781,13 +778,13 @@ def transfer(root: Any, lane: str, expect: str, owner: str, role: Optional[str] 
              now: Optional[int] = None) -> LeaseChange:
     """Give ``lane``'s live lease (which must be ``expect``) to ``owner`` (and ``role``),
     keeping its claim, paths and expiry; gen + 1. Raises TeamUsageError, LeaseRefused
-    (``absent``, ``stale``, ``unreadable``, ``expired``) or GitError."""
+    (``absent``, ``stale``, ``unreadable``, ``legacy_paths``, ``expired``) or GitError."""
     lane_ref(lane)
     expect = _expect(expect)
     owner = _check_label(owner, "owner")
     if role is not None:
         _check_label(role, "role")
-    repo = _repository(root)
+    repo = repository_root(root)
     moment = _now(now)
     current = _expected(repo, read_leases(repo), lane, expect)
     if current.expired(moment):
@@ -796,7 +793,7 @@ def transfer(root: Any, lane: str, expect: str, owner: str, role: Optional[str] 
             "expired", lane, current=current.oid, lease=current,
         )
     landed, holder, lease = _write(repo, lane, current.role if role is None else role, owner, current.claim_id,
-                                   current.gen + 1, current.branch, current.paths, current.ts, current.ttl_s,
+                                   current.gen + 1, current.branch, current.path_set, current.ts, current.ttl_s,
                                    expect)
     if not landed:
         raise _stale(repo, lane, holder, expect)
@@ -817,7 +814,7 @@ def release(root: Any, lane: str, expect: str, caller: Optional[str] = None) -> 
     ref = lane_ref(lane)
     expect = _expect(expect)
     label = _check_label(default_owner() if caller is None else caller, "caller")
-    repo = _repository(root)
+    repo = repository_root(root)
     current = gitsafe.read_ref(repo, ref)
     if current != expect:
         raise _stale(repo, lane, current, expect)
@@ -841,7 +838,7 @@ def gc(root: Any, now: Optional[int] = None, caller: Optional[str] = None) -> Gc
     """CAS-delete every expired lease; unreadable ones are left (their expiry is unknown;
     ``release`` takes them by oid). Each deletion records ``caller``."""
     label = _check_label(default_owner() if caller is None else caller, "caller")
-    repo = _repository(root)
+    repo = repository_root(root)
     moment = _now(now)
     found = read_leases(repo)
     collected: List[LeaseChange] = []
@@ -855,145 +852,3 @@ def gc(root: Any, now: Optional[int] = None, caller: Optional[str] = None) -> Gc
         else:
             kept.append((lease.lane, "changed after it was read"))
     return GcResult(tuple(collected), tuple(sorted(kept)))
-
-
-# ── Metrics ──────────────────────────────────────────────────────────────────
-
-_CLAIMS = ("claimed", "taken_over")
-
-
-def event_counts(root: Any) -> Dict[str, Any]:
-    """Lease events from the log: ``claims`` (claimed or taken over), ``denials`` and
-    their ``denials_by_reason``, every change ``by_result``, the distinct
-    ``lanes_claimed``, the ``first`` and ``last`` row times, and ``unusable_rows``
-    (torn, unparseable, another version, malformed). Reads only."""
-    found = events.read(root, ("lease_claimed", "lease_denied"))
-    by_result: Dict[str, int] = {}
-    by_reason: Dict[str, int] = {}
-    lanes: Set[str] = set()
-    stamps: List[str] = []
-    claims = denials = 0
-    for row in found.rows:
-        stamps.append(row["ts"])
-        detail = row["detail"]
-        if row["event"] == "lease_denied":
-            denials += 1
-            reason = detail.get("reason")
-            key = reason if isinstance(reason, str) else "unknown"
-            by_reason[key] = by_reason.get(key, 0) + 1
-            continue
-        result = row["result"]
-        by_result[result] = by_result.get(result, 0) + 1
-        if result in _CLAIMS:
-            claims += 1
-            if isinstance(detail.get("lane"), str):
-                lanes.add(detail["lane"])
-    return {
-        "claims": claims,
-        "denials": denials,
-        "denials_by_reason": dict(sorted(by_reason.items())),
-        "by_result": dict(sorted(by_result.items())),
-        "lanes_claimed": len(lanes),
-        "first": min(stamps) if stamps else None,
-        "last": max(stamps) if stamps else None,
-        "unusable_rows": found.skipped + int(found.torn_tail) + found.unknown_version + found.malformed,
-        "error": found.error,
-    }
-
-
-def _synthetic_merges(root: Path) -> Set[str]:
-    """Commits GitHub's ``refs/pull/<n>/merge`` (or actions/checkout's
-    ``refs/remotes/pull/<n>/merge``) name: trial merges, never part of a branch."""
-    found: Set[str] = set()
-    for prefix in ("refs/pull", "refs/remotes/pull"):
-        found.update(oid for name, oid in gitsafe.list_refs(root, prefix) if _SYNTHETIC_MERGE.match(name))
-    return found
-
-
-def _rev_list(root: Path, args: Sequence[str]) -> List[List[str]]:
-    res = gitsafe.run(["rev-list", *args], root)
-    if res.returncode != 0:
-        raise gitsafe.GitError(f"git rev-list failed in {root}")
-    return [line.split() for line in os.fsdecode(res.stdout).splitlines() if line.strip()]
-
-
-def _changed_paths(root: Path, base: str, side: str) -> Set[str]:
-    return {entry[3] for entry in gitsafe.diff_entries(root, base, side)}
-
-
-def _both_sides_changed(root: Path, parents: Sequence[str]) -> Optional[bool]:
-    """Whether the first parent and another parent both changed a path since their merge
-    base; None when they share no history."""
-    first = parents[0]
-    for other in parents[1:]:
-        base = gitsafe.merge_base(root, first, other)
-        if base is None:
-            return None
-        ours = _changed_paths(root, base, first)
-        if ours and ours & _changed_paths(root, base, other):
-            return True
-    return False
-
-
-def merge_metrics(root: Any, base: Optional[str] = None) -> Dict[str, Any]:
-    """Per first-parent merge on the current branch since ``base``, oldest first:
-    ``overlapping`` (both sides changed a common path since the merge base) and
-    ``conflicting`` (``git merge-tree --write-tree`` reports a conflict; None and
-    ``conflicting_merge: "unavailable"`` when git cannot say, as before 2.38). A merge
-    of unrelated histories has neither answer (both None) and counts in neither.
-
-    Without ``base`` the branch base is resolved as ``aegis check --lane`` resolves it
-    (``gitsafe.resolve_base_ref``); with none found, the whole first-parent history
-    counts. A HEAD that is GitHub's synthetic pull-request merge is replaced by the pull
-    request's head, and synthetic merges are never counted. Reads refs only (the trial
-    merges store unreferenced objects). Raises TeamUsageError for a base that names no
-    commit, GitError when git fails."""
-    repo = _repository(root)
-    if base is None:
-        base = gitsafe.resolve_base_ref(repo)
-    base_commit = None
-    if base is not None:
-        base_commit = gitsafe.resolve_commit(repo, base) if isinstance(base, str) else None
-        if not base_commit:
-            raise TeamUsageError(f"cannot resolve --base {base!r} to a commit")
-    head = gitsafe.head_commit(repo)
-    synthetic = _synthetic_merges(repo) if head is not None else set()
-    tip, synthetic_head, excluded = head, False, 0
-    if head is not None and head in synthetic:
-        parents = _rev_list(repo, ["--no-walk", "--parents", head])[0][1:]
-        if len(parents) >= 2:
-            tip, synthetic_head, excluded = parents[1], True, 1
-    merges: List[Dict[str, Any]] = []
-    unavailable: Optional[str] = None
-    if tip is not None:
-        args = ["--first-parent", "--merges", "--parents", "--reverse", tip]
-        if base_commit:
-            args.append(f"^{base_commit}")
-        for commit, *parents in _rev_list(repo, [*args, "--"]):
-            if commit in synthetic:
-                excluded += 1
-                continue
-            overlapping = _both_sides_changed(repo, parents)
-            conflicting: Optional[bool] = None
-            # Unrelated histories have no merge base, and merge-tree refuses to merge them.
-            if unavailable is None and overlapping is not None:
-                try:
-                    conflicting = any(gitsafe.merge_tree_conflicted(repo, parents[0], p) for p in parents[1:])
-                except gitsafe.MergeTreeUnavailable as exc:
-                    unavailable = str(exc)
-            merges.append({"commit": commit, "parents": parents, "overlapping": overlapping,
-                           "conflicting": conflicting})
-    if unavailable is not None:
-        for merge in merges:
-            merge["conflicting"] = None
-    return {
-        "range": {"base": base, "base_commit": base_commit, "head": head, "tip": tip,
-                  "synthetic_head": synthetic_head},
-        "count": len(merges),
-        "overlapping_merge": sum(1 for m in merges if m["overlapping"] is True),
-        "conflicting_merge": "unavailable" if unavailable is not None else sum(
-            1 for m in merges if m["conflicting"] is True),
-        "conflicting_unavailable": unavailable,
-        "excluded_synthetic": excluded,
-        "merges": merges,
-    }

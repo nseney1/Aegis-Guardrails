@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -16,6 +19,185 @@ from aegis_cli.doctor import (
     _check_zero_dependencies,
     run_doctor,
 )
+
+
+@pytest.mark.parametrize("drivers_only", [False, True])
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+def test_public_doctor_badges_respect_output_context(tmp_path, monkeypatch, capsys, drivers_only, plain, tty):
+    from aegis_cli.cli import main
+
+    monkeypatch.delenv("TERM", raising=False)
+    _governed(tmp_path)
+    (tmp_path / "app.go").write_bytes(b"package main\n")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    args = ["doctor", "--workspace", str(tmp_path)]
+    args += ["--drivers"] if drivers_only else []
+    args += ["--plain"] if plain else []
+    main(args)
+    output = capsys.readouterr().out
+    if plain or not tty:
+        assert "[WARN] AST drivers:" in output
+        assert not any(icon in output for icon in ("✅", "❌", "⚠", "ℹ", "➖", "❔"))
+    else:
+        assert "⚠️  AST drivers:" in output
+
+
+def test_plain_doctor_preserves_badges_in_repository_paths(tmp_path, capsys):
+    from aegis_cli.cli import main
+
+    root = tmp_path / "⚠️  caller ✅"
+    root.mkdir()
+    _governed(root)
+    assert main(["doctor", "--drivers", "--plain", "--workspace", str(root)]) == 0
+    output = capsys.readouterr().out
+    assert str(root) in output
+    assert "[PASS] AST drivers:" in output
+
+
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+@pytest.mark.parametrize("hint_kind", ["not-installed", "already-on-path", "inactive-venv", "missing-directory"])
+def test_public_doctor_path_hints_respect_output_context(tmp_path, monkeypatch, capsys, real_lookup,
+                                                        plain, tty, hint_kind):
+    from types import SimpleNamespace
+    from aegis_cli import pathcheck
+    from aegis_cli.cli import main
+    from aegis_cli.ui.theme import OutputContext
+
+    root = _governed(tmp_path / "project")
+    prefix = tmp_path / "caller ℹ️ ✅"
+    programs = prefix / "bin"
+    programs.mkdir(parents=True)
+    if hint_kind != "not-installed":
+        _stub(programs, "aegis")
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("TERM", raising=False)
+    # Installation metadata and interpreter state are the OS boundaries here.
+    monkeypatch.setattr(pathcheck, "sysconfig", SimpleNamespace(get_path=lambda *args: str(programs)))
+    if hint_kind == "inactive-venv":
+        monkeypatch.setattr(pathcheck, "sys", SimpleNamespace(**{**vars(sys), "prefix": str(prefix)}))
+    if hint_kind == "already-on-path":
+        # The shell's installed-directory snapshot is stale; doctor's actual PATH stays empty.
+        monkeypatch.setattr(pathcheck, "os", SimpleNamespace(**{
+            **vars(os), "environ": {**os.environ, "PATH": str(programs)},
+        }))
+        monkeypatch.setattr(pathcheck, "pathlookup", SimpleNamespace(which=lambda *args, **kwargs: None))
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    assert main(["doctor", "--workspace", str(root), *(["--plain"] if plain else [])]) == 1
+    output = capsys.readouterr().out
+    message = {
+        "not-installed": "is not installed for this Python",
+        "already-on-path": "which is already on PATH",
+        "inactive-venv": "is installed in the virtual environment",
+        "missing-directory": "which is not on your",
+    }[hint_kind]
+    line = next(line.strip() for line in output.splitlines() if message in line)
+    assert line.startswith("[INFO] " if plain or not tty else "ℹ️  ")
+    if plain or not tty:
+        assert not any(line.lstrip().startswith("ℹ️") for line in output.splitlines())
+    if hint_kind != "not-installed":
+        assert str(prefix) in output
+    legacy = pathcheck.build_hint()
+    assert pathcheck.build_hint(ui=OutputContext(emoji_enabled=True)) == legacy
+    assert pathcheck.build_hint(ui=OutputContext(plain=True)).splitlines()[1:] == legacy.splitlines()[1:]
+
+
+def _new_diagnostic_repository(tmp_path):
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is required for CI workflow diagnostics")
+    root = _governed(tmp_path / "caller ⚠️ ✅")
+    # An empty, newly initialized repository suffices: no checkout history is read.
+    subprocess.run([git, "init", str(root)], check=True, capture_output=True, timeout=10)
+    return root
+
+
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+@pytest.mark.parametrize("repair_status", [None, "applied", "skipped", "failed"])
+def test_public_doctor_renderer_paths(tmp_path, isolated_hosts, monkeypatch, capsys, plain, tty, repair_status):
+    from aegis_cli.cli import main
+
+    monkeypatch.delenv("TERM", raising=False)
+    root = _new_diagnostic_repository(tmp_path)
+    (isolated_hosts / ".aegis" / "rules").mkdir(parents=True)
+    instructions = root / "CLAUDE.md"
+    retained = "@AGENTS.md\nCaller notes ✅ ⚠️\n"
+    instructions.write_text(retained + "<!-- AEGIS:START -->\nold rules\n<!-- AEGIS:END -->\n", encoding="utf-8")
+    if repair_status == "failed":
+        (isolated_hosts / ".aegis" / "backups").write_text("not a directory", encoding="utf-8")
+    if repair_status == "skipped":
+        class ChangedDuringConfirmation(io.StringIO):
+            def isatty(self):
+                return True
+
+            def readline(self, *args, **kwargs):
+                instructions.write_text(retained + "Concurrent caller edit\n", encoding="utf-8")
+                return super().readline(*args, **kwargs)
+
+        monkeypatch.setattr(sys, "stdin", ChangedDuringConfirmation("y\n"))
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    args = ["doctor", "--workspace", str(root)]
+    args += ["--plain"] if plain else []
+    if repair_status:
+        args += ["--fix"] if repair_status == "skipped" else ["--fix", "--yes"]
+    rc = main(args)
+    output = capsys.readouterr().out
+    assert rc == (1 if repair_status in ("skipped", "failed") else 0)
+    assert str(root) in output
+    plain_output = plain or not tty
+    host_badge = "[INFO]" if plain_output else "➖"
+    warning = "[WARN]" if plain_output else "⚠️"
+    info = "[INFO]" if plain_output else "ℹ️"
+    assert any(host_badge in line and "missing_binary" in line for line in output.splitlines())
+    assert any(warning in line and "legacy Aegis rules block" in line for line in output.splitlines())
+    assert any(info in line and "is empty;" in line for line in output.splitlines())
+    assert any(warning in line and "is missing at HEAD" in line for line in output.splitlines())
+    if repair_status:
+        status_badge = {"applied": ("[PASS]", "✅"), "skipped": ("[WARN]", "⚠️"), "failed": ("[FAIL]", "❌")}
+        badge = status_badge[repair_status][0 if plain_output else 1]
+        assert any(badge in line and str(instructions) in line for line in output.splitlines())
+        if repair_status == "applied":
+            assert instructions.read_text(encoding="utf-8") == retained
+        elif repair_status == "skipped":
+            assert "it changed since the check; re-run aegis doctor" in output
+        else:
+            assert "no backup could be made" in output
+    if plain_output:
+        assert not any(icon in output.replace(str(root), "") for icon in ("✅", "❌", "⚠", "ℹ", "➖", "❔"))
+
+
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+def test_public_github_ci_warning_respects_output_context(tmp_path, monkeypatch, capsys, plain, tty):
+    from aegis_cli.cli import main
+
+    monkeypatch.delenv("TERM", raising=False)
+    root = _new_diagnostic_repository(tmp_path)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    args = ["doctor", "--github", "--workspace", str(root), *(["--plain"] if plain else [])]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    badge = "[WARN]" if plain or not tty else "⚠️"
+    assert any(badge in line and "is missing at HEAD" in line for line in output.splitlines())
+    if plain or not tty:
+        assert "⚠️" not in output
+
+
+@pytest.mark.parametrize("plain, tty", [(True, True), (False, False), (False, True)])
+def test_public_driver_repair_result_respects_output_context(tmp_path, monkeypatch, capsys, plain, tty):
+    from aegis_cli.cli import main
+
+    monkeypatch.delenv("TERM", raising=False)
+    root = _governed(tmp_path / "caller ⚠️ ✅")
+    (root / "app.go").write_text("package main\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "")  # provisioning works; no Go compiler is started
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+    args = ["doctor", "--drivers", "--fix", "--yes", "--workspace", str(root)]
+    assert main(args + (["--plain"] if plain else [])) == 1  # Go remains unavailable
+    output = capsys.readouterr().out
+    badge = "[PASS]" if plain or not tty else "✅"
+    assert any(badge in line and str(root / ".aegis" / "config.json") in line for line in output.splitlines())
+    assert "go" in json.loads((root / ".aegis" / "config.json").read_text(encoding="utf-8"))["ast"]["packaged_drivers"]
+    if plain or not tty:
+        assert not any(icon in output.replace(str(root), "") for icon in ("✅", "⚠", "❌", "ℹ"))
 
 
 @pytest.fixture(autouse=True)
@@ -146,18 +328,18 @@ def test_cli_check_prints_zsh_remedy_when_unresolvable(tmp_path, monkeypatch, ca
     assert "-m aegis_cli" not in out
 
 
-def test_cli_check_never_says_aegis_is_where_only_a_v3_soma_script_is(tmp_path, monkeypatch, capsys,
+def test_cli_check_never_says_aegis_is_where_only_an_unrelated_script_is(tmp_path, monkeypatch, capsys,
                                                                       real_lookup):
     bindir = tmp_path / ".local" / "bin"
     bindir.mkdir(parents=True)
-    (bindir / "soma").write_text("#!/bin/sh\n")
+    (bindir / "foreign-tool").write_text("#!/bin/sh\n")
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.setattr("aegis_cli.pathcheck.default_candidates", lambda: [str(bindir)])
     assert _check_cli_resolvable(tmp_path / "ws") is False
     out = capsys.readouterr().out
     assert "The 'aegis' command is not installed" in out
     assert "pip install aegis-guardrails" in out
-    assert str(bindir) not in out and "soma" not in out
+    assert str(bindir) not in out and "foreign-tool" not in out
 
 
 def test_cli_check_silent_remedy_when_resolvable(tmp_path, monkeypatch, capsys, real_lookup):
@@ -352,19 +534,20 @@ def test_run_doctor_without_fix_flag_does_not_provision(tmp_path, monkeypatch, c
     assert "native JavaScript/TypeScript (in-process)" in out
 
 
-
 def test_run_doctor_drivers_flag(tmp_path):
     # The check only reports; provisioning goes through the backed-up --fix plan.
     with patch("aegis_cli.doctor._check_ast_drivers") as mock_check:
         mock_check.return_value = True
         args = argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=False)
         assert run_doctor(args) == 0
-        mock_check.assert_called_with(tmp_path)
+        assert mock_check.call_args.args[0] == tmp_path
+        assert mock_check.call_args.args[2] is True
 
         mock_check.return_value = False
         args_fail = argparse.Namespace(drivers=True, workspace=str(tmp_path), fix=True, yes=True)
         assert run_doctor(args_fail) == 1
-        mock_check.assert_called_with(tmp_path)
+        assert mock_check.call_args.args[0] == tmp_path
+        assert mock_check.call_args.args[2] is True
 
 
 def test_drivers_fix_provisions_after_a_backup(tmp_path, isolated_hosts, capsys, monkeypatch):
@@ -448,7 +631,7 @@ def test_check_precommit_hook_all_branches(tmp_path, capsys):
     assert "Pre-commit hook uses an old block" in capsys.readouterr().out
 
     # 3. Old hook format
-    hook_file.write_text("#!/bin/sh\n# >>> aegis pre-commit >>>\nsoma checkpoint --pre-commit\n# <<< aegis pre-commit <<<\n", encoding="utf-8")
+    hook_file.write_text("#!/bin/sh\n# >>> aegis pre-commit >>>\naegis checkpoint --pre-commit\n# <<< aegis pre-commit <<<\n", encoding="utf-8")
     assert _check_precommit_hook(tmp_path) is False
     assert "Pre-commit hook uses an old block" in capsys.readouterr().out
 
@@ -480,7 +663,6 @@ def test_doctor_json_mode_and_warning_counts(tmp_path, monkeypatch, capsys):
     assert "warnings" in payload["summary"]
     assert payload["summary"]["failed"] == 0
     assert {c["id"] for c in payload["checks"]} >= {"python_version", "rules", "cli_on_path"}
-
 
 
 def test_doctor_fix_refuses_a_symlinked_config_without_crashing(tmp_path, capsys):

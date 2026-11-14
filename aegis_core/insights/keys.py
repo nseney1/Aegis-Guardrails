@@ -16,7 +16,7 @@ from aegis_core import gitsafe, storage
 from aegis_core.errors import PathTraversalError
 from aegis_core.primitives import real_key
 from aegis_core.storage import append_jsonl, read_jsonl, workspace_relative
-from aegis_core.workspace.binding import bounded_walk_up
+from aegis_core.workspace.binding import bounded_walk_up, git_discovery_paths
 from aegis_core.workspace.layout import UserLayout
 
 __all__ = [
@@ -118,7 +118,12 @@ def read_link_key(home: Optional[Path] = None) -> Optional[bytes]:
         return None
     try:
         fd = os.open(str(layout.aegis_dir / "link.key"), os.O_RDONLY | _O_FLAGS)
-        with os.fdopen(fd, "rb") as fh:
+        try:
+            fh = os.fdopen(fd, "rb")
+        except OSError:
+            os.close(fd)
+            raise
+        with fh:
             data = fh.read(KEY_SIZE + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
     except OSError:
         return None
@@ -153,7 +158,7 @@ def _ensure_hs(host: str, session: Optional[str], home: Optional[Path] = None) -
 
 def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
     cur = Path(os.path.realpath(root))
-    for cand in (cur, *cur.parents):
+    for cand in git_discovery_paths(cur):
         dot_git = cand / ".git"
         st = _lstat_or_none(dot_git)
         if not st:
@@ -180,6 +185,7 @@ def _fast_git_common_and_top(root: Path) -> Optional[Tuple[Path, Path]]:
 
 
 def insight_workspace_id(workspace: Any) -> str:
+    # The identity follows Git discovery, including the operator's ceiling environment.
     # Keyed to the governed root (the nearest .aegis inside the git boundary), so a hook
     # running in a subdirectory and `review` at the root share one file.
     root = Path(os.fspath(workspace)).resolve()
@@ -194,7 +200,17 @@ def insight_workspace_id(workspace: Any) -> str:
             rel = "."
         canon = f"{Path(os.path.realpath(common)).as_posix()}\x00{rel}"
     else:
-        c_fb = gitsafe.common_dir(root)
+        # Explicit layouts bypass ceilings, retaining ancestor validation.
+        top_fb = gitsafe.toplevel(root)
+        if top_fb is not None:
+            try:
+                top_fb = top_fb.resolve()
+            except (OSError, RuntimeError, ValueError):
+                top_fb = None
+        explicit = "GIT_DIR" in os.environ or "GIT_WORK_TREE" in os.environ
+        permitted = (top_fb is not None and (top_fb == root or top_fb in root.parents)
+                     and (explicit or top_fb in git_discovery_paths(root)))
+        c_fb = gitsafe.common_dir(root) if permitted else None
         r_fb = workspace_relative(root) if c_fb is not None else None
         if c_fb and r_fb:
             canon = f"{Path(os.path.realpath(c_fb)).as_posix()}\x00{r_fb}"
@@ -210,12 +226,20 @@ def insights_path(workspace: Any, home: Optional[Path] = None) -> Path:
     return layout.aegis_dir / "insights" / f"{insight_workspace_id(workspace)}.jsonl"
 
 
+#: How long one insight append waits for the log's lock. The lock is held only for one
+#: O_APPEND write and its fsync, but that lock is not fair: a busy writer (another session's
+#: prompts, a parallel suite) can keep a poller out past file_lock's generic 5 s, and a
+#: timeout drops the row (the prompt hook fails open). Rows are written only under the
+#: lock, so none is torn; the bound stays under a host's 60 s default hook timeout.
+INSIGHT_APPEND_LOCK_TIMEOUT_SECONDS = 30.0
+
+
 def _append_user_insights(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
         return
     _ensure_private_dir(path.parent.parent)
     _ensure_private_dir(path.parent)
-    with storage.file_lock(path.with_suffix(".lock")):
+    with storage.file_lock(path.with_suffix(".lock"), timeout=INSIGHT_APPEND_LOCK_TIMEOUT_SECONDS):
         append_jsonl(path, list(rows), mode=0o600)  # the mode is set through the descriptor
 
 

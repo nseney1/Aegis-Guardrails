@@ -15,7 +15,7 @@ from aegis_core.scaffolding import (
     ACTIVE_LABEL as _ACTIVE_LABEL,
     ACTIVE_STARTERS,
     CI_WORKFLOW_LABEL,
-    ci_workflow,
+    ci_workflow,  # noqa: F401 - retained by the public-names pin
 )
 from aegis_core.workspace.layout import AEGIS_DIRNAME, RULES_RELDIR
 
@@ -41,6 +41,7 @@ class Step:
     command: Optional[List[str]] = None
     names: Sequence[str] = ()
     kept: Sequence[str] = ()
+    workflow: str = ""  # CI's planned text, shared by the write path and the printed suggestion.
 
     def as_dict(self) -> Dict[str, Any]:
         return {"target": self.target, "result": self.result, "detail": self.detail, "command": self.command}
@@ -54,7 +55,19 @@ class Report:
         self.source = source
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        self.setup_guidance: Dict[str, Any] = {}
         self.muted = False  # the check pass before a real run stays quiet; the run reports
+
+    def language_guidance(self, root: Path, languages) -> None:
+        from aegis_cli.language_capabilities import (
+            capability_data, render_capabilities, render_runner_suggestion, runner_suggestion,
+        )
+
+        capabilities = capability_data(root, languages)
+        suggestion = runner_suggestion(root, structured=True)
+        self.setup_guidance = {'language_capabilities': capabilities, 'runner_suggestion': suggestion}
+        for line in render_capabilities(capabilities) + render_runner_suggestion(suggestion):
+            self.say(line)
 
     def say(self, line: str = "") -> None:
         if not self.json_mode:
@@ -85,6 +98,7 @@ class Report:
             "actions": [a.as_dict() for a in actions],
             "errors": self.errors,
             "warnings": self.warnings,
+            **self.setup_guidance,
         }, indent=2))
 
 
@@ -236,6 +250,6 @@ def _report_ci(report: Report, actions: Sequence[Step]) -> None:
     report.say(f"  {floor}")
     report.say(f"  {lead} Save this as {CI_WORKFLOW_LABEL}, or re-run aegis init with --ci to write it:")
     report.say()
-    for line in ci_workflow().splitlines():
+    for line in step.workflow.splitlines():
         report.say(f"      {line}".rstrip())
     report.say()

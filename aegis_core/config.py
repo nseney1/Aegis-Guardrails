@@ -1,4 +1,4 @@
-"""Configuration: one repo file, one user file, four environment variables (D10, D11).
+"""Configuration: repository/user files and centrally owned environment variables (D10, D11).
 
 ``.aegis/config.json`` (committed, so agent- and PR-writable) holds v1 keys::
 
@@ -17,6 +17,8 @@ only source of command-like values::
 
 The environment is read here and nowhere else: ``AEGIS_WORKSPACE`` (operator pin),
 ``AEGIS_CLIENT`` (host identity), ``AEGIS_MAX_JIT_TOKENS`` and ``AEGIS_LLM_CMD``.
+The separate manager registration selects ``AEGIS_MANAGER_CONFIG`` and pins its bytes
+with ``AEGIS_MANAGER_CONFIG_SHA256``; neither is repository policy.
 """
 from __future__ import annotations
 
@@ -40,6 +42,8 @@ __all__ = [
     "DEFAULT_SCAN_WINDOW_S",
     "ENV_CLIENT",
     "ENV_LLM_CMD",
+    "ENV_MANAGER_CONFIG",
+    "ENV_MANAGER_CONFIG_SHA256",
     "ENV_MAX_JIT_TOKENS",
     "ENV_VARS",
     "ENV_WORKSPACE",
@@ -50,9 +54,11 @@ __all__ = [
     "env_client",
     "env_github_step_summary",
     "env_llm_cmd",
+    "env_manager_registration",
     "env_max_jit_tokens",
     "env_workspace",
     "jit_max_tokens",
+    "manager_registration_env",
     "parse_capture_mode",
     "read_capped",
     "read_user_config",
@@ -77,11 +83,14 @@ ENV_WORKSPACE = "AEGIS_WORKSPACE"
 ENV_CLIENT = "AEGIS_CLIENT"
 ENV_MAX_JIT_TOKENS = "AEGIS_MAX_JIT_TOKENS"
 ENV_LLM_CMD = "AEGIS_LLM_CMD"
-ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD)
+ENV_MANAGER_CONFIG = "AEGIS_MANAGER_CONFIG"
+ENV_MANAGER_CONFIG_SHA256 = "AEGIS_MANAGER_CONFIG_SHA256"
+ENV_VARS = (ENV_WORKSPACE, ENV_CLIENT, ENV_MAX_JIT_TOKENS, ENV_LLM_CMD,
+            ENV_MANAGER_CONFIG, ENV_MANAGER_CONFIG_SHA256)
 
 _DECAY_KEYS = ("half_life_sessions", "epsilon")
 # "fitness" and the top-level decay keys are known (warned about, not counted as unknown keys).
-_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", *_DECAY_KEYS})
+_REPO_KEYS = frozenset({"v", "hosts", "jit", "expiry", "ast", "fitness", "approvals", *_DECAY_KEYS})
 # tests, rules, perf, regression, scanners and insights are read through read_user_config by their consumers.
 _USER_KEYS = frozenset({"v", "drivers", "slots", "arbiter_vendor", "tests", "rules", "perf", "regression", "ci",
                         "scanners", "insights", "coverage"})
@@ -125,6 +134,24 @@ def env_client(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
 def env_llm_cmd(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
     """``AEGIS_LLM_CMD``: the Layer-2 model command, or None."""
     return _env(ENV_LLM_CMD, environ)
+
+
+def env_manager_registration(environ: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, str]]:
+    """Startup manager selection, preserving explicit empty values for fail-closed validation.
+
+    An absent config key selects repository mode. A present but unusable key still
+    selects manager mode, whose startup check refuses it; it never falls back to
+    repository discovery. The digest alone does not select manager mode.
+    """
+    environment = os.environ if environ is None else environ
+    if ENV_MANAGER_CONFIG not in environment:
+        return None
+    return environment.get(ENV_MANAGER_CONFIG, ""), environment.get(ENV_MANAGER_CONFIG_SHA256, "")
+
+
+def manager_registration_env(config_path: Any, digest: str) -> Dict[str, str]:
+    """Build only the manager's startup keys; selection validation belongs to startup."""
+    return {ENV_MANAGER_CONFIG: str(config_path), ENV_MANAGER_CONFIG_SHA256: digest}
 
 
 def env_github_step_summary(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:

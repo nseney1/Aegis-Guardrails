@@ -19,8 +19,10 @@ from aegis_mcp.server import handle_request
 
 _HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
-READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule"}
-WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight"}
+READ = {"aegis_scan": "Scan JIT Rules", "aegis_list_rules": "List Rules", "aegis_create_rule": "Create Rule",
+        "aegis_msg_read": "Read Message", "aegis_team_config": "Team Config", "aegis_team_queue": "Team Queue"}
+WRITE = {"aegis_report_outcome": "Report Outcome", "aegis_capture_insight": "Capture Insight",
+         "aegis_msg_write": "Write Message", "aegis_team_model": "Team Model"}
 
 
 @pytest.fixture
@@ -61,6 +63,8 @@ def test_write_tools_claim_nothing_beyond_not_read_only(tools):
     assert writers == {
         "aegis_report_outcome": {"readOnlyHint": False, "title": "Report Outcome"},
         "aegis_capture_insight": {"readOnlyHint": False, "title": "Capture Insight"},
+        "aegis_msg_write": {"readOnlyHint": False, "title": "Write Message"},
+        "aegis_team_model": {"readOnlyHint": False, "title": "Team Model"},
     }
 
 
@@ -98,6 +102,9 @@ def test_read_only_tools_are_never_destructive(tools):
 
 def test_every_input_schema_property_has_a_short_description(tools):
     for name, tool in tools.items():
+        if name == "aegis_team_config":
+            assert tool["inputSchema"] == {"type": "object", "properties": {}, "additionalProperties": False}
+            continue
         props = tool.get("inputSchema", {}).get("properties", {})
         assert props, f"{name}: empty inputSchema properties"
         for prop_name, prop_schema in props.items():
@@ -111,7 +118,20 @@ def test_every_input_schema_property_has_a_short_description(tools):
 def test_tools_list_declares_no_output_schema(tools):
     """D-mcp-schema: no tool declares an outputSchema, so a result key needs no schema edit."""
     assert [name for name, tool in tools.items() if "outputSchema" in tool] == []
-    assert len(json.dumps(list(tools.values()))) <= 10_642  # 60% of the 4.3.3 list
+    assert len(json.dumps(list(tools.values()))) <= 11_500  # MR-3b adds the selector schema.
+
+
+def test_queue_connection_annotations_and_budget():
+    from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS
+
+    queue, claim = QUEUE_TOOL_DEFINITIONS
+    assert queue["annotations"] == {**_READ_HINTS, "title": "Team Queue"}
+    assert claim["annotations"] == {"readOnlyHint": False, "title": "Claim Queue Item"}
+    assert len(json.dumps(QUEUE_TOOL_DEFINITIONS).encode("utf-8")) <= 11500
+    assert all("outputSchema" not in tool for tool in QUEUE_TOOL_DEFINITIONS)
+    for tool in QUEUE_TOOL_DEFINITIONS:
+        assert tool["inputSchema"]["additionalProperties"] is False
+        assert all(0 < len(spec["description"]) <= 160 for spec in tool["inputSchema"]["properties"].values())
 
 
 @pytest.fixture
@@ -188,22 +208,28 @@ SIBLINGS = {
     "aegis_list_rules": ("aegis_scan",),
     "aegis_create_rule": ("aegis_list_rules",),
     "aegis_capture_insight": ("aegis_report_outcome",),
+    "aegis_msg_read": ("aegis_msg_write",),
+    "aegis_msg_write": ("aegis_msg_read",),
+    "aegis_team_config": (),
+    "aegis_team_model": (),
+    "aegis_team_queue": (),
 }
 
 
 def _description_errors(tools: Dict[str, dict]) -> List[str]:
-    """One line per tool whose description is not 2 to 4 sentences or omits a sibling tool."""
+    """Config has one short sentence; other tools have 2 to 4 and name their siblings."""
     errors = []
     for name in sorted(tools):
         text = tools[name]["description"]
         sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-        if not 2 <= len(sentences) <= 4:
+        minimum, maximum = (1, 1) if name == "aegis_team_config" else (2, 4)
+        if not minimum <= len(sentences) <= maximum:
             errors.append(f"{name}: {len(sentences)} sentences")
         errors += [f"{name}: names no {sibling}" for sibling in SIBLINGS.get(name, ()) if sibling not in text]
     return errors
 
 
-def test_every_description_is_two_to_four_sentences_naming_its_siblings(tools):
+def test_every_description_has_its_admitted_sentence_count_and_names_its_siblings(tools):
     assert set(SIBLINGS) == set(tools)
     assert _description_errors(tools) == []
 
@@ -216,14 +242,18 @@ def test_the_report_description_states_the_limits_the_code_enforces(tools):
 
 
 def test_tools_list_fits_the_handshake_budget(tools):
-    assert len(json.dumps(list(tools.values()))) <= 6_500
+    # MR-3b: ninth tool; compact selector schema measured with json.dumps.
+    budget = 11_235
+    assert budget <= 11_500
+    assert len(json.dumps(list(tools.values()))) <= budget
 
 
 @pytest.mark.parametrize("name,description,error", [
     ("aegis_list_rules", "One. Two. Three. Four. Five; see aegis_scan.", "aegis_list_rules: 5 sentences"),
     ("aegis_create_rule", "Drafts a rule. It writes nothing.", "aegis_create_rule: names no aegis_list_rules"),
     ("aegis_scan", "Call aegis_report_outcome and aegis_list_rules.", "aegis_scan: 1 sentences"),
-], ids=["five-sentences", "no-sibling", "one-sentence"])
+    ("aegis_team_config", "Read config. Return provenance.", "aegis_team_config: 2 sentences"),
+], ids=["five-sentences", "no-sibling", "one-sentence", "config-two-sentences"])
 def test_the_description_guard_names_the_tool(tools, name, description, error):
     broken = copy.deepcopy(tools)
     broken[name]["description"] = description

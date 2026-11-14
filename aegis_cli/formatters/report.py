@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from itertools import islice
 import json
 import os
 import re
@@ -11,6 +12,9 @@ from typing import Any, Optional
 from aegis_cli import sanitize_display
 
 __all__ = [
+    "coverage_explanation",
+    "coverage_omitted_count",
+    "coverage_reason",
     "format_github_step_summary",
     "format_layer1_json_payload",
     "format_layer2_json",
@@ -140,13 +144,19 @@ def ci_findings(document: dict[str, Any], workspace_root: Optional[str | Path] =
 
     found = []
     approved = bool((document.get("approval") or {}).get("valid"))
+    permitted = document.get("approval_mode") in ("none", "review")
     for w in document.get("weakenings", ()):
-        found.append(_finding(w["rule"], w["path"], 0, f"{w['code']}: {w['message']}",
-                              "note" if approved else "error", workspace_root))
+        label = f"; approval mode {document['approval_mode']}" if permitted else ""
+        found.append(_finding(w["rule"], w["path"], 0, f"{w['code']}: {w['message']}{label}",
+                              "note" if approved or permitted else "error", workspace_root))
     gov = document.get("governance") or {}
     for entry in gov.get("paths", ()) if gov.get("enforced") and not gov.get("approved") else ():
         found.append(_finding(f"governance:{entry['category']}", entry["path"], 0,
                               f"governance change without approval: {entry['path']}", "error", workspace_root))
+    if permitted:
+        for entry in gov.get("paths", ()):
+            found.append(_finding(f"governance:{entry['category']}", entry["path"], 0,
+                                  f"governance change; approval mode {document['approval_mode']}", "note", workspace_root))
     reg = document.get("regression") or {}
     for rf in reg.get("findings", ()):
         level = "error" if reg.get("tier") == "gate" and rf["code"] not in regression.UNVERIFIED_CODES else "warning"
@@ -187,13 +197,17 @@ def layer1_report_document(passed: bool, owned: list, checkpoint_issues: list, s
     its workspace-relative file (``owned``: (path or None, ToolEvidence)) with its lines, and each
     checkpoint issue as a line-less finding (an error when it blocks)."""
     from aegis_cli.checkpoint import is_blocking
+    from aegis_core.verification.strict_verdict import evidence_blocks
+
+    strict_causes = [{"rule": "strict:no-driver", "message": "Strict mode: no-driver coverage blocks; a verification driver is unavailable.",
+                      "level": "error"} for _path, e in owned if e.verdict and evidence_blocks(e.verdict, e.tool, strict=strict)]
 
     return {"passed": passed,
             "checkpoint_info": list(checkpoint_info or ()),
             "layer1": [{"tool": e.tool, "target": path or e.target, "verdict": bool(e.verdict), "detail": e.detail,
                         "lines": list(e.lines), **({"language": e.language} if getattr(e, "language", None) else {})} for path, e in owned],
             "findings": [{"rule": f"checkpoint:{issue.get('check', '')}", "message": issue.get("message", ""),
-                          "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues]}
+                          "level": "error" if is_blocking(issue, strict) else "warning"} for issue in checkpoint_issues] + strict_causes}
 
 
 def _split(document: dict[str, Any], workspace_root: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -216,6 +230,9 @@ def governance_note(document: dict[str, Any]) -> str:
     """Why a changed governance set is not enforced (no signing key at the base), or ""."""
     gov = document.get("governance") or {}
     cats = ", ".join(gov.get("categories") or ())
+    mode = document.get("approval_mode")
+    if mode in ("none", "review"):
+        return "owner review required" if mode == "review" else "approval mode none: no owner approval required"
     return (f"governance files changed ({cats}) but the base lists no key in allowed_signers, "
             "so no approval can be required (tier C: detection only)") if cats and not gov.get("enforced") else ""
 
@@ -223,6 +240,58 @@ def governance_note(document: dict[str, Any]) -> str:
 def _escape_annotation(text: str, prop: bool = False) -> str:
     text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def _coverage_line_count(value: Any) -> str:
+    """Only producer counts, never free text or unbounded integer conversions."""
+    return str(value) if type(value) is int and 0 <= value and value.bit_length() <= 63 else "unknown"
+
+
+def coverage_reason(coverage: dict[str, Any]) -> str:
+    """A closed availability category; full producer reasons belong only in JSON."""
+    reason = coverage.get("reason", "")
+    if not isinstance(reason, str) or len(reason) > 4096:
+        return "other"
+    reason = _flat(sanitize_display(reason, max_len=None)).lower()
+    if reason in ("timeout", "the coverage run timed out", "the coverage json timed out"):
+        return "timeout"
+    if reason.endswith("no module named coverage") or reason in ("tool_missing", "go_missing"):
+        return "tool missing"
+    if reason in ("report_missing", "coverage_report_invalid", "coverage wrote no readable report"):
+        return "no report"
+    if reason.startswith(("cannot diff ", "the checkout is not ", "the work tree has uncommitted changes",
+                          "cannot tell whether the work tree", "cannot use the state directory")) \
+            or reason in ("coverage_paths_unmapped", "coverage_command_invalid"):
+        return "validation failed"
+    if reason == "coverage_not_configured":
+        return "not configured"
+    return "partial coverage" if reason == "partial_coverage" else "other"
+
+
+def coverage_omitted_count(coverage: dict[str, Any]) -> str:
+    """Empty unverified inventories mean unavailable accounting, not zero omissions."""
+    inventory = coverage.get("unmeasured")
+    if not isinstance(inventory, list) or (not inventory and coverage.get("status") != "reported"):
+        return "unknown"
+    return str(len(inventory))
+
+
+def coverage_explanation(coverage: dict[str, Any]) -> str:
+    """One bounded explanation of the measured subset; JSON retains every path and language."""
+    languages = coverage.get("languages") or {}
+    unavailable = ((language, row) for language, row in languages.items() if row.get("status") != "reported")
+    shown = [f"{language if language in ('python', 'go', 'rust', 'ts') else 'other language'} ({coverage_reason(row)})"
+             for language, row in islice(unavailable, 4)]
+    remaining = sum(1 for _ in unavailable)
+    if remaining:
+        shown.append(f"{remaining} more (see JSON)")
+    covered = _coverage_line_count(coverage.get("covered_lines"))
+    total = _coverage_line_count(coverage.get("executable_lines"))
+    reason = coverage_reason(coverage) if coverage.get("reason") else ""
+    availability = ", ".join(shown) or ("not specified (see reason)" if not languages and coverage.get("status") != "reported" else "none")
+    return (f"Measured lines: {covered}/{total}; unavailable languages: {availability}; "
+            f"omitted paths: {coverage_omitted_count(coverage)}. See JSON for full detail."
+            + (f" Reason: {reason}." if reason else ""))
 
 
 def github_annotation_lines(document: dict[str, Any]) -> list[str]:
@@ -238,7 +307,10 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
 
     out = []
     approved = bool((document.get("approval") or {}).get("valid"))
+    permitted = document.get("approval_mode") in ("none", "review")
     level, title = ("notice", "weakening approved") if approved else ("error", "weakening without approval")
+    if permitted:
+        level, title = "notice", "weakening permitted by approval mode"
     for w in document.get("weakenings", ()):
         out.append(line(level, title, f"{w['code']}: {w['rule']}: {w['message']}", w["path"]))
     gov = document.get("governance") or {}
@@ -246,9 +318,14 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
     for entry in gov.get("paths", ()) if gov.get("enforced") else ():
         message = f"governance:{entry['category']}: {entry['path']} changed; it passes only with a signed approval (aegis approve)"
         out.append(line(level, title, message, entry["path"]))
+    if permitted:
+        for entry in gov.get("paths", ()):
+            out.append(line("notice", "governance change permitted by approval mode",
+                            f"governance:{entry['category']}: {entry['path']} changed", entry["path"]))
     note = governance_note(document)
     if note:
-        out.append(line("warning", "governance change not enforced", note))
+        out.append(line("notice" if permitted else "warning",
+                        "approval mode" if permitted else "governance change not enforced", note))
     reg = document.get("regression") or {}
     gate = reg.get("tier") == "gate"
     for rf in reg.get("findings", ()):
@@ -277,7 +354,9 @@ def github_annotation_lines(document: dict[str, Any]) -> list[str]:
         out.append(line("notice", "diff coverage",
                         f"{figure} of {cov.get('executable_lines', 0)} changed executable lines (report only)"))
     elif isinstance(cov, dict):
-        out.append(line("warning", "coverage unverified", cov.get("reason", "")))
+        out.append(line("warning", "coverage unverified", coverage_reason(cov)))
+    if isinstance(cov, dict):
+        out[-1] += esc(" " + coverage_explanation(cov))
     for row in document.get("layer1", ()):  # a Layer 1 report: only the first evidence line is annotated
         if not row["verdict"]:
             lines = row.get("lines") or ()
@@ -314,10 +393,16 @@ def _table_row(*spans: str) -> str:
 def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None) -> str:
     """Render a Markdown job summary for $GITHUB_STEP_SUMMARY."""
     anchored, lineless = _split(report_dict, workspace_root)
-    lineless = [f for f in lineless if f["level"] != "note"]  # an approved change is no finding
+    mode = report_dict.get("approval_mode")
+    if mode not in ("none", "review"):
+        lineless = [f for f in lineless if f["level"] != "note"]  # an approved change is no finding
     status = report_dict.get("status")
     passed = report_dict.get("passed", status == "pass" if status is not None else not (anchored or lineless))
     lines = [f"## Aegis Check Summary: {'PASSED' if passed else 'FAILED'}", ""]
+    if mode in ("none", "review"):
+        lines.extend([f"approval mode {mode}", ""])
+        if mode == "review":
+            lines.extend(["owner review required", ""])
     if anchored:
         lines.extend(["### Line-Anchored Findings", "| Rule | Location | Level | Message |", "| :--- | :--- | :--- | :--- |"])
         lines.extend(_table_row(_md_code(f["rule_id"]), _md_code(f"{f['uri']}:{f['line']}:{f['col']}"), f["level"],
@@ -334,7 +419,8 @@ def format_github_step_summary(report_dict: dict[str, Any], workspace_root: Opti
         ratio, measured = cov.get("ratio"), cov.get("status") == "reported"
         figure = "n/a" if ratio is None else f"{float(ratio) * 100.0:.1f}%"
         lines.append(f"### Diff Coverage (report only): {figure} of {cov.get('executable_lines', 0)} changed executable lines"
-                     if measured else f"### Diff Coverage: UNVERIFIED ({_md_code(cov.get('reason', ''))})")
+                     if measured else f"### Diff Coverage: UNVERIFIED ({_md_code(coverage_reason(cov))})")
+        lines.append(_md_code(coverage_explanation(cov)))
         for path, ranges in sorted((cov.get("uncovered_ranges") or {}).items()):
             spans = ", ".join(f"{int(s)}-{int(e)}" if s != e else str(int(s)) for s, e in ranges)
             lines.append(f"- {_md_code(path)}: uncovered lines {spans}")
@@ -367,7 +453,7 @@ def _fingerprints(anchored: list[dict[str, Any]]) -> list[str]:
 
 def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[str | Path] = None,
                         error: str = "") -> str:
-    """A SARIF 2.1.0 log of the line-anchored findings; line-less ones go to the step summary only.
+    """A SARIF 2.1.0 log of line-anchored findings; strict causes are execution notifications.
     With ``error`` the run is reported as not completed, with no result."""
     anchored = [] if error else _split(report_dict, workspace_root)[0]
     rules_seen: dict[str, dict[str, Any]] = {}
@@ -388,8 +474,18 @@ def format_sarif_report(report_dict: dict[str, Any], workspace_root: Optional[st
     if error:
         run["invocations"] = [{"executionSuccessful": False, "toolExecutionNotifications": [
             {"level": "error", "message": {"text": error}}]}]
-    elif report_dict.get("checkpoint_info"):
-        run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": [
-            {"level": "note", "message": {"text": note["message"]}} for note in report_dict["checkpoint_info"]]}]
+    else:
+        notifications = [{"level": "note", "message": {"text": note["message"]}}
+                         for note in report_dict.get("checkpoint_info", ())]
+        notifications.extend({"level": "error", "message": {"text": finding["message"]}}
+                             for finding in report_dict.get("findings", ()) if finding["rule"] == "strict:no-driver")
+        if report_dict.get("approval_mode") is not None:
+            notifications.append({"level": "note", "message": {"text":
+                f"approval mode {report_dict['approval_mode']}; target {report_dict.get('approval_target') or 'unknown'}"}})
+            notifications.extend({"level": finding["level"], "message": {"text":
+                f"{finding['rule_id']}: {finding['uri']}: {finding['message']}"}}
+                for finding in ci_findings(report_dict, workspace_root) if not finding["line"])
+        if notifications:
+            run["invocations"] = [{"executionSuccessful": True, "toolExecutionNotifications": notifications}]
     return json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [run]},
                       indent=2)

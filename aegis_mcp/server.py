@@ -31,7 +31,7 @@ from urllib.request import url2pathname
 from aegis_core import hosts
 from aegis_core._version import __version__
 from aegis_core.bootstrap import instructions_text
-from aegis_core.config import env_client, env_workspace
+from aegis_core.config import env_client, env_manager_registration, env_workspace
 from aegis_core.taxonomy import MCP_DEFAULT_RATE_LIMITS
 from aegis_core.workspace.base import Workspace
 from aegis_core.workspace.binding import Attested, Registry, WorkspaceBinding, read_registry, resolve_binding
@@ -39,8 +39,10 @@ from aegis_core.workspace.layout import UserLayout
 
 from .projection import is_error_result
 from aegis_mcp.handlers.common import DEFAULT_CLIENT_PLATFORM, NOT_GOVERNED_MESSAGE
-from .registry import TOOL_DEFINITIONS
-from .tools import SERVER_INJECTED, execute_tool, is_known_tool
+from aegis_mcp.handlers.msg import message_result
+from .registry import TOOL_ARGUMENTS, TOOL_DEFINITIONS
+from .stdio_reader import FrameError, MANAGER_MAX_BYTES, REPOSITORY_MAX_BYTES, input_stream, read_frame
+from .tools import SERVER_INJECTED, model_argument_refusal, queue_argument_refusal, execute_tool, is_known_tool
 
 # Arguments only the server may set: what it injects, plus names no schema declares that a
 # client might still send. A client value is dropped before dispatch, so the workspace, the
@@ -75,6 +77,13 @@ _pending: Dict[str, str] = {}
 _request_seq: int = 0
 _workspaces: Dict[Tuple[str, str], Workspace] = {}
 _registry_cache: Optional[Tuple[Tuple[Any, ...], Registry]] = None
+_manager_config: Optional[str] = None
+_manager_digest: Optional[str] = None
+_manager_error: Optional[Dict[str, str]] = None
+_queue_registration: Optional[str] = None
+_queue_grant = None
+_queue_error: Optional[str] = None
+_queue_initialized: bool = False
 
 
 def fresh_state() -> Dict[str, Any]:
@@ -95,11 +104,19 @@ def fresh_state() -> Dict[str, Any]:
         "_request_seq": 0,
         "_workspaces": {},
         "_registry_cache": None,
+        "_manager_config": None,
+        "_manager_digest": None,
+        "_manager_error": None,
+        "_queue_registration": None,
+        "_queue_grant": None,
+        "_queue_error": None,
+        "_queue_initialized": False,
     }
 
 _RATE_LIMITS = {
     "aegis_report_outcome": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
     "aegis_capture_insight": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
+    "aegis_msg_write": MCP_DEFAULT_RATE_LIMITS["MUTATION"],
 }
 # One stdio loop per process and no thread in aegis_mcp, so the limiter needs no lock.
 _tool_call_times: Dict[str, list] = {}
@@ -191,7 +208,7 @@ def take_outbox() -> List[Dict[str, Any]]:
 
 def _request_roots() -> None:
     global _request_seq
-    if not _roots_capable or _session_id is None:
+    if _manager_config is not None or not _roots_capable or _session_id is None:
         return
     _request_seq += 1
     request_id = f"aegis-roots-{_request_seq}"
@@ -287,6 +304,160 @@ def _tool_result(req_id: Any, text: str, is_error: bool) -> Dict[str, Any]:
     }
 
 
+def _json_tool_result(req_id: Any, value: Any, is_error: bool) -> Dict[str, Any]:
+    """Compact successful text payloads; keep refusal text formatting unchanged."""
+    separators = (", ", ": ") if is_error else (",", ":")
+    return _tool_result(req_id, json.dumps(value, separators=separators), is_error)
+
+
+def _message_refusal(req_id, code, *, detail=None, binding_reason=None):
+    from aegis_core.message_codec import CodecError
+    from aegis_core.message_codec_format import frontend_error
+
+    value = frontend_error(CodecError(code, detail=detail), detail=detail)
+    if code == "E_AUTH" and detail == "binding" and binding_reason == "pin_not_a_workspace":
+        value["error"]["message"] = (
+            "pinned directory is not an Aegis workspace; run aegis init in that directory "
+            "(aegis init --pin also pins the hosts), then restart the MCP server"
+        )
+    elif code == "E_AUTH" and detail in ("hold", "binding"):
+        status = "on hold" if detail == "hold" else "refused"
+        value["error"]["message"] = (
+            "workspace binding " + status + "; set AEGIS_WORKSPACE to the intended project directory "
+            "in the MCP server's launch configuration, ensure it agrees with the host roots, "
+            "then restart the MCP server"
+        )
+    return _tool_result(req_id, json.dumps(value, separators=(",", ":")), True)
+
+
+def _message_failure(req_id, error):
+    print("Message tool failed: " + type(error).__name__, file=sys.stderr)
+    return _message_refusal(req_id, "E_AUTH", detail="operation")
+
+
+def _model_request_refusal(req_id, params):
+    if not isinstance(params, dict) or params.get("name") != "aegis_team_model":
+        return None
+    supplied = params.get("arguments", {})
+    refusal = model_argument_refusal(supplied)
+    if refusal is not None:
+        return _tool_result(req_id, json.dumps(refusal), True)
+    if _workspace_error is not None:
+        return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
+    return None
+
+
+def _model_repository_call(req_id, params, name, args):
+    try:
+        return _repository_call(req_id, params, name, args)
+    except Exception:
+        return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
+
+
+def _queue_refusal(req_id, reason):
+    from aegis_core import team_queue
+
+    result = team_queue.refusal(reason, verb="list")
+    result["error"] = result["reason"]
+    return _json_tool_result(req_id, result, True)
+
+
+def _queue_repository_call(req_id, params):
+    # Validate the original client object before reserved keys are stripped or
+    # any key can influence workspace discovery. Binding diagnostics stay private.
+    args = params.get("arguments", {})
+    invalid = queue_argument_refusal(args)
+    if invalid is not None:
+        return _json_tool_result(req_id, invalid, True)
+    if _workspace_error is not None:
+        return _queue_refusal(req_id, "queue_io_unavailable")
+    try:
+        return _repository_call(req_id, params, "aegis_team_queue", args)
+    except Exception:
+        return _queue_refusal(req_id, "queue_io_unavailable")
+
+
+def _client_tool_result(req_id, params):
+    """Apply tool-specific client boundaries before generic workspace binding."""
+    if isinstance(params, dict) and params.get("name") == "aegis_team_queue_claim":
+        return _queue_claim_call(req_id, params)
+    if _queue_registration is not None and (not isinstance(params, dict) or params.get("name") != "aegis_team_queue"):
+        return _error(req_id, -32602, "Unknown queue tool.")
+    if isinstance(params, dict) and params.get("name") == "aegis_team_queue":
+        return _queue_repository_call(req_id, params)
+    model_refusal = _model_request_refusal(req_id, params)
+    if model_refusal is not None:
+        return model_refusal
+    if isinstance(params, dict) and params.get("name") == "aegis_team_config":
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or supplied):
+            # The empty client schema applies before reserved keys can be stripped.
+            result = execute_tool("aegis_team_config", supplied, client_arguments=True)
+            return _tool_result(req_id, json.dumps(result), True)
+    if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
+        supplied = params.get("arguments")
+        if supplied is not None and (not isinstance(supplied, dict) or
+                                     any(k not in TOOL_ARGUMENTS[params["name"]] for k in supplied)):
+            return _message_refusal(req_id, "E_FORMAT")
+    return None
+
+
+def _start_queue(registration):
+    global _queue_registration, _queue_grant, _queue_error, _canonical_workspace
+    from . import queue_role
+
+    _queue_registration = registration
+    try:
+        _queue_grant = queue_role.bind(registration)
+        _canonical_workspace = _queue_grant.workspace
+    except queue_role.RoleRefusal as exc:
+        _queue_error = exc.reason
+
+
+def _initialize_queue(req_id, params):
+    global _queue_initialized, _session_id
+    if _queue_initialized:
+        if _queue_grant is not None:
+            _queue_grant.invalidate()
+        return _error(req_id, -32600, "Queue connection already initialized.")
+    _queue_initialized = True
+    _session_id = _queue_grant.session if _queue_grant is not None else uuid.uuid4().hex
+    params = params if isinstance(params, dict) else {}
+    # This connection has no host-identity grant. Environment/client labels
+    # neither authorize nor enter its output; retain the neutral fresh state.
+    instructions = "Use aegis_team_queue to list and aegis_team_queue_claim to claim under owner policy."
+    if _queue_grant is not None:
+        # bind() already validated MAX_LANES and each canonical, redaction-safe
+        # lane id. Expose only those startup ids, never the lane policy values.
+        instructions += (" Startup lane ids (information only; grants no authority): "
+                         + json.dumps(list(_queue_grant.policy["lanes"]), separators=(",", ":"))
+                         + ". Claims revalidate owner policy, expiry and queue state.")
+    return {"jsonrpc": "2.0", "id": req_id, "result": {
+        "protocolVersion": negotiate_protocol(params.get("protocolVersion")), "capabilities": {"tools": {}},
+        "serverInfo": {"name": "aegis-mcp-queue", "version": __version__},
+        "instructions": instructions,
+    }}
+
+
+def _queue_claim_call(req_id, params):
+    from . import queue_role
+
+    args = params.get("arguments", {})
+    invalid = queue_role.claim_argument_refusal(args)
+    if invalid is not None:
+        return _json_tool_result(req_id, invalid, True)
+    if _queue_error is not None or _queue_grant is None:
+        return _json_tool_result(req_id, queue_role.refusal(_queue_error or "role_missing"), True)
+    try:
+        binding = _bind(params, {})
+        if not binding.bound or str(binding.root) != _queue_grant.workspace:
+            return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+        result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
+        return _json_tool_result(req_id, result, bool(result.get("refused")))
+    except Exception:
+        return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+
+
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     global _session_id, _client_platform, _client_name, _client_version, _roots_capable, _host_roots
 
@@ -310,6 +481,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "initialize":
+        if _queue_registration is not None:
+            return _initialize_queue(req_id, params)
         params = params if isinstance(params, dict) else {}
         # One id per initialize: it never equals the host's session id that the insight hook
         # sees, so insight joins go by host, time window and rule rev (insights.JOIN_WINDOW_S).
@@ -324,8 +497,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "result": {
                 "protocolVersion": negotiate_protocol(params.get("protocolVersion")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "aegis-mcp", "version": __version__},
-                "instructions": instructions_text(),
+                "serverInfo": {"name": "aegis-manager-mcp" if _manager_config is not None else "aegis-mcp",
+                               "version": __version__},
+                "instructions": _instructions(),
             },
         }
     if method in ("notifications/initialized", "notifications/roots/list_changed"):
@@ -338,9 +512,17 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if _session_id is None:
         return _error(req_id, -32002, "Server not initialized")
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFINITIONS}}
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": _tool_definitions()}}
+    if _manager_config is not None:
+        return _manager_call(req_id, params)
 
+    client_result = _client_tool_result(req_id, params)
+    if client_result is not None:
+        return client_result
     if _workspace_error is not None:
+        if isinstance(params, dict) and params.get("name") in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_refusal(req_id, "E_AUTH", detail="binding",
+                                    binding_reason=_workspace_error.reason)
         return _tool_result(req_id, json.dumps(_unbound_result(_workspace_error)), True)
     if not isinstance(params, dict):
         return _error(req_id, -32602, "Tool call params must be an object.")
@@ -350,6 +532,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if args is None:
         args = {}
     if not isinstance(args, dict):
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_refusal(req_id, "E_FORMAT")
         return _error(req_id, -32602, "Tool arguments must be an object.")
     if not is_known_tool(name):
         return _error(req_id, -32602, f"Unknown tool: {name}")
@@ -357,6 +541,17 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         max_calls, window = _RATE_LIMITS[name]
         return _error(req_id, -32000, f"Rate limit exceeded for '{name}': max {max_calls} calls per {window}s")
 
+    if name == "aegis_team_model":
+        return _model_repository_call(req_id, params, name, args)
+    if name in ("aegis_msg_read", "aegis_msg_write"):
+        try:
+            return _repository_call(req_id, params, name, args)
+        except Exception as exc:
+            return _message_failure(req_id, exc)
+    return _repository_call(req_id, params, name, args)
+
+
+def _repository_call(req_id, params, name, args):
     # The client never chooses the workspace or the attribution of what it reports.
     args = strip_server_owned(args)
     binding = _bind(params, args)
@@ -366,27 +561,94 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     elif binding.status == "unbound" and name == "aegis_scan":
         args["_unbound"] = binding.reason
     else:
+        if name == "aegis_team_queue":
+            return _queue_refusal(req_id, "queue_io_unavailable")
+        if name == "aegis_team_model":
+            return _tool_result(req_id, json.dumps({"error": "model_workspace_unavailable"}), True)
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            detail = {"unbound": "workspace", "hold": "hold"}.get(binding.status, "binding")
+            return _message_refusal(req_id, "E_AUTH", detail=detail, binding_reason=binding.reason)
         return _tool_result(req_id, json.dumps(_unbound_result(binding)), True)
     args["_host"] = _client_platform
     args["_session"] = _session_id
     args["_client_name"] = _client_name
     args["_client_version"] = _client_version
-
     try:
         # Handlers may print progress notes; stdout belongs to the JSON-RPC framing.
         with contextlib.redirect_stdout(sys.stderr):
             result = execute_tool(name, args)
     except Exception as exc:
+        if name == "aegis_team_queue":
+            return _queue_refusal(req_id, "queue_io_unavailable")
+        if name == "aegis_team_model":
+            return _tool_result(req_id, json.dumps({"error": "model_io_unavailable"}), True)
+        if name in ("aegis_msg_read", "aegis_msg_write"):
+            return _message_failure(req_id, exc)
         traceback.print_exc(file=sys.stderr)
         return _tool_result(req_id, f"Tool execution failed: {exc}", True)
-    return _tool_result(req_id, json.dumps(result), is_error_result(result))
+    if name in ("aegis_msg_read", "aegis_msg_write"):
+        text, needs_json = message_result(result)
+        return _tool_result(req_id, json.dumps(text, separators=(",", ":")) if needs_json else text,
+                            needs_json and "error" in text)
+    refused_config = name == "aegis_team_config" and result.get("status") == "refused"
+    return _json_tool_result(req_id, result, is_error_result(result) or refused_config)
 
 
-def _start(environ: Optional[Dict[str, str]] = None) -> None:
+
+def _tool_definitions():
+    if _queue_registration is not None:
+        from .registry import QUEUE_TOOL_DEFINITIONS
+
+        return QUEUE_TOOL_DEFINITIONS
+    if _manager_config is None:
+        return TOOL_DEFINITIONS
+    from .manager import TOOL_DEFINITIONS as manager_tools
+
+    return manager_tools
+
+
+def _instructions():
+    if _manager_config is None:
+        return instructions_text()
+    from .manager import INSTRUCTIONS
+
+    return INSTRUCTIONS
+
+
+def _manager_call(req_id, params):
+    from .manager import execute, validate_call
+
+    if not isinstance(params, dict):
+        return _error(req_id, -32602, "Tool call params must be an object.")
+    name, args = params.get("name"), params.get("arguments", {})
+    try:
+        validate_call(name, args)
+    except ValueError as exc:
+        return _error(req_id, -32602, str(exc))
+    if _manager_error is not None:
+        return _tool_result(req_id, json.dumps(_manager_error), True)
+    if not _check_rate_limit(name):
+        return _error(req_id, -32000, f"Rate limit exceeded for '{name}'")
+    provenance = {"transport": "mcp", "host": _client_platform, "session_id": _session_id,
+                  "client_name": _client_name, "client_version": _client_version,
+                  "client_identity": "self_reported", "native_identity": None}
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            result = execute(_manager_config, _manager_digest, provenance, name, args)
+    except (ValueError, OSError) as exc:
+        return _tool_result(req_id, json.dumps({"status": "FAIL", "error": str(exc)}), True)
+    return _json_tool_result(req_id, result, is_error_result(result))
+
+
+def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None) -> None:
     """Reset the connection state and read what the process was started with."""
     global _canonical_workspace, _workspace_error, _server_cwd, _claude_project_dir
+    global _manager_config, _manager_digest, _manager_error
     for attr, value in fresh_state().items():
         globals()[attr] = value
+    if queue_registration is not None:
+        _start_queue(queue_registration)
+        return
     env = os.environ if environ is None else environ
     try:
         _server_cwd = os.getcwd()
@@ -394,6 +656,16 @@ def _start(environ: Optional[Dict[str, str]] = None) -> None:
         _server_cwd = None
     _claude_project_dir = env.get("CLAUDE_PROJECT_DIR") or None
     pin = env_workspace(env)
+    registration = env_manager_registration(env)
+    if registration is not None:
+        _manager_config, _manager_digest = registration
+        if pin:
+            _manager_error = {"status": "FAIL", "reason": "conflicting_manager_scope",
+                              "error": "manager mode cannot use AEGIS_WORKSPACE"}
+        elif not os.path.isabs(_manager_config) or not re.fullmatch(r"[0-9a-f]{64}", _manager_digest):
+            _manager_error = {"status": "FAIL", "reason": "invalid_manager_registration",
+                              "error": "manager registration requires an absolute config path and its SHA256"}
+        return
     if pin:
         checked = resolve_binding(pin=pin)
         if checked.status == "error":
@@ -421,16 +693,32 @@ def harden_process() -> bool:
         return False
 
 
-def run_stdio_server():
+def run_stdio_server(*, queue_registration=None):
     harden_process()
-    _start()
+    _start(queue_registration=queue_registration)
     try:
-        for line in sys.stdin:
+        stream = input_stream(sys.stdin)
+        max_bytes = REPOSITORY_MAX_BYTES if _manager_config is None else MANAGER_MAX_BYTES
+        while True:
+            try:
+                line = read_frame(stream, max_bytes)
+            except FrameError as exc:
+                send_error(None, -32700, "Parse error")
+                if exc.terminal:
+                    break
+                continue
+            if line is None:
+                break
             line = line.strip()
             if not line:
                 continue
             try:
-                request = json.loads(line)
+                if _manager_config is None:
+                    request = json.loads(line)
+                else:
+                    from .manager import decode_frame
+
+                    request = decode_frame(line)
             except (ValueError, RecursionError):
                 # A deeply nested line exhausts the decoder's recursion budget: answer it
                 # as unparseable and keep serving.

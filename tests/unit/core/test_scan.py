@@ -140,14 +140,14 @@ def test_a_rule_that_cannot_be_loaded_fails_the_scan_closed(tmp_path: Path) -> N
     assert "relevant_rules" not in result
 
 
-def test_a_v3_rule_left_in_walls_fails_the_scan_instead_of_silently_not_applying(tmp_path: Path) -> None:
-    legacy = tmp_path / ".aegis" / "rules" / "walls" / "wall-x.md"
+def test_an_unknown_type_directory_fails_the_scan_instead_of_silently_not_applying(tmp_path: Path) -> None:
+    legacy = tmp_path / ".aegis" / "rules" / "unsupported" / "invariant-x.md"
     legacy.parent.mkdir(parents=True)
-    legacy.write_text("---\nid: wall-x\ntype: wall\ntarget_paths: ['**']\n---\nb\n", encoding="utf-8")
+    legacy.write_text("---\nid: invariant-x\ntype: invariant\ntarget_paths: ['**']\n---\nb\n", encoding="utf-8")
 
     result = scan(tmp_path, ["src/a.py"])
 
-    assert result["status"] == "FAIL" and "aegis migrate" in result["error"]
+    assert result["status"] == "FAIL" and "cannot be served" in result["error"]
 
 
 def test_an_unsafe_rules_tree_fails_closed(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ with one line on stderr naming its replacement.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import os
 import sys
 from pathlib import Path
@@ -23,11 +24,9 @@ __all__ = ["main", "AegisParser", "REMOVED_COMMANDS"]
 
 PROG = "aegis"
 
-# Global options that take a value, so the removed-name scan can skip it.
-_VALUE_OPTIONS = ("--workspace",)
 
-
-def _positionals(argv: List[str]) -> List[str]:
+def _positionals(argv: List[str], parser: argparse.ArgumentParser) -> List[str]:
+    """Skip root option values using the same option table as argparse."""
     out: List[str] = []
     skip = False
     for token in argv:
@@ -35,20 +34,28 @@ def _positionals(argv: List[str]) -> List[str]:
             skip = False
         elif token == "--":
             break
-        elif token in _VALUE_OPTIONS:
-            skip = True
-        elif not token.startswith("-"):
+        elif token.startswith("-"):
+            equals = token.find("=")
+            option = token if equals < 0 else token[:equals]
+            action = parser._option_string_actions.get(option)
+            if action is None and parser.allow_abbrev and option.startswith("--"):
+                matches = [value for flag, value in parser._option_string_actions.items()
+                           if flag.startswith(option)]
+                if len(matches) == 1:
+                    action = matches[0]
+            skip = action is not None and action.nargs != 0 and equals < 0
+        else:
             out.append(token)
     return out
 
 
-def removed_command_pointer(argv: List[str]) -> Optional[str]:
+def removed_command_pointer(argv: List[str], *, parser=None) -> Optional[str]:
     """The one-line pointer for a removed command in argv, or None.
 
     A name the registry still resolves is not removed: a command whose alias
     is cut in another module keeps working until that module drops it.
     """
-    words = _positionals(argv)
+    words = _positionals(argv, parser if parser is not None else _build_parser())
     if not words:
         return None
     pair = " ".join(words[:2])
@@ -69,11 +76,31 @@ class AegisParser(argparse.ArgumentParser):
             return get_default_registry().format_categorized_help(prog=self.prog) + "\n"
         return super().format_help()
 
+    def __init__(self, *args, error_policy=None, **kwargs):
+        self._error_policy = error_policy
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):
+        factory = kwargs.get("parser_class", type(self))
+        kwargs["parser_class"] = partial(factory, error_policy=self._error_policy)
+        return super().add_subparsers(**kwargs)
+
+    def error(self, message: str) -> None:
+        if self._error_policy is not None:
+            self._error_policy()
+        super().error(message)
+
+    def parse_known_args(self, args=None, namespace=None):
+        select = getattr(self._error_policy, "select_parser", None)
+        if select is not None:
+            select(getattr(self, "_model_errors", False))
+        return super().parse_known_args(args=args, namespace=namespace)
+
     def parse_args(self, args=None, namespace=None):
         ns = super().parse_args(args=args, namespace=namespace)
         if not hasattr(ns, "json"):
             ns.json = False
-        # Only `check` keeps --format; its json value must reach code (and the
+        # `check` and `msg read` have --format; its json value must reach code (and the
         # OutputContext below) that reads args.json alone.
         if getattr(ns, "format", None) == "json":
             ns.json = True
@@ -86,7 +113,7 @@ class AegisParser(argparse.ArgumentParser):
         return ns
 
 
-def _build_parser(prog: str = PROG) -> argparse.ArgumentParser:
+def _build_parser(prog: str = PROG, *, error_policy=None) -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     # SUPPRESS, not False: a subparser writes its defaults over the namespace
     # the top-level parser filled, so a False default here drops a `--json`
@@ -100,6 +127,7 @@ def _build_parser(prog: str = PROG) -> argparse.ArgumentParser:
 
     parser = AegisParser(
         prog=prog,
+        error_policy=error_policy,
         description="Aegis Governance — make AI coding agents trustworthy",
         parents=[common_parser],
     )
@@ -244,13 +272,36 @@ def _print_hold(args: argparse.Namespace, exc: Exception) -> None:
         print(f"Hold ({binding['reason']}): {binding['message']}", file=sys.stderr)
 
 
+def _is_model_invocation(argv: List[str]) -> bool:
+    """Classify raw tokens without importing command or model modules."""
+    seen_team = False
+    for token in argv:
+        if token == "--":
+            break
+        if token == "model" and seen_team:
+            return True
+        if token == "team":
+            seen_team = True
+    return False
+
+
 def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not _is_model_invocation(argv):
+        return _main(argv, prog)
+    from aegis_cli.team import ModelErrorPolicy
+
+    policy = ModelErrorPolicy(argv=argv)
+    return policy.run(partial(_main, argv, prog, policy))
+
+
+def _main(argv: List[str], prog: str, policy=None) -> int:
     # Output uses emoji. On a cp1252 stdout (Windows, redirected) printing
     # one raised UnicodeEncodeError and the command exited 1 (BUG-012).
     # stderr already defaults to errors="backslashreplace".
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
-    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = list(argv)
     if argv[:2] == ["hook", "run"] and not {"-h", "--help"} & set(argv[2:]):
         # What the agent-host hook registrations run, from any cwd ($HOME, a v3 .soma/
         # directory): the handler resolves its workspace from the payload and fails open,
@@ -260,13 +311,21 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
         return run_hook_argv(argv[2:])
 
-    pointer = removed_command_pointer(argv)
+    from aegis_cli.msg import MsgErrorPolicy
+
+    if policy is None:
+        policy = MsgErrorPolicy(argv)
+    else:
+        policy.fallback = MsgErrorPolicy(argv)
+    parser = _build_parser(prog=prog, error_policy=policy)
+    pointer = policy.removed_pointer(argv, partial(removed_command_pointer, parser=parser))
     if pointer is not None:
         print(pointer, file=sys.stderr)
         return 2
 
-    parser = _build_parser(prog=prog)
-    args = parser.parse_args(argv)
+    args = policy.parse(parser, argv)
+    if isinstance(args, int):
+        return args
     args.prog = prog
     if args.command is None:
         parser.print_help()
@@ -278,8 +337,14 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
 
     try:
         try:
-            _attach_workspace(args)
-        except WorkspaceError as exc:
+            if args.command != "workspace":
+                _attach_workspace(args)
+        except (WorkspaceError, OSError) as exc:
+            refusal = policy.workspace_error(args, exc)
+            if refusal is not None:
+                return refusal
+            if not isinstance(exc, WorkspaceError):
+                raise
             if isinstance(exc, WorkspaceHold):
                 _print_hold(args, exc)
             else:
@@ -289,6 +354,8 @@ def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as e:
+        if getattr(policy, "model_invocation", False):
+            return policy.operation_error()
         print(f"Error: {e}", file=sys.stderr)
         return 1
 

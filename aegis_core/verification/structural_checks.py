@@ -28,10 +28,11 @@ def run_checks(paths: list[tuple[str, str]], root: str, session: Any, *, fast_mo
                     ))
         except Exception as exc:
             results.append(failure('call_graph', rel, exc))
+    discovery = import_guard.LocalPackageDiscovery()
     for rel, path in checked:
         if rel.endswith('.py'):
             try:
-                result = import_guard.check(path, project_root=root)
+                result = import_guard.check(path, project_root=root, discovery=discovery)
                 missing = not_in_commit(rel, path, root) if not_in_commit and not result.verdict else []
                 if missing:
                     result.detail += (f"; {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not staged or "

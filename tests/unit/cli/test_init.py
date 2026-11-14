@@ -257,6 +257,106 @@ def _tree(*roots: Path) -> dict:
     return out
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_oversized_config_refuses_init_with_bounded_allocation(project, capsys, dry_run):
+    import tracemalloc
+    from aegis_core.config import MAX_CONFIG_BYTES
+
+    # Exclude lazy CLI imports without initializing the measured project.
+    warmup = project.parent / "warmup"
+    warmup.mkdir()
+    assert main(["init", "--workspace", str(warmup), "--json", "--no-hooks", "--yes", "--host", "codex-cli"]) == 0
+    capsys.readouterr()
+    assert list(project.iterdir()) == []
+
+    config = project / ".aegis/config.json"
+    config.parent.mkdir()
+    with config.open("wb") as stream:
+        stream.truncate(16 * 1024 * 1024)
+    flags = ["--dry-run"] if dry_run else ["--yes"]
+    tracemalloc.start()
+    try:
+        code = main(["init", "--workspace", str(project), "--json", "--no-hooks", *flags])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "refused"
+    assert report["errors"] == [
+        f".aegis/config.json exceeds {MAX_CONFIG_BYTES} bytes",
+        "Nothing was written.",
+    ]
+    assert peak < 2 * 1024 * 1024
+    assert config.stat().st_size == 16 * 1024 * 1024
+    assert sorted(path.relative_to(project).as_posix() for path in project.rglob("*")) == [
+        ".aegis", ".aegis/config.json",
+    ]
+
+
+def test_config_growth_after_init_update_has_a_bounded_read(project, capsys, monkeypatch):
+    import tracemalloc
+    from aegis_core.config import MAX_CONFIG_BYTES
+
+    # Exclude lazy CLI imports without initializing the measured project.
+    warmup = project.parent / "warmup"
+    warmup.mkdir()
+    assert main(["init", "--workspace", str(warmup), "--json", "--no-hooks", "--yes", "--host", "codex-cli"]) == 0
+    capsys.readouterr()
+    assert list(project.iterdir()) == []
+
+    config = project / ".aegis/config.json"
+    config.parent.mkdir()
+    config.write_text('{"v": 1}', encoding="utf-8")
+    real_replace = os.replace
+    grown = []
+
+    def grow_at_replace(source, target, *args, **kwargs):
+        result = real_replace(source, target, *args, **kwargs)
+        if Path(target) == config:
+            with config.open("r+b") as stream:
+                stream.truncate(16 * 1024 * 1024)
+            grown.append(True)
+        return result
+
+    monkeypatch.setattr(os, "replace", grow_at_replace)
+    tracemalloc.start()
+    try:
+        code = main(["init", "--workspace", str(project), "--json", "--no-hooks", "--yes", "--host", "codex-cli"])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert grown == [True]
+    assert code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "failed"
+    assert any(f".aegis/config.json exceeds {MAX_CONFIG_BYTES} bytes" in error for error in report["errors"])
+    assert all("no rule, config.json or .aegis/.gitignore was changed" not in error for error in report["errors"])
+    assert peak < 2 * 1024 * 1024
+
+
+def test_config_read_error_refuses_init_without_echoing_os_input(project, capsys, monkeypatch):
+    config = project / ".aegis/config.json"
+    config.parent.mkdir()
+    config.write_text('{"v": 1}', encoding="utf-8")
+    real_open = os.open
+
+    def deny_config(path, *args, **kwargs):
+        if Path(path) == config:
+            raise PermissionError("HOSTILE_MARKER")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_config)
+    code = main(["init", "--workspace", str(project), "--json", "--no-hooks", "--yes"])
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert code == 1 and report["status"] == "refused"
+    assert report["errors"] == ["cannot read .aegis/config.json", "Nothing was written."]
+    assert report["actions"] == []
+    assert "HOSTILE_MARKER" not in output
+    assert config.read_text(encoding="utf-8") == '{"v": 1}'
+
+
 class TestHookRefusal:
     """A pre-commit hook init cannot safely write (a link out of the repository, a dangling
     link, a broken Aegis block) stops init before anything is written, with the real reason;
@@ -369,7 +469,6 @@ class TestHookRefusal:
         out = capsys.readouterr().out
         assert "Prepare-commit-msg hook kept (existing hook is not Aegis's; left alone)" in out
         assert foreign.read_text(encoding="utf-8") == "#!/bin/sh\necho custom\n"
-
 
 
 GIT = shutil.which("git")
@@ -604,11 +703,13 @@ class TestPromptAndDryRun:
         assert "Dry run complete. No files were created." in out
 
     def test_header_and_next_step(self, project, capsys):
+        from tests.contract.test_legacy_ratchet import REQUIRED_WORDS, _word_counts
+
         assert run_init(_args(project)) == 0
         out = capsys.readouterr().out
         assert "Aegis Guardrails — Workspace Setup" in out
         assert "After a session, run: aegis status" in out
-        assert "Soma" not in out
+        assert not any(_word_counts([out], REQUIRED_WORDS).values())
 
     def test_home_directory_is_refused(self, tmp_path, monkeypatch, capsys):
         home = Path.home()
@@ -1264,7 +1365,7 @@ class TestGovernanceHint:
         assert main(["--json", "init", "--workspace", str(project), "--yes", "--no-hooks", "--rules", "minimal"]) == 0
         out = capsys.readouterr().out
         assert set(json.loads(out)) == {"source", "aegis_version", "checked_at", "scope", "dry_run", "status",
-                                        "actions", "errors", "warnings"}
+                                        "actions", "errors", "warnings", "language_capabilities", "runner_suggestion"}
         assert "doctor --github" not in out
         self._no_codeowners(project)
 
@@ -1273,7 +1374,6 @@ class TestGovernanceHint:
         assert "doctor --github" not in capsys.readouterr().out
         assert not (project / ".aegis").exists()
         self._no_codeowners(project)
-
 
 
 # ── Pins: what each run_init path prints and returns (R-cli-a1; recorded before the split) ──
@@ -1484,7 +1584,7 @@ class TestRunInitPins:
         assert run_init(_args(project, "--host", "codex-cli", "--json")) == 1
         captured = capsys.readouterr()
         doc = _one_document(captured.out)
-        assert list(doc) == INIT_KEYS
+        assert list(doc) == INIT_KEYS + ["language_capabilities", "runner_suggestion"]
         add = ["codex", *failing_codex[-1][1:]]
         assert add[:-1] == ["codex", "mcp", "add", "aegis", "--env", "AEGIS_CLIENT=codex-cli", "--"]
         assert (doc["status"], doc["dry_run"], doc["warnings"]) == ("failed", False, [])

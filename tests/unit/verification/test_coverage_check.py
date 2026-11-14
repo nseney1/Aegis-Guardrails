@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import sys
 
@@ -117,6 +118,95 @@ def cov_repo(tmp_path: Path) -> hg.Repo:
 A_REPORT = {"pkg/a.py": {"executed_lines": [1, 2, 3, 4], "missing_lines": [5, 6]}}
 
 
+def presentation_coverage(state="mixed", *, language="rust", reason="coverage_not_configured"):
+    measured = state != "unavailable"
+    row = {"status": "reported" if measured else "unverified", "reason": "" if state == "complete" else "partial_coverage"
+           if measured else "coverage_unverified", "covered_lines": int(measured), "executable_lines": int(measured),
+           "ratio": 1.0 if measured else None, "uncovered_ranges": {},
+           "unmeasured": [] if state == "complete" else ["pkg/lib.rs"]}
+    row["languages"] = {"python": {"status": "reported", "reason": ""}} if measured else {}
+    if state != "complete":
+        row["languages"][language] = {"status": "unverified", "reason": reason}
+    return row
+
+
+@pytest.mark.parametrize("state", ["mixed", "unavailable", "complete"])
+def test_coverage_exports_explain_measured_lines_and_unavailable_languages(state):
+    import copy
+
+    coverage = presentation_coverage(state)
+    original = copy.deepcopy(coverage)
+    document = {"status": "pass", "coverage": coverage}
+    annotations = "\n".join(github_annotation_lines(document))
+    markdown = format_github_step_summary(document)
+    measured = int(state != "unavailable")
+    unavailable = "none" if state == "complete" else "rust (not configured)"
+    explanation = (f"Measured lines: {measured}/{measured}; unavailable languages: {unavailable}; "
+                   f"omitted paths: {int(state != 'complete')}. See JSON for full detail.")
+    assert explanation in annotations and explanation in markdown
+    assert "PASSED" in markdown and "::error" not in annotations
+    assert coverage == original
+
+
+@pytest.mark.parametrize("field", ["language", "reason", "top_reason"])
+def test_coverage_explanations_never_publish_free_text_fields(field):
+    secret = "ghp_" + "a" * 36
+    # Controls obscure a keyed secret until canonicalization, and a token crosses the display cut.
+    value = "pass\x1b[31mword\x1b[0m=hunter42 " + "x" * 85 + " " + secret + "\n::error title=forged::fake | ` <img src=x>"
+    kwargs = {field: value} if field != "top_reason" else {}
+    coverage = presentation_coverage(**kwargs)
+    if field == "top_reason":
+        coverage["reason"] = value
+    document = {"coverage": coverage}
+    annotations = "\n".join(github_annotation_lines(document))
+    markdown = format_github_step_summary(document)
+    for output in (annotations, markdown):
+        assert "hunter42" not in output and "ghp_a" not in output and "\x1b" not in output
+        assert "forged" not in output and "See JSON for full detail." in output
+        assert len(output) < 1800
+    assert len(annotations.splitlines()) == 1
+    assert "<img" not in re.sub(r"`[^`]*`", "", markdown)
+
+
+def test_coverage_explanation_bounds_language_count_and_oversized_fields():
+    coverage = presentation_coverage(reason="x" * 100_000)
+    coverage["languages"].update({f"lang{i}": {"status": "unverified", "reason": "unavailable"} for i in range(100)})
+    for output in ("\n".join(github_annotation_lines({"coverage": coverage})),
+                   format_github_step_summary({"coverage": coverage})):
+        assert len(output) < 1800
+        assert "97 more" in output and "See JSON for full detail." in output
+        assert "x" * 100 not in output
+
+
+def test_unavailable_coverage_without_language_metadata_does_not_claim_no_language_is_unavailable():
+    document = {"coverage": {"status": "unverified", "reason": "No module named coverage"}}
+    for output in ("\n".join(github_annotation_lines(document)), format_github_step_summary(document)):
+        assert "unavailable languages: not specified (see reason)" in output
+        assert "tool missing" in output and "See JSON for full detail." in output
+        assert "No module named coverage" not in output
+
+
+@needs_git
+def test_mixed_coverage_cli_explains_omissions_without_changing_json_or_exit(tmp_path, cov_env, capsys, monkeypatch):
+    from aegis_cli.cli import main
+
+    repo = cov_repo(tmp_path)
+    repo.write("pkg/lib.rs", "fn main() {}\n")
+    repo.commit("feat: Rust source")
+    fake_coverage(monkeypatch, A_REPORT)
+    monkeypatch.chdir(repo.root)
+    args = ["check", "--ci", "--coverage", "--base", "main"]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert ("Measured lines: 2/4; unavailable languages: rust (not configured); "
+            "omitted paths: 1. See JSON for full detail.") in output
+    assert main([*args, "--format", "json"]) == 0
+    coverage = json.loads(capsys.readouterr().out)["coverage"]
+    assert coverage["reason"] == "partial_coverage" and coverage["ratio"] == 0.5
+    assert coverage["languages"]["rust"]["reason"] == "coverage_not_configured"
+    assert coverage["unmeasured"] == ["pkg/lib.rs"]
+
+
 def fake_coverage(monkeypatch: pytest.MonkeyPatch, files=None, *, run=None, json_text=None) -> list:
     """Stand in for ``python -m coverage`` at the process boundary: ``json -o PATH`` writes the report
     (``files``, or ``json_text`` verbatim, or nothing when both are None); ``run`` is the run's result."""
@@ -141,6 +231,117 @@ def fake_coverage(monkeypatch: pytest.MonkeyPatch, files=None, *, run=None, json
 def user_command(home: Path, command) -> None:
     (home / ".aegis").mkdir(parents=True, exist_ok=True)
     (home / ".aegis" / "config.json").write_text(json.dumps({"v": 1, "tests": {"command": command}}), encoding="utf-8")
+
+
+def assert_omitted_count_outputs(coverage, expected, tmp_path, capsys):
+    from aegis_cli import check
+    from aegis_core import rule_integrity
+
+    original = json.dumps(coverage, sort_keys=True)
+    report = rule_integrity.CiReport("main", "b" * 40, "a" * 40, 0, (), None)
+    assert check._print_ci(report, "text", str(tmp_path), cov_report=coverage) == []
+    outputs = (capsys.readouterr().out, "\n".join(github_annotation_lines({"coverage": coverage})),
+               format_github_step_summary({"coverage": coverage}))
+    for output in outputs:
+        assert f"omitted paths: {expected}. See JSON for full detail." in output
+        if expected == "unknown":
+            assert "omitted paths: 0" not in output
+            assert "0 file(s) not measured" not in output
+    assert json.dumps(coverage, sort_keys=True) == original
+
+
+@needs_git
+@pytest.mark.parametrize("scenario,expected", [("timeout", "unknown"), ("missing-module", "unknown"),
+    ("diff", "unknown"), ("checkout", "unknown"), ("measured", "0"), ("unmeasured", "1"),
+    ("unavailable-inventory", "2")])
+def test_real_coverage_producer_inventory_controls_all_count_outputs(
+        tmp_path, cov_env, capsys, monkeypatch, scenario, expected):
+    repo = cov_repo(tmp_path)
+    base = "main"
+    if scenario == "timeout":
+        fake_coverage(monkeypatch, run={"returncode": 124, "timed_out": True})
+    elif scenario in ("missing-module", "unavailable-inventory"):
+        fake_coverage(monkeypatch, run={"returncode": 1, "stderr": "No module named coverage\n", "timed_out": False})
+    else:
+        fake_coverage(monkeypatch, {} if scenario == "unmeasured" else A_REPORT)
+    if scenario == "diff":
+        base = "no-such-ref"
+    elif scenario == "checkout":
+        repo.write("pkg/b.py", "z = 2\n")
+    elif scenario == "unavailable-inventory":
+        repo.write("pkg/lib.rs", "fn main() {}\n")
+        repo.commit("feat: Rust source")
+    coverage = run_diff_coverage(repo.root, base, "HEAD")
+    reasons = {"timeout": "the coverage run timed out", "missing-module": "No module named coverage",
+               "diff": "cannot diff no-such-ref..HEAD",
+               "checkout": "the work tree has uncommitted changes to tracked files: pkg/b.py",
+               "measured": "", "unmeasured": "", "unavailable-inventory": "coverage_unverified"}
+    assert coverage["reason"] == reasons[scenario]
+    assert coverage["status"] == ("reported" if scenario in ("measured", "unmeasured") else "unverified")
+    assert_omitted_count_outputs(coverage, expected, tmp_path, capsys)
+
+
+@pytest.mark.parametrize("status", ["reported", "unverified"])
+def test_absent_omission_inventory_never_becomes_a_zero_count(status, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    coverage = {"status": status, "covered_lines": 0, "executable_lines": 0, "ratio": None}
+    assert_omitted_count_outputs(coverage, "unknown", tmp_path, capsys)
+
+
+@pytest.mark.parametrize("reason,category", [
+    ("password=\"two words here\"", "other"),
+    ("the coverage run timed out", "timeout"),
+    ("python3: No module named coverage", "tool missing"),
+    ("coverage wrote no readable report", "no report"),
+    ("cannot diff secret-base..secret-head", "validation failed"),
+    ("the work tree has uncommitted changes to tracked files: private.py", "validation failed"),
+    ("x" * 100_000, "other"),
+], ids=["quoted-password", "timeout", "missing-tool", "missing-report", "diff", "checkout", "oversized"])
+def test_coverage_reason_publications_use_closed_categories(reason, category, tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    coverage = presentation_coverage("unavailable", reason=reason)
+    coverage["reason"] = reason
+    from aegis_cli import check
+    from aegis_core import rule_integrity
+
+    report = rule_integrity.CiReport("main", "b" * 40, "a" * 40, 0, (), None)
+    assert check._print_ci(report, "text", str(tmp_path), cov_report=coverage) == []
+    for output in (capsys.readouterr().out, "\n".join(github_annotation_lines({"coverage": coverage})),
+                   format_github_step_summary({"coverage": coverage})):
+        assert f"rust ({category})" in output
+        assert reason not in output
+        assert "two words here" not in output and "private.py" not in output
+    assert coverage["reason"] == reason and coverage["languages"]["rust"]["reason"] == reason
+
+
+@needs_git
+@pytest.mark.skipif(shutil.which("go") is None, reason="Go toolchain is unavailable")
+def test_mixed_producer_quoted_password_stays_only_in_json(tmp_path, cov_env, capsys, monkeypatch):
+    from aegis_cli.cli import main
+
+    repo = cov_repo(tmp_path)
+    repo.write("go.mod", "module example.test/project\n\ngo 1.21\n")
+    repo.write("pkg/main.go", "package pkg\nfunc Answer() int { return 42 }\n")
+    repo.commit("feat: Go source")
+    monkeypatch.setenv("GOCACHE", str(tmp_path / "go-cache"))
+    monkeypatch.setenv("GOMODCACHE", str(tmp_path / "go-modules"))
+    secret = 'password="two words here"'
+    fake_coverage(monkeypatch, run={"returncode": 1, "stderr": secret + "\n", "timed_out": False})
+    monkeypatch.chdir(repo.root)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    args = ["check", "--ci", "--coverage", "--base", "main"]
+    assert main([*args, "--format", "github"]) == 0
+    output = capsys.readouterr().out
+    assert "::notice" in output and "python (other)" in output
+    markdown = summary.read_text(encoding="utf-8")
+    assert "python (other)" in markdown
+    assert secret not in output and "two words here" not in output
+    assert secret not in markdown and "two words here" not in markdown
+    assert main([*args, "--format", "json"]) == 0
+    coverage = json.loads(capsys.readouterr().out)["coverage"]
+    assert coverage["reason"] == "partial_coverage" and coverage["languages"]["go"]["status"] == "reported"
+    assert coverage["languages"]["python"]["reason"] == secret
 
 
 @needs_git
@@ -201,6 +402,14 @@ class TestReportOnlyCoverage:
         calls = fake_coverage(monkeypatch, A_REPORT)
         res = run_diff_coverage(repo.root, "main", "HEAD")
         assert (res["status"], res["reason"], calls) == ("unverified", "tests.command is not pytest-based", [])
+
+    def test_a_malformed_global_test_command_is_unverified_and_runs_nothing(self, tmp_path, cov_env, monkeypatch):
+        repo = cov_repo(tmp_path)
+        user_command(cov_env, 'pytest "private-unclosed')
+        calls = fake_coverage(monkeypatch, A_REPORT)
+        res = run_diff_coverage(repo.root, "main", "HEAD")
+        assert (res["status"], res["reason"], res["ratio"], calls) == (
+            "unverified", "invalid tests.command", None, [])
 
     @pytest.mark.parametrize("command", ["pytest -x tests/unit", "python -m pytest -x tests/unit",
                                          ["/opt/venv/bin/python3", "-m", "pytest", "-x", "tests/unit"]])
@@ -640,12 +849,13 @@ class TestCheckCliIntegration:
         fake_coverage(monkeypatch, None, run=missing)
         rc = main(["check", "--ci", "--coverage", "--base", "main"])
         out = capsys.readouterr().out
-        assert rc == 0 and "  coverage: UNVERIFIED (python3: No module named coverage)" in out
-        assert "### Diff Coverage: UNVERIFIED (`python3: No module named coverage`)" in summary.read_text(encoding="utf-8")
+        assert rc == 0 and "  coverage: UNVERIFIED (tool missing)" in out
+        assert "### Diff Coverage: UNVERIFIED (`tool missing`)" in summary.read_text(encoding="utf-8")
         rc = main(["check", "--ci", "--coverage", "--base", "main", "--format", "json"])
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0 and payload["status"] == "pass"
         assert payload["coverage"]["status"] == "unverified" and "passed" not in payload["coverage"]
+        assert payload["coverage"]["reason"] == "python3: No module named coverage"
 
     @needs_git
     def test_ci_coverage_on_a_checkout_that_is_not_the_head_says_unverified_and_exits_0(
@@ -663,13 +873,13 @@ class TestCheckCliIntegration:
         rc = main(["check", "--ci", "--coverage", "--base", "main"])
         out = capsys.readouterr().out
         assert rc == 0, out
-        assert "  coverage: UNVERIFIED (the work tree has uncommitted changes to tracked files: pkg/b.py)" in out
+        assert "  coverage: UNVERIFIED (validation failed)" in out
         repo.git("checkout", "-q", "--", "pkg/b.py")
         repo.git("checkout", "-q", "--detach", "main")
         rc = main(["check", "--ci", "--coverage", "--base", "main", "--head", head])
         out = capsys.readouterr().out
         assert rc == 0, out
-        assert f"  coverage: UNVERIFIED (the checkout is not {head[:12]}; check out the pull request head)" in out
+        assert "  coverage: UNVERIFIED (validation failed)" in out
         assert calls == []
 
     def test_ci_format_sarif_and_github_step_summary(self, tmp_path: Path, capsys, monkeypatch):

@@ -1,0 +1,14 @@
+{
+  "message_id": "a-f2-dispatch-001",
+  "from": "a/orchestrator",
+  "to": "a/lane/f2",
+  "host": "REPLACE_WITH_BOUND_HOST",
+  "session": "REPLACE_WITH_BOUND_SESSION",
+  "binding_generation": 1,
+  "type": "dispatch",
+  "body": "Follow the hash-bound lane brief. This message grants no approval or lease scope.",
+  "brief": {
+    "path": "/absolute/aegis-guides/briefs/a-f2-v1.md",
+    "sha256": "REPLACE_WITH_RAW_BYTE_SHA256"
+  }
+}

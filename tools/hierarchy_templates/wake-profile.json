@@ -1,0 +1,13 @@
+{
+  "schema": "aegis.hierarchy-wake-profile/v1",
+  "endpoint": "a/orchestrator",
+  "host": "claude-code",
+  "session": "REPLACE_WITH_BOUND_SESSION",
+  "generation": 1,
+  "argv": ["claude", "--resume", "REPLACE_WITH_BOUND_SESSION", "--print",
+           "--strict-mcp-config", "--mcp-config", "/absolute/role-connection.json",
+           "--tools", "Read,Grep,Glob"],
+  "cwd": "/absolute/working-directory",
+  "timeout_seconds": 900,
+  "prompt_via": "stdin"
+}

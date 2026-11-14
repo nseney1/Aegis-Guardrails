@@ -7,6 +7,7 @@
     "hook": "hook",
     "init": "init",
     "migrate": "migrate",
+    "msg": "msg",
     "package": "package",
     "rule": "rule",
     "scan": "scan",
@@ -14,7 +15,8 @@
     "status": "status",
     "sync": "sync",
     "team": "team",
-    "uninstall": "uninstall"
+    "uninstall": "uninstall",
+    "workspace": "workspace"
   },
   "parser": {
     "arguments": [
@@ -453,7 +455,7 @@
             "flags": [
               "--tests"
             ],
-            "help": "With --record: also run the test command from the user-scope config (tests.command in ~/.aegis/config.json, default python -m pytest, never the repository's) in the snapshot with a fixed environment; exit 5 or zero passed tests is never evidence",
+            "help": "With --record: run automatically selected languages in a fixed snapshot environment; user-scope tests.command takes precedence and runs once, never the repository's. Python defaults to pytest; native runners: user-scope tests.languages.{go,rust,ts}.command (required for TS/JS). See docs/languages.md; exit 5 or zero passed is never evidence",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -648,7 +650,7 @@
             "flags": [
               "--coverage"
             ],
-            "help": "With --ci only: report-only diff coverage, the share of the executable lines changed since merge-base(--base, --head) that the user-scope tests.command (pytest-based) runs. It never changes the exit code, and a run that cannot be measured says UNVERIFIED with the reason",
+            "help": "With --ci only: report-only diff coverage by language. Python uses pytest-based tests.command; Go defaults to go test -coverprofile; configure native coverage with coverage.languages.ts.command or coverage.languages.rust.command (LCOV), in user scope only. See docs/languages.md. Exit unchanged; unavailable: UNVERIFIED",
             "kind": "store_true",
             "metavar": null,
             "nargs": 0,
@@ -1634,6 +1636,438 @@
         ],
         "description": "Plan, then with --apply perform, the move to the v4 layout: the v3 ledger becomes .aegis/state/ledger.jsonl (v2 rows), aegis.conf/slots.yaml/config.yaml become .aegis/config.json, .soma cells move to .aegis/rules/<type>/, derived counters leave rule frontmatter and v3 runtime state is removed. Every changed file is backed up to .aegis/state/migrate-backup-<time>/ first; running it again changes nothing.",
         "help": "Convert a v3 or .soma workspace to the v4 layout (dry run unless --apply)"
+      },
+      "msg": {
+        "aliases": [],
+        "arguments": [
+          {
+            "default": "==SUPPRESS==",
+            "dest": "help",
+            "flags": [
+              "-h",
+              "--help"
+            ],
+            "help": "show this help message and exit",
+            "kind": "help",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "const": true,
+            "default": "==SUPPRESS==",
+            "dest": "json",
+            "flags": [
+              "--json"
+            ],
+            "help": "Emit machine-readable JSON output",
+            "kind": "store_true",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "const": true,
+            "default": "==SUPPRESS==",
+            "dest": "plain",
+            "flags": [
+              "--plain"
+            ],
+            "help": "Strip ANSI styling and emoji",
+            "kind": "store_true",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "default": "==SUPPRESS==",
+            "dest": "workspace",
+            "flags": [
+              "--workspace"
+            ],
+            "help": "Target workspace root",
+            "kind": "store",
+            "metavar": null,
+            "nargs": null,
+            "required": false,
+            "type": "str"
+          },
+          {
+            "default": null,
+            "dest": "store",
+            "flags": [
+              "--store"
+            ],
+            "help": "Existing private store directory; default: workspace .aegis/state/messages/",
+            "kind": "store",
+            "metavar": "DIR",
+            "nargs": null,
+            "required": false
+          },
+          {
+            "default": null,
+            "dest": "msg_action",
+            "flags": [],
+            "help": null,
+            "kind": "parsers",
+            "metavar": "ACTION",
+            "nargs": "A...",
+            "required": true
+          }
+        ],
+        "commands": {
+          "read": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "store",
+                "flags": [
+                  "--store"
+                ],
+                "help": "Existing private store directory; default: workspace .aegis/state/messages/",
+                "kind": "store",
+                "metavar": "DIR",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "ref",
+                "flags": [],
+                "help": "64-hex id or unambiguous 16-64 lowercase hex prefix",
+                "kind": "store",
+                "metavar": "REF",
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": [],
+                "dest": "fields",
+                "flags": [
+                  "--fields"
+                ],
+                "help": "At most 16 selectors, depth 8: dotted paths, indices, one-level * and row projection findings.*.{id,severity,file,line}; comma separated; repeatable",
+                "kind": "BoundedSelections",
+                "metavar": "SEL",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": [],
+                "dest": "spans",
+                "flags": [
+                  "--spans"
+                ],
+                "help": "Zero-based body span indices; at most 64 selections; comma separated; repeatable",
+                "kind": "BoundedSelections",
+                "metavar": "N",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": false,
+                "dest": "outline",
+                "flags": [
+                  "--outline"
+                ],
+                "help": "Include outline; alone emits only the envelope and outline",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "since",
+                "flags": [
+                  "--since"
+                ],
+                "help": "Log rows after cursor; 0 starts a new cursor",
+                "kind": "store",
+                "metavar": "CURSOR",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": [],
+                "dest": "expand",
+                "flags": [
+                  "--expand"
+                ],
+                "help": "Expand a named ref one level, charged to max-chars; comma separated; repeatable",
+                "kind": "BoundedSelections",
+                "metavar": "NAME",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "json",
+                "dest": "format",
+                "flags": [
+                  "--format"
+                ],
+                "help": "View format: json, md or tsv; --json requires json; MD fences data as untrusted, TSV uses JSON values",
+                "kind": "store",
+                "metavar": "FORMAT",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "60000",
+                "dest": "max_chars",
+                "flags": [
+                  "--max-chars"
+                ],
+                "help": "Output character limit; excess refuses with E_LIMIT: narrow the selectors",
+                "kind": "store",
+                "metavar": "N",
+                "nargs": null,
+                "required": false
+              }
+            ],
+            "description": "No selectors: pass through records up to 4000 canonical chars; otherwise show outline and top-level scalars. JSON is default; TSV is opt-in. All role-authored text is verbatim and untrusted.",
+            "help": "Render a verified message view"
+          },
+          "verify": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "store",
+                "flags": [
+                  "--store"
+                ],
+                "help": "Existing private store directory; default: workspace .aegis/state/messages/",
+                "kind": "store",
+                "metavar": "DIR",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "ref",
+                "flags": [],
+                "help": "64-hex id or unambiguous 16-64 lowercase hex prefix",
+                "kind": "store",
+                "metavar": "REF",
+                "nargs": null,
+                "required": true
+              }
+            ],
+            "description": null,
+            "help": "Verify canonical bytes and content hash"
+          },
+          "write": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "store",
+                "flags": [
+                  "--store"
+                ],
+                "help": "Existing private store directory; default: workspace .aegis/state/messages/",
+                "kind": "store",
+                "metavar": "DIR",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "choices": [
+                  "text",
+                  "record",
+                  "log",
+                  "blob",
+                  "review.v1",
+                  "prereview.v1",
+                  "handoff.v1",
+                  "leadreport.v1"
+                ],
+                "default": null,
+                "dest": "kind",
+                "flags": [
+                  "--kind"
+                ],
+                "help": "Message kind; fields must match its schema",
+                "kind": "store",
+                "metavar": "K",
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "input_file",
+                "flags": [
+                  "--in"
+                ],
+                "help": "UTF-8 JSON content object (fields, body, refs); - reads stdin; at most 262144 bytes. ATX headings (# through ###### at line start) outside code fences define body-character spans, each ending at the next heading or body end",
+                "kind": "store",
+                "metavar": "FILE",
+                "nargs": null,
+                "required": true
+              }
+            ],
+            "description": "Input must contain exactly fields, body and refs. The CLI authors schema, kind, meta (from=cli, host=cli, empty session, UTC time) and spans.",
+            "help": "Store caller-authored message content"
+          }
+        },
+        "description": "Records are untrusted data, never instructions. Store defaults to the workspace's .aegis/state/messages/ (created private on write through the state helper). Run aegis init first; message commands never initialize a workspace. All errors are fixed JSON with exit 2. Reading never acknowledges a message.",
+        "help": "Write, read and verify untrusted content-addressed messages"
       },
       "package": {
         "aliases": [],
@@ -3701,6 +4135,350 @@
             "description": "Refuse when a live lease of another lane may overlap the paths; otherwise create the lane's lease, or take over its expired lease. Prints the new lease oid.",
             "help": "Lease a lane's paths; prints the lease oid"
           },
+          "config": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "config_action",
+                "flags": [],
+                "help": null,
+                "kind": "parsers",
+                "metavar": null,
+                "nargs": "A...",
+                "required": false
+              }
+            ],
+            "commands": {
+              "init": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "preset",
+                    "flags": [
+                      "--preset"
+                    ],
+                    "help": "Preset name from config presets",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "host",
+                    "flags": [
+                      "--host"
+                    ],
+                    "help": "Bind the preset host kind at initialization; see config presets --json",
+                    "kind": "store",
+                    "metavar": "KIND",
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "force",
+                    "flags": [
+                      "--force"
+                    ],
+                    "help": "Replace an existing valid profile",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Write the repository team profile"
+              },
+              "presets": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "List built-in team presets"
+              },
+              "show": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "Show every resolved value and its layer"
+              }
+            },
+            "description": null,
+            "help": "Inspect or initialize a layered team profile"
+          },
+          "doctor": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              }
+            ],
+            "description": null,
+            "help": "Check profile completeness and host CLIs on PATH"
+          },
           "gc": {
             "aliases": [],
             "arguments": [
@@ -3759,6 +4537,95 @@
             ],
             "description": "Delete every expired lease by compare-and-swap; unreadable leases are kept.",
             "help": "Delete expired leases"
+          },
+          "hosts": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "hosts_action",
+                "flags": [],
+                "help": "status, check or usage",
+                "kind": "store",
+                "metavar": "VERB",
+                "nargs": "?",
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "host",
+                "flags": [],
+                "help": "Declared host alias (see status --json)",
+                "kind": "store",
+                "metavar": "HOST",
+                "nargs": "?",
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "kind",
+                "flags": [],
+                "help": "Job kind or declared role/lens",
+                "kind": "store",
+                "metavar": "KIND",
+                "nargs": "?",
+                "required": false
+              }
+            ],
+            "description": "Read capacity advice: status | usage | check HOST KIND. KIND: writer, review, extra-review, doc, research, a declared role or lens. check exits 0 go / 3 hold / 4 fallback / 5 skip; 1 refused / 2 usage. Real usage readers are adapter extension points; credentials are never read.",
+            "help": "Read host capacity and per-host usage"
           },
           "list": {
             "aliases": [],
@@ -3889,6 +4756,988 @@
             ],
             "description": "Claims and denials from the events log, and for each first-parent merge since --base: whether both sides changed a common path and whether git merge-tree reports a conflict (unavailable before git 2.38). GitHub's synthetic refs/pull/*/merge commits are excluded.",
             "help": "Lease events and merge outcomes"
+          },
+          "model": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "bindings",
+                "flags": [
+                  "--bindings"
+                ],
+                "help": "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "policy",
+                "flags": [
+                  "--policy"
+                ],
+                "help": "Team selection policy JSON file inside the workspace (bounded, regular, no symlinks)",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "history",
+                "flags": [
+                  "--history"
+                ],
+                "help": "Decision JSONL path inside the workspace in an existing owner-only directory; missing log means empty history",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "task_kind",
+                "flags": [
+                  "--task-kind"
+                ],
+                "help": "Task kind T1 through T14, validated by the core",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "role_kind",
+                "flags": [
+                  "--role-kind"
+                ],
+                "help": "Seat kind: orchestrator, decider, implementer, integrator or reviewer",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "subject",
+                "flags": [
+                  "--subject"
+                ],
+                "help": "Single-line lane/endpoint/generation identifier for this decision",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "host_kinds",
+                "flags": [
+                  "--host-kind"
+                ],
+                "help": "Host registry kind; repeat for each host (at most 256)",
+                "kind": "ModelHostKinds",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "intent",
+                "flags": [
+                  "--intent"
+                ],
+                "help": "Semantic intent: light, standard, deep, extended, max or ultra; default from policy/role band",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "author_family",
+                "flags": [
+                  "--author-family"
+                ],
+                "help": "Author family required for reviews; T7 binds it to its chosen family",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "lane_family",
+                "flags": [
+                  "--lane-family"
+                ],
+                "help": "Lane family required for T3; writer lanes must match team_family",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": "primary",
+                "dest": "review_stage",
+                "flags": [
+                  "--review-stage"
+                ],
+                "help": "Review stage: primary, correctness, security, whole or second as allowed by the task",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": false,
+                "dest": "record",
+                "flags": [
+                  "--record"
+                ],
+                "help": "Atomically select and append under the history lock (60-second timeout); default preview",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              }
+            ],
+            "description": "Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed and rejected levels refuse with binding_not_admitted.",
+            "help": "Select a model; optionally record the decision"
+          },
+          "queue": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "queue_action",
+                "flags": [],
+                "help": null,
+                "kind": "parsers",
+                "metavar": "VERB",
+                "nargs": "A...",
+                "required": false
+              }
+            ],
+            "commands": {
+              "add": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item",
+                    "flags": [
+                      "--item"
+                    ],
+                    "help": "Queue item object; no file paths are opened",
+                    "kind": "store",
+                    "metavar": "JSON",
+                    "nargs": null,
+                    "required": true
+                  }
+                ],
+                "description": null,
+                "help": "Enqueue a bounded inline JSON item"
+              },
+              "audit": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "Report held work needing a decision"
+              },
+              "claim": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item_id",
+                    "flags": [],
+                    "help": "Stable queue item id",
+                    "kind": "store",
+                    "metavar": "ITEM",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "expect",
+                    "flags": [
+                      "--expect"
+                    ],
+                    "help": "Current revision returned by add or list",
+                    "kind": "store",
+                    "metavar": "REVISION",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "lane",
+                    "flags": [
+                      "--lane"
+                    ],
+                    "help": "Lane declared in .aegis/team.json",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "branch",
+                    "flags": [
+                      "--branch"
+                    ],
+                    "help": "Lane's local branch; omitted means unknown branch evidence",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": null,
+                    "dest": "capabilities",
+                    "flags": [
+                      "--capability"
+                    ],
+                    "help": "Team capability label; repeat for each label",
+                    "kind": "Capabilities",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "default": 3600,
+                    "dest": "ttl",
+                    "flags": [
+                      "--ttl"
+                    ],
+                    "help": "Claim lifetime, at most one day",
+                    "kind": "store",
+                    "metavar": "SECONDS",
+                    "nargs": null,
+                    "required": false,
+                    "type": "int"
+                  }
+                ],
+                "description": null,
+                "help": "Claim a current item revision with a lease"
+              },
+              "compact": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  }
+                ],
+                "description": null,
+                "help": "Remove completed items not needed by unfinished dependencies"
+              },
+              "done": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item_id",
+                    "flags": [],
+                    "help": "Stable queue item id",
+                    "kind": "store",
+                    "metavar": "ITEM",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "expect",
+                    "flags": [
+                      "--expect"
+                    ],
+                    "help": "Current revision returned by claim or list",
+                    "kind": "store",
+                    "metavar": "REVISION",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "lane",
+                    "flags": [
+                      "--lane"
+                    ],
+                    "help": "Current claim lane; required for a live claim",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Complete a live claim"
+              },
+              "list": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "capabilities",
+                    "flags": [
+                      "--capability"
+                    ],
+                    "help": "Filter by a team capability label; repeat for each label",
+                    "kind": "Capabilities",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "include_done",
+                    "flags": [
+                      "--include-done"
+                    ],
+                    "help": "Include completed items hidden by default",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "List items, blockers and lane labels"
+              },
+              "release": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item_id",
+                    "flags": [],
+                    "help": "Stable queue item id",
+                    "kind": "store",
+                    "metavar": "ITEM",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "expect",
+                    "flags": [
+                      "--expect"
+                    ],
+                    "help": "Current revision returned by claim or list",
+                    "kind": "store",
+                    "metavar": "REVISION",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "lane",
+                    "flags": [
+                      "--lane"
+                    ],
+                    "help": "Current claim lane; required for a live claim",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Release a claim"
+              },
+              "unclaim": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item_id",
+                    "flags": [],
+                    "help": "Stable queue item id",
+                    "kind": "store",
+                    "metavar": "ITEM",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "expect",
+                    "flags": [
+                      "--expect"
+                    ],
+                    "help": "Current revision returned by claim or list",
+                    "kind": "store",
+                    "metavar": "REVISION",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "lane",
+                    "flags": [
+                      "--lane"
+                    ],
+                    "help": "Current claim lane; required for a live claim",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "writer_stopped",
+                    "flags": [
+                      "--writer-stopped"
+                    ],
+                    "help": "Acknowledge that the lane's writer and queued jobs are stopped",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "",
+                    "dest": "reason",
+                    "flags": [
+                      "--reason"
+                    ],
+                    "help": "Single-line noncredential reason for returning the claim and its leases",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Return a claim together with its intersecting lane leases"
+              }
+            },
+            "description": "Queue add, list, claim, release, unclaim, done, audit and compact; all results are JSON.",
+            "help": "Manage queued team work with CAS leases"
           },
           "release": {
             "aliases": [],
@@ -4065,6 +5914,90 @@
             "description": "Renew by compare-and-swap; an expired lease is re-claimed, overlap check included.",
             "help": "Extend a lease; prints the new lease oid"
           },
+          "status": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": "Target workspace root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": null,
+                "dest": "base",
+                "flags": [
+                  "--base"
+                ],
+                "help": "Compare branch tips to this commit (default: the base resolved by check --lane)",
+                "kind": "store",
+                "metavar": "REF",
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": false,
+                "dest": "check",
+                "flags": [
+                  "--check"
+                ],
+                "help": "Check each live lane's captured branch tip; exit 1 for failed or unavailable verdicts",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              }
+            ],
+            "description": "A lease is conflict input, not liveness proof: it records which paths a lane declared and until when, not that its agent is still working. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics. Inspection changes no leases, worktrees or events.",
+            "help": "Inspect every lane, branch and optional tip verdict"
+          },
           "transfer": {
             "aliases": [],
             "arguments": [
@@ -4172,7 +6105,7 @@
           }
         },
         "description": "Leases under refs/aegis/lanes/<lane> declare which paths a lane works on. A lease is cooperative conflict input, not a lock, not an identity and not proof that an agent is alive: claims of different lanes can race, and owner and role are display labels. The backstops are the post-lane gate (aegis check --lane) and aegis team metrics.",
-        "help": "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)"
+        "help": "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)"
       },
       "uninstall": {
         "aliases": [],
@@ -4308,6 +6241,547 @@
         ],
         "description": "Remove the git pre-commit hook block, the Aegis blocks in AGENTS.md and CLAUDE.md, this workspace's entry in ~/.aegis/workspaces.json and the Aegis MCP registration (including the v3 name) of the hosts it was registered with. A host that another registered workspace still lists keeps its registration unless named with --host. Never deletes .aegis/.",
         "help": "Remove Aegis from this workspace's hosts, AGENTS.md/CLAUDE.md and git hook (keeps .aegis/)"
+      },
+      "workspace": {
+        "aliases": [],
+        "arguments": [
+          {
+            "default": "==SUPPRESS==",
+            "dest": "help",
+            "flags": [
+              "-h",
+              "--help"
+            ],
+            "help": "show this help message and exit",
+            "kind": "help",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "const": true,
+            "default": "==SUPPRESS==",
+            "dest": "json",
+            "flags": [
+              "--json"
+            ],
+            "help": "Emit machine-readable JSON output",
+            "kind": "store_true",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "const": true,
+            "default": "==SUPPRESS==",
+            "dest": "plain",
+            "flags": [
+              "--plain"
+            ],
+            "help": "Strip ANSI styling and emoji",
+            "kind": "store_true",
+            "metavar": null,
+            "nargs": 0,
+            "required": false
+          },
+          {
+            "default": "==SUPPRESS==",
+            "dest": "workspace",
+            "flags": [
+              "--workspace"
+            ],
+            "help": "Target workspace root",
+            "kind": "store",
+            "metavar": null,
+            "nargs": null,
+            "required": false,
+            "type": "str"
+          },
+          {
+            "default": "==SUPPRESS==",
+            "dest": "config",
+            "flags": [
+              "--config"
+            ],
+            "help": "Explicit manager configuration path",
+            "kind": "store",
+            "metavar": null,
+            "nargs": null,
+            "required": false
+          },
+          {
+            "default": null,
+            "dest": "workspace_action",
+            "flags": [],
+            "help": null,
+            "kind": "parsers",
+            "metavar": null,
+            "nargs": "A...",
+            "required": true
+          }
+        ],
+        "commands": {
+          "activate": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "config",
+                "flags": [
+                  "--config"
+                ],
+                "help": "Explicit manager configuration path",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "revision",
+                "flags": [
+                  "--revision"
+                ],
+                "help": "Full control-repository policy commit",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "expect",
+                "flags": [
+                  "--expect"
+                ],
+                "help": "Expected active revision, or none for bootstrap",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "approval",
+                "flags": [
+                  "--approval"
+                ],
+                "help": "JSON containing the exact statement and owner-signed approval commit",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              }
+            ],
+            "description": null,
+            "help": "Review or apply an owner-signed revision"
+          },
+          "init": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "config",
+                "flags": [
+                  "--config"
+                ],
+                "help": "Explicit manager configuration path",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "workspace_id",
+                "flags": [
+                  "--workspace-id"
+                ],
+                "help": "Stable manager workspace identity",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "control_repo",
+                "flags": [
+                  "--control-repo"
+                ],
+                "help": "Private control repository root",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "store",
+                "flags": [
+                  "--store"
+                ],
+                "help": "External manager audit directory",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "trusted_signers",
+                "flags": [
+                  "--trusted-signers"
+                ],
+                "help": "Owner-selected public allowed-signers file",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              }
+            ],
+            "description": null,
+            "help": "Prepare draft configuration and registration"
+          },
+          "report": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "config",
+                "flags": [
+                  "--config"
+                ],
+                "help": "Explicit manager configuration path",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "decision",
+                "flags": [
+                  "--decision"
+                ],
+                "help": "Immutable decision reference returned by scan",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": [],
+                "dest": "rules",
+                "flags": [
+                  "--rules"
+                ],
+                "help": "Served manager rule IDs used in this decision",
+                "kind": "store",
+                "metavar": null,
+                "nargs": "*",
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "outcome",
+                "flags": [
+                  "--outcome"
+                ],
+                "help": "Claimed outcome; acknowledgement grants no verified completion",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": "[]",
+                "dest": "evidence",
+                "flags": [
+                  "--evidence"
+                ],
+                "help": "Qualified evidence references as a JSON array",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "idempotency_key",
+                "flags": [
+                  "--idempotency-key"
+                ],
+                "help": "Stable key reused for identical outcome retries",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              }
+            ],
+            "description": null,
+            "help": "Append an audit outcome without fitness credit"
+          },
+          "scan": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "config",
+                "flags": [
+                  "--config"
+                ],
+                "help": "Explicit manager configuration path",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": null,
+                "dest": "action",
+                "flags": [
+                  "--action"
+                ],
+                "help": "Management action to match against manager policy",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              },
+              {
+                "default": null,
+                "dest": "context",
+                "flags": [
+                  "--context"
+                ],
+                "help": "Bounded management context as a JSON object",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": true
+              }
+            ],
+            "description": null,
+            "help": "Record a management decision and matching rules"
+          },
+          "status": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "config",
+                "flags": [
+                  "--config"
+                ],
+                "help": "Explicit manager configuration path",
+                "kind": "store",
+                "metavar": null,
+                "nargs": null,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": "Emit machine-readable JSON output",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": "Strip ANSI styling and emoji",
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              }
+            ],
+            "description": null,
+            "help": "Inspect audit, approval and native enforcement states"
+          }
+        },
+        "description": "Manager audit prototype: explicit configuration, zero fitness credit, and no native Teams enforcement or delegation authority.",
+        "help": "Audit management decisions using a separately approved manager policy"
       }
     },
     "description": "Aegis Governance — make AI coding agents trustworthy"
@@ -4357,6 +6831,12 @@
     },
     {
       "aliases": [],
+      "category": "Plumbing",
+      "help": "Write, read and verify untrusted content-addressed messages",
+      "name": "msg"
+    },
+    {
+      "aliases": [],
       "category": "Setup & Environment",
       "help": "Write an experimental Claude Code plugin directory (MCP server, hook, skills); nothing is published",
       "name": "package"
@@ -4394,7 +6874,7 @@
     {
       "aliases": [],
       "category": "Daily Workflow & Verification",
-      "help": "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, metrics)",
+      "help": "Lease lane paths for parallel agents (claim, renew, transfer, release, gc, list, status, metrics)",
       "name": "team"
     },
     {
@@ -4402,6 +6882,12 @@
       "category": "Setup & Environment",
       "help": "Remove Aegis from this workspace's hosts, AGENTS.md/CLAUDE.md and git hook (keeps .aegis/)",
       "name": "uninstall"
+    },
+    {
+      "aliases": [],
+      "category": "Daily Workflow & Verification",
+      "help": "Audit management decisions using a separately approved manager policy",
+      "name": "workspace"
     }
   ],
   "removed_commands": {

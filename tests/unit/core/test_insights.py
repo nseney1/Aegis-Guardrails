@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import ast
+import errno
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
+import unicodedata
 
 import pytest
 
@@ -19,7 +23,6 @@ from aegis_core.insights import (
     capture_suggestion,
     create_link_key,
     dirty_paths,
-    has_correction_cue,
     host_capture_status,
     insight_workspace_id,
     insights_path,
@@ -28,7 +31,6 @@ from aegis_core.insights import (
     read_link_key,
     record_decision,
     record_hook_prompt,
-    redact_insight_text,
     review_insights,
     session_hs,
     write_proposal,
@@ -65,6 +67,36 @@ def test_link_key_refuses_symlinks_and_corrupt_sizes(tmp_path: Path):
     with pytest.raises(ValueError, match="corrupt"):
         create_link_key(home)
     assert read_link_key(home) is None
+
+
+def test_read_link_key_closes_descriptor_when_fdopen_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from aegis_core.insights import keys
+
+    home = tmp_path / "home"
+    create_link_key(home)
+    descriptors = []
+
+    def fail_fdopen(fd, mode):
+        assert mode == "rb"
+        descriptors.append(fd)
+        raise OSError("fdopen failed")
+
+    local_os = SimpleNamespace(**vars(os))
+    local_os.fdopen = fail_fdopen
+    monkeypatch.setattr(keys, "os", local_os)
+
+    try:
+        assert read_link_key(home) is None
+        assert len(descriptors) == 1
+        with pytest.raises(OSError) as exc_info:
+            os.fstat(descriptors[0])
+        assert exc_info.value.errno == errno.EBADF
+    finally:
+        for fd in descriptors:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
 
 
 def test_session_hs_rejects_invalid_inputs(tmp_path: Path):
@@ -400,6 +432,107 @@ def test_an_ungoverned_repository_under_home_keeps_the_cwds_own_id(hook_home: Pa
     assert _insight_texts(proj / "sub", hook_home) == ["No, wrong file"]
 
 
+@pytest.mark.parametrize("marker", ["directory", "gitfile"])
+def test_insight_workspace_id_at_ceiling_ignores_enclosing_repository(tmp_path: Path, monkeypatch, marker):
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _git(checkout, "init", "-q")
+    if marker == "gitfile":
+        metadata = tmp_path / "checkout.git"
+        (checkout / ".git").rename(metadata)
+        (checkout / ".git").write_text("gitdir: " + str(metadata) + "\n", encoding="utf-8")
+    start = checkout / "basetemp"
+    start.mkdir()
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    assert insight_workspace_id(start) != standalone
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+
+    assert insight_workspace_id(start) == standalone
+
+
+@pytest.mark.parametrize("boundary", ["start", "inside-ceiling", "above-ceiling"])
+def test_insight_workspace_id_honours_explicit_git_layout(tmp_path: Path, monkeypatch, boundary):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    ceiling = tmp_path / "ceiling"
+    top = ceiling / "worktree"
+    start = top / "sub"
+    start.mkdir(parents=True)
+    reported_top = {"start": start, "inside-ceiling": top, "above-ceiling": tmp_path}[boundary]
+    monkeypatch.setenv("GIT_DIR", str(repository / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(reported_top))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(ceiling))
+    relative = start.resolve().relative_to(reported_top.resolve()).as_posix()
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00{relative}"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+def test_single_explicit_git_layout_above_ceiling_keeps_boundary_and_identity(
+    tmp_path: Path, monkeypatch, layout_variable
+):
+    from aegis_core.workspace.binding import git_boundary
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "core.worktree", str(repository.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else repository
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    canonical = f"{(repository / '.git').resolve().as_posix()}\x00basetemp"
+    expected = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert git_boundary(start) == repository.resolve()
+    assert insight_workspace_id(start) == expected
+
+
+@pytest.mark.parametrize("layout_variable", ["GIT_DIR", "GIT_WORK_TREE"])
+@pytest.mark.parametrize("git_answer", ["off-path", "query-failure", "unresolvable"])
+def test_unusable_explicit_git_layout_does_not_supply_insights_identity(
+    tmp_path: Path, monkeypatch, layout_variable, git_answer
+):
+    from aegis_core import gitsafe
+    from aegis_core.insights import keys
+
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    off_path = tmp_path / "off-path"
+    off_path.mkdir()
+    _git(repository, "config", "core.worktree", str(off_path.resolve()))
+    start = repository / "basetemp"
+    start.mkdir()
+    value = repository / ".git" if layout_variable == "GIT_DIR" else off_path
+    monkeypatch.setenv(layout_variable, str(value))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(start))
+    assert gitsafe.toplevel(start) == off_path.resolve()
+    if git_answer != "off-path":
+        class UnresolvablePath(type(Path())):
+            def resolve(self, *args, **kwargs):
+                raise OSError("Git top cannot be resolved")
+
+        reported = UnresolvablePath(off_path) if git_answer == "unresolvable" else None
+        git_api = SimpleNamespace(**vars(gitsafe))
+        git_api.toplevel = lambda cwd: reported
+        monkeypatch.setattr(keys, "gitsafe", git_api)
+    standalone = hashlib.sha256(start.resolve().as_posix().encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+    assert insight_workspace_id(start) == standalone
+
+
 def test_claude_project_dir_wins_over_the_payload_cwd(tmp_path: Path, hook_home: Path, monkeypatch):
     repo, other = _make_repo(tmp_path / "repo"), _make_repo(tmp_path / "other")
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
@@ -687,17 +820,19 @@ def test_the_hook_takes_its_session_and_workspace_from_the_canonical_keys_only(t
 
 
 def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
-    """Every Name and Attribute identifier used in the Python files under ``roots``, except
-    ``module_file`` itself (a package's ``__init__.py``: the whole package) and the nodes in ``skip``."""
-    import ast
-
+    """Identifiers in Python files mentioning insights before or after NFKC under ``roots``,
+    except ``module_file`` (a package's ``__init__.py``: the whole package) and nodes in ``skip``."""
     inside = module_file.resolve().parent if module_file.name == "__init__.py" else module_file.resolve()
     seen = set()
     for root in roots:
         for path in root.rglob("*.py"):
             if path.resolve() == inside or inside in path.resolve().parents:
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            # Python normalizes identifiers with NFKC before exposing them in the AST.
+            if "insights" not in text and (text.isascii() or "insights" not in unicodedata.normalize("NFKC", text)):
+                continue
+            tree = ast.parse(text)
             skipped = {id(n) for top in ast.walk(tree) if isinstance(top, ast.FunctionDef) and top.name in skip
                        for n in ast.walk(top)}
             for node in ast.walk(tree):
@@ -714,13 +849,63 @@ def _defined_names_referenced_outside(module_file: Path, roots, skip) -> set:
     return seen
 
 
-def test_every_name_in_insights_all_is_used_outside_the_module():
+@pytest.mark.parametrize("irrelevant", [
+    "coincidental_name = 1\n", "invalid syntax (\n", "# \u2500\ninvalid syntax (\n", "# \u00e9\ninvalid syntax (\n",
+])
+def test_insights_name_scan_skips_sources_without_the_needle(tmp_path: Path, irrelevant: str):
+    package = tmp_path / "insights"
+    package.mkdir()
+    module_file = package / "__init__.py"
+    module_file.write_text("# insights: invalid syntax (\n", encoding="utf-8")
+    (package / "internal.py").write_text("insights internal syntax (\n", encoding="utf-8")
+    (tmp_path / "irrelevant.py").write_text(irrelevant, encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        'from aegis_core.insights import used_alias\n'
+        'insights.used_attribute(used_name, "patched_name")\n'
+        'def excluded_test():\n    ignored_name()\n', encoding="utf-8",
+    )
+
+    seen = _defined_names_referenced_outside(module_file, [tmp_path], {"excluded_test"})
+
+    assert {"used_alias", "used_attribute", "used_name", "patched_name"} <= seen
+    assert "coincidental_name" not in seen
+    assert "ignored_name" not in seen
+
+
+def test_insights_name_scan_counts_nfkc_normalized_consumers(tmp_path: Path):
+    source = "from aegis_core.\uff49nsights import capture_suggestion\n"
+    assert "insights" not in source
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    seen = _defined_names_referenced_outside(tmp_path / "insights.py", [tmp_path], set())
+    assert "capture_suggestion" in seen
+
+
+@pytest.mark.parametrize("source", ["insights syntax (\n", "# \uff49nsights\ninvalid syntax (\n"])
+def test_insights_name_scan_still_rejects_malformed_candidates(tmp_path: Path, source: str):
+    (tmp_path / "caller.py").write_text(source, encoding="utf-8")
+    with pytest.raises(SyntaxError):
+        _defined_names_referenced_outside(tmp_path / "insights.py", [tmp_path], set())
+
+
+def test_every_name_in_insights_all_is_used_outside_the_module(monkeypatch: pytest.MonkeyPatch):
+    real_parse = ast.parse
+    parse_count = 0
+
+    def counted_parse(text):
+        nonlocal parse_count
+        parse_count += 1
+        return real_parse(text)
+
+    counted_ast = SimpleNamespace(**vars(ast))
+    counted_ast.parse = counted_parse
+    monkeypatch.setattr(sys.modules[__name__], "ast", counted_ast)
     repo = Path(__file__).resolve().parents[3]
     roots = [repo / name for name in ("aegis_cli", "aegis_core", "aegis_mcp", "aegis_sdk", "tests")]
     used = _defined_names_referenced_outside(Path(core_insights.__file__), roots,
                                              {"test_every_name_in_insights_all_is_used_outside_the_module"})
     assert sorted(set(core_insights.__all__) - used) == []
     assert all(hasattr(core_insights, name) for name in core_insights.__all__)
+    assert 0 < parse_count <= 80, parse_count
 
 
 def test_dead_insight_names_are_gone():
@@ -1077,7 +1262,10 @@ S0 = {
     "cue": _S0_IMPORT | {"aegis_core.config", "aegis_core.verification", "aegis_core.verification.scanners",
                          "aegis_core.verification.test_runner"},
 }
-NEW_MODULES = frozenset({"aegis_core.redaction", *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
+# The storage split accompanies storage at all three hook stages.
+NEW_MODULES = frozenset({"aegis_core.redaction", "aegis_core.storage_shared",
+                         "aegis_core.gitsafe_run",
+                         *(f"aegis_core.insights.{m}" for m in INSIGHT_MODULES)})
 REVIEW_ONLY = frozenset({"aegis_core.credit", "aegis_core.human_gate", "aegis_core.rules",
                          "aegis_core.scan_compliance", "aegis_core.telemetry_engine.ledger"})
 _HOOK_PATH = r"""
@@ -1103,9 +1291,12 @@ sys.stdout.write(json.dumps(found))
 
 
 def _child_env(home: Path) -> dict:
-    return {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
+    env = {"HOME": str(home), "USERPROFILE": str(home), "PATH": os.environ.get("PATH", ""),
             "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(home / ".gitconfig")}
+    if "GIT_CEILING_DIRECTORIES" in os.environ:
+        env["GIT_CEILING_DIRECTORIES"] = os.environ["GIT_CEILING_DIRECTORIES"]
+    return env
 
 
 def unexpected_modules(loaded, before) -> list:
@@ -1170,3 +1361,50 @@ def test_two_processes_appending_at_once_leave_100_whole_rows(tmp_path: Path, hb
     read = read_jsonl(path)
     assert (len(read.rows), read.skipped_lines, read.torn_tail) == (100, [], False)
     assert {r["event"] for r in read.rows} == {"heartbeat"} and len({r["hs"] for r in read.rows}) == 100
+
+
+_HOLD = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from aegis_core.storage import file_lock
+
+with file_lock(Path(sys.argv[2])):
+    sys.stdout.reconfigure(newline=sys.argv[4])
+    sys.stdout.write("held\n")
+    sys.stdout.flush()
+    time.sleep(float(sys.argv[3]))
+"""
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_a_prompt_waits_out_a_lock_held_past_5s_and_keeps_its_row(tmp_path: Path, hb_home: Path, newline):
+    """Sad path, deterministic stand-in for the two-process race above (which once lost a row to
+    a 5 s LockTimeoutError under suite load): Given another process holding the insight log's
+    lock for 6 s, longer than file_lock's generic 5 s, When a prompt is recorded, Then it waits
+    for the lock instead of raising, and its heartbeat is appended whole."""
+    import time
+
+    from aegis_core.storage import read_jsonl
+
+    ws = tmp_path / "ws"
+    (ws / ".aegis").mkdir(parents=True)
+    create_link_key(hb_home)
+    prompt = {"prompt": "Please run the tests.", "cwd": str(ws)}
+    record_hook_prompt("claude-code", {**prompt, "session_id": "s-0"}, workspace=ws, excerpts=False, home=hb_home)
+    path = insights_path(ws, home=hb_home)
+    holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLD, str(REPO), str(path.with_suffix(".lock")), "6", newline],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=_child_env(hb_home), cwd=str(ws))
+    try:
+        assert holder.stdout.readline() in (b"held\n", b"held\r\n"), holder.stderr.read().decode("utf-8", "replace")
+        started = time.monotonic()
+        record_hook_prompt("claude-code", {**prompt, "session_id": "s-1"}, workspace=ws, excerpts=False, home=hb_home)
+        assert time.monotonic() - started > 5.0  # it really waited past the generic budget
+    finally:
+        _, err = holder.communicate(timeout=60)
+    assert holder.returncode == 0, err.decode("utf-8", "replace")
+    read = read_jsonl(path)
+    assert (len(read.rows), read.skipped_lines, read.torn_tail) == (2, [], False)
+    assert [r["event"] for r in read.rows] == ["heartbeat", "heartbeat"]

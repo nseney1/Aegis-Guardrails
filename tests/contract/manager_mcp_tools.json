@@ -1,0 +1,205 @@
+{
+  "tools": [
+    {
+      "name": "aegis_scan",
+      "description": "Record a manager action and bounded context; return matching manager rules and an immutable decision reference.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "delegation",
+              "ownership",
+              "hierarchy",
+              "resource_budget",
+              "checkpoint",
+              "handoff",
+              "evidence_review",
+              "escalation",
+              "policy_change"
+            ]
+          },
+          "context": {
+            "type": "object",
+            "properties": {
+              "member_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "worktree_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "role": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "phase": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "risk": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "member_id",
+              "worktree_id"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "action",
+          "context"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "aegis_list_rules",
+      "description": "Inspect the activated manager policy only; no repository implementation rules or fitness exposure.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "aegis_report_outcome",
+      "description": "Record a claimed outcome for a served manager decision. Audit acknowledgement always earns zero fitness credit.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "decision_ref": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "[0-9a-f]{64}"
+          },
+          "rules_used": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "maxItems": 128
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "success",
+              "partial",
+              "failure",
+              "pass",
+              "fail",
+              "tp",
+              "fp"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "member_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "worktree_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "source_tree": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "check": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "rule_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "rule_revision": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "reference": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              },
+              "required": [
+                "member_id",
+                "worktree_id",
+                "source_tree",
+                "check",
+                "rule_id",
+                "rule_revision",
+                "reference"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 20
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "tests_passed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "decision_ref",
+          "rules_used",
+          "outcome",
+          "idempotency_key"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}
