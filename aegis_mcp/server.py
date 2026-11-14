@@ -80,6 +80,10 @@ _registry_cache: Optional[Tuple[Tuple[Any, ...], Registry]] = None
 _manager_config: Optional[str] = None
 _manager_digest: Optional[str] = None
 _manager_error: Optional[Dict[str, str]] = None
+_queue_registration: Optional[str] = None
+_queue_grant = None
+_queue_error: Optional[str] = None
+_queue_initialized: bool = False
 
 
 def fresh_state() -> Dict[str, Any]:
@@ -103,6 +107,10 @@ def fresh_state() -> Dict[str, Any]:
         "_manager_config": None,
         "_manager_digest": None,
         "_manager_error": None,
+        "_queue_registration": None,
+        "_queue_grant": None,
+        "_queue_error": None,
+        "_queue_initialized": False,
     }
 
 _RATE_LIMITS = {
@@ -371,6 +379,10 @@ def _queue_repository_call(req_id, params):
 
 def _client_tool_result(req_id, params):
     """Apply tool-specific client boundaries before generic workspace binding."""
+    if isinstance(params, dict) and params.get("name") == "aegis_team_queue_claim":
+        return _queue_claim_call(req_id, params)
+    if _queue_registration is not None and (not isinstance(params, dict) or params.get("name") != "aegis_team_queue"):
+        return _error(req_id, -32602, "Unknown queue tool.")
     if isinstance(params, dict) and params.get("name") == "aegis_team_queue":
         return _queue_repository_call(req_id, params)
     model_refusal = _model_request_refusal(req_id, params)
@@ -388,6 +400,55 @@ def _client_tool_result(req_id, params):
                                      any(k not in TOOL_ARGUMENTS[params["name"]] for k in supplied)):
             return _message_refusal(req_id, "E_FORMAT")
     return None
+
+
+def _start_queue(registration):
+    global _queue_registration, _queue_grant, _queue_error, _canonical_workspace
+    from . import queue_role
+
+    _queue_registration = registration
+    try:
+        _queue_grant = queue_role.bind(registration)
+        _canonical_workspace = _queue_grant.workspace
+    except queue_role.RoleRefusal as exc:
+        _queue_error = exc.reason
+
+
+def _initialize_queue(req_id, params):
+    global _queue_initialized, _session_id
+    if _queue_initialized:
+        if _queue_grant is not None:
+            _queue_grant.invalidate()
+        return _error(req_id, -32600, "Queue connection already initialized.")
+    _queue_initialized = True
+    _session_id = _queue_grant.session if _queue_grant is not None else uuid.uuid4().hex
+    params = params if isinstance(params, dict) else {}
+    # This connection has no host-identity grant. Environment/client labels
+    # neither authorize nor enter its output; retain the neutral fresh state.
+    return {"jsonrpc": "2.0", "id": req_id, "result": {
+        "protocolVersion": negotiate_protocol(params.get("protocolVersion")), "capabilities": {"tools": {}},
+        "serverInfo": {"name": "aegis-mcp-queue", "version": __version__},
+        "instructions": "Use aegis_team_queue to list and aegis_team_queue_claim to claim under owner policy.",
+    }}
+
+
+def _queue_claim_call(req_id, params):
+    from . import queue_role
+
+    args = params.get("arguments", {})
+    invalid = queue_role.claim_argument_refusal(args)
+    if invalid is not None:
+        return _json_tool_result(req_id, invalid, True)
+    if _queue_error is not None or _queue_grant is None:
+        return _json_tool_result(req_id, queue_role.refusal(_queue_error or "role_missing"), True)
+    try:
+        binding = _bind(params, {})
+        if not binding.bound or str(binding.root) != _queue_grant.workspace:
+            return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
+        result = execute_tool("aegis_team_queue_claim", args, queue_grant=_queue_grant, queue_session=_session_id)
+        return _json_tool_result(req_id, result, bool(result.get("refused")))
+    except Exception:
+        return _json_tool_result(req_id, queue_role.refusal("queue_io_unavailable"), True)
 
 
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -413,6 +474,8 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     if method == "initialize":
+        if _queue_registration is not None:
+            return _initialize_queue(req_id, params)
         params = params if isinstance(params, dict) else {}
         # One id per initialize: it never equals the host's session id that the insight hook
         # sees, so insight joins go by host, time window and rule rev (insights.JOIN_WINDOW_S).
@@ -526,6 +589,10 @@ def _repository_call(req_id, params, name, args):
 
 
 def _tool_definitions():
+    if _queue_registration is not None:
+        from .registry import QUEUE_TOOL_DEFINITIONS
+
+        return QUEUE_TOOL_DEFINITIONS
     if _manager_config is None:
         return TOOL_DEFINITIONS
     from .manager import TOOL_DEFINITIONS as manager_tools
@@ -566,12 +633,15 @@ def _manager_call(req_id, params):
     return _json_tool_result(req_id, result, is_error_result(result))
 
 
-def _start(environ: Optional[Dict[str, str]] = None) -> None:
+def _start(environ: Optional[Dict[str, str]] = None, *, queue_registration=None) -> None:
     """Reset the connection state and read what the process was started with."""
     global _canonical_workspace, _workspace_error, _server_cwd, _claude_project_dir
     global _manager_config, _manager_digest, _manager_error
     for attr, value in fresh_state().items():
         globals()[attr] = value
+    if queue_registration is not None:
+        _start_queue(queue_registration)
+        return
     env = os.environ if environ is None else environ
     try:
         _server_cwd = os.getcwd()
@@ -616,9 +686,9 @@ def harden_process() -> bool:
         return False
 
 
-def run_stdio_server():
+def run_stdio_server(*, queue_registration=None):
     harden_process()
-    _start()
+    _start(queue_registration=queue_registration)
     try:
         stream = input_stream(sys.stdin)
         max_bytes = REPOSITORY_MAX_BYTES if _manager_config is None else MANAGER_MAX_BYTES

@@ -2102,6 +2102,12 @@ PROOF_REGISTRATION_GROUPS = {
         ((0,), 'Fixture chdir operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
     ('tests/unit/cli/test_cli_team_queue.py', 'test_queue_refuses_invalid_raw_workspace_before_resolution', 'fixture', 'monkeypatch.chdir', False):
         ((0,), 'BL-16a round 7 runs the raw-workspace refusal table in process; the fixture enters its own temporary workspace cwd and pytest restores it; no module attribute is patched.'),
+    ('tests/unit/mcp/test_mcp_queue_role.py', 'owner_factory.create', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1), 'BL-16c sets HOME and USERPROFILE to the test-owned account fixture for hermetic queue/profile IO; monkeypatch restores both. Product authority still comes from the separately patched account-database boundary.'),
+    ('tests/unit/mcp/test_mcp_queue_role.py', 'test_ordinary_connection_has_no_grant', 'fixture', 'monkeypatch.setenv', False):
+        ((0, 1), 'BL-16c supplies AEGIS_ROLE and AEGIS_QUEUE_REGISTRATION to prove environment strings cannot opt ordinary MCP into claim authority; monkeypatch restores both.'),
+    ('tests/unit/mcp/test_mcp_queue_role.py', 'test_queue_identity_environment_is_never_printed', 'fixture', 'monkeypatch.setenv', False):
+        ((0,), 'BL-16c supplies a synthetic credential-shaped AEGIS_CLIENT value to prove queue initialization never echoes or trusts host-label environment text; monkeypatch restores it.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_failure_is_json_exit_two', 'fixture', 'monkeypatch.setenv', False):
         ((0,), 'Fixture setenv operation; environment, path or restoration API outside the module-attribute census. The control enters its temporary directory and pins a missing workspace to verify the fixed model_workspace_unavailable JSON refusal.'),
     ('tests/unit/cli/test_cli_team.py', 'test_model_workspace_spellings_keep_fixed_json_errors', 'fixture', 'monkeypatch.chdir', False):

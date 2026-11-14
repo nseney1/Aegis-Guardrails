@@ -324,6 +324,56 @@ of owner-only state is outside v5.0's threat model. These records supply no OS
 authorization. Renew/gc liveness changes and build-kit wrapper retirement remain
 separate follow-up work.
 
+### Owner-bound MCP queue connection
+
+The owner can register a separate queue MCP server with an installed, isolated
+interpreter:
+
+```sh
+python -I -c 'from aegis_mcp.queue_owner import main; raise SystemExit(main())' ID
+```
+
+This connection exposes exactly `aegis_team_queue` and `aegis_team_queue_claim`.
+The ordinary Aegis connection keeps its existing tool list. Claim accepts only
+`id`, `expect` (the actual revision returned by list), and `lane`; it starts no
+host and creates no repository lease or execution authority.
+
+Before launch, the owner installs a private registration at
+`<account-home>/.aegis/mcp-queue/registrations/ID.json`, using directories with mode
+0700 and files with mode 0600. Account home comes from the effective UID's account
+database, never HOME, USERPROFILE or XDG settings. The registration fields are
+`schema`, `registration_id`, `endpoint`, `role`, `workspace`, `lanes`, `ttl_s` and
+`session_ttl_s`; see the [complete registration example](how-it-works.md#owner-bound-queue-connection).
+Only `role: orchestrator` can claim a lane admitted by that policy. Capability
+labels, branch and claim TTL come from the owner registration; caller role fields,
+environment strings and repository files cannot grant or widen permission.
+Registration lanes, capabilities and branches use the queue's shared validators.
+Invalid lane names, duplicate capabilities and invalid branch labels return
+`role_invalid` before a session record is created.
+
+Launch writes a process/session record bound to the registration's original byte
+digest. Linux process-instance qualification and descriptor-relative no-follow
+operations are required; other platforms refuse with `unsupported_platform`
+(`BL-16c-PORTABLE`). Safe separator and dot spellings of the workspace identify the
+same directory; parent traversal and symlinked workspaces refuse. Both TTLs are
+owner-selected integers from 1 through 86400 seconds. Changed or expired authority
+records and a second initialize invalidate the session; the owner must restart it.
+Even an equivalent rewrite of registration bytes requires a fresh session.
+
+The owner must exclude the authority directory and its replaceable ancestors from
+every hostile child's sandbox. The product does not verify this deployment
+prerequisite, and file modes do not isolate unrestricted processes sharing the
+owner UID. The separate OS-principal boundary remains `OS-PRINCIPAL-1`.
+
+Claim refusals return the queue claim envelope with `isError: true`, fixed reasons
+and recovery guidance. Malformed input returns `invalid_arguments` before IO;
+authority reasons are `role_missing`, `role_invalid`, `role_foreign`, `role_stale`,
+`role_forbidden`, `role_lock_timeout` and `role_io_unavailable`. Workspace/dispatch
+failures return `queue_io_unavailable`; unsupported hosts return
+`unsupported_platform`. Existing queue refusals, such as `stale_revision`,
+`blocked` and `queue_lock_timeout`, retain their core semantics. Exit codes in the
+envelope are 0 for success, 2 for invalid arguments and 1 for other refusals.
+
 ## Inspect every lane
 
 ```sh
