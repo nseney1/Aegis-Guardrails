@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,125 @@ from tests.integration.test_hierarchy_workspace import Workspace
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="durable lifecycle mutation requires POSIX directory fsync")
 TOOL = ROOT / "tools" / "hierarchy_router.py"
 TEAM_ENDPOINTS = ("front-door", "orchestrator", "root", "router")
+
+
+@pytest.mark.parametrize("command", ["status","route"])
+@pytest.mark.parametrize("planned", [False,True])
+@pytest.mark.parametrize("damage", ["mailbox","team","bindings","across"])
+def test_round13_public_target_error_holds_only_its_team(tmp_path,command,planned,damage):
+    from tests.integration.test_hierarchy_fresh_brief import r13_consumer_probe,R13_CONSUMER_GOLDENS
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    assert r13_consumer_probe(tmp_path,command,planned,damage)==R13_CONSUMER_GOLDENS[(command,planned,damage)]
+
+
+@pytest.mark.parametrize("seam", ["deliver","closing-report"])
+def test_round13_delivery_and_closing_report_keep_baseline_disposition(tmp_path,seam):
+    from tests.integration.test_hierarchy_fresh_brief import r13_consumer_probe,R13_CONSUMER_GOLDENS
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    damage="mailbox" if seam=="deliver" else "inputs"
+    assert r13_consumer_probe(tmp_path,seam,False,damage)==R13_CONSUMER_GOLDENS[(seam,False,damage)]
+
+
+R10_POLICY_TRACE = r'''
+import json, sys
+from pathlib import Path
+from types import SimpleNamespace
+tools, journal, store, phase, fault, telemetry, home = sys.argv[1:]
+sys.path.insert(0, tools)
+import hierarchy_router as router
+import hierarchy_lifecycle as life
+import hierarchy_workspace as workspace
+import hierarchy_fresh_brief as fresh
+home = Path(home)
+(home / '.codex').mkdir(parents=True)
+environment = {**router.os.environ, 'ROUND10_HOME': str(home / '.codex')}
+router.os = SimpleNamespace(**{**vars(router.os), 'environ': environment})
+router._owner_home = lambda: home
+router._home_declarations = lambda: (('ROUND10_HOME', '.codex'),)
+seen, guards = {'injected': False}, []
+original = fresh._Operation.verify
+identity_error = ValueError('cannot determine private directory identity')
+def verified(self):
+    original(self)
+    if seen['injected']:
+        return
+    frames, frame = [], sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_filename.endswith('hierarchy_router.py'):
+            frames.append((frame.f_code.co_name, frame.f_locals))
+        frame = frame.f_back
+    names = {name for name, _values in frames}
+    selected = (
+        phase == 'status-first' and any(name == 'status' and 'ledger' in values for name, values in frames)
+        or phase == 'status-second' and any(name == 'row_view' and 'prior' in values and 'root' not in values
+                                            for name, values in frames)
+        or phase == 'report' and any(name == 'report' and 'ledger' in values for name, values in frames)
+        or phase == 'route-report' and 'route' in names and any(name == 'report' and 'ledger' in values
+                                                               for name, values in frames)
+        or phase == 'delivery' and 'deliver' in names and any(name == 'attempt' and 'binding' in values
+                                                             and 'published' not in values for name, values in frames))
+    if selected:
+        seen['injected'] = True
+        guard = self.path_guard
+        guards.append(guard)
+        if fault == 'policy':
+            environment['ROUND10_HOME'] = str(home / 'changed')
+        else:
+            guard._identity_error = identity_error
+fresh._Operation.verify = verified
+if phase == 'report':
+    try:
+        value = router.report(life.Lifecycle(journal), workspace.Store(store), 0)
+    except (ValueError, OSError) as error:
+        print(json.dumps({'error': str(error)}))
+        code = 2
+    else:
+        print(json.dumps({'result': value}))
+        code = 0
+else:
+    command = (['route', '--actor', 'router-1', '--evidence-only'] if phase in {'route-report', 'delivery'}
+               else ['status'])
+    code = router.main(['--lifecycle', journal, '--store', store, *command, '--wait', '0'])
+if guards:
+    guard = guards[0]
+    failure = guard._global_failure
+    seen['guard_latched'] = failure is not None
+    seen['type'] = type(failure).__name__
+    environment['ROUND10_HOME'] = str(home / '.codex')
+    guard._identity_error = None
+    try:
+        guard.current()
+    except (ValueError, OSError) as error:
+        seen['retry_same'] = error is failure
+    else:
+        seen['retry_same'] = False
+    router._CapturedPathGuard().current()
+    seen['independent_healthy'] = True
+Path(telemetry).write_text(json.dumps(seen))
+sys.exit(code)
+'''
+
+
+@pytest.mark.parametrize("phase", ["status-first", "status-second", "report", "route-report", "delivery"])
+@pytest.mark.parametrize("fault", ["policy", "identity"])
+def test_round10_latched_policy_is_never_a_mailbox_row_refusal(loop, phase, fault):
+    loop.approved(request("ordinary"))
+    telemetry = loop.tmp / "policy-trace.json"
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", R10_POLICY_TRACE,
+        str(ROOT / "tools"), str(loop.ledger.path), str(loop.workspace.store), phase, fault,
+        str(telemetry), str(loop.tmp / "owner")], capture_output=True, timeout=30)
+    assert result.stderr == b"", result.stderr
+    seen = json.loads(telemetry.read_text())
+    assert seen["injected"] and seen["guard_latched"], seen
+    assert seen["retry_same"] and seen["independent_healthy"], seen
+    expected_type = "CapturedPolicyError" if fault == "policy" else "ValueError"
+    assert seen["type"] == expected_type
+    expected = ("host-home configuration changed during capture" if fault == "policy"
+                else "cannot determine private directory identity")
+    assert result.returncode == 2, result.stdout
+    assert json.loads(result.stdout)["error"] == expected
+    if phase == "delivery":
+        assert loop.inbox("engine") == []
 
 
 def team_mailbox(tmp_path, team, endpoints=TEAM_ENDPOINTS, bound=TEAM_ENDPOINTS):
@@ -81,6 +201,198 @@ def loop(tmp_path):
     space = Loop(tmp_path)
     space.team("engine")
     return space
+
+
+@pytest.mark.parametrize("entry", ["status", "report", "route", "mcp"])
+def test_round6_one_identity_snapshot_per_public_request(loop, monkeypatch, entry):
+    import hierarchy_router as router
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    import hierarchy_mailbox_mcp as mcp
+    private = loop.tmp / "private"
+    private.mkdir()
+    calls = []
+    real_os = router.os
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private:
+            calls.append(path)
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: loop.tmp / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    journal, store = life.Lifecycle(loop.ledger.path), workspace.Store(loop.workspace.store)
+    connection = mcp.Connection(loop.mailboxes["engine"], "engine/router", "host-one", "engine-router", 1,
+        workspace_store=loop.workspace.store, initiative="engine", lifecycle=loop.ledger.path)
+    for _ in range(2):
+        calls.clear()
+        if entry == "mcp":
+            answer = mcp.handle(connection, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "router_status", "arguments": {}}})
+            assert not answer.get("isError"), answer
+        elif entry == "status": router.status(journal, store, 0)
+        elif entry == "report": router.report(journal, store, 0)
+        else: router.route(journal, store, "router-1", 0)
+        assert calls == [private], calls
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["single", "nested"])
+@pytest.mark.parametrize("surface,flag", [("router", "--lifecycle"), ("router", "--store"),
+    ("router", "--recipes"), ("compose", "--root"), ("compose", "--lifecycle"),
+    ("compose", "--delivery-dir"), ("verify", "--path"), ("loop", "--lifecycle"),
+    ("loop", "--store"), ("loop", "--recipes"), ("loop", "--state-dir")])
+def test_round6_no_plan_symlink_refusal_bytes(tmp_path, surface, flag, nested):
+    from tests.conftest import symlink_or_skip
+    public, linked = tmp_path / "public", tmp_path / "linked"
+    public.mkdir()
+    symlink_or_skip(public, linked, target_is_directory=True)
+    target = str(linked / "input")
+    if nested:
+        destination = tmp_path / "destination"
+        destination.mkdir()
+        symlink_or_skip(destination, public / "inner", target_is_directory=True)
+        target = str(linked / "inner/input")
+    if surface == "router":
+        tool = TOOL
+        arguments = ["--lifecycle", str(tmp_path / "journal"), "--store", str(tmp_path / "store"),
+                     "status", "--recipes", str(tmp_path / "recipes")]
+    elif surface == "loop":
+        tool = ROOT / "tools/hierarchy_loop.py"
+        arguments = ["--lifecycle", str(tmp_path / "journal"), "--store", str(tmp_path / "store"),
+            "--recipes", str(tmp_path / "recipes"), "--state-dir", str(tmp_path / "state"), "once"]
+    elif surface == "compose":
+        tool = ROOT / "tools/hierarchy_fresh_brief.py"
+        arguments = ["compose", "--root", str(tmp_path / "mailbox"), "--initiative", "engine",
+            "--endpoint", "engine/router", "--lifecycle", str(tmp_path / "journal"),
+            "--delivery-dir", str(tmp_path / "delivery")]
+    else:
+        tool = ROOT / "tools/hierarchy_fresh_brief.py"
+        arguments = ["verify", "--path", target, "--sha256", "0" * 64]
+    arguments[arguments.index(flag) + 1] = target
+    result = subprocess.run([sys.executable, "-I", "-B", str(tool), *arguments],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and not result.stderr, result.stdout + result.stderr
+    assert json.loads(result.stdout)["error"].encode() == ("symlink paths are not supported: " + str(linked)).encode()
+
+
+def test_round8_stored_public_scope_symlink_is_a_global_cli_refusal(loop):
+    from tests.conftest import symlink_or_skip
+    public, linked = loop.tmp / "public", loop.tmp / "linked"
+    public.mkdir()
+    linked.mkdir()
+    loop.approved(request("hostile", paths=[str(linked / "file.py")]))
+    linked.rmdir()
+    symlink_or_skip(public, linked, target_is_directory=True)
+    expected = "symlink paths are not supported: " + str(linked)
+    for _ in range(2):
+        answer = loop.run("status", "--wait", "5", expect=2)
+        assert answer["error"].encode() == expected.encode()
+        assert answer["state"] == "hold" and "requests" not in answer
+
+
+def test_round6_no_plan_missing_journal_lock_bytes(tmp_path):
+    result = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--lifecycle", str(tmp_path / "journal"),
+        "--store", str(tmp_path / "store"), "status", "--wait", "0"], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and not result.stderr
+    assert json.loads(result.stdout)["error"] == "[Errno 2] No such file or directory: " + repr(str(tmp_path / "journal/.write.lock"))
+
+
+@pytest.mark.parametrize("component", ["root", "ancestor"])
+@pytest.mark.parametrize("surface", ["status", "lock", "deliver"])
+def test_round7_no_plan_not_directory_lock_bytes(tmp_path, component, surface):
+    import errno
+    import hierarchy_router as router
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    if not fresh._reference_descriptors(): pytest.skip("secure lock requires directory descriptors")
+    world = Loop(tmp_path)
+    world.team("engine")
+    value = world.approved(request())
+    ordinary = tmp_path / "ordinary"
+    ordinary.write_text("regular file")
+    root = ordinary if component == "root" else ordinary / "nested"
+    expected = str(NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(root / ".write.lock")))
+    def probe():
+        if surface == "status":
+            result = subprocess.run([sys.executable, "-I", "-B", str(TOOL), "--lifecycle", str(root),
+                "--store", str(world.workspace.store), "status", "--wait", "0"],
+                capture_output=True, text=True, timeout=30)
+            assert result.returncode == 2 and not result.stderr
+            assert json.loads(result.stdout)["error"].encode() == expected.encode()
+        elif surface == "deliver":
+            ledger = workspace.Store(world.workspace.store).load()
+            ledger.initiatives["engine"]["mailbox_root"] = str(root)
+            delivered, refusal = router.deliver(life.Lifecycle(world.ledger.path), ledger, "router-1", value["id"], 5)
+            assert delivered is None
+            assert refusal == {"reason": "delivery_error", "detail": expected}
+        else:
+            with pytest.raises(NotADirectoryError) as refusal:
+                with router.writer_lock(root): pass
+            assert str(refusal.value).encode() == expected.encode()
+    probe()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe), pool.submit(probe)]: future.result(timeout=30)
+    ordinary.unlink()
+    root.mkdir(parents=True)
+    with router.writer_lock(root): assert (root / ".write.lock").is_file()
+    assert not (root / ".write.lock").exists()
+
+
+def test_round6_no_plan_lock_permission_bytes_and_retry(tmp_path, monkeypatch):
+    import errno
+    import hierarchy_router as router
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors(): pytest.skip("secure lock requires directory descriptors")
+    root, real_os, failed = tmp_path.resolve(), router.os, []
+    def opened(path, *args, **kwargs):
+        if path == ".write.lock" and not failed:
+            failed.append(True)
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+        return real_os.open(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "open": opened}))
+    with pytest.raises(PermissionError) as refusal:
+        with router.writer_lock(root): pass
+    assert str(refusal.value).encode() == ("[Errno 13] Permission denied: " + repr(str(root / ".write.lock"))).encode()
+    assert not (root / ".write.lock").exists()
+    with router.writer_lock(root): assert (root / ".write.lock").exists()
+    assert not (root / ".write.lock").exists()
+
+
+@pytest.mark.parametrize("stage", ["open", "stat", "fstat"])
+def test_round6_lock_parent_errors_without_errno_are_refused_and_closed(tmp_path, monkeypatch, stage):
+    import hierarchy_router as router
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors(): pytest.skip("secure lock requires directory descriptors")
+    root, injected, live = tmp_path.resolve(), [], set()
+    def fail(which):
+        if stage == which and not injected:
+            injected.append(which)
+            raise OSError("UNTRUSTED errno-less parent failure")
+    def opened(path, *args, **kwargs):
+        fail("open")
+        descriptor = os.open(path, *args, **kwargs)
+        live.add(descriptor)
+        return descriptor
+    def stated(path, *args, **kwargs):
+        if path == root.anchor: fail("stat")
+        return os.stat(path, *args, **kwargs)
+    def fstated(descriptor):
+        fail("fstat")
+        return os.fstat(descriptor)
+    def closed(descriptor):
+        live.discard(descriptor)
+        return os.close(descriptor)
+    boundary = SimpleNamespace(**{**vars(os), "open": opened, "stat": stated, "fstat": fstated, "close": closed})
+    monkeypatch.setattr("hierarchy_router.os", boundary)
+    monkeypatch.setattr("hierarchy_fresh_brief.os", boundary)
+    with pytest.raises(ValueError, match="^cannot create journal lock$"):
+        with router.writer_lock(root): pass
+    assert injected == [stage] and not live
+    assert not (root / ".write.lock").exists()
+    with router.writer_lock(root): pass
+    assert not live and not (root / ".write.lock").exists()
 
 
 def test_an_approved_request_reaches_the_team_orchestrator_with_its_exact_bytes(loop):
@@ -615,6 +927,21 @@ def test_status_names_a_bad_argument_as_the_source_of_its_refusal(loop):
                                        "error": "--lifecycle must be absolute without traversal: got 'lifecycle'"}
 
 
+@pytest.mark.parametrize("flag", ["--lifecycle", "--store", "--recipes", "--state-dir"])
+@pytest.mark.parametrize("invalid", ["relative", "traversal"])
+def test_privacy_preflight_preserves_the_loops_argument_refusal(tmp_path, flag, invalid):
+    paths = {name: str(tmp_path / name[2:]) for name in ("--lifecycle", "--store", "--recipes", "--state-dir")}
+    value = "relative" if invalid == "relative" else str(tmp_path / "parent" / ".." / "input")
+    paths[flag] = value
+    arguments = [argument for name, path in paths.items() for argument in (name, path)]
+    for _ in range(2):
+        proc = subprocess.run([sys.executable, "-I", "-B", str(ROOT / "tools/hierarchy_loop.py"),
+            *arguments, "once"], capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 2 and not proc.stderr, proc.stdout + proc.stderr
+        assert json.loads(proc.stdout) == {"error": flag + " must be absolute without traversal: got " + repr(value)}
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_a_route_refusal_carries_no_source(loop):
     (Path(loop.workspace.store) / "events" / "junk").write_text("x")
 
@@ -624,6 +951,7 @@ def test_a_route_refusal_carries_no_source(loop):
 @pytest.mark.parametrize("home_kind", ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "TEST_EXTRA_PRIVATE_HOME", "default-codex", "default-claude", "unrelated"])
 @pytest.mark.parametrize("command", ["status", "dispatch"])
 def test_r12_public_router_private_roots_refuse_before_discovery(tmp_path, home_kind, command):
+    """Refuse before private content discovery; trusted root identity metadata stays bounded."""
     import shutil
     world = Loop(tmp_path)
     home = tmp_path / "modelled-account"
@@ -637,7 +965,7 @@ import importlib.util, json, os, pwd, sys
 from pathlib import Path
 from types import SimpleNamespace
 spec=importlib.util.spec_from_file_location('hierarchy_router',sys.argv[1])
-router=importlib.util.module_from_spec(spec);spec.loader.exec_module(router)
+router=importlib.util.module_from_spec(spec);sys.modules['hierarchy_router']=router;spec.loader.exec_module(router)
 import hierarchy_hosts
 pwd.getpwuid=lambda uid: SimpleNamespace(pw_dir=sys.argv[2])
 if sys.argv[3]=='TEST_EXTRA_PRIVATE_HOME':
@@ -647,16 +975,45 @@ if sys.argv[3]=='TEST_EXTRA_PRIVATE_HOME':
     hierarchy_hosts.describe=lambda:data
 for host in hierarchy_hosts.describe()['hosts'].values(): os.environ.pop(host['home']['variable'],None)
 if not sys.argv[3].startswith('default-'): os.environ[sys.argv[3] if sys.argv[3]!='unrelated' else 'CODEX_HOME']=sys.argv[4]
-private=Path(sys.argv[4]); accesses=[]
-def observe(path):
-    if isinstance(path,(str,bytes,os.PathLike)):
-        value=Path(os.fsdecode(path))
-        if value==private or private in value.parents: accesses.append(str(value))
-old_stat,old_lstat=os.stat,os.lstat
-def checked_stat(path,*a,**kw): observe(path);return old_stat(path,*a,**kw)
-def checked_lstat(path,*a,**kw): observe(path);return old_lstat(path,*a,**kw)
-os.stat,os.lstat=checked_stat,checked_lstat
-sys.addaudithook(lambda event,args: observe(args[0]) if event in {'open','os.scandir','os.listdir','os.mkdir'} and args else None)
+private=Path(sys.argv[4]); accesses=[]; operations=[]; active=None; fd_paths={}
+import hierarchy_fresh_brief as fresh
+original_init=fresh._Operation.__init__
+def initialized(self,*args,**kwargs):
+    original_init(self,*args,**kwargs)
+    operations.append(self)
+fresh._Operation.__init__=initialized
+original_identities=router._CapturedPathGuard.identities
+def identities(self):
+    global active
+    owner=next((i for i,operation in enumerate(operations) if operation.path_guard is self),None)
+    frame=sys._getframe(1)
+    while frame is not None:
+        candidate=frame.f_locals.get('operation',frame.f_locals.get('_operation'))
+        if candidate in operations:owner=operations.index(candidate)
+        frame=frame.f_back
+    previous,active=active,owner
+    try:return original_identities(self)
+    finally:active=previous
+router._CapturedPathGuard.identities=identities
+def actual(path,kw):
+    if isinstance(path,int):return fd_paths.get(path)
+    if not isinstance(path,(str,bytes,os.PathLike)):return None
+    value=Path(os.fsdecode(path))
+    return fd_paths[kw['dir_fd']]/value if not value.is_absolute() and kw.get('dir_fd') in fd_paths else value
+def observe(path,kind,kw=None):
+    value=actual(path,kw or {})
+    if value is not None and (value==private or private in value.parents):
+        accesses.append({'path':str(value),'kind':kind,'operation':active})
+old_stat,old_lstat,old_open,old_close=os.stat,os.lstat,os.open,os.close
+def checked_stat(path,*a,**kw): observe(path,'stat',kw);return old_stat(path,*a,**kw)
+def checked_lstat(path,*a,**kw): observe(path,'lstat',kw);return old_lstat(path,*a,**kw)
+def opened(path,*a,**kw):
+    value=actual(path,kw);observe(path,'open',kw);fd=old_open(path,*a,**kw)
+    if value is not None:fd_paths[fd]=value
+    return fd
+def closed(fd):fd_paths.pop(fd,None);return old_close(fd)
+os.stat,os.lstat,os.open,os.close=checked_stat,checked_lstat,opened,closed
+sys.addaudithook(lambda event,args: observe(args[0],event) if event in {'open','os.scandir','os.listdir','os.mkdir'} and args else None)
 try: code=router.main(sys.argv[6:])
 finally: Path(sys.argv[5]).write_text(json.dumps(accesses))
 sys.exit(code)
@@ -669,7 +1026,13 @@ sys.exit(code)
         str(private),str(telemetry),*args],env=os.environ.copy(),capture_output=True,text=True,timeout=20)
     assert process.stderr == "", process.stdout + process.stderr
     answer = json.loads(process.stdout)
-    assert json.loads(telemetry.read_text()) == [], answer
+    accesses = json.loads(telemetry.read_text())
+    if home_kind == "unrelated":
+        assert all(row["path"] == str(private) and row["kind"] in {"stat", "lstat"}
+                   and row["operation"] is not None for row in accesses), (accesses, answer)
+        assert len({(row["path"], row["operation"]) for row in accesses}) == len(accesses), accesses
+    else:
+        assert accesses == [], answer
     if home_kind == "unrelated":
         assert process.returncode == 0, answer
     else:
@@ -696,6 +1059,7 @@ def test_r12_case_variant_private_root_on_case_insensitive_filesystem(tmp_path):
 
 @pytest.mark.parametrize("insensitive", [False, True])
 def test_r12_case_probe_is_read_only_outside_private_roots(tmp_path, insensitive):
+    """Case probing never discovers private content; each operation may snapshot root metadata once."""
     import shutil
     # Resolve only the owned fixture root (/var and /tmp may be links on macOS).
     tmp_path = tmp_path.resolve()
@@ -711,10 +1075,29 @@ def test_r12_case_probe_is_read_only_outside_private_roots(tmp_path, insensitive
 import importlib.util,json,os,pwd,sys
 from pathlib import Path
 from types import SimpleNamespace
-spec=importlib.util.spec_from_file_location('hierarchy_router',sys.argv[1]);router=importlib.util.module_from_spec(spec);spec.loader.exec_module(router)
+spec=importlib.util.spec_from_file_location('hierarchy_router',sys.argv[1]);router=importlib.util.module_from_spec(spec);sys.modules['hierarchy_router']=router;spec.loader.exec_module(router)
 pwd.getpwuid=lambda uid:SimpleNamespace(pw_dir=sys.argv[2])
 private=Path(sys.argv[3]);os.environ['CODEX_HOME']=str(private)
-insensitive=sys.argv[4]=='True';seen={'case_probes':0,'private':[]}
+insensitive=sys.argv[4]=='True';seen={'case_probes':0,'private':[]};operations=[];active=None
+import hierarchy_fresh_brief as fresh
+original_init=fresh._Operation.__init__
+def initialized(self,*args,**kwargs):
+    original_init(self,*args,**kwargs)
+    operations.append(self)
+fresh._Operation.__init__=initialized
+original_identities=router._CapturedPathGuard.identities
+def identities(self):
+    global active
+    owner=next((i for i,operation in enumerate(operations) if operation.path_guard is self),None)
+    frame=sys._getframe(1)
+    while frame is not None:
+        candidate=frame.f_locals.get('operation',frame.f_locals.get('_operation'))
+        if candidate in operations:owner=operations.index(candidate)
+        frame=frame.f_back
+    previous,active=active,owner
+    try:return original_identities(self)
+    finally:active=previous
+router._CapturedPathGuard.identities=identities
 aliases={p.name.swapcase():p for p in private.parent.iterdir() if p.name.casefold()!=private.name.casefold()}
 old_stat,old_lstat,old_open,old_close=os.stat,os.lstat,os.open,os.close
 fd_paths={}
@@ -726,24 +1109,25 @@ def actual(path,kw):
         assert parent is not None, 'untracked fixture directory descriptor'
         value=parent/value
     return value
-def record(path,kw):
+def record(path,kw,kind):
     value=actual(path,kw)
     if value is not None and (str(value).casefold()==str(private).casefold() or str(value).casefold().startswith(str(private).casefold()+'/')):
-        seen['private'].append(str(value))
+        seen['private'].append({'path':str(value),'kind':kind,'operation':active})
     return value
 def inspected(path,*a,**kw):
-    value=record(path,kw)
+    value=record(path,kw,'stat')
     if value is not None and value.parent==private.parent and value.name in aliases:
         seen['case_probes']+=1
         if insensitive:return old_stat(aliases[value.name],follow_symlinks=False)
     return old_stat(path,*a,**kw)
-def linspected(path,*a,**kw):record(path,kw);return old_lstat(path,*a,**kw)
+def linspected(path,*a,**kw):record(path,kw,'lstat');return old_lstat(path,*a,**kw)
 def opened(path,*a,**kw):
-    value=record(path,kw);fd=old_open(path,*a,**kw)
+    value=record(path,kw,'open');fd=old_open(path,*a,**kw)
     if value is not None:fd_paths[fd]=value
     return fd
 def closed(fd):fd_paths.pop(fd,None);return old_close(fd)
 os.stat,os.lstat,os.open,os.close=inspected,linspected,opened,closed
+sys.addaudithook(lambda event,args: record(args[0],{},event) if event in {'open','os.scandir','os.listdir'} and args else None)
 try:code=router.main(sys.argv[6:])
 finally:Path(sys.argv[5]).write_text(json.dumps(seen))
 sys.exit(code)
@@ -756,5 +1140,9 @@ sys.exit(code)
     assert seen['case_probes']>0,(seen,answer)
     if insensitive:
         assert p.returncode==2 and answer['error']=='owner-private host directory is not an input',answer
-        assert seen['private']==[],seen
     else:assert p.returncode==0,answer
+    accesses = seen['private'] if insensitive else [row for row in seen['private']
+        if row['path'] == str(private) or str(private) + os.sep in row['path']]
+    assert all(row['path'] == str(private) and row['kind'] in {'stat', 'lstat'}
+               and row['operation'] is not None for row in accesses), seen
+    assert len({(row['path'], row['operation']) for row in accesses}) == len(accesses), seen
