@@ -23,7 +23,366 @@ from tests.integration.test_hierarchy_small_change_admission import SmallChange
 
 
 ROUTER = ROOT / "tools/hierarchy_router.py"
+
+
+@pytest.mark.parametrize("planned", [False,True])
+def test_round13_row_target_error_retains_its_baseline_hold(tmp_path,planned):
+    from tests.integration.test_hierarchy_fresh_brief import r13_consumer_probe,R13_CONSUMER_GOLDENS
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    assert r13_consumer_probe(tmp_path,"row",planned)==R13_CONSUMER_GOLDENS[("row",planned,"inputs")]
 JOBS = ROOT / "tools/hierarchy_jobs.py"
+
+
+@pytest.mark.parametrize("entry", ["prove", "project", "plan", "refresh", "path", "store"])
+def test_round6_dispatch_request_owns_all_helper_probes(tmp_path, monkeypatch, entry):
+    from types import SimpleNamespace
+    import hierarchy_router as router
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_small_change_dispatch as dispatch
+    import hierarchy_loop as loop
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    world = DispatchWorld(tmp_path)
+    private = tmp_path / "private"
+    private.mkdir()
+    real_os, calls = router.os, []
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private: calls.append(path)
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    for _ in range(2):
+        calls.clear()
+        if entry == "store":
+            (Path(world.workspace.store) / "events/.pending-round6").write_text("inert pending data")
+            captured = dispatch._CapturedStore(world.workspace.store, fresh._Operation())
+            captured.load()
+        elif entry == "path": dispatch.checked_path(world.root)
+        elif entry == "prove":
+            operation = fresh._Operation()
+            def verification():
+                dispatch.checked_path(world.root)
+                dispatch.checked_path(world.checkout)
+                operation.exists(world.recipes_path)
+            operation.prove(verification)
+        elif entry == "project":
+            result = dispatch.project(life.Lifecycle(world.ledger.path), workspace.Store(world.workspace.store),
+                                      recipes=world.recipes_path)
+            assert result["small_changes"][0]["state"] == "writer_ready", result
+        else:
+            work = loop.Pass(SimpleNamespace(dispatcher_host_plan=world.dispatcher_plan,
+                lifecycle=world.ledger.path, store=world.workspace.store, recipes=world.recipes_path))
+            if entry == "plan": work.validate_dispatcher_plan()
+            else: assert work.refresh_planning(), work.holds
+        assert calls == [private], calls
+
+
+@pytest.mark.parametrize("field", ["worktree", "scan_workspace"])
+@pytest.mark.parametrize("consumed", [False, True])
+def test_round6_stored_readiness_identity_refusal_does_not_poison_dispatch(tmp_path, field, consumed):
+    _round7_stored_readiness_probe(tmp_path, field, consumed)
+
+
+@pytest.mark.parametrize("field", ["worktree", "scan_workspace"])
+@pytest.mark.parametrize("consumed", [False, True])
+@pytest.mark.parametrize("walk_failure", ["not-directory", "denied", "changed"])
+def test_round7_stored_readiness_walk_refusal_does_not_poison_dispatch(tmp_path, field, consumed, walk_failure):
+    _round7_stored_readiness_probe(tmp_path, field, consumed, walk_failure)
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+def test_round8_private_symlink_readiness_remains_quarantined(tmp_path, consumed):
+    _round7_stored_readiness_probe(tmp_path, "worktree", consumed, "private-symlink")
+
+
+@pytest.mark.parametrize("spelling", ["private-home-suffix", "private-alias-target", "private-two-hop"])
+@pytest.mark.parametrize("consumed", [False, True])
+def test_round9_private_link_chain_readiness_is_message_local(tmp_path, consumed, spelling):
+    _round7_stored_readiness_probe(tmp_path, "worktree", consumed, spelling)
+
+
+def test_round8_public_symlink_readiness_stays_global(tmp_path):
+    from tests.conftest import symlink_or_skip
+    from hierarchy_mailbox import Mailbox
+    import hierarchy_fresh_brief as fresh
+    world = DispatchWorld(tmp_path)
+    world.dispatch()
+    world.finish_writer()
+    ack = next(row for row in world.messages("ack") if "readiness" in row["message"])
+    public, linked = tmp_path / "public", tmp_path / "linked"
+    public.mkdir()
+    linked.mkdir()
+    rewrite_message(ack, lambda value: value["readiness"].update(worktree=str(linked), scan_workspace=str(linked)))
+    linked.rmdir()
+    symlink_or_skip(public, linked, target_is_directory=True)
+    with pytest.raises(ValueError) as pinned:
+        Mailbox(world.root).messages()
+    expected = "malformed mailbox message: " + str(ack["path"]) + ": symlink paths are not supported: " + str(linked)
+    assert str(pinned.value).encode() == expected.encode()
+    def probe():
+        mailbox = fresh._CapturedMailbox(world.root)
+        with pytest.raises(ValueError) as captured:
+            mailbox.messages()
+        assert str(captured.value).encode() == expected.encode()
+        result = subprocess.run([sys.executable, "-I", "-B", str(ROUTER), "--lifecycle", str(world.ledger.path),
+            "--store", str(world.workspace.store), "status", "--recipes", str(world.recipes_path), "--wait", "5"],
+            capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+        row = json.loads(result.stdout)["small_changes"][0]
+        assert (row["state"], row["reason"]) == ("held", "small_change_result_invalid")
+        assert row["detail"].encode() == expected.encode()
+        assert not row.get("mailbox_history_verified")
+    probe()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in (pool.submit(probe), pool.submit(probe)): future.result(timeout=30)
+
+
+def _round7_stored_readiness_probe(tmp_path, field, consumed, walk_failure="identity"):
+    world = DispatchWorld(tmp_path)
+    manifest = json.loads((world.root / "manifest.json").read_text())
+    manifest["endpoints"]["engine/lane/historical"] = {"kind": "implementer"}
+    (world.root / "manifest.json").write_text(json.dumps(manifest))
+    world.dispatch()
+    world.finish_writer()
+    ack = next(row for row in world.messages("ack") if "readiness" in row["message"])
+    # Keep this historical exchange unrelated to the current row, while preserving a valid ACK shape.
+    def rewrite(value):
+        value["message_id"] = "historical-ack"
+        value["in_reply_to"] = "historical-dispatch"
+    old_dispatch = world.messages("dispatch")[0]
+    historical = copy.deepcopy(old_dispatch["message"])
+    historical["message_id"] = "historical-dispatch"
+    historical["to"] = "engine/lane/historical"
+    historical_path = world.root / "engine/lane/historical-dispatch.md"
+    historical_path.write_text("---\n" + json.dumps({k: v for k, v in historical.items() if k != "body"})
+                               + "\n---\n\n" + historical["body"])
+    original_ack = copy.deepcopy(ack["message"])
+    ack_path = Path(ack["path"]).with_name("historical-ack.md")
+    rewrite(original_ack)
+    original_ack["from"] = "engine/lane/historical"
+    private = tmp_path / "owner-home/.codex" if walk_failure == "private-home-suffix" else tmp_path / "private"
+    target = (tmp_path / "alias" if walk_failure == "identity" else
+              tmp_path / "alias/.codex/child" if walk_failure == "private-home-suffix" else tmp_path / "alias/child")
+    original_ack["readiness"]["worktree"] = str(target)
+    original_ack["readiness"]["scan_workspace"] = str(target)
+    ack_path.write_text("---\n" + json.dumps({k: v for k, v in original_ack.items() if k != "body"})
+                        + "\n---\n\n" + original_ack["body"])
+    (tmp_path / "alias").mkdir()
+    private.mkdir(parents=True)
+    (tmp_path / "ordinary").write_text("regular file")
+    if walk_failure.startswith("private-"):
+        from tests.conftest import symlink_or_skip
+        (tmp_path / "alias").rmdir()
+        destination = private
+        if walk_failure == "private-home-suffix": destination = private.parent
+        if walk_failure == "private-alias-target":
+            destination = tmp_path / "platform-alias"
+            destination.mkdir()
+        if walk_failure == "private-two-hop":
+            destination = tmp_path / "second-link"
+            symlink_or_skip(private, destination, target_is_directory=True)
+        symlink_or_skip(destination, tmp_path / "alias", target_is_directory=True)
+    if consumed:
+        rewrite_message(ack, lambda value: value["readiness"].update(
+            worktree=str(target), scan_workspace=str(target)))
+    injection = r'''
+import hierarchy_fresh_brief as fresh, hierarchy_router as canonical_router
+private = Path(os.environ['ROUND6_PRIVATE'])
+alias = Path(os.environ['ROUND6_ALIAS'])
+failure = os.environ['ROUND7_WALK_FAILURE']
+os.environ['CODEX_HOME'] = str(private)
+if failure == 'private-home-suffix': canonical_router._owner_home = lambda: private.parent
+identity = private.stat()
+original_stat = os.stat
+original_open = os.open
+seen['alias_checks'] = 0
+seen['forbidden'] = []
+def actual(path, kwargs):
+    value = Path(path)
+    return value if value.is_absolute() else Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / value
+def stated(path, *args, **kwargs):
+    value = actual(path, kwargs)
+    platform_alias = alias.parent / 'platform-alias'
+    if private in value.parents or platform_alias in value.parents:
+        seen['forbidden'].append(str(value))
+        raise AssertionError('private descendant metadata')
+    if failure == 'private-alias-target' and value == platform_alias: return identity
+    if value == alias:
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == 'readiness' and frame.f_code.co_filename.endswith('hierarchy_mailbox.py'):
+                selected = 'scan_workspace' if 'worktree' in frame.f_locals else 'worktree'
+                if selected == os.environ['ROUND6_FIELD']:
+                    seen['alias_checks'] += 1
+                    if failure == 'not-directory': return original_stat(alias.parent / 'ordinary')
+                    if failure == 'denied': raise PermissionError(13, 'Permission denied', str(alias))
+                    if failure == 'changed': raise ValueError('reference parent changed while opening')
+                    if failure.startswith('private-'): return original_stat(path, *args, **kwargs)
+                    return identity
+            frame = frame.f_back
+    return original_stat(path, *args, **kwargs)
+def opened(path, *args, **kwargs):
+    value = actual(path, kwargs)
+    if value == private or private in value.parents or value == alias.parent / 'platform-alias':
+        seen['forbidden'].append(str(value))
+        raise AssertionError('private directory open')
+    return original_open(path, *args, **kwargs)
+fresh.os = SimpleNamespace(**{**vars(os), 'stat': stated, 'open': opened})
+'''
+    from concurrent.futures import ThreadPoolExecutor
+    before = world.ledger.files(), mailbox_snapshot(world.root)
+    def probe(index):
+        return r7_router_probe(world, injection, command="status", extra=("--wait", "5"),
+            telemetry=tmp_path / ("round6-readiness-%d.json" % index), environ={**os.environ,
+            "ROUND6_PRIVATE": str(private), "ROUND6_ALIAS": str(tmp_path / "alias"), "ROUND6_FIELD": field,
+            "ROUND7_WALK_FAILURE": walk_failure})
+    outcomes = [probe(0)]
+    with ThreadPoolExecutor(max_workers=2) as pool: outcomes += list(pool.map(probe, (1, 2)))
+    for answer, _seen in outcomes:
+        assert _seen["alias_checks"] > 0, (_seen, answer["small_changes"])
+        assert not _seen["forbidden"]
+        row = answer["small_changes"][0]
+        if consumed or walk_failure in {"denied", "changed"}:
+            reason = "small_change_configuration" if walk_failure in {"denied", "not-directory"} else "small_change_result_invalid"
+            assert (row["state"], row["reason"]) == ("held", reason), row
+            expected = {"identity": "owner-private host directory is not an input", "not-directory": "checkout is not registered",
+                        "denied": "Permission denied", "changed": "reference parent changed while opening",
+                        "private-symlink": "symlink paths are not supported: " + str(tmp_path / "alias")}.get(walk_failure,
+                            "symlink paths are not supported: " + str(tmp_path / "alias"))
+            assert expected in row["detail"], row
+            assert "writer_publication_verified" not in row
+        else:
+            assert row["state"] == "checking", row
+    assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
+
+
+def assert_private_root_probes(roots, accesses):
+    """Privacy checks permit only one metadata identity probe per trusted root/capture."""
+    trusted, seen = {str(Path(root)) for root in roots}, set()
+    for row in accesses:
+        if (not isinstance(row, dict) or not isinstance(row.get("path"), str)
+                or row["path"] not in trusted or row.get("kind") not in {"stat", "lstat"}
+                or type(row.get("operation")) is not int or row["operation"] < 0):
+            raise AssertionError("private access must be a single root identity probe")
+        key = row["path"], row["operation"]
+        if key in seen:
+            raise AssertionError("private access must be a single root identity probe")
+        seen.add(key)
+
+
+# These spies run only in their owned subprocess, never in a pytest worker's OS module.
+# All four privacy helpers emit the same observations for the predicate above.
+PRIVATE_ROOT_PROBE = r'''
+import hierarchy_router as _probe_router
+_probe_roots = tuple(sorted(map(str, _probe_router._private_roots(
+    _probe_router._owner_home(), _probe_router._home_declarations()))))
+_probe_root_paths = tuple(map(Path, _probe_roots))
+_probe_accesses, _probe_operations, _probe_fds = [], [], {}
+import hierarchy_fresh_brief as _probe_fresh
+_probe_init = _probe_fresh._Operation.__init__
+def _probe_initialized(self, *args, **kwargs):
+    _probe_init(self, *args, **kwargs)
+    _probe_operations.append(self)
+_probe_fresh._Operation.__init__ = _probe_initialized
+_probe_active_operation = None
+def _probe_bind(original):
+    def identities(self):
+        global _probe_active_operation
+        owner = next((i for i, operation in enumerate(_probe_operations) if operation.path_guard is self), None)
+        # Attribute fallback guards to their outer request, rather than granting
+        # a new allowance simply because a helper constructed another object.
+        frame = sys._getframe(1)
+        while frame is not None:
+            candidate = frame.f_locals.get('operation', frame.f_locals.get('_operation'))
+            if candidate in _probe_operations:
+                owner = _probe_operations.index(candidate)
+            frame = frame.f_back
+        previous, _probe_active_operation = _probe_active_operation, owner
+        try: return original(self)
+        finally: _probe_active_operation = previous
+    return identities
+for _probe_class in {router._CapturedPathGuard, _probe_router._CapturedPathGuard}:
+    _probe_class.identities = _probe_bind(_probe_class.identities)
+def _probe_actual(value, kwargs):
+    if isinstance(value, int): return _probe_fds.get(value)
+    if not isinstance(value, (str, bytes, os.PathLike)): return None
+    path = Path(os.fsdecode(value))
+    if not path.is_absolute() and kwargs.get('dir_fd') is not None:
+        parent = _probe_fds.get(kwargs['dir_fd'])
+        if parent is None: parent = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd']))
+        path = parent/path
+    return path
+def _probe_record(kind, value, kwargs=None):
+    path = _probe_actual(value, kwargs or {})
+    if path is not None and any(path == root or root in path.parents for root in _probe_root_paths):
+        _probe_accesses.append({'path': str(path), 'kind': kind, 'operation': _probe_active_operation})
+    return path
+_probe_stat, _probe_lstat, _probe_open, _probe_close, _probe_read = os.stat, os.lstat, os.open, os.close, os.read
+def _probe_stated(path, *args, **kwargs):
+    _probe_record('stat', path, kwargs)
+    return _probe_stat(path, *args, **kwargs)
+def _probe_lstated(path, *args, **kwargs):
+    _probe_record('lstat', path, kwargs)
+    return _probe_lstat(path, *args, **kwargs)
+def _probe_opened(path, *args, **kwargs):
+    actual = _probe_record('open', path, kwargs)
+    descriptor = _probe_open(path, *args, **kwargs)
+    if actual is not None: _probe_fds[descriptor] = actual
+    return descriptor
+def _probe_closed(descriptor):
+    _probe_fds.pop(descriptor, None)
+    return _probe_close(descriptor)
+def _probe_consumed(descriptor, amount):
+    _probe_record('read', descriptor)
+    return _probe_read(descriptor, amount)
+os.stat, os.lstat, os.open, os.close, os.read = _probe_stated, _probe_lstated, _probe_opened, _probe_closed, _probe_consumed
+sys.addaudithook(lambda event, args: _probe_record(event, args[0])
+    if args and event in {'open', 'os.scandir', 'os.listdir', 'os.mkdir'} else None)
+'''
+
+
+# The reader's portable backend is independent of the new descriptor-only lock.
+# This shim belongs to the isolated child and preserves the real lock capability.
+PORTABLE_REFERENCE_PROBE = r'''
+import hierarchy_fresh_brief as fresh
+_native_reference_descriptors = fresh._reference_descriptors
+def portable_reference_support():
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_code.co_name == 'writer_lock' and frame.f_code.co_filename == router.__file__:
+            return _native_reference_descriptors()
+        frame = frame.f_back
+    return False
+fresh._reference_descriptors = portable_reference_support
+'''
+
+
+@pytest.mark.parametrize("case", ["none", "stat", "lstat", "two-roots", "two-captures"])
+def test_private_probe_policy_accepts_only_bounded_identity_metadata(tmp_path, case):
+    roots = [tmp_path / "private", tmp_path / "other-private"]
+    accesses = []
+    if case != "none":
+        accesses.append({"path": str(roots[0]), "kind": "lstat" if case == "lstat" else "stat", "operation": 0})
+    if case in {"two-roots", "two-captures"}:
+        accesses.append({"path": str(roots[1] if case == "two-roots" else roots[0]),
+                         "kind": "stat", "operation": 0 if case == "two-roots" else 1})
+    assert_private_root_probes(roots, accesses)
+
+
+@pytest.mark.parametrize("case", ["below-stat", "root-open", "root-listdir", "duplicate-stat",
+                                  "root-read", "root-scandir", "root-iterdir", "unbound-operation"])
+def test_private_probe_policy_refuses_content_and_repeated_identity_access(tmp_path, case):
+    root = tmp_path / "private"
+    row = {"path": str(root / "record" if case == "below-stat" else root),
+           "kind": {"root-open": "open", "root-listdir": "os.listdir", "root-read": "read",
+                    "root-scandir": "os.scandir", "root-iterdir": "iterdir"}.get(case, "stat"),
+           "operation": None if case == "unbound-operation" else 0}
+    accesses = [row, dict(row)] if case == "duplicate-stat" else [row]
+    with pytest.raises(AssertionError, match="^private access must be a single root identity probe$"):
+        assert_private_root_probes([root], accesses)
 
 
 class DispatchWorld(Loop):
@@ -85,7 +444,7 @@ class DispatchWorld(Loop):
         self.recipes_path.write_text(json.dumps(self.recipes))
         self.recipe_hash = hashlib.sha256(self.recipes_path.read_bytes()).hexdigest()
 
-    def dispatch(self, *, fault=None, expect=0, command="dispatch"):
+    def dispatch(self, *, fault=None, expect=0, command="dispatch", timeout=40):
         args = ["--lifecycle", str(self.ledger.path), "--store", str(self.workspace.store), command,
                 "--recipes", str(self.recipes_path), "--wait", "0.1"]
         if command == "dispatch":
@@ -163,7 +522,7 @@ os.link = link
 sys.exit(module.main(sys.argv[3:]))
 """
             argv = [sys.executable, "-I", "-B", "-c", script, str(ROUTER), fault]
-        proc = subprocess.run(argv + args, env=os.environ.copy(), capture_output=True, text=True, timeout=40)
+        proc = subprocess.run(argv + args, env=os.environ.copy(), capture_output=True, text=True, timeout=timeout)
         assert proc.returncode == expect, proc.stdout + proc.stderr
         assert not proc.stderr, proc.stderr
         return json.loads(proc.stdout)
@@ -1355,7 +1714,9 @@ def test_record_limit_preflight_leaves_no_partial_dispatch_or_artifact(tmp_path,
     def bytes_at(path):
         return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
     before = bytes_at(world.root.parent), world.ledger.files()
-    row = world.dispatch()["small_changes"][0]
+    # This boundary fixture replays MAX_RECORDS histories under concurrent CI
+    # load. Its contract is refusal without partial writes, not a speed bound.
+    row = world.dispatch(timeout=120)["small_changes"][0]
     assert (row["state"], row["reason"]) == ("held", "small_change_configuration"), row
     assert (bytes_at(world.root.parent), world.ledger.files()) == before
 
@@ -1571,24 +1932,71 @@ journal, store_path, recipes = map(Path, sys.argv[4:7])
 if entry not in {'status', 'dispatch'}:
     lifecycle, store = Lifecycle(journal), Store(store_path)
 accesses = []
-def observe(operation, value):
-    if not isinstance(value, (str, bytes, os.PathLike)):
-        return
-    path = Path(os.fsdecode(value))
-    if any(path == root or root in path.parents for root in (journal, store_path)):
+descriptors = {}
+def canonical(path):
+    return Path('/', *path.parts[1:]) if path.anchor == '//' else path
+roots = tuple(canonical(root) for root in (journal, store_path))
+def observe(operation, value, kwargs=None):
+    if isinstance(value, int):
+        path = descriptors.get(value)
+        if path is None: return
+    else:
+        if not isinstance(value, (str, bytes, os.PathLike)): return
+        path = Path(os.fsdecode(value))
+        if not path.is_absolute() and (kwargs or {}).get('dir_fd') is not None:
+            parent = (kwargs or {})['dir_fd']
+            directory = descriptors.get(parent)
+            if directory is None: directory = Path(os.readlink('/proc/self/fd/%d' % parent))
+            path = directory/path
+    path = canonical(path)
+    if any(path == root or root in path.parents for root in roots):
         accesses.append({'operation': operation, 'path': str(path)})
+    return path
 # Metadata lookup is discovery too: reject CLI private paths before safe_path's lstat.
 original_stat, original_lstat = os.stat, os.lstat
+if sys.argv[7:] == ['cached-pathlib']:
+    # Python 3.9's accessor captures the original OS functions. Reproduce that
+    # boundary on newer interpreters so the positive control cannot lose it.
+    Path.stat = lambda path, *args, **kwargs: original_stat(path, *args, **kwargs)
+    Path.lstat = lambda path, *args, **kwargs: original_lstat(path, *args, **kwargs)
+original_path_stat, original_path_lstat = Path.stat, Path.lstat
+original_open, original_close, original_fstat, original_read = os.open, os.close, os.fstat, os.read
 def stat(path, *args, **kwargs):
-    observe('stat', path)
+    observe('stat', path, kwargs)
     return original_stat(path, *args, **kwargs)
 def lstat(path, *args, **kwargs):
-    observe('lstat', path)
+    observe('lstat', path, kwargs)
     return original_lstat(path, *args, **kwargs)
 os.stat, os.lstat = stat, lstat
+def path_stat(path, *args, **kwargs):
+    observe('stat', path)
+    return original_path_stat(path, *args, **kwargs)
+def path_lstat(path, *args, **kwargs):
+    observe('lstat', path)
+    return original_path_lstat(path, *args, **kwargs)
+Path.stat, Path.lstat = path_stat, path_lstat
+def opened(path, *args, **kwargs):
+    actual = observe('open', path, kwargs)
+    descriptor = original_open(path, *args, **kwargs)
+    if actual is not None: descriptors[descriptor] = actual
+    return descriptor
+def closed(descriptor):
+    result = original_close(descriptor)
+    descriptors.pop(descriptor, None)
+    return result
+def fstated(descriptor):
+    observe('fstat', descriptor)
+    return original_fstat(descriptor)
+def read(descriptor, size):
+    observe('read', descriptor)
+    return original_read(descriptor, size)
+os.open, os.close, os.fstat, os.read = opened, closed, fstated, read
 def audit(event, args):
     if event in {'open', 'os.listdir', 'os.scandir', 'os.mkdir', 'os.remove', 'os.rename'} and args:
-        observe(event, args[0])
+        directory = (args[2] if event in {'os.mkdir', 'os.rename'} else args[1]
+                     if event == 'os.remove' else None)
+        observe(event, args[0], {'dir_fd': directory})
+        if event == 'os.rename': observe(event, args[1], {'dir_fd': args[3]})
 sys.addaudithook(audit)
 if entry in {'status', 'dispatch'}:
     args = ['--lifecycle', str(journal), '--store', str(store_path), entry,
@@ -1724,9 +2132,10 @@ def test_private_coordination_root_spelling_refuses_before_discovery(tmp_path, d
     assert coordination_input_snapshot(tmp_path, metadata=True) == before
 
 
-def coordination_input_probe_at_home(world, recipes, entry, pwd_home):
+def coordination_input_probe_at_home(world, recipes, entry, pwd_home, *, cached_pathlib=False):
     process = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVATE_INPUT_PROBE, str(ROOT / "tools"), entry,
-        str(pwd_home), str(world.ledger.path), str(world.workspace.store), str(recipes)],
+        str(pwd_home), str(world.ledger.path), str(world.workspace.store), str(recipes),
+        *(['cached-pathlib'] if cached_pathlib else [])],
         env=os.environ.copy(), capture_output=True, text=True, timeout=20)
     assert process.stderr == "", process.stderr
     lines = process.stdout.splitlines()
@@ -1740,6 +2149,22 @@ def coordination_input_spelling(world, component, spelling):
             world.ledger.path = Path("/" + str(world.ledger.path))
         else:
             world.workspace.store = Path("/" + str(world.workspace.store))
+
+
+@pytest.mark.parametrize("entry", PRIVATE_INPUT_ENTRIES)
+@pytest.mark.parametrize("component", ["journal", "store"])
+def test_coordination_discovery_witness_covers_cached_pathlib_accessors(tmp_path, component, entry):
+    world, recipes = coordination_input_fixture(tmp_path, ".codex.public", component, False)
+    coordination_input_spelling(world, component, "double")
+    before = coordination_input_snapshot(tmp_path)
+    code, result, accesses = coordination_input_probe_at_home(
+        world, recipes, entry, "/" + str(world.tmp / "home"), cached_pathlib=True)
+    assert code == 0, result
+    assert accesses, "cached pathlib must not hide real journal/store discovery"
+    selected = world.ledger.path if component == "journal" else world.workspace.store
+    selected = Path("/", *selected.parts[1:]) if selected.anchor == "//" else selected
+    assert any(row["operation"] == "read" and selected in Path(row["path"]).parents for row in accesses), accesses
+    assert coordination_input_snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("directory", [".codex", ".claude"])
@@ -2389,14 +2814,19 @@ original = os.open
 registered = False
 def opened(path, flags, *args, **kwargs):
     global registered
-    if not registered and Path(path) == Path(root) / '.write.lock':
+    actual = Path(path)
+    if not actual.is_absolute() and kwargs.get('dir_fd') is not None:
+        actual = Path(os.readlink('/proc/self/fd/%d' % kwargs['dir_fd'])) / actual
+    if not registered and actual == Path(root) / '.write.lock':
         registered = True
         p = subprocess.run([sys.executable, '-I', '-B', lifecycle_cli, '--root', journal, 'record',
                             '--event', envelope, '--evidence-only'], env=os.environ.copy(), capture_output=True, text=True)
         assert p.returncode == 0, p.stdout + p.stderr
     return original(path, flags, *args, **kwargs)
 os.open = opened
-sys.exit(router.main(sys.argv[6:]))
+code = router.main(sys.argv[6:])
+assert registered, 'the mixed-queue registration must reach the real mailbox lock boundary'
+sys.exit(code)
 """
     p = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROUTER), str(world.mailboxes["engine"]),
         str(world.ledger.path), str(path), str(ROOT / "tools/hierarchy_lifecycle.py"),
@@ -5238,6 +5668,7 @@ os.stat = inspected
 @pytest.mark.parametrize("name", [".codex", ".claude"])
 @pytest.mark.parametrize("field", ["hide", "ro_binds"])
 def test_r9_recipe_folder_checks_refuse_private_inputs_before_metadata(tmp_path, name, field):
+    """Refuse before private content discovery; only bounded root identity metadata is allowed."""
     world = DispatchWorld(tmp_path)
     world.dispatch()
     world.finish_writer()
@@ -5246,18 +5677,12 @@ def test_r9_recipe_folder_checks_refuse_private_inputs_before_metadata(tmp_path,
     config = json.loads(world.recipes_path.read_text())
     config[field] = [str(private)]
     world.recipes_path.write_text(json.dumps(config))
-    injection = r"""
-old_stat = os.stat
-seen['probes'] = 0
-def inspected(path, *args, **kw):
-    if not isinstance(path, int) and Path(path) == Path(%r): seen['probes'] += 1
-    return old_stat(path, *args, **kw)
-os.stat = inspected
-""" % str(private)
+    injection = PRIVATE_ROOT_PROBE + "\nseen.update(roots=_probe_roots, accesses=_probe_accesses)\n"
     answer, seen = r7_router_probe(world, injection)
     row = answer["small_changes"][0]
     assert (row["state"], row["reason"], row["detail"]) == ("held", "small_change_configuration", "owner-private host directory is not an input"), row
-    assert seen["probes"] == 0 and world.messages("job_request") == [], seen
+    assert_private_root_probes(seen["roots"], seen["accesses"])
+    assert world.messages("job_request") == [], seen
 
 
 @pytest.mark.parametrize("name", [".codex", ".claude"])
@@ -5815,13 +6240,20 @@ probe=fresh._Operation.exists
 seen.update(decorated_probe=hasattr(probe,'__wrapped__'),probe_calls=0,directory_syncs=0)
 original_os=fresh.os
 def lstat(path,*args,**kwargs):
-    if Path(path) == Path(os.environ['HOSTENV_PROBE_PATH']):
+    return plan_metadata(original_os.lstat,path,*args,**kwargs)
+def stated(path,*args,**kwargs):
+    return plan_metadata(original_os.stat,path,*args,**kwargs)
+def plan_metadata(original,path,*args,**kwargs):
+    actual = None if isinstance(path,int) else Path(path)
+    if actual is not None and not actual.is_absolute() and kwargs.get('dir_fd') is not None:
+        actual = Path(original_os.readlink('/proc/self/fd/%d' % kwargs['dir_fd']))/actual
+    if actual == Path(os.environ['HOSTENV_PROBE_PATH']):
         seen['probe_calls']+=1
         if (os.environ['HOSTENV_PROBE_FAULT'].startswith('permission-')
                 and seen['probe_calls'] == int(os.environ['HOSTENV_PROBE_FAIL_AT'])):
             raise PermissionError('modelled unreadable host plan')
-    return original_os.lstat(path,*args,**kwargs)
-fresh.os=SimpleNamespace(**{**vars(original_os),'lstat':lstat})
+    return original(path,*args,**kwargs)
+fresh.os=SimpleNamespace(**{**vars(original_os),'lstat':lstat,'stat':stated})
 sync_os=life.os
 def fsync(descriptor):
     if stat.S_ISDIR(sync_os.fstat(descriptor).st_mode):
@@ -5869,6 +6301,7 @@ assert fresh._Operation.exists is probe and seen['decorated_probe']
 @pytest.mark.parametrize("home_variable", ["CODEX_HOME", "CLAUDE_CONFIG_DIR"])
 @pytest.mark.parametrize("kind", ["evidence", "attachment", "recipe", "checkout"])
 def test_r12_all_dispatcher_private_inputs_refuse_before_metadata(tmp_path, home_variable, kind):
+    """Private content is never discovered; trusted root identity probes share one policy."""
     import shutil
     world = DispatchWorld(tmp_path)
     world.dispatch()
@@ -5891,24 +6324,8 @@ def test_r12_all_dispatcher_private_inputs_refuse_before_metadata(tmp_path, home
         accepted=next(r for r in world.messages("ack") if r["message"].get("acknowledgment")=="accepted");private_record=accepted["path"]
         rewrite_message(accepted,lambda m:m["readiness"].update(worktree=str(target),scan_workspace=str(target)))
         world.workspace.run("update",{"initiative":"engine","source":"owner","checkouts":[str(target)]})
-    injection = r"""
-private=Path(%r);os.environ[%r]=str(private)
-seen['accesses']=[]
-old_stat,old_lstat,old_open=os.stat,os.lstat,os.open
-def actual(path,kw):
-    if isinstance(path,int): return None
-    value=Path(os.fsdecode(path))
-    if not value.is_absolute() and kw.get('dir_fd') is not None:
-        value=Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd']))/value
-    return value
-def observe(path,kw):
-    value=actual(path,kw)
-    if value is not None and (value==private or private in value.parents):seen['accesses'].append(str(value))
-def inspected(path,*a,**kw):observe(path,kw);return old_stat(path,*a,**kw)
-def linspected(path,*a,**kw):observe(path,kw);return old_lstat(path,*a,**kw)
-def opened(path,*a,**kw):observe(path,kw);return old_open(path,*a,**kw)
-os.stat,os.lstat,os.open=inspected,linspected,opened
-""" % (str(private), home_variable)
+    injection = ("private=Path(%r);os.environ[%r]=str(private)\n" % (str(private), home_variable)
+                 + PRIVATE_ROOT_PROBE + "\nseen.update(roots=_probe_roots, accesses=_probe_accesses)\n")
     # Keep the public router invocation, but expose an argument-stage refusal as well as a row hold.
     script = """import importlib.util,json,os,pwd,sys
 from pathlib import Path
@@ -5927,7 +6344,7 @@ sys.exit(code)
         "--evidence-only","--wait","0.1",*extra],env=os.environ.copy(),capture_output=True,text=True,timeout=30)
     assert p.stderr=="" and p.returncode in (0,2),p.stdout+p.stderr
     answer=json.loads(p.stdout);seen=json.loads(telemetry.read_text())
-    assert seen['accesses']==[],(answer,seen)
+    assert_private_root_probes(seen['roots'], seen['accesses'])
     detail=answer.get('error') if p.returncode==2 else answer['small_changes'][0]['detail']
     expected='owner-private host directory is not an input'
     if private_record is not None:expected='malformed mailbox message: '+private_record+': '+expected
@@ -6046,28 +6463,16 @@ pwd.getpwuid = lambda uid: pwd.struct_passwd((*user[:5], str(home), user.pw_shel
 import hierarchy_router as router
 import hierarchy_lifecycle as life
 functions = {name: value for name, value in vars(life).items() if callable(value)}
-accesses = []
-def observe(kind, value):
-    if isinstance(value, (str, bytes, os.PathLike)):
-        path = Path(os.fsdecode(value))
-        if any(path == home/name or home/name in path.parents for name in ('.codex', '.claude')):
-            accesses.append({'kind': kind, 'path': str(path)})
-original_stat, original_lstat = os.stat, os.lstat
-def stat(path, *args, **kwargs):
-    observe('stat', path)
-    return original_stat(path, *args, **kwargs)
-def lstat(path, *args, **kwargs):
-    observe('lstat', path)
-    return original_lstat(path, *args, **kwargs)
-os.stat, os.lstat = stat, lstat
-sys.addaudithook(lambda event, args: observe(event, args[0]) if args and event in {'open', 'os.scandir', 'os.listdir'} else None)
+""" + PRIVATE_ROOT_PROBE + r"""
 code = router.main(sys.argv[3:])
-print(json.dumps({'accesses': accesses, 'lifecycle_functions_unchanged': all(getattr(life, name) is value for name, value in functions.items())}))
+print(json.dumps({'roots': _probe_roots, 'accesses': _probe_accesses,
+    'lifecycle_functions_unchanged': all(getattr(life, name) is value for name, value in functions.items())}))
 sys.exit(code)
 """
 
 
 def r13_private_row(world, command, expect=0):
+    """R13 preserves private content refusal while applying the shared identity-probe policy."""
     args = ['--lifecycle', str(world.ledger.path), '--store', str(world.workspace.store),
             command, '--recipes', str(world.recipes_path), '--wait', '0.1']
     if command == 'dispatch':
@@ -6078,7 +6483,7 @@ def r13_private_row(world, command, expect=0):
     lines = proc.stdout.splitlines()
     assert len(lines) == 2, (proc.returncode, proc.stdout, proc.stderr)
     answer, observation = map(json.loads, lines)
-    assert observation['accesses'] == [], observation
+    assert_private_root_probes(observation['roots'], observation['accesses'])
     assert observation['lifecycle_functions_unchanged'] is True, observation
     assert proc.returncode == expect, answer
     return answer
@@ -6284,13 +6689,11 @@ def activate_loop(world):
 R15_CONTROLLER_PROBE = R13_PRIVATE_ROW_PROBE.replace(
     'code = router.main(sys.argv[3:])',
     "if sys.argv[3] == 'router':\n    code = router.main(sys.argv[4:])\nelse:\n"
-    "    import hierarchy_fresh_brief as fresh\n    code = fresh.main(sys.argv[4:])").replace(
-    "if any(path == home/name or home/name in path.parents for name in ('.codex', '.claude')):",
-    "if any(path == p or p in path.parents for p in [home/'.codex', home/'.claude'] + "
-    "[Path(os.environ[n]) for n in ('CODEX_HOME', 'CLAUDE_CONFIG_DIR') if n in os.environ]):")
+    "    import hierarchy_fresh_brief as fresh\n    code = fresh.main(sys.argv[4:])")
 
 
 def r15_controller(world, tool, args, expect=0, probe=None):
+    """R15/R16/R16b keep private content undiscovered under the shared identity-probe policy."""
     process = subprocess.run([sys.executable, '-I', '-B', '-c', R15_CONTROLLER_PROBE if probe is None else probe,
         str(ROOT/'tools'), str(world.tmp/'home'), tool, *map(str, args)],
         env=dict(os.environ), capture_output=True, text=True, timeout=40)
@@ -6298,7 +6701,7 @@ def r15_controller(world, tool, args, expect=0, probe=None):
     lines = process.stdout.splitlines()
     assert len(lines) == 2, process.stdout
     answer, observation = map(json.loads, lines)
-    assert observation['accesses'] == [], observation
+    assert_private_root_probes(observation['roots'], observation['accesses'])
     assert process.returncode == expect, answer
     assert observation['lifecycle_functions_unchanged'], observation
     return answer
@@ -6763,30 +7166,36 @@ pwd.getpwuid = queried
 def test_r15_captured_privacy_policy_change_refuses_before_publication(tmp_path, changed):
     world = DispatchWorld(tmp_path)
     injection = r"""
+import hierarchy_router as owning_router
+import hierarchy_fresh_brief as fresh
 target = Path(router.__file__).parent/'hierarchy_templates/role-registry.json'
 seen['changed'] = False
 original_open, original_uid = os.open, os.getuid
+kind = os.environ['AEGIS_ROUND10_POLICY_KIND']
+policy_os = SimpleNamespace(**{**vars(os), 'environ': dict(os.environ)})
+router.os = owning_router.os = fresh.os = policy_os
 def opened(path, *a, **kw):
     actual = None if isinstance(path, int) else Path(os.fsdecode(path))
     if actual is not None and not actual.is_absolute() and kw.get('dir_fd') is not None:
-        actual = Path(os.readlink('/proc/self/fd/%%d' %% kw['dir_fd']))/actual
+        actual = Path(os.readlink('/proc/self/fd/%d' % kw['dir_fd']))/actual
     if not seen['changed'] and actual == target:
         seen['changed'] = True
-        if %r == 'home':
-            pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir=%r)
-        elif %r == 'environment':
-            os.environ['CODEX_HOME'] = %r
+        if kind == 'home':
+            router._owner_home = owning_router._owner_home = lambda: Path(sys.argv[2]).parent/'changed-home'
+        elif kind == 'environment':
+            policy_os.environ['CODEX_HOME'] = str(Path(sys.argv[2]).parent/'changed-config')
         else:
-            os.getuid = lambda: original_uid()+1
+            policy_os.getuid = lambda: original_uid()+1
     return original_open(path, *a, **kw)
-os.open = opened
-""" % (changed, str(tmp_path/'changed-home'), changed, str(tmp_path/'changed-config'))
+policy_os.open = opened
+"""
     before = world.ledger.files(), mailbox_snapshot(world.root)
-    answer, seen = r7_router_probe(world, injection)
+    answer, seen = r7_router_probe(world, injection, expect=2,
+        environ={**os.environ, 'AEGIS_ROUND10_POLICY_KIND': changed})
     assert seen['changed']
-    row = answer['small_changes'][0]
-    assert row['state'] == 'held' and 'changed during capture' in row['detail'], row
-    assert row['drafts'] == []
+    error = ('owner-home policy changed during capture' if changed == 'home'
+             else 'host-home configuration changed during capture')
+    assert answer == {'state': 'hold', 'execution_enabled': False, 'error': error}
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
@@ -6946,7 +7355,10 @@ def test_r16_dependency_evidence_is_consumed_with_a_bound_before_dispatch(tmp_pa
             assert row['state'] == ('writer_ready' if command == 'status' and not world.messages('dispatch') else 'writer_sent'), row
         else:
             assert (row['state'], row.get('reason')) == ('held', 'small_change_configuration'), row
-            assert str(proof) in row['detail'] or 'evidence' in row['detail'], row
+            if damage == 'symlink':
+                assert row['detail'] == 'symlink paths are not supported: ' + str(proof), row
+            else:
+                assert str(proof) in row['detail'] or 'evidence' in row['detail'], row
             assert world.messages('dispatch') == [] and world.messages('job_request') == []
             assert row.get('route_receipt') is None, row
             assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
@@ -7488,9 +7900,7 @@ def test_r17_shared_dependency_hash_is_memoized_per_pass_with_capability_control
     second.register(); second.decide()
     admission = second.admission(); admission['checks'][0]['recipes_sha256'] = world.recipe_hash
     second.admit(admission)
-    injection = r"""
-import hierarchy_fresh_brief as fresh
-if %r: fresh._reference_descriptors = lambda: False
+    injection = (PORTABLE_REFERENCE_PROBE if portable else "") + r"""
 target = Path(%r)
 seen['bytes'] = 0
 original_read = os.read
@@ -7500,7 +7910,7 @@ def read(fd, count):
         seen['bytes'] += len(raw)
     return raw
 os.read = read
-""" % (portable, str(proof))
+""" % str(proof)
     before = world.ledger.files(), mailbox_snapshot(world.root)
     report, seen = r7_router_probe(world, injection, command='status')
     selected = {r['request_id']: r for r in report['small_changes']}
@@ -7534,9 +7944,7 @@ def test_r17_producer_reference_limit_refuses_from_metadata_before_open(tmp_path
         with retained.open('wb') as stream:
             stream.truncate(proof.stat().st_size)
         proof = retained
-    injection = r"""
-import hierarchy_fresh_brief as fresh
-if %r: fresh._reference_descriptors = lambda: False
+    injection = (PORTABLE_REFERENCE_PROBE if portable else "") + r"""
 target = Path(%r)
 seen['opens'] = 0
 original_open = os.open
@@ -7549,7 +7957,7 @@ def opened(path, *args, **kw):
         raise OSError('modelled over-limit content must not be opened')
     return original_open(path, *args, **kw)
 os.open = opened
-""" % (portable, str(proof))
+""" % str(proof)
     before = world.ledger.files(), mailbox_snapshot(world.mailboxes['engine'])
     report, seen = r16_router(world, ['status', '--wait', '0.1'], injection)
     row = next(r for r in report['small_changes'] if r['request_id'] == change.value['id'])
@@ -7853,7 +8261,14 @@ def stated(path, *args, **kw):
         proof.parent.rename(alternate); retired.rename(proof.parent)
         swapped = False; seen['swapped_and_restored'] = True
     return result
-fresh.os = SimpleNamespace(**dict(vars(original), open=opened, stat=stated))
+def fstated(descriptor):
+    global swapped
+    result = original.fstat(descriptor)
+    if swapped and Path(original.readlink('/proc/self/fd/%%d' %% descriptor)) == proof.parent:
+        proof.parent.rename(alternate); retired.rename(proof.parent)
+        swapped = False; seen['swapped_and_restored'] = True
+    return result
+fresh.os = SimpleNamespace(**dict(vars(original), open=opened, stat=stated, fstat=fstated))
 """ % (str(proof), str(alternate))
     answer, seen = r7_router_probe(world, injection)
     assert seen == {'swapped_and_restored':True}, seen
@@ -8174,7 +8589,7 @@ fresh.os = SimpleNamespace(**dict(vars(original), open=opened, close=closed))
     answer, seen = r7_router_probe(world, injection)
     assert seen == {'swapped':True, 'restored':True}, seen
     row = next(r for r in answer['small_changes'] if r['request_id'] == change.value['id'])
-    assert row['state'] == 'held' and 'cached evidence reference path changed' in row['detail'], row
+    assert row['state'] == 'held' and row['detail'] == 'reference parent changed while opening', row
     assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
     assert 'engine/lane/fix' in answer['planning_exclusions'], answer
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
@@ -8272,6 +8687,7 @@ def test_r19_unread_declaration_cannot_hide_a_failed_authority_witness(tmp_path,
             'sha256':hashlib.sha256(proof.read_bytes()).hexdigest()}})
     injection = r'''
 import hierarchy_fresh_brief as fresh
+import hierarchy_router as owning_router
 original = os
 parent, alternate, damage = Path(%r), Path(%r), %r
 retired = parent.with_name('r19-authority-retired')
@@ -8294,21 +8710,24 @@ def closed(fd):
         parent.rename(alternate); retired.rename(parent); seen['restored'] = True
     return original.close(fd)
 fresh.os = SimpleNamespace(**dict(vars(original), open=opened, close=closed))
-user = pwd.getpwuid
-def getpwuid(uid):
+user = owning_router._owner_home
+def owner_home():
     if damage == 'shared-policy' and '_unread_attachment' in frames() and 'verify' in frames() and not seen['triggered']:
         seen['triggered'] = seen['restored'] = True
-        return SimpleNamespace(pw_dir=str(parent/'modelled-other-home'))
-    return user(uid)
-pwd.getpwuid = getpwuid
+        return parent/'modelled-other-home'
+    return user()
+router._owner_home = owning_router._owner_home = owner_home
 ''' % (str(parent), str(alternate), damage)
     before = world.ledger.files(), mailbox_snapshot(world.root)
-    answer, seen = r7_router_probe(world, injection)
+    answer, seen = r7_router_probe(world, injection, expect=2 if damage == 'shared-policy' else 0)
     assert seen == {'triggered':True, 'restored':True}, seen
-    row = next(r for r in answer['small_changes'] if r['request_id'] == change.value['id'])
-    assert row['state'] == 'held', row
-    assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
-    assert 'engine/lane/fix' in answer['planning_exclusions'], answer
+    if damage == 'shared-policy':
+        assert answer == {'state':'hold', 'execution_enabled':False, 'error':'owner-home policy changed during capture'}
+    else:
+        row = next(r for r in answer['small_changes'] if r['request_id'] == change.value['id'])
+        assert row['state'] == 'held', row
+        assert not row.get('writer_publication_verified') and not row.get('route_receipt'), row
+        assert 'engine/lane/fix' in answer['planning_exclusions'], answer
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 
@@ -8404,7 +8823,7 @@ pwd.getpwuid = getpwuid
     code, answer, seen = r8_compose_probe(world, injection)
     assert seen == {'triggered':True, 'restored':True}, seen
     assert code == 2 and 'error' in answer, answer
-    assert ('captured reference changed' if damage == 'cached-proof' else 'owner-home policy changed') in answer['error'], answer
+    assert ('reference parent changed while opening' if damage == 'cached-proof' else 'owner-home policy changed') in answer['error'], answer
     assert (world.ledger.files(), mailbox_snapshot(world.root)) == before
 
 

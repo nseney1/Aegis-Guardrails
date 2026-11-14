@@ -58,6 +58,7 @@ sys.path.insert(0, str(HERE))
 from hierarchy_jobs import NEEDS_ROOT  # noqa: E402
 from hierarchy_hosts import child_environment, validate_plan  # noqa: E402
 from hierarchy_mailbox import cli_path, parse_time, timestamp  # noqa: E402
+from hierarchy_router import _request_context  # noqa: E402
 
 
 SCHEMA = "aegis.loop-status/v1"
@@ -484,6 +485,8 @@ class Pass:
         try:
             self.validate_dispatcher_plan()
         except ERRORS + (RecursionError, TypeError, KeyError) as exc:
+            from hierarchy_fresh_brief import _raise_global
+            _raise_global(exc)
             self.steps.append({"step": "dispatch", "state": "hold", "exit": 2})
             self.hold("dispatch", "planning_exclusions_unavailable", str(exc), "owner")
             return
@@ -499,17 +502,19 @@ class Pass:
             self.steps.append({"step": "dispatch", "state": "hold", "exit": code})
             self.hold("dispatch", "dispatch_error", (result or {}).get("error", stderr or problem), "owner")
 
+    @_request_context
     def validate_dispatcher_plan(self):
         # Explicit opt-in is independent of journal availability and status.json.
         # This is configuration selection, not a role/binding/activation grant.
         from hierarchy_router import preflight_paths
         from hierarchy_fresh_brief import _Operation
         path = self.args.dispatcher_host_plan
-        preflight_paths(path)
         operation = _Operation()
+        preflight_paths(path, _guard=operation.path_guard)
         validate_plan(operation.json(path))
         operation.verify()
 
+    @_request_context
     def refresh_planning(self):
         # Child reports can fail independently of durable evidence, including after publication.
         try:
@@ -523,6 +528,8 @@ class Pass:
                              recipes=self.args.recipes, mutate=False)
             _decode_dispatch(_object(result, "planning projection"), status=True)
         except ERRORS + (RecursionError, TypeError, KeyError) as exc:
+            from hierarchy_fresh_brief import _raise_global
+            _raise_global(exc)
             self.hold("dispatch", "planning_exclusions_unavailable", str(exc), "owner")
             return False
         self.planning_exclusions = set(result["planning_exclusions"])
