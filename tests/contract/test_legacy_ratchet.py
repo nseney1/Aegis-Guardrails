@@ -965,7 +965,11 @@ def test_mutation_root_symlink_into_checkout_is_refused(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("suffix", [".py", ".rs"])
 @pytest.mark.parametrize("invoked_from", ["other-checkout", "target-checkout"])
-@pytest.mark.parametrize("layout", ["relative", "absolute", "unresolved", "common-relative"])
+@pytest.mark.parametrize("layout", ["relative", "absolute", "unresolved", "common-relative",
+                                  "parent-relative", "parent-absolute", "pointer-relative",
+                                  "pointer-absolute", "pointer-file-parent-relative",
+                                  "pointer-file-parent-absolute", "pointer-invalid-relative",
+                                  "pointer-invalid-absolute"])
 @pytest.mark.parametrize("external", [False, True], ids=["checkout-scratch", "external-scratch"])
 def test_explicit_layout_keeps_invocation_paths(
     tmp_path, monkeypatch, suffix, invoked_from, layout, external, external_scratch_root,
@@ -975,10 +979,15 @@ def test_explicit_layout_keeps_invocation_paths(
     from aegis_core.verification import mutation_tester
 
     checkout, other, metadata = tmp_path / "B", tmp_path / "A", tmp_path / "metadata.git"
+    pointer = layout.startswith("pointer-")
+    unusable = layout == "unresolved" or layout.startswith(("pointer-file-parent-", "pointer-invalid-"))
     package = checkout / "src" / "package"
     package.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(other)], check=True)
-    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True)
+    command = ["git", "init", "-q", "--separate-git-dir", str(metadata), str(checkout)] if pointer else [
+        "git", "init", "--bare", "-q", str(metadata),
+    ]
+    subprocess.run(command, check=True, timeout=30)
     target, test = package / ("target" + suffix), package / "test_target.py"
     target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
     test.write_text(
@@ -992,13 +1001,13 @@ def test_explicit_layout_keeps_invocation_paths(
     allocated = []
 
     def allocate(**kwargs):
-        if not external or layout == "unresolved":
+        if not external or unusable:
             pytest.fail("explicit checkout layout reached scratch allocation")
         manager = real_tempfile.TemporaryDirectory(**kwargs)
         allocated.append(Path(manager.name))
         return manager
 
-    candidate = external_scratch_root / "scratch" if external or layout == "unresolved" else checkout
+    candidate = external_scratch_root / "scratch" if external or unusable else checkout
     candidate.mkdir(exist_ok=True)
     monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
         gettempdir=lambda: str(candidate), TemporaryDirectory=allocate,
@@ -1006,15 +1015,32 @@ def test_explicit_layout_keeps_invocation_paths(
     point = MutationPoint(line=2, col=0, original_op="+", replacement_op="-")
     runner = SimpleNamespace(parse_file=lambda _: SimpleNamespace(mutation_points=[point]))
     with _git_environment(invocation):
-        os.environ["GIT_DIR"] = str(metadata) if layout in ("absolute", "common-relative") else "../metadata.git"
-        os.environ["GIT_WORK_TREE"] = str(checkout) if layout in ("absolute", "common-relative") else "../B"
+        os.environ["GIT_DIR"] = str(metadata) if layout in ("absolute", "common-relative", "parent-absolute") else "../metadata.git"
+        os.environ["GIT_WORK_TREE"] = str(checkout) if layout in ("absolute", "common-relative", "parent-absolute") else "../B"
         if layout == "unresolved":
             os.environ["GIT_DIR"] = "../missing.git"
         if layout == "common-relative":
             os.environ["GIT_COMMON_DIR"] = "../metadata.git"
+        if pointer:
+            path = str(checkout / ".git")
+            assert Path(path).is_file()
+            if "invalid" in layout:
+                Path(path).write_text("private diagnostic\n", encoding="utf-8")
+            if "file-parent" in layout:
+                path += "/../.git"
+            os.environ["GIT_DIR"] = path if layout.endswith("absolute") else os.path.relpath(checkout, invocation) + path[len(str(checkout)):]
+            native = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=invocation,
+                                    capture_output=True, timeout=30)
+            assert (native.returncode != 0) is unusable
+        if layout.startswith("parent-"):
+            os.environ["GIT_COMMON_DIR"] = os.environ["GIT_DIR"]
+            for root in (metadata, checkout):
+                (root / "existing").mkdir()
+            for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+                os.environ[name] += "/existing/.."
         before = {name: os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
-        if not external or layout == "unresolved":
+        if not external or unusable:
             assert result.verdict is False
             assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
             assert result.lines == [-1]
@@ -1023,9 +1049,277 @@ def test_explicit_layout_keeps_invocation_paths(
             assert "survived" in result.detail, result.detail
             assert result.verdict is (suffix == ".py"), result.detail
             assert len(allocated) == 1
-            assert allocated[0].parent == candidate
+            assert allocated[0].parent == candidate.resolve()
             assert not allocated[0].exists()
         assert {name: os.environ.get(name) for name in before} == before
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_COMMON_DIR"])
+@pytest.mark.parametrize("shape", ["dots", "slashes", "trailing-dot", "parent"])
+@pytest.mark.parametrize("long", [False, True], ids=["short", "long"])
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_explicit_layout_preserves_native_path_spelling(
+    monkeypatch, external_scratch_root, name, shape, long, absolute,
+):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    checkout, other, metadata = (external_scratch_root / part for part in ("B", "A", "metadata.git"))
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, timeout=30)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    (metadata / "existing").mkdir()
+    target, test = checkout / "target.py", checkout / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text(f"import sys\nsys.path.insert(0, {str(checkout)!r})\nfrom target import add\n"
+                    "def test_add():\n    assert add(2, 3) == 5\n", encoding="utf-8")
+    suffix = {"dots": "/./", "slashes": "//", "trailing-dot": "/.", "parent": "/existing/.."}[shape]
+    value = (str(metadata) if absolute else os.path.relpath(metadata, other)) + suffix * (
+        4800 // len(suffix) if long else 1
+    )
+    assert len(value) <= 65536
+    scratch = external_scratch_root / "scratch"
+    scratch.mkdir()
+    real_tempfile, allocated = mutation_tester.tempfile, []
+    native_accepts = False
+
+    def allocate(**kwargs):
+        assert native_accepts, "native-refused Git layout reached scratch allocation"
+        manager = real_tempfile.TemporaryDirectory(**kwargs)
+        allocated.append(Path(manager.name))
+        return manager
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(scratch), TemporaryDirectory=allocate,
+    ))
+    with _git_environment(other):
+        os.environ.update(GIT_DIR=str(metadata), GIT_WORK_TREE=str(checkout), GIT_COMMON_DIR=str(metadata))
+        os.environ[name] = value
+        before = {key: os.environ[key] for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+        native = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=30)
+        native_accepts = native.returncode == 0
+        for _ in range(1 if native_accepts else 2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            if native_accepts:
+                assert result.verdict is True, result.detail
+                assert "survived" in result.detail
+                assert len(allocated) == 1
+                assert allocated[0].parent == scratch.resolve()
+                assert not allocated[0].exists()
+            else:
+                assert result.verdict is False
+                assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+                assert result.lines == [-1]
+                assert allocated == []
+            assert {key: os.environ[key] for key in before} == before
+
+
+@pytest.mark.parametrize("pointer_parent", ["declared", "canonical"])
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_git_pointer_file_symlink_preserves_declared_parent(
+    monkeypatch, external_scratch_root, pointer_parent, absolute,
+):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+    from tests.conftest import symlink_or_skip
+
+    checkout, other, metadata = (external_scratch_root / part for part in ("B", "A", "metadata.git"))
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, timeout=30)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    pointer = external_scratch_root / "far" / "nested" / "gitfile"
+    pointer.parent.mkdir(parents=True)
+    relative = "../metadata.git" if pointer_parent == "declared" else "../../metadata.git"
+    pointer.write_text("gitdir: " + relative + "\n", encoding="utf-8")
+    alias = checkout / ".git"
+    symlink_or_skip(pointer, alias)
+    target, test = checkout / "target.py", checkout / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text(f"import sys\nsys.path.insert(0, {str(checkout)!r})\nfrom target import add\n"
+                    "def test_add():\n    assert add(2, 3) == 5\n", encoding="utf-8")
+    scratch = external_scratch_root / "scratch"
+    scratch.mkdir()
+    real_tempfile, allocated = mutation_tester.tempfile, []
+    native_accepts = False
+
+    def allocate(**kwargs):
+        assert native_accepts, "native-refused pointer layout reached scratch allocation"
+        manager = real_tempfile.TemporaryDirectory(**kwargs)
+        allocated.append(Path(manager.name))
+        return manager
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(scratch), TemporaryDirectory=allocate,
+    ))
+    with _git_environment(other):
+        os.environ["GIT_DIR"] = str(alias) if absolute else os.path.relpath(alias, other)
+        os.environ["GIT_WORK_TREE"] = str(checkout)
+        before = {key: os.environ[key] for key in ("GIT_DIR", "GIT_WORK_TREE")}
+        native = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, timeout=30)
+        native_accepts = native.returncode == 0
+        for _ in range(1 if native_accepts else 2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            if native_accepts:
+                assert result.verdict is True, result.detail
+                assert "survived" in result.detail
+                assert len(allocated) == 1
+                assert allocated[0].parent == scratch.resolve()
+                assert not allocated[0].exists()
+            else:
+                assert result.verdict is False
+                assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+                assert result.lines == [-1]
+                assert allocated == []
+            assert {key: os.environ[key] for key in before} == before
+
+
+@pytest.mark.parametrize("failure", ["exit", "error"])
+def test_original_layout_git_probe_refuses_before_allocation(monkeypatch, external_scratch_root, failure):
+    from types import SimpleNamespace
+    from aegis_core.errors import AegisError
+    from aegis_core.verification import mutation_tester
+
+    checkout, other, metadata = (external_scratch_root / part for part in ("B", "A", "metadata.git"))
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, timeout=30)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    target, test = checkout / "target.py", checkout / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append(True)
+        if failure == "error":
+            raise AegisError("private diagnostic")
+        return subprocess.CompletedProcess([], 128, b"", b"private diagnostic")
+
+    def forbidden_allocation(**kwargs):
+        raise AssertionError("failed original-layout probe reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.gitsafe", SimpleNamespace(
+        **{**vars(mutation_tester.gitsafe), "run": refuse},
+    ))
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(external_scratch_root), TemporaryDirectory=forbidden_allocation,
+    ))
+    with _git_environment(other):
+        os.environ.update(GIT_DIR=str(metadata), GIT_WORK_TREE=str(checkout))
+        for attempt in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+            assert len(calls) == attempt + 1
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
+@pytest.mark.parametrize("invalid", ["empty", "missing-parent", "file-parent"])
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+@pytest.mark.parametrize("inside", [False, True], ids=["outside-cwd", "inside-cwd"])
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+def test_explicit_layout_is_validated_as_given(
+    monkeypatch, external_scratch_root, name, invalid, absolute, inside, suffix,
+):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    metadata = external_scratch_root / "metadata.git"
+    package = checkout / "src" / "package"
+    package.mkdir(parents=True)
+    for root in (checkout, other):
+        subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=30)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    target, test = package / ("target" + suffix), package / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    invocation = checkout / "src" if inside else other
+    valid = {"GIT_DIR": metadata, "GIT_WORK_TREE": checkout / "src", "GIT_COMMON_DIR": metadata}
+    base = valid[name]
+    if invalid == "file-parent":
+        (base / "blocked").write_text("regular file\n", encoding="utf-8")
+    tail = "blocked/.." if invalid == "file-parent" else "missing/.."
+    value = str(base / tail) if absolute else os.path.relpath(base, invocation) + "/" + tail
+    if invalid == "empty":
+        value = ""
+
+    def forbidden_allocation(**kwargs):
+        raise AssertionError("invalid original Git layout reached scratch allocation")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(checkout), TemporaryDirectory=forbidden_allocation,
+    ))
+    with _git_environment(invocation):
+        os.environ.update({key: str(path) for key, path in valid.items()})
+        os.environ[name] = value
+        before = {key: os.environ[key] for key in valid}
+        for _ in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+            assert {key: os.environ[key] for key in valid} == before
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
+@pytest.mark.parametrize("aliased", [False, True], ids=["physical-temp", "symlinked-temp"])
+def test_explicit_layout_component_rename_refuses_and_can_be_retried(
+    monkeypatch, external_scratch_root, name, aliased,
+):
+    from types import SimpleNamespace
+    from aegis_core.verification import mutation_tester
+    from tests.conftest import symlink_or_skip
+
+    if aliased:
+        physical = external_scratch_root / "physical"
+        physical.mkdir()
+        alias = external_scratch_root / "alias"
+        symlink_or_skip(physical, alias, target_is_directory=True)
+        external_scratch_root = alias
+
+    checkout, other = external_scratch_root / "B", external_scratch_root / "A"
+    metadata = external_scratch_root / "metadata.git"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True, timeout=30)
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    target, test = checkout / "target.py", checkout / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    valid = {"GIT_DIR": metadata, "GIT_WORK_TREE": checkout, "GIT_COMMON_DIR": metadata}
+    component = valid[name] / "existing"
+    component.mkdir()
+    canonical = component.resolve()
+    moved = component.with_name("moved")
+    renamed = []
+
+    class ConcurrentPath(type(checkout)):
+        def resolve(self, *args, **kwargs):
+            result = super().resolve(*args, **kwargs)
+            if result == canonical and not renamed:
+                component.rename(moved)
+                renamed.append(True)
+            return result
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.Path", ConcurrentPath)
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.tempfile", SimpleNamespace(
+        gettempdir=lambda: str(external_scratch_root),
+        TemporaryDirectory=lambda **kwargs: pytest.fail("layout probe reached allocation"),
+    ))
+    with _git_environment(other):
+        os.environ.update({key: str(path) for key, path in valid.items()})
+        os.environ[name] = str(component / "..")
+        result = mutation_tester.check(str(target), "add", str(test), max_mutations=0)
+        assert result.verdict is False
+        assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+        assert result.lines == [-1]
+        assert renamed == [True]
+        assert not component.exists() and moved.is_dir()
+        moved.rename(component)
+        for _ in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=0)
+            assert result.verdict is True
+            assert result.detail == "0/0 survived (no mutations to apply)"
 
 
 @pytest.mark.parametrize("suffix", [".py", ".rs"])
@@ -1189,7 +1483,7 @@ def test_git_layout_limits_refuse_before_path_or_runner(tmp_path, monkeypatch, n
     assert result.lines == [-1]
 
 
-def test_git_runner_policy_refusal_has_fixed_public_message(tmp_path, monkeypatch):
+def test_nonexistent_git_dir_refuses_before_custody(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from aegis_core.errors import AegisError
     from aegis_core.verification import mutation_tester
@@ -1207,8 +1501,43 @@ def test_git_runner_policy_refusal_has_fixed_public_message(tmp_path, monkeypatc
         **{**vars(mutation_tester.gitsafe), "custody": refused_runner},
     ))
     with _git_environment():
-        os.environ["GIT_DIR"] = str(tmp_path / "metadata.git")
+        os.environ["GIT_DIR"] = str(tmp_path / "missing.git")
         os.environ["GIT_WORK_TREE"] = str(tmp_path)
+        for _ in range(2):
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            assert result.verdict is False
+            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.lines == [-1]
+            assert calls == []
+
+
+def test_git_runner_policy_refusal_has_fixed_public_message(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from aegis_core.errors import AegisError
+    from aegis_core.verification import mutation_tester
+
+    target, test = tmp_path / "target.py", tmp_path / "test_target.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    metadata = tmp_path / "metadata.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(metadata)], check=True, timeout=30)
+    calls = []
+
+    def refused_runner(**kwargs):
+        calls.append(kwargs)
+        raise AegisError("private diagnostic")
+
+    monkeypatch.setattr("aegis_core.verification.mutation_tester.gitsafe", SimpleNamespace(
+        **{**vars(mutation_tester.gitsafe), "custody": refused_runner},
+    ))
+    with _git_environment():
+        os.environ["GIT_DIR"] = str(metadata)
+        os.environ["GIT_WORK_TREE"] = str(tmp_path)
+        native = subprocess.run(
+            ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        assert Path(native.stdout.strip()).resolve() == tmp_path.resolve()
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
     assert result.verdict is False
     assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
@@ -1254,7 +1583,7 @@ def test_explicit_layout_preserves_closest_marker_boundary(monkeypatch, external
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
     assert "survived" in result.detail, result.detail
     assert len(allocated) == 1
-    assert allocated[0].parent == candidate
+    assert allocated[0].parent == candidate.resolve()
     assert not allocated[0].exists()
 
 
