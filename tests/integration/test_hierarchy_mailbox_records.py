@@ -1,11 +1,15 @@
 """Opt-in record tools through the caller-bound mailbox MCP surface."""
+import gc
 import hashlib
 import errno
+import inspect
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 import sys
+import tracemalloc
 from types import SimpleNamespace
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +27,7 @@ import hierarchy_mailbox_records as records
 import hierarchy_mailbox as mailbox_module
 from aegis_core import message_codec as codec
 from aegis_core import message_codec_store as codec_store
+from aegis_core import message_codec_views as codec_views
 
 
 def make_store(root):
@@ -2181,3 +2186,389 @@ def test_mc4b_concurrent_malformed_views_do_not_read_a_tampered_child(bound, mon
     assert leaf not in reads
     assert data(call(connection(root), "mailbox_read_record", dict({"message_id": "parent"}, **options))) == expected
     assert leaf not in reads
+
+
+# Captured from the pre-change renderer with timestamp 2026-11-14T00:00:00.000000Z
+# and fields=["body"]. Rows 1/63/64/65 use a distinct body per message id so record
+# ids differ. Hashes are of the raw tool text.
+_PERF_STAMP = "2026-11-14T00:00:00.000000Z"
+_PERF_DIGEST_SHA = {
+    0: "5cfb4322fd01737292fab45aa9321fee2caf3b689dd11adaaeaf979c2dc091f4",
+    1: "2f8ced25d43c3632630a3fc5436b5024c02d3d15f6fd97343a8260ad67b0d635",
+    63: "3f156e7ef1865bd8de62b7bb7129100350fbe84afb5d015d1484f72eb3665c13",
+    64: "2166ec53fd37a979a158cbfab2551ae2c427ee7c41954264db937c38984d1ea2",
+    65: "e2b25ecf2b8590e10677d943518ed54d4680ac63d302f611835c1319a5201c16",
+}
+_PERF_REFS_SHA = "853edbd431fdd44f297846b2987f01a4abb4b69a262f9a0649d2d91340003b14"
+_PERF_RETAINED_CEILING = 64 * 1024
+_PERF_GRANT_FLOOR = 100 * 1024
+_PERF_TRACE_DEPTH = 25
+_PERF_SPANS = {}
+
+
+def _perf_sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _perf_source_span(function):
+    """3.9-safe filename and line range. co_lines() starts in 3.10."""
+    code = function.__code__
+    key = (code.co_filename, code.co_firstlineno)
+    span = _PERF_SPANS.get(key)
+    if span is None:
+        lines, start = inspect.getsourcelines(function)
+        span = (code.co_filename, start, start + len(lines) - 1)
+        _PERF_SPANS[key] = span
+    return span
+
+
+def _perf_renderer(limit):
+    from aegis_core.message_codec_format import escape_char, neutral_text
+    return codec_views.Renderer(codec.require, escape_char, neutral_text, limit)
+
+
+def _perf_count_renders(monkeypatch):
+    renders = []
+    real = codec_views.Renderer.render
+    def counted(self, view, format):
+        renders.append(format)
+        return real(self, view, format)
+    monkeypatch.setattr(codec_views.Renderer, "render", counted)
+    return renders
+
+
+def _perf_count_payloads(monkeypatch):
+    reads = []
+    real = codec_store.Store._read_bytes
+    def counted(self, reference, rootfd, budget=None, expected_size=None):
+        reads.append(reference)
+        return real(self, reference, rootfd, budget, expected_size)
+    monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+    return reads
+
+
+@contextmanager
+def _perf_trace_depth():
+    """Trace at _PERF_TRACE_DEPTH, then restore a shallower session that was already on.
+
+    start() ignores its argument when tracing is already active, and a 1-frame
+    traceback never reaches _grant_entry. Stop and start again to raise the limit.
+    """
+    was_tracing = tracemalloc.is_tracing()
+    previous_limit = tracemalloc.get_traceback_limit() if was_tracing else None
+    restarted = not was_tracing or previous_limit < _PERF_TRACE_DEPTH
+    if restarted and was_tracing:
+        tracemalloc.stop()
+    try:
+        if restarted:
+            tracemalloc.start(_PERF_TRACE_DEPTH)
+        yield
+    finally:
+        if restarted:
+            tracemalloc.stop()
+            if was_tracing:
+                tracemalloc.start(previous_limit)
+
+
+def _perf_grant_traced():
+    # format() never emits function names. A 1-frame traceback also omits
+    # _grant_entry, several frames above the parser allocations. Refuse to
+    # report zero when the session cannot see that caller frame.
+    # Parser allocations count when that caller frame is on the traceback.
+    # A record-body parse has no _grant_entry frame and stays out of the ceiling.
+    assert tracemalloc.is_tracing(), "grant trace inactive"
+    assert tracemalloc.get_traceback_limit() >= _PERF_TRACE_DEPTH, "grant trace depth"
+    filename, start, end = _perf_source_span(records._grant_entry)
+    total = 0
+    for stat in tracemalloc.take_snapshot().statistics("traceback"):
+        if any(frame.filename == filename and start <= frame.lineno <= end for frame in stat.traceback):
+            total += stat.size
+    return total
+
+
+def _perf_retained(access):
+    raw = 0
+    for item in access.entries.values():
+        if type(item) is tuple and len(item) == 2 and type(item[1]) is bytes:
+            raw += len(item[1])
+    return raw, _perf_grant_traced()
+
+
+def _perf_assert_retained(raw, traced):
+    assert raw == 0
+    margin = traced - _PERF_RETAINED_CEILING
+    assert traced <= _PERF_RETAINED_CEILING, "grant ceiling traced=%d ceiling=%d margin=%d" % (
+        traced, _PERF_RETAINED_CEILING, margin)
+
+
+def test_mc_records_perf_renderer_accounts_each_row_once():
+    """Envelope, commas and array elements sum to one bounded render. No store required."""
+    documents = []
+    for count in (0, 1, 63, 64, 65):
+        documents.append({"messages": [{"n": index, "body": "line\n\"%d" % index} for index in range(count)],
+                          "next_after": None if count != 64 else "r63"})
+    documents.append({"messages": [{"n": 0, "body": "a,b"}], "next_after": None,
+                      "records": [{"n": 1}, {"body": "d\ne"}]})
+    for value in documents:
+        limit = 60000
+        tool = _perf_renderer(limit)
+        skeleton = {"messages": [], "next_after": value["next_after"]}
+        if "records" in value:
+            skeleton["records"] = []
+        total = tool.json_size(skeleton, limit)
+        for key in ("messages", "records"):
+            if key not in value:
+                continue
+            populated = False
+            for row in value[key]:
+                total += tool.json_array_extra(row, populated, limit)
+                populated = True
+        rendered = _perf_renderer(limit).render(value, "json")
+        assert total == len(rendered) == _perf_renderer(limit).json_size(value, limit)
+        assert _perf_renderer(total).render(value, "json") == rendered
+        with pytest.raises(codec.CodecError) as error:
+            _perf_renderer(total - 1).render(value, "json")
+        assert error.value.code == "E_LIMIT"
+
+
+def _perf_request(identifier):
+    return request(identifier, content=json.dumps({
+        "fields": {}, "body": "# Evidence\nHOSTILE_MARKER\n" + identifier, "refs": {}}))
+
+
+def test_mc_records_perf_digest_bytes_limits_and_render_count(bound, monkeypatch):
+    """Real-store digests keep pre-change bytes and stop on the row that crosses the limit."""
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: _PERF_STAMP)
+    empty = call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"]})
+    assert not empty.get("isError")
+    empty_text = empty["content"][0]["text"]
+    assert _perf_sha(empty_text) == _PERF_DIGEST_SHA[0]
+    assert data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "max_chars": len(empty_text)})) == json.loads(empty_text)
+    assert data(call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "max_chars": len(empty_text) - 1})) == codec.CodecError("E_LIMIT").as_dict()
+    identifiers = []
+    for number in range(65):
+        identifiers.append(data(call(writer, "mailbox_publish_record", _perf_request("r%02d" % number)))["id"])
+    texts = {0: empty_text}
+    for count in (1, 63, 64, 65):
+        result = call(reader, "mailbox_digest", {"limit": count, "fields": ["body"]})
+        assert not result.get("isError"), result["content"][0]["text"][:200]
+        texts[count] = result["content"][0]["text"]
+        assert _perf_sha(texts[count]) == _PERF_DIGEST_SHA[count]
+        assert json.loads(texts[count])["messages"][0]["record"]["data"]["body"] == "# Evidence\nHOSTILE_MARKER\nr00"
+    renders = _perf_count_renders(monkeypatch)
+    counted = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"]})
+    assert counted["content"][0]["text"] == texts[65]
+    assert len(renders) == 65 + 1, len(renders)
+    parsed = json.loads(texts[65])
+    same_envelope = dict(parsed, messages=parsed["messages"][:-1])
+    limit_64 = len(_perf_renderer(60000).render(same_envelope, "json"))
+    exact = len(texts[65])
+    assert data(call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact})) == parsed
+    refused = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact - 1})
+    assert data(refused) == codec.CodecError("E_LIMIT").as_dict()
+    assert "HOSTILE_MARKER" not in refused["content"][0]["text"]
+    # One under the 64-row same-envelope size reads the crossing row and not the next one.
+    reads = _perf_count_payloads(monkeypatch)
+    early = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": limit_64 - 1})
+    assert data(early) == codec.CodecError("E_LIMIT").as_dict()
+    assert identifiers[63] in reads and identifiers[64] not in reads
+    reads.clear()
+    boundary = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": limit_64})
+    assert data(boundary) == codec.CodecError("E_LIMIT").as_dict()
+    assert identifiers[64] in reads
+    retried = call(reader, "mailbox_digest", {"limit": 65, "fields": ["body"], "max_chars": exact})
+    assert retried["content"][0]["text"] == texts[65]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_digest",
+                            {"limit": 65, "fields": ["body"]}) for _ in range(2)]
+        concurrent = [job.result(timeout=30) for job in jobs]
+    assert concurrent[0]["content"][0]["text"] == concurrent[1]["content"][0]["text"] == texts[65]
+    invoke(root, "publish", message(recipient="a/lane/review", identifier="z-legacy",
+                                    body="ordinary\u202etext\nline"))
+    legacy_renders = _perf_count_renders(monkeypatch)
+    legacy = call(reader, "mailbox_digest", {"after_message_id": "r64", "limit": 100, "fields": ["body"]})
+    assert not legacy.get("isError"), legacy["content"][0]["text"][:200]
+    legacy_text = legacy["content"][0]["text"]
+    assert "\u202e" not in legacy_text and "\\n" in legacy_text and "\n" not in legacy_text
+    assert json.loads(legacy_text)["messages"] == [{
+        "message_id": "z-legacy", "from": "a/orchestrator", "type": "info", "untrusted": True,
+        "body": "ordinary\u202etext\nline"}]
+    assert len(legacy_renders) <= 1 + 1
+    assert len(legacy_renders) == 1
+
+
+def test_mc_records_perf_large_grant_read_bounds_retained_bytes(bound, monkeypatch):
+    """A large grant authorizes the same view without retaining its original bytes."""
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: _PERF_STAMP)
+    published = data(call(writer, "mailbox_publish_record", request("r00")))
+    rid = published["id"]
+    small = call(reader, "mailbox_read_record", {"message_id": "r00", "fields": ["body"]})
+    assert not small.get("isError")
+    small_text = small["content"][0]["text"]
+    refs = call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "refs": [rid]})
+    assert not refs.get("isError")
+    assert _perf_sha(refs["content"][0]["text"]) == _PERF_REFS_SHA
+    grant = root.parent / "mailbox-records" / (".grants-" + rid)
+    envelope = codec.parse(grant.read_bytes())
+    entry = envelope["fields"]["value"]
+    scope = entry["grants"][0]["root"]
+    entry["grants"] = list(entry["grants"]) + [
+        {"root": scope, "endpoint": ("a/lane/pad-" + ("x" * 200) + "-%03d" % number)[:256]}
+        for number in range(400)
+    ]
+    padded = codec.canonical(envelope)
+    assert len(padded) > _PERF_GRANT_FLOOR
+    grant.write_bytes(padded)
+    with pytest.raises(AssertionError) as raw_probe:
+        _perf_assert_retained(1, 0)
+    assert "grant ceiling" not in str(raw_probe.value)
+    samples = []
+    phase = {"name": "allowed"}
+    plant = {"on": True, "traced": 0}
+    real_authorize = records._RecordAccess.authorize
+    def sampling(self, reference, *args, **kwargs):
+        # Measure after refusal frames unwind. An active traceback keeps the
+        # grant locals alive, so a finally-block sample would count a temporary.
+        failure = None
+        result = None
+        try:
+            result = real_authorize(self, reference, *args, **kwargs)
+        except Exception as error:
+            failure = error.with_traceback(None)
+        if plant["on"] and failure is None:
+            retained, discarded = records._grant_entry(self.codec, self.store, reference)
+            if type(retained) is dict:
+                self.facts[reference] = {
+                    "author": retained.get("author"), "kind": retained.get("kind"), "parsed": retained}
+            retained = None
+            discarded = None
+        gc.collect()
+        raw, traced = _perf_retained(self)
+        if plant["on"]:
+            plant["traced"] = traced
+            _perf_assert_retained(raw, traced)
+        else:
+            samples.append((phase["name"], raw, traced))
+        if failure is not None:
+            raise failure
+        return result
+    monkeypatch.setattr(records._RecordAccess, "authorize", sampling)
+    # Enter from a 1-frame session when nothing else is tracing, so the lift
+    # below is what makes the planted grant visible.
+    shallow_owned = False
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(1)
+        shallow_owned = True
+    try:
+        if shallow_owned:
+            assert tracemalloc.get_traceback_limit() == 1
+        with _perf_trace_depth():
+            gc.collect()
+            tracemalloc.clear_traces()
+            with pytest.raises(AssertionError, match="grant ceiling traced=") as planted:
+                call(reader, "mailbox_read_record", {"message_id": "r00", "fields": ["body"]})
+            margin = plant["traced"] - _PERF_RETAINED_CEILING
+            assert plant["traced"] > _PERF_GRANT_FLOOR
+            assert ("grant ceiling traced=%d ceiling=%d margin=%d" % (
+                plant["traced"], _PERF_RETAINED_CEILING, margin)) in str(planted.value)
+            plant["on"] = False
+            gc.collect()
+            tracemalloc.clear_traces()
+            again = call(reader, "mailbox_read_record", {"message_id": "r00", "fields": ["body"]})
+            digested = call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"]})
+            assert again["content"][0]["text"] == small_text
+            assert json.loads(digested["content"][0]["text"])["messages"][0]["record"] == json.loads(small_text)
+            denied_entry = codec.parse(padded)
+            denied_entry["fields"]["value"]["grants"] = [
+                row for row in denied_entry["fields"]["value"]["grants"] if row["endpoint"] != "a/lane/review"
+            ]
+            grant.write_bytes(codec.canonical(denied_entry))
+            phase["name"] = "denied"
+            denied = call(reader, "mailbox_read_record", {"message_id": "r00", "fields": ["body"]})
+            assert data(denied) == auth_error("reference")
+            assert "HOSTILE_MARKER" not in denied["content"][0]["text"]
+        if shallow_owned:
+            assert tracemalloc.is_tracing() and tracemalloc.get_traceback_limit() == 1
+    finally:
+        if shallow_owned and tracemalloc.is_tracing():
+            tracemalloc.stop()
+    assert any(name == "allowed" for name, _raw, _traced in samples)
+    assert any(name == "denied" for name, _raw, _traced in samples)
+    for _name, raw, traced in samples:
+        _perf_assert_retained(raw, traced)
+        assert plant["traced"] > traced * 10
+    grant.write_bytes(padded)
+    monkeypatch.setattr(records._RecordAccess, "authorize", real_authorize)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(call, connection(root, "a/lane/review"), "mailbox_read_record",
+                            {"message_id": "r00", "fields": ["body"]}) for _ in range(2)]
+        concurrent = [job.result(timeout=20) for job in jobs]
+    assert concurrent[0]["content"][0]["text"] == concurrent[1]["content"][0]["text"] == small_text
+
+
+def test_mc_records_perf_pythontracemalloc_keeps_the_grant_ceiling(tmp_path):
+    """PYTHONTRACEMALLOC=1 still raises the planted ceiling and passes the real read."""
+    store = make_store(tmp_path)
+    store.close()
+    env = os.environ.copy()
+    env["PYTHONTRACEMALLOC"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    root = Path(__file__).resolve().parents[2]
+    child_base = tmp_path / "child"
+    child_base.mkdir()
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         "tests/integration/test_hierarchy_mailbox_records.py::test_mc_records_perf_large_grant_read_bounds_retained_bytes",
+         "-p", "no:cacheprovider", "--basetemp", str(child_base), "-q", "--tb=line"],
+        cwd=str(root), env=env, capture_output=True, text=True, timeout=180, check=False)
+    assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
+    assert "1 passed" in completed.stdout
+
+
+def test_mc_records_perf_publish_rollback_restores_original_bytes(bound, monkeypatch):
+    """A mid-publish link failure restores grant bytes, then a retry and a reader both succeed."""
+    root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: _PERF_STAMP)
+    source = data(call(writer, "mailbox_publish_record", request("source")))
+    unrelated_content = json.dumps({"fields": {}, "body": "# Evidence\nHOSTILE_MARKER\nunrelated", "refs": {}})
+    unrelated = data(call(writer, "mailbox_publish_record", request("unrelated", content=unrelated_content)))
+    directory = root.parent / "mailbox-records"
+    source_grant = directory / (".grants-" + source["id"])
+    unrelated_grant = directory / (".grants-" + unrelated["id"])
+    original = source_grant.read_bytes()
+    unrelated_bytes = unrelated_grant.read_bytes()
+    real_link = os.link
+    def linked(src, target, *args, **kwargs):
+        if str(target).endswith(".md"):
+            raise OSError(errno.EIO, "injected")
+        return real_link(src, target, *args, **kwargs)
+    monkeypatch.setattr(records, "os", SimpleNamespace(**{**vars(os), "link": linked}))
+    content = json.dumps({"fields": {}, "body": "delegate", "refs": {"source": source["id"]}})
+    # a/front-door has no direct grant, so a successful retry must add a via row.
+    delegate = request("delegate", to="a/front-door", content=content)
+    failed = call(writer, "mailbox_publish_record", delegate)
+    assert data(failed) == codec.CodecError("E_AUTH").as_dict()
+    assert "HOSTILE_MARKER" not in failed["content"][0]["text"]
+    assert source_grant.read_bytes() == original
+    assert unrelated_grant.read_bytes() == unrelated_bytes
+    assert sorted(path.name for path in directory.glob(".grants-*")) == sorted(
+        [".grants-" + source["id"], ".grants-" + unrelated["id"]])
+    assert set(writer.checked_mailbox().messages()) == {"source", "unrelated"}
+    monkeypatch.setattr(records, "os", os)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [
+            pool.submit(call, connection(root, "a/lane/review"), "mailbox_read_record",
+                        {"message_id": name, "fields": ["body"]})
+            for name in ("source", "unrelated")
+        ]
+        read_back = [job.result(timeout=20) for job in jobs]
+    assert all(not result.get("isError") for result in read_back)
+    assert source_grant.read_bytes() == original
+    retried = data(call(writer, "mailbox_publish_record", delegate))
+    assert retried == data(call(writer, "mailbox_publish_record", delegate))
+    assert "id" in retried
+    assert source_grant.read_bytes() != original
+    assert unrelated_grant.read_bytes() == unrelated_bytes
+    assert data(call(reader, "mailbox_read_record", {"message_id": "source", "fields": ["body"]}))["data"]["body"] == "# Evidence\nHOSTILE_MARKER"
