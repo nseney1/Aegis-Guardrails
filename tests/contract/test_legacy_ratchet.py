@@ -713,6 +713,25 @@ def _git_environment(cwd=None):
                 os.environ[name] = value
 
 
+_SCRATCH_INSIDE_DETAIL = "could not assess: mutation scratch root is not outside the checkout"
+_INVALID_LAYOUT_DETAIL = (
+    "could not assess: invalid explicit Git layout: "
+    "GIT_DIR requires GIT_WORK_TREE; "
+    "GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR must name existing directories"
+)
+_BOUNDARY_DETAIL = (
+    "could not assess: Git boundary could not be verified: "
+    "confirm GIT_DIR and GIT_WORK_TREE describe one checkout"
+)
+
+
+def _unusable_layout_detail(layout: str) -> str:
+    """A missing or non-directory component is an invalid layout; Git refusing it is not."""
+    if layout == "unresolved" or "file-parent" in layout:
+        return _INVALID_LAYOUT_DETAIL
+    return _BOUNDARY_DETAIL
+
+
 @pytest.mark.parametrize("suffix", [".py", ".rs"])
 @pytest.mark.parametrize("inside", [False, True], ids=["outside", "inside"])
 def test_mutation_scratch_stays_outside_checkout(tmp_path, monkeypatch, suffix, inside, external_scratch_root):
@@ -1042,7 +1061,8 @@ def test_explicit_layout_keeps_invocation_paths(
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
         if not external or unusable:
             assert result.verdict is False
-            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.detail == (_unusable_layout_detail(layout) if unusable else _SCRATCH_INSIDE_DETAIL)
+            assert "private diagnostic" not in result.detail
             assert result.lines == [-1]
             assert allocated == []
         else:
@@ -1108,7 +1128,8 @@ def test_explicit_layout_preserves_native_path_spelling(
                 assert not allocated[0].exists()
             else:
                 assert result.verdict is False
-                assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+                assert result.detail == _BOUNDARY_DETAIL
+                assert os.environ[name] not in result.detail
                 assert result.lines == [-1]
                 assert allocated == []
             assert {key: os.environ[key] for key in before} == before
@@ -1167,7 +1188,7 @@ def test_git_pointer_file_symlink_preserves_declared_parent(
                 assert not allocated[0].exists()
             else:
                 assert result.verdict is False
-                assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+                assert result.detail == _BOUNDARY_DETAIL
                 assert result.lines == [-1]
                 assert allocated == []
             assert {key: os.environ[key] for key in before} == before
@@ -1208,7 +1229,8 @@ def test_original_layout_git_probe_refuses_before_allocation(monkeypatch, extern
         for attempt in range(2):
             result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
             assert result.verdict is False
-            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.detail == _BOUNDARY_DETAIL
+            assert "private diagnostic" not in result.detail
             assert result.lines == [-1]
             assert len(calls) == attempt + 1
 
@@ -1257,7 +1279,8 @@ def test_explicit_layout_is_validated_as_given(
         for _ in range(2):
             result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
             assert result.verdict is False
-            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.detail == _INVALID_LAYOUT_DETAIL
+            assert not value or value not in result.detail
             assert result.lines == [-1]
             assert {key: os.environ[key] for key in valid} == before
 
@@ -1311,7 +1334,7 @@ def test_explicit_layout_component_rename_refuses_and_can_be_retried(
         os.environ[name] = str(component / "..")
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=0)
         assert result.verdict is False
-        assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+        assert result.detail == _INVALID_LAYOUT_DETAIL
         assert result.lines == [-1]
         assert renamed == [True]
         assert not component.exists() and moved.is_dir()
@@ -1367,8 +1390,14 @@ def test_explicit_worktree_must_be_established_before_allocation(
         if layout != "implicit":
             os.environ["GIT_WORK_TREE"] = "../" + worktree.name
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1, ast_runner=runner)
+    if layout == "valid":
+        expected = _SCRATCH_INSIDE_DETAIL
+    elif layout == "disjoint":
+        expected = _BOUNDARY_DETAIL
+    else:
+        expected = _INVALID_LAYOUT_DETAIL
     assert result.verdict is False
-    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.detail == expected
     assert result.lines == [-1]
 
 
@@ -1409,7 +1438,7 @@ def test_explicit_layout_cannot_invent_a_disjoint_context_boundary(
         os.environ["GIT_WORK_TREE"] = os.path.relpath(checkout, invocation)
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
     assert result.verdict is False
-    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.detail == _BOUNDARY_DETAIL
     assert result.lines == [-1]
 
 
@@ -1444,7 +1473,7 @@ def test_explicit_worktree_must_match_reported_toplevel(monkeypatch, external_sc
         os.environ["GIT_WORK_TREE"] = "../B"
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
     assert result.verdict is False
-    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.detail == _BOUNDARY_DETAIL
     assert result.lines == [-1]
 
 
@@ -1479,7 +1508,8 @@ def test_git_layout_limits_refuse_before_path_or_runner(tmp_path, monkeypatch, n
     ))
     result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
     assert result.verdict is False
-    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.detail == _INVALID_LAYOUT_DETAIL
+    assert value not in result.detail
     assert result.lines == [-1]
 
 
@@ -1506,7 +1536,8 @@ def test_nonexistent_git_dir_refuses_before_custody(tmp_path, monkeypatch):
         for _ in range(2):
             result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
             assert result.verdict is False
-            assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+            assert result.detail == _INVALID_LAYOUT_DETAIL
+            assert "private diagnostic" not in result.detail
             assert result.lines == [-1]
             assert calls == []
 
@@ -1540,7 +1571,8 @@ def test_git_runner_policy_refusal_has_fixed_public_message(tmp_path, monkeypatc
         assert Path(native.stdout.strip()).resolve() == tmp_path.resolve()
         result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
     assert result.verdict is False
-    assert result.detail == "could not assess: mutation scratch root is not outside the checkout"
+    assert result.detail == _BOUNDARY_DETAIL
+    assert "private diagnostic" not in result.detail
     assert result.lines == [-1]
     assert len(calls) == 1
 
