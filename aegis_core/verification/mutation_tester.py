@@ -622,28 +622,65 @@ def collect_mutations_from_ast(
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
-    """Read-only validation of the physical scratch root, before allocation.
+class _ScratchRefusal:
+    """One fixed scratch-root category. It carries no env value and no OS or Git text."""
 
-    Establish target, cwd and tool checkout boundaries independently of the
-    candidate, including explicit layouts and broken Git markers.
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+
+
+# Public sentences name the category and, where advice needs them, GIT_* names only.
+_SCRATCH_INSIDE = _ScratchRefusal("inside")
+_SCRATCH_INVALID_LAYOUT = _ScratchRefusal("invalid-layout")
+_SCRATCH_UNVERIFIED = _ScratchRefusal("unverified-boundary")
+_SCRATCH_REASON_TEXT = {
+    "inside": "mutation scratch root is not outside the checkout",
+    "invalid-layout": (
+        "invalid explicit Git layout: GIT_DIR requires GIT_WORK_TREE; "
+        "GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR must name existing directories"
+    ),
+    "unverified-boundary": (
+        "Git boundary could not be verified: "
+        "confirm GIT_DIR and GIT_WORK_TREE describe one checkout"
+    ),
+}
+_LAYOUT_LIMIT = 65536
+
+
+def _scratch_refusal_text(reason: object) -> str:
+    """Fixed category sentence. Unknown reasons stay on the containment sentence."""
+    code = reason.code if isinstance(reason, _ScratchRefusal) else "inside"
+    return _SCRATCH_REASON_TEXT.get(code, _SCRATCH_REASON_TEXT["inside"])
+
+
+def _explicit_layout_refusal(layout: dict, invocation: Path):
+    """Reject an empty, NUL, or overlong GIT_* value before any path is parsed.
+
+    A newline stays in the value. It is not folded into another path, and a
+    metadata directory may be named with one.
+    """
+    if any(not value or len(value) > _LAYOUT_LIMIT or "\x00" in value for value in layout.values()):
+        return _SCRATCH_INVALID_LAYOUT
+    # A relative value is measured against the invocation cwd before Path sees it.
+    if any(len(os.path.join(str(invocation), value)) > _LAYOUT_LIMIT for value in layout.values()):
+        return _SCRATCH_INVALID_LAYOUT
+    return None
+
+
+def _resolve_explicit_layout(layout: dict, invocation: Path):
+    """Parse an explicit layout, or a refusal when a component is not a directory.
+
+    An OS error that is not a missing or non-directory component means the
+    boundary could not be verified. Missing components are an invalid layout.
     """
     try:
-        parent = target.resolve().parent
-        invocation = Path.cwd().resolve()
-        layout = {name: os.environ[name]
-                  for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") if name in os.environ}
-        # Enforce the scoped runner's value limit before parsing paths, and
-        # again after expanding a relative value against the invocation cwd.
-        if any(not value or len(value) > 65536 or "\x00" in value for value in layout.values()):
-            return None
-        if any(len(os.path.join(str(invocation), value)) > 65536 for value in layout.values()):
-            return None
         explicit = {}
         for name, value in layout.items():
             path = invocation / value
-            if len(str(path)) > 65536:
-                return None
+            if len(str(path)) > _LAYOUT_LIMIT:
+                return _SCRATCH_INVALID_LAYOUT
             # Validate original components and directory types before consuming
             # '..'; whole-path normalization can erase an invalid ancestor
             # before an existence check sees it.
@@ -653,27 +690,43 @@ def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
                 if not resolved.is_dir() and not (
                     name == "GIT_DIR" and index == len(path.parts) - 1 and resolved.is_file()
                 ):
-                    return None
+                    return _SCRATCH_INVALID_LAYOUT
             # Gitfile contents are relative to the declared filename's parent,
             # even when that final entry is itself a symlink to a regular file.
             explicit[name] = str(path.parent.resolve(strict=True) / path.name) if (
                 name == "GIT_DIR" and resolved.is_file()
             ) else str(resolved)
-        if any(len(value) > 65536 for value in explicit.values()):
-            return None
+        if any(len(value) > _LAYOUT_LIMIT for value in explicit.values()):
+            return _SCRATCH_INVALID_LAYOUT
         worktree = None
         if "GIT_DIR" in explicit or "GIT_WORK_TREE" in explicit:
             if "GIT_WORK_TREE" not in explicit:
-                return None
+                return _SCRATCH_INVALID_LAYOUT
             worktree = Path(explicit["GIT_WORK_TREE"]).resolve(strict=True)
             if not worktree.is_dir():
-                return None
+                return _SCRATCH_INVALID_LAYOUT
+        return explicit, worktree
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return _SCRATCH_INVALID_LAYOUT
+    except OSError as exc:
+        # Windows reports an illegal name, including a newline, as WinError 123
+        # rather than FileNotFoundError. That component is not a directory.
+        if getattr(exc, "winerror", None) == 123:
+            return _SCRATCH_INVALID_LAYOUT
+        return _SCRATCH_UNVERIFIED
+    except (RuntimeError, AegisError):
+        return _SCRATCH_UNVERIFIED
+
+
+def _confirmed_git_boundaries(parent, invocation, explicit, worktree, layout):
+    """Checkout roots, or a refusal when Git will not confirm the layout."""
+    try:
         if layout:
             # Git must accept the original spelling before any probe substitutes
             # canonical paths: Path erases dots/slashes and OS path-length failures.
             with gitsafe.custody(scratch=invocation, env=layout):
                 if gitsafe.run(["rev-parse", "--show-toplevel"], invocation).returncode != 0:
-                    return None
+                    return _SCRATCH_UNVERIFIED
         contexts = (parent, invocation, Path(__file__).resolve().parents[2])
         roots = set(contexts)
         # Scoped runner overrides preserve invocation-relative paths without
@@ -689,7 +742,7 @@ def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
                         top.resolve(strict=True) != worktree
                         or (start != worktree and worktree not in start.parents)
                     )):
-                        return None
+                        return _SCRATCH_UNVERIFIED
                 # A marker at start is already the closest possible Git boundary.
                 if marker == start:
                     continue
@@ -697,14 +750,76 @@ def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
                     checkout = git_boundary(start)
                     if checkout is not None:
                         roots.add(checkout)
+        return roots
+    except (OSError, RuntimeError, ValueError, AegisError):
+        return _SCRATCH_UNVERIFIED
+
+
+def _scratch_candidate(candidate: str):
+    """Resolved scratch directory and key, or the containment refusal.
+
+    A missing, non-directory, or otherwise unresolvable candidate keeps that
+    sentence. Moving the candidate is what fixes it.
+    """
+    try:
         root = Path(candidate).resolve(strict=True)
         root_key = real_key(root)
-        keys = [real_key(checkout) for checkout in roots]
-        if not root.is_dir() or root_key is None or any(key is None or key_within(root_key, key) for key in keys):
-            return None
-        return str(root)
+        if not root.is_dir() or root_key is None:
+            return _SCRATCH_INSIDE
+        return root, root_key
     except (OSError, RuntimeError, ValueError, AegisError):
-        return None
+        return _SCRATCH_INSIDE
+
+
+def _scratch_outside_checkouts(roots, candidate: str):
+    """The scratch directory when it sits outside every resolved checkout.
+
+    Containment requires a resolved scratch key inside a resolved checkout
+    key. An unresolved checkout key is an unverified boundary unless some
+    other resolved checkout already contains the scratch directory.
+    """
+    resolved = _scratch_candidate(candidate)
+    if isinstance(resolved, _ScratchRefusal):
+        return resolved
+    root, root_key = resolved
+    try:
+        keys = [real_key(checkout) for checkout in roots]
+        if any(key is not None and key_within(root_key, key) for key in keys):
+            return _SCRATCH_INSIDE
+        if any(key is None for key in keys):
+            return _SCRATCH_UNVERIFIED
+    except (OSError, RuntimeError, ValueError, AegisError):
+        return _SCRATCH_UNVERIFIED
+    return str(root)
+
+
+def _mutation_temp_root(target: Path, candidate: str):
+    """Read-only validation of the physical scratch root, before allocation.
+
+    Returns the scratch directory, or a fixed refusal category. The public
+    sentence names that category and GIT_* variable names only.
+
+    Establish target, cwd and tool checkout boundaries independently of the
+    candidate, including explicit layouts and broken Git markers.
+    """
+    try:
+        parent = target.resolve().parent
+        invocation = Path.cwd().resolve()
+    except (OSError, RuntimeError, ValueError, AegisError):
+        return _SCRATCH_UNVERIFIED
+    layout = {name: os.environ[name]
+              for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") if name in os.environ}
+    refused = _explicit_layout_refusal(layout, invocation)
+    if refused is not None:
+        return refused
+    resolved = _resolve_explicit_layout(layout, invocation)
+    if isinstance(resolved, _ScratchRefusal):
+        return resolved
+    explicit, worktree = resolved
+    roots = _confirmed_git_boundaries(parent, invocation, explicit, worktree, layout)
+    if isinstance(roots, _ScratchRefusal):
+        return roots
+    return _scratch_outside_checkouts(roots, candidate)
 
 
 def check(
@@ -742,9 +857,9 @@ def check(
             lines=lines or [],
         )
 
-    if not test_files or (scratch_root := _mutation_temp_root(target_path, tempfile.gettempdir())) is None:
-        return evidence(False, "could not assess: " + ("mutation scratch root is not outside the checkout"
-                        if test_files else "no test file to run"), [-1] if test_files else None)
+    if not test_files or not isinstance(scratch_root := _mutation_temp_root(target_path, tempfile.gettempdir()), str):
+        return evidence(False, "could not assess: " + ("no test file to run" if not test_files
+                        else _scratch_refusal_text(scratch_root)), [-1] if test_files else None)
 
     if target_path.suffix != ".py":
         from aegis_core.ast.runner import ASTDriverRunner
