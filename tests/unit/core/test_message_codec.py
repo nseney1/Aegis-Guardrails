@@ -173,6 +173,14 @@ def assert_record_limit(action):
     assert_error("E_LIMIT", action, RECORD_LIMIT)
 
 
+def _warm_codec(action):
+    """Run the traced codec entry point once so first-import allocations stay outside the peak."""
+    try:
+        action()
+    except codec.CodecError:
+        return
+
+
 @pytest.mark.parametrize("payload", [
     b"\xffHOSTILE_MARKER", b"HOSTILE_MARKER", b'{"HOSTILE_MARKER":0,"HOSTILE_MARKER":1}',
     b'{"x":{"HOSTILE_MARKER":0,"HOSTILE_MARKER":1}}',
@@ -1904,6 +1912,7 @@ def test_r7_class_d_three_large_refs_have_separate_io_allowance(tmp_path):
 
 
 def test_r7_class_e_astral_refusal_does_not_encode_whole_input():
+    _warm_codec(lambda: codec.canonical(record(body="\U0001f600")))
     value = record(body="\U0001f600" * 200000)
     tracemalloc.start()
     try:
@@ -2070,6 +2079,10 @@ def test_r8_class_d_expansion_caches_and_refuses_before_unbounded_allocation(tmp
     store = make_store(tmp_path)
     rid = store.write(record(body="x" * 200000))
     parent = dict(record(), refs={"r%d" % i: rid for i in range(64)})
+    # Warm expansion on a different child so the measured parse counter stays exact.
+    tiny = dict(record(), refs={"only": store.write(record(body="y"))})
+    _warm_codec(lambda: codec.read_view(tiny, store=store, expand=["only"], max_chars=1))
+    _warm_codec(lambda: codec.read_view(tiny, store=store, expand=["only"], max_chars=100000))
     calls, original = [], codec.parse
     with monkeypatch.context() as patch:
         def counted(data):
@@ -2557,6 +2570,7 @@ def test_r10_constructor_close_observer_rejects_foreign_cleanup_close(tmp_path, 
 
 @pytest.mark.parametrize("run", [100000, 200000])
 def test_coord1_security_md_preflights_framing_before_allocating(run):
+    _warm_codec(lambda: codec.read_view(record(body="`"), selectors=["body"], format="md", max_chars=1))
     value = record(body="`" * run)
     tracemalloc.start()
     try:
@@ -2865,6 +2879,10 @@ def test_coord3_store_replaced_during_successful_operation_refuses(tmp_path, mon
 
 
 def output_allocation_peak(action):
+    # Formatter imports happen before the window that starts at canonical()'s return.
+    _warm_codec(lambda: codec.read_view(dict(record(body="xy"), spans=[[0, 1, "s"]]), spans=[0], max_chars=1))
+    _warm_codec(lambda: codec.read_view(
+        record("log", {"rows": [{"text": "a"}]}), selectors=["rows.*.{text,time}"], max_chars=1))
     baseline, previous = [], sys.getprofile()
     code = codec.canonical.__code__
     def observed(frame, event, _arg):
@@ -3093,9 +3111,10 @@ def test_mc2_round6_compose_preserves_numeric_bytes(token):
 
 @pytest.mark.parametrize("case", ["arrays", "integer"])
 def test_mc2_compose_preflights_allocation(case):
+    meta = record()["meta"]
+    _warm_codec(lambda: codec.compose("record", b'{"fields":{"value":0},"body":"","refs":{}}', meta))
     payload = (b'{"fields":{"value":[' + b"[]," * 59999 + b'[]]},"body":"","refs":{}}'
                if case == "arrays" else b'{"fields":{"value":' + b"9" * 5000 + b'},"body":"","refs":{}}')
-    meta = record()["meta"]
     assert len(payload) < codec.MAX_BYTES
     reached, previous = [], sys.getprofile()
     def observed(frame, event, _arg):
@@ -3215,9 +3234,10 @@ def test_mc2_spans_share_the_record_node_budget(existing_nodes):
 
 
 def test_mc2_derived_spans_refuse_before_excess_allocation():
+    meta = record()["meta"]
+    _warm_codec(lambda: codec.compose("text", raw({"fields": {}, "body": "#\n", "refs": {}}), meta))
     body = "#\n" * 80000
     payload = raw({"fields": {}, "body": body, "refs": {}})
-    meta = record()["meta"]
     assert len(payload) <= codec.MAX_BYTES
     tracemalloc.start()
     try:
@@ -3255,3 +3275,334 @@ def test_mc2_argon_span_reproducer_linear_growth():
         assert count[0] > 0
         steps.append(count[0])
     assert all(larger <= 2 * smaller + 1000 for smaller, larger in zip(steps, steps[1:]))
+
+
+_OPERATION = ("store operation unavailable; check permissions, free space, "
+              "write access and file descriptor limits")
+
+
+def _store_os(base, **overrides):
+    """Copy the store os surface onto a local object. The process os stays intact."""
+    copied = {
+        "O_RDONLY": base.O_RDONLY,
+        "O_WRONLY": base.O_WRONLY,
+        "O_CREAT": base.O_CREAT,
+        "O_EXCL": base.O_EXCL,
+        "O_DIRECTORY": base.O_DIRECTORY,
+        "O_NOFOLLOW": base.O_NOFOLLOW,
+        "open": base.open,
+        "close": base.close,
+        "fdopen": base.fdopen,
+        "fstat": base.fstat,
+        "geteuid": base.geteuid,
+        "stat": base.stat,
+        "scandir": base.scandir,
+        "link": base.link,
+        "fsync": base.fsync,
+        "unlink": base.unlink,
+    }
+    if hasattr(base, "O_NONBLOCK"):
+        copied["O_NONBLOCK"] = base.O_NONBLOCK
+    if hasattr(base, "O_BINARY"):
+        copied["O_BINARY"] = base.O_BINARY
+    copied.update(overrides)
+    return SimpleNamespace(**copied)
+
+
+def _descriptor_live(identity):
+    root = "/proc/self/fd"
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            try:
+                info = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == identity:
+                return True
+        return False
+    return None
+
+
+def _proc_fd_count():
+    root = "/proc/self/fd"
+    if not os.path.isdir(root):
+        return None
+    return len(os.listdir(root))
+
+
+def _watch_store_descriptors(monkeypatch, failure):
+    """Track descriptors Store opens while failure is injected once.
+
+    os.close is the product's Python closer. A stream that already closed the
+    same inode makes a later os.close observe a dead or reused number; that is
+    a second closer. /proc/self/fd (when present) is the leak oracle.
+    """
+    real_open, real_close = os.open, os.close
+    real_fdopen, real_fsync, real_unlink = os.fdopen, os.fsync, os.unlink
+    rows, bad, preclosed = [], [], []
+    fired = {"fdopen": False, "fsync": False, "close": False, "unlink": False}
+
+    def opened(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        info = os.fstat(fd)
+        rows.append({"fd": fd, "ident": (info.st_dev, info.st_ino), "good": 0,
+                     "creat": bool(flags & os.O_CREAT)})
+        return fd
+
+    def closed(fd):
+        try:
+            info = os.fstat(fd)
+            ident = (info.st_dev, info.st_ino)
+        except OSError:
+            ident = None
+        pending = [row for row in rows if ident is not None and row["ident"] == ident and row["good"] == 0]
+        if pending:
+            pending[0]["good"] += 1
+            real_close(fd)
+            if failure == "fdopen-memory-closeerr" and pending[0]["creat"] and not fired["close"]:
+                fired["close"] = True
+                raise OSError(errno.EBUSY, MARKER)
+            return None
+        if ident is None and any(row["fd"] == fd for row in rows):
+            bad.append(fd)
+        return real_close(fd)
+
+    def fdopen(fd, mode="r", *args, **kwargs):
+        closefd = kwargs.get("closefd", True)
+        if not fired["fdopen"] and failure != "success":
+            fired["fdopen"] = True
+            if failure == "fdopen-late":
+                if closefd:
+                    real_close(fd)
+                    preclosed.append(fd)
+                raise MemoryError()
+            if failure in ("fdopen-oserror", "fdopen-oserror-closeerr"):
+                raise OSError(errno.EIO, MARKER)
+            if failure in ("fdopen-memory", "fdopen-memory-closeerr", "memory-unlink"):
+                raise MemoryError()
+            if failure == "fdopen-interrupt":
+                raise KeyboardInterrupt()
+            stream = real_fdopen(fd, mode, *args, **kwargs)
+            if failure == "write":
+                def refused(_data):
+                    raise OSError(errno.EIO, MARKER)
+                stream.write = refused
+            elif failure in ("write-memory-close", "close"):
+                real_stream_close = stream.close
+
+                def close_and_fail():
+                    real_stream_close()
+                    raise OSError(errno.EBUSY if failure == "write-memory-close" else errno.EIO, MARKER)
+                stream.close = close_and_fail
+                if failure == "write-memory-close":
+                    def refused(_data):
+                        raise MemoryError()
+                    stream.write = refused
+            return stream
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    def fsync(fd):
+        info = os.fstat(fd)
+        ident = (info.st_dev, info.st_ino)
+        if (failure == "fsync" and not fired["fsync"]
+                and any(row["creat"] and row["ident"] == ident for row in rows)):
+            fired["fsync"] = True
+            raise OSError(errno.ENOSPC, MARKER)
+        return real_fsync(fd)
+
+    def unlink(path, *args, **kwargs):
+        if failure == "memory-unlink" and not fired["unlink"]:
+            fired["unlink"] = True
+            raise OSError(errno.EIO, MARKER)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(codec_store, "os", _store_os(
+        os, open=opened, close=closed, fdopen=fdopen, fsync=fsync, unlink=unlink))
+    return rows, bad, preclosed
+
+
+def _assert_descriptors_closed(rows, bad, preclosed, before):
+    assert bad == []
+    for row in rows:
+        live = _descriptor_live(row["ident"])
+        if live is not None:
+            assert live is False
+        assert row["good"] <= 1
+        if row["creat"] and row["fd"] in preclosed:
+            assert row["good"] == 0
+    after = _proc_fd_count()
+    if before is not None and after is not None:
+        assert after == before
+
+
+def _refuse_write(failure, store, value):
+    if failure in ("fdopen-memory", "fdopen-memory-closeerr", "fdopen-late",
+                   "memory-unlink", "write-memory-close"):
+        with pytest.raises(MemoryError):
+            store.write(value)
+    elif failure == "fdopen-interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            store.write(value)
+    else:
+        assert_error("E_AUTH", lambda: store.write(value), _OPERATION)
+
+
+@pytest.mark.parametrize("failure", [
+    "fdopen-oserror", "fdopen-memory", "fdopen-memory-closeerr", "fdopen-interrupt",
+    "fdopen-late", "write", "write-memory-close", "fsync", "close", "memory-unlink",
+    "success",
+])
+def test_store_write_raw_descriptor_has_one_closer(tmp_path, monkeypatch, failure):
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    store = make_store(root)
+    value = record(body="closer-" + failure)
+    before = _proc_fd_count()
+    rows, bad, preclosed = _watch_store_descriptors(monkeypatch, failure)
+    try:
+        if failure == "success":
+            rid = store.write(value)
+            assert store.read(rid) == value
+            assert store.write(value) == rid
+            assert [path.name for path in root.iterdir()] == [rid + ".json"]
+        else:
+            _refuse_write(failure, store, value)
+            names = [path.name for path in root.iterdir()]
+            assert all(not name.endswith(".json") for name in names)
+            if failure == "memory-unlink":
+                assert len(names) == 1 and names[0].startswith(".msg-")
+            else:
+                assert names == []
+            rid = store.write(value)
+            assert store.read(rid) == value
+            leftover = [path.name for path in root.iterdir() if path.name != rid + ".json"]
+            assert leftover == ([names[0]] if failure == "memory-unlink" else [])
+        creat = [row for row in rows if row["creat"]]
+        if failure in ("fdopen-oserror", "fdopen-memory", "fdopen-memory-closeerr",
+                       "fdopen-interrupt", "memory-unlink"):
+            assert creat and all(row["good"] == 1 for row in creat[:1])
+        _assert_descriptors_closed(rows, bad, preclosed, before)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["fdopen-oserror", "fdopen-memory", "fdopen-late"])
+@pytest.mark.parametrize("operation", ["read", "describe"])
+def test_store_read_fdopen_failure_closes_descriptor(tmp_path, monkeypatch, failure, operation):
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    store = make_store(root)
+    value = record(body="read-closer-" + failure + operation)
+    rid = store.write(value)
+    before = _proc_fd_count()
+    rows, bad, preclosed = _watch_store_descriptors(monkeypatch, failure)
+    try:
+        action = (lambda: store.read(rid)) if operation == "read" else (lambda: store.describe(rid))
+        if failure == "fdopen-oserror":
+            assert_error("E_AUTH", action, _OPERATION)
+        else:
+            with pytest.raises(MemoryError):
+                action()
+        assert (root / (rid + ".json")).is_file()
+        opened = [row for row in rows if row["good"] == 0 or row["fd"] not in preclosed]
+        assert opened and opened[0]["good"] == (0 if opened[0]["fd"] in preclosed else 1)
+        if operation == "read":
+            assert store.read(rid) == value
+        else:
+            assert store.describe(rid)["kind"] == value["kind"]
+        _assert_descriptors_closed(rows, bad, preclosed, before)
+    finally:
+        store.close()
+
+
+def test_store_write_fdopen_failure_unblocks_waiting_writer(tmp_path, monkeypatch):
+    from threading import Event, Thread
+    import time
+    root = tmp_path / "store"
+    root.mkdir(mode=0o700)
+    store = make_store(root)
+    entered, release = Event(), Event()
+    real_open, real_close, real_fdopen = os.open, os.close, os.fdopen
+    rows, bad = [], []
+    first = {"done": False}
+
+    def opened(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        info = os.fstat(fd)
+        rows.append({"fd": fd, "ident": (info.st_dev, info.st_ino), "good": 0,
+                     "creat": bool(flags & os.O_CREAT)})
+        return fd
+
+    def closed(fd):
+        try:
+            info = os.fstat(fd)
+            ident = (info.st_dev, info.st_ino)
+        except OSError:
+            ident = None
+        pending = [row for row in rows if ident is not None and row["ident"] == ident and row["good"] == 0]
+        if pending:
+            pending[0]["good"] += 1
+            return real_close(fd)
+        if ident is None and any(row["fd"] == fd for row in rows):
+            bad.append(fd)
+        return real_close(fd)
+
+    def fdopen(fd, mode="r", *args, **kwargs):
+        if not first["done"]:
+            first["done"] = True
+            entered.set()
+            assert release.wait(5)
+            raise OSError(errno.EIO, MARKER)
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    inner, enters = store._lock, []
+
+    class _Contended:
+        def __enter__(self):
+            enters.append(inner.locked())
+            return inner.__enter__()
+
+        def __exit__(self, *args):
+            return inner.__exit__(*args)
+
+    store._lock = _Contended()
+    monkeypatch.setattr(codec_store, "os", _store_os(os, open=opened, close=closed, fdopen=fdopen))
+    before, box = _proc_fd_count(), []
+
+    def run(body):
+        try:
+            box.append(("ok", store.write(record(body=body))))
+        except BaseException as error:
+            box.append(("err", type(error), error))
+
+    first_writer, second_writer = Thread(target=run, args=("first",)), Thread(target=run, args=("second",))
+    try:
+        first_writer.start()
+        assert entered.wait(5)
+        second_writer.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(enters) < 2:
+            time.sleep(0.01)
+        assert enters == [False, True]
+        assert second_writer.is_alive()
+        release.set()
+        first_writer.join(5)
+        second_writer.join(5)
+        assert not first_writer.is_alive() and not second_writer.is_alive()
+        errors = [item for item in box if item[0] == "err"]
+        written = [item[1] for item in box if item[0] == "ok"]
+        assert len(errors) == 1 and len(written) == 1
+        assert errors[0][1] is codec.CodecError and errors[0][2].code == "E_AUTH"
+        assert str(errors[0][2]) == _OPERATION
+        assert MARKER not in json.dumps(errors[0][2].as_dict())
+        assert store.read(written[0]) == record(body="second")
+        assert [path.name for path in root.iterdir()] == [written[0] + ".json"]
+        creat = [row for row in rows if row["creat"]]
+        assert len(creat) == 2 and creat[0]["good"] == 1
+        _assert_descriptors_closed(rows, bad, [], before)
+    finally:
+        release.set()
+        first_writer.join(5)
+        second_writer.join(5)
+        store._lock = inner
+        store.close()
