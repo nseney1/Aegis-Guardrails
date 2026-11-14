@@ -104,6 +104,10 @@ def test_the_pytest_command_is_bounded_only_when_a_root_is_found(temp_root, monk
 # secret-looking GIT_* value or raw OS/Git text never appears in the detail.
 _SECRET = "SECRET-GIT-LAYOUT-VALUE"
 _INSIDE_DETAIL = "could not assess: mutation scratch root is not outside the checkout"
+_UNUSABLE_DETAIL = (
+    "could not assess: mutation scratch root is not usable: "
+    "choose an existing, accessible directory outside the checkout"
+)
 _INVALID_DETAIL = (
     "could not assess: invalid explicit Git layout: "
     "GIT_DIR requires GIT_WORK_TREE; "
@@ -326,6 +330,92 @@ def _assert_stable_refusal(monkeypatch, target, test, candidate, detail):
         seen.append(result.detail)
     assert seen[0] == seen[1]
     assert allocated == []
+
+
+@pytest.mark.parametrize("suffix", [".py", ".rs"])
+@pytest.mark.parametrize("case", ["missing", "file", "nul", "permission", "os-error", "unresolved-key"])
+def test_unusable_scratch_names_the_failed_check(tmp_path, monkeypatch, case, suffix):
+    """Candidate failures refuse on retry before allocation, without echoing input."""
+    class NoOverwritePath(type(tmp_path)):
+        def rename(self, destination):
+            # Exercise Windows' existing-destination refusal on every platform.
+            if Path(destination).exists():
+                raise FileExistsError("rename destination already exists")
+            return super().rename(destination)
+
+    target, test = _layout_pair(tmp_path / "work")
+    target = NoOverwritePath(target)
+    if target.suffix != suffix:
+        target = target.rename(target.with_suffix(suffix))
+    candidate = tmp_path / _SECRET
+    if case == "file":
+        candidate.write_text("regular file", encoding="utf-8")
+    elif case == "nul":
+        candidate = _SECRET + "\x00hidden\nline"
+    elif case != "missing":
+        candidate.mkdir()
+
+    class RefusingPath(type(tmp_path)):
+        def resolve(self, *args, **kwargs):
+            if os.fspath(self) == str(candidate):
+                if case == "permission":
+                    raise PermissionError(_SECRET + "\nprivate diagnostic")
+                if case == "os-error":
+                    raise OSError(_SECRET + "\nprivate diagnostic")
+            return super().resolve(*args, **kwargs)
+
+    original_key = mutation_tester.real_key
+
+    def candidate_key(path):
+        if case == "unresolved-key" and os.fspath(path) == str(candidate):
+            return None
+        return original_key(path)
+
+    monkeypatch.setattr(mutation_tester, "Path", RefusingPath)
+    monkeypatch.setattr(mutation_tester, "real_key", candidate_key)
+    _assert_stable_refusal(monkeypatch, target, test, candidate, _UNUSABLE_DETAIL)
+
+
+def test_scratch_removed_during_overlapping_checks_is_unusable(tmp_path, monkeypatch):
+    """Concurrent checks refuse a candidate removed just before strict resolution."""
+    target, test = _layout_pair(tmp_path / "work")
+    candidate = tmp_path / _SECRET
+    candidate.mkdir()
+    barrier = threading.Barrier(4, action=candidate.rmdir)
+    allocated, results, errors = [], [], []
+
+    class RemovedPath(type(tmp_path)):
+        def resolve(self, *args, **kwargs):
+            if self == candidate and kwargs.get("strict"):
+                barrier.wait(timeout=5)
+            return super().resolve(*args, **kwargs)
+
+    def forbid_allocation(**kwargs):
+        allocated.append(kwargs)
+        raise AssertionError("removed scratch reached allocation")
+
+    def worker():
+        try:
+            result = mutation_tester.check(str(target), "add", str(test), max_mutations=1)
+            results.append((result.verdict, result.detail, tuple(result.lines)))
+        except Exception as exc:
+            errors.append(repr(exc))
+
+    monkeypatch.setattr(mutation_tester, "Path", RemovedPath)
+    monkeypatch.setattr(mutation_tester, "tempfile", SimpleNamespace(
+        gettempdir=lambda: str(candidate), TemporaryDirectory=forbid_allocation,
+    ))
+    _install_layout(monkeypatch, {})
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert errors == []
+    assert results == [(False, _UNUSABLE_DETAIL, (-1,))] * 4
+    assert allocated == []
+    assert not candidate.exists()
 
 
 def test_removed_cwd_is_an_unverified_boundary(tmp_path, monkeypatch):
