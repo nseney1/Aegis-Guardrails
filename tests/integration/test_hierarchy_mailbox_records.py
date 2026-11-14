@@ -9,7 +9,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from threading import Event, Lock
 import shutil
 from io import BytesIO
 
@@ -2058,3 +2058,126 @@ def test_r10_reference_request_is_validated_before_withholding(bound, monkeypatc
         answers.append(call(outsider, tool, dict(query, **options)))
     assert answers[0] == answers[1] and data(answers[0]) == auth_error("reference")
     assert len(reads) == before
+
+
+def _mc4b_lead_views(parent):
+    """Message-id read, digest inbox value view, and by-ref read of one record."""
+    return (
+        ("message-id", "mailbox_read_record", {"message_id": "parent"}),
+        ("value", "mailbox_digest", {}),
+        ("reference", "mailbox_read_record", {"ref": parent}),
+    )
+
+
+def _mc4b_reviewer_views(parent):
+    return (
+        ("mailbox_read_record", {"message_id": "wrapper"}),
+        ("mailbox_digest", {}),
+        ("mailbox_read_record", {"ref": parent}),
+        ("mailbox_digest", {"refs": [parent]}),
+    )
+
+
+def _mc4b_count_reads(monkeypatch):
+    original, reads, gate = codec_store.Store._read_bytes, [], Lock()
+
+    def counted(self, reference, *values, **kwargs):
+        with gate:
+            reads.append(reference)
+        return original(self, reference, *values, **kwargs)
+
+    monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+    return reads
+
+
+@pytest.mark.parametrize("case,options,code,tamper", [
+    ("valid", {}, None, False),
+    ("tampered", {}, "E_HASH", True),
+    ("unknown", {"fields": ["not_a_field", "refs"]}, "E_SELECTOR", True),
+    ("oversized", {"max_chars": 60001}, "E_LIMIT", True),
+    ("unresolved", {"expand": ["nosuch"]}, "E_REF", True),
+])
+def test_mc4b_message_value_and_reference_views_share_request_refusals(bound, monkeypatch, case, options, code, tamper):
+    """Record-specific options are refused before any cited child is opened."""
+    # A real created_at can contain the oversized max_chars digits.
+    if case == "valid":
+        monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T03:18:00.600010Z")
+    root, lead, reviewer, leaf, parent, _other = r8_delegated_chain(bound)
+    if tamper:
+        (root.parent / "mailbox-records" / (leaf + ".json")).write_bytes(b"TAMPERED_CHILD")
+    reads = _mc4b_count_reads(monkeypatch)
+    expected = None if code is None else codec.CodecError(code).as_dict()
+    views = {}
+    for name, tool, args in _mc4b_lead_views(parent):
+        before = len(reads)
+        result = call(lead, tool, dict(args, **options))
+        if expected is None:
+            assert not result.get("isError"), result
+            body = data(result)
+            view = body["messages"][0]["record"] if name == "value" else body
+            views[name] = view
+            assert view["data"]["body"] == "parent body"
+            assert view["data"]["meta"]["created_at"] == "2026-11-14T03:18:00.600010Z"
+            assert leaf in reads[before:]
+        else:
+            refusal = data(result)
+            assert result.get("isError") is True and refusal == expected
+            if code == "E_LIMIT":
+                assert list(options) == ["max_chars"]
+                assert options["max_chars"] == records.MAX_CHARS + 1
+                assert refusal["error"]["code"] == "E_LIMIT"
+            text = result["content"][0]["text"]
+            assert "TAMPERED_CHILD" not in text and "not_a_field" not in text and "nosuch" not in text
+            if code == "E_HASH":
+                assert leaf in reads[before:]
+            else:
+                assert leaf not in reads[before:]
+            retry = call(lead, tool, dict(args, **options))
+            assert retry.get("isError") is True and data(retry) == expected
+            if code != "E_HASH":
+                assert leaf not in reads
+    if expected is None:
+        assert views["value"] == views["message-id"]
+        assert views["reference"]["data"] == views["message-id"]["data"]
+        withheld = data(call(reviewer, "mailbox_read_record", {"ref": parent}))
+        assert withheld["refs_withheld"] is True and "data" not in withheld and leaf in reads
+        return
+    if code == "E_HASH":
+        before = len(reads)
+        withheld = data(call(reviewer, "mailbox_read_record", {"ref": parent}))
+        assert withheld["refs_withheld"] is True and "data" not in withheld
+        assert leaf not in reads[before:]
+        return
+    for tool, args in _mc4b_reviewer_views(parent):
+        result = call(reviewer, tool, dict(args, **options))
+        assert result.get("isError") is True and data(result) == expected
+        assert "TAMPERED_CHILD" not in result["content"][0]["text"]
+    assert leaf not in reads
+
+
+@pytest.mark.parametrize("options,code", [
+    ({"expand": ["nosuch"]}, "E_REF"),
+    ({"fields": ["not_a_field", "refs"]}, "E_SELECTOR"),
+    ({"max_chars": 60001}, "E_LIMIT"),
+])
+def test_mc4b_concurrent_malformed_views_do_not_read_a_tampered_child(bound, monkeypatch, options, code):
+    root, lead, reviewer, leaf, parent, _other = r8_delegated_chain(bound)
+    (root.parent / "mailbox-records" / (leaf + ".json")).write_bytes(b"TAMPERED_CHILD")
+    reads = _mc4b_count_reads(monkeypatch)
+    expected = codec.CodecError(code).as_dict()
+    workers = (
+        (connection(root), "mailbox_read_record", {"message_id": "parent"}),
+        (connection(root), "mailbox_digest", {}),
+        (connection(root), "mailbox_read_record", {"ref": parent}),
+        (connection(root, "a/lane/review"), "mailbox_read_record", {"ref": parent}),
+        (connection(root, "a/lane/review"), "mailbox_read_record", {"message_id": "wrapper"}),
+    )
+    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+        jobs = [pool.submit(call, who, tool, dict(args, **options)) for who, tool, args in workers]
+        results = [job.result(timeout=10) for job in jobs]
+    assert [data(result) for result in results] == [expected] * len(workers)
+    assert all(result.get("isError") is True and "TAMPERED_CHILD" not in result["content"][0]["text"]
+               for result in results)
+    assert leaf not in reads
+    assert data(call(connection(root), "mailbox_read_record", dict({"message_id": "parent"}, **options))) == expected
+    assert leaf not in reads
