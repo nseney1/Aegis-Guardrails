@@ -672,6 +672,8 @@ def _view(codec, store, message, options, access):
 
 
 def _value_view(codec, store, message, value, options, access):
+    # Share read_view's record-specific validation without describing any child.
+    codec._options(value, store=store, unknown={}, **options)
     if access is not None:
         access.authorize_refs(value, options)
     else:
