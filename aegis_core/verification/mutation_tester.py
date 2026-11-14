@@ -633,10 +633,15 @@ class _ScratchRefusal:
 
 # Public sentences name the category and, where advice needs them, GIT_* names only.
 _SCRATCH_INSIDE = _ScratchRefusal("inside")
+_SCRATCH_UNUSABLE = _ScratchRefusal("unusable-root")
 _SCRATCH_INVALID_LAYOUT = _ScratchRefusal("invalid-layout")
 _SCRATCH_UNVERIFIED = _ScratchRefusal("unverified-boundary")
 _SCRATCH_REASON_TEXT = {
     "inside": "mutation scratch root is not outside the checkout",
+    "unusable-root": (
+        "mutation scratch root is not usable: "
+        "choose an existing, accessible directory outside the checkout"
+    ),
     "invalid-layout": (
         "invalid explicit Git layout: GIT_DIR requires GIT_WORK_TREE; "
         "GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR must name existing directories"
@@ -756,19 +761,19 @@ def _confirmed_git_boundaries(parent, invocation, explicit, worktree, layout):
 
 
 def _scratch_candidate(candidate: str):
-    """Resolved scratch directory and key, or the containment refusal.
+    """Resolved scratch directory and key, or the unusable-root refusal.
 
-    A missing, non-directory, or otherwise unresolvable candidate keeps that
-    sentence. Moving the candidate is what fixes it.
+    A missing, non-directory, or unresolvable candidate has not reached a
+    containment check, so its refusal names usability instead.
     """
     try:
         root = Path(candidate).resolve(strict=True)
         root_key = real_key(root)
         if not root.is_dir() or root_key is None:
-            return _SCRATCH_INSIDE
+            return _SCRATCH_UNUSABLE
         return root, root_key
     except (OSError, RuntimeError, ValueError, AegisError):
-        return _SCRATCH_INSIDE
+        return _SCRATCH_UNUSABLE
 
 
 def _scratch_outside_checkouts(roots, candidate: str):
