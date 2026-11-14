@@ -277,6 +277,16 @@ def observe_transcript(tool, transcript, prompt_file, monkeypatch):
     return record
 
 
+def _warm_prompt_stream(tool, tmp_path, prompt_file, monkeypatch, consumer):
+    """Run the consumer on a tiny transcript so first-use caches stay outside the peak."""
+    tiny = write_transcript(tmp_path / "_warm_projects" / "-w" / (SESSION + ".jsonl"),
+                            [user_record(prompt_file.read_text(encoding="utf-8")), {"type": "assistant"}])
+    if consumer == "first-prompt":
+        tool.first_prompt_check(tiny, prompt_file, sha(prompt_file.read_bytes()))
+    else:
+        observe_transcript(tool, tiny, prompt_file, monkeypatch)
+
+
 @pytest.mark.parametrize("torn_tail", [None, '{"type":"assist'])
 def test_first_prompt_and_launch_preserve_complete_observations(tool, tmp_path, prompt_file,
                                                               monkeypatch, torn_tail):
@@ -359,6 +369,7 @@ def test_prompt_observations_stream_with_bounded_peak_memory(tool, tmp_path, pro
         for _ in range(10000):
             stream.write(padding)
     size = transcript.stat().st_size
+    _warm_prompt_stream(tool, tmp_path, prompt_file, monkeypatch, consumer)
     tracemalloc.start()
     try:
         if consumer == "first-prompt":
@@ -1174,11 +1185,32 @@ def test_lanes_health_streams_a_large_transcript_with_bounded_peak_memory(stub, 
         stream.write(json.dumps(request("2026-11-02T16:35:00.000Z", "last-request")) + "\n")
         stream.write(json.dumps(queue(NOW, "enqueue", "pending notice")) + "\n")
     stub.serve("agents.json", [])
+    warm_body = "".join((
+        json.dumps(user_record("x")) + "\n",
+        json.dumps(request("2026-11-02T16:35:00.000Z", "warm-request")) + "\n",
+        json.dumps(queue(NOW, "enqueue", "n")) + "\n",
+    ))
+    # Warm parser, transcript reduction, and the agents stub in the child, then drop the
+    # warmup call so the measured command still records exactly one agents invocation.
     result = capability_cli("lanes-health", "--projects-dir", stub.projects, "--now", NOW,
                             "--session", SESSION, **capability_host, after=(
         "import atexit, tracemalloc\n"
+        "tool.build_parser()\n"
+        "warm_root = tool.tempfile.mkdtemp(prefix='lanes-warm-')\n"
+        "warm_projects = tool.Path(warm_root) / 'projects'\n"
+        "warm_file = warm_projects / '-w' / (%r + '.jsonl')\n"
+        "warm_file.parent.mkdir(parents=True)\n"
+        "warm_file.write_text(%r, encoding='utf-8')\n"
+        "warm_args = tool.argparse.Namespace(projects_dir=str(warm_projects), stall_s=1200, stall_max_s=3600, silent_s=600)\n"
+        "tool.lane_health(%r, 'warm', None, warm_args, tool.parse_utc(%r))\n"
+        "tool.agents_rows()\n"
+        "calls = tool.Path(tool.os.environ['HIERARCHY_STUB_DIR']) / 'calls.jsonl'\n"
+        "if calls.exists():\n"
+        "    calls.unlink()\n"
+        "tool.shutil.rmtree(warm_root, ignore_errors=True)\n"
         "tracemalloc.start()\n"
-        "atexit.register(lambda: print(tracemalloc.get_traced_memory()[1], file=sys.stderr))\n"))
+        "atexit.register(lambda: print(tracemalloc.get_traced_memory()[1], file=sys.stderr))\n"
+    ) % (SESSION, warm_body, SESSION, NOW))
     assert result.returncode == 0, (result.stdout, result.stderr)
     calls = stub.dir / "calls.jsonl"
     assert calls.is_file(), result.stdout

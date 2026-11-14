@@ -325,9 +325,9 @@ Preview model selection as JSON; --record atomically selects and appends. Errors
 
 Manage queued team work with CAS leases
 
-Queue add, list, claim, release, done, audit and compact; all results are JSON.
+Queue add, list, claim, release, unclaim, done, audit and compact; all results are JSON.
 
-Subcommands: `add`, `audit`, `claim`, `compact`, `done`, `list`, `release`.
+Subcommands: `add`, `audit`, `claim`, `compact`, `done`, `list`, `release`, `unclaim`.
 
 ### `aegis team queue add`
 
@@ -386,6 +386,18 @@ Release a claim
 | `item_id` | `ITEM` |  | Stable queue item id (required) |
 | `--expect` | `REVISION` |  | Current revision returned by claim or list |
 | `--lane` | `LANE` |  | Current claim lane; required for a live claim |
+
+### `aegis team queue unclaim`
+
+Return a claim together with its intersecting lane leases
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `item_id` | `ITEM` |  | Stable queue item id (required) |
+| `--expect` | `REVISION` |  | Current revision returned by claim or list |
+| `--lane` | `LANE` |  | Current claim lane; required for a live claim |
+| `--writer-stopped` |  |  | Acknowledge that the lane's writer and queued jobs are stopped |
+| `--reason` | `REASON` | `""` | Single-line noncredential reason for returning the claim and its leases |
 
 ### `aegis team release`
 
