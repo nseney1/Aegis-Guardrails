@@ -408,6 +408,12 @@ def test_crash_and_lease_state_matrix(make_store, monkeypatch, record_property, 
     monkeypatch.setattr(team_claims, "events", SimpleNamespace(**{**vars(events), "try_append": appending}))
     first = unclaim(make_store, revision)
     assert first["reason"] == "unclaim_recovery_required"
+    # Every blocked recovery in this matrix is an injected I/O failure. The cause
+    # entry is present on the first refusal, before the lease mutation on retry.
+    assert [row["reason"] for row in first["blockers"]] == [
+        "unclaim_recovery_required", "queue_io_unavailable"], first
+    assert set(first["blockers"][1]) == {"refused", "reason", "next_action"}, first
+    assert "injected" not in json.dumps(first["blockers"])
     fault_bytes = path.read_bytes()
     pending = "unclaim" in json.loads(fault_bytes)
     assert pending is (phase != "before-intent")
@@ -426,9 +432,22 @@ def test_crash_and_lease_state_matrix(make_store, monkeypatch, record_property, 
     record_property("transition_matrix", json.dumps(evidence, sort_keys=True))
     if pending and mutation in ("same-lane", "foreign", "unreadable"):
         assert result["reason"] == "unclaim_recovery_required", evidence
+        assert result["exit_code"] == 1, evidence
         assert after_retry == before_retry and "unclaim" in json.loads(after_retry), evidence
+        # The recovery command stays first. The second entry is only the sanitized cause.
+        assert [row["reason"] for row in result["blockers"]] == [
+            "unclaim_recovery_required", "unclaim_lease_refused"], evidence
+        cause = result["blockers"][1]
+        assert set(cause) == {"refused", "reason", "lane", "lease_oid", "next_action"}, evidence
+        assert cause["lane"] == ("alpha" if mutation == "same-lane" else "beta"), evidence
+        assert cause["lease_oid"] and len(cause["lease_oid"]) in (40, 64), evidence
+        assert all(character in "0123456789abcdef" for character in cause["lease_oid"]), evidence
+        assert "aegis team release " + cause["lane"] in cause["next_action"], evidence
+        assert cause["lease_oid"] in cause["next_action"], evidence
     elif not pending and mutation in ("foreign", "unreadable"):
-        assert result["reason"] == "unclaim_lease_refused" and after_retry == original_bytes, evidence
+        assert result["reason"] == "unclaim_lease_refused" and result["exit_code"] == 1, evidence
+        assert after_retry == original_bytes, evidence
+        assert [row["reason"] for row in result["blockers"]] == ["unclaim_lease_refused"], evidence
     else:
         assert not result["refused"] and result["item"]["state"] == "queued", evidence
         assert "unclaim" not in json.loads(after_retry), evidence
@@ -546,12 +565,18 @@ def test_recovery_blockers_and_returned_hold_view(make_store, monkeypatch):
     monkeypatch.setattr(team_claims, "_release_lease", failed)
     first = unclaim(make_store, revision, reason="Waiting for review")
     monkeypatch.setattr(team_claims, "_release_lease", original)
+    assert [row["reason"] for row in first["blockers"]] == [
+        "unclaim_recovery_required", "queue_io_unavailable"]
+    assert set(first["blockers"][1]) == {"refused", "reason", "next_action"}
+    assert "private-value" not in json.dumps(first)
     for result in (first, queue.list(make_store, now=102), queue.audit(make_store, now=102)):
         blocker = result["blockers"][0]
         assert (blocker["item_id"], blocker["lane"], blocker["revision"], blocker["caller"]) == (
             "ONE", "alpha", revision, "owner")
         assert revision in blocker["next_action"] and "--writer-stopped" in blocker["next_action"]
         assert blocker["reason_text"] == "Waiting for review"
+    for result in (queue.list(make_store, now=102), queue.audit(make_store, now=102)):
+        assert [row["reason"] for row in result["blockers"]] == ["unclaim_recovery_required"]
     result = unclaim(make_store, revision)
     assert not result["refused"] and result["item"]["conditions_met"] is False
     assert result["item"]["blockers"][0]["reason"] == "lease_free"
@@ -714,6 +739,10 @@ def test_unclaim_queue_size_failure_preserves_phase_and_compact_guidance(make_st
     assert result["refused"] and result["exit_code"] == 1
     assert result["reason"] == ("queue_size_limit" if phase == "intent" else "unclaim_recovery_required")
     assert "aegis team queue compact" in json.dumps(result)
+    if phase == "released-ids":
+        assert [row["reason"] for row in result["blockers"]] == [
+            "unclaim_recovery_required", "queue_size_limit"]
+        assert set(result["blockers"][1]) == {"refused", "reason", "next_action"}
     assert receipts(make_store) == []
     if phase == "intent":
         assert path.read_bytes() == before
@@ -728,6 +757,7 @@ def test_unclaim_queue_size_failure_preserves_phase_and_compact_guidance(make_st
         assert len(receipts(make_store)) == 1 and "unclaim" not in json.loads(path.read_bytes())
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("case", ["holds", "foreign-lease"])
 def test_large_fingerprint_observation_has_linear_evaluation_budget(make_store, monkeypatch, record_property, case):
     count, lane_count, holds = 128, 4000, 64 if case == "holds" else 0
@@ -842,3 +872,571 @@ def test_round_two_fingerprint_golden(make_store, monkeypatch, record_property, 
     assert not result["refused"], result
     record_property("round_two_golden", json.dumps({case: result["claimable_fingerprint"]}))
     assert result["claimable_fingerprint"] == ROUND_TWO_FINGERPRINTS[case]
+
+
+def plant_pending(root, monkeypatch):
+    """Publish one pending unclaim, then fail before the lease release."""
+    revision, oid = held(root)
+    original = queue._publish
+
+    def fail_after(store, state, **kwargs):
+        original(store, state, **kwargs)
+        if "unclaim" in state:
+            raise OSError("injected")
+
+    monkeypatch.setattr(queue, "_publish", fail_after)
+    failed = unclaim(root, revision)
+    monkeypatch.setattr(queue, "_publish", original)
+    assert failed["reason"] == "unclaim_recovery_required", failed
+    path = root / ".aegis" / "state" / "team-queue.json"
+    assert "unclaim" in json.loads(path.read_bytes())
+    return revision, oid, path
+
+
+def cause_of(result):
+    assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1, result
+    assert result["blockers"][0]["reason"] == "unclaim_recovery_required"
+    return result["blockers"][1]
+
+
+def test_initial_event_refusal_restores_queue_bytes(make_store):
+    revision, oid = held(make_store)
+    log = events.events_path(make_store)
+    original_log = log.read_bytes()
+    log.write_bytes(original_log + b'{"token":"private-value"\n')
+    path = make_store / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    result = unclaim(make_store, revision)
+    assert result["reason"] == "unclaim_event_unavailable" and result["exit_code"] == 1
+    assert "private-value" not in json.dumps(result)
+    assert path.read_bytes() == before and "unclaim" not in json.loads(before)
+    assert team.read_leases(make_store).get("alpha").oid == oid
+    log.write_bytes(original_log)
+    assert not unclaim(make_store, revision)["refused"]
+
+
+def test_initial_duplicate_rows_are_not_a_receipt_conflict(make_store):
+    revision, _ = held(make_store)
+    log = events.events_path(make_store)
+    row = (b'{"event":"lease_claimed","result":"queue_unclaim","detail":{"unclaim_id":"'
+           + b"ab" * 32 + b'"}}\n')
+    log.write_bytes(log.read_bytes() + row + row)
+    assert not unclaim(make_store, revision)["refused"]
+
+
+@pytest.mark.parametrize("blocker", ["foreign", "unreadable", "missing-newline", "torn-row",
+    "malformed", "duplicate"])
+def test_recovery_cause_names_the_blocker_and_retries(make_store, monkeypatch, blocker):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    log = events.events_path(make_store)
+    original_log = log.read_bytes()
+    pending = json.loads(before)["unclaim"]
+    if blocker == "foreign":
+        # A second src/** lease cannot be claimed while alpha's live lease overlaps it.
+        team.release(make_store, "alpha", oid, caller="external")
+        team.claim(make_store, "beta", ["src/**"], owner="someone-else", now=100)
+    elif blocker == "unreadable":
+        bad = gitsafe.write_blob(make_store, b'{"token":"private-value"}')
+        gitsafe.update_ref(make_store, team.lane_ref("beta"), bad, None)
+    elif blocker == "missing-newline":
+        log.write_bytes(original_log + b'{"token":"private-value"')
+    elif blocker == "torn-row":
+        log.write_bytes(original_log + b'{"token":"private-value"\n')
+    elif blocker == "malformed":
+        log.write_bytes(original_log + b'"private-value"\n')
+    else:
+        receipt = (json.dumps({"event": "lease_claimed", "result": "queue_unclaim", "detail": {
+            "unclaim_id": pending["to_revision"], "note": "private-value"}},
+            separators=(",", ":")).encode("ascii") + b"\n")
+        log.write_bytes(original_log + receipt + receipt)
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        cause = cause_of(result)
+        assert path.read_bytes() == before
+        assert "private-value" not in json.dumps(result)
+        assert "\n" not in json.dumps(cause)
+        if blocker in ("foreign", "unreadable"):
+            assert cause["reason"] == "unclaim_lease_refused"
+            assert cause["lane"] == "beta" and cause["lease_oid"]
+            assert "aegis team release beta --expect " + cause["lease_oid"] == cause["next_action"].split(": ", 1)[1]
+        else:
+            assert cause["reason"] == "unclaim_event_unavailable"
+            assert set(cause) == {"refused", "reason", "next_action"}
+    if blocker == "foreign":
+        foreign = team.read_leases(make_store).get("beta")
+        team.release(make_store, "beta", foreign.oid, caller="someone-else")
+    elif blocker == "unreadable":
+        team.release(make_store, "beta", bad, caller="owner")
+    else:
+        log.write_bytes(original_log)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert recovered["item"]["state"] == "queued"
+    assert team.read_leases(make_store).get("alpha") is None
+    if blocker == "foreign":
+        assert recovered["released_lease_ids"] == []
+    else:
+        assert oid in recovered["released_lease_ids"]
+
+
+def test_recovery_cause_omits_unsanitized_lease_facts(make_store, monkeypatch):
+    revision, _, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+
+    def hostile(root):
+        return SimpleNamespace(leases=(), unreadable=(SimpleNamespace(
+            lane="beta\nprivate-value", oid="not-an-oid/private-value"),))
+
+    monkeypatch.setattr(team_claims, "team", SimpleNamespace(**{**vars(team), "read_leases": hostile}))
+    result = unclaim(make_store, revision)
+    cause = cause_of(result)
+    assert cause["reason"] == "unclaim_lease_refused"
+    assert "lane" not in cause and "lease_oid" not in cause
+    assert cause["next_action"] == "aegis team list --json; ask the coordinator to repair the unreadable ref"
+    assert "private-value" not in json.dumps(result)
+    assert "beta private-value" not in json.dumps(result)
+    assert path.read_bytes() == before
+
+
+def test_recovery_lease_refusal_omits_exception_text(make_store, monkeypatch):
+    revision, _, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    current = "ab" * 20
+
+    def leaked(*args, **kwargs):
+        raise team.LeaseRefused("leak private-value /tmp/secret", "stale", "alpha", current=current)
+
+    monkeypatch.setattr(team_claims, "_release_lease", leaked)
+    result = unclaim(make_store, revision)
+    cause = cause_of(result)
+    assert cause["reason"] == "unclaim_lease_refused"
+    assert cause["lane"] == "alpha" and cause["lease_oid"] == current
+    assert "private-value" not in json.dumps(result) and "/tmp/secret" not in json.dumps(result)
+    assert path.read_bytes() == before
+
+
+def test_concurrent_recovery_retries_keep_one_lease_cause(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    team.release(make_store, "alpha", oid, caller="external")
+    team.claim(make_store, "beta", ["src/**"], owner="someone-else", now=100)
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+    assert path.read_bytes() == before
+    assert [result["reason"] for result in results] == ["unclaim_recovery_required"] * 2
+    for result in results:
+        cause = cause_of(result)
+        assert cause["reason"] == "unclaim_lease_refused" and cause["lane"] == "beta"
+        assert "private-value" not in json.dumps(result)
+    foreign = team.read_leases(make_store).get("beta")
+    team.release(make_store, "beta", foreign.oid, caller="someone-else")
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert recovered["released_lease_ids"] == []
+
+
+def _receipt_row(token, **detail):
+    body = {"unclaim_id": token, "writer_stopped": True, "released_lease_ids": []}
+    body.update(detail)
+    return json.dumps({"event": "lease_claimed", "result": "queue_unclaim", "detail": body},
+                      separators=(",", ":")).encode("ascii")
+
+
+def _parity_log(case):
+    token = "ab" * 32
+    row = _receipt_row(token)
+    other = b'{"event":"lease_claimed","result":"released","detail":{}}'
+    if case == "lf":
+        raw = other + b"\n" + row + b"\n"
+    elif case == "crlf":
+        raw = other + b"\r\n" + row + b"\r\n"
+    elif case == "blank-rows":
+        raw = b"\n \n\t\n\v\n\f\n\r\n" + row + b"\n\n"
+    elif case == "missing-trailing-newline":
+        raw = row
+    elif case == "torn-last-row":
+        raw = row + b"\n" + b'{"event":"private-value"\n'
+    elif case == "duplicate-receipt":
+        raw = (row + b"\n") * 2
+    elif case == "cr-terminated":
+        raw = other + b"\r" + row + b"\n"
+    elif case in ("boundary-exact", "boundary-over"):
+        boundary = team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN
+        line = row + b"\n"
+        extra = 0 if case == "boundary-exact" else 1
+        raw = line + (b" " * (boundary + extra - len(line) - 1)) + b"\n"
+        assert len(raw) == boundary + extra and raw.endswith(b"\n")
+    else:
+        raise AssertionError(case)
+    return token, raw
+
+
+def _oracle_scan(raw, correlation, decode):
+    if correlation is None and len(raw) > team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN:
+        raise team_claims.ClaimRefusal("unclaim_event_unavailable")
+    if raw and not raw.endswith(b"\n"):
+        raise team_claims.ClaimRefusal("unclaim_event_unavailable")
+    receipt = None
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = decode(line, "invalid_queue_state")
+        except ValueError:
+            raise team_claims.ClaimRefusal("unclaim_event_unavailable") from None
+        if type(row) is not dict:
+            raise team_claims.ClaimRefusal("unclaim_event_unavailable")
+        detail = row.get("detail")
+        if (correlation is not None and row.get("event") == "lease_claimed" and
+                row.get("result") == "queue_unclaim" and type(detail) is dict and
+                detail.get("unclaim_id") == correlation):
+            if receipt is not None:
+                raise team_claims.ClaimRefusal("unclaim_event_unavailable")
+            receipt = detail
+    return receipt
+
+
+def _scan_outcome(raw, correlation, decode):
+    try:
+        return ("ok", team_claims._scan_event_log(raw, correlation, decode))
+    except team_claims.ClaimRefusal as error:
+        return ("refuse", error.reason)
+
+
+def _oracle_outcome(raw, correlation, decode):
+    try:
+        return ("ok", _oracle_scan(raw, correlation, decode))
+    except team_claims.ClaimRefusal as error:
+        return ("refuse", error.reason)
+
+
+@pytest.mark.parametrize("case", ["lf", "crlf", "blank-rows", "missing-trailing-newline", "torn-last-row",
+    "duplicate-receipt", "boundary-exact", "boundary-over", "cr-terminated"])
+def test_event_log_decoder_matches_splitlines_parity(case):
+    token, raw = _parity_log(case)
+    expected_lines = [line for line in raw.splitlines() if line.strip()]
+    assert list(team_claims._iter_event_rows(raw)) == expected_lines
+    correlation = None if case == "boundary-over" else token
+    assert _scan_outcome(raw, correlation, queue._json) == _oracle_outcome(raw, correlation, queue._json)
+    if case == "boundary-exact":
+        assert _scan_outcome(raw, None, queue._json) == ("ok", None)
+        assert _oracle_outcome(raw, None, queue._json) == ("ok", None)
+    if case == "boundary-over":
+        seen = []
+
+        def decode(line, reason):
+            seen.append(line)
+            return queue._json(line, reason)
+
+        assert _scan_outcome(raw, None, decode) == ("refuse", "unclaim_event_unavailable")
+        assert seen == []
+    if case in ("missing-trailing-newline", "torn-last-row", "duplicate-receipt"):
+        assert _scan_outcome(raw, token, queue._json)[0] == "refuse"
+        rendered = json.dumps(_scan_outcome(raw, token, queue._json))
+        assert "private-value" not in rendered
+
+
+def test_overlong_event_row_is_refused_before_decode():
+    raw = b"{" + (b"x" * team_claims._EVENT_ROW_BYTES) + b"}\n"
+    assert team_claims._EVENT_ROW_BYTES == queue.MAX_BYTES
+    seen = []
+
+    def decode(line, reason):
+        seen.append(len(line))
+        raise AssertionError("decoded an overlong row")
+
+    with pytest.raises(team_claims.ClaimRefusal) as caught:
+        team_claims._scan_event_log(raw, "ab" * 32, decode)
+    assert caught.value.reason == "unclaim_event_unavailable" and caught.value.blockers is None
+    assert seen == []
+    assert "x" * 32 not in str(caught.value)
+
+
+def test_receipt_scan_memory_is_one_row():
+    import tracemalloc
+    token = "cd" * 32
+    rows = [b'{"event":"lease_denied","result":"refused","detail":{"n":%d}}\n' % index
+            for index in range(6000)]
+    rows.append(_receipt_row(token) + b"\n")
+    raw = b"".join(rows)
+    assert len(raw) > 256 * 1024
+    team_claims._scan_event_log(_receipt_row(token) + b"\n", token, queue._json)
+    tracemalloc.start()
+    found = team_claims._scan_event_log(raw, token, queue._json)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert found["unclaim_id"] == token
+    assert peak < 128 * 1024, peak
+
+
+class CountingBuffer(bytes):
+    """Bytes whose ``find`` reports how many bytes each delimiter search examines."""
+
+    def __new__(cls, data, budget):
+        obj = bytes.__new__(cls, data)
+        obj.examined = 0
+        obj.budget = budget
+        return obj
+
+    def find(self, sub, start=0, end=None):
+        if end is None:
+            end = len(self)
+        if start < 0:
+            start = max(0, len(self) + start)
+        found = bytes.find(self, sub, start, end)
+        span = (end - start) if found < 0 else (found - start + len(sub))
+        self.examined += span
+        if self.examined > self.budget:
+            raise RuntimeError("delimiter search exceeded the linear budget: %s > %s" % (
+                self.examined, self.budget))
+        return found
+
+
+def _budget_log(case):
+    cap = team_claims.MAX_EVENT_BYTES - team_claims.EVENT_MARGIN
+    if case == "lf-rows":
+        row = b'{"event":"lease_denied","result":"refused","detail":{}}\n'
+        raw = row * (cap // len(row))
+    elif case == "blank-lf":
+        raw = b"\n" * 15728640
+    elif case == "cr-rows":
+        unit = b"{}\r"
+        raw = unit * ((cap - 1) // len(unit)) + b"\n"
+    else:
+        raise AssertionError(case)
+    assert 0 < len(raw) <= cap or case == "blank-lf"
+    if case == "blank-lf":
+        assert len(raw) == 15728640
+    else:
+        assert len(raw) > cap - 80
+    return raw
+
+
+@pytest.mark.parametrize("case", ["lf-rows", "blank-lf", "cr-rows"])
+def test_event_row_delimiter_search_is_linear(case):
+    raw = _budget_log(case)
+    rows = raw.count(b"\n") + raw.count(b"\r")
+    # Two full scans plus a few bytes of bookkeeping per row. A suffix rescan
+    # exceeds this on the third row and aborts, so the quadratic shape cannot
+    # run to the end of a 15 MiB log.
+    budget = 2 * len(raw) + 8 * rows
+    buf = CountingBuffer(raw, budget)
+    produced = 0
+    for _line in team_claims._iter_event_rows(buf):
+        produced += 1
+    assert buf.examined <= budget
+    assert buf.examined >= len(raw)
+    if case == "blank-lf":
+        assert produced == 0
+    elif case == "lf-rows":
+        assert produced == raw.count(b"\n")
+    else:
+        assert produced == raw.count(b"\r")
+
+
+@pytest.mark.timing
+def test_blank_lf_receipt_scan_finishes_within_the_lock_timeout():
+    raw = b"\n" * 15728640
+    started = time.monotonic()
+    assert list(team_claims._iter_event_rows(raw)) == []
+    assert time.monotonic() - started < 5.0
+
+
+def _assert_recovery_cause(result, category, *, lane=None, lease_oid=None):
+    assert result["reason"] == "unclaim_recovery_required" and result["exit_code"] == 1, result
+    assert [row["reason"] for row in result["blockers"]] == [
+        "unclaim_recovery_required", category], result
+    cause = result["blockers"][1]
+    rendered = json.dumps(result)
+    assert "private-value" not in rendered and "/tmp/" not in rendered
+    assert "\n" not in json.dumps(cause)
+    if category == "unclaim_lease_refused":
+        assert cause["lane"] == lane and cause["lease_oid"] == lease_oid
+        assert set(cause) == {"refused", "reason", "lane", "lease_oid", "next_action"}
+        command = "aegis team release " + lane + " --expect " + lease_oid
+        assert cause["next_action"].split(": ", 1)[1] == command
+        assert "unreadable" not in cause["next_action"]
+    else:
+        assert set(cause) == {"refused", "reason", "next_action"}
+    return cause
+
+
+def _append_correlated(root, pending, **overrides):
+    body = {"unclaim_id": pending["to_revision"], "writer_stopped": True,
+            "released_lease_ids": list(pending.get("released_lease_ids", []))}
+    body.update(overrides)
+    row = json.dumps({"event": "lease_claimed", "result": "queue_unclaim", "detail": body,
+                      "note": "private-value"}, separators=(",", ":")).encode("ascii") + b"\n"
+    log = events.events_path(root)
+    original = log.read_bytes()
+    log.write_bytes(original + row)
+    return log, original
+
+
+def _patch_gitsafe(monkeypatch, **methods):
+    monkeypatch.setattr(team_claims, "gitsafe", SimpleNamespace(**{**vars(gitsafe), **methods}))
+
+
+def _finish_without_attestation(root, path, revision, recovered):
+    assert not recovered["refused"], recovered
+    assert recovered["item"]["state"] == "queued"
+    assert recovered["released_lease_ids"] == []
+    assert "unclaim" not in json.loads(path.read_bytes())
+    assert "private-value" not in json.dumps(recovered) and "/tmp/" not in json.dumps(recovered)
+    rows = receipts(root)
+    assert len(rows) == 1 and rows[0]["detail"]["released_lease_ids"] == []
+    after = path.read_bytes()
+    again = unclaim(root, recovered["item"]["revision"])
+    assert again["reason"] == "not_claimed" and again["exit_code"] == 1
+    assert path.read_bytes() == after
+    assert team.read_leases(root).get("alpha") is None
+
+
+@pytest.mark.parametrize("defect", ["writer-stopped", "released-ids"])
+def test_inconsistent_receipt_names_event_cause(make_store, monkeypatch, defect):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    pending = json.loads(before)["unclaim"]
+    if defect == "writer-stopped":
+        log, original = _append_correlated(make_store, pending, writer_stopped=False)
+    else:
+        log, original = _append_correlated(make_store, pending, released_lease_ids=["ab" * 20])
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        _assert_recovery_cause(result, "unclaim_event_unavailable")
+        assert path.read_bytes() == before
+        assert "ab" * 20 not in json.dumps(result["blockers"])
+    log.write_bytes(original)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert oid in recovered["released_lease_ids"]
+    assert team.read_leases(make_store).get("alpha") is None
+
+
+def test_concurrent_inconsistent_receipts_keep_the_event_cause(make_store, monkeypatch):
+    revision, _oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    pending = json.loads(before)["unclaim"]
+    log, original = _append_correlated(make_store, pending, writer_stopped=False)
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(race_unclaim, [(make_store, revision)] * 2, timeout=30))
+    assert path.read_bytes() == before
+    assert [result["reason"] for result in results] == ["unclaim_recovery_required"] * 2
+    for result in results:
+        _assert_recovery_cause(result, "unclaim_event_unavailable")
+    log.write_bytes(original)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+
+
+def test_receipt_while_lease_held_names_observed_oid(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+    pending = json.loads(before)["unclaim"]
+    log, original = _append_correlated(make_store, pending)
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        _assert_recovery_cause(result, "unclaim_lease_refused", lane="alpha", lease_oid=oid)
+        assert path.read_bytes() == before
+    log.write_bytes(original)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert recovered["released_lease_ids"] == [oid]
+
+
+def test_unconfirmed_release_names_lease_cause(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+
+    def already(root, ref, new, old, single_attempt=False):
+        return "already"
+
+    _patch_gitsafe(monkeypatch, update_ref=already)
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        _assert_recovery_cause(result, "unclaim_lease_refused", lane="alpha", lease_oid=oid)
+        assert path.read_bytes() == before
+        assert "already" not in json.dumps(result["blockers"])
+    monkeypatch.setattr(team_claims, "gitsafe", gitsafe)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert recovered["released_lease_ids"] == [oid]
+
+
+def test_absent_ref_between_release_reads_attests_nothing(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    real_read, real_update = gitsafe.read_ref, gitsafe.update_ref
+    calls = {"n": 0}
+
+    def read_ref(root, ref):
+        if ref != team.lane_ref("alpha"):
+            return real_read(root, ref)
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return real_read(root, ref)
+        if calls["n"] == 3:
+            real_update(root, ref, None, oid, single_attempt=True)
+        return None
+
+    _patch_gitsafe(monkeypatch, read_ref=read_ref)
+    recovered = unclaim(make_store, revision)
+    assert calls["n"] >= 3
+    _finish_without_attestation(make_store, path, revision, recovered)
+
+
+def test_refconflict_absent_ref_attests_nothing(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    real_update = gitsafe.update_ref
+
+    def update_ref(root, ref, new, old, single_attempt=False):
+        if ref == team.lane_ref("alpha") and new is None:
+            real_update(root, ref, None, old, single_attempt=True)
+            raise gitsafe.RefConflict("private-value /tmp/secret", ref=ref, expected=old, current=None)
+        return real_update(root, ref, new, old, single_attempt=single_attempt)
+
+    _patch_gitsafe(monkeypatch, update_ref=update_ref)
+    recovered = unclaim(make_store, revision)
+    _finish_without_attestation(make_store, path, revision, recovered)
+
+
+def test_owner_release_between_reads_attests_nothing(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    real_read = gitsafe.read_ref
+    calls = {"n": 0, "released": 0}
+
+    def read_ref(root, ref):
+        if ref != team.lane_ref("alpha"):
+            return real_read(root, ref)
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return real_read(root, ref)
+        if calls["n"] == 3:
+            team.release(root, "alpha", oid, caller="owner")
+            calls["released"] += 1
+        return None
+
+    _patch_gitsafe(monkeypatch, read_ref=read_ref)
+    recovered = unclaim(make_store, revision)
+    assert calls["released"] == 1 and calls["n"] >= 3
+    _finish_without_attestation(make_store, path, revision, recovered)
+
+
+def test_absent_lease_refusal_keeps_intent_oid(make_store, monkeypatch):
+    revision, oid, path = plant_pending(make_store, monkeypatch)
+    before = path.read_bytes()
+
+    original = team_claims._release_lease
+
+    def missing(*args, **kwargs):
+        raise team.LeaseRefused("leak private-value /tmp/secret", "absent", "alpha", current=None)
+
+    monkeypatch.setattr(team_claims, "_release_lease", missing)
+    for _ in range(2):
+        result = unclaim(make_store, revision)
+        _assert_recovery_cause(result, "unclaim_lease_refused", lane="alpha", lease_oid=oid)
+        assert path.read_bytes() == before
+    monkeypatch.setattr(team_claims, "_release_lease", original)
+    recovered = unclaim(make_store, revision)
+    assert not recovered["refused"], recovered
+    assert recovered["released_lease_ids"] == [oid]

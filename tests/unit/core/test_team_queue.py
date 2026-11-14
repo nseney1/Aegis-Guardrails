@@ -1239,3 +1239,131 @@ def test_unsupported_branch_preserves_independent_lease_findings(make_store, lea
                row["refused"] and row["reason"] and row["next_action"] for row in findings)
     assert "private-value" not in json.dumps(findings)
     assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+
+
+def _pending_state(root):
+    revision = add(root)
+    claimed = claim(root, revision)
+    assert not claimed["refused"], claimed
+    path = root / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    row = state["items"]["ONE"]
+    state["unclaim"] = {
+        "id": "ONE", "revision": row["revision"], "lane": row["lane"], "caller": "owner",
+        "reason": "Waiting", "lease_oid": None, "to_revision": "ab" * 32}
+    return path, state, row
+
+
+def _write_state(path, state):
+    raw = json.dumps(state, separators=(",", ":")).encode("ascii")
+    path.write_bytes(raw)
+    return raw
+
+
+def race_list(arguments):
+    root, moment = arguments
+    return queue.list(root, now=moment)
+
+
+def test_valid_pending_intent_stays_recoverable(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    assert listed["reason"] == "unclaim_recovery_required" and listed["exit_code"] == 1
+    assert listed["blockers"][0]["reason_text"] == "Waiting"
+    assert path.read_bytes() == before
+    state.pop("unclaim")
+    _write_state(path, state)
+    restored = queue.list(make_store, now=102)
+    assert not restored["refused"], restored
+    assert restored["items"][0]["id"] == "ONE"
+
+
+@pytest.mark.parametrize("shape", [
+    "non-dict", "missing-key", "extra-key", "bad-id", "bad-lane", "bad-revision", "bad-to-revision",
+    "bad-lease-oid", "bad-lease-type", "writer-stopped", "released-other", "released-shape",
+    "released-without-oid", "reason-length", "reason-multiline", "reason-credential", "caller-length",
+    "caller-multiline", "stale-revision", "not-claimed", "lane-mismatch"])
+def test_malformed_pending_intent_is_invalid_queue_state(make_store, shape):
+    path, state, row = _pending_state(make_store)
+    intent = state["unclaim"]
+    hostile = "private-value"
+    if shape == "non-dict":
+        state["unclaim"] = hostile
+    elif shape == "missing-key":
+        del intent["caller"]
+    elif shape == "extra-key":
+        intent["note"] = hostile
+    elif shape == "bad-id":
+        intent["id"] = "../" + hostile
+    elif shape == "bad-lane":
+        intent["lane"] = "BETA"
+    elif shape == "bad-revision":
+        intent["revision"] = hostile
+    elif shape == "bad-to-revision":
+        intent["to_revision"] = hostile
+    elif shape == "bad-lease-oid":
+        intent["lease_oid"] = hostile
+    elif shape == "bad-lease-type":
+        intent["lease_oid"] = 1
+    elif shape == "writer-stopped":
+        intent["writer_stopped"] = hostile
+    elif shape == "released-other":
+        intent["lease_oid"] = "cd" * 20
+        intent["released_lease_ids"] = [hostile]
+    elif shape == "released-shape":
+        intent["released_lease_ids"] = hostile
+    elif shape == "released-without-oid":
+        intent["released_lease_ids"] = ["ab" * 20]
+    elif shape == "reason-length":
+        intent["reason"] = hostile + ("x" * queue.MAX_TEXT)
+    elif shape == "reason-multiline":
+        intent["reason"] = hostile + "\ntrailer"
+    elif shape == "reason-credential":
+        intent["reason"] = "token=" + hostile
+    elif shape == "caller-length":
+        intent["caller"] = hostile + ("c" * 200)
+    elif shape == "caller-multiline":
+        intent["caller"] = hostile + "\ntrailer"
+    elif shape == "stale-revision":
+        intent["revision"] = "f" * 64
+    elif shape == "not-claimed":
+        row["state"] = "queued"
+        row["lane"] = None
+        row["expires_at"] = None
+    elif shape == "lane-mismatch":
+        intent["lane"] = "beta"
+    else:
+        raise AssertionError(shape)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    again = queue.list(make_store, now=102)
+    refused = queue.unclaim(make_store, "ONE", expect="0" * 64, lane="alpha", now=103,
+                            caller="owner", writer_stopped=True)
+    for result in (listed, again, refused):
+        assert result["reason"] == "invalid_queue_state" and result["exit_code"] == 1, result
+        rendered = json.dumps(result)
+        assert hostile not in rendered and "trailer" not in rendered, rendered
+        assert "Waiting" not in rendered and "f" * 64 not in rendered
+        if shape == "bad-lane":
+            assert "BETA" not in rendered
+        if shape == "lane-mismatch":
+            assert "beta" not in rendered
+        assert "\n" not in rendered
+    assert path.read_bytes() == before
+
+
+def test_malformed_pending_intent_retries_after_repair(make_store):
+    path, state, _row = _pending_state(make_store)
+    state["unclaim"] = "private-value"
+    before = _write_state(path, state)
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
+    assert all("private-value" not in json.dumps(result) for result in results)
+    assert path.read_bytes() == before
+    repaired = json.loads(before)
+    repaired.pop("unclaim")
+    _write_state(path, repaired)
+    restored = queue.list(make_store, now=103)
+    assert not restored["refused"], restored
