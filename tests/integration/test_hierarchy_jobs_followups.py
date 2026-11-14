@@ -1,4 +1,5 @@
 """JOBS-2b: observations never authorize a second execution or invent custody."""
+import ast
 import errno
 import hashlib
 import json
@@ -31,6 +32,97 @@ PROVENANCE_REPAIR_ACTION = ("Root: preserve admitted.json and derivation.json; r
                             "revalidate stopped-process evidence, then retry resolve.")
 
 
+def test_job_class_boundary_is_explicit(tmp_path):
+    assert issubclass(jobs.PlannedJob, jobs.Job)
+    (tmp_path / jobs.hierarchy_hosts.PLAN_FILE).write_text("{}")
+    initiative = {"id": "pilot", "mailbox_root": str(tmp_path / "mailbox")}
+    message = {"message_id": "boundary"}
+    assert jobs.Job(tmp_path / "store", initiative, message).planned is False
+    assert jobs.PlannedJob(tmp_path / "store", {"id": "pilot"}, message).planned is True
+    tree = ast.parse(Path(jobs.__file__).read_text(encoding="utf-8"))
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)
+               and node.name in ("Job", "PlannedJob")]
+    planned = next(cls for cls in classes if cls.name == "PlannedJob")
+    methods = {node.name for node in planned.body if isinstance(node, ast.FunctionDef)}
+    for name in ("recorded_execution_fence", "observe_fence", "metadata_kind", "observe_result",
+                 "observe_existing_fence", "validated_admission", "runner_alive", "result", "claim",
+                 "take_execution", "process_record", "process_group"):
+        assert name in methods
+    assert not [(node.lineno, node.attr) for cls in classes for node in ast.walk(cls)
+                if isinstance(node, ast.Attribute) and node.attr == "planned"]
+
+
+@pytest.mark.usefixtures("jobs2_fresh_cache")
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
+def test_job_class_public_dispatch_uses_explicit_type(kind_shop, capsys, planned):
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    shop.request_job("job-1", "ok")
+    expected = jobs.PlannedJob if planned else jobs.Job
+    original, captured = jobs.run_job, []
+
+    def run(store, job, *args, **kwargs):
+        captured.append(type(job))
+        return original(store, job, *args, **kwargs)
+
+    with patch.object(jobs, "run_job", run):
+        assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 0
+        assert job_fixtures.job_row(json.loads(capsys.readouterr().out))["state"] == "completed"
+    assert captured == [expected]
+    # Completed work remains settled on retry, including recovery's independently constructed job.
+    assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 0
+    assert capsys.readouterr().out == '{"rows": []}\n'
+    assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert next(row for row in report["jobs"] if row["job"] == "pilot/job-1")["state"] == "finished"
+
+
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
+@pytest.mark.parametrize("shape", ["absent", "valid", "schema", "malformed", "oversized"])
+def test_job_class_result_golden(tmp_path, planned, shape):
+    """Capture each reader's public result and refusal before separating the classes."""
+    if planned:
+        (tmp_path / jobs.hierarchy_hosts.PLAN_FILE).write_text("{}")
+    initiative = {"id": "pilot", "mailbox_root": str(tmp_path / "mailbox")}
+    job = (jobs.PlannedJob if planned else jobs.Job)(tmp_path / "store", initiative, {"message_id": "golden"})
+    job.folder.mkdir(parents=True)
+    result = {"schema": jobs.RESULT_SCHEMA, "job": job.id, "state": "completed", "exit_code": 0, "steps": []}
+    payloads = {"valid": json.dumps(result).encode(), "schema": b"{}", "malformed": b"{",
+                "oversized": b" " * (jobs.MAX_RESULT_BYTES + 1)}
+    if shape != "absent":
+        job.result_path.write_bytes(payloads[shape])
+    for _ in range(2):
+        if shape in ("absent", "valid"):
+            assert job.result() == (result if shape == "valid" else None)
+        else:
+            error = ("result is not a readable file within its limit" if shape == "oversized" else
+                     "invalid job result schema" if planned or shape == "schema" else
+                     "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)")
+            error_type = json.JSONDecodeError if not planned and shape == "malformed" else ValueError
+            with pytest.raises(error_type) as caught:
+                job.result()
+            assert type(caught.value) is error_type and str(caught.value) == error
+
+
+@pytest.mark.parametrize("planned", [False, True], ids=["legacy", "planned"])
+@pytest.mark.parametrize("surface", ["run-open", "resolve", "clean", "clean-finished"])
+def test_job_class_cli_refusal_golden(kind_shop, capsys, planned, surface):
+    shop = kind_shop
+    if planned:
+        host_plan(shop)
+    flags, error = {
+        "run-open": (("--max-jobs", "0"), "invalid max-jobs"),
+        "resolve": (("--job", "pilot/absent", "--reason", "checked"), "no running job here: pilot/absent"),
+        "clean": (("--job", "pilot/absent"), "no job here: pilot/absent"),
+        "clean-finished": (("--initiative", "invalid/id", "--finished"), "invalid initiative"),
+    }[surface]
+    command = "clean" if surface == "clean-finished" else surface
+    for _ in range(2):
+        assert jobs.main(shop.argv(command, *flags, census=[], lock_wait=0)[3:]) == 2
+        assert capsys.readouterr().out == json.dumps({"error": error}, sort_keys=True) + "\n"
+
+
 def recovery_admission_case(shop, terminal):
     """Retain a real staged admission, optionally execute or settle a fixture failure."""
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
@@ -39,7 +131,7 @@ def recovery_admission_case(shop, terminal):
     elif terminal == "failed":
         ledger = jobs.Store(shop.workspace.store).load()
         message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-        job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+        job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
         derived = json.loads((folder / "derivation.json").read_bytes())
         jobs.write_result(job, "failed", 7, reason="fixture execution failure", recipe="commit-exact",
                           process_stopped_confirmed=True, **derived)
@@ -475,7 +567,7 @@ def test_request_derivation_classification_refuses_unverified_bytes_before_parsi
     shop.request_job("job-1", "ok")
     ledger = jobs.Store(shop.workspace.store).load()
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
     path = Path(message["brief"]["path"])
     if fault == "oversized":
         path.write_bytes(b" " * (jobs.MAX_BYTES + 1))
@@ -580,7 +672,7 @@ def test_pending_invalid_terminal_digest_keeps_settlement_guidance(kind_shop, ca
     folder = recovery_admission_case(shop, None)
     ledger = jobs.Store(shop.workspace.store).load()
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
     derived = json.loads((folder / "derivation.json").read_bytes())
     if pending == "mismatch":
         jobs.write_result(job, "failed", 7, reason="historical result", process_stopped_confirmed=True, **derived)
@@ -628,7 +720,7 @@ def test_planned_provenance_unsupported_descriptors_refuses_before_io(kind_shop,
     recovery_admission_case(shop, None)
     ledger = jobs.Store(shop.workspace.store).load()
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
 
     def read_reference(*args, **kwargs):
         pytest.fail("unsupported provenance reader reached reference IO")
@@ -673,7 +765,7 @@ def test_settled_invalid_terminal_digest_remains_unavailable_evidence(kind_shop,
     folder = recovery_admission_case(shop, None)
     ledger = jobs.Store(shop.workspace.store).load()
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
     # Model a previously persisted bad result before a matching receipt is published.
     derived = json.loads((folder / "derivation.json").read_bytes())
     derived["dirty_content_sha256"] = "not-a-digest"
@@ -869,7 +961,7 @@ def test_result_first_probe_of_vanished_directory_retains_uncertainty(kind_shop)
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     ledger = jobs.Store(shop.workspace.store).load()
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(shop.workspace.store, ledger.initiative("pilot"), message)
+    job = jobs.PlannedJob(shop.workspace.store, ledger.initiative("pilot"), message)
     job.validated_admission()
     saved = shop.tmp / "vanished-result-first-job"
     folder.rename(saved)
@@ -890,7 +982,7 @@ def test_process_consumers_refuse_untrusted_groups(kind_shop, capsys, fault):
     shop.request_job("job-0", "ok")
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     job.folder.mkdir(parents=True)
     claim = job_fixtures.live_claim(jobs, os.getpid(), job.id)
     job.claim_path.write_text(json.dumps(claim))
@@ -954,11 +1046,11 @@ def test_process_refusal_survives_concurrent_replacement(kind_shop, replacement)
     shop.request_job("job-0", "ok")
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     job.folder.mkdir(parents=True)
     job.claim_path.write_text(json.dumps(job_fixtures.live_claim(jobs, os.getpid(), job.id)))
     job.process_path.write_text(json.dumps({"step": 1, "group": "untrusted-group\nsecond-line"}))
-    original = jobs.Job.process_record
+    original = jobs.PlannedJob.process_record
     changed = []
 
     def record(current):
@@ -970,13 +1062,13 @@ def test_process_refusal_survives_concurrent_replacement(kind_shop, replacement)
             changed.append(True)
         return answer
 
-    with patch.object(jobs.Job, "process_record", record):
+    with patch.object(jobs.PlannedJob, "process_record", record):
         for _ in range(2):
             with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
                 jobs.check_settlement_processes(job, {"steps": []})
     assert changed == [True] and shop.receipts("job-0") == []
     # A new attempt can use independently verified repaired evidence.
-    repaired = jobs.Job(store.path, job.initiative, message)
+    repaired = jobs.PlannedJob(store.path, job.initiative, message)
     jobs.check_settlement_processes(repaired, {"steps": []})
 
 
@@ -988,13 +1080,13 @@ def test_final_process_probe_refusal_cannot_be_bypassed(kind_shop, capsys, surfa
     shop.request_job("job-0", "ok")
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     job.folder.mkdir(parents=True)
     claim = job_fixtures.live_claim(jobs, os.getpid(), job.id)
     claim["start"] = "0"
     job.claim_path.write_text(json.dumps(claim))
     (job.folder / "step-1.log").write_bytes(b"")
-    original = jobs.Job.process_record
+    original = jobs.PlannedJob.process_record
     probes = []
 
     def record(current):
@@ -1005,9 +1097,9 @@ def test_final_process_probe_refusal_cannot_be_bypassed(kind_shop, capsys, surfa
 
     for _ in range(2):
         probes.clear()
-        job = jobs.Job(store.path, job.initiative, message)
+        job = jobs.PlannedJob(store.path, job.initiative, message)
         job.process_path.write_text(json.dumps({"step": 1, "group": "untrusted-group\nsecond-line"}))
-        with patch.object(jobs.Job, "process_record", record):
+        with patch.object(jobs.PlannedJob, "process_record", record):
             if surface == "settlement":
                 with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
                     jobs.check_settlement_processes(job, {"steps": [], "process_stopped_confirmed": True})
@@ -1033,7 +1125,7 @@ def test_process_descriptor_failures_close_every_owned_handle(kind_shop, failure
     shop.request_job("job-0", "ok")
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-0"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     job.folder.mkdir(parents=True)
     job.process_path.write_text(json.dumps({"step": 1, "group": 2147483647}))
     owned, process_handles, refused = set(), set(), []
@@ -1128,7 +1220,7 @@ def test_planned_admission_decode_failures_have_one_fixed_message(kind_shop, cap
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     raw = (folder / "packet.md").read_bytes()
     marker = folder / "admitted.json"
     reference = json.loads(marker.read_bytes())
@@ -1182,7 +1274,7 @@ def test_unbound_derivation_bytes_never_reach_the_parser(kind_shop):
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     raw = (folder / "packet.md").read_bytes()
     recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
     poison = '{"untrusted-group\\nsecond-line":1,"untrusted-group\\nsecond-line":2}'
@@ -1289,8 +1381,8 @@ def test_settlement_uses_one_process_snapshot(kind_shop, first):
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
     initiative = store.load().initiative("pilot")
     process = folder / "process.json"
-    jobs.write_result(jobs.Job(store.path, initiative, message), "refused", None, reason="fixture terminal refusal")
-    original, captured = jobs.Job.process_record, []
+    jobs.write_result(jobs.PlannedJob(store.path, initiative, message), "refused", None, reason="fixture terminal refusal")
+    original, captured = jobs.PlannedJob.process_record, []
     group = os.getpgrp()
 
     def record(job):
@@ -1302,11 +1394,11 @@ def test_settlement_uses_one_process_snapshot(kind_shop, first):
     for _ in range(2):
         captured.clear()
         process.write_text(json.dumps({"step": 1, "group": None if first == "null" else group}))
-        with patch.object(jobs.Job, "process_record", record):
+        with patch.object(jobs.PlannedJob, "process_record", record):
             expected = ("job has an unrecorded process effect: pilot/job-1" if first == "null" else
                         "job process group is still running: " + str(group))
             with pytest.raises(ValueError, match="^" + re.escape(expected) + "$"):
-                jobs.settle(store, jobs.Job(store.path, initiative, message), 0)
+                jobs.settle(store, jobs.PlannedJob(store.path, initiative, message), 0)
         assert captured == [True]
         assert shop.receipts("job-1") == []
 
@@ -1397,7 +1489,7 @@ def test_recovery_recipe_acquisition_is_bounded_and_anchored(kind_shop, capsys, 
     store = jobs.Store(shop.workspace.store)
     mailbox = jobs.Mailbox(shop.root)
     message = mailbox.messages()["job-1"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     root = shop.tmp / "recipe-root"
     root.mkdir()
     recipe = root / "recipes.json"
@@ -1474,7 +1566,7 @@ def test_admitted_and_result_consumers_refuse_hostile_groups(kind_shop, capsys, 
         if fault == "unsupported":
             active.enter_context(patch.object(job_fixtures.jobs2_fresh_brief, "_reference_descriptors", lambda: False))
         for _ in range(2):
-            job = jobs.Job(store.path, initiative, message)
+            job = jobs.PlannedJob(store.path, initiative, message)
             expected = ("admission metadata requires directory descriptor support" if fault == "unsupported"
                         else PROCESS_REPAIR_ERROR)
             with pytest.raises(ValueError, match="^" + re.escape(expected) + "$"):
@@ -1492,12 +1584,12 @@ def test_admitted_and_result_consumers_refuse_hostile_groups(kind_shop, capsys, 
             assert row["process_group"] is None and row["process_alive"] is None
             assert "untrusted-group" not in output and "second-line" not in output
         # A syntactically valid terminal result cannot release custody with malformed process evidence.
-        job = jobs.Job(store.path, initiative, message)
+        job = jobs.PlannedJob(store.path, initiative, message)
         jobs.write_result(job, "refused", None, reason="fixture terminal refusal", process_stopped_confirmed=True)
         before = (folder / "result.json").read_bytes()
         for _ in range(2):
             with pytest.raises(ValueError, match="^" + re.escape(PROCESS_REPAIR_ERROR) + "$"):
-                jobs.settle(store, jobs.Job(store.path, initiative, message), 0)
+                jobs.settle(store, jobs.PlannedJob(store.path, initiative, message), 0)
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             row = job_fixtures.job_row(json.loads(capsys.readouterr().out))
             assert row["state"] == "settle_pending" and row["error"] == PROCESS_REPAIR_ERROR
@@ -1564,7 +1656,7 @@ def test_planned_admission_size_limit_precedes_open_and_parse(kind_shop, name):
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     raw = (folder / "packet.md").read_bytes()
     recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
     (folder / name).write_bytes(b" " * (jobs.MAX_BYTES + 1))
@@ -1614,7 +1706,7 @@ def test_planned_admission_unsupported_descriptors_refuses_before_io(kind_shop):
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     store = jobs.Store(shop.workspace.store)
     message = jobs.Mailbox(shop.root).messages()["job-1"]["message"]
-    job = jobs.Job(store.path, store.load().initiative("pilot"), message)
+    job = jobs.PlannedJob(store.path, store.load().initiative("pilot"), message)
     raw = (folder / "packet.md").read_bytes()
     recipes = json.loads((folder / "admitted.json").read_bytes())["recipes_sha256"]
 
@@ -1686,7 +1778,7 @@ def test_first_result_snapshot_blocks_derived_readmission(kind_shop, capsys, fir
     before = {name: (folder / name).read_bytes()
               for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
-    original = jobs.Job.observe_existing_fence
+    original = jobs.PlannedJob.observe_existing_fence
     captured = []
 
     def existing(job):
@@ -1714,7 +1806,7 @@ def test_first_result_snapshot_blocks_derived_readmission(kind_shop, capsys, fir
             else:
                 result.mkdir()
         with ExitStack() as active:
-            active.enter_context(patch.object(jobs.Job, "observe_existing_fence", existing))
+            active.enter_context(patch.object(jobs.PlannedJob, "observe_existing_fence", existing))
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
         row = job_fixtures.job_row(report)
@@ -1946,7 +2038,7 @@ def test_nonderived_claim_loser_with_unresolvable_directory_reports_exact_row(ki
     folder.mkdir(parents=True)
     (folder / "claim.json").write_text(json.dumps(job_fixtures.live_claim(jobs, os.getpid(), "pilot/job-1")))
     saved = shop.tmp / "peer-job"
-    original_run, original_claim = jobs.run_job, jobs.Job.claim
+    original_run, original_claim = jobs.run_job, jobs.PlannedJob.claim
     captured = []
 
     def claim(job, *args, **kwargs):
@@ -1964,7 +2056,7 @@ def test_nonderived_claim_loser_with_unresolvable_directory_reports_exact_row(ki
 
     folder.rename(saved)
     try:
-        with patch.object(jobs, "run_job", run), patch.object(jobs.Job, "claim", claim):
+        with patch.object(jobs, "run_job", run), patch.object(jobs.PlannedJob, "claim", claim):
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
         assert report == job_fixtures.jobs2_2m_unknown_report("job-1", job_fixtures.JOBS2_2M_FENCED_UNKNOWN_ACTION)
@@ -2045,7 +2137,7 @@ def test_uncertain_first_result_snapshot_cannot_readmit_after_disappearance(kind
     before = {name: (folder / name).read_bytes()
               for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
-    original_stat, original_existing = os.stat, jobs.Job.observe_existing_fence
+    original_stat, original_existing = os.stat, jobs.PlannedJob.observe_existing_fence
     refused, captured = [], []
 
     def existing(job):
@@ -2070,7 +2162,7 @@ def test_uncertain_first_result_snapshot_cannot_readmit_after_disappearance(kind
 
     for _ in range(2):
         result.write_bytes(b"{}")
-        with patch.object(jobs.Job, "observe_existing_fence", existing):
+        with patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             assert json.loads(capsys.readouterr().out) == job_fixtures.jobs2_2m_unknown_report(
                 "job-1", job_fixtures.JOBS2_UNVERIFIED_ACTION)
@@ -2099,7 +2191,7 @@ def test_recorded_metadata_uncertainty_refuses_admission_and_execution(kind_shop
         if node == "execution-vanishes":
             execution = folder / "execution.json"
             execution.mkdir()
-            original_fence = jobs.Job.observe_fence
+            original_fence = jobs.PlannedJob.observe_fence
             removed = []
 
             def fence(current, name=None, directory=None):
@@ -2109,7 +2201,7 @@ def test_recorded_metadata_uncertainty_refuses_admission_and_execution(kind_shop
                     removed.append(True)
                 return original_fence(current, name, directory)
 
-            with patch.object(jobs.Job, "observe_fence", fence):
+            with patch.object(jobs.PlannedJob, "observe_fence", fence):
                 nodes = job.observe_existing_fence()
             assert nodes["execution"] == "other" and removed == [True]
             captured.append(job)
@@ -2261,7 +2353,7 @@ def test_argon_uncertain_first_result_snapshot_preserves_sibling_rows(kind_shop,
     before = {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file() and path != result}
     receipts, head = shop.receipts(identifier), shop.head()
     index = (shop.checkout / ".git/index").read_bytes()
-    original_existing, original_stat, original_run = jobs.Job.observe_existing_fence, os.stat, jobs.run_job
+    original_existing, original_stat, original_run = jobs.PlannedJob.observe_existing_fence, os.stat, jobs.run_job
     armed, captured, peer = [], [], []
 
     def existing(job):
@@ -2294,7 +2386,7 @@ def test_argon_uncertain_first_result_snapshot_preserves_sibling_rows(kind_shop,
     expected = job_fixtures.jobs2_2m_unknown_report(identifier, job_fixtures.JOBS2_2M_FENCED_UNKNOWN_ACTION)
     if entry == "taken":
         expected["rows"][0]["process_group"] = json.loads(before["process.json"])["group"]
-    with patch.object(jobs.Job, "observe_existing_fence", existing), patch.object(jobs, "run_job", run):
+    with patch.object(jobs.PlannedJob, "observe_existing_fence", existing), patch.object(jobs, "run_job", run):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         assert json.loads(capsys.readouterr().out) == expected
     assert len(captured) == 1 and captured[0].recorded_execution_fence() is None
@@ -2320,7 +2412,7 @@ def test_attempt_uncertainty_can_settle_a_later_valid_terminal_result(kind_shop,
         shop.recipes["recipes"].pop("touch")
         shop.save_recipes()
     folder = shop.workspace.store / "jobs/pilot/job-1"
-    original_route, original_claim, original_stat = getattr(jobs, route), jobs.Job.claim, os.stat
+    original_route, original_claim, original_stat = getattr(jobs, route), jobs.PlannedJob.claim, os.stat
     captured, refused, peer = [], [], {}
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -2349,7 +2441,7 @@ def test_attempt_uncertainty_can_settle_a_later_valid_terminal_result(kind_shop,
             active.enter_context(patch.object(jobs, "run_job", enter))
         else:
             active.enter_context(patch.object(jobs, "refuse", enter))
-        active.enter_context(patch.object(jobs.Job, "claim", claim))
+        active.enter_context(patch.object(jobs.PlannedJob, "claim", claim))
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 0
         report = json.loads(capsys.readouterr().out)
     assert report == {"rows": [{"job": "pilot/job-1", "state": "refused", "exit_code": None,
@@ -2366,7 +2458,7 @@ def test_attempt_retains_result_from_execution_publication_probe(kind_shop, caps
     shop = kind_shop
     folder = job_fixtures.jobs2_2j_stopped_derived_admission(shop)
     result = folder / "result.json"
-    original_publish, original_observe = jobs.Job.publish_execution_claim, jobs.Job.observe_result
+    original_publish, original_observe = jobs.PlannedJob.publish_execution_claim, jobs.PlannedJob.observe_result
     captured, vanished, claim_bytes = [], [], []
     preserved = {name: (folder / name).read_bytes()
                  for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
@@ -2386,7 +2478,7 @@ def test_attempt_retains_result_from_execution_publication_probe(kind_shop, caps
             captured.append(job)
         return observed
 
-    with patch.object(jobs.Job, "publish_execution_claim", publish), patch.object(jobs.Job, "observe_result", observe):
+    with patch.object(jobs.PlannedJob, "publish_execution_claim", publish), patch.object(jobs.PlannedJob, "observe_result", observe):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     assert report == {"rows": [{"job": "pilot/job-1", "state": "settle_pending",
@@ -2409,7 +2501,7 @@ def test_argon_failed_directory_classification_never_verifies_staging_as_executi
         (folder / "claim.json").write_text(json.dumps(job_fixtures.live_claim(jobs, os.getpid(), "pilot/job-1")))
     before = {name: (folder / name).read_bytes()
               for name in ("admitted.json", "claim.json", "packet.md", "derivation.json")}
-    original_existing, original_stat = jobs.Job.observe_existing_fence, os.stat
+    original_existing, original_stat = jobs.PlannedJob.observe_existing_fence, os.stat
     captured = []
 
     def existing(job):
@@ -2429,7 +2521,7 @@ def test_argon_failed_directory_classification_never_verifies_staging_as_executi
         captured.append(job)
         return nodes
 
-    with patch.object(jobs.Job, "observe_existing_fence", existing):
+    with patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
         for _ in range(2):
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             assert json.loads(capsys.readouterr().out) == job_fixtures.jobs2_2m_unknown_report(
@@ -2451,7 +2543,7 @@ def test_argon_disappearing_execution_candidate_retains_unknown_recovery_guidanc
         execution.write_bytes(b"{}")
     else:
         execution.mkdir()
-    original_fence, original_existing = jobs.Job.observe_fence, jobs.Job.observe_existing_fence
+    original_fence, original_existing = jobs.PlannedJob.observe_fence, jobs.PlannedJob.observe_existing_fence
     original_grant, original_load = jobs.grant_next, jobs.Store.load
     store, retained = shop.workspace.store, shop.tmp / "retained-execution-candidate-store"
     vanished, captured, granted, swapped = [], [], [], []
@@ -2485,8 +2577,8 @@ def test_argon_disappearing_execution_candidate_retains_unknown_recovery_guidanc
 
     try:
         with ExitStack() as active:
-            active.enter_context(patch.object(jobs.Job, "observe_fence", fence))
-            active.enter_context(patch.object(jobs.Job, "observe_existing_fence", existing))
+            active.enter_context(patch.object(jobs.PlannedJob, "observe_fence", fence))
+            active.enter_context(patch.object(jobs.PlannedJob, "observe_existing_fence", existing))
             active.enter_context(patch.object(jobs, "grant_next", grant))
             active.enter_context(patch.object(jobs.Store, "load", load))
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
@@ -2514,7 +2606,7 @@ def test_attempt_retains_released_peer_entry_result(kind_shop, capsys, first):
     folder = shop.workspace.store / "jobs/pilot/job-1"
     result = folder / "result.json"
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
-    original_grant, original_existing, original_stat = jobs.grant_next, jobs.Job.observe_existing_fence, os.stat
+    original_grant, original_existing, original_stat = jobs.grant_next, jobs.PlannedJob.observe_existing_fence, os.stat
     released, captured, preserved = [], [], {}
 
     def grant(*args, **kwargs):
@@ -2551,7 +2643,7 @@ def test_attempt_retains_released_peer_entry_result(kind_shop, capsys, first):
         captured.append(job)
         return nodes
 
-    with patch.object(jobs, "grant_next", grant), patch.object(jobs.Job, "observe_existing_fence", existing):
+    with patch.object(jobs, "grant_next", grant), patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     assert len(released) == len(captured) == 1
@@ -2585,7 +2677,7 @@ def test_attempt_retains_nonderived_claim_loser_result(kind_shop, capsys, route,
     shop.request_job("job-1", "touch")
     folder = shop.workspace.store / "jobs/pilot/job-1"
     result = folder / "result.json"
-    original_route, original_claim, original_stat = getattr(jobs, route), jobs.Job.claim, os.stat
+    original_route, original_claim, original_stat = getattr(jobs, route), (jobs.PlannedJob if planned else jobs.Job).claim, os.stat
     peer, captured = [], []
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -2628,7 +2720,10 @@ def test_attempt_retains_nonderived_claim_loser_result(kind_shop, capsys, route,
             active.enter_context(patch.object(jobs, "run_job", enter))
         else:
             active.enter_context(patch.object(jobs, "refuse", enter))
-        active.enter_context(patch.object(jobs.Job, "claim", claim))
+        if planned:
+            active.enter_context(patch.object(jobs.PlannedJob, "claim", claim))
+        else:
+            active.enter_context(patch.object(jobs.Job, "claim", claim))
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         output = capsys.readouterr().out
         report = json.loads(output)
@@ -2703,7 +2798,7 @@ def test_argon_addendum_admissionheld_retains_admission_role(kind_shop, capsys):
               for name in ("claim.json", "packet.md", "derivation.json", "process.json")}
     group = json.loads(before["process.json"])["group"]
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
-    original_kind, original_admit = jobs.Job.metadata_kind, jobs.admit
+    original_kind, original_admit = jobs.PlannedJob.metadata_kind, jobs.admit
     vanished, held, captured = [], [], []
 
     def kind(job, name):
@@ -2721,7 +2816,7 @@ def test_argon_addendum_admissionheld_retains_admission_role(kind_shop, capsys):
             held.append(True)
             raise
 
-    with patch.object(jobs.Job, "metadata_kind", kind), patch.object(jobs, "admit", admit):
+    with patch.object(jobs.PlannedJob, "metadata_kind", kind), patch.object(jobs, "admit", admit):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     expected = job_fixtures.jobs2_2m_unknown_report("job-1", job_fixtures.JOBS2_UNVERIFIED_ACTION)
@@ -2875,7 +2970,7 @@ def test_attempt_retained_result_does_not_certify_uncertain_metadata(kind_shop, 
     (folder / "result.json").write_bytes(b"{}")
     (folder / "execution.json").write_text(json.dumps(claim))
     before = {name: (folder / name).read_bytes() for name in ("claim.json", "execution.json", "result.json")}
-    original_stat, original_existing = os.stat, jobs.Job.observe_existing_fence
+    original_stat, original_existing = os.stat, jobs.PlannedJob.observe_existing_fence
     refused, captured = [], []
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -2890,7 +2985,7 @@ def test_attempt_retained_result_does_not_certify_uncertain_metadata(kind_shop, 
         captured.append(job)
         return answer
 
-    with patch.object(jobs.Job, "observe_existing_fence", existing):
+    with patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
         with patch.object(jobs, "os", SimpleNamespace(**{**vars(os), "stat": stat_node})):
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
@@ -2915,7 +3010,7 @@ def test_attempt_first_metadata_kind_probe_retains_admission_custody(kind_shop, 
               for name in ("claim.json", "packet.md", "derivation.json", "process.json")}
     saved = shop.tmp / "peer-admission-published-after-visit"
     folder.rename(saved)
-    original_kind, original_stat = jobs.Job.metadata_kind, os.stat
+    original_kind, original_stat = jobs.PlannedJob.metadata_kind, os.stat
     captured, refused = [], []
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -2945,7 +3040,7 @@ def test_attempt_first_metadata_kind_probe_retains_admission_custody(kind_shop, 
                 marker.mkdir()
         return answer
 
-    with patch.object(jobs.Job, "metadata_kind", kind):
+    with patch.object(jobs.PlannedJob, "metadata_kind", kind):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     expected = job_fixtures.jobs2_2m_unknown_report("job-1", job_fixtures.JOBS2_UNVERIFIED_ACTION)
@@ -2986,7 +3081,7 @@ def test_attempt_resolve_refuses_result_first_observed_during_liveness(kind_shop
     claim["start"] = "0"
     (folder / "claim.json").write_text(json.dumps(claim))
     before, head = (folder / "claim.json").read_bytes(), shop.head()
-    original, original_stat = jobs.Job.observe_existing_fence, os.stat
+    original, original_stat = jobs.PlannedJob.observe_existing_fence, os.stat
     captured, refused = [], []
 
     def stat_node(path, *args, **kwargs):
@@ -3005,7 +3100,7 @@ def test_attempt_resolve_refuses_result_first_observed_during_liveness(kind_shop
                     return original(job)
         return original(job)
 
-    with patch.object(jobs.Job, "observe_existing_fence", existing):
+    with patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
         assert jobs.main(shop.argv("resolve", "--job", "pilot/job-0", "--reason", "root recovery",
                                    census=[], lock_wait=0)[3:]) == 2
         error = ("job is already finished: pilot/job-0" if observation == "regular"
@@ -3030,7 +3125,7 @@ def test_attempt_recovery_reports_retained_result_as_unvalidated_evidence(kind_s
     if race == "disappears-before-open":
         result.write_bytes(b"{}")
     before, head = (folder / "claim.json").read_bytes(), shop.head()
-    original_observe, original_existing = jobs.Job.observe_result, jobs.Job.observe_existing_fence
+    original_observe, original_existing = jobs.PlannedJob.observe_result, jobs.PlannedJob.observe_existing_fence
     captured = []
 
     def observe(job, directory=None, **kwargs):
@@ -3047,7 +3142,7 @@ def test_attempt_recovery_reports_retained_result_as_unvalidated_evidence(kind_s
             captured.append(job)
         return original_existing(job)
 
-    with patch.object(jobs.Job, "observe_result", observe), patch.object(jobs.Job, "observe_existing_fence", existing):
+    with patch.object(jobs.PlannedJob, "observe_result", observe), patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
         assert jobs.main(shop.argv("recovery-status", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     row = next(row for row in report["jobs"] if row["job"] == "pilot/job-0")
@@ -3068,8 +3163,8 @@ def test_attempt_result_stat_survives_descriptor_cleanup_failure(kind_shop, caps
     before = {name: (folder / name).read_bytes()
               for name in ("claim.json", "packet.md", "derivation.json", "admitted.json")}
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
-    original_existing, original_publish = jobs.Job.observe_existing_fence, jobs.Job.publish_execution_claim
-    original_observe, original_close = jobs.Job.observe_result, os.close
+    original_existing, original_publish = jobs.PlannedJob.observe_existing_fence, jobs.PlannedJob.publish_execution_claim
+    original_observe, original_close = jobs.PlannedJob.observe_result, os.close
     armed, failed, captured, closed = [], [], [], []
 
     def publish_result():
@@ -3108,9 +3203,9 @@ def test_attempt_result_stat_survives_descriptor_cleanup_failure(kind_shop, caps
         return original_observe(job, directory, **kwargs)
 
     with ExitStack() as active:
-        active.enter_context(patch.object(jobs.Job, "observe_existing_fence", existing))
-        active.enter_context(patch.object(jobs.Job, "publish_execution_claim", publish))
-        active.enter_context(patch.object(jobs.Job, "observe_result", observe))
+        active.enter_context(patch.object(jobs.PlannedJob, "observe_existing_fence", existing))
+        active.enter_context(patch.object(jobs.PlannedJob, "publish_execution_claim", publish))
+        active.enter_context(patch.object(jobs.PlannedJob, "observe_result", observe))
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     action = job_fixtures.JOBS2_OBSERVED_RESULT_ACTION if shape == "regular" else job_fixtures.JOBS2_BLOCKED_ACTION
@@ -3132,7 +3227,7 @@ def test_attempt_claim_never_recreates_an_observed_peer_candidate(kind_shop, cap
     host_plan(shop)
     shop.request_job("job-1", "touch")
     folder = shop.workspace.store / "jobs/pilot/job-1"
-    original = jobs.Job.claim
+    original = jobs.PlannedJob.claim
     captured = []
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -3151,7 +3246,7 @@ def test_attempt_claim_never_recreates_an_observed_peer_candidate(kind_shop, cap
             folder.rmdir()
         return original(job, *args, **kwargs)
 
-    with patch.object(jobs.Job, "claim", claim):
+    with patch.object(jobs.PlannedJob, "claim", claim):
         assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
         report = json.loads(capsys.readouterr().out)
     action = job_fixtures.JOBS2_2M_FENCED_UNKNOWN_ACTION if verified else job_fixtures.JOBS2_UNVERIFIED_ACTION
@@ -3169,7 +3264,7 @@ def test_attempt_standalone_result_probe_retains_lost_admission_directory(kind_s
     before = {name: (folder / name).read_bytes()
               for name in ("claim.json", "admitted.json", "packet.md", "derivation.json")}
     saved = shop.tmp / "lost-admission-directory"
-    original = jobs.Job.observe_existing_fence
+    original = jobs.PlannedJob.observe_existing_fence
     captured = []
     head, index = shop.head(), (shop.checkout / ".git/index").read_bytes()
 
@@ -3182,7 +3277,7 @@ def test_attempt_standalone_result_probe_retains_lost_admission_directory(kind_s
         return answer
 
     try:
-        with patch.object(jobs.Job, "observe_existing_fence", existing):
+        with patch.object(jobs.PlannedJob, "observe_existing_fence", existing):
             assert jobs.main(shop.argv("run-open", census=[], lock_wait=0)[3:]) == 3
             report = json.loads(capsys.readouterr().out)
         assert report == job_fixtures.jobs2_2m_unknown_report("job-1", job_fixtures.JOBS2_UNVERIFIED_ACTION)
