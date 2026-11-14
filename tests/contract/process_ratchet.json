@@ -59,6 +59,10 @@
     "count": 1,
     "reason": "Forwards the injected child-process runner to hook measurements."
   },
+  "process:aegis_core/ghcli.py:default_gh_runner:subprocess.Popen": {
+    "count": 1,
+    "reason": "Effect-only built-in GitHub API child: exactly one borrowed receipt descriptor, a new process group, concurrent bounded stdout/stderr capture, timeout, kill/reap/close cleanup; the existing no-opt-in subprocess.run recipe is unchanged."
+  },
   "process:aegis_core/ghcli.py:default_gh_runner:subprocess.run": {
     "count": 1,
     "reason": "Single GitHub transport, isolated working directory and explicit timeout."
