@@ -267,7 +267,7 @@ _SCALAR_TYPES = {
 
 
 def is_known_tool(name: Any) -> bool:
-    return isinstance(name, str) and name in _TOOL_HANDLERS
+    return isinstance(name, str) and (name in _TOOL_HANDLERS or name == "aegis_team_queue_claim")
 
 
 def _shown(value: Any) -> str:
@@ -296,8 +296,17 @@ def _invalid_scalar(name: str, args: dict) -> Optional[str]:
     return None
 
 
-def execute_tool(name: str, args: dict, *, client_arguments: bool = False) -> Any:
+def execute_tool(name: str, args: dict, *, client_arguments: bool = False, queue_grant=None, queue_session=None) -> Any:
     """Check the arguments against the schema, dispatch, and project the response if a view is asked for."""
+    if name == "aegis_team_queue_claim":
+        from .queue_role import Grant, claim_argument_refusal, refusal
+
+        invalid = claim_argument_refusal(args)
+        if invalid is not None:
+            return invalid
+        if client_arguments or type(queue_grant) is not Grant:
+            return refusal("role_missing")
+        return queue_grant.claim(args, queue_session)
     if name == "aegis_team_queue":
         if client_arguments:
             invalid = queue_argument_refusal(args)
