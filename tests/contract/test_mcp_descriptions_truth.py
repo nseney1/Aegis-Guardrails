@@ -72,6 +72,16 @@ def test_every_command_a_description_names_exists():
     assert unresolved_mentions(TOOL_DEFINITIONS, _tree()) == []
 
 
+def test_queue_descriptions_name_only_supported_surfaces():
+    from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS
+
+    assert unresolved_mentions(QUEUE_TOOL_DEFINITIONS, _tree()) == []
+    claim = QUEUE_TOOL_DEFINITIONS[1]
+    assert "owner-bound orchestrator" in claim["description"]
+    assert "no host launch" in claim["description"]
+    assert set(claim["inputSchema"]["properties"]) == {"id", "expect", "lane"}
+
+
 def test_the_guard_rejects_a_missing_command_a_removed_one_and_an_unknown_flag():
     tools = [{"name": "t", "description": "see `aegis insights review`, 'aegis verify' and `aegis check --nope`",
               "inputSchema": {"properties": {"p": {"description": "run \"aegis rule insight review\""}}}}]
