@@ -18,7 +18,7 @@ import re
 import stat
 from typing import Any
 
-from aegis_core import hosts as host_registry, pathlookup, storage
+from aegis_core import hosts as host_registry, pathlookup, storage, team_supervisor
 from aegis_core.primitives import sanitize_display as sanitize_display
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
@@ -49,6 +49,12 @@ CAPACITY_KINDS = ("writer", "review", "extra-review", "doc", "research",
                   "reviewer.correctness", "reviewer.security", "lens.extra")
 CAPACITY_DEFAULTS = {"hold_pct": 99, "route_pct": 95, "flex_route_pct": 80}
 _CAPACITY_ALIASES = {"review": "reviewer.correctness", "extra-review": "lens.extra"}
+# Bounds, declarations and required bindings precede these route-kind checks.
+_ROUTE_REFUSAL_ORDER = {
+    "review": ("cross_family", "admission", "pinned_family", "terminal"),
+    "writer": ("admission", "terminal"),
+    "other": ("admission",),
+}
 _IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
 PROFILE_SCHEMA = "aegis.team.profile/v1"
 REPO_PATH = (AEGIS_DIRNAME, "team", "profile.json")
@@ -153,8 +159,9 @@ _RUNNER = _object({"cpus": _INT, "image": _TEXT, "provider": _TEXT,
                                         "user_layer_only": True}})
 JSON_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": PROFILE_SCHEMA,
+    "validation_order": ("version", "preset", "model_settings", "policy", "run_config", "supervisor"),
     **_object({
-        "version": {"type": "integer", "enum": [1]},
+        "version": {"type": "integer", "enum": [1], "invalid_refusal": "unsupported profile version; upgrade aegis"},
         "preset": {"type": "string", "enum": list(PRESET_DATA["presets"])},
         "policy": _object({
             "review": _object({"require_cross_family": _BOOL, "cap": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},
@@ -171,14 +178,16 @@ JSON_SCHEMA = {
                                 "batch_max": _INT, "signature_required_for": _array(_TEXT),
                                 "publish": _object({"remote": _TEXT, "app": _TEXT})}),
         }),
-        "model_settings": _object({"hosts": _map(_HOST, MAX_HOSTS, reserved=_TERMINALS), "roles": _object({
+        "model_settings": {"validation_order": ("hosts", "roles", "capacity"), **_object({
+            "hosts": _map(_HOST, MAX_HOSTS, reserved=_TERMINALS), "roles": _object({
             name: _ROLE for name in ("writer", "reviewer.correctness", "reviewer.security", "lens.extra", "research")}),
-            "capacity": _map(_CAPACITY, reserved=_TERMINALS)}),
+            "capacity": _map(_CAPACITY, reserved=_TERMINALS)})},
         "run_config": _object({"runners": _map(_RUNNER),
             "autopilot": _object({"queue_full_on_ready": _BOOL, "claim_next": _BOOL, "resume_writer": _BOOL,
                                    "rulings": {"type": "string", "enum": ["owner", "coordinator"]}}),
             "limits": _object({"writers_max": _INT, "votes_max": _INT, "research_max": _INT}),
             "token_budgets": {**_map(_INT), "user_layer_only": True}}),
+        "supervisor": team_supervisor.SUPERVISOR_SCHEMA,
     }),
 }
 
@@ -202,70 +211,11 @@ def _context(error, layer, file=None):
     return error
 
 
-def _bounded(value, depth=0, budget=None):
-    if budget is None:
-        budget = [MAX_NODES]
-    budget[0] -= 1
-    if depth > MAX_DEPTH or budget[0] < 0:
-        raise ProfileError("profile nesting or node limit exceeded")
-    if type(value) is str and len(value) > MAX_STRING:
-        raise ProfileError("profile string size limit exceeded")
-    if type(value) in (dict, list):
-        if len(value) > MAX_NODES:
-            raise ProfileError("profile node limit exceeded")
-        for item in (value.items() if type(value) is dict else enumerate(value)):
-            if type(value) is dict:
-                _bounded(item[0], depth + 1, budget)
-            _bounded(item[1], depth + 1, budget)
-
-
-def _validate(value, schema, path, layer):
+def _validate(value, schema, path, layer, *, required=None, resolved=False):
     try:
-        _validate_value(value, schema, path, layer)
-    except ProfileError as error:
-        if error.path is None:
-            error.path = path
-        raise _context(error, layer)
-
-
-def _validate_value(value, schema, path, layer):
-    types = schema["type"]
-    types = [types] if type(types) is str else types
-    names = {dict: "object", list: "array", str: "string", bool: "boolean", int: "integer",
-             float: "number", type(None): "null"}
-    actual = names.get(type(value))
-    if actual not in types and not (actual == "integer" and "number" in types):
-        raise ProfileError("wrong type: " + (path or "profile"))
-    if schema.get("user_layer_only") and layer != "user":
-        raise ProfileError("user-only key: " + path)
-    if "enum" in schema and value not in schema["enum"]:
-        reason = "unregistered host kind" if path.endswith(".kind") else "invalid value"
-        raise ProfileError(reason + ": " + path)
-    if actual == "string" and "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
-        raise ProfileError("invalid identifier: " + path)
-    if type(value) in (int, float):
-        if not schema.get("minimum", 0) <= value <= schema.get("maximum", 1000000):
-            raise ProfileError("value out of range: " + path)
-    if actual == "object":
-        if len(value) > schema.get("maxProperties", MAX_ITEMS):
-            raise ProfileError("profile object size limit exceeded")
-        _reject_terminal_hosts(value, ProfileError, path)
-        for key, child in value.items():
-            if type(key) is not str:
-                raise ProfileError("profile keys must be strings")
-            child_schema = schema.get("properties", {}).get(key)
-            if child_schema is None:
-                child_schema = next((item for pattern, item in schema.get("patternProperties", {}).items()
-                                     if re.fullmatch(pattern, key)), None)
-            child_path = path + "." + key if path else key
-            if child_schema is None:
-                raise ProfileError("unknown key: " + child_path)
-            _validate(child, child_schema, child_path, layer)
-    elif actual == "array":
-        if len(value) > schema["maxItems"]:
-            raise ProfileError("profile array size limit exceeded: " + path)
-        for index, child in enumerate(value):
-            _validate(child, schema["items"], path + "." + str(index), layer)
+        return team_supervisor.validate_input(value, schema, path, layer, required=required, resolved=resolved)
+    except team_supervisor.SupervisorError as error:
+        raise _context(ProfileError(str(error), path=error.path, layer=error.layer), layer) from None
 
 
 def _merge(target, patch, origins, layer, prefix=()):
@@ -304,7 +254,8 @@ def capacity_thresholds(capacity):
 
 def _capacity_complete(settings):
     hosts, edges = settings["hosts"], 0
-    for name, capacity in settings["capacity"].items():
+    for name in sorted(settings["capacity"]):
+        capacity = settings["capacity"][name]
         path = "model_settings.capacity." + name
         if name not in hosts:
             raise ProfileError("capacity references undeclared host", path=path)
@@ -312,7 +263,9 @@ def _capacity_complete(settings):
         if not thresholds["flex_route_pct"] <= thresholds["route_pct"] <= thresholds["hold_pct"]:
             raise ProfileError("capacity thresholds must satisfy flex_route_pct <= route_pct <= hold_pct",
                                path=path + ".thresholds")
-        for kind, chain in capacity.get("fallback", {}).items():
+        fallbacks = capacity.get("fallback", {})
+        for kind in sorted(fallbacks):
+            chain = fallbacks[kind]
             if len(chain) > MAX_FALLBACK_CHAIN:
                 raise ProfileError("profile fallback chain limit exceeded", path=path + ".fallback." + kind)
             edges += len(chain)
@@ -414,7 +367,7 @@ def _lens_identities(profile):
 
 def _review_routes(profile, families):
     roles, hosts = profile["model_settings"]["roles"], profile["model_settings"]["hosts"]
-    kinds = [kind for kind, role in roles.items() if role["hosts"]]
+    kinds = [kind for kind in sorted(roles) if roles[kind]["hosts"]]
     kinds += [lens["name"] for lens in profile["policy"]["review"]["lenses"]]
     @lru_cache(maxsize=None)
     def planned(kind, start=None):
@@ -423,45 +376,59 @@ def _review_routes(profile, families):
     bindings = {kind: planned(kind) for kind in kinds}
     starts = [(kind, host) for kind, binding in bindings.items()
               for host in dict.fromkeys([*binding["binding"], *binding["admitted"]])]
-    starts += [("doc", host) for host in hosts]
+    starts += [("doc", host) for host in sorted(hosts)]
     # Cache every restarted plan before checking policy, preserving refusal order.
     for kind, host in starts:
         planned(kind, host)
+    admitted = {kind: set(binding["admitted"]) for kind, binding in bindings.items()}
     writers = {entry["host"] for kind, host in starts if kind == "writer"
                for route in (planned(kind, host),)
-               for entry in (route["entries"][:1] if route["pinned"] else route["entries"]) if "host" in entry}
+               for entry in (route["entries"][:1] if route["pinned"] else route["entries"])
+               if "host" in entry and entry["host"] in admitted["writer"]}
     writer_families = {families[host] for host in writers}
-    admitted = {kind: set(binding["admitted"]) for kind, binding in bindings.items()}
     checked = {kind: set() for kind in kinds}
     cross_family = profile["policy"]["review"]["require_cross_family"]
     if cross_family and (not writers or not roles.get("reviewer.correctness", {}).get("hosts")):
         raise ProfileError("cross-family review needs declared writer and reviewer hosts", path="policy.review.require_cross_family")
 
+    def refuse(rule, route, entry, allowed, cross):
+        name = entry.get("host")
+        if rule == "terminal" and entry.get("terminal") == "skip" and (route["voting"] or route["kind"] == "writer"):
+            raise ProfileError("skip is allowed only for non-voting jobs", path=entry["path"])
+        if name is None:
+            return
+        if rule == "cross_family" and cross and route["voting"] and families[name] in writer_families:
+            raise ProfileError("cross-family review route reaches the writer family", path=entry["path"],
+                               related_paths=("model_settings.roles.writer.hosts", "model_settings.hosts." + name + ".kind"))
+        if rule == "admission" and not route["pinned"] and name not in allowed:
+            raise ProfileError("fallback destination is not admitted for this job", path=entry["path"])
+        if rule == "pinned_family" and route["pinned"] and families[name] != families[route["binding"][0]]:
+            raise ProfileError("pinned lens fallback changes family", path=entry["path"],
+                               related_paths=("model_settings.hosts." + name + ".kind",))
+
+    order, grouped = [], {}
     for kind, host in starts:
         route = planned(kind, host)
-        # Role/lens facts apply across starts; doc admission is host-rooted.
+        review = kind.startswith("reviewer.") or kind == "lens.extra" or kind not in roles and kind != "doc"
+        category = "review" if review else "writer" if kind == "writer" else "other"
+        if category not in grouped:
+            order.append(category)
+            grouped[category] = []
         destinations = set() if kind == "doc" else checked[kind]
         allowed = set(route["admitted"]) if kind == "doc" else admitted[kind]
-        review = kind.startswith("reviewer.") or kind == "lens.extra" or kind not in roles
-        cross = cross_family and (kind not in roles or kind == "reviewer.correctness" or
-                                  (kind.startswith("reviewer.") and not route["pinned"]))
+        cross = review and cross_family and (kind not in roles or kind == "reviewer.correctness" or
+                                             (kind.startswith("reviewer.") and not route["pinned"]))
         for entry in route["entries"]:
-            if "terminal" in entry:
-                if entry["terminal"] == "skip" and (route["voting"] or kind == "writer"):
-                    raise ProfileError("skip is allowed only for non-voting jobs", path=entry["path"])
-                continue
-            name = entry["host"]
+            name = entry.get("host")
             if name in destinations:
                 continue
-            if review and route["pinned"] and families[name] != families[route["binding"][0]]:
-                raise ProfileError("pinned lens fallback changes family", path=entry["path"],
-                                   related_paths=("model_settings.hosts." + name + ".kind",))
-            if cross and route["voting"] and families[name] in writer_families:
-                raise ProfileError("cross-family review route reaches the writer family", path=entry["path"],
-                                   related_paths=("model_settings.roles.writer.hosts", "model_settings.hosts." + name + ".kind"))
-            if not route["pinned"] and name not in allowed:
-                raise ProfileError("fallback destination is not admitted for this job", path=entry["path"])
-            destinations.add(name)
+            if name is not None:
+                destinations.add(name)
+            grouped[category].append((route, entry, allowed, cross))
+    for category in order:
+        for rule in _ROUTE_REFUSAL_ORDER[category]:
+            for route, entry, allowed, cross in grouped[category]:
+                refuse(rule, route, entry, allowed, cross)
 
 
 def _complete(profile):
@@ -469,13 +436,19 @@ def _complete(profile):
     hosts, roles = settings["hosts"], settings["roles"]
     if len(hosts) > MAX_HOSTS:
         raise ProfileError("profile host limit exceeded", path="model_settings.hosts")
+    try:
+        team_supervisor.validate_input(profile, {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES}, resolved=True)
+    except team_supervisor.SupervisorError as error:
+        raise ProfileError(str(error), path=error.path) from None
     _reject_terminal_hosts(hosts, ProfileError, "model_settings.hosts")
-    for name, host in hosts.items():
+    for name in sorted(hosts):
+        host = hosts[name]
         if "kind" not in host:
             raise ProfileError("incomplete host: kind required", path="model_settings.hosts." + name)
         if host["kind"] not in PRESET_DATA["hosts"] or not PRESET_DATA["hosts"][host["kind"]]["writer"]:
             raise ProfileError("host kind not qualified for team-run roles", path="model_settings.hosts." + name + ".kind")
-    for name, role in roles.items():
+    for name in sorted(roles):
+        role = roles[name]
         path = "model_settings.roles." + name
         if "optional" in role and name != "lens.extra":
             raise ProfileError("optional is allowed only on lens.extra", path=path + ".optional")
@@ -490,7 +463,8 @@ def _complete(profile):
 
     families = {name: PRESET_DATA["hosts"][host["kind"]]["family"] for name, host in hosts.items()}
 
-    for name, role in roles.items():
+    for name in sorted(roles):
+        role = roles[name]
         chain = role["hosts"]
         if role.get("pinned_family", False) and chain and any(families[host] != families[chain[0]] for host in chain):
             raise ProfileError("pinned role chain changes family", path="model_settings.roles." + name + ".hosts",
@@ -607,21 +581,52 @@ def _user_layer(document, repository):
 
 
 def resolve(*, preset=None, repo=None, user=None, flags=None, live_run=False):
-    """Attribute refusals by resolving again without the user, never by origins."""
+    """Attribute intrinsic repository defects before evaluating the owner ceiling."""
     try:
         return _resolve(preset=preset, repo=repo, user=user, flags=flags, live_run=live_run)
     except ProfileError as error:
         try:
-            _resolve(preset=preset, repo=repo)
+            _repository_intrinsic(preset, repo)
         except ProfileError as repository_error:
             raise _context(repository_error, "repo") from None
         try:
             _resolve(preset=preset, repo=repo, user=user)
         except ProfileError as user_error:
+            # assemble identifies repository widening against the actual owner
+            # ceiling. Other combined-prefix failures belong to the user.
             raise _context(user_error, "user") from None
         # Both earlier prefixes are valid. Only the added flags/live-run
         # restrictions can account for the final refusal.
         raise _context(error, "flags") from None
+
+
+def _repository_intrinsic(preset, repo):
+    """Check repository syntax and policy without comparing supervisor to defaults.
+
+    A valid owner file may widen those defaults. Its absence during attribution
+    must not manufacture a repository failure that hides an owner-file refusal.
+    """
+    try:
+        prepared, _fragments = _split_supervisor([("repo", {} if repo is None else repo)])
+        _resolve(preset=preset, repo=prepared[0][1])
+    except ProfileError as error:
+        raise _context(error, "repo") from None
+
+
+def _split_supervisor(layers):
+    """Validate each layer, then hold supervisor fragments out of the generic merge."""
+    prepared, fragments = [], {}
+    for layer, document in layers:
+        try:
+            _validate(document, USER_JSON_SCHEMA if layer == "user" else JSON_SCHEMA, "", layer)
+            _policy_layer(document, layer)
+        except ProfileError as error:
+            raise _context(error, layer)
+        if type(document) is dict and "supervisor" in document:
+            fragments[layer] = document["supervisor"]
+            document = {key: value for key, value in document.items() if key != "supervisor"}
+        prepared.append((layer, document))
+    return prepared, fragments
 
 
 def _resolve(*, preset=None, repo=None, user=None, flags=None, live_run=False):
@@ -630,17 +635,10 @@ def _resolve(*, preset=None, repo=None, user=None, flags=None, live_run=False):
     Repository policy changes go through the existing human gate before merge.
     User/flag layers cannot set policy. There is no runtime approval switch.
     """
-    layers = [("repo", {} if repo is None else repo), ("user", {} if user is None else user),
-              ("flags", {} if flags is None else flags)]
-    for layer, document in layers:
-        try:
-            _bounded(document)
-            if type(document) is dict and "version" in document and (type(document["version"]) is not int or document["version"] != 1):
-                raise ProfileError("unsupported profile version; upgrade aegis")
-            _validate(document, USER_JSON_SCHEMA if layer == "user" else JSON_SCHEMA, "", layer)
-            _policy_layer(document, layer)
-        except ProfileError as error:
-            raise _context(error, layer)
+    layers, fragments = _split_supervisor([
+        ("repo", {} if repo is None else repo), ("user", {} if user is None else user),
+        ("flags", {} if flags is None else flags),
+    ])
     if preset is not None and (type(preset) is not str or preset not in PRESET_DATA["presets"]):
         raise ProfileError("unknown preset; use aegis team config presets --json", layer="flags", file="<command-line>", exit_code=2)
     selected = preset or PRESET_DATA["defaults"]["preset"]
@@ -668,8 +666,14 @@ def _resolve(*, preset=None, repo=None, user=None, flags=None, live_run=False):
     if result["run_config"]["autopilot"]["rulings"] != "owner":
         raise _context(ProfileError("governance floor: rulings remain with owner"), "repo")
     _complete(result)
+    try:
+        supervisor, supervisor_origins = team_supervisor.assemble(fragments.get("user", {}), fragments.get("repo", {}))
+    except team_supervisor.SupervisorError as error:
+        raise _context(ProfileError(str(error), path=error.path, layer=error.layer), error.layer or "repo")
+    result["supervisor"] = supervisor
+    origins.update(supervisor_origins)
     values = {path: {"value": value, "layer": origins[path],
-                     "frozen_at_run_start": path[0] in ("model_settings", "run_config")}
+                     "frozen_at_run_start": path[0] in ("model_settings", "run_config", "supervisor")}
               for path, value in _leaves(result)}
     values.update(user_records)
     writer_hosts = result["model_settings"]["roles"].get("writer", {}).get("hosts", [])
@@ -787,13 +791,17 @@ def _parse(data):
 
 
 def _read(root, parts, layer):
-    file = str(Path(root).joinpath(*parts))
+    file = str(root.joinpath(*parts))
     try:
         with _profile_file(root, parts) as handle:
             if layer == "user":
                 info = handle.parent_stat()
                 if info.st_uid != os.getuid() or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                     raise ProfileError("user profile directory must be owned by the current user and not group/other-writable")
+                data = team_supervisor.read_owned_leaf(
+                    handle._parent, parts[-1], MAX_BYTES,
+                    "user profile file must be owned by the current user and not group/other-writable")
+                return {} if data is None else _parse(data)
             return _parse(handle.read_bytes(MAX_BYTES))
     except storage.ConfinedFileError as error:
         if error.reason == "missing":
@@ -801,31 +809,51 @@ def _read(root, parts, layer):
         raise _context(_file_refusal(error), layer, file) from None
     except ProfileError as error:
         raise _context(error, layer, file)
+    except team_supervisor.SupervisorError as error:
+        reason = str(error) if error.layer == "user" else "unsafe or unreadable profile path"
+        raise _context(ProfileError(reason), layer, file) from None
+    except OSError:
+        raise _context(ProfileError("unsafe or unreadable profile path"), layer, file) from None
+
+
+def _repository_root(root):
+    return _validate(root, {"type": "root", "refusal": "unsafe profile root; use an absolute trusted directory"},
+                     "root", "repo")
+
+
+def _owner_config_root(user_root):
+    """Resolve an absolute owner home before any anchored read."""
+    message = "user profile root unavailable; configure a home directory"
+    if user_root is None:
+        layout = UserLayout.current()
+        if layout is None:
+            raise _context(ProfileError(message), "user")
+        home = layout.home
+    else:
+        home = user_root
+    try:
+        # The owner-selected directory chain includes stow's folded aegis link.
+        # Resolve an absolute home once, then verify its opened descriptor.
+        resolved = team_supervisor.resolved_home(home)
+        root = resolved.joinpath(*USER_PATH[:-1]).resolve()
+        _validate(root, {"type": "root", "refusal": message}, "root", "user")
+        return root
+    except (team_supervisor.SupervisorError, OSError, RuntimeError, ValueError):
+        raise _context(ProfileError(message), "user") from None
 
 
 def load(root, *, user_root=None):
-    try:
-        if user_root is None:
-            layout = UserLayout.current()
-            if layout is None:
-                raise _context(ProfileError("user profile root unavailable; configure a home directory"), "user")
-            home = layout.home
-        else:
-            home = Path(user_root)
-        # The owner-selected directory chain includes stow's folded aegis link.
-        # Resolve once, then verify its opened descriptor; never resolve the leaf.
-        home = home.resolve()
-        config_root = home.joinpath(*USER_PATH[:-1]).resolve()
-    except (OSError, RuntimeError):
-        raise _context(ProfileError("user profile root unavailable; configure a home directory"), "user") from None
+    root = _repository_root(root)
+    config_root = _owner_config_root(user_root)
     try:
         repository = _read(root, REPO_PATH, "repo")
         try:
             user = _read(config_root, USER_PATH[-1:], "user")
         except ProfileError:
             # Parsing/refusal occurs before resolve sees the user document.
-            # Apply the same repository-only counterfactual at this boundary.
-            resolve(repo=repository)
+            # Check intrinsic repository policy without a fabricated default
+            # supervisor ceiling when the owner file could not be read.
+            _repository_intrinsic(None, repository)
             raise
         resolved = resolve(repo=repository, user=user)
         # A parsed on-disk profile always has version; only a missing anchored
@@ -834,7 +862,7 @@ def load(root, *, user_root=None):
         return resolved
     except ProfileError as error:
         if error.layer in ("repo", "user"):
-            error.file = str(Path(root).joinpath(*REPO_PATH) if error.layer == "repo" else config_root / USER_PATH[-1])
+            error.file = str(root.joinpath(*REPO_PATH) if error.layer == "repo" else config_root / USER_PATH[-1])
         raise
 
 
@@ -881,6 +909,7 @@ def _preset_document(preset, host=None):
 
 def initialize(root, preset, *, host=None, force=False):
     document = _preset_document(preset, host)
+    root = _repository_root(root)
     data = (json.dumps(document, indent=2) + "\n").encode("utf-8")
     try:
         with _profile_file(root, REPO_PATH, create=True) as handle:
@@ -895,21 +924,35 @@ def initialize(root, preset, *, host=None, force=False):
                     raise
             handle.publish_bytes(data, replace=force)
     except storage.ConfinedFileError as error:
-        raise _context(_file_refusal(error), "repo", str(Path(root).joinpath(*REPO_PATH))) from None
+        raise _context(_file_refusal(error), "repo", str(root.joinpath(*REPO_PATH))) from None
     except ProfileError as error:
         error = _context(error, "repo")
         if error.layer == "repo":
-            error.file = str(Path(root).joinpath(*REPO_PATH))
+            error.file = str(root.joinpath(*REPO_PATH))
         raise error
     return document
 
 
 def validate_resolved(resolved, root=None):
-    """Recheck route policy before consuming an already resolved profile."""
+    """Recheck route policy and supervisor bounds before consuming a resolved profile."""
+    file = str(_repository_root(root).joinpath(*REPO_PATH)) if root is not None else None
+    def complete(body):
+        _complete(body)
+        team_supervisor.require_resolved(body["supervisor"])
+
     try:
-        _complete(resolved["profile"])
+        envelope = {"validation_order": ("profile", "values", "write_scope", "repository_profile_exists"), **_object({
+            "profile": {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES, "after": complete},
+            "values": {"type": "provenance", "schema": JSON_SCHEMA, "user_schema": USER_JSON_SCHEMA},
+            "write_scope": _array(_TEXT), "repository_profile_exists": _BOOL,
+        })}
+        _validate(resolved, envelope, "", "repo",
+                  required={"profile": {**PRESET_DATA["defaults"], "supervisor": team_supervisor.assemble({}, {})[0]},
+                            "values": {}, "write_scope": []}, resolved=True)
     except ProfileError as error:
-        raise _context(error, "repo", str(Path(root).joinpath(*REPO_PATH)) if root is not None else None)
+        raise _context(error, "repo", file)
+    except team_supervisor.SupervisorError as error:
+        raise _context(ProfileError(str(error), path=error.path, layer=error.layer), "repo", file)
 
 
 def doctor(resolved, root=None):
@@ -939,5 +982,8 @@ def doctor(resolved, root=None):
 
 def display_profile(value: Any, *, capacity=False) -> Any:
     """Render through the shared policy; capacity views opt into typed actions."""
+    value, snapshot = _validate(value, {"type": "display", "profile_keys": tuple(JSON_SCHEMA["properties"])}, "", "repo")
+    if snapshot is not None:
+        validate_resolved(snapshot)
     return _render_profile(value, capacity=capacity,
                            identifier_pattern=_IDENTIFIER_PATTERN, max_string=MAX_STRING)

@@ -80,6 +80,7 @@ packages = [
     "aegis_core.insights",
     "aegis_core.lifecycle",
     "aegis_core.outcomes",
+    "aegis_core.proposals",
     "aegis_core.skills",
     "aegis_core.team_templates",
     "aegis_core.telemetry_engine",
