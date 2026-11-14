@@ -120,7 +120,9 @@ def test_owner_workspace_unsafe_spellings_keep_fixed_refusal(owner_factory, tmp_
     raw = json.dumps(policy).encode("utf-8")
     path.write_bytes(raw)
     assert queue_owner.main(["alpha"]) == 1
-    assert capsys.readouterr().err == "aegis-mcp-queue: role_invalid\n"
+    assert capsys.readouterr().err == (
+        "aegis-mcp-queue: role_invalid: "
+        + queue_role.RoleRefusal("role_invalid").next_action + "\n")
     assert path.read_bytes() == raw
     assert not (root / "sessions").exists()
 
