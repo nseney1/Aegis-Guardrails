@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from aegis_core import gitsafe, lane_gate, team
 
-__all__ = ["status"]
+__all__ = ["status", "supervisor_health"]
 
 
 def _branch(root: Path, name: Optional[str]) -> Tuple[Optional[str], str]:
@@ -103,3 +103,15 @@ def status(root: Path, now: int, base: Optional[str] = None, check: bool = False
             row["check"] = _check(root, row, base_commit, now)
     return {"base": ref, "base_commit": base_commit, "lanes": rows, "check_requested": check,
             "checks_passed": all(row["check"]["status"] == "pass" for row in rows) if check else None}
+
+
+def supervisor_health(root, now, user_root=None):
+    """One supervisor health projection. Lease status is a different report and is not changed."""
+    from aegis_core import team_profile
+    from aegis_core.team_supervisor import report
+    def checked_load(root, **kwargs):
+        loaded = team_profile.load(root, **kwargs)
+        team_profile.validate_resolved(loaded, root)
+        return loaded
+
+    return report(checked_load, root, now, user_root, team_profile.ProfileError)
