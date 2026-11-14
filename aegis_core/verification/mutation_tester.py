@@ -8,6 +8,7 @@ test files against each mutant, and reports surviving mutations.
 """
 
 import ast
+from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 import subprocess
@@ -16,11 +17,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
-from aegis_core import testexec
+from aegis_core import gitsafe, testexec
 from aegis_core.ast.schema import MutationPoint, NormalizedAST
+from aegis_core.errors import AegisError
 from aegis_core.primitives import key_within, real_key
 from aegis_core.storage import atomic_write_text
-from aegis_core.workspace.binding import git_discovery_ceiling, git_discovery_paths
+from aegis_core.workspace.binding import git_boundary, git_discovery_ceiling, git_discovery_paths
 from . import ToolEvidence
 
 __all__ = ["check"]
@@ -620,6 +622,64 @@ def collect_mutations_from_ast(
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
+    """Read-only validation of the physical scratch root, before allocation.
+
+    Establish target, cwd and tool checkout boundaries independently of the
+    candidate, including explicit layouts and broken Git markers.
+    """
+    try:
+        parent = target.resolve().parent
+        invocation = Path.cwd().resolve()
+        layout = {name: os.environ[name]
+                  for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") if name in os.environ}
+        # Enforce the scoped runner's value limit before parsing paths, and
+        # again after expanding a relative value against the invocation cwd.
+        if any(len(value) > 65536 or "\x00" in value for value in layout.values()):
+            return None
+        explicit = {name: str((invocation / value).resolve()) for name, value in layout.items()}
+        if any(len(value) > 65536 for value in explicit.values()):
+            return None
+        worktree = None
+        if "GIT_DIR" in explicit or "GIT_WORK_TREE" in explicit:
+            if "GIT_WORK_TREE" not in explicit:
+                return None
+            worktree = Path(explicit["GIT_WORK_TREE"]).resolve(strict=True)
+            if not worktree.is_dir():
+                return None
+        contexts = (parent, invocation, Path(__file__).resolve().parents[2])
+        roots = set(contexts)
+        # Scoped runner overrides preserve invocation-relative paths without
+        # changing the process environment. These queries have no stdin/scratch IO.
+        scope = gitsafe.custody(scratch=invocation, env=explicit) if explicit else nullcontext()
+        with scope, gitsafe.memo():
+            for start in contexts:
+                marker = next((path for path in git_discovery_paths(start)
+                               if os.path.lexists(path / ".git")), None)
+                if (explicit and start == parent) or (worktree is not None and marker is None):
+                    top = gitsafe.toplevel(start)
+                    if top is None or (worktree is not None and (
+                        top.resolve(strict=True) != worktree
+                        or (start != worktree and worktree not in start.parents)
+                    )):
+                        return None
+                # A marker at start is already the closest possible Git boundary.
+                if marker == start:
+                    continue
+                if marker is not None or explicit:
+                    checkout = git_boundary(start)
+                    if checkout is not None:
+                        roots.add(checkout)
+        root = Path(candidate).resolve(strict=True)
+        root_key = real_key(root)
+        keys = [real_key(checkout) for checkout in roots]
+        if not root.is_dir() or root_key is None or any(key is None or key_within(root_key, key) for key in keys):
+            return None
+        return str(root)
+    except (OSError, RuntimeError, ValueError, AegisError):
+        return None
+
+
 def check(
     target_file: str,
     target_function: str,
@@ -655,8 +715,9 @@ def check(
             lines=lines or [],
         )
 
-    if not test_files:
-        return evidence(False, "could not assess: no test file to run")
+    if not test_files or (scratch_root := _mutation_temp_root(target_path, tempfile.gettempdir())) is None:
+        return evidence(False, "could not assess: " + ("mutation scratch root is not outside the checkout"
+                        if test_files else "no test file to run"), [-1] if test_files else None)
 
     if target_path.suffix != ".py":
         from aegis_core.ast.runner import ASTDriverRunner
@@ -683,9 +744,8 @@ def check(
         if failure:
             return evidence(False, failure, [-1])
 
-        # Stage non-Python mutants in an isolated temporary directory rather than
-        # leaving sibling files beside the source tree.
-        with tempfile.TemporaryDirectory(prefix="aegis-mutant-") as mutant_dir:
+        # Stage non-Python mutants only under the validated external scratch root.
+        with tempfile.TemporaryDirectory(prefix="aegis-mutant-", dir=scratch_root) as mutant_dir:
             for m in mutation_points:
                 mutated_source = apply_mutation_point(source, m)
                 if mutated_source is None:
@@ -730,7 +790,7 @@ def check(
         return evidence(False, f"could not assess: cannot regenerate {target_path.name}: {type(exc).__name__}: {exc}", [-1])
 
     survived = []
-    with tempfile.TemporaryDirectory(prefix="aegis-mutants-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="aegis-mutants-", dir=scratch_root) as workdir:
         swap = _ModuleSwap(target_path, workdir)
         baseline = _check_tests(test_files, timeout, swap, unmutated)
         failure = _baseline_failure(baseline, timeout, note)
