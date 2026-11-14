@@ -181,6 +181,35 @@ def caught(call):
     pytest.fail("expected a fail-closed exception")
 
 
+def _warm_mailbox_reader(mailbox, mode):
+    """Exercise the reader on a scratch mailbox so one-time caches stay outside the trace.
+
+    The scratch root is a sibling of the measured mailbox. The measured seed is untouched.
+    """
+    root = mailbox.root.parent / ("_warm_index_" + mode)
+    manifest = {"schema": "aegis.hierarchy-pilot/v1", "writer_limit": 3,
+                "endpoints": {"a/front-door": {}, "a/orchestrator": {}, "a/root": {},
+                              "a/lane/review": {"kind": "reviewer"}}, "counterparts": []}
+    hm.initialize(root, manifest)
+    box = hm.Mailbox(root)
+    for endpoint in manifest["endpoints"]:
+        box.bind({"endpoint": endpoint, "host": "test-host", "session": endpoint,
+                  "expected_generation": 0})
+    box.publish(request("warm-seed"))
+    index = index_module().MailboxIndex(box, mode=mode)
+    seed = index.messages()["warm-seed"]
+    path = Path(seed["path"])
+    path.write_bytes(b"malformed A")
+    caught(lambda: index.get("warm-seed"))
+    caught(box.messages)
+    brief = {"path": "/" + "a/" * 300 + "x.md", "sha256": "a" * 64}
+    rewrite(path, {**seed["message"], "brief": brief})
+    caught(index.messages)
+    brief = {"path": "../../../outside/secret.md", "sha256": "a" * 64}
+    rewrite(path, {**seed["message"], "brief": brief})
+    caught(index.messages)
+
+
 def assert_fallback_verification(index, expected):
     """Canonical returns preserve observed facts while disclaiming PIN bytes."""
     first = index.verify()
@@ -1927,6 +1956,7 @@ def test_r19_thousand_malformed_alternations_are_bounded(mailbox, monkeypatch, r
     old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     tracing = tracemalloc.is_tracing()
     if not tracing:
+        _warm_mailbox_reader(mailbox, "indexed")
         tracemalloc.start()
     try:
         gc.collect()
@@ -2028,6 +2058,13 @@ def test_r19_rejected_new_paths_do_not_enter_hash_history(mailbox, monkeypatch, 
     interned_components = [sys.intern(component) for name in paths for component in Path(name).parts]
     tracing = tracemalloc.is_tracing()
     if not tracing:
+        _warm_mailbox_reader(mailbox, "indexed")
+        if read_path == "nonposix_fixture_cache":
+            # Fill the fixture Path cache outside the measured mailbox, then drop the Path.
+            warm_cached = fixture_path(os.fspath(mailbox.root.parent / "_warm_cached.md"))
+            warm_cached.write_bytes(b"warm")
+            warm_cached.unlink()
+            del warm_cached
         tracemalloc.start()
     try:
         gc.collect()
@@ -3243,6 +3280,9 @@ def test_critical_validate_before_dependency_expansion(mailbox, monkeypatch, rec
     rewrite(source, {**seed["message"], "brief": {"path": reference, "sha256": "a" * 64}})
     assert source.stat().st_size < hm.MAX_BYTES
     expected = caught(mailbox.messages)
+    if not tracemalloc.is_tracing():
+        # Before the lstat spy, so the scratch refusal cannot record a measured probe.
+        _warm_mailbox_reader(mailbox, mode)
     probes = []
     real_lstat, real_path_lstat = os.lstat, Path.lstat
 
