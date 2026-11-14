@@ -635,9 +635,30 @@ def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
                   for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR") if name in os.environ}
         # Enforce the scoped runner's value limit before parsing paths, and
         # again after expanding a relative value against the invocation cwd.
-        if any(len(value) > 65536 or "\x00" in value for value in layout.values()):
+        if any(not value or len(value) > 65536 or "\x00" in value for value in layout.values()):
             return None
-        explicit = {name: str((invocation / value).resolve()) for name, value in layout.items()}
+        if any(len(os.path.join(str(invocation), value)) > 65536 for value in layout.values()):
+            return None
+        explicit = {}
+        for name, value in layout.items():
+            path = invocation / value
+            if len(str(path)) > 65536:
+                return None
+            # Validate original components and directory types before consuming
+            # '..'; whole-path normalization can erase an invalid ancestor
+            # before an existence check sees it.
+            resolved = Path(path.anchor)
+            for index, component in enumerate(path.parts[1:], 1):
+                resolved = (resolved / component).resolve(strict=True)
+                if not resolved.is_dir() and not (
+                    name == "GIT_DIR" and index == len(path.parts) - 1 and resolved.is_file()
+                ):
+                    return None
+            # Gitfile contents are relative to the declared filename's parent,
+            # even when that final entry is itself a symlink to a regular file.
+            explicit[name] = str(path.parent.resolve(strict=True) / path.name) if (
+                name == "GIT_DIR" and resolved.is_file()
+            ) else str(resolved)
         if any(len(value) > 65536 for value in explicit.values()):
             return None
         worktree = None
@@ -647,6 +668,12 @@ def _mutation_temp_root(target: Path, candidate: str) -> Optional[str]:
             worktree = Path(explicit["GIT_WORK_TREE"]).resolve(strict=True)
             if not worktree.is_dir():
                 return None
+        if layout:
+            # Git must accept the original spelling before any probe substitutes
+            # canonical paths: Path erases dots/slashes and OS path-length failures.
+            with gitsafe.custody(scratch=invocation, env=layout):
+                if gitsafe.run(["rev-parse", "--show-toplevel"], invocation).returncode != 0:
+                    return None
         contexts = (parent, invocation, Path(__file__).resolve().parents[2])
         roots = set(contexts)
         # Scoped runner overrides preserve invocation-relative paths without
