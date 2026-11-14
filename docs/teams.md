@@ -82,6 +82,7 @@ aegis team queue list --capability docs --json
 aegis team queue list --include-done --json
 aegis team queue claim DOCS-1 --lane docs --branch lane/docs --capability docs --expect REVISION --ttl 3600 --json
 aegis team queue release DOCS-1 --lane docs --expect CLAIM_REVISION --json
+aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION --writer-stopped --reason 'Waiting for review' --json
 aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
 aegis team queue audit --json
 aegis team queue compact --json
@@ -97,6 +98,59 @@ Each lane may hold one live queue claim; another claim refuses with `lane_busy`.
 Release and done accept `--lane`; live claims require their matching lane
 (`lane_required` or `lane_mismatch` otherwise). Lane labels are cooperative caller
 assertions, not authenticated identities or OS permissions.
+Use `unclaim` to return a claim together with that lane's repository lease when
+its paths intersect the item's write set. It requires the matching lane even
+after expiry and refuses completed work or a stale revision. The lease's owner
+label must match the caller (the CLI uses `team.default_owner()`); a live foreign
+covering lease or any unreadable lease refuses before changes. Unrelated leases
+remain in place. `unclaim_lease_refused` includes the lease OID and a release
+command for inspection and reconciliation. The optional reason follows the
+queue's single-line, 4,096-character and credential-text validation.
+Unclaim also requires `--writer-stopped`: the operator must explicitly acknowledge
+that the lane's writer and queued jobs are stopped. Omitting it refuses with
+`writer_not_stopped` (exit 1), without changes. The receipt records this
+acknowledgement with the caller label. The host layer must check process and job
+liveness before calling unclaim; core cannot inspect host processes. Verifiable
+runtime evidence is tracked separately by **BL-16f-LIVE**. Unclaim is an owner-UID
+administrative transition; sandboxed children cannot invoke it against owner records.
+An unreadable, torn or oversized receipt log refuses before release with
+`unclaim_event_unavailable` (exit 1). Receipt reads use descriptor confinement,
+a 16 MiB admission reader and the queue's bounded JSON-row parser. Admission
+reserves 1 MiB for the release event and receipt; recovery accepts bounded slack
+up to 17 MiB so those events cannot exhaust its reader. The coordinator must
+reconcile retained event evidence before retrying an unavailable log.
+
+Queue transitions are serialized by the workspace writer lock. Unclaim records
+a durable intent before releasing the intersecting lease using its current OID
+as the CAS expectation. A crash or uncertain I/O result returns
+`unclaim_recovery_required` (exit 1); all other queue operations then refuse,
+including expiry-based claims. Retry the original unclaim with the same item,
+revision, lane and caller to finish it. The original reason remains attached.
+The refusal's `blockers` carry the pending item, lane, revision, caller and a
+concrete retry command with `--writer-stopped`; omitting `--reason` on retry keeps
+the original reason. A replacement reason is refused. Until a release may have
+landed, a definite refusal restores the exact original queue bytes. Recovery
+retains its pending intent and never rolls the item back to an unreserved claim.
+The queue becomes available only after the release and one correlated `unclaim`
+event containing the lane, reason and `released_lease_ids` have completed.
+Released IDs attest only successful release calls acknowledged by this operation.
+An externally vanished lease or a lost release acknowledgement is never attested;
+recovery can finish with an empty released-ID list while preserving existing events.
+These leases remain cooperative scheduling records; unclaim does not stop agents.
+
+Successful `queue list --json` responses include `claimable_fingerprint`, a
+SHA-256 digest of scheduling state: claimable item IDs and revisions, item and
+typed-hold state, milestones, completion history and live lease OIDs (including
+unreadable lease evidence), configured lane eligibility and effective profile
+validity/capacity. The claimable set uses the same eligibility checks as claim.
+Git errors and timeouts refuse observation; they never mean an empty lease set.
+In a non-Git workspace, `lease_free` holds stay unmet because lease evidence is
+unavailable. The digest is independent of display filters and observation
+timestamps. Unchanged scheduling state yields the same digest; unclaim, lease
+release or expiry, completion and clearing a hold change it. A changed digest
+signals callers to inspect the queue again; it grants no claim authority and
+does not replace the revision check. Automatic supervisor retries are separate.
+
 Pass the lane's branch explicitly with `claim --branch`; it can be a short local
 name or `refs/heads/` name. Queue claims never infer a lane branch from the shared
 workspace's HEAD. Omitted branches are recorded as unknown. Queue claims use the

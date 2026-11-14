@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 
 import pytest
 
-from aegis_core import events, gitsafe, lane_gate, match, storage_confined, team, team_paths, team_status
+from aegis_core import events, gitsafe, lane_gate, match, storage_confined, team, team_paths, team_queue, team_status
 from tests import helpers_teamrace
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -1686,3 +1686,280 @@ def test_refusals_and_file_errors_survive_pickling(repo: Path):
         str(info.value), "taken", "docs", first.oid, first.lease, ())
     error = pickle.loads(pickle.dumps(team.TeamFileError("v must be 1")))
     assert (type(error), str(error)) == (team.TeamFileError, "team.json: v must be 1")
+
+
+# ── branch bytes: one predicate for lease and queue claims ──────────────────
+
+BRANCH_REASON = "branch must be 1 to 200 characters with no spaces or control characters"
+_SURROGATE_BYTES = b"feature/\xffmarker".decode("utf-8", "surrogateescape")
+_BRANCH_MATRIX = [
+    ("feature/bytes", True),
+    ("feature/\u00fc", True),
+    ("feature/\ud800marker", False),
+    (_SURROGATE_BYTES, False),
+    ("", False),
+    ("x" * 201, False),
+    ("feature/a\nb", False),
+]
+_BRANCH_IDS = ["ascii", "utf8", "lone-surrogate", "surrogateescape", "empty", "over-length", "embedded-newline"]
+
+
+def _forbid_git_write(monkeypatch):
+    """Block lease writes. Restore only these two module attributes afterwards.
+
+    ``monkeypatch.undo()`` would also drop autouse patches this test does not own.
+    """
+    def forbid(*_args, **_kwargs):
+        raise AssertionError("branch validation reached a git write")
+
+    originals = (gitsafe.write_blob, gitsafe.update_ref)
+    monkeypatch.setattr(gitsafe, "write_blob", forbid)
+    monkeypatch.setattr(gitsafe, "update_ref", forbid)
+    return originals
+
+
+def _restore_git_write(monkeypatch, originals) -> None:
+    write_blob, update_ref = originals
+    monkeypatch.setattr(gitsafe, "write_blob", write_blob)
+    monkeypatch.setattr(gitsafe, "update_ref", update_ref)
+
+
+def _queue_workspace(repo: Path, tmp_path: Path) -> Path:
+    if not team_queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    (repo / ".aegis").mkdir(exist_ok=True)
+    (repo / ".aegis" / "team.json").write_text(
+        json.dumps({"v": 1, "lanes": {"docs": ["docs/**"]}}), encoding="utf-8")
+    home = tmp_path / "queue-home"
+    home.mkdir(exist_ok=True)
+    # Restored by the repository's autouse environment-isolation fixture.
+    os.environ.update({"HOME": str(home), "USERPROFILE": str(home)})
+    return repo
+
+
+def _queue_item() -> dict:
+    return {"id": "ONE", "title": "Queue work", "paths": ["docs/**"], "capabilities": ["core"]}
+
+
+def _add_queue_item(root: Path):
+    added = team_queue.add(root, _queue_item(), now=NOW, caller="owner")
+    assert added["refused"] is False, added
+    return added["item"]["revision"]
+
+
+@pytest.mark.parametrize("branch,accepted", _BRANCH_MATRIX, ids=_BRANCH_IDS)
+def test_claim_branch_matrix_refuses_undecodable_names_before_write(repo: Path, monkeypatch, branch, accepted):
+    """Lease claims accept only a bounded UTF-8 branch; retry after a refusal still claims."""
+    if accepted:
+        change = team.claim(repo, "docs", ["docs/**"], owner="o@h", branch=branch, now=NOW)
+        assert change.lease.branch == branch
+        raw = subprocess.run(["git", "cat-file", "blob", change.oid], cwd=str(repo),
+                             capture_output=True, check=True).stdout
+        assert branch.encode("utf-8") in raw
+        assert team.read_leases(repo).get("docs").branch == branch
+        return
+    originals = _forbid_git_write(monkeypatch)
+    with pytest.raises(team.TeamUsageError) as caught:
+        team.claim(repo, "docs", ["docs/**"], owner="o@h", branch=branch, now=NOW)
+    assert str(caught.value) == BRANCH_REASON
+    assert _refs(repo) == {}
+    assert not events.events_path(repo).exists()
+    _restore_git_write(monkeypatch, originals)
+    retried = team.claim(repo, "docs", ["docs/**"], owner="o@h", branch="feature/retry", now=NOW)
+    assert retried.lease.branch == "feature/retry"
+    assert _ref(repo, "docs") == retried.oid
+
+
+def test_undecodable_branch_refusal_does_not_disturb_a_concurrent_claim(repo: Path):
+    """A refused branch never enters the claim loop, so a concurrent valid claim is unchanged."""
+    import threading
+
+    start = threading.Barrier(2)
+    done = []
+    errors = []
+
+    def valid():
+        start.wait(timeout=10)
+        try:
+            done.append(team.claim(repo, "docs", ["docs/**"], owner="o@h", branch="feature/ok", now=NOW))
+        except Exception as exc:
+            errors.append(exc)
+
+    def invalid():
+        start.wait(timeout=10)
+        try:
+            team.claim(repo, "web", ["web/**"], owner="o@h", branch="feature/\ud800marker", now=NOW)
+        except team.TeamUsageError as exc:
+            done.append(exc)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=valid), threading.Thread(target=invalid)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert errors == []
+    refused = [item for item in done if isinstance(item, team.TeamUsageError)]
+    claimed = [item for item in done if isinstance(item, team.LeaseChange)]
+    assert [str(item) for item in refused] == [BRANCH_REASON]
+    assert [item.lease.branch for item in claimed] == ["feature/ok"]
+    assert team.read_leases(repo).get("web") is None
+    assert team.read_leases(repo).get("docs").branch == "feature/ok"
+
+
+@pytest.mark.parametrize("branch,accepted", _BRANCH_MATRIX, ids=_BRANCH_IDS)
+def test_queue_claim_branch_matrix_uses_the_shared_predicate(repo: Path, tmp_path: Path, branch, accepted):
+    """Queue claims call the same predicate and refuse before the queue file changes."""
+    if not team_queue.descriptor_supported():
+        if accepted:
+            pytest.skip("requires descriptor-relative nofollow operations")
+        result = team_queue.claim(tmp_path, "ONE", expect="0" * 64, lane="docs", capabilities=[],
+                                  branch=branch, now=NOW, caller="owner")
+        assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+        assert result["next_action"] == "Use the documented queue arguments and the revision returned by list."
+        assert "marker" not in json.dumps(result)
+        assert list(tmp_path.iterdir()) == []
+        return
+    root = _queue_workspace(repo, tmp_path)
+    revision = _add_queue_item(root)
+    path = root / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    if accepted:
+        team.claim(root, "docs", ["docs/**"], owner="owner", branch=branch, now=NOW)
+        result = team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                                  ttl_s=60, branch=branch, now=NOW + 1, caller="owner")
+        assert result["refused"] is False, result
+        assert result["item"]["branch"] == branch
+        audited = team_queue.audit(root, now=NOW + 2)
+        assert audited["refused"] is False, audited
+        assert audited["findings"] == []
+        assert audited["items"][0]["branch"] == branch
+        return
+    result = team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                              ttl_s=60, branch=branch, now=NOW + 1, caller="owner")
+    assert result["refused"] is True and result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert result["next_action"] == "Use the documented queue arguments and the revision returned by list."
+    assert "marker" not in json.dumps(result)
+    assert path.read_bytes() == before
+    retried = team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                               ttl_s=60, branch="feature/retry", now=NOW + 1, caller="owner")
+    assert retried["refused"] is False, retried
+    assert retried["item"]["branch"] == "feature/retry"
+
+
+def test_undecodable_queue_branch_refuses_before_the_platform_probe(tmp_path: Path, monkeypatch):
+    """The shared predicate refuses before descriptor checks, including when the probe is off."""
+    monkeypatch.setattr(team_queue, "descriptor_supported", lambda: False)
+
+    def forbid(*_args, **_kwargs):
+        raise AssertionError("platform probe was not the first refusal")
+
+    monkeypatch.setattr(storage_confined, "confined_file", forbid)
+    result = team_queue.claim(tmp_path, "ONE", expect="0" * 64, lane="docs", capabilities=[],
+                              branch="feature/\ud800marker", now=NOW, caller="owner")
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert "marker" not in json.dumps(result)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_queue_undecodable_branch_does_not_disturb_a_concurrent_claim(repo: Path, tmp_path: Path):
+    import threading
+
+    root = _queue_workspace(repo, tmp_path)
+    revision = _add_queue_item(root)
+    start = threading.Barrier(2)
+    done = []
+    errors = []
+
+    def valid():
+        start.wait(timeout=10)
+        try:
+            done.append(team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                                        ttl_s=60, branch="feature/ok", now=NOW + 1, caller="owner"))
+        except Exception as exc:
+            errors.append(exc)
+
+    def invalid():
+        start.wait(timeout=10)
+        try:
+            done.append(team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                                        ttl_s=60, branch=_SURROGATE_BYTES, now=NOW + 1, caller="owner"))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=valid), threading.Thread(target=invalid)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert errors == []
+    good = [item for item in done if item["refused"] is False]
+    bad = [item for item in done if item["refused"] is True]
+    assert len(good) == 1 and good[0]["item"]["branch"] == "feature/ok"
+    assert [item["reason"] for item in bad] == ["invalid_arguments"]
+    assert [item["exit_code"] for item in bad] == [2]
+    assert "marker" not in json.dumps(bad)
+    listed = team_queue.list(root, now=NOW + 2)
+    assert listed["items"][0]["branch"] == "feature/ok"
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_stored_queue_branch_stays_unsupported_and_audit_does_not_crash(repo: Path, tmp_path: Path, branch):
+    """A legacy stored value is an item finding, not a crash and not a rewritten branch."""
+    root = _queue_workspace(repo, tmp_path)
+    revision = _add_queue_item(root)
+    claimed = team_queue.claim(root, "ONE", expect=revision, lane="docs", capabilities=["core"],
+                               ttl_s=60, branch="feature/ok", now=NOW + 1, caller="owner")
+    assert claimed["refused"] is False, claimed
+    team.claim(root, "docs", ["docs/**"], owner="owner", branch="lane/docs", now=NOW)
+    path = root / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["items"]["ONE"]["branch"] = branch
+    planted = json.dumps(state, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    path.write_bytes(planted)
+    listed = team_queue.list(root, now=NOW + 2)
+    audited = team_queue.audit(root, now=NOW + 2)
+    assert listed["refused"] is False and audited["refused"] is False
+    row = listed["items"][0]
+    assert row["branch"] == branch and row["branch_supported"] is False
+    assert [item["code"] for item in audited["findings"]] == ["CLAIM-BRANCH-UNSUPPORTED"]
+    assert "marker" not in json.dumps(audited["findings"])
+    assert path.read_bytes() == planted
+    again = team_queue.audit(root, now=NOW + 3)
+    assert again["findings"][0]["code"] == "CLAIM-BRANCH-UNSUPPORTED"
+    assert path.read_bytes() == planted
+    released = team_queue.release(root, "ONE", expect=claimed["item"]["revision"], lane="docs",
+                                  now=NOW + 4, caller="owner")
+    assert released["refused"] is False, released
+    assert team_queue.audit(root, now=NOW + 5)["findings"] == []
+
+
+def test_surrogateescape_branch_is_the_posix_fsencode_argv_bytes():
+    """The invalid-byte fixture is the string POSIX argv would deliver for those bytes."""
+    if os.name != "posix":
+        pytest.skip("Windows argv cannot carry surrogate-escaped non-UTF-8 bytes")
+    raw = b"feature/\xffmarker"
+    assert os.fsdecode(raw) == _SURROGATE_BYTES
+    assert os.fsencode(_SURROGATE_BYTES) == raw
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_stored_lease_surrogate_branch_is_unreadable_and_renew_does_not_crash(repo: Path, branch):
+    """A legacy lease blob with an undecodable branch is unreadable; list and renew do not encode it."""
+    blob = _valid_blob(branch=branch)
+    raw = (json.dumps(blob, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    view = team.describe(repo, now=NOW)
+    assert view["leases"] == []
+    assert view["unreadable"][0]["lane"] == "docs"
+    assert view["unreadable"][0]["oid"] == oid
+    assert "marker" not in view["unreadable"][0]["error"]
+    report = team_status.status(repo, NOW)
+    assert "marker" not in json.dumps(report)
+    with pytest.raises(team.LeaseRefused) as caught:
+        team.renew(repo, "docs", oid, now=NOW)
+    assert caught.value.reason == "unreadable"
+    assert _ref(repo, "docs") == oid

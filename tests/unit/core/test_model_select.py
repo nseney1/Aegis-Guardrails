@@ -57,6 +57,17 @@ def choose(bindings, policy, **kwargs):
     return select_model(bindings, policy, "T9", "implementer", [], **kwargs)
 
 
+def _warm_measured(action):
+    """Run the traced entry point once so first-import allocations stay outside the peak.
+
+    The scratch call uses a tiny input and must not create or mutate the measured log.
+    """
+    try:
+        action()
+    except ModelSelectionError:
+        return
+
+
 def admission_refusal(host, intent, role, *, within_band=False):
     message = ("binding_not_admitted: %s/coding intent %s for %s; "
                "probe the level or repair model-bindings.json" % (host, intent, role))
@@ -1106,6 +1117,11 @@ def test_record_budgets_apply_before_large_allocations(bindings, policy, tmp_pat
     import tracemalloc
 
     _, record = choose(bindings, policy)
+    # Refusal is raised while sizing the line, before any log file is created.
+    sample = copy.deepcopy(record)
+    sample["outcome"] = "x" * core.MAX_LINE_BYTES
+    _warm_measured(lambda: append_decision(tmp_path / "warm-log", sample))
+    _warm_measured(lambda: select_model(bindings, policy, "T9", "implementer", [sample]))
     record["outcome"] = {"string": "x" * 8_000_000, "collection": [None] * 200_000,
                          "integer": 1 << 1_000_000, "aggregate": ["x" * 128] * 128,
                          "nodes": [[""] * 128] * 8}[kind]
@@ -1554,6 +1570,9 @@ def test_round6_opened_log_permissions_are_rechecked(bindings, policy, tmp_path,
 def test_round6_large_parsed_unknown_host_registry_is_bounded(bindings):
     import tracemalloc
 
+    warm = copy.deepcopy(bindings)
+    warm["oversized"] = "x" * (core.MAX_INPUT_BYTES + 1)
+    _warm_measured(lambda: core.validate_bindings(warm, host_kinds=("codex-cli", "claude-code")))
     row = bindings["hosts"][0]
     bindings["hosts"] = [dict(row, host="unknown-%d" % i) for i in range(100_000)]
     tracemalloc.start()
@@ -1571,6 +1590,9 @@ def test_round6_large_parsed_unknown_host_registry_is_bounded(bindings):
 def test_round6_parsed_input_budgets_precede_semantic_traversal(bindings, policy, field, kind):
     import tracemalloc
 
+    warm_bindings, warm_policy = copy.deepcopy(bindings), copy.deepcopy(policy)
+    (warm_bindings if field == "bindings" else warm_policy)["oversized"] = "x" * (core.MAX_INPUT_BYTES + 1)
+    _warm_measured(lambda: choose(warm_bindings, warm_policy))
     nested = None
     for _ in range(65):
         nested = [nested]
@@ -2211,6 +2233,18 @@ def test_round7b_path_budget_precedes_path_parsing(bindings, policy, tmp_path, s
     import tracemalloc
 
     _, row = choose(bindings, policy)
+    # Length is refused before the path is opened, so this scratch value creates nothing.
+    too_long = "x" * (core.MAX_INPUT_BYTES + 1)
+    warm = {
+        "bindings": lambda: choose(too_long, policy),
+        "policy": lambda: choose(bindings, too_long),
+        "read": lambda: read_decisions(too_long),
+        "append": lambda: append_decision(too_long, row),
+        "transaction": lambda: core.select_and_append(
+            too_long, bindings, policy, "T9", "implementer",
+            host_kinds=("codex-cli", "claude-code"), subject="warm"),
+    }[surface]
+    _warm_measured(warm)
     path = str(tmp_path) + "/" + "x" * 8_000_000
     error = "invalid_" + surface if surface in ("bindings", "policy") else "unsafe_decision_path"
     tracemalloc.start()
@@ -2248,6 +2282,12 @@ def test_round7b_invalid_decision_path_types_have_a_refusal(bindings, policy, ba
 def test_round7b_path_depth_is_bounded_before_parent_allocation(bindings, policy, tmp_path, surface):
     import tracemalloc
 
+    # Separator count is refused before any parent is opened.
+    too_deep = "nested/" * 300 + "log"
+    if surface == "bindings":
+        _warm_measured(lambda: choose(too_deep, policy))
+    else:
+        _warm_measured(lambda: read_decisions(too_deep))
     path = str(tmp_path) + "/" + "nested/" * 300 + "log"
     error = "invalid_bindings" if surface == "bindings" else "unsafe_decision_path"
     tracemalloc.start()

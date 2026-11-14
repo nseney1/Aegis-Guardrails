@@ -120,8 +120,10 @@ def check(condition, reason, detail):
 
 
 def checked_path(path):
-    router.preflight_paths(path)
-    return safe_path(path)
+    guard = router._operation_guard()
+    router.preflight_paths(path, _guard=guard)
+    guard.check(path)
+    return Path(path)
 
 
 def _attachment(mailbox, ref):
@@ -589,8 +591,12 @@ class _RunnerClaim(_RetainedJob):
 class _CapturedStore:
     """Read-only workspace replay from captured bytes using the existing public reducers."""
     def __init__(self, path, operation):
-        self.path, self.operation = checked_path(path), operation
+        self.operation = operation
+        with operation.capture():
+            operation.reject_failed()
+            self.path = checked_path(path)
 
+    @fresh._operation_context
     def load(self):
         ledger, count = workspace.Ledger(), 0
         self.private_refusals = {}
@@ -625,6 +631,7 @@ class _CapturedStore:
                 fresh._private_paths(guarded, paths=self.operation.path_guard)
                 ledger.apply(event)
             except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
         require(ledger.limits is not None, "workspace store is not initialized")
         for team, initiative in ledger.initiatives.items():
@@ -730,6 +737,7 @@ class Row:
         except Hold:
             raise
         except (ValueError, OSError) as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_receipt_invalid", str(exc)) from exc
 
     def recheck_dependencies(self):
@@ -822,6 +830,7 @@ class Row:
                 require(parse_time(timestamp()) < parse_time(self.row["request"]["continuation"]["expires_at"]),
                         "bounded authority expired")
         except ValueError as exc:
+            fresh._raise_global(exc, operation=self.operation)
             reason = "small_change_expired" if "expired" in str(exc) else "small_change_binding_changed"
             raise Hold(reason, str(exc)) from exc
         check(self.row["resolution"] is None, "small_change_configuration", "disposed request requires owner resolution")
@@ -888,6 +897,7 @@ class Row:
                 require(len(assignments) == 1 and all(assignments[0].get(k) == v for k, v in body.items()),
                         "brief lacks exact request/plan assignment")
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_message_conflict", str(exc)) from exc
         try:
             in_force(self.mailbox, message)
@@ -896,6 +906,7 @@ class Row:
                 require(self.mailbox.ready(target), "writer target binding is unacknowledged")
                 self._writer_target_current = self.mailbox.current_binding(to)["generation"] == target["generation"]
         except ValueError as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_binding_changed", str(exc)) from exc
         return record
 
@@ -907,6 +918,7 @@ class Row:
             try:
                 raw, answer = fresh.prepare(args, _mailbox=self.mailbox, _request_id=self.key)
             except fresh.UnverifiedAttachment as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 self.view["next_action"] = "reconcile the attachment's original durable reference, then rerun dispatch"
                 if exc.message_id is not None:
                     # The validated ASCII slug is already canonical and bounded.
@@ -956,11 +968,13 @@ class Row:
             try:
                 life.sync_directory(Path(record["path"]).parent)
             except (ValueError, OSError) as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 raise fresh.PartialPublication(record, exc) from exc
         except fresh.PartialPublication as exc:
             self.records[request["message_id"]] = exc.record
             self.view["partial_publication"] = {"message_id": request["message_id"],
                                                 "evidence": {"path": exc.record["path"], "sha256": exc.record["sha256"]}}
+            fresh._raise_global(exc, operation=self.operation)
             if isinstance(exc.error, Hold):
                 raise Hold(exc.error.reason, str(exc)) from exc
             if isinstance(exc.error, fresh.CaptureChanged) and self.recipes is not None and exc.error.path == Path(self.recipes):
@@ -971,8 +985,10 @@ class Row:
                 self.reload()
                 self.live(expiry=request["type"] == "job_request")
             except Hold as current:
+                fresh._raise_global(current, operation=self.operation)
                 raise Hold(current.reason, str(exc) + "; " + str(current)) from exc
-            except (ValueError, OSError, TypeError, KeyError):
+            except (ValueError, OSError, TypeError, KeyError) as global_refusal:
+                fresh._raise_global(global_refusal, operation=self.operation)
                 pass
             raise Hold("small_change_partial_publication", str(exc)) from exc
         return record
@@ -1042,8 +1058,10 @@ class Row:
             receipt = router.patient(lambda: self.lifecycle.record(envelope), self.wait)
         except fresh._CommittedEvent as exc:
             self.view["partial_publication"] = exc.record
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_committed_event", str(exc)) from exc
         except (ValueError, OSError) as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("delivered_unrecorded", str(exc)) from exc
         self._writer_receipt = receipt
         self.reload()
@@ -1061,12 +1079,14 @@ class Row:
         try:
             in_force(self.mailbox, dispatch["message"])
         except ValueError as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_binding_changed", str(exc)) from exc
         for record in accepted + complete:
             m = record["message"]
             try:
                 in_force(self.mailbox, m)
             except ValueError as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 raise Hold("small_change_binding_changed", str(exc)) from exc
             check(m["from"] == endpoint and m["binding_generation"] == target_generation,
                   "small_change_binding_changed", "lane result/acceptance binding changed")
@@ -1085,6 +1105,7 @@ class Row:
             require(len({c["check"] for c in checks}) == len(checks), "duplicate lane check")
             check(all(c["outcome"] == "pass" for c in checks), "small_change_check_failed", "lane checks are not all passing")
         except ValueError as exc:
+            fresh._raise_global(exc, operation=self.operation)
             if isinstance(exc, Hold):
                 raise
             raise Hold("small_change_result_invalid", str(exc)) from exc
@@ -1224,6 +1245,7 @@ class Row:
             except Hold:
                 raise
             except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 raise Hold("small_change_receipt_invalid", str(exc)) from exc
             check(state not in {"failed", "refused"}, "small_change_check_failed", "job did not pass: " + msg_id)
             if state != "completed":
@@ -1261,6 +1283,7 @@ class Row:
             except Hold:
                 raise
             except (ValueError, OSError, KeyError, TypeError) as exc:
+                fresh._raise_global(exc, operation=self.operation)
                 raise Hold("small_change_receipt_invalid", str(exc)) from exc
             self.proofs.append(self.reference(witness["path"]))
             self._completed_checks.append((admission, job))
@@ -1372,6 +1395,7 @@ class Row:
                 require(parse_time(self.row["review"]["at"]) >= self.review_not_before,
                         "lifecycle review precedes verified check evidence")
         except (ValueError, OSError, UnicodeError, KeyError, TypeError, RecursionError) as exc:
+            fresh._raise_global(exc, operation=self.operation)
             raise Hold("small_change_message_conflict", str(exc)) from exc
 
     def invalidate(self, reason, detail):
@@ -1467,7 +1491,8 @@ class Row:
             require(parse_time(message["created_at"]) <= parse_time(accepted[0]["created_at"])
                     <= parse_time(completed[0]["created_at"]), "foreign assignment chronology differs")
             self.mailbox.completion(completed[0].get("result"), self.mailbox.endpoint(message["to"])["kind"])
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError) as global_refusal:
+            fresh._raise_global(global_refusal, operation=self.operation)
             return False
         return True
 
@@ -1493,6 +1518,7 @@ class Row:
                 try:
                     packet = fresh._bounded_json(jobs.packet_text(_attachment(self.mailbox, message["brief"])))
                 except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as exc:
+                    fresh._raise_global(exc, operation=self.operation)
                     raise Hold("small_change_mixed_queue", malformed) from exc
                 check(isinstance(packet, dict), "small_change_mixed_queue", malformed)
                 if hasattr(self, "result_record"):
@@ -1609,6 +1635,7 @@ class Row:
             self._verification_proof = self.operation.prove(self.verification_pass, mutate)
             self._custody = self.finalize_writer_release()
         except (ValueError, OSError, UnicodeError, TypeError, KeyError, RecursionError) as exc:
+            fresh._raise_global(exc, operation=self.operation)
             reason = exc.reason if isinstance(exc, Hold) else "small_change_configuration"
             if isinstance(exc, fresh.CaptureChanged) and self.recipes is not None and exc.path == Path(self.recipes):
                 reason = "small_change_recipe_mismatch"
@@ -1631,11 +1658,13 @@ class Row:
                 if not self.view["drafts"]:
                     self.view["drafts"] = self.drafts(reason)
             except (ValueError, OSError, TypeError, KeyError) as draft_error:
+                fresh._raise_global(draft_error, operation=self.operation)
                 self.view["draft_error"] = str(draft_error)[:1024]
                 self.invalidate(self.view["reason"], self.view["detail"])
             try:
                 self._custody = self.finalize_writer_release()
             except (ValueError, OSError, TypeError, KeyError, RecursionError) as release_error:
+                fresh._raise_global(release_error, operation=self.operation)
                 self.view["release_validation_error"] = str(release_error)[:1024]
                 self.invalidate(self.view["reason"], self.view["detail"])
         return self.view
@@ -1646,6 +1675,7 @@ class Row:
         self.live(writing=writing, expiry=writing or request["type"] == "job_request")
 
 
+@router._request_context
 def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
     router.preflight_paths(lifecycle.root, store.path)
     root, store_path = lifecycle.root, store.path
@@ -1694,6 +1724,7 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
                         appended = True
                     continue
                 except (ValueError, OSError) as exc:
+                    fresh._raise_global(exc)
                     if current is None:
                         current = Row(_lifecycle, _store, ledger, _policy, state, key, recipes, wait,
                                       fresh._Operation(reference_cache=reference_cache))
@@ -1713,11 +1744,11 @@ def project(lifecycle, store, wait=5.0, recipes=None, mutate=False):
         contexts.append(current)
     final = fresh._Operation(reference_cache=reference_cache)
     _policy, planning = router.locked_load(final.lifecycle(root), wait)
+    final.verify()
     for current in contexts:
         if current._custody.state_head != planning["head"]:
             reason = ("small_change_revoked" if router.last_decision(planning, current.key) == "deny"
                       else "small_change_snapshot_changed")
             current.invalidate(reason, "lifecycle snapshot changed after writer verification; rerun dispatch")
-    final.verify()
     return {"small_changes": rows, "planning_exclusions": exclusions(planning, custody),
             "qualification_dependencies": ["D4 registry companion", "D5 lane lifecycle tools", "D7 independent early-release record seam"]}
