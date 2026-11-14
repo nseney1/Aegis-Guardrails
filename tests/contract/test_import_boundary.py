@@ -58,6 +58,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.storage_shared": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_run": 0,
+    "aegis_core.team_claims": 2,
     "aegis_core.team_git": 0,
     "aegis_core.atomicio": 0,
     # Read-only repository facts keyed by full object ids; imports gitsafe and errors only.
