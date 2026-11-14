@@ -828,7 +828,7 @@ def _configure_model_parser(sub, common):
     model = sub.add_parser("model", parents=[common], help="Select a model; optionally record the decision",
                            description="Preview model selection as JSON; --record atomically selects and appends. "
                            "Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. "
-                           "No model is launched; unprobed admission remains explicit.")
+                           "No model is launched; unprobed and rejected levels refuse with binding_not_admitted.")
     model._model_errors = True
     for flag, help_text in (
         ("bindings", "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)"),
