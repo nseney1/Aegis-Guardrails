@@ -27,6 +27,8 @@ All notable changes to Aegis Guardrails are documented here. The project uses [S
 
 ### Added
 
+- Owner-launched queue MCP connection (`python -m aegis_mcp.queue_owner ID`) exposes queue list and role-gated claim without changing the ordinary tool list. Account-database authority records bind one Linux process and MCP session to an orchestrator policy; caller roles and environment values cannot enroll or widen it. Revocation and expiry are checked under authority then queue locks; unsupported platforms refuse explicitly. Child sandbox exclusion of authority storage remains the owner's deployment responsibility.
+
 - `aegis team model` and `aegis_team_model` preview model selection with identical JSON output; opt into atomic decision-history publication with `--record` or `record: true`.
 - Read-only `aegis_team_config` MCP tool returns the resolved team profile with per-value layer provenance and CLI-shaped refusals.
 - Read-only `aegis_team_queue` MCP tool lists work items, blockers and lane labels with the same capability and completed-item filters as `aegis team queue list`.
