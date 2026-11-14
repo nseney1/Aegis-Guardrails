@@ -399,8 +399,8 @@ def test_init_builds_the_mailbox_registers_the_initiative_and_pins_the_source(se
     assert pinned["source_tree"] == git(setup.source, "rev-parse", "HEAD^{tree}")
 
 
-def test_init_uses_the_bound_interpreter_for_a_working_mcp_connection(tmp_path):
-    built = Setup(tmp_path)
+def test_init_uses_the_bound_interpreter_for_a_working_mcp_connection(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     record = built.init()
     assert record["python"] == sys.executable
     assert json.loads((built.base / "provision.json").read_text())["python"] == sys.executable
@@ -410,9 +410,9 @@ def test_init_uses_the_bound_interpreter_for_a_working_mcp_connection(tmp_path):
     assert "mailbox_inbox" in start_connection(role["connection"])
 
 
-def test_init_needs_no_system_python_path(tmp_path, mr1_cli, monkeypatch):
+def test_init_needs_no_system_python_path(tmp_path, mr1_cli, monkeypatch, source_seed):
     module, call = mr1_cli
-    built = Setup(tmp_path)
+    built = Setup(tmp_path, source_seed=source_seed)
     interpreter = str(tmp_path / "bound-python")
     shutil.copy2(sys.executable, interpreter)
     monkeypatch.setattr(module, "sys", SimpleNamespace(executable=interpreter))
@@ -425,9 +425,9 @@ def test_init_needs_no_system_python_path(tmp_path, mr1_cli, monkeypatch):
 
 @pytest.mark.parametrize("interpreter", [None, "", "missing"])
 def test_init_refuses_an_unavailable_bound_interpreter_without_publication(tmp_path, mr1_cli, monkeypatch,
-                                                                         interpreter):
+                                                                         interpreter, source_seed):
     module, call = mr1_cli
-    built = Setup(tmp_path)
+    built = Setup(tmp_path, source_seed=source_seed)
     if interpreter == "missing":
         interpreter = str(tmp_path / "missing-python")
     monkeypatch.setattr(module, "sys", SimpleNamespace(executable=interpreter))
@@ -437,8 +437,8 @@ def test_init_refuses_an_unavailable_bound_interpreter_without_publication(tmp_p
 
 
 @pytest.mark.parametrize("kind", ["missing", "directory", "not-executable"])
-def test_init_refuses_an_unavailable_explicit_interpreter(tmp_path, kind):
-    built = Setup(tmp_path)
+def test_init_refuses_an_unavailable_explicit_interpreter(tmp_path, kind, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     interpreter = tmp_path / "unavailable-python"
     if kind == "directory":
         interpreter.mkdir()
@@ -451,8 +451,8 @@ def test_init_refuses_an_unavailable_explicit_interpreter(tmp_path, kind):
     assert "pilot" not in built.workspace.run("status")["initiatives"]
 
 
-def test_init_preserves_an_explicit_interpreter_override(tmp_path):
-    built = Setup(tmp_path)
+def test_init_preserves_an_explicit_interpreter_override(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     interpreter = str(Path(sys.executable).resolve())
     assert provision("init", built.init_request(python=interpreter))["python"] == interpreter
     role = built.add_role("pilot/orchestrator", cwd=str(tmp_path))
@@ -462,19 +462,19 @@ def test_init_preserves_an_explicit_interpreter_override(tmp_path):
 
 
 @pytest.mark.parametrize("python", [5, "", None, "\x00", "x" * 4097])
-def test_rb2_explicit_malformed_python_keeps_its_validation_error(tmp_path, python):
-    built = Setup(tmp_path)
+def test_rb2_explicit_malformed_python_keeps_its_validation_error(tmp_path, python, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     assert provision("init", built.init_request(python=python), expect=2) == {"error": "invalid python"}
     assert not built.base.exists()
     assert "pilot" not in built.workspace.run("status")["initiatives"]
 
 
 @pytest.fixture
-def rb2_pending(tmp_path, mr1_cli, monkeypatch):
+def rb2_pending(tmp_path, mr1_cli, monkeypatch, source_seed):
     import hierarchy_workspace
 
     _, call = mr1_cli
-    built = Setup(tmp_path)
+    built = Setup(tmp_path, source_seed=source_seed)
     built.python = tmp_path / "pending-python"
     shutil.copy2(sys.executable, built.python)
     publish = hierarchy_workspace.publish_file
@@ -561,9 +561,10 @@ def test_rb2_pending_init_reuses_the_available_recorded_interpreter(rb2_pending,
 
 
 @pytest.mark.parametrize("fault", [OSError, ValueError])
-def test_rb2_interpreter_probe_failure_has_a_fixed_refusal_and_hint(tmp_path, mr1_cli, monkeypatch, fault):
+def test_rb2_interpreter_probe_failure_has_a_fixed_refusal_and_hint(tmp_path, mr1_cli, monkeypatch, fault,
+                                                                    source_seed):
     module, call = mr1_cli
-    built = Setup(tmp_path)
+    built = Setup(tmp_path, source_seed=source_seed)
 
     def unavailable(*args):
         raise fault("probe detail must not be echoed")
@@ -705,8 +706,8 @@ def test_rb2c_registered_move_reuses_the_available_recorded_python(rb2c_register
     assert json.loads(path.read_text())["command"] == sys.executable
 
 
-def test_rb2_no_plan_codex_output_changes_only_the_legacy_interpreter(tmp_path):
-    built = Setup(tmp_path)
+def test_rb2_no_plan_codex_output_changes_only_the_legacy_interpreter(tmp_path, source_seed):
+    built = Setup(tmp_path, source_seed=source_seed)
     request = built.init_request()
     assert "python" not in request
     provision("init", request)
