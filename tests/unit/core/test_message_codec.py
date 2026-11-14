@@ -173,6 +173,14 @@ def assert_record_limit(action):
     assert_error("E_LIMIT", action, RECORD_LIMIT)
 
 
+def _warm_codec(action):
+    """Run the traced codec entry point once so first-import allocations stay outside the peak."""
+    try:
+        action()
+    except codec.CodecError:
+        return
+
+
 @pytest.mark.parametrize("payload", [
     b"\xffHOSTILE_MARKER", b"HOSTILE_MARKER", b'{"HOSTILE_MARKER":0,"HOSTILE_MARKER":1}',
     b'{"x":{"HOSTILE_MARKER":0,"HOSTILE_MARKER":1}}',
@@ -1904,6 +1912,7 @@ def test_r7_class_d_three_large_refs_have_separate_io_allowance(tmp_path):
 
 
 def test_r7_class_e_astral_refusal_does_not_encode_whole_input():
+    _warm_codec(lambda: codec.canonical(record(body="\U0001f600")))
     value = record(body="\U0001f600" * 200000)
     tracemalloc.start()
     try:
@@ -2070,6 +2079,10 @@ def test_r8_class_d_expansion_caches_and_refuses_before_unbounded_allocation(tmp
     store = make_store(tmp_path)
     rid = store.write(record(body="x" * 200000))
     parent = dict(record(), refs={"r%d" % i: rid for i in range(64)})
+    # Warm expansion on a different child so the measured parse counter stays exact.
+    tiny = dict(record(), refs={"only": store.write(record(body="y"))})
+    _warm_codec(lambda: codec.read_view(tiny, store=store, expand=["only"], max_chars=1))
+    _warm_codec(lambda: codec.read_view(tiny, store=store, expand=["only"], max_chars=100000))
     calls, original = [], codec.parse
     with monkeypatch.context() as patch:
         def counted(data):
@@ -2557,6 +2570,7 @@ def test_r10_constructor_close_observer_rejects_foreign_cleanup_close(tmp_path, 
 
 @pytest.mark.parametrize("run", [100000, 200000])
 def test_coord1_security_md_preflights_framing_before_allocating(run):
+    _warm_codec(lambda: codec.read_view(record(body="`"), selectors=["body"], format="md", max_chars=1))
     value = record(body="`" * run)
     tracemalloc.start()
     try:
@@ -2865,6 +2879,10 @@ def test_coord3_store_replaced_during_successful_operation_refuses(tmp_path, mon
 
 
 def output_allocation_peak(action):
+    # Formatter imports happen before the window that starts at canonical()'s return.
+    _warm_codec(lambda: codec.read_view(dict(record(body="xy"), spans=[[0, 1, "s"]]), spans=[0], max_chars=1))
+    _warm_codec(lambda: codec.read_view(
+        record("log", {"rows": [{"text": "a"}]}), selectors=["rows.*.{text,time}"], max_chars=1))
     baseline, previous = [], sys.getprofile()
     code = codec.canonical.__code__
     def observed(frame, event, _arg):
@@ -3093,9 +3111,10 @@ def test_mc2_round6_compose_preserves_numeric_bytes(token):
 
 @pytest.mark.parametrize("case", ["arrays", "integer"])
 def test_mc2_compose_preflights_allocation(case):
+    meta = record()["meta"]
+    _warm_codec(lambda: codec.compose("record", b'{"fields":{"value":0},"body":"","refs":{}}', meta))
     payload = (b'{"fields":{"value":[' + b"[]," * 59999 + b'[]]},"body":"","refs":{}}'
                if case == "arrays" else b'{"fields":{"value":' + b"9" * 5000 + b'},"body":"","refs":{}}')
-    meta = record()["meta"]
     assert len(payload) < codec.MAX_BYTES
     reached, previous = [], sys.getprofile()
     def observed(frame, event, _arg):
@@ -3215,9 +3234,10 @@ def test_mc2_spans_share_the_record_node_budget(existing_nodes):
 
 
 def test_mc2_derived_spans_refuse_before_excess_allocation():
+    meta = record()["meta"]
+    _warm_codec(lambda: codec.compose("text", raw({"fields": {}, "body": "#\n", "refs": {}}), meta))
     body = "#\n" * 80000
     payload = raw({"fields": {}, "body": body, "refs": {}})
-    meta = record()["meta"]
     assert len(payload) <= codec.MAX_BYTES
     tracemalloc.start()
     try:
