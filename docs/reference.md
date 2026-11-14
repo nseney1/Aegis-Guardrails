@@ -304,7 +304,7 @@ Claims and denials from the events log, and for each first-parent merge since --
 
 Select a model; optionally record the decision
 
-Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed admission remains explicit.
+Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed and rejected levels refuse with binding_not_admitted.
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
