@@ -19,7 +19,7 @@ import stat
 from typing import Any
 
 from aegis_core import hosts as host_registry, pathlookup, storage, team_supervisor
-from aegis_core.primitives import sanitize_display as sanitize_display
+from aegis_core.primitives import json_preflight, sanitize_display as sanitize_display
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
     closed_object as _object, reject_terminal_hosts as _reject_terminal_hosts,
@@ -721,63 +721,14 @@ def _pairs(items):
 
 
 def _parse(data):
-    if len(data) > MAX_BYTES:
-        raise ProfileError("profile size limit exceeded")
     try:
-        text = data.decode("utf-8")
-    except UnicodeError:
-        raise ProfileError("invalid profile JSON") from None
-    # Preflight containers, strings, nesting and nodes before tree allocation.
-    depth, nodes, chars, unicode_left = 0, 0, 0, 0
-    quoted, escaped, atom = False, False, False
-    containers = []  # [entry count, awaiting first token of the next entry]
-    for char in text:
-        if not quoted and containers and containers[-1][1] and char not in " \t\r\n]}":
-            containers[-1][0] += 1
-            containers[-1][1] = False
-            if containers[-1][0] > MAX_ITEMS:
-                raise ProfileError("profile container size limit exceeded")
-        if quoted:
-            if unicode_left:
-                unicode_left -= 1
-            elif escaped:
-                escaped = False
-                if char == "u":
-                    unicode_left = 4
-            elif char == "\\":
-                escaped = True
-                chars += 1
-            elif char == '"':
-                quoted = False
-            else:
-                chars += 1
-            if chars > MAX_STRING:
-                raise ProfileError("profile string size limit exceeded")
-        elif char == '"':
-            quoted = True
-            chars, atom = 0, False
-            nodes += 1
-        elif char in "[{":
-            nodes += 1
-            atom = False
-            depth += 1
-            if depth > MAX_DEPTH:
-                raise ProfileError("profile nesting limit exceeded")
-            containers.append([0, True])
-        elif char in "]}":
-            depth -= 1
-            atom = False
-            if containers:
-                containers.pop()
-        elif char in " \t\r\n,:":
-            atom = False
-            if char == "," and containers:
-                containers[-1][1] = True
-        elif not atom:
-            nodes += 1
-            atom = True
-        if nodes > MAX_NODES:
-            raise ProfileError("profile node limit exceeded")
+        text = json_preflight(data, max_bytes=MAX_BYTES, max_depth=MAX_DEPTH,
+                              max_nodes=MAX_NODES, max_items=MAX_ITEMS, max_string=MAX_STRING)
+    except ValueError as error:
+        messages = {"size": "profile size limit exceeded", "nesting": "profile nesting limit exceeded",
+                    "nodes": "profile node limit exceeded", "container": "profile container size limit exceeded",
+                    "string": "profile string size limit exceeded"}
+        raise ProfileError(messages.get(str(error), "invalid profile JSON")) from None
     try:
         value = json.loads(text, object_pairs_hook=_pairs,
                            parse_constant=lambda _: (_ for _ in ()).throw(ProfileError("invalid profile JSON")))
