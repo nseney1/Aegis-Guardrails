@@ -5,7 +5,7 @@ from aegis_core.taxonomy import CANONICAL_RULE_TYPES
 from aegis_core.message_codec_format import KIND_SCHEMAS
 from aegis_mcp.handlers.common import VALID_OUTCOMES
 
-__all__ = ["TOOL_DEFINITIONS", "TOOL_ARGUMENTS"]
+__all__ = ["TOOL_DEFINITIONS", "TOOL_ARGUMENTS", "QUEUE_TOOL_DEFINITIONS", "QUEUE_TOOL_ARGUMENTS"]
 
 _VIEW_PROPERTY = {
     "type": "string",
@@ -295,3 +295,16 @@ TOOL_DEFINITIONS = [
 TOOL_ARGUMENTS = {
     tool["name"]: frozenset(tool["inputSchema"].get("properties", {})) for tool in TOOL_DEFINITIONS
 }
+
+# A separate owner-launched connection; ordinary tools/list bytes stay unchanged.
+QUEUE_TOOL_DEFINITIONS = [next(tool for tool in TOOL_DEFINITIONS if tool["name"] == "aegis_team_queue"), {
+    "name": "aegis_team_queue_claim",
+    "description": "Claim an item from aegis_team_queue using this owner-bound orchestrator connection. Lane policy supplies capabilities, branch and TTL; no host launch.",
+    "annotations": _write("Claim Queue Item"),
+    "inputSchema": {"type": "object", "properties": {
+        "id": {"type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", "description": "Queue item ID."},
+        "expect": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Revision from aegis_team_queue."},
+        "lane": {"type": "string", "maxLength": 63, "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$", "description": "Owner-admitted lane."},
+    }, "required": ["id", "expect", "lane"], "additionalProperties": False},
+}]
+QUEUE_TOOL_ARGUMENTS = {tool["name"]: frozenset(tool["inputSchema"]["properties"]) for tool in QUEUE_TOOL_DEFINITIONS}

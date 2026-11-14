@@ -6,6 +6,9 @@ import subprocess
 
 import pytest
 
+import aegis_mcp.queue_role as queue_role
+from tests.unit.mcp.test_mcp_queue_role import owner_factory
+
 from aegis_core import team_queue as queue
 from aegis_cli.cli import main
 import aegis_mcp.server as server
@@ -43,6 +46,237 @@ def require_store(root):
     if shutil.which("git") is None:
         pytest.skip("requires git")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
+
+
+def test_owner_claim_policy_and_revision_retry(owner_factory, tmp_path, monkeypatch):
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": ["core"]})
+    start_owner()
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    result = claim(arguments)
+    assert not result["refused"], result
+    assert result["item"]["lane"] == "alpha"
+    assert result["item"]["branch"] == "lane/alpha"
+    assert result["item"]["expires_at"] is not None
+    assert claim(arguments)["reason"] == "stale_revision"
+
+
+def _workspace_spelling(root, style):
+    if style == "trailing":
+        return str(root) + "/"
+    if style == "separators":
+        return str(root.parent) + "//" + root.name
+    if style == "dot":
+        return str(root.parent) + "/./" + root.name
+    if style == "leading":
+        return "/" + str(root)
+    return str(root)
+
+
+@pytest.mark.parametrize("style", ["canonical", "trailing", "separators", "dot", "leading"])
+def test_owner_workspace_spellings_claim_and_pin_original_bytes(owner_factory, style):
+    import hashlib
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    policy["workspace"] = _workspace_spelling(repo, style)
+    raw = (json.dumps(policy, indent=1) + "\n").encode("utf-8")
+    path.write_bytes(raw)
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    assert not added["refused"], added
+    start_owner()
+    record = json.loads(next((root / "sessions").glob("*.json")).read_text())
+    assert record["registration_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert path.read_bytes() == raw
+    _, listed = call({})
+    assert [item["id"] for item in listed["items"]] == ["ONE"]
+    arguments = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    result = claim(arguments)
+    assert not result["refused"], result
+    assert claim(arguments)["reason"] == "stale_revision"
+    assert path.read_bytes() == raw
+    # Equivalent policy/path content cannot replace the exact startup bytes.
+    policy["workspace"] = str(repo)
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    assert claim(arguments)["reason"] == "role_stale"
+
+
+@pytest.mark.parametrize("style", ["parent", "symlink"])
+def test_owner_workspace_unsafe_spellings_keep_fixed_refusal(owner_factory, tmp_path, capsys, style):
+    from conftest import symlink_or_skip
+    from aegis_mcp import queue_owner
+
+    role, root, path, repo, policy = owner_factory()
+    if style == "parent":
+        policy["workspace"] = str(repo / ".." / repo.name)
+    else:
+        link = tmp_path / "workspace-link"
+        symlink_or_skip(repo, link, target_is_directory=True)
+        policy["workspace"] = str(link)
+    raw = json.dumps(policy).encode("utf-8")
+    path.write_bytes(raw)
+    assert queue_owner.main(["alpha"]) == 1
+    assert capsys.readouterr().err == "aegis-mcp-queue: role_invalid\n"
+    assert path.read_bytes() == raw
+    assert not (root / "sessions").exists()
+
+
+def test_owner_claim_forbidden_lane_and_dispatch_retry(owner_factory, tmp_path, monkeypatch):
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    start_owner()
+    args = {"id": "ONE", "expect": added["item"]["revision"], "lane": "foreign"}
+    assert claim(args)["reason"] == "role_forbidden"
+    args["lane"] = "alpha"
+    original = queue.claim
+    def unavailable(*args, **kwargs):
+        raise OSError("token=private-value")
+    monkeypatch.setattr(queue, "claim", unavailable)
+    result = claim(args)
+    assert result["reason"] == "queue_io_unavailable"
+    assert "private-value" not in json.dumps(result)
+    monkeypatch.setattr(queue, "claim", original)
+    assert not claim(args)["refused"]
+
+
+@pytest.mark.parametrize("reason", ["item_missing", "invalid_queue_state", "stale_revision", "blocked", "capability_mismatch"])
+def test_authorized_claim_refusals_preserve_state_and_recover(owner_factory, reason):
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    item = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    if reason == "blocked":
+        item["hold"] = "Owner review"
+    elif reason == "capability_mismatch":
+        item["capabilities"] = ["other"]
+    revision = "a" * 64
+    if reason != "item_missing":
+        added = queue.add(repo, item)
+        assert not added["refused"], added
+        revision = added["item"]["revision"]
+    state = repo / ".aegis" / "state" / "team-queue.json"
+    if reason == "invalid_queue_state":
+        state.write_text("[]")
+    before = state.read_bytes() if state.exists() else None
+    start_owner()
+    result = claim({"id": "ONE", "expect": "b" * 64 if reason == "stale_revision" else revision, "lane": "alpha"})
+    assert result["reason"] == reason and result["refused"], result
+    assert (state.read_bytes() if state.exists() else None) == before
+    if reason == "invalid_queue_state":
+        state.unlink()  # Remove only this test's injected corrupt record.
+    corrected = queue.add(repo, {"id": "TWO", "title": "Next", "paths": ["src/**"], "capabilities": []})
+    assert not corrected["refused"], corrected
+    assert not claim({"id": "TWO", "expect": corrected["item"]["revision"], "lane": "alpha"})["refused"]
+
+
+def test_owner_expiry_rechecked_after_queue_lock(owner_factory, tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    start_owner()
+    expires = server._queue_grant.record["expires_at"]
+    clock = [expires - 1]
+    real = role.storage
+    @contextmanager
+    def delayed_lock(*args, **kwargs):
+        with real.locked(*args, **kwargs) as held:
+            clock[0] = expires
+            yield held
+    monkeypatch.setattr(queue_role, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(queue_role, "storage", SimpleNamespace(
+        locked=delayed_lock, file_lock=real.file_lock, LockTimeoutError=real.LockTimeoutError))
+    result = claim({"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"})
+    assert result["reason"] == "role_stale"
+    assert queue.list(repo)["items"][0]["state"] == "queued"
+
+
+def _owner_claim_worker(arguments, barrier, results):
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    start_owner()
+    barrier.wait(timeout=10)
+    results.put(claim(arguments))
+
+
+@pytest.mark.parametrize("workspace_style", ["canonical", "trailing", "separators", "dot"])
+def test_two_owner_processes_claim_one_revision(owner_factory, tmp_path, monkeypatch, workspace_style):
+    import multiprocessing
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    policy["workspace"] = _workspace_spelling(repo, workspace_style)
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    args = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    context = multiprocessing.get_context("fork")
+    barrier, results = context.Barrier(2), context.Queue()
+    processes = [context.Process(target=_owner_claim_worker, args=(args, barrier, results)) for _ in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        values = [results.get(timeout=15) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+            assert not process.is_alive() and process.exitcode == 0
+        assert sum(not value["refused"] for value in values) == 1
+        assert [value["reason"] for value in values if value["refused"]] == ["stale_revision"]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        results.close()
+        results.join_thread()
+
+
+def _owner_revocation_worker(arguments, ready, proceed, results):
+    from tests.unit.mcp.test_mcp_queue_role import start_owner, claim
+
+    start_owner()
+    ready.set()
+    assert proceed.wait(timeout=10)
+    results.put(claim(arguments))
+
+
+def test_owner_revocation_precedes_waiting_claim(owner_factory, tmp_path):
+    import multiprocessing
+
+    role, root, path, repo, policy = owner_factory()
+    require_store(repo)
+    added = queue.add(repo, {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []})
+    args = {"id": "ONE", "expect": added["item"]["revision"], "lane": "alpha"}
+    context = multiprocessing.get_context("fork")
+    ready, proceed, results = context.Event(), context.Event(), context.Queue()
+    process = context.Process(target=_owner_revocation_worker, args=(args, ready, proceed, results))
+    try:
+        process.start()
+        assert ready.wait(timeout=10)
+        with role.authority():
+            policy["role"] = "reviewer"
+            path.write_text(json.dumps(policy), encoding="utf-8")
+            proceed.set()
+        assert results.get(timeout=15)["reason"] == "role_stale"
+        process.join(timeout=10)
+        assert not process.is_alive() and process.exitcode == 0
+        assert queue.list(repo)["items"][0]["state"] == "queued"
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        results.close()
+        results.join_thread()
 
 
 def test_queue_tool_is_closed_and_read_only(workspace):
