@@ -1328,6 +1328,9 @@ def test_dotted_report_input_has_bounded_peak_allocation(tmp_path, monkeypatch, 
     repo = make_repo(tmp_path)
     _fix(repo, "fix: bounded attribution memory", {"src/app.py": APP.format(1), "tests/test_app.py": TEST_COMPUTE})
     plain = "tests.test_app::test_plain"
+    # Warm git object reads and the snapshot runner before the measured input exists.
+    _fake_outcomes(monkeypatch, ({plain}, set(), set()), (set(), set(), set()))
+    regression.check_ci_regressions(repo.root, "main")
     component = "a." if case == "base-error" else "ab."
     dotted = component * ((8 * 1024 * 1024 - 4096) // len(component)) + "Case"
     if case == "base-error":

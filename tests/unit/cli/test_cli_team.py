@@ -20,7 +20,7 @@ from typing import List, Optional
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core import events, team
+from aegis_core import events, team, team_queue
 from aegis_core._version import __version__
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -752,3 +752,150 @@ def test_metrics_text_counts_an_excluded_synthetic_merge(ws: Path, capsys):
     assert rc == 0
     assert f"First-parent merges on {tip[:12]} since main: 0\n" in out
     assert out.endswith("  excluded synthetic pull-request merges: 1\n")
+
+
+# ── branch bytes on the public claim commands ───────────────────────────────
+
+_BRANCH_REASON = "branch must be 1 to 200 characters with no spaces or control characters"
+_SURROGATE_BYTES = b"feature/\xffmarker".decode("utf-8", "surrogateescape")
+_CLI_BRANCHES = [
+    ("feature/bytes", True, False),
+    ("feature/\u00fc", True, False),
+    ("feature/\ud800marker", False, True),
+    (_SURROGATE_BYTES, False, True),
+    ("", False, False),
+    ("x" * 201, False, False),
+    ("feature/a\nb", False, False),
+]
+_CLI_BRANCH_IDS = ["ascii", "utf8", "lone-surrogate", "surrogateescape", "empty", "over-length", "embedded-newline"]
+
+
+def _skip_posix_argv(posix_only: bool) -> None:
+    if posix_only and os.name == "nt":
+        pytest.skip("Windows argv cannot carry surrogate-escaped non-UTF-8 bytes")
+
+
+def _prepare_queue(ws: Path, tmp_path: Path) -> None:
+    if not team_queue.descriptor_supported():
+        pytest.skip("requires descriptor-relative nofollow operations")
+    (ws / ".aegis" / "team.json").write_text(
+        json.dumps({"v": 1, "lanes": {"docs": ["docs/**"]}}), encoding="utf-8")
+    home = tmp_path / "queue-home"
+    home.mkdir(exist_ok=True)
+    # The autouse hermetic_environment_and_mcp_isolation fixture restores this.
+    os.environ.update({"HOME": str(home), "USERPROFILE": str(home)})
+
+
+def _queue_json(capsys, root: Path, *argv: str):
+    rc = main(["--workspace", str(root), "team", "queue", *argv, "--json"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    return rc, json.loads(captured.out)
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("branch,accepted,posix_only", _CLI_BRANCHES, ids=_CLI_BRANCH_IDS)
+def test_cli_claim_branch_matrix(ws: Path, capsys, mode, branch, accepted, posix_only):
+    _skip_posix_argv(posix_only)
+    argv = ["claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--branch", branch]
+    if mode == "json":
+        rc, payload, err = _json(capsys, *argv)
+        if accepted:
+            assert rc == 0 and err == ""
+            assert payload["lease"]["branch"] == branch
+            assert team.read_leases(ws).get("docs").branch == branch
+            return
+        assert rc == 2 and err == ""
+        assert payload["status"] == "error" and payload["error"] == _BRANCH_REASON
+        assert "marker" not in json.dumps(payload)
+    else:
+        rc, out, err = _run(capsys, *argv)
+        if accepted:
+            assert rc == 0, err
+            assert out == f"{_ref(ws, 'docs')}\n"
+            assert team.read_leases(ws).get("docs").branch == branch
+            return
+        assert rc == 2 and out == ""
+        assert err == f"Error: {_BRANCH_REASON}\n"
+        assert "marker" not in err
+    assert _ref(ws, "docs") is None
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--branch", "feature/retry")
+    assert rc == 0, err
+    assert team.read_leases(ws).get("docs").branch == "feature/retry"
+
+
+@pytest.mark.parametrize("branch,accepted,posix_only", _CLI_BRANCHES, ids=_CLI_BRANCH_IDS)
+def test_cli_queue_claim_branch_matrix(ws: Path, tmp_path: Path, capsys, branch, accepted, posix_only):
+    _skip_posix_argv(posix_only)
+    if not accepted and not team_queue.descriptor_supported():
+        rc, payload = _queue_json(capsys, ws, "claim", "ONE", "--expect", "0" * 64, "--lane", "docs",
+                                  "--capability", "core", "--branch", branch)
+        assert rc == 2 and payload["reason"] == "invalid_arguments" and payload["exit_code"] == 2
+        assert payload["next_action"] == "Use the documented queue arguments and the revision returned by list."
+        assert "marker" not in json.dumps(payload)
+        assert not (ws / ".aegis" / "state" / "team-queue.json").exists()
+        return
+    _prepare_queue(ws, tmp_path)
+    item = json.dumps({"id": "ONE", "title": "Queue work", "paths": ["docs/**"], "capabilities": ["core"]})
+    rc, added = _queue_json(capsys, ws, "add", "--item", item)
+    assert rc == 0, added
+    revision = added["item"]["revision"]
+    path = ws / ".aegis" / "state" / "team-queue.json"
+    before = path.read_bytes()
+    rc, payload = _queue_json(capsys, ws, "claim", "ONE", "--expect", revision, "--lane", "docs",
+                              "--capability", "core", "--branch", branch)
+    if accepted:
+        assert rc == 0 and payload["refused"] is False, payload
+        assert payload["item"]["branch"] == branch
+        return
+    assert rc == 2 and payload["reason"] == "invalid_arguments" and payload["exit_code"] == 2
+    assert payload["next_action"] == "Use the documented queue arguments and the revision returned by list."
+    assert "marker" not in json.dumps(payload)
+    assert path.read_bytes() == before
+    rc, retried = _queue_json(capsys, ws, "claim", "ONE", "--expect", revision, "--lane", "docs",
+                              "--capability", "core", "--branch", "feature/retry")
+    assert rc == 0 and retried["item"]["branch"] == "feature/retry"
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_cli_list_of_stored_surrogate_branch_does_not_crash(ws: Path, capsys, branch):
+    blob = {"v": 1, "lane": "docs", "role": "implementer", "owner": "o@h", "claim_id": "0123456789abcdef",
+            "gen": 1, "branch": branch, "paths": ["docs/**"], "ts": NOW, "ttl_s": 600}
+    raw = (json.dumps(blob, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(ws), input=raw,
+                         capture_output=True, check=True).stdout.decode().strip()
+    _git(ws, "update-ref", "refs/aegis/lanes/docs", oid)
+    rc, out, err = _run(capsys, "list")
+    assert rc == 0 and err == ""
+    assert "unreadable" in out and "marker" not in out
+    rc, payload, err = _json(capsys, "list")
+    assert rc == 0 and err == ""
+    assert payload["leases"] == []
+    assert payload["unreadable"][0]["lane"] == "docs"
+    assert payload["unreadable"][0]["oid"] == oid
+    assert "marker" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("branch", ["feature/\ud800marker", _SURROGATE_BYTES], ids=["lone-surrogate", "surrogateescape"])
+def test_cli_queue_audit_of_stored_surrogate_branch_stays_unsupported(ws: Path, tmp_path: Path, capsys, branch):
+    _prepare_queue(ws, tmp_path)
+    item = json.dumps({"id": "ONE", "title": "Queue work", "paths": ["docs/**"], "capabilities": ["core"]})
+    rc, added = _queue_json(capsys, ws, "add", "--item", item)
+    assert rc == 0, added
+    rc, claimed = _queue_json(capsys, ws, "claim", "ONE", "--expect", added["item"]["revision"],
+                              "--lane", "docs", "--capability", "core", "--branch", "feature/ok")
+    assert rc == 0, claimed
+    assert team.claim(ws, "docs", ["docs/**"], owner="owner", branch="lane/docs").lease.branch == "lane/docs"
+    path = ws / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["items"]["ONE"]["branch"] = branch
+    planted = json.dumps(state, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    path.write_bytes(planted)
+    rc, audited = _queue_json(capsys, ws, "audit")
+    assert rc == 0 and audited["refused"] is False
+    assert [row["code"] for row in audited["findings"]] == ["CLAIM-BRANCH-UNSUPPORTED"]
+    assert "marker" not in json.dumps(audited["findings"])
+    assert path.read_bytes() == planted
+    rc, listed = _queue_json(capsys, ws, "list")
+    assert rc == 0 and listed["items"][0]["branch_supported"] is False
+    assert listed["items"][0]["branch"] == branch

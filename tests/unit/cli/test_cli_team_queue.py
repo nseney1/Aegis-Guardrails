@@ -43,6 +43,26 @@ def run(capsys, root, *arguments):
     return code, json.loads(captured.out)
 
 
+def test_cli_unclaim_releases_lane_lease_and_preserves_refusal_envelope(workspace, capsys):
+    value = {"id": "ONE", "title": "Work", "paths": ["src/**"], "capabilities": []}
+    code, added = run(capsys, workspace, "add", "--item", json.dumps(value))
+    assert code == 0
+    code, claimed = run(capsys, workspace, "claim", "ONE", "--expect", added["item"]["revision"], "--lane", "writer")
+    assert code == 0
+    lease = team.claim(workspace, "writer", ["src/**"])
+    revision = claimed["item"]["revision"]
+    code, refused = run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer")
+    assert code == 1 and refused["reason"] == "writer_not_stopped"
+    code, refused = run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer", "--writer-stopped", "--reason", "token=private-value")
+    assert code == 2 and refused["reason"] == "credential_like_text"
+    assert "private-value" not in json.dumps(refused)
+    code, released = run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer", "--writer-stopped", "--reason", "Waiting for review")
+    assert code == 0 and released["schema"] == "aegis.team.queue.unclaim/v1"
+    assert released["item"]["state"] == "queued" and released["released_lease_ids"] == [lease.oid]
+    assert team.read_leases(workspace).get("writer") is None
+    assert run(capsys, workspace, "unclaim", "ONE", "--expect", revision, "--lane", "writer", "--writer-stopped")[0] == 1
+
+
 def test_queue_cli_lifecycle_and_core_parity(workspace, capsys):
     item = {"id": "ONE", "title": "Core work", "paths": ["src/**"], "capabilities": ["core"]}
     code, added = run(capsys, workspace, "add", "--item", json.dumps(item))

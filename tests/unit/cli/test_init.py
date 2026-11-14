@@ -291,6 +291,13 @@ def test_config_growth_after_init_update_has_a_bounded_read(project, capsys, mon
     import tracemalloc
     from aegis_core.config import MAX_CONFIG_BYTES
 
+    # Exclude lazy CLI imports without initializing the measured project.
+    warmup = project.parent / "warmup"
+    warmup.mkdir()
+    assert main(["init", "--workspace", str(warmup), "--json", "--no-hooks", "--yes", "--host", "codex-cli"]) == 0
+    capsys.readouterr()
+    assert list(project.iterdir()) == []
+
     config = project / ".aegis/config.json"
     config.parent.mkdir()
     config.write_text('{"v": 1}', encoding="utf-8")
