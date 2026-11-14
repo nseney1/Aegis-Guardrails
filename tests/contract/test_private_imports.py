@@ -10,7 +10,12 @@ import pytest
 from tests.contract.test_process_ratchets import module_trees, ScopedNames, import_bindings
 
 REPO = Path(__file__).resolve().parents[2]
-PRIVATE_IMPORTS = {'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1,
+PRIVATE_IMPORTS = {'aegis_mcp/queue_role.py:aegis_core.team_queue._REVISION': 1,
+ 'aegis_mcp/queue_role.py:aegis_core.team_queue._branch_name': 1,
+ 'aegis_mcp/queue_role.py:aegis_core.team_queue._key': 1,
+ 'aegis_mcp/queue_role.py:aegis_core.team_queue._lane': 2,
+ 'aegis_mcp/queue_role.py:aegis_core.team_queue._strings': 1,
+ 'aegis_cli/check.py:aegis_cli.verify._append_step_summary': 1,
  'aegis_core/team_queue.py:aegis_core.team._check_branch': 1,
  'aegis_cli/check.py:aegis_cli.verify._resolve_git_cwd': 2,
  'aegis_cli/check.py:aegis_cli.verify._wants_json': 1,

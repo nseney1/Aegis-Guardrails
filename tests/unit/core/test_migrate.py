@@ -104,11 +104,25 @@ def test_retired_markers_do_not_report_both_a_file_and_its_parent(tmp_path):
     assert unmigrated_state(tmp_path) == [".aegis/evidence/signals.jsonl"]
 
 
+def _warm_migrate_apply(tmp_path):
+    """Load apply()'s lazy scaffold import on a scratch workspace, not the measured one."""
+    warm = tmp_path / "_warm_migrate"
+    rule = warm / ".aegis" / "rules" / "traps" / "t.md"
+    rule.parent.mkdir(parents=True)
+    rule.write_bytes(b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n")
+    planned = migrate.plan(warm)
+    try:
+        migrate.apply(planned)
+    except migrate.MigrationRefused:
+        return
+
+
 @pytest.mark.parametrize("when", ["before_plan", "after_plan"])
 def test_oversized_config_refuses_apply_before_allocating_its_contents(tmp_path, when):
     import tracemalloc
     from aegis_core.config import MAX_CONFIG_BYTES
 
+    _warm_migrate_apply(tmp_path)
     source = tmp_path / ".aegis/rules/traps/t.md"
     source.parent.mkdir(parents=True)
     original = b"---\nid: t\ntype: trap\nscore: 0.4\n---\nBody\n"

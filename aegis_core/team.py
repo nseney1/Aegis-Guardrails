@@ -342,12 +342,22 @@ def lane_ref(lane: object) -> str:
 
 
 def _label_ok(value: object, spaces: bool = True) -> bool:
-    return (
-        isinstance(value, str)
-        and 1 <= len(value) <= LABEL_MAX
-        and _CONTROL.search(value) is None
-        and (spaces or not any(ch.isspace() for ch in value))
-    )
+    # Length is capped before encode so a hostile label cannot allocate an
+    # unbounded UTF-8 copy. Lone surrogates (POSIX argv surrogateescape) pass
+    # the control and space checks but are not UTF-8; the same probe as
+    # team_queue._text refuses them before any lease or queue state is written.
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= LABEL_MAX
+        or _CONTROL.search(value) is not None
+        or (not spaces and any(ch.isspace() for ch in value))
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
 
 
 def _check_label(value: object, what: str) -> str:

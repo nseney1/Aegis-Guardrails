@@ -639,6 +639,9 @@ def _queue_command(args):
                                   capabilities=args.capabilities or [], ttl_s=args.ttl, branch=args.branch)
     elif verb in ("release", "done"):
         result = getattr(team_queue, verb)(root, args.item_id, expect=args.expect, lane=args.lane)
+    elif verb == "unclaim":
+        result = team_queue.unclaim(root, args.item_id, expect=args.expect, lane=args.lane,
+                                    reason=args.reason, writer_stopped=args.writer_stopped)
     else:
         result = team_queue.refusal("invalid_arguments")
     return _queue_output(args, result)
@@ -741,7 +744,7 @@ def _configure_queue_parser(sub, common, parent):
     sub._parser_class = partial(QueueParser, **keywords)
     try:
         parser = sub.add_parser("queue", parents=[common], help="Manage queued team work with CAS leases",
-                                description="Queue add, list, claim, release, done, audit and compact; all results are JSON.",
+                                description="Queue add, list, claim, release, unclaim, done, audit and compact; all results are JSON.",
                                 allow_abbrev=False)
     finally:
         sub._parser_class = factory
@@ -760,12 +763,16 @@ def _configure_queue_parser(sub, common, parent):
     claim.add_argument("--capability", dest="capabilities", action=Capabilities, default=None,
                        help="Team capability label; repeat for each label")
     claim.add_argument("--ttl", type=int, default=team.DEFAULT_TTL_S, metavar="SECONDS", help="Claim lifetime, at most one day")
-    for verb in ("release", "done"):
-        action = verbs.add_parser(verb, parents=[common], help="Release a claim" if verb == "release" else "Complete a live claim",
+    for verb in ("release", "done", "unclaim"):
+        action = verbs.add_parser(verb, parents=[common], help={"release": "Release a claim", "done": "Complete a live claim",
+                                  "unclaim": "Return a claim together with its intersecting lane leases"}[verb],
                                   allow_abbrev=False)
         action.add_argument("item_id", metavar="ITEM", help="Stable queue item id")
         action.add_argument("--expect", required=True, metavar="REVISION", help="Current revision returned by claim or list")
-        action.add_argument("--lane", default=None, help="Current claim lane; required for a live claim")
+        action.add_argument("--lane", default=None, required=verb == "unclaim", help="Current claim lane; required for a live claim")
+        if verb == "unclaim":
+            action.add_argument("--writer-stopped", action="store_true", help="Acknowledge that the lane's writer and queued jobs are stopped")
+            action.add_argument("--reason", default="", help="Single-line noncredential reason for returning the claim and its leases")
     verbs.add_parser("audit", parents=[common], help="Report held work needing a decision", allow_abbrev=False)
     verbs.add_parser("compact", parents=[common], help="Remove completed items not needed by unfinished dependencies", allow_abbrev=False)
 
@@ -821,7 +828,7 @@ def _configure_model_parser(sub, common):
     model = sub.add_parser("model", parents=[common], help="Select a model; optionally record the decision",
                            description="Preview model selection as JSON; --record atomically selects and appends. "
                            "Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. "
-                           "No model is launched; unprobed admission remains explicit.")
+                           "No model is launched; unprobed and rejected levels refuse with binding_not_admitted.")
     model._model_errors = True
     for flag, help_text in (
         ("bindings", "Model bindings JSON file inside the workspace (bounded, regular, no symlinks)"),

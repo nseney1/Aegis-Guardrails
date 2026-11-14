@@ -38,6 +38,7 @@ EXPECTED_MCP_TOOLS = (
     "aegis_team_model",
     "aegis_team_queue",
 )
+EXPECTED_QUEUE_MCP_TOOLS = ("aegis_team_queue", "aegis_team_queue_claim")
 MAX_MCP_STDOUT = 1024 * 1024
 MAX_MCP_TOOLS = 1024
 MAX_MCP_NAME = 128
@@ -54,7 +55,8 @@ EXPECTED_FACT_KEYS = tuple(sorted(set(EXPECTED_MCP_TOOLS) | {
 EXPECTED_IDENTIFIERS = frozenset(EXPECTED_MCP_TOOLS + (
     "trap-smoke", "aegis.team.claim/v1", "aegis.team.status/v1", "aegis.doctor/v1", "aegis init", "ok", "pass", "workspace-tip",
 ))
-EXPECTED_MODULES = PACKAGES + ("aegis_core.ast.drivers.js", "aegis_core.ast.drivers.rust", "aegis_core.team_status")
+EXPECTED_MODULES = PACKAGES + ("aegis_core.ast.drivers.js", "aegis_core.ast.drivers.rust", "aegis_core.team_status",
+                              "aegis_mcp.queue_role", "aegis_mcp.queue_owner")
 SAFE_EXCEPTION_CLASSES = {
     OSError: "OSError", FileNotFoundError: "FileNotFoundError", PermissionError: "PermissionError",
     ValueError: "ValueError", TypeError: "TypeError", RecursionError: "RecursionError",
@@ -340,6 +342,16 @@ def check_mcp_tools(tools, context):
         fail(f"{context} tools mismatch: missing={missing!r}, unexpected={_identifier_list(unexpected)}, duplicates={_identifier_list(duplicates)}")
 
 
+def check_queue_tools(tools):
+    if type(tools) is not list or len(tools) != 2:
+        fail("queue MCP tools mismatch")
+    for tool in tools:
+        if type(tool) is not dict or type(tool.get("name")) is not str or len(tool["name"]) > MAX_MCP_NAME:
+            fail("queue MCP tools mismatch")
+    if tuple(sorted(tool["name"] for tool in tools)) != EXPECTED_QUEUE_MCP_TOOLS:
+        fail("queue MCP tools mismatch")
+
+
 def check_module_origins(names=PACKAGES):
     for name in names:
         if name not in EXPECTED_MODULES:
@@ -541,9 +553,11 @@ def check_packaged_rules_and_skills(ws):
     import importlib.resources
     from pathlib import Path
     from aegis_cli.init import packaged_active_rules, packaged_dir, packaged_rules
-    from aegis_mcp.registry import TOOL_DEFINITIONS
+    from aegis_mcp.registry import QUEUE_TOOL_DEFINITIONS, TOOL_DEFINITIONS
 
     check_mcp_tools(TOOL_DEFINITIONS, "TOOL_DEFINITIONS")
+    check_queue_tools(QUEUE_TOOL_DEFINITIONS)
+    check_module_origins(("aegis_mcp.queue_role", "aegis_mcp.queue_owner"))
     dist = importlib.metadata.distribution("aegis-guardrails")
     top_level = sorted((dist.read_text("top_level.txt") or "").split())
     if top_level != sorted(PACKAGES):

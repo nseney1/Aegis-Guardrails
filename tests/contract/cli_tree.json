@@ -4958,7 +4958,7 @@
                 "required": false
               }
             ],
-            "description": "Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed admission remains explicit.",
+            "description": "Preview model selection as JSON; --record atomically selects and appends. Errors are JSON with exit 2. Paths must stay inside the workspace; absolute and parent paths refuse. No model is launched; unprobed and rejected levels refuse with binding_not_admitted.",
             "help": "Select a model; optionally record the decision"
           },
           "queue": {
@@ -5616,9 +5616,127 @@
                 ],
                 "description": null,
                 "help": "Release a claim"
+              },
+              "unclaim": {
+                "aliases": [],
+                "arguments": [
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "help",
+                    "flags": [
+                      "-h",
+                      "--help"
+                    ],
+                    "help": "show this help message and exit",
+                    "kind": "help",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "json",
+                    "flags": [
+                      "--json"
+                    ],
+                    "help": "Emit machine-readable JSON output",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "const": true,
+                    "default": "==SUPPRESS==",
+                    "dest": "plain",
+                    "flags": [
+                      "--plain"
+                    ],
+                    "help": "Strip ANSI styling and emoji",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "==SUPPRESS==",
+                    "dest": "workspace",
+                    "flags": [
+                      "--workspace"
+                    ],
+                    "help": "Target workspace root",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false,
+                    "type": "str"
+                  },
+                  {
+                    "default": null,
+                    "dest": "item_id",
+                    "flags": [],
+                    "help": "Stable queue item id",
+                    "kind": "store",
+                    "metavar": "ITEM",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "expect",
+                    "flags": [
+                      "--expect"
+                    ],
+                    "help": "Current revision returned by claim or list",
+                    "kind": "store",
+                    "metavar": "REVISION",
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "default": null,
+                    "dest": "lane",
+                    "flags": [
+                      "--lane"
+                    ],
+                    "help": "Current claim lane; required for a live claim",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": true
+                  },
+                  {
+                    "const": true,
+                    "default": false,
+                    "dest": "writer_stopped",
+                    "flags": [
+                      "--writer-stopped"
+                    ],
+                    "help": "Acknowledge that the lane's writer and queued jobs are stopped",
+                    "kind": "store_true",
+                    "metavar": null,
+                    "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "default": "",
+                    "dest": "reason",
+                    "flags": [
+                      "--reason"
+                    ],
+                    "help": "Single-line noncredential reason for returning the claim and its leases",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
+                  }
+                ],
+                "description": null,
+                "help": "Return a claim together with its intersecting lane leases"
               }
             },
-            "description": "Queue add, list, claim, release, done, audit and compact; all results are JSON.",
+            "description": "Queue add, list, claim, release, unclaim, done, audit and compact; all results are JSON.",
             "help": "Manage queued team work with CAS leases"
           },
           "release": {
