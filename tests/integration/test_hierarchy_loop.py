@@ -25,6 +25,15 @@ from tests.integration.test_hierarchy_sweep import EVIDENCE, SealedFleet, ago, c
 
 
 LOOP = ROOT / "tools" / "hierarchy_loop.py"
+
+
+@pytest.mark.parametrize("mode", ["once","run"])
+@pytest.mark.parametrize("damage", ["request","plan"])
+def test_round13_planning_target_error_keeps_serving_and_runs_jobs(tmp_path,mode,damage):
+    from tests.integration.test_hierarchy_fresh_brief import r13_consumer_probe,R13_CONSUMER_GOLDENS
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    seam="loop-"+mode
+    assert r13_consumer_probe(tmp_path,seam,True,damage)==R13_CONSUMER_GOLDENS[(seam,True,damage)]
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"),
                                 reason="run-open reads /proc and the wake supports POSIX process groups only")
 # Loads the loop with one step's tool swapped for a script, which is how a test makes a step misbehave.

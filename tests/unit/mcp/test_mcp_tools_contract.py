@@ -16,6 +16,15 @@ if REPO_ROOT not in sys.path:
 from aegis_mcp.tools import execute_tool
 
 
+def test_direct_claim_dispatch_cannot_supply_authority():
+    from aegis_mcp.tools import is_known_tool
+
+    assert is_known_tool("aegis_team_queue_claim")
+    arguments = {"id": "ONE", "expect": "a" * 64, "lane": "alpha"}
+    assert execute_tool("aegis_team_queue_claim", arguments, client_arguments=True)["reason"] == "role_missing"
+    assert execute_tool("aegis_team_queue_claim", {**arguments, "_role": "orchestrator"})["reason"] == "invalid_arguments"
+
+
 def _setup_workspace(tmp_path):
     """Create a minimal workspace with rules for MCP tools."""
     ws = str(tmp_path)

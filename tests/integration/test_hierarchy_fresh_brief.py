@@ -11,12 +11,12 @@ import hashlib
 import itertools
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import stat
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import pytest
 
@@ -26,9 +26,4522 @@ from tests.integration.test_hierarchy_host_plan import write_plan
 from tests.integration.test_hierarchy_lifecycle import Ledger, SOURCE, raw_request, request, pytestmark as lifecycle_only
 from tests.integration.test_hierarchy_small_change_admission import SmallChange
 from tools.hierarchy_mailbox import Mailbox, safe_path
+import hierarchy_router as alias_router
+from tools import hierarchy_fresh_brief as alias_fresh
+import hierarchy_fresh_brief as portable_fresh
+from tests.conftest import symlink_or_skip
 
 
 TOOL = ROOT / "tools" / "hierarchy_fresh_brief.py"
+
+
+R17_CHAIN_SHAPES = ("direct", "target-prefix", "two-nested", "ancestor-suffix")
+R17_LEAF_OUTCOMES = ("absent", "enotdir", "eacces", "eio", "present")
+R17_CHAIN_SETUP = r'''
+import errno
+from types import SimpleNamespace
+ordinary, public, real = root / 'ordinary', root / 'public', root / 'real'
+real.mkdir()
+leaf = real / 'note.md'
+if shape == 'direct':
+    ordinary.unlink(); ordinary.mkdir()
+    (ordinary / 'note.md').symlink_to(leaf)
+elif shape == 'target-prefix':
+    (public / 'note.md').unlink()
+    (public / 'note.md').symlink_to(root / 'hop' / 'note.md')
+    (root / 'hop').symlink_to(real, target_is_directory=True)
+elif shape == 'two-nested':
+    ordinary.unlink(); ordinary.mkdir()
+    (ordinary / 'note.md').symlink_to(root / 'hop' / 'note.md')
+    (root / 'hop').symlink_to(root / 'hop2', target_is_directory=True)
+    (root / 'hop2').symlink_to(real, target_is_directory=True)
+else:
+    (real / 'sub').mkdir()
+    leaf = real / 'sub' / 'note.md'
+    ordinary.unlink()
+    ordinary.symlink_to(root / 'hop' / 'sub', target_is_directory=True)
+    (root / 'hop').symlink_to(real, target_is_directory=True)
+if outcome != 'absent': leaf.write_bytes(b'public final leaf')
+real_os, descriptors = fresh.os, {}
+codes = dict(enotdir=errno.ENOTDIR, eacces=errno.EACCES, eio=errno.EIO, enoent=errno.ENOENT)
+def actual(path, kwargs):
+    if isinstance(path, int): return None
+    value = Path(path)
+    parent = descriptors.get(kwargs.get('dir_fd'))
+    return parent / value if not value.is_absolute() and parent is not None else value
+def failure(code):
+    if code == 'no-errno': raise PermissionError('controlled proof failure')
+    raise OSError(codes[code], real_os.strerror(codes[code]), str(leaf))
+def stated(path, *args, **kwargs):
+    if actual(path, kwargs) == leaf and outcome in ('enotdir', 'eacces', 'eio'):
+        failure(outcome)
+    return real_os.stat(path, *args, **kwargs)
+def opened(path, *args, **kwargs):
+    value = actual(path, kwargs)
+    if outcome.startswith('proof-') and outcome != 'proof-result' and value == leaf.parent:
+        failure(outcome[len('proof-'):])
+    descriptor = real_os.open(path, *args, **kwargs)
+    descriptors[descriptor] = value
+    return descriptor
+def closed(descriptor):
+    descriptors.pop(descriptor, None)
+    return real_os.close(descriptor)
+fresh.os = SimpleNamespace(**{**vars(real_os), 'stat': stated, 'open': opened, 'close': closed})
+if outcome == 'proof-result':
+    original_lookup = fresh._LeafLookup
+    class FailedResult(original_lookup):
+        def __init__(self, kind, value, proof):
+            if proof.leaf == leaf: raise MemoryError('controlled result allocation failure')
+            super().__init__(kind, value, proof)
+    fresh._LeafLookup = FailedResult
+target = root / 'ordinary' / 'note.md'
+'''
+
+
+def r17_chain_probe(shape, outcome):
+    # Both values come from the fixed test matrix, never from a request.
+    assert shape in R17_CHAIN_SHAPES
+    assert outcome in R17_LEAF_OUTCOMES or outcome in {
+        "proof-enoent", "proof-enotdir", "proof-eacces", "proof-eio", "proof-no-errno", "proof-result"}
+    return R9_PUBLIC_PROBE.replace("tools, fallback, root, seam, backend = sys.argv[1:]",
+        "tools, fallback, root, seam, backend, fault = sys.argv[1:]").replace(
+        "target = root / 'ordinary' / 'note.md'",
+        "shape = " + repr(shape) + "\noutcome = " + repr(outcome) + "\n" + R17_CHAIN_SETUP)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("shape", R17_CHAIN_SHAPES)
+@pytest.mark.parametrize("outcome", R17_LEAF_OUTCOMES)
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+@pytest.mark.parametrize("backend", ["native", "portable"])
+@pytest.mark.parametrize("inert", [False, True])
+def test_round17_pathname_final_leaf_keeps_baseline_bytes(tmp_path, shape, outcome, seam, backend, inert):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    consumer = "shared-" + seam if inert else seam
+    if shape in {"direct", "two-nested"}:
+        expected = R13_LEAF_GOLDENS[(consumer, False, backend)]
+    elif outcome in {"eacces", "eio"}:
+        expected = R10_PUBLIC_GOLDENS[(consumer, "link-to-denied" if outcome == "eacces" else "link-to-io", False, backend)]
+    else:
+        expected = R9_PUBLIC_GOLDENS[(consumer, "symlink", False, backend)]
+    assert r9_public_probe(tmp_path, consumer, "symlink", False, backend,
+        _probe=r17_chain_probe(shape, outcome)) == expected
+
+
+@lifecycle_only
+@pytest.mark.parametrize("shape", R17_CHAIN_SHAPES)
+@pytest.mark.parametrize("fault", ["enoent", "enotdir", "eacces", "eio", "no-errno", "result"])
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+@pytest.mark.parametrize("backend", ["native", "portable"])
+def test_round17_parent_proof_failure_is_quarantined_and_consumed(tmp_path, shape, fault, seam, backend):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    probe = r17_chain_probe(shape, "proof-" + fault).replace(
+        "print(json.dumps({'result': result}, sort_keys=True))", """
+assert journal.refusals_for('hostile', consume=True)
+assert journal.refusals_for('hostile', consume=True)
+assert journal.refusals_for('healthy', consume=True) == []
+journal.operation.verify()
+assert journal.operation.path_guard._global_failure is None
+print(json.dumps({'result': result}, sort_keys=True))
+""")
+    status, raw, stderr = r9_public_probe(tmp_path, seam, "symlink", False, backend, _probe=probe)
+    assert status == 0 and stderr == b"", (status, raw, stderr)
+    result = json.loads(raw)["result"]
+    assert {"first", "healthy", "hostile"} <= set(result["requests"])
+    assert result["unknown"] == {}
+    assert result["refusals"]["hostile"]
+    assert "healthy" not in result["refusals"]
+
+
+def test_round17_only_final_leaf_lookup_assigns_leaf_refusal():
+    tree = ast.parse(TOOL.read_text(encoding="utf-8"))
+    assignments = []
+    class Inventory(ast.NodeVisitor):
+        def __init__(self): self.function = None
+        def visit_FunctionDef(self, node):
+            previous, self.function = self.function, node.name
+            self.generic_visit(node)
+            self.function = previous
+        def visit_Attribute(self, node):
+            if node.attr == "leaf_refusal" and isinstance(node.ctx, ast.Store):
+                assignments.append(self.function)
+            self.generic_visit(node)
+    Inventory().visit(tree)
+    assert assignments == ["_final_leaf_lookup"]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", ["disposition", "resolve"])
+@pytest.mark.parametrize("backend", ["native", "portable"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_round17_nested_leaf_witness_rejects_concurrent_replacement(tmp_path, monkeypatch, seam, backend, nested):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world, linked, public, private, home, path = r14_trial(tmp_path, seam)
+    real = tmp_path / "real"; real.mkdir()
+    leaf = real / "note.md"
+    (public / "note.md").unlink()
+    symlink_or_skip(tmp_path / "hop" / "note.md", public / "note.md")
+    if nested:
+        symlink_or_skip(tmp_path / "hop2", tmp_path / "hop", target_is_directory=True)
+        symlink_or_skip(real, tmp_path / "hop2", target_is_directory=True)
+    else:
+        symlink_or_skip(real, tmp_path / "hop", target_is_directory=True)
+    entered, changed = Event(), Event()
+    original = portable_fresh._final_leaf_lookup
+    reached, descriptors = [], []
+    def replace():
+        assert entered.wait(10), "final nested leaf lookup was not reached"
+        leaf.symlink_to(private, target_is_directory=True)
+        changed.set()
+    def lookup(proof):
+        result = original(proof)
+        if proof.leaf == leaf and not changed.is_set():
+            assert result.kind == "absent"
+            reached.append(proof.leaf_outcome); descriptors.append(proof.directory)
+            entered.set()
+            assert changed.wait(10), "nested leaf replacement did not complete"
+        return result
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: backend == "native")
+    monkeypatch.setattr(portable_fresh, "_final_leaf_lookup", lookup)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        mutation = pool.submit(replace)
+        try:
+            r14_assert_quarantined(world, path)
+            assert reached
+        finally:
+            entered.set()
+            mutation.result(timeout=15)
+    for descriptor in set(descriptors):
+        with pytest.raises(OSError) as error: os.fstat(descriptor)
+        assert error.value.errno == errno.EBADF
+    leaf.unlink(); leaf.write_bytes(b"healthy retry")
+    r15_assert_healthy_retry(world)
+
+
+def r15_trial(tmp_path,seam,shape):
+    result=r14_trial(tmp_path,seam,"direct-leaf destination" if shape=="single" else "hop target")
+    world,linked,public,private,home,path=result
+    leaf=public/"note.md"
+    if shape=="multi":
+        leaf.unlink()
+        leaf=public/"destination.md"
+        leaf.write_bytes(b"public destination")
+        symlink_or_skip(leaf,public/"note.md")
+    return (*result,leaf)
+
+
+def r15_assert_healthy_retry(world):
+    operation=portable_fresh._Operation()
+    journal=operation.lifecycle(world.ledger.path)
+    _policy,state=journal.load()
+    assert {"following","healthy"}<=set(state["requests"])
+    assert journal.refusals_for("following")==[]
+    assert journal.refusals_for("healthy")==[]
+    operation.verify()
+    assert operation.path_guard._global_failure is None
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("shape",["single","multi"])
+def test_round15_private_root_final_leaf_is_refused_before_a_second_metadata_probe(tmp_path,monkeypatch,seam,backend,shape):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world,linked,public,private,home,path,leaf=r15_trial(tmp_path,seam,shape)
+    leaf.unlink(); symlink_or_skip(private,leaf,target_is_directory=True)
+    real_os=portable_fresh.os
+    info=home.stat(); home_id=info.st_dev,info.st_ino
+    touches=[]
+    def metadata(value,*args,**kwargs):
+        direct=not isinstance(value,int) and Path(value)==private
+        relative=False
+        if value==private.name and kwargs.get("dir_fd") is not None:
+            parent=real_os.fstat(kwargs["dir_fd"])
+            relative=(parent.st_dev,parent.st_ino)==home_id
+        if direct or relative: touches.append("snapshot" if direct else "final leaf")
+        return real_os.stat(value,*args,**kwargs)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(alias_router,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata}))
+    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":metadata}))
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    r14_assert_quarantined(world,path)
+    assert touches==["snapshot"]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("fault",["enoent","eacces"])
+@pytest.mark.parametrize("shape",["ordinary","single","multi"])
+def test_round15_opened_parent_aba_is_part_of_the_final_witness(tmp_path,monkeypatch,seam,backend,fault,shape):
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    if fault=="eacces" and (not hasattr(os,"O_PATH") or os.geteuid()==0):
+        pytest.skip("real leaf-denial witness requires O_PATH and an unprivileged runner")
+    world,linked,public,private,home,path,leaf=r15_trial(tmp_path,seam,shape)
+    leaf.unlink()
+    symlink_or_skip(private,leaf,target_is_directory=True)
+    alternate=tmp_path/"alternate"; alternate.mkdir()
+    parked=tmp_path/"parked"
+    alternate_identity=(alternate.stat().st_dev,alternate.stat().st_ino)
+    if fault=="eacces": alternate.chmod(0)
+    commands,acks=Queue(),Queue()
+    real_os=portable_fresh.os
+    operation,token=portable_fresh._proof_operation,portable_fresh._proof_token
+    flags={"active":False,"swapped":False,"restored":False,"enabled":True}
+    captured=[]
+    def mutate():
+        while True:
+            command=commands.get(timeout=20)
+            if command is None: return
+            if command=="swap": public.rename(parked); alternate.rename(public)
+            else: public.rename(alternate); parked.rename(public)
+            acks.put(True)
+    def signal(command):
+        commands.put(command)
+        assert acks.get(timeout=10),"parent mutation did not complete"
+    def proof(guard,stage,action,*args,**kwargs):
+        if flags["enabled"] and action is token and args[2]==leaf:
+            flags.update(active=True,swapped=False,restored=False)
+            try: return operation(guard,stage,action,*args,**kwargs)
+            finally: flags["active"]=False
+        return operation(guard,stage,action,*args,**kwargs)
+    def stated(value,*args,**kwargs):
+        if flags["active"] and not flags["swapped"] and not flags["restored"] and value==public.name and kwargs.get("dir_fd") is not None:
+            signal("swap"); flags["swapped"]=True
+        return real_os.stat(value,*args,**kwargs)
+    def fstated(descriptor):
+        info=real_os.fstat(descriptor)
+        if flags["active"] and flags["swapped"] and not flags["restored"] and (info.st_dev,info.st_ino)==alternate_identity:
+            signal("restore"); captured.append(descriptor); flags["restored"]=True
+        return info
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    monkeypatch.setattr(portable_fresh,"_proof_operation",proof)
+    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":stated,"fstat":fstated}))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            mutation=pool.submit(mutate)
+            try:
+                r14_assert_quarantined(world,path)
+                assert captured
+                for descriptor in set(captured):
+                    with pytest.raises(OSError) as error: real_os.fstat(descriptor)
+                    assert error.value.errno==errno.EBADF
+            finally:
+                commands.put(None); mutation.result(timeout=25)
+    finally:
+        if parked.exists(): public.rename(alternate); parked.rename(public)
+        alternate.chmod(0o700)
+    flags["enabled"]=False
+    leaf.unlink(); leaf.write_bytes(b"healthy retry")
+    r15_assert_healthy_retry(world)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("fault",["enoent","eacces"])
+@pytest.mark.parametrize("replacement",["private","file","directory"])
+@pytest.mark.parametrize("shape",["ordinary","single","multi"])
+def test_round15_leaf_outcome_is_revalidated_before_inert_scope(tmp_path,monkeypatch,seam,backend,fault,replacement,shape):
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world,linked,public,private,home,path,leaf=r15_trial(tmp_path,seam,shape)
+    leaf.unlink()
+    commands,acks=Queue(),Queue()
+    real_os=portable_fresh.os
+    original,checked=portable_fresh._final_leaf_lookup,portable_fresh._reference_check
+    flags={"inside":False,"enabled":True}
+    reached=[]
+    def reset():
+        if leaf.is_symlink() or leaf.is_file(): leaf.unlink()
+        elif leaf.is_dir(): leaf.rmdir()
+    def mutate():
+        while True:
+            command=commands.get(timeout=20)
+            if command is None: return
+            reset()
+            if command=="replace":
+                if replacement=="private": leaf.symlink_to(private,target_is_directory=True)
+                elif replacement=="file": leaf.write_bytes(b"replacement public file")
+                else: leaf.mkdir()
+            acks.put(True)
+    def signal(command):
+        commands.put(command)
+        assert acks.get(timeout=10),"leaf mutation did not complete"
+    def check(value,*args,**kwargs):
+        if flags["enabled"] and Path(value)==Path(path): signal("reset")
+        return checked(value,*args,**kwargs)
+    def stated(value,*args,**kwargs):
+        if flags["enabled"] and flags["inside"] and value==leaf.name and kwargs.get("dir_fd") is not None and fault=="eacces":
+            raise PermissionError(errno.EACCES,os.strerror(errno.EACCES),value)
+        return real_os.stat(value,*args,**kwargs)
+    def lookup(proof):
+        target=flags["enabled"] and proof.leaf==leaf and not leaf.exists() and not leaf.is_symlink()
+        flags["inside"]=target
+        try: result=original(proof)
+        finally: flags["inside"]=False
+        if target:
+            assert result.kind==("absent" if fault=="enoent" else "error")
+            reached.append(result.kind); signal("replace")
+        return result
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    monkeypatch.setattr(portable_fresh,"_reference_check",check)
+    monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
+    monkeypatch.setattr(portable_fresh,"os",SimpleNamespace(**{**vars(real_os),"stat":stated}))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        mutation=pool.submit(mutate)
+        try:
+            r14_assert_quarantined(world,path)
+            assert reached
+        finally:
+            commands.put(None); mutation.result(timeout=25)
+    flags["enabled"]=False
+    reset(); leaf.write_bytes(b"healthy retry")
+    r15_assert_healthy_retry(world)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("hops",[1,2,3])
+def test_round15_last_hop_destination_uses_the_final_leaf_witness(tmp_path,monkeypatch,seam,backend,hops):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world,linked,public,private,home,path,leaf=r15_trial(tmp_path,seam,"single" if hops==1 else "multi")
+    leaf.unlink()
+    if hops==3:
+        symlink_or_skip(public/"last.md",leaf)
+        leaf=public/"last.md"
+    reached=[]
+    original=portable_fresh._final_leaf_lookup
+    def lookup(proof):
+        result=original(proof)
+        if proof.leaf==leaf:
+            assert result.kind=="absent"
+            reached.append(proof.leaf_outcome)
+        return result
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
+    r15_assert_healthy_retry(world)
+    assert reached and all(outcome==("errno",errno.ENOENT) for outcome in reached)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,planned,backend",tuple(itertools.product(
+    ("paths","scope","disposition","resolve","shared-disposition","shared-resolve"),
+    (False,True),("native","portable"))))
+@pytest.mark.parametrize("fault",["eio","eacces"])
+def test_round15_proved_direct_leaf_errno_keeps_its_baseline_consumer(tmp_path,seam,planned,backend,fault):
+    if backend=="native" and not portable_fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    probe=R13_LEAF_PROBE.replace("ordinary in value.parents or value == public / 'note.md'",
+                                "value == public / 'note.md'")
+    if fault=="eacces": probe=probe.replace("errno.EIO","errno.EACCES")
+    assert r9_public_probe(tmp_path,seam,"link-to-io",planned,backend,_probe=probe)==R13_LEAF_GOLDENS[(seam,planned,backend)]
+
+
+R15_DANGLING_PROBE= r'''
+from pathlib import Path
+root = Path(root)
+ordinary=root/'ordinary'
+ordinary.unlink()
+ordinary.symlink_to(root/'missing',target_is_directory=True)
+'''
+
+
+@lifecycle_only
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("code",[errno.EACCES,errno.EIO])
+@pytest.mark.parametrize("stage",["suffix ancestor","direct-leaf destination"])
+def test_round15_direct_leaf_proof_failure_keeps_original_diagnostic(tmp_path,monkeypatch,backend,code,stage):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world,linked,public,private,home,path=r14_trial(tmp_path,"disposition","direct-leaf destination")
+    original=portable_fresh._proof_operation
+    reached=[]
+    def fail(): raise OSError(code,"UNTRUSTED proof failure")
+    def proof(guard,layer,action,*args,**kwargs):
+        if layer==stage:
+            reached.append(layer)
+            return original(guard,layer,fail)
+        return original(guard,layer,action,*args,**kwargs)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    monkeypatch.setattr(portable_fresh,"_proof_operation",proof)
+    operation=portable_fresh._Operation()
+    with pytest.raises(alias_router.SymlinkPathError) as error: operation.path_guard.check(path)
+    assert str(error.value)=="symlink paths are not supported: "+str(linked)
+    assert reached and operation.path_guard._global_failure is None
+    operation.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("code",[errno.ENOENT,errno.ENOTDIR,errno.EBADF,errno.ELOOP])
+def test_round15_ignored_proof_errnos_keep_the_original_symlink_diagnostic(tmp_path,monkeypatch,backend,code):
+    if not portable_fresh._descriptor_capabilities() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded directory-relative link proof unavailable")
+    world,linked,public,private,home,path=r14_trial(tmp_path,"disposition")
+    original=portable_fresh._proof_operation
+    reached=[]
+    def fail(): raise OSError(code,"UNTRUSTED proof failure")
+    def proof(guard,stage,action,*args,**kwargs):
+        if stage=="hop target":
+            reached.append(stage)
+            return original(guard,stage,fail)
+        return original(guard,stage,action,*args,**kwargs)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    monkeypatch.setattr(portable_fresh,"_proof_operation",proof)
+    operation=portable_fresh._Operation()
+    with pytest.raises(alias_router.SymlinkPathError) as error: operation.path_guard.check(path)
+    assert str(error.value)=="symlink paths are not supported: "+str(linked)
+    assert reached and operation.path_guard._global_failure is None
+    operation.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,planned,backend",tuple(itertools.product(
+    ("check","exists","read","members","paths","scope","disposition","resolve",
+     "shared-disposition","shared-resolve","worktree","scan_workspace","compose-file",
+     "router:--lifecycle","router:--store","router:--recipes","compose:--root",
+     "compose:--lifecycle","compose:--delivery-dir","verify:--path",
+     "loop:--lifecycle","loop:--store","loop:--recipes","loop:--state-dir"),
+    (False,True),("native","portable"))))
+def test_round15_dangling_parent_keeps_ec27eebf_bytes(tmp_path,seam,planned,backend):
+    if backend=="native" and not portable_fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    probe=R10_PUBLIC_PROBE.replace("root = Path(root)\n","root = Path(root)\n"+R15_DANGLING_PROBE).replace(
+        "target if seam == 'worktree' else root","target")
+    actual=r9_public_probe(tmp_path,seam,"symlink",planned,backend,_probe=probe)
+    if seam not in {"paths","scope","disposition","resolve","shared-disposition","shared-resolve",
+                    "worktree","scan_workspace"}:
+        assert actual==R15_DANGLING_GOLDENS[(seam,planned,backend)]
+        return
+    # The later proof-layer ruling requires quarantine here. Preserve the
+    # literal baseline diagnostic, without restoring the superseded GLOBAL/
+    # UNKNOWN disposition or suppressing an unproved inert occurrence.
+    assert actual[0]==0 and actual[2]==b""
+    result=json.loads(actual[1])["result"]
+    errors=result["refusals"]
+    if isinstance(errors,dict):
+        errors=[item[1] for rows in errors.values() for item in rows]
+        assert "healthy" in result["requests"]
+        assert result["unknown"]=={}
+    expected=json.loads(R15_DANGLING_GOLDENS[("check",planned,backend)][1])["error"].encode()
+    assert errors and all(value.encode()==expected for value in errors)
+
+
+R15_DANGLING_GOLDENS = {('check', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--delivery-dir', False, 'native'): (2,
+                                               b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                               b''),
+ ('compose:--delivery-dir', False, 'portable'): (2,
+                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                 b'}\n',
+                                                 b''),
+ ('compose:--delivery-dir', True, 'native'): (2,
+                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                              b''),
+ ('compose:--delivery-dir', True, 'portable'): (2,
+                                                b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                                b''),
+ ('compose:--lifecycle', False, 'native'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('compose:--lifecycle', False, 'portable'): (2,
+                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                              b''),
+ ('compose:--lifecycle', True, 'native'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('compose:--lifecycle', True, 'portable'): (2,
+                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                             b''),
+ ('compose:--root', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--root', False, 'portable'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('compose:--root', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--root', True, 'portable'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('disposition', False, 'native'): (0,
+                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                    b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                    b'pported: {CASE}/ordinary"}}}\n',
+                                    b''),
+ ('disposition', False, 'portable'): (0,
+                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown":'
+                                      b' {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths ar'
+                                      b'e not supported: {CASE}/ordinary"}}}\n',
+                                      b''),
+ ('disposition', True, 'native'): (0,
+                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                   b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                   b'pported: {CASE}/ordinary"}}}\n',
+                                   b''),
+ ('disposition', True, 'portable'): (0,
+                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown":'
+                                     b' {"first": "lifecycle row UNKNOWN at event fault-event: symlink paths ar'
+                                     b'e not supported: {CASE}/ordinary"}}}\n',
+                                     b''),
+ ('exists', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--lifecycle', False, 'native'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('loop:--lifecycle', False, 'portable'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('loop:--lifecycle', True, 'native'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('loop:--lifecycle', True, 'portable'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('loop:--recipes', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--recipes', False, 'portable'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('loop:--recipes', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--recipes', True, 'portable'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('loop:--state-dir', False, 'native'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('loop:--state-dir', False, 'portable'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('loop:--state-dir', True, 'native'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('loop:--state-dir', True, 'portable'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('loop:--store', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--store', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--store', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--store', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('resolve', False, 'native'): (0,
+                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                b' {CASE}/ordinary"}}}\n',
+                                b''),
+ ('resolve', False, 'portable'): (0,
+                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                  b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                  b'pported: {CASE}/ordinary"}}}\n',
+                                  b''),
+ ('resolve', True, 'native'): (0,
+                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                               b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                               b' {CASE}/ordinary"}}}\n',
+                               b''),
+ ('resolve', True, 'portable'): (0,
+                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                 b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                 b'pported: {CASE}/ordinary"}}}\n',
+                                 b''),
+ ('router:--lifecycle', False, 'native'): (2,
+                                           b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                           b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                           b''),
+ ('router:--lifecycle', False, 'portable'): (2,
+                                             b'{"error":"symlink paths are not supported: {CASE}/ordinary","exe'
+                                             b'cution_enabled":false,"source":"arguments","state":"hold"}\n',
+                                             b''),
+ ('router:--lifecycle', True, 'native'): (2,
+                                          b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                          b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                          b''),
+ ('router:--lifecycle', True, 'portable'): (2,
+                                            b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                            b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                            b''),
+ ('router:--recipes', False, 'native'): (2,
+                                         b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                         b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                         b''),
+ ('router:--recipes', False, 'portable'): (2,
+                                           b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                           b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                           b''),
+ ('router:--recipes', True, 'native'): (2,
+                                        b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
+                                        b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                        b''),
+ ('router:--recipes', True, 'portable'): (2,
+                                          b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                          b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                          b''),
+ ('router:--store', False, 'native'): (2,
+                                       b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
+                                       b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                       b''),
+ ('router:--store', False, 'portable'): (2,
+                                         b'{"error":"symlink paths are not supported: {CASE}/ordinary","executi'
+                                         b'on_enabled":false,"source":"arguments","state":"hold"}\n',
+                                         b''),
+ ('router:--store', True, 'native'): (2,
+                                      b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
+                                      b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                      b''),
+ ('router:--store', True, 'portable'): (2,
+                                        b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_e'
+                                        b'nabled":false,"source":"arguments","state":"hold"}\n',
+                                        b''),
+ ('scan_workspace', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scan_workspace', False, 'portable'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('scan_workspace', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scan_workspace', True, 'portable'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('scope', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('shared-disposition', False, 'native'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                           b'e"], "unknown": {}}}\n',
+                                           b''),
+ ('shared-disposition', False, 'portable'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                             b'stile"], "unknown": {}}}\n',
+                                             b''),
+ ('shared-disposition', True, 'native'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                          b'e"], "unknown": {}}}\n',
+                                          b''),
+ ('shared-disposition', True, 'portable'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                            b'e"], "unknown": {}}}\n',
+                                            b''),
+ ('shared-resolve', False, 'native'): (0,
+                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                       b' "unknown": {}}}\n',
+                                       b''),
+ ('shared-resolve', False, 'portable'): (0,
+                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostil'
+                                         b'e"], "unknown": {}}}\n',
+                                         b''),
+ ('shared-resolve', True, 'native'): (0,
+                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                      b' "unknown": {}}}\n',
+                                      b''),
+ ('shared-resolve', True, 'portable'): (0,
+                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                        b' "unknown": {}}}\n',
+                                        b''),
+ ('verify:--path', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('verify:--path', False, 'portable'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('verify:--path', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('verify:--path', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b'')}
+
+
+# The list is deliberately explicit: legacy readers are outside this classifier graph.
+R14_CLASSIFIER_FUNCTIONS = (
+    "_proof_operation", "_final_leaf_lookup", "_private_symlink_target",
+    "_resolve_public_chain", "_lookup_chain_leaf", "_proof_parent", "_proof_check", "_proof_recheck",
+    "_proof_token", "_proof_link", "_link_snapshot", "_stable_link",
+    "_symlink_reader", "_symlink_reader.read", "_proof_parent_marks", "_disposition",
+    "_diagnostic_error", "_walk_error", "_recheck_final_witness", "_LeafLookup.__init__",
+    "_ProvedChain.proved", "_LinkLookupFailure.proved",
+)
+R14_PROOF_STAGES = ("prefix ancestor","link","hop target","traversal prefix",
+                   "post-traversal","suffix ancestor","direct-leaf destination")
+R14_PROOF_ERRORS = ("enoent","enotdir","eacces","eio","eloop","permission-no-errno")
+
+
+def test_round14_classifier_has_only_two_exception_boundaries():
+    tree=ast.parse(TOOL.read_text(encoding="utf-8"))
+    functions={}
+    class Inventory(ast.NodeVisitor):
+        def __init__(self): self.names=[]
+        def scoped(self,node):
+            self.names.append(node.name)
+            if isinstance(node,ast.FunctionDef): functions[".".join(self.names)]=node
+            self.generic_visit(node); self.names.pop()
+        visit_FunctionDef=scoped
+        visit_ClassDef=scoped
+    Inventory().visit(tree)
+    assert set(R14_CLASSIFIER_FUNCTIONS)<=set(functions)
+    family={"OSError","IOError","FileNotFoundError","NotADirectoryError","PermissionError",
+            "Exception","BaseException"}
+    for name in R14_CLASSIFIER_FUNCTIONS:
+        if name in {"_proof_operation","_final_leaf_lookup"}: continue
+        for node in ast.walk(functions[name]):
+            if isinstance(node,ast.ExceptHandler):
+                caught={item.id for item in ast.walk(node.type) if isinstance(item,ast.Name)} if node.type else family
+                # A bare re-raise for descriptor cleanup never decides a layer.
+                if caught=={"BaseException"} and any(isinstance(x,ast.Raise) and x.exc is None for x in node.body):
+                    continue
+                assert not caught&family,(name,node.lineno,caught)
+
+
+def r14_trial(tmp_path,seam,stage="hop target"):
+    from tests.integration.test_hierarchy_router import Loop
+    world=Loop(tmp_path); world.team("engine"); world.team("docs")
+    world.approved(request("healthy",team="docs"))
+    linked,public,home=tmp_path/"l1",tmp_path/"public",tmp_path/"owner"
+    private=home/".codex"
+    for directory in (linked,public,private,public/"sub",public/"step",public/"base"):
+        directory.mkdir(parents=True,exist_ok=True)
+    (public/"note.md").write_bytes(b"public fixture")
+    (private/"note.md").write_bytes(b"controlled private fixture")
+    if stage=="direct-leaf destination": path=str(linked)
+    elif stage=="suffix ancestor":
+        (linked/"sub"/"priv_link").mkdir(parents=True)
+        (public/"sub"/"priv_link").mkdir()
+        path=str(linked/"sub"/"priv_link"/"note.md")
+    else: path=str(linked/"note.md")
+    first=request("first"); world.ledger.publish(first)
+    following=request("following",paths=[path])
+    extra={}
+    if seam=="resolve":
+        world.ledger.event("disposition",status="HOLD",resolution={"kind":"blocked","owner":"engine/coordinator",
+            "next_decision":"review","condition":"reviewed","evidence":world.ledger.evidence},**world.ledger.target(first))
+        extra["blocker_sha256"]=portable_fresh.digest(world.ledger.status()["requests"]["first"]["resolution"])
+    world.ledger.event(seam,**({"status":"FINAL"} if seam=="disposition" else extra),
+        resolution={"kind":"next","request":raw_request(following),"evidence":[{"path":path,"sha256":"0"*64}]},
+        **world.ledger.target(first))
+    world.ledger.approve(following)
+    if stage=="suffix ancestor":
+        (linked/"sub"/"priv_link").rmdir(); (linked/"sub").rmdir()
+    linked.rmdir()
+    target=(public/"note.md" if stage=="direct-leaf destination" else
+            public/"step"/".."/"base" if stage in {"traversal prefix","post-traversal"} else public)
+    symlink_or_skip(target,linked,target_is_directory=stage!="direct-leaf destination")
+    return world,linked,public,private,home,path
+
+
+def r14_assert_quarantined(world,path):
+    operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
+    _policy,state=journal.load()
+    assert "healthy" in state["requests"]
+    assert journal.refusals_for("healthy")==[]
+    assert journal.refusals_for("following")
+    for _ in range(2):
+        assert journal.refusals_for("following",consume=True)
+        brief=portable_fresh.Brief(_operation=operation)
+        portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
+        assert path not in json.dumps(brief.sections["Approved scope"])
+    operation.verify()
+    assert operation.path_guard._global_failure is None
+    return operation,journal
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("damage",["removed","file","suffix"])
+def test_round14_real_unproved_ancestors_never_reach_scope(tmp_path,monkeypatch,seam,backend,damage):
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    if damage=="suffix" and os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    stage="suffix ancestor" if damage=="suffix" else "hop target"
+    world,linked,public,private,home,path=r14_trial(tmp_path,seam,stage)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    linked.unlink()
+    if damage=="suffix":
+        # l1/sub/priv_link/note.md: the suffix ancestor hides the link.
+        (public/"sub"/"priv_link").rmdir()
+        denied=public/"sub"
+        symlink_or_skip(private,denied/"priv_link",target_is_directory=True)
+        symlink_or_skip(public,linked,target_is_directory=True)
+        denied.chmod(0)
+    else:
+        staging=tmp_path/"staging"; staging.mkdir()
+        symlink_or_skip(private,staging/"priv_link",target_is_directory=True)
+        symlink_or_skip(staging/"priv_link",linked,target_is_directory=True)
+        (staging/"priv_link").unlink(); staging.rmdir()
+        if damage=="file": staging.write_bytes(b"replacement regular file")
+    try: r14_assert_quarantined(world,path)
+    finally:
+        if damage=="suffix": denied.chmod(0o700)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("stage",R14_PROOF_STAGES)
+@pytest.mark.parametrize("fault",R14_PROOF_ERRORS)
+def test_round14_every_proof_failure_is_persistent_and_row_local(tmp_path,monkeypatch,seam,backend,stage,fault):
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    world,linked,public,private,home,path=r14_trial(tmp_path,seam,stage)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    original=portable_fresh._proof_operation
+    reached=[]
+    codes={"enoent":errno.ENOENT,"enotdir":errno.ENOTDIR,"eacces":errno.EACCES,"eio":errno.EIO,"eloop":errno.ELOOP}
+    def failed(*args,**kwargs):
+        if fault=="permission-no-errno": raise PermissionError("controlled proof failure")
+        raise OSError(codes[fault],"controlled proof failure")
+    def injected(guard,layer,action,*args,**kwargs):
+        if layer==stage:
+            reached.append(layer)
+            return original(guard,layer,failed)
+        return original(guard,layer,action,*args,**kwargs)
+    monkeypatch.setattr(portable_fresh,"_proof_operation",injected)
+    operation,journal=r14_assert_quarantined(world,path)
+    assert reached
+    healthy=tmp_path/"healthy-retry.md"; healthy.write_bytes(b"independent healthy capture")
+    retry=portable_fresh._Operation(); assert retry.read(healthy)[1]==b"independent healthy capture"
+    retry.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("replacement",["private","public"])
+def test_round14_suffix_replacement_after_leaf_lookup_invalidates_the_whole_token(tmp_path,monkeypatch,seam,backend,replacement):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    world,linked,public,private,home,path=r14_trial(tmp_path,seam,"suffix ancestor")
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    original=portable_fresh._final_leaf_lookup
+    entered,changed=Event(),Event()
+    alternate=tmp_path/"alternate"; (alternate/"priv_link").mkdir(parents=True)
+    parked=tmp_path/"parked"
+    def replace():
+        assert entered.wait(10),"final lookup did not reach the mutation boundary"
+        (public/"sub").rename(parked)
+        (public/"sub").symlink_to(private if replacement=="private" else alternate,target_is_directory=True)
+        changed.set()
+    def lookup(proof):
+        result=original(proof)
+        if proof.leaf==public/"sub"/"priv_link"/"note.md" and not changed.is_set():
+            entered.set(); assert changed.wait(10),"ancestor replacement did not complete"
+        return result
+    monkeypatch.setattr(portable_fresh,"_final_leaf_lookup",lookup)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        mutation=pool.submit(replace)
+        try: operation,journal=r14_assert_quarantined(world,path)
+        finally:
+            entered.set()
+            mutation.result(timeout=15)
+    assert journal.refusals_for("following",consume=True)
+    assert operation.path_guard._global_failure is None
+
+
+@lifecycle_only
+def test_round14_failed_result_allocation_releases_the_proved_token(tmp_path,monkeypatch):
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    world,linked,public,private,home,path=r14_trial(tmp_path,"disposition")
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    original=portable_fresh._ProofValue
+    descriptors=[]
+    class AllocationFailure(original):
+        def __init__(self,value):
+            if isinstance(value,portable_fresh._ProvedChain) and value.directory is not None:
+                descriptors.append(value.directory)
+                raise MemoryError("controlled proof-result allocation failure")
+            super().__init__(value)
+    monkeypatch.setattr(portable_fresh,"_ProofValue",AllocationFailure)
+    try:
+        r14_assert_quarantined(world,path)
+        assert descriptors
+        for descriptor in set(descriptors):
+            with pytest.raises(OSError) as error: os.fstat(descriptor)
+            assert error.value.errno==errno.EBADF
+    finally:
+        for descriptor in set(descriptors):
+            try: os.close(descriptor)
+            except OSError: pass
+
+
+def test_round14_final_leaf_lookup_requires_a_live_proved_token():
+    with pytest.raises(ValueError,match="^final lookup requires a live proved-chain token$"):
+        portable_fresh._final_leaf_lookup(object())
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("shape",["outer","leaf"])
+@pytest.mark.parametrize("level",[2,3])
+def test_round14_argon_nested_hop_targets_are_proof_until_complete(tmp_path,monkeypatch,seam,backend,shape,level):
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    world,linked,public,private,home,path=r14_trial(tmp_path,seam)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    denied=tmp_path/"denied"; denied.mkdir()
+    symlink_or_skip(private,denied/"priv_link",target_is_directory=True)
+    hop2,hop3=tmp_path/"hop2",tmp_path/"hop3"
+    if level==3:
+        symlink_or_skip(denied,hop3,target_is_directory=True)
+        symlink_or_skip(hop3,hop2,target_is_directory=True)
+    else: symlink_or_skip(denied,hop2,target_is_directory=True)
+    if shape=="outer":
+        linked.unlink(); symlink_or_skip(hop2/"priv_link",linked,target_is_directory=True)
+    else:
+        (public/"note.md").unlink()
+        # Keep the denied component in the proof layer: the pathname ruling
+        # permits an inert final-leaf EACCES after all parents are proved.
+        symlink_or_skip(hop2/"priv_link"/"note.md",public/"note.md")
+    denied.chmod(0)
+    try: r14_assert_quarantined(world,path)
+    finally: denied.chmod(0o700)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("backend",["native","portable"])
+@pytest.mark.parametrize("site",["target","ancestor"])
+@pytest.mark.parametrize("replacement",["directory","private"])
+def test_round14_argon_resolved_directory_rechecked_before_errno_suppression(tmp_path,monkeypatch,seam,backend,site,replacement):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from queue import Queue
+    if not portable_fresh._descriptor_capabilities(): pytest.skip("directory descriptors unavailable")
+    if not hasattr(os,"O_PATH"): pytest.skip("leaf-denial witness requires O_PATH directory handles")
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    world,linked,public,private,home,path=r14_trial(tmp_path,seam)
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_descriptors",lambda:backend=="native")
+    container=tmp_path/"container"; target=container/"target_dir"; target.mkdir(parents=True)
+    linked.unlink(); symlink_or_skip(target,linked,target_is_directory=True)
+    original,checked=portable_fresh._LinkLookupFailure,portable_fresh._reference_check
+    changed=Event()
+    mutations,acknowledgments=Queue(),Queue()
+    reached=[]
+    alternate=tmp_path/"alternate"; alternate.mkdir()
+    if site=="ancestor": (alternate/"target_dir").mkdir()
+    value=target if site=="target" else container
+    parked=value.with_name(value.name+".parked")
+    def restore():
+        if parked.exists():
+            if value.is_symlink(): value.unlink()
+            else: value.rename(alternate)
+            parked.rename(value)
+            changed.clear()
+    def check(value_path,*args,**kwargs):
+        if Path(value_path)==Path(path): restore()
+        return checked(value_path,*args,**kwargs)
+    def replace():
+        while mutations.get(timeout=15) is not None:
+            value.rename(parked)
+            if replacement=="private": value.symlink_to(private,target_is_directory=True)
+            else: alternate.rename(value)
+            changed.set()
+            acknowledgments.put(True)
+    class InterruptedProof(original):
+        def proved(self,guard):
+            assert self.error.errno==errno.EACCES
+            if not changed.is_set():
+                mutations.put(True)
+                assert acknowledgments.get(timeout=10),"directory replacement did not complete"
+                reached.append(True)
+            return super().proved(guard)
+    monkeypatch.setattr(portable_fresh,"_LinkLookupFailure",InterruptedProof)
+    monkeypatch.setattr(portable_fresh,"_reference_check",check)
+    target.chmod(0)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            mutation=pool.submit(replace)
+            try:
+                r14_assert_quarantined(world,path)
+                assert reached
+            finally:
+                mutations.put(None)
+                mutation.result(timeout=15)
+    finally:
+        restore()
+        target.chmod(0o700)
+
+
+R14_FINAL_SEAMS=("check","exists","read","members","paths","scope","disposition","resolve",
+                 "shared-disposition","shared-resolve","worktree","scan_workspace")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,planned,backend,fault",tuple(itertools.product(
+    R14_FINAL_SEAMS,(False,True),("native","portable"),("enoent","enotdir"))))
+def test_round14_final_leaf_absence_keeps_ec27eebf_bytes(tmp_path,seam,planned,backend,fault):
+    if backend=="native" and not portable_fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    probe=R10_PUBLIC_PROBE.replace("errno.EIO","errno.ENOENT" if fault=="enoent" else "errno.ENOTDIR")
+    assert r9_public_probe(tmp_path,seam,"link-to-io",planned,backend,_probe=probe)==R14_FINAL_GOLDENS[(seam,planned,backend,fault)]
+
+
+R14_FINAL_GOLDENS = {('check', False, 'native', 'enoent'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('check', False, 'native', 'enotdir'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('check', False, 'portable', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('check', False, 'portable', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('check', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', True, 'native', 'enotdir'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('check', True, 'portable', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('check', True, 'portable', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('disposition', False, 'native', 'enoent'): (0,
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
+ ('disposition', False, 'native', 'enotdir'): (0,
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
+ ('disposition', False, 'portable', 'enoent'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                b''),
+ ('disposition', False, 'portable', 'enotdir'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"]'
+                                                 b', "unknown": {"first": "lifecycle row UNKNOWN at event fault'
+                                                 b'-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                 b''),
+ ('disposition', True, 'native', 'enoent'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('disposition', True, 'native', 'enotdir'): (0,
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                              b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                              b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
+ ('disposition', True, 'portable', 'enoent'): (0,
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                               b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                               b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
+ ('disposition', True, 'portable', 'enotdir'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                                b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                                b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                b''),
+ ('exists', False, 'native', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('exists', False, 'native', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('exists', False, 'portable', 'enoent'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('exists', False, 'portable', 'enotdir'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('exists', True, 'native', 'enoent'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('exists', True, 'native', 'enotdir'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('exists', True, 'portable', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('exists', True, 'portable', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('members', False, 'native', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('members', False, 'native', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('members', False, 'portable', 'enoent'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('members', False, 'portable', 'enotdir'): (2,
+                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                             b''),
+ ('members', True, 'native', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('members', True, 'native', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('members', True, 'portable', 'enoent'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('members', True, 'portable', 'enotdir'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('paths', False, 'native', 'enoent'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('paths', False, 'native', 'enotdir'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('paths', False, 'portable', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('paths', False, 'portable', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('paths', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', True, 'native', 'enotdir'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('paths', True, 'portable', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('paths', True, 'portable', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('read', False, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', False, 'native', 'enotdir'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('read', False, 'portable', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('read', False, 'portable', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('read', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', True, 'native', 'enotdir'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', True, 'portable', 'enoent'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('read', True, 'portable', 'enotdir'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('resolve', False, 'native', 'enoent'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
+ ('resolve', False, 'native', 'enotdir'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
+ ('resolve', False, 'portable', 'enoent'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
+ ('resolve', False, 'portable', 'enotdir'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "u'
+                                             b'nknown": {"first": "lifecycle row UNKNOWN at event fault-event: '
+                                             b'symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('resolve', True, 'native', 'enoent'): (0,
+                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                         b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                         b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                         b''),
+ ('resolve', True, 'native', 'enotdir'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                          b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                          b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
+ ('resolve', True, 'portable', 'enoent'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                           b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                           b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
+ ('resolve', True, 'portable', 'enotdir'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unkno'
+                                            b'wn": {"first": "lifecycle row UNKNOWN at event fault-event: symlink '
+                                            b'paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
+ ('scan_workspace', False, 'native', 'enoent'): (2,
+                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                 b'}\n',
+                                                 b''),
+ ('scan_workspace', False, 'native', 'enotdir'): (2,
+                                                  b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                  b'}\n',
+                                                  b''),
+ ('scan_workspace', False, 'portable', 'enoent'): (2,
+                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                   b'}\n',
+                                                   b''),
+ ('scan_workspace', False, 'portable', 'enotdir'): (2,
+                                                    b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                    b'}\n',
+                                                    b''),
+ ('scan_workspace', True, 'native', 'enoent'): (2,
+                                                b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                                b''),
+ ('scan_workspace', True, 'native', 'enotdir'): (2,
+                                                 b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                 b'}\n',
+                                                 b''),
+ ('scan_workspace', True, 'portable', 'enoent'): (2,
+                                                  b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                  b'}\n',
+                                                  b''),
+ ('scan_workspace', True, 'portable', 'enotdir'): (2,
+                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                   b'}\n',
+                                                   b''),
+ ('scope', False, 'native', 'enoent'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('scope', False, 'native', 'enotdir'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('scope', False, 'portable', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('scope', False, 'portable', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('scope', True, 'native', 'enoent'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', True, 'native', 'enotdir'): (2,
+                                        b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                        b''),
+ ('scope', True, 'portable', 'enoent'): (2,
+                                         b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                         b''),
+ ('scope', True, 'portable', 'enotdir'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('shared-disposition', False, 'native', 'enoent'): (0,
+                                                     b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                     b'hy", "hostile"], "unknown": {}}}\n',
+                                                     b''),
+ ('shared-disposition', False, 'native', 'enotdir'): (0,
+                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                      b'hy", "hostile"], "unknown": {}}}\n',
+                                                      b''),
+ ('shared-disposition', False, 'portable', 'enoent'): (0,
+                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                       b'hy", "hostile"], "unknown": {}}}\n',
+                                                       b''),
+ ('shared-disposition', False, 'portable', 'enotdir'): (0,
+                                                        b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                        b'hy", "hostile"], "unknown": {}}}\n',
+                                                        b''),
+ ('shared-disposition', True, 'native', 'enoent'): (0,
+                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                    b' "hostile"], "unknown": {}}}\n',
+                                                    b''),
+ ('shared-disposition', True, 'native', 'enotdir'): (0,
+                                                     b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                     b'hy", "hostile"], "unknown": {}}}\n',
+                                                     b''),
+ ('shared-disposition', True, 'portable', 'enoent'): (0,
+                                                      b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                      b'hy", "hostile"], "unknown": {}}}\n',
+                                                      b''),
+ ('shared-disposition', True, 'portable', 'enotdir'): (0,
+                                                       b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                       b'hy", "hostile"], "unknown": {}}}\n',
+                                                       b''),
+ ('shared-resolve', False, 'native', 'enoent'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                 b' "hostile"], "unknown": {}}}\n',
+                                                 b''),
+ ('shared-resolve', False, 'native', 'enotdir'): (0,
+                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                  b' "hostile"], "unknown": {}}}\n',
+                                                  b''),
+ ('shared-resolve', False, 'portable', 'enoent'): (0,
+                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                   b' "hostile"], "unknown": {}}}\n',
+                                                   b''),
+ ('shared-resolve', False, 'portable', 'enotdir'): (0,
+                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                    b' "hostile"], "unknown": {}}}\n',
+                                                    b''),
+ ('shared-resolve', True, 'native', 'enoent'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                                b'stile"], "unknown": {}}}\n',
+                                                b''),
+ ('shared-resolve', True, 'native', 'enotdir'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                 b' "hostile"], "unknown": {}}}\n',
+                                                 b''),
+ ('shared-resolve', True, 'portable', 'enoent'): (0,
+                                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                  b' "hostile"], "unknown": {}}}\n',
+                                                  b''),
+ ('shared-resolve', True, 'portable', 'enotdir'): (0,
+                                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                   b' "hostile"], "unknown": {}}}\n',
+                                                   b''),
+ ('worktree', False, 'native', 'enoent'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('worktree', False, 'native', 'enotdir'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('worktree', False, 'portable', 'enoent'): (2,
+                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                             b''),
+ ('worktree', False, 'portable', 'enotdir'): (2,
+                                              b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                              b''),
+ ('worktree', True, 'native', 'enoent'): (2,
+                                          b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                          b''),
+ ('worktree', True, 'native', 'enotdir'): (2,
+                                           b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                           b''),
+ ('worktree', True, 'portable', 'enoent'): (2,
+                                            b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                            b''),
+ ('worktree', True, 'portable', 'enotdir'): (2,
+                                             b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                             b'')}
+
+
+# Filled from an ec27eebf tools snapshot by the round-13 baseline capture.
+R13_CONSUMER_GOLDENS = {('attachment', False, 'inputs'): (0,
+                                   b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79'
+                                   b'f1e8d", "unverified": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\''
+                                   b'"}\n',
+                                   b''),
+ ('closing-report', False, 'inputs'): (0,
+                                       b'{"held": {}, "report_error": "[Errno 13] Permission denied: \'{CASE}/inputs/n'
+                                       b'ote.md\'", "requests": null, "routed": ["damaged", "healthy"]}\n',
+                                       b''),
+ ('deliver', False, 'mailbox'): (0,
+                                 b'{"delivered": false, "failure": {"detail": "[Errno 13] Permission denied: \'{CASE'
+                                 b'}/engine/mailbox/.write.lock\'", "reason": "delivery_error"}}\n',
+                                 b''),
+ ('evidence', False, 'inputs'): (0,
+                                 b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79f1e8'
+                                 b'd", "kinds": ["unverified_evidence"]}\n',
+                                 b''),
+ ('loop-once', True, 'plan'): (3,
+                               b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/not'
+                               b'e.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "'
+                               b'[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions'
+                               b'_unavailable", "step": "dispatch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "o'
+                               b'k", "step": "router_status"}, {"state": "skipped", "step": "route"}, {"exit": 2, "st'
+                               b'ate": "hold", "step": "dispatch"}, {"state": "skipped", "step": "sweep"}, {"exit": 0'
+                               b', "state": "ok", "step": "run_open"}]}], "run_open_calls": 1}\n',
+                               b''),
+ ('loop-once', True, 'request'): (3,
+                                  b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs'
+                                  b'/note.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pa'
+                                  b'ss_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"stat'
+                                  b'e": "skipped", "step": "route"}, {"state": "skipped", "step": "sweep"}, {"exit":'
+                                  b' 0, "state": "ok", "step": "run_open"}]}], "run_open_calls": 1}\n',
+                                  b''),
+ ('loop-run', True, 'plan'): (3,
+                              b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/not'
+                              b'e.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}, {"detail": "'
+                              b'[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions'
+                              b'_unavailable", "step": "dispatch"}], "pass_id": 1, "steps": [{"exit": 0, "state": "o'
+                              b'k", "step": "router_status"}, {"state": "skipped", "step": "route"}, {"exit": 2, "st'
+                              b'ate": "hold", "step": "dispatch"}, {"state": "skipped", "step": "sweep"}, {"exit": 0'
+                              b', "state": "ok", "step": "run_open"}]}, {"holds": [{"detail": "[Errno 13] Permission'
+                              b' denied: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions_unavailable", "step"'
+                              b': "dispatch"}, {"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "'
+                              b'kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pass_id": 2, "steps'
+                              b'": [{"exit": 0, "state": "ok", "step": "router_status"}, {"state": "skipped", "step"'
+                              b': "route"}, {"exit": 2, "state": "hold", "step": "dispatch"}, {"state": "skipped", "'
+                              b'step": "sweep"}, {"exit": 0, "state": "ok", "step": "run_open"}]}], "run_open_calls"'
+                              b': 2}\n',
+                              b''),
+ ('loop-run', True, 'request'): (3,
+                                 b'{"reports": [{"holds": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs'
+                                 b'/note.md\'", "kind": "planning_exclusions_unavailable", "step": "dispatch"}], "pa'
+                                 b'ss_id": 1, "steps": [{"exit": 0, "state": "ok", "step": "router_status"}, {"state": '
+                                 b'"skipped", "step": "route"}, {"state": "skipped", "step": "sweep"}, {"exit": 0, "sta'
+                                 b'te": "ok", "step": "run_open"}]}, {"holds": [{"detail": "[Errno 13] Permission denie'
+                                 b'd: \'{CASE}/inputs/note.md\'", "kind": "planning_exclusions_unavailable", "step": '
+                                 b'"dispatch"}], "pass_id": 2, "steps": [{"exit": 0, "state": "ok", "step": "router_sta'
+                                 b'tus"}, {"state": "skipped", "step": "route"}, {"state": "skipped", "step": "sweep"},'
+                                 b' {"exit": 0, "state": "ok", "step": "run_open"}]}], "run_open_calls": 2}\n',
+                                 b''),
+ ('receipts', False, 'inputs'): (0,
+                                 b'{"healthy_capture": "e21a21f88e72fedf876c98e7e2492391ae5643f37ce4687f310efd73b79f1e8'
+                                 b'd", "refused": "[Errno 13] Permission denied: \'{CASE}/delivery/delivered/engine/'
+                                 b'orchestrator\'"}\n',
+                                 b''),
+ ('route', False, 'across'): (0,
+                              b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
+                              b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
+                              b'": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                              b''),
+ ('route', False, 'bindings'): (0,
+                                b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
+                                b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
+                                b'state": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"'
+                                b']}\n',
+                                b''),
+ ('route', False, 'mailbox'): (0,
+                               b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
+                               b'reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held"}, {"req'
+                               b'uest_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                               b''),
+ ('route', False, 'team'): (0,
+                            b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
+                            b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
+                            b'"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                            b''),
+ ('route', True, 'across'): (0,
+                             b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
+                             b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
+                             b'": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                             b''),
+ ('route', True, 'bindings'): (0,
+                               b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
+                               b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
+                               b'state": "held"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"'
+                               b']}\n',
+                               b''),
+ ('route', True, 'mailbox'): (0,
+                              b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
+                              b'reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held"}, {"req'
+                              b'uest_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                              b''),
+ ('route', True, 'team'): (0,
+                           b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
+                           b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
+                           b'"}, {"request_id": "healthy", "state": "routed"}], "routed": ["healthy"]}\n',
+                           b''),
+ ('row', False, 'inputs'): (0,
+                            b'{"small_changes": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\''
+                            b'", "reason": "small_change_configuration", "request_id": "engine-partial", "state": "hel'
+                            b'd"}]}\n',
+                            b''),
+ ('row', True, 'inputs'): (0,
+                           b'{"small_changes": [{"detail": "[Errno 13] Permission denied: \'{CASE}/inputs/note.md\'", "'
+                           b'reason": "small_change_configuration", "request_id": "engine-partial", "state": "held"}]'
+                           b'}\n',
+                           b''),
+ ('status', False, 'across'): (0,
+                               b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
+                               b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
+                               b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                               b''),
+ ('status', False, 'bindings'): (0,
+                                 b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/b'
+                                 b'indings/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "dam'
+                                 b'aged", "state": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                                 b''),
+ ('status', False, 'mailbox'): (0,
+                                b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
+                                b'reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held"}, {"req'
+                                b'uest_id": "healthy", "state": "ready"}]}\n',
+                                b''),
+ ('status', False, 'team'): (0,
+                             b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engin'
+                             b'e/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
+                             b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                             b''),
+ ('status', True, 'across'): (0,
+                              b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/acros'
+                              b's/front-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state'
+                              b'": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                              b''),
+ ('status', True, 'bindings'): (0,
+                                b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/bindi'
+                                b'ngs/engine/router\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "'
+                                b'state": "held"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                                b''),
+ ('status', True, 'mailbox'): (0,
+                               b'{"requests": [{"detail": "symlink paths are not supported: {CASE}/engine/mailbox", "'
+                               b'reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held"}, {"req'
+                               b'uest_id": "healthy", "state": "ready"}]}\n',
+                               b''),
+ ('status', True, 'team'): (0,
+                            b'{"requests": [{"detail": "[Errno 13] Permission denied: \'{CASE}/engine/mailbox/engine/fr'
+                            b'ont-door\'", "reason": "team_mailbox_unreadable", "request_id": "damaged", "state": "held'
+                            b'"}, {"request_id": "healthy", "state": "ready"}]}\n',
+                            b'')}
+R13_CONSUMER_PROBE = r'''
+import contextlib, io, json, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+tools, fallback, raw = sys.argv[1:]
+sys.path[:0] = [tools, fallback]
+config = json.loads(raw)
+root = Path(config['root'])
+import hierarchy_fresh_brief as fresh
+import hierarchy_router as router
+import hierarchy_lifecycle as life
+import hierarchy_workspace as workspace
+router._owner_home = lambda: root / 'owner'
+target = root / 'inputs' / 'note.md'
+seam = config['seam']
+def captured_main(module,args):
+    with io.BytesIO() as raw:
+        with io.TextIOWrapper(raw,encoding='utf-8') as output:
+            with contextlib.redirect_stdout(output): code = module.main(args)
+            output.flush()
+            captured = raw.getvalue()
+    return code,captured
+def damage_inputs():
+    source = root / 'inputs'
+    if not source.is_symlink():
+        source.rename(root / 'original-inputs')
+        source.symlink_to(root / 'denied', target_is_directory=True)
+def rows(value):
+    return [{k: row[k] for k in ('request_id','state','reason','detail') if k in row}
+            for row in value or []]
+def project(value):
+    if 'error' in value:
+        return {'error': value['error']}
+    result = {}
+    if 'requests' in value: result['requests'] = rows(value['requests']) if value['requests'] is not None else None
+    if 'routed' in value: result['routed'] = [r['request_id'] for r in value['routed']]
+    for key in ('report_error', 'held'):
+        if key in value: result[key] = value[key]
+    if 'small_changes' in value: result['small_changes'] = rows(value['small_changes'])
+    return result
+answer = {}
+code = 0
+try:
+    if seam in ('status','route','closing-report','row'):
+        if seam == 'closing-report':
+            damage_inputs()
+            original_report = router.report
+            def closing(*args, **kwargs):
+                fresh.file_ref(target)
+                return original_report(*args, **kwargs)
+            router.report = closing
+        if seam == 'row':
+            import hierarchy_small_change_dispatch as dispatch
+            original_progress = dispatch.Row.progress
+            def progress(self,*args,**kwargs):
+                damage_inputs()
+                self.operation.read(target)
+                return original_progress(self,*args,**kwargs)
+            dispatch.Row.progress = progress
+        command = 'dispatch' if seam == 'row' else 'route' if seam != 'status' else 'status'
+        args = ['--lifecycle',config['journal'],'--store',config['store'],command,'--wait','0']
+        if command == 'route': args += ['--actor','router-1','--evidence-only']
+        if command == 'dispatch': args += ['--recipes',str(root/'inputs'/'note.md'),'--evidence-only']
+        code,output = captured_main(router,args)
+        answer = project(json.loads(output))
+    elif seam == 'deliver':
+        ledger = workspace.Store(config['store']).load()
+        value, failure = router.deliver(life.Lifecycle(config['journal']),ledger,'router-1','damaged',0)
+        answer = {'delivered': value is not None, 'failure': failure}
+    elif seam in ('evidence','attachment','receipts'):
+        operation = fresh._Operation()
+        active = operation.path_guard.active() if hasattr(operation.path_guard,'active') else contextlib.nullcontext()
+        with active:
+            if seam == 'evidence':
+                brief = fresh.Brief(_operation=operation)
+                brief.evidence({'path':str(target),'sha256':'0'*64},
+                    {'path':str(root/'origin'),'sha256':'0'*64})
+                answer = {'kinds':[item['kind'] for item in brief.sections['Evidence references']]}
+                operation.verify()
+            elif seam == 'attachment':
+                mailbox = fresh._CapturedMailbox(config['mailbox'],_operation=operation)
+                try: fresh._unread_attachment(mailbox,{'path':str(target),'sha256':'0'*64})
+                except fresh.UnverifiedAttachment as error: answer = {'unverified':str(error)}
+                else: answer = {'unverified':None}
+                operation.verify()
+            else:
+                mailbox = fresh._CapturedMailbox(config['mailbox'],_operation=operation)
+                try: mailbox.delivery_receipts(root/'delivery','delivered','engine/orchestrator',{})
+                except (ValueError,OSError) as error: answer = {'refused':str(error)}
+                else: answer = {'refused':None}
+            answer['healthy_capture'] = fresh._Operation().read(root/'healthy.md')[0]['sha256']
+    elif seam.startswith('loop-'):
+        import hierarchy_loop as loop
+        calls = []
+        def child(tool,args,decoder,planned=None):
+            calls.append(tool)
+            if tool == 'jobs': return 0, {'rows':[]}, '', None
+            if tool == 'sweep': return 0, {'rows':[],'still_unread':[],'root_queue':[],'root_time':[]}, '', None
+            return 0, {'router':'router-1','requests':[]}, '', None
+        loop.run_child = child
+        ticks = [0]
+        def tick():
+            ticks[0] += 6
+            return ticks[0]
+        loop.time = SimpleNamespace(**{**vars(loop.time),'monotonic':tick})
+        plan = root/'inputs'/'note.md' if config['damage']=='plan' else root/'dispatcher-host-plan.json'
+        args = ['--lifecycle',config['journal'],'--store',config['store'],'--recipes',config['recipes'],
+                '--state-dir',str(root/'state'),'--dispatcher-host-plan',str(plan),seam[5:]]
+        if seam == 'loop-run': args += ['--interval','5','--passes','2']
+        code,output = captured_main(loop,args)
+        reports = [json.loads(line) for line in output.splitlines()]
+        answer = {'reports':[{'pass_id':r['pass_id'], 'steps':[{k:s[k] for k in ('step','state','exit') if k in s}
+                    for s in r.get('steps',[])], 'holds':[{k:h[k] for k in ('step','kind','detail') if k in h}
+                    for h in r.get('holds',[])]} if 'pass_id' in r else r for r in reports],
+                  'run_open_calls':calls.count('jobs')}
+    else: raise AssertionError(seam)
+except (ValueError,OSError) as error:
+    answer = {'error':str(error)}
+    code = 2
+print(json.dumps(answer,sort_keys=True))
+sys.exit(code)
+'''
+
+
+def r13_consumer_probe(tmp_path, seam, planned=False, damage="inputs", *, tools=None):
+    """Identical public fixture and entry point for baseline capture and history-free tests."""
+    from tests.integration.test_hierarchy_router import Loop
+    from tests.integration.test_hierarchy_small_change_dispatch import DispatchWorld, modelled_loop_plan
+    import hierarchy_hosts
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    world = DispatchWorld(tmp_path) if seam == "row" else Loop(tmp_path)
+    mailbox = world.root if seam == "row" else world.team("engine")
+    world.team("docs")
+    if seam != "row": world.approved(request("damaged"))
+    world.approved(request("healthy", team="docs"))
+    inputs, denied = tmp_path / "inputs", tmp_path / "denied"
+    inputs.mkdir(); denied.mkdir()
+    (tmp_path / "healthy.md").write_bytes(b"healthy public reference")
+    (inputs / "note.md").write_bytes(world.recipes_path.read_bytes() if seam == "row" else b"fixture target")
+    recipes = world.recipes_path if seam == "row" else tmp_path / "recipes.json"
+    if seam != "row": recipes.write_text("{}")
+    modelled_loop_plan(tmp_path)
+    if planned:
+        for team, base in world.mailboxes.items():
+            (base.parent / "host-plan.json").write_text(json.dumps(
+                hierarchy_hosts.plan_record(team,"codex-cli","codex-cli",{},"0"*64)))
+    if seam.startswith("loop-") and damage == "request":
+        world.ledger.publish(request("scope-under-link",paths=[str(inputs/"note.md")]))
+    replaced = None
+    if seam in {"status","route","deliver"}:
+        replaced = mailbox if damage == "mailbox" else mailbox / ("engine" if damage == "team" else damage)
+    elif seam not in {"closing-report","row"}:
+        replaced = inputs
+    if seam == "receipts":
+        replaced = tmp_path / "delivery" / "delivered"
+        (replaced / "engine" / "orchestrator").mkdir(parents=True)
+    if replaced is not None:
+        replaced.rename(replaced.with_name(replaced.name+"-before"))
+        symlink_or_skip(denied,replaced,target_is_directory=True)
+    denied.chmod(0)
+    config = dict(root=str(tmp_path),seam=seam,damage=damage,planned=planned,journal=str(world.ledger.path),
+                  store=str(world.workspace.store),mailbox=str(mailbox),recipes=str(recipes))
+    try:
+        result = subprocess.run([sys.executable,"-I","-B","-c",R13_CONSUMER_PROBE,
+            str(tools or ROOT/"tools"),str(ROOT/"tools"),json.dumps(config)],capture_output=True,timeout=45)
+    finally:
+        denied.chmod(0o700)
+    return result.returncode,result.stdout.replace(os.fsencode(tmp_path),b"{CASE}"),result.stderr.replace(os.fsencode(tmp_path),b"{CASE}")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam", ["evidence","attachment","receipts"])
+def test_round13_optional_and_receipt_target_errors_match_baseline(tmp_path,seam):
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    assert r13_consumer_probe(tmp_path,seam)==R13_CONSUMER_GOLDENS[(seam,False,"inputs")]
+
+
+# Recorded from ec27eebf outside this checkout. Tests consume data, never Git history.
+# CLI cases retain native capabilities; portable API cases exercise the reference
+# fallback. Unsupported secure locking has its own refusal/probe test below.
+R9_PUBLIC_GOLDENS = {('check', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('check', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('check', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('check', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('check', 'missing', False, 'native'): (0, b'{"result": false}\n', b''),
+ ('check', 'missing', False, 'portable'): (0, b'{"result": false}\n', b''),
+ ('check', 'missing', True, 'native'): (0, b'{"result": false}\n', b''),
+ ('check', 'missing', True, 'portable'): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', False, 'native'): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', False, 'portable'): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', True, 'native'): (0, b'{"result": false}\n', b''),
+ ('check', 'not-directory', True, 'portable'): (0, b'{"result": false}\n', b''),
+ ('check', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('check', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('compose-file', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('compose-file', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/manifest.json\'"}\n', b''),
+ ('compose-file', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose-file', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--delivery-dir', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--delivery-dir', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--delivery-dir', 'missing', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+ ('compose:--delivery-dir', 'missing', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+ ('compose:--delivery-dir', 'not-directory', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+ ('compose:--delivery-dir', 'not-directory', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/missing-journal"}\n', b''),
+ ('compose:--delivery-dir', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--delivery-dir', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'missing', False, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/note.md"}\n', b''),
+ ('compose:--lifecycle', 'missing', True, 'native'): (2, b'{"error": "lifecycle directory unavailable: {CASE}/ordinary/note.md"}\n', b''),
+ ('compose:--lifecycle', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--lifecycle', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--lifecycle', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--root', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--root', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('compose:--root', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('compose:--root', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('compose:--root', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/manifest.json\'"}\n', b''),
+ ('compose:--root', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/manifest.json\'"}\n', b''),
+ ('compose:--root', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('compose:--root', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('disposition', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('disposition', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('disposition', 'symlink', False, 'native'): (0,
+                                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                               b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                               b''),
+ ('disposition', 'symlink', False, 'portable'): (0,
+                                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                                 b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                 b''),
+ ('disposition', 'symlink', True, 'native'): (0,
+                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                              b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                              b''),
+ ('disposition', 'symlink', True, 'portable'): (0,
+                                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at'
+                                                b' event fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                                b''),
+ ('exists', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'missing', False, 'native'): (0, b'{"result": false}\n', b''),
+ ('exists', 'missing', False, 'portable'): (0, b'{"result": false}\n', b''),
+ ('exists', 'missing', True, 'native'): (0, b'{"result": false}\n', b''),
+ ('exists', 'missing', True, 'portable'): (0, b'{"result": false}\n', b''),
+ ('exists', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'not-directory', False, 'portable'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'not-directory', True, 'portable'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('exists', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('exists', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--lifecycle', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--lifecycle', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--lifecycle', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--lifecycle', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--lifecycle', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md.loop.lock\'"}\n', b''),
+ ('loop:--lifecycle', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'{CASE}/ordinary/note.md.loop.lock\'"}\n', b''),
+ ('loop:--lifecycle', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--lifecycle', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--recipes', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--recipes', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--recipes', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--recipes', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--recipes', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--recipes', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--recipes', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--recipes', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--state-dir', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--state-dir', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--state-dir', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--state-dir', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--state-dir', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--state-dir', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--state-dir', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--state-dir', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--store', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--store', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('loop:--store', 'missing', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--store', 'missing', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--store', 'not-directory', False, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--store', 'not-directory', True, 'native'): (3, b'{"last": null, "schema": "aegis.loop-status/v1", "state": "not_running"}\n', b''),
+ ('loop:--store', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('loop:--store', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('members', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('members', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('members', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('members', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('members', 'missing', False, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
+ ('members', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('members', 'missing', True, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
+ ('members', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('members', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('members', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('members', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('members', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('members', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('paths', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('paths', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('paths', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('read', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('read', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('read', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('read', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('read', 'missing', False, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
+ ('read', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('read', 'missing', True, 'portable'): (2, b'{"error": "[Errno 2] No such file or directory: \'{CASE}/ordinary\'"}\n', b''),
+ ('read', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('read', 'not-directory', False, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('read', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('read', 'not-directory', True, 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary"}\n', b''),
+ ('read', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('read', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('resolve', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('resolve', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('resolve', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('resolve', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('resolve', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('resolve', 'symlink', False, 'native'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                           b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                           b''),
+ ('resolve', 'symlink', False, 'portable'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                             b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                             b''),
+ ('resolve', 'symlink', True, 'native'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                          b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                          b''),
+ ('resolve', 'symlink', True, 'portable'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "lifecycle row UNKNOWN at eve'
+                                            b'nt fault-event: symlink paths are not supported: {CASE}/ordinary"}}}\n',
+                                            b''),
+ ('router:--lifecycle', 'denied', False, 'native'): (2,
+                                                     b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source'
+                                                     b'":"arguments","state":"hold"}\n',
+                                                     b''),
+ ('router:--lifecycle', 'denied', True, 'native'): (2,
+                                                    b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source'
+                                                    b'":"arguments","state":"hold"}\n',
+                                                    b''),
+ ('router:--lifecycle', 'missing', False, 'native'): (2,
+                                                      b'{"error":"[Errno 2] No such file or directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_ena'
+                                                      b'bled":false,"source":"journal","state":"hold"}\n',
+                                                      b''),
+ ('router:--lifecycle', 'missing', True, 'native'): (2,
+                                                     b'{"error":"[Errno 2] No such file or directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_ena'
+                                                     b'bled":false,"source":"journal","state":"hold"}\n',
+                                                     b''),
+ ('router:--lifecycle', 'not-directory', False, 'native'): (2,
+                                                            b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_enab'
+                                                            b'led":false,"source":"journal","state":"hold"}\n',
+                                                            b''),
+ ('router:--lifecycle', 'not-directory', True, 'native'): (2,
+                                                           b'{"error":"[Errno 20] Not a directory: \'{CASE}/ordinary/note.md/.write.lock\'","execution_enabled"'
+                                                           b':false,"source":"journal","state":"hold"}\n',
+                                                           b''),
+ ('router:--lifecycle', 'symlink', False, 'native'): (2,
+                                                      b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argu'
+                                                      b'ments","state":"hold"}\n',
+                                                      b''),
+ ('router:--lifecycle', 'symlink', True, 'native'): (2,
+                                                     b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
+                                                     b's","state":"hold"}\n',
+                                                     b''),
+ ('router:--recipes', 'denied', False, 'native'): (2,
+                                                   b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
+                                                   b'rguments","state":"hold"}\n',
+                                                   b''),
+ ('router:--recipes', 'denied', True, 'native'): (2,
+                                                  b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
+                                                  b'rguments","state":"hold"}\n',
+                                                  b''),
+ ('router:--recipes', 'missing', False, 'native'): (0,
+                                                    b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests":[],'
+                                                    b'"router":"router-1","schema":"aegis.router-status/v1"}\n',
+                                                    b''),
+ ('router:--recipes', 'missing', True, 'native'): (0,
+                                                   b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests":[],'
+                                                   b'"router":"router-1","schema":"aegis.router-status/v1"}\n',
+                                                   b''),
+ ('router:--recipes', 'not-directory', False, 'native'): (0,
+                                                          b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","reque'
+                                                          b'sts":[],"router":"router-1","schema":"aegis.router-status/v1"}\n',
+                                                          b''),
+ ('router:--recipes', 'not-directory', True, 'native'): (0,
+                                                         b'{"authenticated":false,"escalations":[],"execution_enabled":false,"identity":"configured","requests"'
+                                                         b':[],"router":"router-1","schema":"aegis.router-status/v1"}\n',
+                                                         b''),
+ ('router:--recipes', 'symlink', False, 'native'): (2,
+                                                    b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
+                                                    b's","state":"hold"}\n',
+                                                    b''),
+ ('router:--recipes', 'symlink', True, 'native'): (2,
+                                                   b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
+                                                   b's","state":"hold"}\n',
+                                                   b''),
+ ('router:--store', 'denied', False, 'native'): (2,
+                                                 b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
+                                                 b'rguments","state":"hold"}\n',
+                                                 b''),
+ ('router:--store', 'denied', True, 'native'): (2,
+                                                b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'","execution_enabled":false,"source":"a'
+                                                b'rguments","state":"hold"}\n',
+                                                b''),
+ ('router:--store', 'missing', False, 'native'): (2,
+                                                  b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execution_enabled":false,"sou'
+                                                  b'rce":"store","state":"hold"}\n',
+                                                  b''),
+ ('router:--store', 'missing', True, 'native'): (2,
+                                                 b'{"error":"captured directory disappeared: {CASE}/ordinary/note.md/events","execution_enabled":false,"source"'
+                                                 b':"store","state":"hold"}\n',
+                                                 b''),
+ ('router:--store', 'not-directory', False, 'native'): (2,
+                                                        b'{"error":"workspace store is not initialized","execution_enabled":false,"source":"store","state":"ho'
+                                                        b'ld"}\n',
+                                                        b''),
+ ('router:--store', 'not-directory', True, 'native'): (2,
+                                                       b'{"error":"workspace store is not initialized","execution_enabled":false,"source":"store","state":"ho'
+                                                       b'ld"}\n',
+                                                       b''),
+ ('router:--store', 'symlink', False, 'native'): (2,
+                                                  b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"argument'
+                                                  b's","state":"hold"}\n',
+                                                  b''),
+ ('router:--store', 'symlink', True, 'native'): (2,
+                                                 b'{"error":"symlink paths are not supported: {CASE}/ordinary","execution_enabled":false,"source":"arguments","'
+                                                 b'state":"hold"}\n',
+                                                 b''),
+ ('scan_workspace', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scan_workspace', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scan_workspace', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scan_workspace', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scan_workspace', 'missing', False, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'missing', False, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'missing', True, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'missing', True, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', False, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', False, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', True, 'native'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'not-directory', True, 'portable'): (2, b'{"error": "scan workspace does not match lane worktree"}\n', b''),
+ ('scan_workspace', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scan_workspace', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scan_workspace', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scan_workspace', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scope', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scope', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scope', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('scope', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('scope', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('scope', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('shared-disposition', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'not-directory', False, 'native'): (0,
+                                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+                                                            b''),
+ ('shared-disposition', 'not-directory', False, 'portable'): (0,
+                                                              b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+                                                              b''),
+ ('shared-disposition', 'not-directory', True, 'native'): (0,
+                                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+                                                           b''),
+ ('shared-disposition', 'not-directory', True, 'portable'): (0,
+                                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+                                                             b''),
+ ('shared-disposition', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-disposition', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'denied', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'denied', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'denied', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'denied', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'missing', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'missing', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'missing', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'missing', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'not-directory', False, 'portable'): (0,
+                                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n',
+                                                          b''),
+ ('shared-resolve', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'symlink', False, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'symlink', False, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'symlink', True, 'native'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('shared-resolve', 'symlink', True, 'portable'): (0, b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "unknown": {}}}\n', b''),
+ ('verify:--path', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('verify:--path', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('verify:--path', 'missing', False, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('verify:--path', 'missing', True, 'native'): (2, b'{"error": "[Errno 2] No such file or directory: \'ordinary\'"}\n', b''),
+ ('verify:--path', 'not-directory', False, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('verify:--path', 'not-directory', True, 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'"}\n', b''),
+ ('verify:--path', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('verify:--path', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', 'denied', False, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('worktree', 'denied', False, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('worktree', 'denied', True, 'native'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('worktree', 'denied', True, 'portable'): (2, b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}\n', b''),
+ ('worktree', 'missing', False, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'missing', False, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'missing', True, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'missing', True, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', False, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', False, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', True, 'native'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'not-directory', True, 'portable'): (0, b'{"result": {"refusals": []}}\n', b''),
+ ('worktree', 'symlink', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', 'symlink', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', 'symlink', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b''),
+ ('worktree', 'symlink', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n', b'')}
+R9_WITNESS_GOLDENS = {('members', 'not-directory', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
+ ('members', 'not-directory', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
+ ('members', 'symlink', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
+ ('members', 'symlink', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
+ ('read', 'not-directory', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
+ ('read', 'not-directory', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b''),
+ ('read', 'symlink', 'native'): (2, b'{"error": "[Errno 20] Not a directory: \'ordinary\'", "type": "CaptureChanged"}\n', b''),
+ ('read', 'symlink', 'portable'): (2, b'{"error": "reference parent must be a directory: {CASE}/ordinary", "type": "CaptureChanged"}\n', b'')}
+R9_WITNESS_PROBE = "\nimport json, os, sys\nfrom pathlib import Path\ntools, fallback, case, action, fault, backend = sys.argv[1:]\nsys.path[:0] = [tools, fallback]\nimport hierarchy_fresh_brief as fresh\nif backend == 'portable': fresh._reference_descriptors = lambda: False\ncase = Path(case); case.mkdir(parents=True, exist_ok=True)\nparent = case/'ordinary'; parent.mkdir()\nnote = parent/'note.md'; note.write_bytes(b'public note')\noperation = fresh._Operation()\nif action == 'read': operation.read(note)\nelse: operation.entries(parent)\nparent.rename(case/'original')\nif fault == 'symlink': parent.symlink_to(case/'original', target_is_directory=True)\nelse: parent.write_text('ordinary file')\ntry:\n    operation.verify()\nexcept (ValueError,OSError) as error:\n    print(json.dumps({'error':str(error),'type':type(error).__name__},sort_keys=True))\n    sys.exit(2)\nprint('{}')\n"
+
+R9_PUBLIC_SEAMS = (
+    "check", "exists", "read", "members", "paths", "scope", "disposition", "resolve",
+    "shared-disposition", "shared-resolve", "worktree", "scan_workspace", "compose-file",
+    "router:--lifecycle", "router:--store", "router:--recipes", "compose:--root",
+    "compose:--lifecycle", "compose:--delivery-dir", "verify:--path",
+    "loop:--lifecycle", "loop:--store", "loop:--recipes", "loop:--state-dir",
+)
+R9_PUBLIC_PROBE = r'''
+import json, os, sys
+from pathlib import Path
+tools, fallback, root, seam, backend = sys.argv[1:]
+sys.path[:0] = [tools, fallback]
+import hierarchy_fresh_brief as fresh
+import hierarchy_mailbox as protocol
+if backend == 'portable':
+    fresh._reference_descriptors = lambda: False
+root = Path(root)
+target = root / 'ordinary' / 'note.md'
+try:
+    if seam == 'check':
+        if hasattr(fresh, '_reference_check'):
+            result = fresh._Operation().path_guard.check(target) is not None
+        else:
+            protocol.safe_path(target)
+            result = os.path.lexists(target)
+    elif seam == 'exists': result = fresh._Operation().exists(target)
+    elif seam == 'read': result = fresh._Operation().read(target)[0]
+    elif seam == 'members': result = fresh._Operation()._members(target)[1]
+    elif seam in ('worktree', 'scan_workspace'):
+        mailbox = fresh._CapturedMailbox(root / 'mailbox')
+        mailbox._stored_message_paths, mailbox._stored_message_refusals = set(), []
+        readiness = dict(worktree=str(target if seam == 'worktree' else root),
+            scan_workspace=str(target), branch='feature/fixture', base_revision='a'*40,
+            lease_ref='refs/aegis/lanes/fixture', lease_oid='b'*40,
+            lease_expires_at='2099-01-01T00:00:00Z', owned_paths=['src/**'],
+            scan_evidence='fixture scan', hook_evidence='fixture hook', enforcement_tier='advisory')
+        mailbox.readiness(readiness, observe=False)
+        result = {'refusals': mailbox._stored_message_refusals}
+    elif seam in ('paths', 'scope', 'disposition', 'resolve', 'shared-disposition', 'shared-resolve'):
+        journal = fresh._Operation().lifecycle(root / 'lifecycle')
+        policy, state = journal.load()
+        result = dict(requests=sorted(state['requests']), unknown=journal.unknown_rows,
+                      refusals=journal.private_refusals)
+    else:
+        family, flag = ('compose', '--root') if seam == 'compose-file' else seam.split(':')
+        value = str(root / 'ordinary') if seam == 'compose-file' else str(target)
+        if family == 'router':
+            import hierarchy_router as module
+            args = ['--lifecycle', str(root/'lifecycle'), '--store', str(root/'store'),
+                    'status', '--recipes', str(root/'recipes.json'), '--wait', '0']
+        elif family == 'loop':
+            import hierarchy_loop as module
+            args = ['--lifecycle', str(root/'lifecycle'), '--store', str(root/'store'),
+                    '--recipes', str(root/'recipes.json'), '--state-dir', str(root/'state'), 'status']
+        elif family == 'compose':
+            module = fresh
+            args = ['compose', '--root', str(root/'mailbox'), '--initiative', 'a',
+                    '--endpoint', 'a/orchestrator', '--lifecycle', str(root/'missing-journal'),
+                    '--delivery-dir', str(root/'delivery'), '--as-of', '2030-01-01T00:00:00Z']
+        else:
+            module = fresh
+            args = ['verify', '--path', str(target), '--sha256', '0'*64]
+        args[args.index(flag)+1] = value
+        sys.exit(module.main(args))
+except (ValueError, OSError, TypeError, KeyError) as error:
+    print(json.dumps({'error': str(error)}, sort_keys=True))
+    sys.exit(2)
+print(json.dumps({'result': result}, sort_keys=True))
+'''
+
+
+def r9_public_probe(tmp_path, seam, fault, planned, backend, *, tools=None, _probe=None):
+    """Same real fixture/entry point for recorded baseline and history-free tests."""
+    from tests.integration.test_hierarchy_router import Loop
+    import hierarchy_hosts
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "note.md").write_text("public fixture")
+    (tmp_path / "recipes.json").write_text("{}")
+    mailbox = tmp_path / "mailbox"
+    mailbox.mkdir()
+    (mailbox / "manifest.json").write_text(json.dumps({"schema": "aegis.hierarchy-pilot/v1",
+        "endpoints": {"a/front-door": {}, "a/orchestrator": {}}, "counterparts": [], "writer_limit": 3}))
+    if planned:
+        (tmp_path / "host-plan.json").write_text(json.dumps(
+            hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)))
+    if seam.startswith(("router:", "loop:")):
+        Loop(tmp_path)
+    elif seam in {"paths", "scope", "disposition", "resolve", "shared-disposition", "shared-resolve"}:
+        ledger = Ledger(tmp_path)
+        bad = request("hostile", paths=[str(ordinary / "note.md")])
+        ledger.publish(request("healthy"))
+        if seam == "scope":
+            change = SmallChange(ledger, bad)
+            change.plan["plan"]["path_scopes"] = [bad["paths"]]
+            change.register()
+        elif seam.endswith(("disposition", "resolve")):
+            first = request("first")
+            ledger.publish(first)
+            kind, extra = seam.split("-")[-1], {}
+            if kind == "resolve":
+                ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                    "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+                extra["blocker_sha256"] = alias_fresh.digest(ledger.status()["requests"]["first"]["resolution"])
+            evidence = [{"path": bad["paths"][0], "sha256": "0" * 64}] if seam.startswith("shared-") else ledger.evidence
+            ledger.event(kind, identifier="fault-event", **({"status": "FINAL"} if kind == "disposition" else extra),
+                resolution={"kind": "next", "request": raw_request(bad), "evidence": evidence}, **ledger.target(first))
+        else:
+            ledger.publish(bad)
+    if fault in {"symlink", "link-to-denied", "link-to-io"}:
+        public = tmp_path / "public"
+        ordinary.rename(public)
+        symlink_or_skip(public, ordinary, target_is_directory=True)
+        if fault == "link-to-denied":
+            public.chmod(0)
+    elif fault == "not-directory":
+        (ordinary / "note.md").unlink()
+        ordinary.rmdir()
+        ordinary.write_text("ordinary file")
+    elif fault == "missing":
+        (ordinary / "note.md").unlink()
+        ordinary.rmdir()
+    else:
+        assert fault == "denied"
+        ordinary.chmod(0)
+    try:
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", _probe or R9_PUBLIC_PROBE,
+            str(tools or ROOT / "tools"), str(ROOT / "tools"), str(tmp_path), seam, backend,
+            *([fault] if _probe is not None else [])],
+            capture_output=True, timeout=30)
+    finally:
+        if fault == "denied": ordinary.chmod(0o700)
+        if fault == "link-to-denied": public.chmod(0o700)
+    return result.returncode, result.stdout.replace(os.fsencode(tmp_path), b"{CASE}"), result.stderr.replace(os.fsencode(tmp_path), b"{CASE}")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,fault,planned,backend", tuple(R9_PUBLIC_GOLDENS),
+    ids=["%s-%s-%s-%s" % (seam, fault, "planned" if planned else "no-plan", backend)
+         for seam, fault, planned, backend in R9_PUBLIC_GOLDENS])
+def test_round9_public_path_differential_goldens(tmp_path, seam, fault, planned, backend):
+    import hierarchy_fresh_brief as fresh
+    if backend == "native" and not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    if fault == "denied" and os.geteuid() == 0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    expected = R9_PUBLIC_GOLDENS[(seam, fault, planned, backend)]
+    assert r9_public_probe(tmp_path, seam, fault, planned, backend) == expected
+
+
+@lifecycle_only
+@pytest.mark.parametrize("action,fault,backend", tuple(R9_WITNESS_GOLDENS))
+def test_round9_captured_public_parent_failure_bytes(tmp_path, action, fault, backend):
+    import hierarchy_fresh_brief as fresh
+    if backend == "native":
+        if not sys.platform.startswith("linux"): pytest.skip("native errno goldens were recorded on Linux")
+        if not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    if fault == "symlink":
+        target, link = tmp_path / "capability-target", tmp_path / "capability-link"
+        target.mkdir()
+        symlink_or_skip(target, link, target_is_directory=True)
+        link.unlink()
+        target.rmdir()
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", R9_WITNESS_PROBE,
+        str(ROOT / "tools"), str(ROOT / "tools"), str(tmp_path), action, fault, backend],
+        capture_output=True, timeout=30)
+    actual = result.returncode, result.stdout.replace(os.fsencode(tmp_path), b"{CASE}"), result.stderr
+    assert actual == R9_WITNESS_GOLDENS[action, fault, backend]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("field", ["paths", "scope"])
+@pytest.mark.parametrize("spelling", ["home-suffix", "alias-target", "two-hop"])
+def test_round9_private_link_chain_quarantines_only_its_row(tmp_path, monkeypatch, field, spelling):
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors() or fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    home, linked, platform_alias = tmp_path / "owner", tmp_path / "linked", tmp_path / "platform-alias"
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    platform_alias.mkdir()
+    linked.mkdir()
+    target = linked / ".codex/auth.json" if spelling == "home-suffix" else linked / "auth.json"
+    ledger = Ledger(tmp_path)
+    bad = request("hostile", paths=[str(target)])
+    ledger.publish(request("healthy"))
+    if field == "scope":
+        change = SmallChange(ledger, bad)
+        change.plan["plan"]["path_scopes"] = [bad["paths"]]
+        change.register()
+    else:
+        ledger.publish(bad)
+    linked.rmdir()
+    if spelling == "two-hop":
+        symlink_or_skip(private, tmp_path / "second", target_is_directory=True)
+    destination = {"home-suffix": home, "alias-target": platform_alias, "two-hop": tmp_path / "second"}[spelling]
+    symlink_or_skip(destination, linked, target_is_directory=True)
+    identity, real_os, descriptors, accesses = private.stat(), fresh.os, {}, []
+    def actual(path, kwargs):
+        return Path(path) if Path(path).is_absolute() else descriptors[kwargs["dir_fd"]] / path
+    def observe(kind, value):
+        if value == private or private in value.parents:
+            accesses.append({"path": str(value), "kind": kind, "operation": id(fresh._PATH_GUARD.get())})
+        assert not (private in value.parents or platform_alias in value.parents), (kind, value)
+        if kind == "open": assert value not in {private, platform_alias}, value
+    def stated(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        observe("stat", value)
+        if spelling == "alias-target" and value == platform_alias:
+            return identity
+        return real_os.stat(path, *args, **kwargs)
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        observe("open", value)
+        descriptor = real_os.open(path, *args, **kwargs)
+        descriptors[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND9_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "open": opened, "close": closed}))
+    owners = []
+    def probe():
+        operation = fresh._Operation()
+        owners.append(operation)
+        journal = operation.lifecycle(ledger.path)
+        _policy, state = journal.load()
+        assert set(state["requests"]) == {"hostile", "healthy"}
+        for _ in range(2):
+            assert journal.refusals_for("hostile", consume=True)
+            assert journal.refusals_for("healthy") == []
+            operation.verify()
+    probe()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in (pool.submit(probe), pool.submit(probe)): future.result(timeout=30)
+    from tests.integration.test_hierarchy_small_change_dispatch import assert_private_root_probes
+    assert_private_root_probes([private], accesses)
+    assert not descriptors
+
+
+# Exact ec27eebf records; only the case directory prefix is normalized.
+R10_PUBLIC_GOLDENS = {('check', 'link-to-denied', False, 'native'): (2,
+                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('check', 'link-to-denied', False, 'portable'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('check', 'link-to-denied', True, 'native'): (2,
+                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('check', 'link-to-denied', True, 'portable'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('check', 'link-to-io', False, 'native'): (2,
+                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                            b''),
+ ('check', 'link-to-io', False, 'portable'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('check', 'link-to-io', True, 'native'): (2,
+                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                           b''),
+ ('check', 'link-to-io', True, 'portable'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('compose-file', 'link-to-denied', False, 'native'): (2,
+                                                       b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                       b'}\n',
+                                                       b''),
+ ('compose-file', 'link-to-denied', True, 'native'): (2,
+                                                      b'{"error": "symlink paths are not supported: {CASE}/ordinary"'
+                                                      b'}\n',
+                                                      b''),
+ ('compose-file', 'link-to-io', False, 'native'): (2,
+                                                   b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                                   b''),
+ ('compose-file', 'link-to-io', True, 'native'): (2,
+                                                  b'{"error": "symlink paths are not supported: {CASE}/ordinary"}\n',
+                                                  b''),
+ ('compose:--delivery-dir', 'link-to-denied', False, 'native'): (2,
+                                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}'
+                                                                 b'/ordinary/note.md\'"}\n',
+                                                                 b''),
+ ('compose:--delivery-dir', 'link-to-denied', True, 'native'): (2,
+                                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
+                                                                b'inary/note.md\'"}\n',
+                                                                b''),
+ ('compose:--delivery-dir', 'link-to-io', False, 'native'): (2,
+                                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ord'
+                                                             b'inary/note.md\'"}\n',
+                                                             b''),
+ ('compose:--delivery-dir', 'link-to-io', True, 'native'): (2,
+                                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
+                                                            b'y/note.md\'"}\n',
+                                                            b''),
+ ('compose:--lifecycle', 'link-to-denied', False, 'native'): (2,
+                                                              b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
+                                                              b'inary/note.md\'"}\n',
+                                                              b''),
+ ('compose:--lifecycle', 'link-to-denied', True, 'native'): (2,
+                                                             b'{"error": "[Errno 13] Permission denied: \'{CASE}/ord'
+                                                             b'inary/note.md\'"}\n',
+                                                             b''),
+ ('compose:--lifecycle', 'link-to-io', False, 'native'): (2,
+                                                          b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
+                                                          b'y/note.md\'"}\n',
+                                                          b''),
+ ('compose:--lifecycle', 'link-to-io', True, 'native'): (2,
+                                                         b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinar'
+                                                         b'y/note.md\'"}\n',
+                                                         b''),
+ ('compose:--root', 'link-to-denied', False, 'native'): (2,
+                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                         b'y/note.md\'"}\n',
+                                                         b''),
+ ('compose:--root', 'link-to-denied', True, 'native'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('compose:--root', 'link-to-io', False, 'native'): (2,
+                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('compose:--root', 'link-to-io', True, 'native'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('disposition', 'link-to-denied', False, 'native'): (2,
+                                                      b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
+                                                      b''),
+ ('disposition', 'link-to-denied', False, 'portable'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('disposition', 'link-to-denied', True, 'native'): (2,
+                                                     b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('disposition', 'link-to-denied', True, 'portable'): (2,
+                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('disposition', 'link-to-io', False, 'native'): (2,
+                                                  b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('disposition', 'link-to-io', False, 'portable'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('disposition', 'link-to-io', True, 'native'): (2,
+                                                 b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('disposition', 'link-to-io', True, 'portable'): (2,
+                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('exists', 'link-to-denied', False, 'native'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('exists', 'link-to-denied', False, 'portable'): (2,
+                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('exists', 'link-to-denied', True, 'native'): (2,
+                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('exists', 'link-to-denied', True, 'portable'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('exists', 'link-to-io', False, 'native'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('exists', 'link-to-io', False, 'portable'): (2,
+                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('exists', 'link-to-io', True, 'native'): (2,
+                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                            b''),
+ ('exists', 'link-to-io', True, 'portable'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('loop:--lifecycle', 'link-to-denied', False, 'native'): (2,
+                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                           b'y/note.md\'"}\n',
+                                                           b''),
+ ('loop:--lifecycle', 'link-to-denied', True, 'native'): (2,
+                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                          b'y/note.md\'"}\n',
+                                                          b''),
+ ('loop:--lifecycle', 'link-to-io', False, 'native'): (2,
+                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('loop:--lifecycle', 'link-to-io', True, 'native'): (2,
+                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
+                                                      b''),
+ ('loop:--recipes', 'link-to-denied', False, 'native'): (2,
+                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                         b'y/note.md\'"}\n',
+                                                         b''),
+ ('loop:--recipes', 'link-to-denied', True, 'native'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('loop:--recipes', 'link-to-io', False, 'native'): (2,
+                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('loop:--recipes', 'link-to-io', True, 'native'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('loop:--state-dir', 'link-to-denied', False, 'native'): (2,
+                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                           b'y/note.md\'"}\n',
+                                                           b''),
+ ('loop:--state-dir', 'link-to-denied', True, 'native'): (2,
+                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                          b'y/note.md\'"}\n',
+                                                          b''),
+ ('loop:--state-dir', 'link-to-io', False, 'native'): (2,
+                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('loop:--state-dir', 'link-to-io', True, 'native'): (2,
+                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
+                                                      b''),
+ ('loop:--store', 'link-to-denied', False, 'native'): (2,
+                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('loop:--store', 'link-to-denied', True, 'native'): (2,
+                                                      b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
+                                                      b''),
+ ('loop:--store', 'link-to-io', False, 'native'): (2,
+                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('loop:--store', 'link-to-io', True, 'native'): (2,
+                                                  b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('members', 'link-to-denied', False, 'native'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('members', 'link-to-denied', False, 'portable'): (2,
+                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('members', 'link-to-denied', True, 'native'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('members', 'link-to-denied', True, 'portable'): (2,
+                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('members', 'link-to-io', False, 'native'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('members', 'link-to-io', False, 'portable'): (2,
+                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('members', 'link-to-io', True, 'native'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('members', 'link-to-io', True, 'portable'): (2,
+                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('paths', 'link-to-denied', False, 'native'): (2,
+                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('paths', 'link-to-denied', False, 'portable'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('paths', 'link-to-denied', True, 'native'): (2,
+                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('paths', 'link-to-denied', True, 'portable'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('paths', 'link-to-io', False, 'native'): (2,
+                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                            b''),
+ ('paths', 'link-to-io', False, 'portable'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('paths', 'link-to-io', True, 'native'): (2,
+                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                           b''),
+ ('paths', 'link-to-io', True, 'portable'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('read', 'link-to-denied', False, 'native'): (2,
+                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('read', 'link-to-denied', False, 'portable'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('read', 'link-to-denied', True, 'native'): (2,
+                                              b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('read', 'link-to-denied', True, 'portable'): (2,
+                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('read', 'link-to-io', False, 'native'): (2,
+                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                           b''),
+ ('read', 'link-to-io', False, 'portable'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('read', 'link-to-io', True, 'native'): (2,
+                                          b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                          b''),
+ ('read', 'link-to-io', True, 'portable'): (2,
+                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                            b''),
+ ('resolve', 'link-to-denied', False, 'native'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('resolve', 'link-to-denied', False, 'portable'): (2,
+                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('resolve', 'link-to-denied', True, 'native'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('resolve', 'link-to-denied', True, 'portable'): (2,
+                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('resolve', 'link-to-io', False, 'native'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('resolve', 'link-to-io', False, 'portable'): (2,
+                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('resolve', 'link-to-io', True, 'native'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('resolve', 'link-to-io', True, 'portable'): (2,
+                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('router:--lifecycle', 'link-to-denied', False, 'native'): (2,
+                                                             b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordi'
+                                                             b'nary/note.md\'","execution_enabled":false,"source":"a'
+                                                             b'rguments","state":"hold"}\n',
+                                                             b''),
+ ('router:--lifecycle', 'link-to-denied', True, 'native'): (2,
+                                                            b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
+                                                            b'/note.md\'","execution_enabled":false,"source":"arguments'
+                                                            b'","state":"hold"}\n',
+                                                            b''),
+ ('router:--lifecycle', 'link-to-io', False, 'native'): (2,
+                                                         b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary'
+                                                         b'/note.md\'","execution_enabled":false,"source":"arguments'
+                                                         b'","state":"hold"}\n',
+                                                         b''),
+ ('router:--lifecycle', 'link-to-io', True, 'native'): (2,
+                                                        b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
+                                                        b'e.md\'","execution_enabled":false,"source":"arguments","state'
+                                                        b'":"hold"}\n',
+                                                        b''),
+ ('router:--recipes', 'link-to-denied', False, 'native'): (2,
+                                                           b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
+                                                           b'/note.md\'","execution_enabled":false,"source":"arguments'
+                                                           b'","state":"hold"}\n',
+                                                           b''),
+ ('router:--recipes', 'link-to-denied', True, 'native'): (2,
+                                                          b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
+                                                          b'/note.md\'","execution_enabled":false,"source":"arguments'
+                                                          b'","state":"hold"}\n',
+                                                          b''),
+ ('router:--recipes', 'link-to-io', False, 'native'): (2,
+                                                       b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
+                                                       b'e.md\'","execution_enabled":false,"source":"arguments","state'
+                                                       b'":"hold"}\n',
+                                                       b''),
+ ('router:--recipes', 'link-to-io', True, 'native'): (2,
+                                                      b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
+                                                      b'e.md\'","execution_enabled":false,"source":"arguments","state'
+                                                      b'":"hold"}\n',
+                                                      b''),
+ ('router:--store', 'link-to-denied', False, 'native'): (2,
+                                                         b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary'
+                                                         b'/note.md\'","execution_enabled":false,"source":"arguments'
+                                                         b'","state":"hold"}\n',
+                                                         b''),
+ ('router:--store', 'link-to-denied', True, 'native'): (2,
+                                                        b'{"error":"[Errno 13] Permission denied: \'{CASE}/ordinary/not'
+                                                        b'e.md\'","execution_enabled":false,"source":"arguments","state'
+                                                        b'":"hold"}\n',
+                                                        b''),
+ ('router:--store', 'link-to-io', False, 'native'): (2,
+                                                     b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/not'
+                                                     b'e.md\'","execution_enabled":false,"source":"arguments","state'
+                                                     b'":"hold"}\n',
+                                                     b''),
+ ('router:--store', 'link-to-io', True, 'native'): (2,
+                                                    b'{"error":"[Errno 5] Input/output error: \'{CASE}/ordinary/note.md'
+                                                    b'\'","execution_enabled":false,"source":"arguments","state":"hold"'
+                                                    b'}\n',
+                                                    b''),
+ ('scan_workspace', 'link-to-denied', False, 'native'): (2,
+                                                         b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                         b'y/note.md\'"}\n',
+                                                         b''),
+ ('scan_workspace', 'link-to-denied', False, 'portable'): (2,
+                                                           b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                           b'y/note.md\'"}\n',
+                                                           b''),
+ ('scan_workspace', 'link-to-denied', True, 'native'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('scan_workspace', 'link-to-denied', True, 'portable'): (2,
+                                                          b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinar'
+                                                          b'y/note.md\'"}\n',
+                                                          b''),
+ ('scan_workspace', 'link-to-io', False, 'native'): (2,
+                                                     b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('scan_workspace', 'link-to-io', False, 'portable'): (2,
+                                                       b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('scan_workspace', 'link-to-io', True, 'native'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('scan_workspace', 'link-to-io', True, 'portable'): (2,
+                                                      b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/no'
+                                                      b'te.md\'"}\n',
+                                                      b''),
+ ('scope', 'link-to-denied', False, 'native'): (2,
+                                                b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b''),
+ ('scope', 'link-to-denied', False, 'portable'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('scope', 'link-to-denied', True, 'native'): (2,
+                                               b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('scope', 'link-to-denied', True, 'portable'): (2,
+                                                 b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('scope', 'link-to-io', False, 'native'): (2,
+                                            b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                            b''),
+ ('scope', 'link-to-io', False, 'portable'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('scope', 'link-to-io', True, 'native'): (2,
+                                           b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}\n',
+                                           b''),
+ ('scope', 'link-to-io', True, 'portable'): (2,
+                                             b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                             b'\n',
+                                             b''),
+ ('shared-disposition', 'link-to-denied', False, 'native'): (0,
+                                                             b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                             b'hy", "hostile"], "unknown": {}}}\n',
+                                                             b''),
+ ('shared-disposition', 'link-to-denied', False, 'portable'): (0,
+                                                               b'{"result": {"refusals": {}, "requests": ["first", "h'
+                                                               b'ealthy", "hostile"], "unknown": {}}}\n',
+                                                               b''),
+ ('shared-disposition', 'link-to-denied', True, 'native'): (0,
+                                                            b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                            b'hy", "hostile"], "unknown": {}}}\n',
+                                                            b''),
+ ('shared-disposition', 'link-to-denied', True, 'portable'): (0,
+                                                              b'{"result": {"refusals": {}, "requests": ["first", "h'
+                                                              b'ealthy", "hostile"], "unknown": {}}}\n',
+                                                              b''),
+ ('shared-disposition', 'link-to-io', False, 'native'): (0,
+                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                         b' "hostile"], "unknown": {}}}\n',
+                                                         b''),
+ ('shared-disposition', 'link-to-io', False, 'portable'): (0,
+                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                           b'hy", "hostile"], "unknown": {}}}\n',
+                                                           b''),
+ ('shared-disposition', 'link-to-io', True, 'native'): (0,
+                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                        b' "hostile"], "unknown": {}}}\n',
+                                                        b''),
+ ('shared-disposition', 'link-to-io', True, 'portable'): (0,
+                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                          b'hy", "hostile"], "unknown": {}}}\n',
+                                                          b''),
+ ('shared-resolve', 'link-to-denied', False, 'native'): (0,
+                                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                         b' "hostile"], "unknown": {}}}\n',
+                                                         b''),
+ ('shared-resolve', 'link-to-denied', False, 'portable'): (0,
+                                                           b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                           b'hy", "hostile"], "unknown": {}}}\n',
+                                                           b''),
+ ('shared-resolve', 'link-to-denied', True, 'native'): (0,
+                                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                        b' "hostile"], "unknown": {}}}\n',
+                                                        b''),
+ ('shared-resolve', 'link-to-denied', True, 'portable'): (0,
+                                                          b'{"result": {"refusals": {}, "requests": ["first", "healt'
+                                                          b'hy", "hostile"], "unknown": {}}}\n',
+                                                          b''),
+ ('shared-resolve', 'link-to-io', False, 'native'): (0,
+                                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                                     b'stile"], "unknown": {}}}\n',
+                                                     b''),
+ ('shared-resolve', 'link-to-io', False, 'portable'): (0,
+                                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                       b' "hostile"], "unknown": {}}}\n',
+                                                       b''),
+ ('shared-resolve', 'link-to-io', True, 'native'): (0,
+                                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy", "ho'
+                                                    b'stile"], "unknown": {}}}\n',
+                                                    b''),
+ ('shared-resolve', 'link-to-io', True, 'portable'): (0,
+                                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy",'
+                                                      b' "hostile"], "unknown": {}}}\n',
+                                                      b''),
+ ('verify:--path', 'link-to-denied', False, 'native'): (2,
+                                                        b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                        b'te.md\'"}\n',
+                                                        b''),
+ ('verify:--path', 'link-to-denied', True, 'native'): (2,
+                                                       b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                       b'te.md\'"}\n',
+                                                       b''),
+ ('verify:--path', 'link-to-io', False, 'native'): (2,
+                                                    b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('verify:--path', 'link-to-io', True, 'native'): (2,
+                                                   b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('worktree', 'link-to-denied', False, 'native'): (2,
+                                                   b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                   b'd\'"}\n',
+                                                   b''),
+ ('worktree', 'link-to-denied', False, 'portable'): (2,
+                                                     b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/no'
+                                                     b'te.md\'"}\n',
+                                                     b''),
+ ('worktree', 'link-to-denied', True, 'native'): (2,
+                                                  b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                  b'd\'"}\n',
+                                                  b''),
+ ('worktree', 'link-to-denied', True, 'portable'): (2,
+                                                    b'{"error": "[Errno 13] Permission denied: \'{CASE}/ordinary/note.m'
+                                                    b'd\'"}\n',
+                                                    b''),
+ ('worktree', 'link-to-io', False, 'native'): (2,
+                                               b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                               b'\n',
+                                               b''),
+ ('worktree', 'link-to-io', False, 'portable'): (2,
+                                                 b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                 b'd\'"}\n',
+                                                 b''),
+ ('worktree', 'link-to-io', True, 'native'): (2,
+                                              b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.md\'"}'
+                                              b'\n',
+                                              b''),
+ ('worktree', 'link-to-io', True, 'portable'): (2,
+                                                b'{"error": "[Errno 5] Input/output error: \'{CASE}/ordinary/note.m'
+                                                b'd\'"}\n',
+                                                b'')}
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,fault,planned,backend", tuple(R10_PUBLIC_GOLDENS),
+    ids=["%s-%s-%s-%s" % (seam, fault, "planned" if planned else "no-plan", backend)
+         for seam, fault, planned, backend in R10_PUBLIC_GOLDENS])
+def test_round10_public_target_failure_matches_baseline(tmp_path, seam, fault, planned, backend):
+    import hierarchy_fresh_brief as fresh
+    if backend == "native" and not fresh._reference_descriptors():
+        pytest.skip("directory descriptors unavailable")
+    if fault == "link-to-denied" and os.geteuid() == 0:
+        pytest.skip("mode-000 witness requires an unprivileged runner")
+    expected = R10_PUBLIC_GOLDENS[(seam, fault, planned, backend)]
+    assert r9_public_probe(tmp_path, seam, fault, planned, backend, _probe=R10_PUBLIC_PROBE) == expected
+
+
+
+@lifecycle_only
+@pytest.mark.parametrize("field", ["paths", "scope"])
+@pytest.mark.parametrize("pivot_kind", ["public-link", "private-link", "missing", "not-directory"])
+def test_round9_link_parent_traversal_resolves_before_normalizing(tmp_path, monkeypatch, field, pivot_kind):
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors() or fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    home, public, linked = tmp_path / "owner", tmp_path / "public", tmp_path / "linked"
+    for directory in (home / ".codex", home / "sub", public / ".codex", public / "sub", linked):
+        directory.mkdir(parents=True, exist_ok=True)
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("healthy"))
+    hostile = request("hostile", paths=[str(linked / "auth.json")])
+    if field == "scope":
+        change = SmallChange(ledger, hostile)
+        change.plan["plan"]["path_scopes"] = [hostile["paths"]]
+        change.register()
+    else:
+        ledger.publish(hostile)
+    pivot = home / "pivot"
+    if pivot_kind.endswith("-link"):
+        symlink_or_skip((public if pivot_kind == "public-link" else home) / "sub", pivot,
+                        target_is_directory=True)
+    elif pivot_kind == "not-directory":
+        pivot.write_text("ordinary file")
+    linked.rmdir()
+    symlink_or_skip(str(pivot) + "/../.codex", linked, target_is_directory=True)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    # Round 14 also quarantines a missing/non-directory traversal proof.
+    if pivot_kind in {"private-link", "missing", "not-directory"}:
+        _policy, state = journal.load()
+        assert set(state["requests"]) == {"healthy", "hostile"}
+        assert journal.refusals_for("hostile")
+        assert journal.refusals_for("hostile", consume=True)
+        assert journal.refusals_for("healthy") == []
+        operation.verify()
+        assert not operation.failed_validation
+    else:
+        expected = "symlink paths are not supported: " + str(linked)
+        for attempt in (journal.load, operation.verify):
+            with pytest.raises(alias_router.SymlinkPathError) as caught:
+                attempt()
+            assert str(caught.value).encode() == expected.encode()
+        assert operation.failed_validation
+
+
+@lifecycle_only
+@pytest.mark.parametrize("destination_kind", ["public", "private"])
+def test_round9_optional_evidence_parent_replacement_uses_owning_guard(tmp_path, monkeypatch, destination_kind):
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors() or fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    home, linked, held, public = (tmp_path / name for name in ("owner", "linked", "held", "public"))
+    private = home / ".codex"
+    for directory in (private, linked, public):
+        directory.mkdir(parents=True)
+        (directory / "note.md").write_bytes(b"fixture evidence\n")
+    capability = tmp_path / "symlink-capability"
+    symlink_or_skip(public, capability, target_is_directory=True)
+    capability.unlink()
+    reference = ref(linked / "note.md")
+    destination = private if destination_kind == "private" else public
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
+    real_os, descriptors, observations = fresh.os, {}, []
+    def actual(path, kwargs):
+        return Path(path) if Path(path).is_absolute() else descriptors[kwargs["dir_fd"]] / path
+    def stated(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        assert private not in value.parents, value
+        if value == linked:
+            observations.append(value)
+            if len(observations) == 2:
+                linked.rename(held)
+                linked.symlink_to(destination, target_is_directory=True)
+        return real_os.stat(path, *args, **kwargs)
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        assert value != private and private not in value.parents, value
+        descriptor = real_os.open(path, *args, **kwargs)
+        descriptors[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "open": opened, "close": closed}))
+    brief = fresh.Brief()
+    brief.evidence(reference, reference)
+    assert len(observations) >= 2
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    if destination_kind == "private":
+        with pytest.raises(alias_router.PrivatePathError):
+            brief.operation.verify()
+        assert brief.operation.failed_validation
+    else:
+        brief.operation.verify()
+        assert not brief.operation.failed_validation
+    assert not descriptors
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["policy", "identity"])
+@pytest.mark.parametrize("site", ["verify", "prove", "evidence", "unread", "brief-preflight", "brief-content",
+    "messages", "store", "case-insensitive", "case-default"])
+def test_round9_global_policy_errors_survive_every_boundary(tmp_path, pilot, monkeypatch, fault, site):
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_router as router
+    import hierarchy_small_change_dispatch as dispatch
+    from tests.integration.test_hierarchy_workspace import Workspace
+    if not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    root, _brief = pilot
+    note = tmp_path / "fatal.md"
+    note.write_bytes(b"fixture evidence\n")
+    reference = {"path": str(note), "sha256": hashlib.sha256(note.read_bytes()).hexdigest()}
+    operation = fresh._Operation()
+    mailbox = fresh._CapturedMailbox(root, _operation=operation)
+    if site == "verify": operation.read(note)
+    if site == "messages": invoke(root, "publish", message(identifier="fatal-message"))
+    if site == "store":
+        workspace = Workspace(tmp_path)
+        workspace.run("init", {"writer_limit": 3, "heavy_limit": 1})
+        store = dispatch._CapturedStore(workspace.store, operation)
+    brief = fresh.Brief(_operation=operation)
+    error = (router.CapturedPolicyError("host-home configuration changed during capture") if fault == "policy"
+             else ValueError("cannot determine private directory identity"))
+    guard, original_current, injected, enabled = operation.path_guard, router._CapturedPathGuard.current, [], [True]
+    def current(self):
+        frame, frames = sys._getframe(1), []
+        while frame is not None:
+            frames.append((frame.f_code.co_name, frame.f_code.co_filename))
+            frame = frame.f_back
+        names = {name for name, _filename in frames}
+        selected = {
+            "verify": "verify" in names and "_reference_parent" in names,
+            "evidence": "evidence" in names and "read" in names,
+            "unread": "_unread_attachment" in names and "read" in names and "brief" not in names,
+            "brief-preflight": "brief" in names and "read" not in names,
+            "brief-content": "brief" in names and "read" in names,
+            "messages": "declared_path" in names,
+            "store": "_private_paths" in names and any(name == "load" and filename.endswith("hierarchy_small_change_dispatch.py")
+                                                           for name, filename in frames),
+            "case-insensitive": "_case_insensitive" in names and "_reference_parent" in names,
+            "case-default": "_case_insensitive" in names and "_reference_parent" in names,
+            "prove": "_case_insensitive" in names and "_reference_parent" in names,
+        }[site]
+        if self is guard and enabled[0] and selected:
+            injected.append(site)
+            if fault == "identity": guard._identity_error = error
+            raise error
+        return original_current(self)
+    # The owned host-policy boundary, never pytest's global OS namespace.
+    monkeypatch.setattr("hierarchy_router._CapturedPathGuard.current", current)
+    def run():
+        if site == "verify": operation.verify()
+        elif site == "prove": operation.prove(lambda: router._case_insensitive(tmp_path, (), _guard=guard))
+        elif site == "evidence": brief.evidence(reference, reference)
+        elif site == "unread": fresh._unread_attachment(mailbox, reference)
+        elif site.startswith("brief-"): mailbox.brief(reference)
+        elif site == "messages": mailbox.messages()
+        elif site == "store": store.load()
+        elif site == "case-default":
+            with operation.capture():
+                router._case_insensitive(tmp_path, ())
+        else:
+            with operation.capture():
+                router._case_insensitive(tmp_path, (), _guard=guard)
+    with pytest.raises(type(error)) as caught:
+        run()
+    assert injected, site
+    assert caught.value is error
+    assert operation.failed_validation
+    assert not brief.sections["Evidence references"]
+    enabled[0], guard._identity_error = False, None
+    def retry():
+        with pytest.raises(type(error)) as caught:
+            operation.verify()
+        assert caught.value is error
+    retry()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in (pool.submit(retry), pool.submit(retry)): future.result(timeout=30)
+    healthy = fresh._Operation()
+    assert healthy.read(note)[0] == reference
+    healthy.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("shape", ["cycle", "hop-limit"])
+def test_round10_unproved_link_chains_are_bounded_and_quarantined(tmp_path, monkeypatch, shape):
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    native_read = fresh._symlink_reader()
+    if native_read is None: pytest.skip("bounded readlinkat unavailable")
+    linked, private = tmp_path / "linked", tmp_path / "private"
+    linked.mkdir()
+    private.mkdir()
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("healthy"))
+    ledger.publish(request("hostile", paths=[str(linked / "auth.json")]))
+    linked.rmdir()
+    if shape == "cycle":
+        symlink_or_skip(tmp_path / "second", linked, target_is_directory=True)
+        symlink_or_skip(linked, tmp_path / "second", target_is_directory=True)
+    else:
+        for index in range(41):
+            path = linked if index == 0 else tmp_path / ("hop-%d" % index)
+            target = private if index == 40 else tmp_path / ("hop-%d" % (index + 1))
+            symlink_or_skip(target, path, target_is_directory=True)
+    real_os, live, sizes = fresh.os, set(), []
+    def opened(path, *args, **kwargs):
+        assert Path(path).name != private.name, "private target opened"
+        descriptor = real_os.open(path, *args, **kwargs)
+        live.add(descriptor)
+        return descriptor
+    def closed(descriptor):
+        live.remove(descriptor)
+        return real_os.close(descriptor)
+    def read(directory, name, size):
+        sizes.append(size)
+        assert len(sizes) <= 40
+        assert 0 < size <= 4096
+        return native_read(directory, name, size)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os),
+        "environ": {**os.environ, "ROUND9_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "open": opened, "close": closed}))
+    monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", lambda: read)
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    expected = "symlink paths are not supported: " + str(linked)
+    _policy, state = journal.load()
+    assert set(state["requests"]) == {"healthy", "hostile"}
+    assert journal.refusals_for("hostile") == [(str(linked / "auth.json"), expected)]
+    assert journal.refusals_for("healthy") == []
+    assert 0 < len(sizes) <= 40
+    assert not live and not operation.failed_validation
+    operation.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["policy", "identity"])
+def test_round9_global_fault_invalidates_every_capture_of_its_request(tmp_path, monkeypatch, fault):
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_router as router
+    private, note = tmp_path / "private", tmp_path / "note.md"
+    private.mkdir()
+    note.write_bytes(b"healthy independent evidence\n")
+    environment = {**os.environ, "ROUND9_HOME": str(private)}
+    real_os, denied = router.os, [fault == "identity"]
+    def stated(path, *args, **kwargs):
+        if Path(path) == private and denied[0]:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(private))
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated, "environ": environment}))
+    owner = fresh._Operation()
+    expected_type = router.CapturedPolicyError if fault == "policy" else ValueError
+    with owner.path_guard.active():
+        first = fresh._Operation()
+        if fault == "policy": environment["ROUND9_HOME"] = str(tmp_path / "changed")
+        with pytest.raises(expected_type) as caught:
+            first.prove(first.path_guard.identities)
+        original = caught.value
+        assert first.failed_validation
+        denied[0], environment["ROUND9_HOME"] = False, str(private)
+        siblings = [fresh._Operation(), fresh._Operation()]
+        assert all(operation.path_guard is owner.path_guard for operation in siblings)
+        def prove(operation):
+            with pytest.raises(expected_type) as caught:
+                operation.prove(lambda: None)
+            assert caught.value is original
+            assert operation.failed_validation
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for future in [pool.submit(prove, operation) for operation in siblings]: future.result(timeout=30)
+        with pytest.raises(expected_type) as caught:
+            owner.verify()
+        assert caught.value is original and owner.failed_validation
+    independent = fresh._Operation()
+    independent.read(note)
+    independent.verify()
+
+
+@lifecycle_only
+def test_round9_concurrent_captures_share_one_lazy_root_probe(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_router as router
+    private = tmp_path / "private"
+    private.mkdir()
+    real_os, calls, second, start = router.os, [], threading.Event(), threading.Barrier(2)
+    def stated(path, *args, **kwargs):
+        if Path(path) == private:
+            calls.append(private)
+            if len(calls) == 1:
+                # Model a slow OS boundary. The assertion is the probe count,
+                # never elapsed time; a serialized reader needs no second call.
+                second.wait(1)
+            else:
+                second.set()
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path)
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", "private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND9_HOME": str(private)}}))
+    owner = fresh._Operation()
+    with owner.path_guard.active():
+        children = [fresh._Operation(), fresh._Operation()]
+    def prove(operation):
+        start.wait(timeout=10)
+        return operation.prove(operation.path_guard.identities)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(prove, operation) for operation in children]:
+            assert future.result(timeout=30) is not None
+    assert calls == [private]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["policy", "identity"])
+def test_round9_an_ambient_failure_cannot_poison_an_independent_request(tmp_path, monkeypatch, fault):
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_router as router
+    private = tmp_path / "private"
+    private.mkdir()
+    environment = {**os.environ, "ROUND9_HOME": str(private)}
+    real_os, denied = router.os, [fault == "identity"]
+    def stated(path, *args, **kwargs):
+        if Path(path) == private and denied[0]:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(private))
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND9_HOME", ".codex"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated, "environ": environment}))
+    failed = fresh._Operation()
+    if fault == "policy": environment["ROUND9_HOME"] = str(tmp_path / "changed")
+    try:
+        failed.prove(failed.path_guard.identities)
+    except ValueError:
+        assert failed.failed_validation
+        denied[0], environment["ROUND9_HOME"] = False, str(private)
+        independent = fresh._Operation()
+        assert independent.path_guard is not failed.path_guard
+        brief = fresh.Brief(_operation=independent)
+        missing = {"path": str(tmp_path / "missing.md"), "sha256": "0" * 64}
+        origin = {"path": str(tmp_path / "origin.json"), "sha256": "1" * 64}
+        brief.evidence(missing, origin)
+        assert not independent.failed_validation
+        assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+        independent.verify()
+    else:
+        pytest.fail("global failure witness did not refuse")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("field", ["paths", "scope", "disposition", "resolve"])
+@pytest.mark.parametrize("backend", ["native", "unsupported"])
+def test_round8_stored_public_symlink_stays_global(tmp_path, monkeypatch, field, backend):
+    import hierarchy_fresh_brief as fresh
+    if backend == "native" and not fresh._reference_descriptors():
+        pytest.skip("directory descriptors unavailable")
+    ledger = Ledger(tmp_path)
+    linked, public = tmp_path / "linked", tmp_path / "public"
+    linked.mkdir()
+    public.mkdir()
+    bad, healthy = request("hostile", paths=[str(linked / "file.py")]), request("healthy")
+    ledger.publish(healthy)
+    if field == "scope":
+        change = SmallChange(ledger, bad)
+        change.plan["plan"]["path_scopes"] = [bad["paths"]]
+        change.register()
+    elif field in {"disposition", "resolve"}:
+        first = request("first")
+        ledger.publish(first)
+        extra = {}
+        if field == "resolve":
+            ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+            extra["blocker_sha256"] = fresh.digest(ledger.status()["requests"]["first"]["resolution"])
+        ledger.event(field, **({"status": "FINAL"} if field == "disposition" else extra),
+            resolution={"kind": "next", "request": raw_request(bad), "evidence": ledger.evidence}, **ledger.target(first))
+    else:
+        ledger.publish(bad)
+    linked.rmdir()
+    symlink_or_skip(public, linked, target_is_directory=True)
+    if backend == "unsupported":
+        monkeypatch.setattr("hierarchy_fresh_brief._reference_descriptors", lambda: False)
+    expected = "symlink paths are not supported: " + str(linked)
+    def probe():
+        operation = fresh._Operation()
+        journal = operation.lifecycle(ledger.path)
+        if field in {"disposition", "resolve"}:
+            _policy, state = journal.load()
+            assert set(state["requests"]) == {"first", "healthy"}
+            assert journal.unknown_rows == {"first": "lifecycle row UNKNOWN at event event-%d: %s" % (ledger.counter, expected)}
+            assert journal.private_refusals == {}
+            operation.verify()
+            return operation
+        with pytest.raises(alias_router.SymlinkPathError) as caught:
+            journal.load()
+        assert str(caught.value).encode() == expected.encode()
+        return operation
+    owners = [probe()]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owners += [future.result(timeout=30) for future in (pool.submit(probe), pool.submit(probe))]
+    linked.unlink()
+    linked.mkdir()
+    for operation in owners:
+        if field in {"disposition", "resolve"}:
+            operation.verify()
+            continue
+        with pytest.raises(alias_router.SymlinkPathError) as caught:
+            operation.verify()
+        assert str(caught.value).encode() == expected.encode()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["oversize", "zero-size", "zero-inode", "lost-inode", "unavailable", "denied", "truncated"])
+def test_round10_unproved_private_link_is_quarantined_and_closes_descriptors(tmp_path, monkeypatch, fault):
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    ledger = Ledger(tmp_path)
+    linked, private = tmp_path / "linked", tmp_path / "private"
+    linked.mkdir()
+    private.mkdir()
+    ledger.publish(request("healthy"))
+    ledger.publish(request("hostile", paths=[str(linked / "file.py")]))
+    linked.rmdir()
+    symlink_or_skip(private, linked, target_is_directory=True)
+    real_os, live, reads = fresh.os, {}, []
+    native_read = fresh._symlink_reader()
+    if fault == "lost-inode" and native_read is None: pytest.skip("bounded readlinkat unavailable")
+    def actual(path, kwargs):
+        value = Path(path)
+        return live[kwargs["dir_fd"]] / value if not value.is_absolute() and kwargs.get("dir_fd") is not None else value
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        assert value != linked and linked not in value.parents
+        assert value != private and private not in value.parents
+        descriptor = real_os.open(path, *args, **kwargs)
+        live[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        live.pop(descriptor, None)
+        return real_os.close(descriptor)
+    def stated(path, *args, **kwargs):
+        info = real_os.stat(path, *args, **kwargs)
+        if actual(path, kwargs) == linked and (fault in {"oversize", "zero-size", "zero-inode"} or fault == "lost-inode" and reads):
+            size = fresh.MAX_SYMLINK_BYTES + 1 if fault == "oversize" else 0 if fault == "zero-size" else info.st_size
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=0 if fault in {"zero-inode", "lost-inode"} else info.st_ino, st_mode=info.st_mode,
+                st_size=size,
+                st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+        return info
+    def read(directory, name, size):
+        reads.append(size)
+        assert 0 < size <= fresh.MAX_SYMLINK_BYTES
+        if fault == "lost-inode": return native_read(directory, name, size)
+        if fault == "denied": raise PermissionError("UNTRUSTED readlink failure")
+        return os.fsencode(private) + b"/extra"
+    def reader():
+        if fault in {"oversize", "zero-size", "zero-inode"}:
+            raise AssertionError("reader reached before declared-size refusal")
+        return None if fault == "unavailable" else read
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND8_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND8_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "open": opened, "close": closed}))
+    monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", reader)
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    expected = "symlink paths are not supported: " + str(linked)
+    _policy, state = journal.load()
+    assert set(state["requests"]) == {"healthy", "hostile"}
+    assert journal.refusals_for("hostile") == [(str(linked / "file.py"), expected)]
+    assert journal.refusals_for("healthy") == []
+    operation.verify()
+    assert not operation.failed_validation
+    assert not live
+    assert reads == ([] if fault in {"oversize", "zero-size", "zero-inode", "unavailable"} else [len(os.fsencode(private))])
+
+
+@lifecycle_only
+@pytest.mark.parametrize("changed", ["link", "parent", "inner-link"])
+def test_round10_link_classification_quarantines_concurrent_replacement(tmp_path, monkeypatch, changed):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    if not fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    native_read = fresh._symlink_reader()
+    if native_read is None: pytest.skip("bounded readlinkat unavailable")
+    ledger = Ledger(tmp_path)
+    parent, private, public = tmp_path / "links", tmp_path / "private", tmp_path / "public"
+    parent.mkdir()
+    private.mkdir()
+    public.mkdir()
+    linked = parent / "linked"
+    linked.mkdir()
+    ledger.publish(request("healthy"))
+    ledger.publish(request("hostile", paths=[str(linked / "file.py")]))
+    linked.rmdir()
+    second = tmp_path / "second"
+    if changed == "inner-link": symlink_or_skip(private, second, target_is_directory=True)
+    symlink_or_skip(public if changed == "link" else second if changed == "inner-link" else private,
+                    linked, target_is_directory=True)
+    entered, release = threading.Event(), threading.Event()
+    def read(directory, name, size):
+        raw = native_read(directory, name, size)
+        if changed == "inner-link" and name != "second": return raw
+        entered.set()
+        assert release.wait(10), "link replacement was not released"
+        return raw
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND8_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND8_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief._symlink_reader", lambda: read)
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    expected = "symlink paths are not supported: " + str(linked)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(journal.load)
+        try:
+            assert entered.wait(10), "link classifier did not reach the reader"
+            if changed == "link":
+                linked.unlink()
+                symlink_or_skip(private, linked, target_is_directory=True)
+            elif changed == "inner-link":
+                second.unlink()
+                symlink_or_skip(public, second, target_is_directory=True)
+            else:
+                parent.rename(tmp_path / "old-links")
+                parent.mkdir()
+                symlink_or_skip(public, linked, target_is_directory=True)
+        finally:
+            release.set()
+        _policy, state = pending.result(timeout=30)
+        assert set(state["requests"]) == {"healthy", "hostile"}
+    assert journal.refusals_for("hostile") == [(str(linked / "file.py"), expected)]
+    assert journal.refusals_for("healthy") == []
+    assert not operation.failed_validation
+    operation.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("spelling", ["firmlink", "absolute-symlink", "relative-symlink"])
+@pytest.mark.parametrize("kind", ["disposition", "resolve"])
+def test_round7_shared_evidence_path_does_not_exempt_successor_scope(tmp_path, monkeypatch, kind, spelling):
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    from tests.integration.test_hierarchy_router import Loop
+    if not fresh._reference_descriptors(): pytest.skip("secure lock requires directory descriptors")
+    world = Loop(tmp_path)
+    world.team("engine")
+    alias, private = tmp_path / "firmlink", tmp_path / "private"
+    alias.mkdir()
+    private.mkdir()
+    first, healthy = request("first"), request("healthy")
+    following = request("following", paths=[str(alias / "auth.json")])
+    world.ledger.publish(first)
+    world.approved(healthy)
+    extra = {}
+    if kind == "resolve":
+        world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked",
+            "owner": "engine/coordinator", "next_decision": "review", "condition": "reviewed",
+            "evidence": world.ledger.evidence}, **world.ledger.target(first))
+        extra["blocker_sha256"] = fresh.digest(world.ledger.status()["requests"]["first"]["resolution"])
+    world.ledger.event(kind, **({"status": "FINAL"} if kind == "disposition" else extra),
+        resolution={"kind": "next", "request": raw_request(following),
+                    "evidence": [{"path": following["paths"][0], "sha256": "0" * 64}]},
+        **world.ledger.target(first))
+    world.ledger.approve(following)
+    if spelling != "firmlink":
+        alias.rmdir()
+        target = private if spelling == "absolute-symlink" else os.path.relpath(private, alias.parent)
+        symlink_or_skip(target, alias, target_is_directory=True)
+    real_os, mark, descriptors = fresh.os, private.stat(), {}
+    def actual(path, kwargs):
+        value = Path(path)
+        return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() and kwargs.get("dir_fd") is not None else value
+    def stated(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        if value == alias and spelling == "firmlink": return mark
+        assert alias not in value.parents, "private descendant metadata"
+        return real_os.stat(path, *args, **kwargs)
+    def lstated(path, *args, **kwargs):
+        if Path(path) == alias and spelling == "firmlink": return mark
+        assert alias not in Path(path).parents, "private descendant metadata"
+        return real_os.lstat(path, *args, **kwargs)
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        assert value != alias and alias not in value.parents, "private content open"
+        descriptor = real_os.open(path, *args, **kwargs)
+        descriptors[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND7_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND7_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "stat": stated, "lstat": lstated,
+        "open": opened, "close": closed}))
+    def probe():
+        result = alias_router.status(life.Lifecycle(world.ledger.path), workspace.Store(world.workspace.store), 5)
+        rows = {row["request_id"]: row for row in result["requests"]}
+        assert (rows["following"]["state"], rows["following"].get("reason")) == ("held", "reference_unavailable")
+        expected = ("owner-private host directory is not an input" if spelling == "firmlink"
+                    else "symlink paths are not supported: " + str(alias))
+        assert rows["following"]["detail"] == expected
+        assert rows["healthy"]["state"] == "ready"
+    for _ in range(2): probe()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe), pool.submit(probe)]: future.result(timeout=30)
+    assert not descriptors
+
+
+@lifecycle_only
+@pytest.mark.parametrize("field", ["paths", "scope", "disposition", "resolve"])
+@pytest.mark.parametrize("failure", ["not-directory", "denied", "changed"])
+def test_round7_stored_walk_refusal_stays_with_its_row(tmp_path, monkeypatch, field, failure):
+    import hierarchy_fresh_brief as fresh
+    ledger = Ledger(tmp_path)
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    bad, healthy = request("hostile", paths=[str(blocked / "scope")]), request("healthy")
+    ledger.publish(healthy)
+    target = bad
+    if field == "scope":
+        change = SmallChange(ledger, bad)
+        change.plan["plan"]["path_scopes"] = [bad["paths"]]
+        change.register()
+    elif field in {"disposition", "resolve"}:
+        first = request("first")
+        ledger.publish(first)
+        extra = {}
+        if field == "resolve":
+            ledger.event("disposition", status="HOLD", resolution={"kind": "blocked", "owner": "engine/coordinator",
+                "next_decision": "review", "condition": "reviewed", "evidence": ledger.evidence}, **ledger.target(first))
+            extra["blocker_sha256"] = fresh.digest(ledger.status()["requests"]["first"]["resolution"])
+        ledger.event(field, **({"status": "FINAL"} if field == "disposition" else extra),
+            resolution={"kind": "next", "request": raw_request(bad), "evidence": ledger.evidence}, **ledger.target(first))
+    else:
+        ledger.publish(bad)
+    if failure == "not-directory":
+        blocked.rmdir()
+        blocked.write_text("ordinary file")
+    real_os = fresh.os
+    def stated(path, *args, **kwargs):
+        if Path(path).name == "blocked":
+            if failure == "denied": raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(blocked))
+            if failure == "changed": raise ValueError("reference parent changed while opening")
+        return real_os.stat(path, *args, **kwargs)
+    def lstated(path, *args, **kwargs):
+        if Path(path).name == "blocked": return stated(path, *args, **kwargs)
+        return real_os.lstat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "stat": stated, "lstat": lstated}))
+    def probe():
+        operation = fresh._Operation()
+        journal = operation.lifecycle(ledger.path)
+        if failure == "denied" or failure == "changed" and field not in {"disposition", "resolve"}:
+            expected_type = PermissionError if failure == "denied" else ValueError
+            expected = (str(PermissionError(errno.EACCES, os.strerror(errno.EACCES), bad["paths"][0]))
+                        if failure == "denied" else "reference parent changed while opening")
+            with pytest.raises(expected_type) as caught:
+                journal.load()
+            assert str(caught.value) == expected
+            with pytest.raises(expected_type) as caught:
+                operation.verify()
+            assert str(caught.value) == expected
+            return
+        _policy, state = journal.load()
+        if failure == "changed":
+            assert set(state["requests"]) == {"first", "healthy"}
+            assert journal.unknown_rows
+            assert journal.private_refusals == {}
+            operation.verify()
+            return
+        assert {target["id"], "healthy"} <= state["requests"].keys()
+        assert target["id"] not in journal.unknown_rows
+        for _ in range(2): assert journal.refusals_for(target["id"], consume=True) == []
+        assert journal.refusals_for("healthy") == []
+        operation.verify()
+    probe()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe), pool.submit(probe)]: future.result(timeout=30)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("failure", ["missing", "hash", "witness", "symlink"])
+def test_round7_consumed_evidence_failure_latches_its_publishing_parent(tmp_path, failure):
+    import hierarchy_fresh_brief as fresh
+    ledger = Ledger(tmp_path)
+    bad, healthy = request("hostile"), request("healthy")
+    artifact = tmp_path / "row-evidence"
+    artifact.write_bytes(b"valid evidence")
+    reference = {"path": str(artifact), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
+    ledger.ready(bad)
+    event_path = sorted((ledger.path / "events").glob("*.json"))[-1]
+    record = json.loads(event_path.read_text())
+    record["envelope"]["event"]["gates"]["source"] = [reference]
+    record["event_sha256"] = fresh.digest(record["envelope"])
+    event_path.write_bytes(fresh.encoded(record) + b"\n")
+    ledger.publish(healthy)
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    journal.load()
+    if failure == "witness": assert journal.refusals_for("hostile", consume=True) == []
+    if failure in {"missing", "symlink"}: artifact.unlink()
+    if failure == "symlink":
+        public = tmp_path / "public-evidence"
+        public.write_bytes(b"valid evidence")
+        symlink_or_skip(public, artifact)
+    elif failure != "missing": artifact.write_bytes(b"changed evidence")
+    first_failure = None
+    for _ in range(2):
+        refusals = journal.refusals_for("hostile", consume=True)
+        assert refusals and operation.failed_validation
+        if first_failure is None:
+            first_failure = ("captured attachment identity/content metadata changed: " + str(artifact)
+                             if failure == "witness" else refusals[0][1])
+        with pytest.raises(FileNotFoundError if failure == "missing" else ValueError) as caught:
+            operation.verify()
+        assert str(caught.value) == first_failure
+    def probe():
+        owner = fresh._Operation()
+        captured = owner.lifecycle(ledger.path)
+        captured.load()
+        assert captured.refusals_for("healthy", consume=True) == []
+        owner.verify()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in [pool.submit(probe), pool.submit(probe)]: future.result(timeout=30)
+    if failure == "symlink": artifact.unlink()
+    artifact.write_bytes(b"valid evidence")
+    with pytest.raises(FileNotFoundError if failure == "missing" else ValueError) as caught:
+        operation.verify()
+    assert str(caught.value) == first_failure
+
+
+@lifecycle_only
+def test_round7_policy_authority_symlink_refuses_globally(tmp_path):
+    import hierarchy_fresh_brief as fresh
+    authority, public = tmp_path / "authority", tmp_path / "public"
+    authority.mkdir()
+    public.mkdir()
+    ledger = Ledger(tmp_path, policy_changes={"authority": [{"path": str(authority / "auth.json"), "sha256": "0" * 64}]})
+    ledger.publish(request("healthy"))
+    authority.rmdir()
+    symlink_or_skip(public, authority, target_is_directory=True)
+    operation = fresh._Operation()
+    captured = operation.lifecycle(ledger.path)
+    expected = "symlink paths are not supported: " + str(authority)
+    with pytest.raises(alias_router.SymlinkPathError) as caught:
+        captured.load()
+    assert str(caught.value) == expected
+    authority.unlink()
+    authority.mkdir()
+    for _ in range(2):
+        with pytest.raises(alias_router.SymlinkPathError) as caught:
+            operation.verify()
+        assert str(caught.value) == expected
+
+
+@lifecycle_only
+def test_round7_successor_policy_failure_is_global(tmp_path, monkeypatch):
+    import hierarchy_fresh_brief as fresh
+    ledger = Ledger(tmp_path)
+    first = request("first")
+    blocked, private = tmp_path / "blocked", tmp_path / "private"
+    blocked.mkdir()
+    private.mkdir()
+    ledger.publish(first)
+    following = request("following", paths=[str(blocked / "scope")])
+    ledger.event("disposition", status="FINAL", resolution={"kind": "next", "request": raw_request(following),
+                 "evidence": ledger.evidence}, **ledger.target(first))
+    environment = {**os.environ, "ROUND7_HOME": str(private)}
+    real_os = fresh.os
+    def stated(path, *args, **kwargs):
+        if Path(path).name == "blocked": environment["ROUND7_HOME"] = str(tmp_path / "changed-home")
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND7_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os), "environ": environment}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "stat": stated}))
+    operation = fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    with pytest.raises(alias_router.CapturedPolicyError, match="^host-home configuration changed during capture$"):
+        journal.load()
+    environment["ROUND7_HOME"] = str(private)
+    for _ in range(2):
+        with pytest.raises(alias_router.CapturedPolicyError, match="^host-home configuration changed during capture$"):
+            operation.verify()
+
+
+@pytest.mark.parametrize("site", ["lifecycle", "lifecycle-direct", "mailbox", "store"])
+def test_round6_failed_captured_constructor_latches_before_witnesses(tmp_path, monkeypatch, site):
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_small_change_dispatch as dispatch
+    private = tmp_path / "private"
+    private.mkdir()
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    operation = fresh._Operation()
+    def construct():
+        if site == "lifecycle": return operation.lifecycle(private)
+        if site == "lifecycle-direct": return fresh._CapturedLifecycle(private, operation)
+        if site == "mailbox": return fresh._CapturedMailbox(private, _operation=operation)
+        return dispatch._CapturedStore(private, operation)
+    for attempt in (construct, operation.verify, construct, operation.verify):
+        with pytest.raises(ValueError, match="^owner-private host directory is not an input$"):
+            attempt()
+        assert operation.failed_validation
+    assert operation.files == {} and operation.folders == {}
+    fresh._Operation().verify()
+
+
+@pytest.mark.parametrize("entry", ["inspect", "locate", "evidence"])
+def test_round6_standalone_inspect_has_one_owning_snapshot(tmp_path, pilot, monkeypatch, entry):  # noqa: F811
+    import hierarchy_fresh_brief as fresh
+    private, target = tmp_path / "private", tmp_path / "note"
+    private.mkdir()
+    target.write_bytes(b"public fixture")
+    reference = {"path": str(target), "sha256": hashlib.sha256(b"public fixture").hexdigest()}
+    brief = fresh.Brief()
+    for kind in ("one", "two"): brief.add(fresh.SECTIONS[0], kind, reference)
+    raw = brief.render("a/orchestrator", "2026-01-01T00:00:00Z", 1)
+    real_os, calls = alias_router.os, []
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private: calls.append(path)
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    for _ in range(2):
+        calls.clear()
+        if entry == "inspect": assert fresh.inspect(raw) == 2
+        elif entry == "locate": assert fresh.locate(pilot[0], "a")[0].root == pilot[0]
+        else:
+            scoped = fresh.Brief(_authoritative=True)
+            for _ in range(2): scoped.evidence(reference, reference)
+            scoped.operation.verify()
+        assert calls == [private], calls
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_round6_concurrent_proofs_keep_request_identity_and_failure_local(tmp_path, monkeypatch, failed):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import ContextVar
+    from threading import Barrier
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_small_change_dispatch as dispatch
+    private, public = tmp_path / "private", tmp_path / "public"
+    private.mkdir(); public.mkdir()
+    real_os, calls, request_id = alias_router.os, [], ContextVar("round6_request", default=None)
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private: calls.append(request_id.get())
+        return real_os.stat(path, *args, **kwargs)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated,
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    ready = Barrier(2)
+    def run(index):
+        request_id.set(index)
+        operation = fresh._Operation()
+        ready.wait(timeout=10)
+        def verification():
+            dispatch.checked_path(public)
+            operation.exists(public)
+            if failed and index == 0: operation.read(private / "never-opened")
+        if failed and index == 0:
+            for _ in range(2):
+                with pytest.raises(ValueError, match="^owner-private host directory is not an input$"):
+                    operation.prove(verification)
+            assert operation.failed_validation
+        else:
+            operation.prove(verification)
+            assert not operation.failed_validation
+        assert fresh._PATH_GUARD.get() is None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(run, range(2)))
+    assert sorted(calls) == [0, 1]
+
+
+@lifecycle_only
+def test_round6_policy_validation_uses_inert_guard_bound_paths(tmp_path, monkeypatch):
+    import hierarchy_fresh_brief as fresh
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("healthy"))
+    def pinned_path(_value):
+        raise AssertionError("pinned bottom-up safe_path reached during captured replay")
+    monkeypatch.setattr("hierarchy_lifecycle.safe_path", pinned_path)
+    operation = fresh._Operation()
+    assert "healthy" in operation.lifecycle(ledger.path).load()[1]["requests"]
+    operation.verify()
+
+
+def test_round6_no_plan_optional_public_symlink_remains_unverified(tmp_path):
+    import hierarchy_fresh_brief as fresh
+    target, linked = tmp_path / "public.md", tmp_path / "linked.md"
+    target.write_bytes(b"public fixture")
+    symlink_or_skip(target, linked)
+    brief = fresh.Brief()
+    brief.evidence({"path": str(linked), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()},
+                   {"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
+    assert [row["kind"] for row in brief.sections["Evidence references"]] == ["unverified_evidence"]
+    brief.operation.verify()
+
+
+@lifecycle_only
+@pytest.mark.parametrize("spelling", ["symlink", "firmlink"])
+@pytest.mark.parametrize("field", ["paths", "scope", "evidence"])
+def test_round6_stored_lifecycle_alias_is_row_local(tmp_path, monkeypatch, spelling, field):
+    import hierarchy_fresh_brief as fresh
+    ledger = Ledger(tmp_path)
+    private, alias = tmp_path / "private", tmp_path / "alias"
+    private.mkdir()
+    if spelling == "symlink": symlink_or_skip(private, alias, target_is_directory=True)
+    else: alias.mkdir()
+    bad, healthy = request("bad-alias"), request("healthy")
+    bad["paths"] = [str(alias / "auth.json")]
+    # Publish valid source bytes first, then replace only the stored canonical capsule and chain digest.
+    ledger.publish(healthy)
+    if field == "scope":
+        change = SmallChange(ledger, request("bad-alias"))
+        change.register()
+    else:
+        ledger.publish(request("bad-alias"))
+        if field == "evidence":
+            ledger.approve(request("bad-alias"))
+            ledger.admit(request("bad-alias"))
+    event_path = sorted((ledger.path / "events").glob("*.json"))[-1]
+    record = json.loads(event_path.read_text())
+    if field == "paths": record["envelope"]["event"]["request"] = raw_request(bad)
+    elif field == "evidence":
+        record["envelope"]["event"]["gates"]["source"] = [{"path": str(alias / "auth.json"), "sha256": "0" * 64}]
+    else:
+        proposal = alias_fresh.life.raw_value(record["envelope"]["event"]["proposal"])
+        proposal["request"] = raw_request(bad)
+        proposal["plan"]["request_sha256"] = raw_request(bad)["sha256"]
+        proposal["plan"]["path_scopes"] = [bad["paths"]]
+        record["envelope"]["event"]["proposal"] = raw_request(proposal)
+        record["envelope"]["event"]["request_sha256"] = raw_request(bad)["sha256"]
+        publish_path = sorted((ledger.path / "events").glob("*.json"))[-2]
+        published = json.loads(publish_path.read_text())
+        published["envelope"]["event"]["request"] = raw_request(bad)
+        published["event_sha256"] = alias_fresh.digest(published["envelope"])
+        publish_path.write_bytes(alias_fresh.encoded(published) + b"\n")
+        record["previous"] = alias_fresh.digest(published)
+    record["event_sha256"] = alias_fresh.digest(record["envelope"])
+    event_path.write_bytes(alias_fresh.encoded(record) + b"\n")
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr("hierarchy_router._home_declarations", lambda: (("ROUND6_HOME", ".private"),))
+    real_os, private_mark = fresh.os, private.stat()
+    below, descriptors = [], {}
+    def actual(path, kwargs):
+        value = Path(path)
+        return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() and kwargs.get("dir_fd") is not None else value
+    def stated(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        if alias in value.parents: below.append(value)
+        if spelling == "firmlink" and value == alias: return private_mark
+        return real_os.stat(path, *args, **kwargs)
+    def lstated(path, *args, **kwargs):
+        if alias in Path(path).parents: below.append(Path(path))
+        if spelling == "firmlink" and Path(path) == alias: return private_mark
+        return real_os.lstat(path, *args, **kwargs)
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        if value == alias or alias in value.parents: below.append(value)
+        descriptor = real_os.open(path, *args, **kwargs)
+        descriptors[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ROUND6_HOME": str(private)}}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os), "stat": stated, "lstat": lstated,
+        "open": opened, "close": closed}))
+    def pinned_path(_value):
+        raise AssertionError("pinned bottom-up safe_path reached during captured replay")
+    monkeypatch.setattr("hierarchy_lifecycle.safe_path", pinned_path)
+    for _ in range(2):
+        operation = fresh._Operation()
+        journal = operation.lifecycle(ledger.path)
+        _policy, state = journal.load()
+        assert {"bad-alias", "healthy"} <= state["requests"].keys()
+        assert journal.refusals_for("bad-alias", consume=True)
+        assert journal.refusals_for("bad-alias", consume=True)
+        assert journal.refusals_for("healthy") == []
+        if field == "evidence":
+            with pytest.raises(alias_router.SymlinkPathError if spelling == "symlink" else alias_router.PrivatePathError):
+                operation.verify()
+        else:
+            operation.verify()
+    assert below == []
+    assert descriptors == {}
+
+
+PRIVACY_ACCESS_DRIVER = r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import hierarchy_fresh_brief as fresh
+import hierarchy_router as router
+root, private, alias, target = map(Path, sys.argv[2:6])
+action, backend = sys.argv[6:8]
+router._owner_home = lambda: root/'owner'
+router._home_declarations = lambda: (('ALIAS_TEST_HOME', '.private'),)
+os.environ['ALIAS_TEST_HOME'] = str(private)
+native = fresh._reference_descriptors()
+if backend == 'descriptor' and not native:
+    print(json.dumps({'unsupported': True})); sys.exit(0)
+fresh._reference_descriptors = lambda: backend == 'descriptor'
+identity = private.stat()
+original_stat, original_lstat, original_fstat = os.stat, os.lstat, os.fstat
+original_open, original_close, original_read, original_write = os.open, os.close, os.read, os.write
+descriptors, accesses = {}, []
+injected = False
+active = action not in {'recheck', 'verify', 'verify-absence', 'read-swap'}
+synthetic = action not in {'symlink-parent', 'race-parent', 'read-swap'}
+def actual(value, kwargs=None):
+    if isinstance(value, int): return descriptors.get(value)
+    if not isinstance(value, (str, bytes, os.PathLike)): return None
+    value = Path(os.fsdecode(value)); kwargs = kwargs or {}
+    if not value.is_absolute() and kwargs.get('dir_fd') is not None:
+        value = descriptors[kwargs['dir_fd']]/value
+    return value
+def observe(kind, value, kwargs=None):
+    path = actual(value, kwargs)
+    if active and path is not None and (path == alias or alias in path.parents):
+        accesses.append({'kind': kind, 'path': str(path)})
+    return path
+def stated(path, *args, **kwargs):
+    value = observe('stat', path, kwargs)
+    return identity if active and synthetic and value == alias else original_stat(path, *args, **kwargs)
+def lstated(path, *args, **kwargs):
+    value = observe('lstat', path, kwargs)
+    return identity if active and synthetic and value == alias else original_lstat(path, *args, **kwargs)
+def fstated(descriptor):
+    global injected
+    if action == 'lock-fstat-failure' and not injected and descriptors.get(descriptor) == root/'.write.lock':
+        injected = True
+        raise OSError('fixture lock metadata failure')
+    return identity if active and synthetic and descriptors.get(descriptor) == alias else original_fstat(descriptor)
+def opened(path, *args, **kwargs):
+    global injected
+    value = observe('open', path, kwargs)
+    if action == 'lock-open-failure' and not injected and value == root/'.write.lock':
+        injected = True
+        raise OSError('UNTRUSTED lock open error')
+    if action == 'race-parent' and value == alias and not injected:
+        injected = True
+        alias.rename(alias.with_name('previous-alias'))
+        alias.symlink_to(private, target_is_directory=True)
+    descriptor = original_open(path, *args, **kwargs)
+    if active and not synthetic:
+        info = original_fstat(descriptor)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            answer['opened_private'] = True
+    if value is not None: descriptors[descriptor] = value
+    return descriptor
+def closed(descriptor):
+    descriptors.pop(descriptor, None)
+    return original_close(descriptor)
+def consumed(descriptor, amount):
+    global active, injected
+    observe('read', descriptor)
+    raw = original_read(descriptor, amount)
+    if action == 'read-swap' and raw and not injected:
+        injected = True
+        previous = alias.with_name('previous-alias')
+        alias.rename(previous)
+        alias.symlink_to(private, target_is_directory=True)
+        # Descriptors already opened before the rename retain their PUBLIC identity.
+        for opened_descriptor, path in list(descriptors.items()):
+            if path == alias or alias in path.parents:
+                descriptors[opened_descriptor] = previous/path.relative_to(alias)
+        active = True
+    return raw
+def written(descriptor, raw):
+    global injected
+    if action in {'lock-write-failure', 'lock-write-exception'} and not injected and descriptors.get(descriptor) == root/'.write.lock':
+        injected = True
+        if action == 'lock-write-exception': raise OSError('UNTRUSTED lock write error')
+        return 0
+    return original_write(descriptor, raw)
+os.stat, os.lstat, os.fstat, os.open, os.close, os.read = stated, lstated, fstated, opened, closed, consumed
+os.write = written
+def path_stat(path, *args, **kwargs): return stated(path, *args, **kwargs)
+def path_lstat(path, *args, **kwargs): return lstated(path, *args, **kwargs)
+# This child owns its pathlib classes; cover Python 3.9's cached accessor functions too.
+Path.stat, Path.lstat = path_stat, path_lstat
+sys.addaudithook(lambda event, args: observe(event, args[0])
+    if active and args and event in {'open', 'os.scandir', 'os.listdir', 'os.mkdir'} else None)
+operation = fresh._Operation()
+answer = {'refused': False}
+try:
+    if action == 'read': fresh.file_ref(target)
+    elif action in {'symlink-parent', 'race-parent', 'read-swap'}: operation.read(target)
+    elif action == 'verify':
+        operation.read(target)
+        active = True
+        operation.verify()
+    elif action == 'verify-absence':
+        assert not operation.exists(target)
+        target.write_bytes(b'fixture private')
+        active = True
+        operation.verify()
+    elif action == 'recheck':
+        witness = {}
+        fresh._read_reference(target, _witness=witness, _guard=operation.path_guard)
+        active = True
+        fresh._recheck_reference(witness, _guard=operation.path_guard)
+    elif action == 'parent':
+        descriptor, _ = fresh._reference_parent(alias, _guard=operation.path_guard)
+        os.close(descriptor)
+    elif action == 'ancestors': fresh._reference_ancestors(target, _guard=operation.path_guard)
+    elif action in {'members', 'identity-only'}: operation.entries(alias, identity_only=action == 'identity-only')
+    elif action.startswith('exists'): answer['exists'] = operation.exists(target); operation.verify()
+    elif action == 'optional-evidence':
+        brief = fresh.Brief(_operation=operation)
+        brief.evidence({'path': str(target), 'sha256': sys.argv[8]},
+                       {'path': str(root/'origin'), 'sha256': '0'*64})
+        answer['unverified'] = any(row['kind'] == 'unverified_evidence'
+                                  for row in brief.sections['Evidence references'])
+        operation.verify()
+    elif action == 'optional-attachment':
+        active = False
+        mailbox = fresh._CapturedMailbox(root/'mailbox', _operation=operation)
+        active = True
+        fresh._unread_attachment(mailbox, {'path': str(target), 'sha256': sys.argv[8]})
+        operation.verify()
+    elif action == 'readiness':
+        mailbox = fresh._CapturedMailbox(root/'mailbox', _operation=operation)
+        mailbox.readiness({'worktree': str(alias), 'branch': 'fixture', 'base_revision': 'a'*40,
+            'lease_ref': 'refs/aegis/lanes/fixture', 'lease_oid': 'b'*40,
+            'lease_expires_at': '2099-01-01T00:00:00Z', 'owned_paths': ['tools'],
+            'scan_workspace': str(alias), 'scan_evidence': 'fixture', 'hook_evidence': 'fixture',
+            'enforcement_tier': 'advisory'}, observe=False)
+    elif action == 'router-lock':
+        answer['code'] = router.main(['--lifecycle', str(alias), '--store', str(root/'store'), 'status'])
+        answer['refused'] = answer['code'] == 2
+    elif action == 'preflight-before-invalid':
+        router.preflight_paths(alias, 'relative', _guard=operation.path_guard)
+    elif action.startswith('lock-'):
+        try:
+            with router.writer_lock(root): pass
+        except (ValueError, OSError) as exc:
+            answer['first_failure'] = str(exc)
+        answer['lock_left'] = (root/'.write.lock').exists()
+        with router.writer_lock(root): answer['retried'] = True
+except router.PrivatePathError as exc:
+    answer.update(refused=True, error=str(exc), privacy=True)
+except (ValueError, OSError) as exc:
+    answer.update(refused=True, error=str(exc), privacy=False, exception=type(exc).__name__)
+if action == 'read-swap':
+    try: operation.read(target)
+    except ValueError: answer['retry_refused'] = True
+    active = False
+    alias.unlink()
+    alias.with_name('previous-alias').rename(alias)
+    answer['repaired_sha256'] = fresh._Operation().read(target)[0]['sha256']
+answer.update(accesses=accesses, live_descriptors=len(descriptors), parent_failed=operation.failed_validation)
+print(json.dumps(answer))
+'''
+
+
+def test_privacy_case_alias_preflight_uses_the_mailbox_operation_snapshot(pilot, monkeypatch):  # noqa: F811
+    """Argon 5 counts one mailbox operation, including its preflight, not guard instances."""
+    if not alias_fresh._reference_descriptors():
+        pytest.skip("case-sensitive public-sibling probes require directory descriptors")
+    root, _ = pilot
+    private, public = root.parent / "PrivateHome", root.parent / "pRIVATEhOME"
+    private.mkdir()
+    if public.exists(): pytest.skip("distinct case spellings require a case-sensitive fixture volume")
+    public.mkdir()
+    target = public / "note.md"
+    target.write_bytes(b"public note")
+    calls = []
+    def stated(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == private: calls.append(Path(path))
+        return os.stat(path, *args, **kwargs)
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: root.parent / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ALIAS_TEST_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os), "stat": stated,
+        "environ": {**os.environ, "ALIAS_TEST_HOME": str(private)}}))
+    mailbox = alias_fresh._CapturedMailbox(root)
+    reference = {"path": str(target), "sha256": hashlib.sha256(b"public note").hexdigest()}
+    for _ in range(2):
+        assert mailbox.brief(reference) == b"public note"
+        mailbox.operation.verify()
+    assert calls == [private]
+
+
+def test_privacy_windows_anchor_quarantines_only_its_message(pilot, monkeypatch):  # noqa: F811
+    root, _ = pilot
+    invoke(root, "publish", message(identifier="windows-private", body=r"\\server\share\private"))
+    invoke(root, "publish", message(identifier="healthy-note", body="healthy"))
+    original = alias_router._lexical_path
+    def lexical(value):
+        return original(PureWindowsPath(value) if isinstance(value, str) and value.startswith("\\") else value)
+    monkeypatch.setattr(alias_router, "_lexical_path", lexical)
+    mailbox = alias_fresh._CapturedMailbox(root)
+    records = mailbox.messages()
+    assert {"windows-private", "healthy-note"} <= records.keys()
+    assert set(mailbox.message_refusals) == {"windows-private"}
+    assert mailbox.message_refusals["windows-private"][0].endswith("unsupported Windows path anchor")
+    mailbox.operation.verify()
+
+
+@lifecycle_only
+def test_privacy_windows_anchor_quarantines_only_its_lifecycle_row(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path)
+    bad, healthy = request("windows-private"), request("healthy")
+    ledger.publish(bad); ledger.publish(healthy)
+    ledger.event("decision", actor=ledger.root_actor, decision="approve", reason=r"\\server\share\private",
+                 **ledger.target(bad))
+    original = alias_router._lexical_path
+    def lexical(value):
+        return original(PureWindowsPath(value) if isinstance(value, str) and value.startswith("\\") else value)
+    monkeypatch.setattr(alias_router, "_lexical_path", lexical)
+    operation = alias_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    _policy, state = journal.load()
+    assert {"windows-private", "healthy"} <= state["requests"].keys()
+    assert set(journal.private_refusals) == {"windows-private"}
+    assert journal.refusals_for("healthy") == []
+    assert journal.private_refusals["windows-private"][0][1] == "unsupported Windows path anchor"
+    operation.verify()
+
+
+@pytest.mark.parametrize("action", ["verify", "retry"])
+@pytest.mark.parametrize("replacement", [True, False], ids=["replaced", "missing"])
+def test_privacy_exists_retains_its_successful_identity_witness(tmp_path, action, replacement):
+    target = tmp_path.resolve() / "present"
+    target.write_bytes(b"public")
+    operation = alias_fresh._Operation()
+    assert operation.exists(target) is True
+    target.rename(target.with_name("previous"))
+    if replacement: target.write_bytes(b"replacement")
+    with pytest.raises(ValueError, match="captured existing input changed"):
+        operation.verify() if action == "verify" else operation.exists(target)
+    with pytest.raises(ValueError, match="captured existing input changed"):
+        operation.verify()
+
+
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("action", ["read", "recheck", "verify", "parent", "ancestors", "members", "identity-only",
+                                    "exists-existing", "exists-missing", "exists-notdir", "router-lock",
+                                    "optional-evidence", "optional-attachment", "readiness", "preflight-before-invalid"])
+def test_privacy_before_every_alias_touch(tmp_path, backend, action):
+    """Argon 1-4: even pathlib metadata and directory opens must follow the identity refusal."""
+    if action == "parent" and backend == "portable":
+        pytest.skip("directory descriptors are explicitly unsupported in this backend")
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir(); alias.mkdir()
+    target = alias / "record.md"
+    target.write_bytes(b"fixture evidence")
+    (root / "store").mkdir()
+    if action == "exists-missing": target = alias / "missing"
+    if action == "exists-notdir": target = target / "child"
+    if action in {"optional-attachment", "readiness"}:
+        invoke(root / "mailbox", "init", {"schema": "aegis.hierarchy-pilot/v1", "endpoints": {
+            "a/front-door": {}, "a/orchestrator": {}, "a/root": {}}, "counterparts": [], "writer_limit": 3})
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(target), action, backend,
+        hashlib.sha256(b"fixture evidence").hexdigest()], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+    assert answer["refused"] and answer.get("exception") != "NotADirectoryError", answer
+    assert all(row["path"] == str(alias) and row["kind"] in {"stat", "lstat"}
+               for row in answer["accesses"]), answer
+    assert answer["live_descriptors"] == 0, answer
+    if action == "preflight-before-invalid":
+        assert answer["error"] == "owner-private host directory is not an input", answer
+    if action == "verify": assert answer.get("privacy") and answer["parent_failed"], answer
+    if action.startswith("optional"):
+        assert answer["parent_failed"] and not answer.get("unverified", False), answer
+
+
+@pytest.mark.parametrize("backend", ["descriptor", "portable"])
+@pytest.mark.parametrize("action", ["read", "verify-absence"])
+def test_privacy_refuses_a_leaf_that_aliases_a_private_file(tmp_path, backend, action):
+    """Argon 1's regular-file private-root instance must never open the matching leaf."""
+    root = tmp_path.resolve()
+    private, alias = root / "private-file", root / "alias-file"
+    private.write_bytes(b"fixture private")
+    if action == "read": alias.write_bytes(b"fixture private")
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(alias), action, backend, "0" * 64],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+    assert answer["refused"] and answer["live_descriptors"] == 0, answer
+    assert answer.get("privacy"), answer
+    assert all(row["kind"] in {"stat", "lstat"} for row in answer["accesses"]), answer
+
+
+@pytest.mark.parametrize("fault", ["lock-fstat-failure", "lock-write-failure", "lock-open-failure", "lock-write-exception"])
+def test_privacy_anchored_lock_failure_closes_descriptors_and_allows_retry(tmp_path, fault):
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir(); alias.mkdir()
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(alias / "unused"), fault, "descriptor", "0" * 64],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+    assert answer.get("first_failure") and not answer["lock_left"] and answer.get("retried"), answer
+    assert answer["first_failure"] == {"lock-fstat-failure": "cannot inspect journal lock",
+        "lock-open-failure": "cannot create journal lock", "lock-write-failure": "cannot write journal lock",
+        "lock-write-exception": "cannot write journal lock"}[fault], answer
+    assert answer["live_descriptors"] == 0, answer
+
+
+@pytest.mark.parametrize("action,backend", [("symlink-parent", "descriptor"),
+    ("symlink-parent", "portable"), ("race-parent", "descriptor")])
+def test_privacy_symlink_parent_and_concurrent_replacement(tmp_path, action, backend):
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir()
+    (private / "record.md").write_bytes(b"private fixture")
+    if action == "symlink-parent":
+        symlink_or_skip(private, alias, target_is_directory=True)
+    else:
+        probe = root / "capability-probe"
+        symlink_or_skip(private, probe, target_is_directory=True)
+        probe.unlink()
+        alias.mkdir()
+        (alias / "record.md").write_bytes(b"public fixture")
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(alias / "record.md"), action, backend, "0" * 64],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+    assert answer["refused"] and not answer.get("opened_private"), answer
+    assert all(row["path"] == str(alias) for row in answer["accesses"]), answer
+    assert answer["live_descriptors"] == 0, answer
+
+
+def test_privacy_unsupported_lock_backend_refuses_without_a_lock(tmp_path):
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir(); alias.mkdir()
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(alias / "unused"), "lock-unsupported", "portable", "0" * 64],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    assert answer["refused"] and answer["error"] == "secure reference hashing requires directory descriptor support"
+    assert not answer["lock_left"] and answer["live_descriptors"] == 0
+
+
+def _privacy_parent_swap_during_read_checks_ancestors_before_metadata(tmp_path, backend):
+    if os.name != "posix":
+        pytest.skip("renaming a parent while its file is open requires POSIX sharing semantics")
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir(); alias.mkdir()
+    (alias / "record").write_bytes(b"initially public")
+    (private / "record").write_bytes(b"private fixture")
+    probe = root / "symlink-probe"
+    symlink_or_skip(private, probe, target_is_directory=True)
+    probe.unlink()
+    proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+        str(root), str(private), str(alias), str(alias / "record"), "read-swap", backend, "0" * 64],
+        capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+    answer = json.loads(proc.stdout.splitlines()[-1])
+    if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+    assert answer["refused"] and not answer.get("opened_private") and answer["retry_refused"], answer
+    assert answer["repaired_sha256"] == hashlib.sha256(b"initially public").hexdigest(), answer
+    assert all(row["path"] == str(alias) and row["kind"] in {"stat", "lstat"}
+               for row in answer["accesses"]), answer
+    assert answer["live_descriptors"] == 0, answer
+
+
+@pytest.mark.parametrize("value", [
+    r"\\?\C:\Users\Alice\.codex\secret", r"\\.\C:\Users\Alice\.codex\secret",
+    r"\\server\share\Users\Alice\.codex\secret", r"\\?\UNC\server\share\secret",
+    r"\Users\Alice\.codex\secret",
+])
+def test_private_alias_windows_anchors_refuse_before_metadata(monkeypatch, value):
+    def unexpected(*args, **kwargs):
+        pytest.fail("non-drive anchor reached owner or filesystem discovery")
+
+    monkeypatch.setattr(alias_router, "_owner_home", unexpected)
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(stat=unexpected, lstat=unexpected, open=unexpected))
+    with pytest.raises(ValueError, match="^unsupported Windows path anchor$"):
+        alias_router.preflight_paths(PureWindowsPath(value))
+
+
+def test_private_alias_windows_drive_paths_remain_lexically_private():
+    root = PureWindowsPath(r"C:\Users\Alice\.codex")
+    for value in (root / "secret", PureWindowsPath(r"c:\users\ALICE\.CODEX\secret")):
+        with pytest.raises(alias_router.PrivatePathError, match="^owner-private host directory is not an input$"):
+            alias_router._refuse_private_paths([value], {root})
+    alias_router._refuse_private_paths([PureWindowsPath(r"C:\Users\Alice\public\record")], {root})
+
+
+@pytest.mark.parametrize("anchored", [False, True], ids=["portable", "descriptor"])
+@pytest.mark.parametrize("action", ["reference", "entries", "identity-only"])
+def test_private_alias_reference_refuses_identity_before_content(tmp_path, anchored, action):
+    root = tmp_path.resolve()
+    private, alias = root / "private", root / "alias"
+    private.mkdir(); alias.mkdir()
+    target = alias / "record"
+    target.write_bytes(b"private fixture bytes")
+    selected = {"reference": "read", "entries": "members", "identity-only": "identity-only"}[action]
+    for _ in range(2):
+        proc = subprocess.run([sys.executable, "-I", "-B", "-c", PRIVACY_ACCESS_DRIVER, str(ROOT / "tools"),
+            str(root), str(private), str(alias), str(target), selected,
+            "descriptor" if anchored else "portable", "0" * 64], capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0 and not proc.stderr, proc.stdout + proc.stderr
+        answer = json.loads(proc.stdout.splitlines()[-1])
+        if answer.get("unsupported"): pytest.skip("directory descriptor capability unavailable")
+        assert answer["refused"] and answer["privacy"] and answer["live_descriptors"] == 0, answer
+        assert all(row["path"] == str(alias) and row["kind"] in {"stat", "lstat"}
+                   for row in answer["accesses"]), answer
+
+
+@pytest.mark.parametrize("anchored", [False, True], ids=["portable", "descriptor"])
+def test_private_alias_root_metadata_is_lazy_and_once_per_operation(tmp_path, monkeypatch, anchored):
+    if anchored and not alias_fresh._reference_descriptors():
+        pytest.skip("secure reference hashing requires directory descriptor support")
+    tmp_path = tmp_path.resolve()
+    private = tmp_path / "private"
+    private.mkdir()
+    target = tmp_path / "public"
+    target.write_bytes(b"public fixture")
+    calls = []
+
+    def inspected(path, *args, **kwargs):
+        if Path(path) == private:
+            calls.append(Path(path))
+        return os.stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ALIAS_TEST_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os), "stat": inspected,
+        "environ": {**os.environ, "ALIAS_TEST_HOME": str(private)}}))
+    monkeypatch.setattr(alias_fresh, "_reference_descriptors", lambda: anchored)
+    operation = alias_fresh._Operation()
+    operation.path_guard(str(target))
+    operation.verify()
+    assert calls == []
+    for _ in range(2):
+        operation.reference(target)
+        operation.entries(tmp_path, identity_only=True)
+        operation.verify()
+    assert calls == [private]
+    assert alias_fresh.file_ref(target)["sha256"] == hashlib.sha256(b"public fixture").hexdigest()
+    assert calls == [private, private]
+
+
+@pytest.mark.parametrize("failure", ["denied", "zero-inode"])
+def test_private_alias_root_metadata_failure_is_a_fixed_cli_refusal(tmp_path, monkeypatch, capsys, failure):
+    tmp_path = tmp_path.resolve()
+    private = tmp_path / "private"
+    private.mkdir()
+    target = tmp_path / "brief.md"
+    target.write_bytes(b"not consumed")
+    calls = []
+
+    def inspected(path, *args, **kwargs):
+        if Path(path) == private:
+            calls.append(Path(path))
+            if failure == "denied":
+                raise PermissionError("SECRET_FROM_UNTRUSTED_OS_ERROR")
+            return SimpleNamespace(st_dev=1, st_ino=0)
+        return os.stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: tmp_path / "owner")
+    monkeypatch.setattr(alias_router, "_home_declarations", lambda: (("ALIAS_TEST_HOME", ".private"),))
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os), "stat": inspected,
+        "environ": {**os.environ, "ALIAS_TEST_HOME": str(private)}}))
+    expected = ("cannot determine private directory identity" if failure == "denied"
+                else "private directory identity unavailable")
+    operation = alias_fresh._Operation()
+    for _ in range(2):
+        with pytest.raises(ValueError, match="^" + expected + "$"):
+            operation.reference(target)
+    assert calls == [private]
+    for _ in range(2):
+        assert alias_fresh.main(["verify", "--path", str(target), "--sha256", "0" * 64]) == 2
+        output = capsys.readouterr()
+        assert output.err == ""
+        assert json.loads(output.out) == {"error": expected}
+    # Failure belongs to its operation; a later operation can capture a repaired trusted root.
+    monkeypatch.setattr(alias_router, "os", SimpleNamespace(**{**vars(os),
+        "environ": {**os.environ, "ALIAS_TEST_HOME": str(private)}}))
+    assert alias_fresh.file_ref(target)["sha256"] == hashlib.sha256(b"not consumed").hexdigest()
+
+
+@pytest.mark.parametrize("anchored", [False, True], ids=["portable", "descriptor"])
+def test_private_alias_change_during_read_refuses_and_does_not_poison_next_operation(tmp_path, anchored):
+    _privacy_parent_swap_during_read_checks_ancestors_before_metadata(
+        tmp_path, "descriptor" if anchored else "portable")
 
 
 LATCH_STATES = list(itertools.product((False, True), repeat=3))
@@ -884,6 +5397,11 @@ def assert_custody_channel(tree, parents, qualified):
     def expression(source):
         return shape(ast.parse(source, mode='eval').body)
 
+    last_replacement = shape(ast.parse('custody[-1] = current._custody').body[0])
+
+    def replaces_custody(statement):
+        return isinstance(statement, ast.Assign) and shape(statement) == last_replacement
+
     definitions = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == '_WriterCustody']
     assert len(definitions) == 1, 'release custody record definition'
     record = definitions[0]
@@ -966,8 +5484,7 @@ def exclusions(state, custody):
                         and isinstance(parents[parent], ast.Expr))
                 head = (scope == 'project' and isinstance(parent, ast.Attribute)
                         and shape(parent) == expression('current._custody.state_head'))
-                replaced = (scope == 'project' and isinstance(parent, ast.Assign)
-                            and shape(parent) == shape(ast.parse('custody[-1] = current._custody').body[0]))
+                replaced = scope == 'project' and replaces_custody(parent)
                 assert collected or head or replaced, ('release custody escape', node.lineno)
         if isinstance(node, ast.Name) and node.id == 'custody':
             if scope == 'exclusions':
@@ -984,8 +5501,7 @@ def exclusions(state, custody):
                 admitted = admitted or (isinstance(parent, ast.Call)
                                         and shape(parent) == expression('exclusions(planning, custody)'))
                 statement = parents.get(parent)
-                admitted = admitted or (isinstance(parent, ast.Subscript) and isinstance(statement, ast.Assign)
-                    and shape(statement) == shape(ast.parse('custody[-1] = current._custody').body[0]))
+                admitted = admitted or (isinstance(parent, ast.Subscript) and replaces_custody(statement))
             assert admitted, ('release custody collection escape', node.lineno)
         if isinstance(node, ast.Name) and node.id == 'exclusions' and isinstance(node.ctx, ast.Load):
             assert (scope == 'project' and isinstance(parent, ast.Call)
@@ -996,6 +5512,24 @@ def exclusions(state, custody):
 def test_latch_release_assignments_require_one_proof_reading_function():
     # Tracked source is ordinary, cross-platform test input.
     assert_latch_release_structure((ROOT / 'tools/hierarchy_small_change_dispatch.py').read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize("damage", ["index-overwrite", "wrong-iterable", "stale-context"])
+def test_round10_custody_collection_rejects_misaligned_producers(damage):
+    source = (ROOT / "tools/hierarchy_small_change_dispatch.py").read_text(encoding="utf-8")
+    assert_latch_release_structure(source)
+    if damage == "index-overwrite":
+        before = "custody[-1] = current._custody"
+        after = "custody[0] = current._custody"
+    elif damage == "wrong-iterable":
+        before = "exclusions(planning, custody)"
+        after = "exclusions(planning, custody[::-1])"
+    else:
+        before = "custody[-1] = current._custody"
+        after = "custody[-1] = contexts[0]._custody"
+    assert before in source
+    with pytest.raises(AssertionError, match="custody"):
+        assert_latch_release_structure(source.replace(before, after, 1))
 
 
 @pytest.mark.parametrize('line', [
@@ -2675,3 +7209,706 @@ def test_consumed_reference_rechecks_do_not_enumerate_shared_cache(pilot, monkey
     assert json.loads(output.out) == expected
     assert max(map(len, caches)) >= notes
     assert len(visits) == 0, "cached-path membership must not enumerate identity entries"
+
+
+R9_MESSAGE_ONLY_WALK_PROBE = r'''
+import errno, hashlib, sys
+from pathlib import Path
+from types import SimpleNamespace
+tools, fallback, root, backend, kind = sys.argv[1:]
+sys.path[:0] = [tools, fallback]
+import hierarchy_fresh_brief as fresh
+ordinary = Path(root) / 'ordinary'
+note = ordinary / 'note.md'
+sha = hashlib.sha256(note.read_bytes()).hexdigest()
+failures = {'generic': OSError, 'missing': FileNotFoundError,
+            'not-directory': NotADirectoryError, 'denied': PermissionError}
+name = kind.removesuffix('-errno')
+failure = failures[name]
+number = {'generic': errno.EIO, 'missing': errno.ENOENT,
+          'not-directory': errno.ENOTDIR, 'denied': errno.EACCES}[name]
+arguments = (number, 'modelled directory unavailable') if kind.endswith('-errno') else ('modelled directory unavailable',)
+real_os = fresh.os
+def opened(path, flags, *args, **kwargs):
+    if str(path) == 'ordinary' and flags & real_os.O_DIRECTORY:
+        raise failure(*arguments)
+    return real_os.open(path, flags, *args, **kwargs)
+def stated(path, *args, **kwargs):
+    if Path(path) == ordinary:
+        raise failure(*arguments)
+    return real_os.lstat(path, *args, **kwargs)
+fresh.os = SimpleNamespace(**{**vars(real_os), 'open': opened, 'lstat': stated})
+if backend == 'portable':
+    fresh._reference_descriptors = lambda: False
+sys.exit(fresh.main(['verify', '--path', str(note), '--sha256', sha]))
+'''
+
+# Actual ec27eebf capture: all sixteen parameter rows have these same bytes.
+R9_MESSAGE_ONLY_WALK_GOLDEN = (2, b'{"error": "modelled directory unavailable"}\n', b'')
+R9_FILENAMELESS_WALK_GOLDENS = {
+    "generic": R9_MESSAGE_ONLY_WALK_GOLDEN,
+    "missing": R9_MESSAGE_ONLY_WALK_GOLDEN,
+    "not-directory": R9_MESSAGE_ONLY_WALK_GOLDEN,
+    "denied": R9_MESSAGE_ONLY_WALK_GOLDEN,
+    "generic-errno": (2, b'{"error": "[Errno 5] modelled directory unavailable"}\n', b''),
+    "missing-errno": (2, b'{"error": "[Errno 2] modelled directory unavailable"}\n', b''),
+    "not-directory-errno": (2, b'{"error": "[Errno 20] modelled directory unavailable"}\n', b''),
+    "denied-errno": (2, b'{"error": "[Errno 13] modelled directory unavailable"}\n', b''),
+}
+
+
+def r9_message_only_walk_probe(tmp_path, backend, kind, planned, *, tools=None):
+    import hierarchy_hosts
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir(parents=True)
+    (ordinary / "note.md").write_bytes(b"public fixture\n")
+    if planned:
+        (tmp_path / "host-plan.json").write_text(json.dumps(
+            hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)))
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", R9_MESSAGE_ONLY_WALK_PROBE,
+        str(tools or ROOT / "tools"), str(ROOT / "tools"), str(tmp_path), backend, kind],
+        capture_output=True, timeout=30)
+    return result.returncode, result.stdout, result.stderr
+
+
+@lifecycle_only
+@pytest.mark.parametrize("backend", ["native", "portable"])
+@pytest.mark.parametrize("kind", tuple(R9_FILENAMELESS_WALK_GOLDENS))
+@pytest.mark.parametrize("planned", [False, True])
+def test_round9_public_message_only_walk_error_bytes(tmp_path, backend, kind, planned):
+    import hierarchy_fresh_brief as fresh
+    if backend == "native" and not fresh._reference_descriptors():
+        pytest.skip("directory descriptors unavailable")
+    assert r9_message_only_walk_probe(tmp_path, backend, kind, planned) == R9_FILENAMELESS_WALK_GOLDENS[kind]
+
+
+R10_LINK_IO_SETUP = r'''
+if fault == 'link-to-io':
+    import errno
+    from types import SimpleNamespace
+    real_os, descriptors = fresh.os, {}
+    ordinary, public = root / 'ordinary', root / 'public'
+    def unavailable(path):
+        value = Path(path)
+        return ordinary in value.parents or value == public / 'note.md'
+    class FaultPath(type(Path())):
+        def stat(self, *args, **kwargs):
+            if unavailable(self):
+                raise OSError(errno.EIO, real_os.strerror(errno.EIO), str(self))
+            return super().stat(*args, **kwargs)
+        def lstat(self, *args, **kwargs):
+            if unavailable(self):
+                raise OSError(errno.EIO, real_os.strerror(errno.EIO), str(self))
+            return super().lstat(*args, **kwargs)
+    # The isolated child owns these module references; global OS functions stay intact.
+    protocol.Path = FaultPath
+    def actual(path, kwargs):
+        if isinstance(path, int):
+            return None
+        value = Path(path)
+        parent = descriptors.get(kwargs.get('dir_fd'))
+        return parent / value if not value.is_absolute() and parent is not None else value
+    def observed(function):
+        def call(path, *args, **kwargs):
+            value = actual(path, kwargs)
+            if value is not None and unavailable(value):
+                raise OSError(errno.EIO, real_os.strerror(errno.EIO), str(value))
+            return function(path, *args, **kwargs)
+        return call
+    def opened(path, *args, **kwargs):
+        value = actual(path, kwargs)
+        descriptor = real_os.open(path, *args, **kwargs)
+        descriptors[descriptor] = value
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    fresh.os = SimpleNamespace(**{**vars(real_os), 'stat': observed(real_os.stat),
+        'lstat': observed(real_os.lstat), 'open': opened, 'close': closed})
+'''
+R10_PUBLIC_PROBE = R9_PUBLIC_PROBE.replace(
+    "tools, fallback, root, seam, backend = sys.argv[1:]",
+    "tools, fallback, root, seam, backend, fault = sys.argv[1:]").replace(
+    "root = Path(root)\n", "root = Path(root)\n" + R10_LINK_IO_SETUP)
+
+
+R13_LEAF_GOLDENS = {('disposition', False, 'native'): (0,
+                                    b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                    b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                    b' {CASE}/ordinary/note.md"}}}\n',
+                                    b''),
+ ('disposition', False, 'portable'): (0,
+                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"f'
+                                      b'irst": "lifecycle row UNKNOWN at event fault-event: symlink paths are not su'
+                                      b'pported: {CASE}/ordinary/note.md"}}}\n',
+                                      b''),
+ ('disposition', True, 'native'): (0,
+                                   b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                   b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                   b' {CASE}/ordinary/note.md"}}}\n',
+                                   b''),
+ ('disposition', True, 'portable'): (0,
+                                     b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                     b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                     b' {CASE}/ordinary/note.md"}}}\n',
+                                     b''),
+ ('paths', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('paths', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('paths', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('paths', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('resolve', False, 'native'): (0,
+                                b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                                b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                                b'ordinary/note.md"}}}\n',
+                                b''),
+ ('resolve', False, 'portable'): (0,
+                                  b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first'
+                                  b'": "lifecycle row UNKNOWN at event fault-event: symlink paths are not supported:'
+                                  b' {CASE}/ordinary/note.md"}}}\n',
+                                  b''),
+ ('resolve', True, 'native'): (0,
+                               b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                               b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                               b'ordinary/note.md"}}}\n',
+                               b''),
+ ('resolve', True, 'portable'): (0,
+                                 b'{"result": {"refusals": {}, "requests": ["first", "healthy"], "unknown": {"first": "'
+                                 b'lifecycle row UNKNOWN at event fault-event: symlink paths are not supported: {CASE}/'
+                                 b'ordinary/note.md"}}}\n',
+                                 b''),
+ ('scope', False, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('scope', False, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('scope', True, 'native'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('scope', True, 'portable'): (2, b'{"error": "symlink paths are not supported: {CASE}/ordinary/note.md"}\n', b''),
+ ('shared-disposition', False, 'native'): (0,
+                                           b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                           b' "unknown": {}}}\n',
+                                           b''),
+ ('shared-disposition', False, 'portable'): (0,
+                                             b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                             b' "unknown": {}}}\n',
+                                             b''),
+ ('shared-disposition', True, 'native'): (0,
+                                          b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                          b' "unknown": {}}}\n',
+                                          b''),
+ ('shared-disposition', True, 'portable'): (0,
+                                            b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"],'
+                                            b' "unknown": {}}}\n',
+                                            b''),
+ ('shared-resolve', False, 'native'): (0,
+                                       b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
+                                       b'known": {}}}\n',
+                                       b''),
+ ('shared-resolve', False, 'portable'): (0,
+                                         b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
+                                         b'known": {}}}\n',
+                                         b''),
+ ('shared-resolve', True, 'native'): (0,
+                                      b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
+                                      b'known": {}}}\n',
+                                      b''),
+ ('shared-resolve', True, 'portable'): (0,
+                                        b'{"result": {"refusals": {}, "requests": ["first", "healthy", "hostile"], "un'
+                                        b'known": {}}}\n',
+                                        b'')}
+R13_LEAF_PROBE = R10_PUBLIC_PROBE.replace("target = root / 'ordinary' / 'note.md'", """
+(root / 'ordinary').unlink()
+(root / 'ordinary').mkdir()
+(root / 'ordinary' / 'note.md').symlink_to(root / 'public' / 'note.md')
+target = root / 'ordinary' / 'note.md'
+""")
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,planned,backend", tuple(itertools.product(
+    ("paths","scope","disposition","resolve"),
+    (False,True),("native","portable"))))
+def test_round13_leaf_link_lookup_keeps_the_baseline_consumer(tmp_path,seam,planned,backend):
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    if backend=="native" and not portable_fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    assert r9_public_probe(tmp_path,seam,"link-to-denied",planned,backend,_probe=R13_LEAF_PROBE)==R13_LEAF_GOLDENS[(seam,planned,backend)]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam,planned,backend", tuple(itertools.product(
+    ("shared-disposition","shared-resolve"),(False,True),("native","portable"))))
+def test_round13_unproved_leaf_destination_cannot_be_inert_scope(tmp_path,seam,planned,backend):
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    if backend=="native" and not portable_fresh._reference_descriptors(): pytest.skip("directory descriptors unavailable")
+    # The last destination itself is now a target lookup after proved parents.
+    # Keep this a proof-failure control by requiring traversal below the denied
+    # directory before the final leaf can be reached.
+    probe=R13_LEAF_PROBE.replace(".symlink_to(root / 'public' / 'note.md')",
+                               ".symlink_to(root / 'public' / 'unproved' / 'note.md')")
+    code,out,error=r9_public_probe(tmp_path,seam,"link-to-denied",planned,backend,_probe=probe)
+    assert code==0 and error==b""
+    state=json.loads(out)["result"]
+    assert "healthy" in state["requests"]
+    assert state["refusals"]["hostile"]
+    assert "healthy" not in state["refusals"]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("destination_kind", ["public", "private"])
+def test_round10_unavailable_link_primitives_quarantine_without_descriptor_calls(tmp_path, monkeypatch, destination_kind):
+    linked, public, home = (tmp_path / name for name in ("linked", "public", "owner"))
+    private = home / ".codex"
+    for directory in (linked, public, private):
+        directory.mkdir(parents=True)
+    ledger = Ledger(tmp_path)
+    ledger.publish(request("healthy"))
+    ledger.publish(request("following", paths=[str(linked / "note.md")]))
+    linked.rmdir()
+    symlink_or_skip(private if destination_kind == "private" else public, linked, target_is_directory=True)
+    real_os, opened_paths = portable_fresh.os, []
+    def opened(value, flags, *args, **kwargs):
+        value = Path(value)
+        assert kwargs.get("dir_fd") is None
+        assert not flags & getattr(real_os, "O_DIRECTORY", 0)
+        assert value not in {linked, private} and private not in value.parents and linked not in value.parents
+        opened_paths.append(value)
+        return real_os.open(value, flags, *args, **kwargs)
+    def no_parent(*args, **kwargs):
+        pytest.fail("unsupported link proof reached a directory descriptor")
+    monkeypatch.setattr(alias_router, "_owner_home", lambda: home)
+    monkeypatch.setattr(portable_fresh, "_descriptor_capabilities", lambda: False)
+    monkeypatch.setattr(portable_fresh, "_reference_descriptors", lambda: False)
+    monkeypatch.setattr(portable_fresh, "_symlink_reader", lambda: pytest.fail("unsupported link proof reached the reader"))
+    monkeypatch.setattr(portable_fresh, "_reference_parent", no_parent)
+    # Bind the existing reader seam to owned IO; neither module.os nor os.open changes.
+    original_read = portable_fresh._read_reference
+    observed_read = FunctionType(original_read.__code__, {**original_read.__globals__,
+        "os": SimpleNamespace(**{**vars(real_os), "open": opened})},
+        original_read.__name__, original_read.__defaults__, original_read.__closure__)
+    observed_read.__kwdefaults__ = original_read.__kwdefaults__
+    monkeypatch.setattr(portable_fresh, "_read_reference", observed_read)
+    operation = portable_fresh._Operation()
+    journal = operation.lifecycle(ledger.path)
+    _policy, state = journal.load()
+    assert set(state["requests"]) == {"healthy", "following"}
+    assert journal.refusals_for("following")
+    assert journal.refusals_for("healthy") == []
+    operation.verify()
+    assert not operation.failed_validation
+    assert opened_paths
+    assert portable_fresh.os is real_os
+
+
+@lifecycle_only
+@pytest.mark.parametrize("anchors", [(2, 1), (3, 1), (1, 2), (2, 3), (3, 2), (2, 2), (3, 3)])
+@pytest.mark.parametrize("field,shared", [("paths", False), ("scope", False),
+    ("disposition", False), ("disposition", True), ("resolve", False), ("resolve", True)])
+def test_round10_anchor_chain_is_quarantined_before_scope_publication(tmp_path, monkeypatch, anchors, field, shared):
+    from concurrent.futures import ThreadPoolExecutor
+    import hierarchy_fresh_brief as fresh
+    import hierarchy_lifecycle as life
+    import hierarchy_workspace as workspace
+    from tests.integration.test_hierarchy_router import Loop
+    if not fresh._reference_descriptors() or fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    world = Loop(tmp_path)
+    world.team("engine")
+    world.team("docs")
+    world.approved(request("healthy", team="docs"))
+    first_link, second_link, home = (tmp_path / name for name in ("l1", "l2", "alice"))
+    private = home / ".codex"
+    private.mkdir(parents=True)
+    (private / "auth.json").write_bytes(b"controlled private fixture\n")
+    first_link.mkdir()
+    path = str(first_link / ".codex/auth.json")
+    bad = request("following", paths=[path])
+    if field == "paths":
+        world.approved(bad)
+    elif field == "scope":
+        change = SmallChange(world.ledger, bad)
+        change.plan["plan"]["path_scopes"] = [bad["paths"]]
+        change.register()
+    else:
+        first = request("first")
+        world.ledger.publish(first)
+        extra = {}
+        if field == "resolve":
+            world.ledger.event("disposition", status="HOLD", resolution={"kind": "blocked",
+                "owner": "engine/coordinator", "next_decision": "review", "condition": "reviewed",
+                "evidence": world.ledger.evidence}, **world.ledger.target(first))
+            extra["blocker_sha256"] = fresh.digest(world.ledger.status()["requests"]["first"]["resolution"])
+        evidence = [{"path": path, "sha256": "0" * 64}] if shared else world.ledger.evidence
+        world.ledger.event(field, **({"status": "FINAL"} if field == "disposition" else extra),
+            resolution={"kind": "next", "request": raw_request(bad), "evidence": evidence},
+            **world.ledger.target(first))
+        world.ledger.approve(bad)
+    first_link.rmdir()
+    spell = lambda value, count: "/" * count + str(value).lstrip("/")
+    symlink_or_skip(spell(second_link, anchors[0]), first_link, target_is_directory=True)
+    symlink_or_skip(spell(home, anchors[1]), second_link, target_is_directory=True)
+    real_os, descriptors, accesses = fresh.os, {}, []
+    def actual(value, kwargs):
+        value = Path(value)
+        return descriptors[kwargs["dir_fd"]] / value if not value.is_absolute() else value
+    def stated(value, *args, **kwargs):
+        value_path = actual(value, kwargs)
+        assert private not in value_path.parents, ("private descendant metadata", value_path)
+        if value_path == private:
+            accesses.append({"path": str(value_path), "kind": "stat", "operation": id(fresh._PATH_GUARD.get())})
+        return real_os.stat(value, *args, **kwargs)
+    def opened(value, *args, **kwargs):
+        value_path = actual(value, kwargs)
+        assert value_path != private and private not in value_path.parents, ("private open", value_path)
+        descriptor = real_os.open(value, *args, **kwargs)
+        descriptors[descriptor] = value_path
+        return descriptor
+    def closed(descriptor):
+        descriptors.pop(descriptor, None)
+        return real_os.close(descriptor)
+    monkeypatch.setattr("hierarchy_router._owner_home", lambda: home)
+    monkeypatch.setattr("hierarchy_router.os", SimpleNamespace(**{**vars(real_os), "stat": stated}))
+    monkeypatch.setattr("hierarchy_fresh_brief.os", SimpleNamespace(**{**vars(real_os),
+        "stat": stated, "open": opened, "close": closed}))
+    owners = []
+    def probe():
+        operation = fresh._Operation()
+        owners.append(operation)
+        journal = operation.lifecycle(world.ledger.path)
+        _policy, state = journal.load()
+        assert {"following", "healthy"} <= set(state["requests"])
+        assert journal.refusals_for("following", consume=True)
+        assert journal.refusals_for("healthy") == []
+        assert not journal.unknown_rows
+        brief = fresh.Brief(_operation=operation)
+        fresh.lifecycle_records(brief, world.ledger.path, fresh.parse_time("2030-01-01T00:00:00Z"))
+        assert not any(row.get("request_id") == "following" for row in brief.sections["Approved scope"])
+        assert path not in json.dumps(brief.sections["Approved scope"])
+        operation.verify()
+        assert not operation.failed_validation
+    probe()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for future in (pool.submit(probe), pool.submit(probe)):
+            future.result(timeout=30)
+    rows = alias_router.status(life.Lifecycle(world.ledger.path), workspace.Store(world.workspace.store), 0)["requests"]
+    assert next(row for row in rows if row["request_id"] == "healthy")["state"] == "ready"
+    from tests.integration.test_hierarchy_small_change_dispatch import assert_private_root_probes
+    assert_private_root_probes([private], accesses)
+    assert not descriptors
+
+
+@lifecycle_only
+@pytest.mark.parametrize("fault", ["eacces","einval","regular","recheck","disposition","resolve"])
+def test_round13_proof_failures_and_repointed_inert_scope_are_row_local(tmp_path,monkeypatch,fault):
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    from threading import Event
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    if fault in {"disposition","resolve"} and os.geteuid()==0:
+        pytest.skip("mode-000 witness requires an unprivileged runner")
+    world=Loop(tmp_path)
+    world.team("engine"); world.team("docs")
+    world.approved(request("healthy",team="docs"))
+    home=tmp_path/"owner"; private=home/".codex"
+    private.mkdir(parents=True)
+    (private/"auth.json").write_bytes(b"controlled private fixture")
+    linked,denied=tmp_path/"linked",tmp_path/"denied"
+    linked.mkdir(); denied.mkdir()
+    path=str(linked if fault in {"disposition","resolve"} else linked/"auth.json")
+    bad=request("following",paths=[path])
+    if fault in {"disposition","resolve"}:
+        first=request("first"); world.ledger.publish(first)
+        extra={}
+        if fault=="resolve":
+            world.ledger.event("disposition",status="HOLD",resolution={"kind":"blocked","owner":"engine/coordinator",
+                "next_decision":"review","condition":"reviewed","evidence":world.ledger.evidence},**world.ledger.target(first))
+            extra["blocker_sha256"]=portable_fresh.digest(world.ledger.status()["requests"]["first"]["resolution"])
+        world.ledger.event(fault,**({"status":"FINAL"} if fault=="disposition" else extra),
+            resolution={"kind":"next","request":raw_request(bad),"evidence":[{"path":path,"sha256":"0"*64}]},
+            **world.ledger.target(first))
+        world.ledger.approve(bad)
+    else: world.approved(bad)
+    linked.rmdir()
+    symlink_or_skip(denied/"auth.json" if fault in {"disposition","resolve"} else private,linked,
+        target_is_directory=fault not in {"disposition","resolve"})
+    entered,changed=Event(),Event()
+    mutations,acknowledgments=Queue(),Queue()
+    original_snapshot=portable_fresh._link_snapshot
+    original_parent=portable_fresh._reference_parent
+    original_proof_parent=portable_fresh._proof_parent
+    original_check=portable_fresh._reference_check
+    native_read=portable_fresh._symlink_reader()
+    descriptors=[]
+    def parent(value,*args,**kwargs):
+        value=Path(value)
+        assert value!=private and private not in value.parents
+        descriptor,marks=original_parent(value,*args,**kwargs)
+        descriptors.append(descriptor)
+        return descriptor,marks
+    def snapshot(*args,**kwargs):
+        result=original_snapshot(*args,**kwargs)
+        if result is not None and Path(args[1])==linked:
+            mutations.put(True)
+            assert acknowledgments.get(timeout=10),"repoint did not complete"
+        return result
+    def proof_parent(value,*args,**kwargs):
+        value=Path(value)
+        assert value!=private and private not in value.parents
+        descriptor,marks=original_proof_parent(value,*args,**kwargs)
+        descriptors.append(descriptor)
+        return descriptor,marks
+    def checked(value,*args,**kwargs):
+        if Path(value)==linked:
+            linked.unlink()
+            linked.symlink_to(denied/"auth.json")
+        return original_check(value,*args,**kwargs)
+    def read(directory,name,size):
+        if fault in {"eacces","einval"}:
+            code=errno.EACCES if fault=="eacces" else errno.EINVAL
+            raise OSError(code,os.strerror(code),name)
+        if fault=="regular":
+            entered.set()
+            assert changed.wait(10),"regular-file replacement did not complete"
+        return native_read(directory,name,size)
+    def recheck(*args,**kwargs):
+        raise OSError(errno.EACCES,os.strerror(errno.EACCES),str(linked))
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    monkeypatch.setattr(portable_fresh,"_reference_parent",parent)
+    monkeypatch.setattr(portable_fresh,"_proof_parent",proof_parent)
+    if fault in {"disposition","resolve"}:
+        monkeypatch.setattr(portable_fresh,"_link_snapshot",snapshot)
+        monkeypatch.setattr(portable_fresh,"_reference_check",checked)
+    elif fault=="recheck": monkeypatch.setattr(portable_fresh,"_stable_link",recheck)
+    else: monkeypatch.setattr(portable_fresh,"_symlink_reader",lambda:read)
+    def replace():
+        if fault in {"disposition","resolve"}:
+            while mutations.get(timeout=15) is not None:
+                linked.unlink()
+                linked.symlink_to(private/"auth.json")
+                acknowledgments.put(True)
+            return
+        assert entered.wait(10),"proof did not reach the mutation boundary"
+        linked.unlink()
+        if fault=="regular": linked.write_bytes(b"public replacement")
+        else: linked.symlink_to(private/"auth.json")
+        changed.set()
+    denied.chmod(0)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            mutation=pool.submit(replace) if fault in {"regular","disposition","resolve"} else None
+            operation=portable_fresh._Operation()
+            journal=operation.lifecycle(world.ledger.path)
+            try:
+                _policy,state=journal.load()
+                assert {"healthy","following"}<=set(state["requests"])
+                assert journal.refusals_for("following")
+                assert journal.refusals_for("healthy")==[]
+                brief=portable_fresh.Brief(_operation=operation)
+                portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
+                assert path not in json.dumps(brief.sections["Approved scope"])
+                assert journal.refusals_for("following",consume=True)
+                assert journal.refusals_for("following",consume=True)
+                operation.verify()
+                assert not operation.failed_validation and operation.path_guard._global_failure is None
+                healthy=tmp_path/"healthy-after-refusal.md"
+                healthy.write_bytes(b"independent healthy capture")
+                retry=portable_fresh._Operation()
+                assert retry.read(healthy)[1]==b"independent healthy capture"
+                retry.verify()
+                for descriptor in set(descriptors):
+                    with pytest.raises(OSError) as closed: os.fstat(descriptor)
+                    assert closed.value.errno==errno.EBADF
+            finally:
+                if mutation is not None:
+                    changed.set()
+                    if fault in {"disposition","resolve"}: mutations.put(None)
+                    mutation.result(timeout=15)
+    finally: denied.chmod(0o700)
+
+
+@lifecycle_only
+@pytest.mark.parametrize("seam",["disposition","resolve"])
+@pytest.mark.parametrize("shape",["leaf_hop","directory_hop","direct_leaf"])
+def test_round13_denied_hop_target_is_unproved_and_never_approved(tmp_path,monkeypatch,seam,shape):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    world=Loop(tmp_path); world.team("engine"); world.team("docs")
+    world.approved(request("healthy",team="docs"))
+    home=tmp_path/"owner"; private=home/".codex"
+    public,denied=tmp_path/"public",tmp_path/"denied"
+    for directory in (private,public,denied): directory.mkdir(parents=True)
+    (private/"note.md").write_bytes(b"controlled private fixture")
+    symlink_or_skip(private,denied/"priv_link",target_is_directory=True)
+    linked=tmp_path/"l1"
+    linked.mkdir()
+    path=str(linked/"note.md")
+    # Publish while the path is public, then replace only its stored observation.
+    first=request("first"); world.ledger.publish(first)
+    following=request("following",paths=[path])
+    extra={}
+    if seam=="resolve":
+        world.ledger.event("disposition",status="HOLD",resolution={"kind":"blocked","owner":"engine/coordinator",
+            "next_decision":"review","condition":"reviewed","evidence":world.ledger.evidence},**world.ledger.target(first))
+        extra["blocker_sha256"]=portable_fresh.digest(world.ledger.status()["requests"]["first"]["resolution"])
+    world.ledger.event(seam,**({"status":"FINAL"} if seam=="disposition" else extra),
+        resolution={"kind":"next","request":raw_request(following),"evidence":[{"path":path,"sha256":"0"*64}]},
+        **world.ledger.target(first))
+    world.ledger.approve(following)
+    linked.rmdir()
+    if shape=="leaf_hop":
+        symlink_or_skip(public,linked,target_is_directory=True)
+        symlink_or_skip(denied/"priv_link"/"note.md",public/"note.md")
+    elif shape=="directory_hop": symlink_or_skip(denied/"priv_link",linked,target_is_directory=True)
+    else:
+        linked.mkdir()
+        symlink_or_skip(denied/"priv_link"/"note.md",linked/"note.md")
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    denied.chmod(0)
+    try:
+        operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
+        _policy,state=journal.load()
+        assert "healthy" in state["requests"]
+        assert journal.refusals_for("following")
+        assert journal.refusals_for("healthy")==[]
+        for _ in range(2):
+            assert journal.refusals_for("following",consume=True)
+            brief=portable_fresh.Brief(_operation=operation)
+            portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
+            assert path not in json.dumps(brief.sections["Approved scope"])
+        operation.verify()
+        assert not operation.failed_validation and operation.path_guard._global_failure is None
+    finally: denied.chmod(0o700)
+    assert journal.refusals_for("following",consume=True)
+    retry=portable_fresh._Operation().lifecycle(world.ledger.path)
+    retry.load()
+    assert retry.refusals_for("following",consume=True)
+    assert retry.refusals_for("healthy")==[]
+
+
+@lifecycle_only
+@pytest.mark.parametrize("phase",["preflight","classify"])
+@pytest.mark.parametrize("prior",["symlink","policy"])
+def test_round13_directory_cleanup_cannot_downgrade_proof_or_policy(tmp_path,monkeypatch,phase,prior):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    world=Loop(tmp_path); world.team("engine"); world.team("docs")
+    world.approved(request("healthy",team="docs"))
+    linked,public,home=tmp_path/"linked",tmp_path/"public",tmp_path/"owner"
+    private=home/".codex"
+    for directory in (linked,public,private): directory.mkdir(parents=True)
+    (private/"note.md").write_bytes(b"controlled private fixture")
+    if phase=="classify": (linked/"sub").mkdir()
+    path=str(linked/"sub"/"note.md" if phase=="classify" else linked/"note.md")
+    first=request("first"); world.ledger.publish(first)
+    following=request("following",paths=[path])
+    world.ledger.event("disposition",status="FINAL",resolution={"kind":"next","request":raw_request(following),
+        "evidence":[{"path":path,"sha256":"0"*64}]},**world.ledger.target(first))
+    world.ledger.approve(following)
+    if phase=="classify": (linked/"sub").rmdir()
+    linked.rmdir(); symlink_or_skip(public,linked,target_is_directory=True)
+    if phase=="classify": symlink_or_skip(private,public/"sub",target_is_directory=True)
+    else: symlink_or_skip(private/"note.md",public/"note.md")
+    real_os=portable_fresh.os
+    info=public.stat(); public_identity=info.st_dev,info.st_ino
+    armed,closed,policy_seen=[False],[],[False]
+    trigger=linked/"note.md" if phase=="preflight" else public/"sub"
+    def close(descriptor):
+        info=real_os.fstat(descriptor)
+        selected=(armed[0] and (info.st_dev,info.st_ino)==public_identity
+                  and (prior!="policy" or policy_seen[0]))
+        real_os.close(descriptor)
+        if selected:
+            closed.append(descriptor)
+            raise OSError(errno.EIO,"controlled proof-directory cleanup failure")
+    def metadata(*args,**kwargs):
+        if armed[0] and prior=="policy" and args[0]==("sub" if phase=="classify" else "note.md"):
+            policy_seen[0]=True
+            raise alias_router.CapturedPolicyError("controlled proof policy failure")
+        return real_os.stat(*args,**kwargs)
+    namespace={**vars(portable_fresh),"os":SimpleNamespace(**{**vars(real_os),"close":close,"stat":metadata})}
+    # Bind production functions to one owned OS boundary, including any cleanup helper.
+    for name,function in vars(portable_fresh).items():
+        if isinstance(function,FunctionType) and function.__globals__ is vars(portable_fresh):
+            clone=FunctionType(function.__code__,namespace,name,function.__defaults__,function.__closure__)
+            clone.__kwdefaults__=function.__kwdefaults__
+            namespace[name]=clone
+    original=namespace["_proof_check" if phase=="classify" else "_reference_check"]
+    def checked(value,*args,**kwargs):
+        previous=armed[0]
+        armed[0]=Path(value)==trigger and (phase=="classify" or not kwargs.get("_classifying"))
+        try: return original(value,*args,**kwargs)
+        finally: armed[0]=previous
+    monkeypatch.setattr(alias_router,"_owner_home",lambda:home)
+    if phase=="classify":
+        namespace["_proof_check"]=checked
+        monkeypatch.setattr(portable_fresh,"_proof_check",checked)
+    else:
+        namespace["_reference_check"]=checked
+        monkeypatch.setattr(portable_fresh,"_reference_check",checked)
+    operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
+    if prior=="policy":
+        with pytest.raises(alias_router.CapturedPolicyError,match="controlled proof policy failure"): journal.load()
+        assert operation.path_guard._global_failure is not None
+    else:
+        journal.load()
+        assert journal.refusals_for("following",consume=True)
+        assert journal.refusals_for("healthy")==[]
+        brief=portable_fresh.Brief(_operation=operation)
+        portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
+        assert path not in json.dumps(brief.sections["Approved scope"])
+        operation.verify()
+        assert operation.path_guard._global_failure is None
+    assert closed
+    for descriptor in set(closed):
+        with pytest.raises(OSError) as error: real_os.fstat(descriptor)
+        assert error.value.errno==errno.EBADF
+
+
+@lifecycle_only
+def test_round13_cached_target_errno_quarantines_a_failed_proof_close(tmp_path,monkeypatch):
+    from tests.integration.test_hierarchy_router import Loop
+    if not portable_fresh._reference_descriptors() or portable_fresh._symlink_reader() is None:
+        pytest.skip("bounded descriptor-relative link reader unavailable")
+    if os.geteuid()==0: pytest.skip("mode-000 witness requires an unprivileged runner")
+    world=Loop(tmp_path); world.team("engine"); world.team("docs")
+    world.approved(request("healthy",team="docs"))
+    linked,denied=tmp_path/"linked",tmp_path/"denied"
+    linked.mkdir(); denied.mkdir()
+    path=str(linked/"auth.json")
+    first=request("first"); world.ledger.publish(first)
+    following=request("following",paths=[path])
+    world.ledger.event("disposition",status="FINAL",resolution={"kind":"next","request":raw_request(following),
+        "evidence":[{"path":path,"sha256":"0"*64}]},**world.ledger.target(first))
+    world.ledger.approve(following)
+    linked.rmdir(); symlink_or_skip(denied,linked,target_is_directory=True)
+    stable,disposition=portable_fresh._stable_link,portable_fresh._disposition
+    real_os=portable_fresh.os
+    consuming,closed=[False],[]
+    def close(descriptor):
+        real_os.close(descriptor); closed.append(descriptor)
+        raise OSError(errno.EIO,"controlled proof-close failure")
+    failing=FunctionType(stable.__code__,{**stable.__globals__,
+        "os":SimpleNamespace(**{**vars(real_os),"close":close})},stable.__name__,stable.__defaults__,stable.__closure__)
+    failing.__kwdefaults__=stable.__kwdefaults__
+    def checked(error,*args,**kwargs):
+        if kwargs.get("seam")=="scope": consuming[0]=True
+        return disposition(error,*args,**kwargs)
+    def rechecked(*args,**kwargs):
+        return failing(*args,**kwargs) if consuming[0] else stable(*args,**kwargs)
+    monkeypatch.setattr(portable_fresh,"_disposition",checked)
+    monkeypatch.setattr(portable_fresh,"_stable_link",rechecked)
+    denied.chmod(0)
+    try:
+        operation=portable_fresh._Operation(); journal=operation.lifecycle(world.ledger.path)
+        _policy,state=journal.load()
+        assert {"following","healthy"}<=set(state["requests"])
+        assert journal.refusals_for("following") and journal.refusals_for("healthy")==[]
+        brief=portable_fresh.Brief(_operation=operation)
+        portable_fresh.lifecycle_records(brief,world.ledger.path,portable_fresh.parse_time("2030-01-01T00:00:00Z"))
+        assert path not in json.dumps(brief.sections["Approved scope"])
+        operation.verify()
+        assert closed and operation.path_guard._global_failure is None and not operation.failed_validation
+        for descriptor in set(closed):
+            with pytest.raises(OSError) as error: os.fstat(descriptor)
+            assert error.value.errno==errno.EBADF
+    finally: denied.chmod(0o700)

@@ -33,11 +33,15 @@ T7 records set author_family to the chosen family and refuse a contradictory
 author, providing the binding for a subsequent T8 check. No Router seat, launch
 or effort update is added.
 
-Selection requires admitted bindings. Unprobed and rejected levels both refuse
-`binding_not_admitted: <host>/<class> intent <intent> for <role>; probe the level or repair model-bindings.json`.
-Provision uses this same refusal at load and resolution. Every choice and record
-carries admission `admitted`; replay and append refuse unprobed records as
-`invalid_history`. A null selected capability refuses binding_unavailable:<host>:<intent>.
+Selection requires admitted bindings. Every choice and record carries admission
+`admitted`. Distinguish a current binding refusal from a historical admission refusal:
+
+| Symptom | Action |
+| --- | --- |
+| Binding refusal: an unprobed or rejected level returns `binding_not_admitted: <host>/<class> intent <intent> for <role>; probe the level or repair model-bindings.json`. Provision uses the same refusal at load and resolution. | Probe the level or repair the current bindings. Choose an alternative level only when the refusal offers that action under the role's band and fixed-effort policy, as described below. |
+| Legacy-history refusal: replay or append returns `invalid_history` even with today's bindings admitted, and the original log contains records with admission `unprobed`. The code alone does not distinguish this from other invalid history. | Keep the original audit log unchanged; repairing today's bindings cannot repair historical admission provenance. Never edit old admission fields. If restarting is appropriate, the owner must explicitly choose a separately named new history. Empty history restarts split counts and does not preserve split continuity. |
+
+A null selected capability refuses binding_unavailable:<host>:<intent>.
 Non-endpoint selections with caller-selectable effort append
 `or choose an admitted level within the band` to the next action.
 Provision's unbanded front-door offers `or choose an admitted supported level`;

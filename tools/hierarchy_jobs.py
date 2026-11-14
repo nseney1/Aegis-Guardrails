@@ -1166,7 +1166,8 @@ def check_dependency(store, initiative, message, packet, recipes):
         require(isinstance(original.get("recipe"), str) and original["recipe"] in recipes["recipes"]
                 and recipes["recipes"][original["recipe"]]["kind"] == "command",
                 "predecessor must be a command check")
-        job = Job(store.path, initiative, parent)
+        job_type = PlannedJob if has_host_plan(initiative) else Job
+        job = job_type(store.path, initiative, parent)
         result = job.result()
         if result is None:
             raise DependencyPending("predecessor has no validated terminal result")
@@ -1287,7 +1288,9 @@ def admit(ledger, initiative, message, mailbox, recipes, store=None, job=None):
         require(kind == "commit", "only a commit recipe takes derive")
         host_plan = derive_host_plan(initiative)
         require(store is not None, "derivation requires the workspace store")
-        job = job or Job(store.path, initiative, message)
+        if job is None:
+            job_type = PlannedJob if has_host_plan(initiative) else Job
+            job = job_type(store.path, initiative, message)
         if job.planned:
             job.derivation_required = True
         marker = job.metadata_kind("admitted.json") if job.planned else (
@@ -1515,6 +1518,10 @@ def file_sha256(path):
 
 
 class Job:
+    """Legacy jobs retain their historical observation and refusal behavior."""
+
+    planned = False
+
     def __init__(self, store_path, initiative, message):
         self.initiative = initiative
         self.message = message
@@ -1529,7 +1536,6 @@ class Job:
         self.execution_owned = False
         self.execution_fence = None
         self.execution_published = False
-        self.planned = has_host_plan(initiative)
         self.execution_claim_name = "claim.json"
         self.fence_observations = {}
         self.claim_candidates = set()
@@ -1555,9 +1561,6 @@ class Job:
         self.written_result = None
 
     def recorded_execution_fence(self):
-        if self.planned and (self.result_decision() == "unknown" or self.metadata_uncertain
-                             or self.admission_unverified):
-            return None
         observation = self.fence_observations.get(self.execution_claim_name)
         if observation is not None and observation.state == FENCE_VERIFIED:
             return True
@@ -1646,10 +1649,6 @@ class Job:
         except Exception as exc:
             observation = ClaimObservation(FENCE_UNCERTAIN, value if parsed else None, present, parsed,
                                            None if parsed else exc)
-        if self.planned and observation.state == FENCE_UNCERTAIN and name in self.claim_candidates:
-            self.metadata_uncertain = True
-        if self.planned and name == "execution.json" and observation.present is not False:
-            self.attempt_observations["execution_nodes"].add(name)
         previous = self.fence_observations.get(name)
         if previous is None or previous.state != FENCE_VERIFIED or observation.state == FENCE_VERIFIED:
             self.fence_observations[name] = observation
@@ -1664,17 +1663,6 @@ class Job:
             kind = "absent"
         except Exception:
             kind = "uncertain"
-            if self.planned:
-                self.metadata_uncertain = True
-        if self.planned and name == "admitted.json":
-            retained = self.attempt_observations["execution_nodes"]
-            if kind != "absent":
-                retained.add(name)
-                self.execution_claim_name = "execution.json"
-                if not self.admission_validated or kind != "regular":
-                    self.admission_unverified = True
-            elif name in retained:
-                self.metadata_uncertain = True
         return kind
 
     def observe_result(self, directory=None, *, info=None):
@@ -1702,9 +1690,6 @@ class Job:
                 # Record before context cleanup: a close error cannot erase this stat observation.
                 return record("regular" if stat.S_ISREG(info.st_mode) else "other")
         except FileNotFoundError:
-            if (self.planned and not isinstance(directory, Exception)
-                    and (self.attempt_observations["execution_nodes"] or self.claim_candidates)):
-                self.metadata_uncertain = True
             return record("absent")
         except Exception:
             return record("uncertain")
@@ -1726,7 +1711,6 @@ class Job:
             with self.directory_descriptor() as directory:
                 nodes["folder"] = "directory"
                 nodes["result"] = self.observe_result(directory)
-                retained = self.attempt_observations["execution_nodes"] if self.planned else set()
                 for key, name in (("admitted", "admitted.json"), ("execution", "execution.json")):
                     try:
                         info = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -1734,43 +1718,23 @@ class Job:
                         nodes[key] = "absent"
                     except Exception:
                         nodes[key] = "uncertain"
-                        if self.planned:
-                            self.metadata_uncertain = True
                     else:
                         nodes[key] = "regular" if stat.S_ISREG(info.st_mode) else "other"
-                    if self.planned:
-                        if nodes[key] != "absent":
-                            retained.add(name)
-                        elif name in retained:
-                            self.metadata_uncertain = True
-                if nodes["execution"] != "absent" or "execution.json" in retained:
+                if nodes["execution"] != "absent":
                     self.execution_claim_name = "execution.json"
-                    if self.planned:
-                        self.claim_candidates.add("execution.json")
-                elif (self.admission_validated or nodes["admitted"] == "regular"
-                      or "admitted.json" in retained
-                      or (self.planned and (nodes["admitted"] != "absent"
-                                           or self.execution_claim_name == "execution.json"))):
+                elif self.admission_validated or nodes["admitted"] == "regular":
                     self.execution_claim_name = "execution.json"
-                    self.admission_unverified = (not self.admission_validated
-                        or (self.planned and nodes["admitted"] not in ("absent", "regular")))
+                    self.admission_unverified = not self.admission_validated
                 else:
                     self.execution_claim_name = "claim.json"
                     self.execution_boundary_crossed = True
                 nodes["observation"] = self.observe_fence(directory=directory)
         except FileNotFoundError:
             nodes.update(folder="absent", admitted="absent", execution="absent")
-            if self.planned:
-                if self.attempt_observations["execution_nodes"] or self.claim_candidates:
-                    self.metadata_uncertain = True
-            else:
-                nodes["result"] = "absent"
+            nodes["result"] = "absent"
         except Exception as exc:
             self.metadata_uncertain = True
-            if self.planned:
-                nodes["result"] = self.observe_result(exc)
-            else:
-                nodes["observation"] = self.observe_fence()
+            nodes["observation"] = self.observe_fence()
         return nodes
 
     def validated_admission(self):
@@ -1779,33 +1743,17 @@ class Job:
         self.admission_detail = None
         self.execution_claim_name = "execution.json"
         self.execution_boundary_crossed = False
-        if self.planned:
-            self.staged_derivation = None
-            self.attempt_observations["execution_nodes"].add("admitted.json")
 
     def runner_alive(self, observation=None):
-        """Planned liveness uses the verified snapshot; legacy labels and refusal codes stay compatible."""
-        if self.planned:
-            if observation is None:
-                nodes = self.observe_existing_fence()
-                observation = nodes["observation"]
-                if self.metadata_uncertain or self.result_decision() == "unknown":
-                    return None
-                if (nodes["folder"] == "directory" and nodes["execution"] == "absent"
-                        and self.execution_claim_name == "execution.json"):
-                    # Admission-only jobs still have a staging runner, but its claim is not an execution fence.
-                    observation = self.observe_fence("claim.json")
-            if observation is None or observation.state != FENCE_VERIFIED:
-                return None
-        else:
-            name = self.execution_path.name if self.execution_path.exists() else self.claim_path.name
-            observation = self.observe_fence(name)
-            if not observation.parsed:
-                if isinstance(observation.read_error, ERRORS) and not isinstance(observation.read_error, (ValueError, OSError)):
-                    # The old reader let these reach main's documented refusal handler. This is serialization
-                    # compatibility only: the common verifier still returned UNCERTAIN and recorded no fence.
-                    raise observation.read_error
-                return None
+        """Preserve the legacy liveness labels and refusal codes."""
+        name = self.execution_path.name if self.execution_path.exists() else self.claim_path.name
+        observation = self.observe_fence(name)
+        if not observation.parsed:
+            if isinstance(observation.read_error, ERRORS) and not isinstance(observation.read_error, (ValueError, OSError)):
+                # The old reader let these reach main's documented refusal handler. This is serialization
+                # compatibility only: the common verifier still returned UNCERTAIN and recorded no fence.
+                raise observation.read_error
+            return None
         claim = observation.value
 
         def inspect():
@@ -1816,27 +1764,18 @@ class Job:
                 return None
             return process_start(claim["pid"]) == claim["start"]
 
-        if not self.planned:
-            return inspect()
-        try:
-            return inspect()
-        except Exception:
-            return None
+        return inspect()
 
     def result(self):
         """Read with the same limit it was written with, or a valid large result could never be settled."""
-        if not self.planned and not self.result_path.exists():
+        if not self.result_path.exists():
             return None
-        directory = None
         try:
             with ExitStack() as owned:
-                directory = owned.enter_context(self.directory_descriptor(legacy_result=not self.planned))
+                directory = owned.enter_context(self.directory_descriptor(legacy_result=True))
                 before = os.stat(self.result_path.name, dir_fd=directory, follow_symlinks=False)
-                if self.planned:
-                    self.observe_result(directory, info=before)
                 require(stat.S_ISREG(before.st_mode), "result is not a readable file within its limit")
-                if not self.planned:
-                    self.result_observed = True
+                self.result_observed = True
                 require(before.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
                 descriptor = os.open(self.result_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                                      dir_fd=directory)
@@ -1849,28 +1788,10 @@ class Job:
                     raw = stream.read(MAX_RESULT_BYTES + 1)
                 require(len(raw) <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
         except (OSError, ValueError) as exc:
-            if not self.planned:
-                # Any failed component belongs to this read; retain its type/errno and the legacy result path.
-                if isinstance(exc, OSError) and exc.filename is not None:
-                    exc.filename = str(self.result_path)
-                raise
-            if (directory is None and isinstance(exc, FileNotFoundError)
-                    and (self.attempt_observations["execution_nodes"] or self.claim_candidates)):
-                self.observe_result(ValueError("job directory unavailable"))
-            else:
-                self.observe_result(exc)
-            if isinstance(exc, FileNotFoundError):
-                require(self.result_decision() != "settle", "job has no validated terminal result")
-                return None
-            if isinstance(exc, OSError):
-                raise ValueError("result is not a readable file within its limit") from exc
+            if isinstance(exc, OSError) and exc.filename is not None:
+                exc.filename = str(self.result_path)
             raise
-        try:
-            result = strict_json(raw.decode("utf-8"))
-        except (ValueError, UnicodeError, RecursionError) as exc:
-            if not self.planned:
-                raise
-            raise ValueError("invalid job result schema") from exc
+        result = strict_json(raw.decode("utf-8"))
         require(isinstance(result, dict) and result.get("schema") == RESULT_SCHEMA, "invalid job result schema")
         require(result.get("job") == self.id, "result does not belong to job: " + self.id)
         require(result.get("state") in ("completed", "failed", "refused"), "invalid terminal job state")
@@ -1892,8 +1813,6 @@ class Job:
             valid(result.get(field) is None or isinstance(result[field], str), field)
         if "process_stopped_confirmed" in result:
             valid(type(result["process_stopped_confirmed"]) is bool, "process_stopped_confirmed")
-        if self.planned and "provenance_unverified" in result:
-            valid(result["provenance_unverified"] is True, "provenance_unverified")
         if result.get("tests") is not None:
             tests = result["tests"]
             valid(isinstance(tests, dict), "tests")
@@ -1917,11 +1836,6 @@ class Job:
 
     def claim(self, packet_raw, recipes_sha256=None, *, for_execution=False):
         """The directory excludes competing writers; only its validated claim proves a fence."""
-        if self.planned:
-            if (self.result_decision() != "absent" or self.attempt_observations["execution_nodes"]
-                    or self.claim_candidates or self.execution_boundary_crossed):
-                return False
-            require(not self.metadata_uncertain, "job metadata observation unverified")
         self.folder.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.folder.mkdir(mode=0o700)
@@ -1942,7 +1856,6 @@ class Job:
         if packet_raw is not None:
             publish_file(self.folder / "packet.md", packet_raw)
         return True
-
 
     @contextmanager
     def disposition(self):
@@ -2009,31 +1922,15 @@ class Job:
 
     def take_execution(self, packet_raw, recipes_sha256):
         """Successful derivation admission and the separate execution claim have distinct custody."""
-        if self.planned:
-            require(self.admission_detail is None, self.admission_detail or "admission marker unverified")
-            if self.result_decision() == "settle":
-                return False
-            require(not self.metadata_uncertain, "job metadata observation unverified")
-            if "execution.json" in self.attempt_observations["execution_nodes"]:
-                return False
         self.execution_fence = None
         self.execution_published = False
         self.execution_boundary_crossed = False
-        if self.planned:
-            marker = self.metadata_kind("admitted.json")
-            require(marker in ("absent", "regular"), "admission marker unverified")
-            admitted = marker == "regular"
-        else:
-            admitted = (self.folder / "admitted.json").exists()
+        admitted = (self.folder / "admitted.json").exists()
         if not admitted:
             return self.claim(packet_raw, recipes_sha256, for_execution=True)
         self.execution_claim_name = "execution.json"
         with self.disposition():
-            if self.planned:
-                raw = self.admission_packet if packet_raw is None else packet_raw
-                require(raw is not None, "admission packet unavailable; revalidate the original mailbox request")
-            else:
-                raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
+            raw = read_bytes(self.folder / "packet.md") if packet_raw is None else packet_raw
             admitted_derivation(self, raw, recipes_sha256)
             check_settlement_processes(self, {"steps": []})
             claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
@@ -2056,23 +1953,14 @@ class Job:
                         self.execution_fence = self.execution_path
                 raise
             self.execution_fence = self.execution_path
-            if not self.planned:
-                if self.result_path.exists():
-                    return False
-            else:
-                self.observe_result()
-                decision = self.result_decision()
-                if decision == "settle":
-                    return False
-                require(decision == "absent", "result publication unverified")
+            if self.result_path.exists():
+                return False
             observation = self.observe_fence()
             require(observation.state == FENCE_VERIFIED and observation.value == claim
                     and self.runner_alive(observation) is True, "execution claim ownership changed: " + self.id)
             return True
 
     def process_record(self):
-        if self.planned:
-            return self.bounded_process_record()
         # The owner requires exact historical no-plan serialization and refusal behavior.
         try:
             record = read_json(self.process_path)
@@ -2106,7 +1994,7 @@ class Job:
 
     def process_group(self):
         group = (self.process_record() or {}).get("group")
-        return group if not self.planned or (type(group) is int and group > 0) else None
+        return group
 
     def staging_process_group(self):
         """An optional diagnostic never follows a replaced node or falls back to a path read."""
@@ -2137,6 +2025,298 @@ class Job:
                        if path.name.startswith("step-") or path.name == "result.json"
                        or (include_derivation and path.name == "derivation.json"))
         return [{"path": str(path), "sha256": file_sha256(path)} for path in names]
+
+
+class PlannedJob(Job):
+    """Host-planned jobs retain attempt-wide observations and verified execution custody."""
+
+    planned = True
+
+    def recorded_execution_fence(self):
+        if (self.result_decision() == "unknown" or self.metadata_uncertain
+                or self.admission_unverified):
+            return None
+        return super().recorded_execution_fence()
+
+    def observe_fence(self, name=None, directory=None):
+        """Retain uncertain candidates without creating a second fence verifier."""
+        name = self.execution_claim_name if name is None else name
+        observation = super().observe_fence(name, directory)
+        if observation.state == FENCE_UNCERTAIN and name in self.claim_candidates:
+            self.metadata_uncertain = True
+        if name == "execution.json" and observation.present is not False:
+            self.attempt_observations["execution_nodes"].add(name)
+        return observation
+
+    def metadata_kind(self, name):
+        kind = super().metadata_kind(name)
+        if kind == "uncertain":
+            self.metadata_uncertain = True
+        if name == "admitted.json":
+            retained = self.attempt_observations["execution_nodes"]
+            if kind != "absent":
+                retained.add(name)
+                self.execution_claim_name = "execution.json"
+                if not self.admission_validated or kind != "regular":
+                    self.admission_unverified = True
+            elif name in retained:
+                self.metadata_uncertain = True
+        return kind
+
+    def observe_result(self, directory=None, *, info=None):
+        """Retain a failed enclosing acquisition, but absence of a result alone stays absent."""
+        def record(result):
+            self.attempt_observations["result"].add(result)
+            if result == "regular":
+                self.result_observed = True
+            elif result in ("other", "uncertain"):
+                self.metadata_uncertain = True
+            return result
+
+        try:
+            if isinstance(directory, Exception):
+                raise directory
+            with ExitStack() as owned:
+                if directory is None:
+                    directory = owned.enter_context(self.directory_descriptor())
+                try:
+                    if info is None:
+                        info = os.stat(self.result_path.name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    return record("absent")
+                # Retain the observation before descriptor cleanup can fail.
+                return record("regular" if stat.S_ISREG(info.st_mode) else "other")
+        except FileNotFoundError:
+            if (not isinstance(directory, Exception)
+                    and (self.attempt_observations["execution_nodes"] or self.claim_candidates)):
+                self.metadata_uncertain = True
+            return record("absent")
+        except Exception:
+            return record("uncertain")
+
+    def observe_existing_fence(self):
+        """Classify every metadata node without following links, then use the one claim verifier."""
+        nodes = {"folder": "uncertain", "result": "uncertain", "admitted": "uncertain",
+                 "execution": "uncertain", "observation": None}
+        try:
+            with self.directory_descriptor() as directory:
+                nodes["folder"] = "directory"
+                nodes["result"] = self.observe_result(directory)
+                retained = self.attempt_observations["execution_nodes"]
+                for key, name in (("admitted", "admitted.json"), ("execution", "execution.json")):
+                    try:
+                        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        nodes[key] = "absent"
+                    except Exception:
+                        nodes[key] = "uncertain"
+                        self.metadata_uncertain = True
+                    else:
+                        nodes[key] = "regular" if stat.S_ISREG(info.st_mode) else "other"
+                    if nodes[key] != "absent":
+                        retained.add(name)
+                    elif name in retained:
+                        self.metadata_uncertain = True
+                if nodes["execution"] != "absent" or "execution.json" in retained:
+                    self.execution_claim_name = "execution.json"
+                    self.claim_candidates.add("execution.json")
+                elif (self.admission_validated or nodes["admitted"] == "regular"
+                      or "admitted.json" in retained
+                      or (nodes["admitted"] != "absent" or self.execution_claim_name == "execution.json")):
+                    self.execution_claim_name = "execution.json"
+                    self.admission_unverified = (not self.admission_validated
+                        or (nodes["admitted"] not in ("absent", "regular")))
+                else:
+                    self.execution_claim_name = "claim.json"
+                    self.execution_boundary_crossed = True
+                nodes["observation"] = self.observe_fence(directory=directory)
+        except FileNotFoundError:
+            nodes.update(folder="absent", admitted="absent", execution="absent")
+            if self.attempt_observations["execution_nodes"] or self.claim_candidates:
+                self.metadata_uncertain = True
+        except Exception as exc:
+            self.metadata_uncertain = True
+            nodes["result"] = self.observe_result(exc)
+        return nodes
+
+    def validated_admission(self):
+        super().validated_admission()
+        self.staged_derivation = None
+        self.attempt_observations["execution_nodes"].add("admitted.json")
+
+    def runner_alive(self, observation=None):
+        """Planned liveness uses the verified snapshot; legacy labels and refusal codes stay compatible."""
+        if observation is None:
+            nodes = self.observe_existing_fence()
+            observation = nodes["observation"]
+            if self.metadata_uncertain or self.result_decision() == "unknown":
+                return None
+            if (nodes["folder"] == "directory" and nodes["execution"] == "absent"
+                    and self.execution_claim_name == "execution.json"):
+                # Admission-only jobs still have a staging runner, but its claim is not an execution fence.
+                observation = self.observe_fence("claim.json")
+        if observation is None or observation.state != FENCE_VERIFIED:
+            return None
+        claim = observation.value
+
+        def inspect():
+            require(isinstance(claim, dict) and claim.get("job") == self.id, "claim does not belong to job: " + self.id)
+            require(type(claim.get("pid")) is int and claim["pid"] > 0 and isinstance(claim.get("start"), str)
+                    and claim["start"].isdigit(), "invalid runner claim: " + self.id)
+            if claim.get("process_scope") != process_scope():
+                return None
+            return process_start(claim["pid"]) == claim["start"]
+
+        try:
+            return inspect()
+        except Exception:
+            return None
+
+    def result(self):
+        """Read with the same limit it was written with, or a valid large result could never be settled."""
+        directory = None
+        try:
+            with ExitStack() as owned:
+                directory = owned.enter_context(self.directory_descriptor(legacy_result=False))
+                before = os.stat(self.result_path.name, dir_fd=directory, follow_symlinks=False)
+                self.observe_result(directory, info=before)
+                require(stat.S_ISREG(before.st_mode), "result is not a readable file within its limit")
+                require(before.st_size <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
+                descriptor = os.open(self.result_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                     dir_fd=directory)
+                owned.callback(os.close, descriptor)
+                after = os.fstat(descriptor)
+                require(stat.S_ISREG(after.st_mode) and after.st_size <= MAX_RESULT_BYTES
+                        and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+                        "result is not a readable file within its limit")
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    raw = stream.read(MAX_RESULT_BYTES + 1)
+                require(len(raw) <= MAX_RESULT_BYTES, "result is not a readable file within its limit")
+        except (OSError, ValueError) as exc:
+            if (directory is None and isinstance(exc, FileNotFoundError)
+                    and (self.attempt_observations["execution_nodes"] or self.claim_candidates)):
+                self.observe_result(ValueError("job directory unavailable"))
+            else:
+                self.observe_result(exc)
+            if isinstance(exc, FileNotFoundError):
+                require(self.result_decision() != "settle", "job has no validated terminal result")
+                return None
+            if isinstance(exc, OSError):
+                raise ValueError("result is not a readable file within its limit") from exc
+            raise
+        try:
+            result = strict_json(raw.decode("utf-8"))
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError("invalid job result schema") from exc
+        require(isinstance(result, dict) and result.get("schema") == RESULT_SCHEMA, "invalid job result schema")
+        require(result.get("job") == self.id, "result does not belong to job: " + self.id)
+        require(result.get("state") in ("completed", "failed", "refused"), "invalid terminal job state")
+        require(isinstance(result.get("steps"), list), "invalid job result steps")
+        # A durable result can survive a lost writer. Validate the fields settlement reads before
+        # publishing a receipt or releasing capacity; a malformed row leaves its effects uncertain.
+        def valid(condition, field):
+            require(condition, "invalid job result " + field)
+
+        for index, step in enumerate(result["steps"]):
+            field = "steps[%d]" % index
+            valid(isinstance(step, dict), field)
+            argv = step.get("argv")
+            valid(isinstance(argv, list) and bool(argv) and all(isinstance(word, str) for word in argv), field + ".argv")
+            valid("exit_code" in step and (step["exit_code"] is None or type(step["exit_code"]) is int), field + ".exit_code")
+            if "stopped_leftovers" in step:
+                valid(type(step["stopped_leftovers"]) is bool, field + ".stopped_leftovers")
+        for field in ("reason", "commit"):
+            valid(result.get(field) is None or isinstance(result[field], str), field)
+        if "process_stopped_confirmed" in result:
+            valid(type(result["process_stopped_confirmed"]) is bool, "process_stopped_confirmed")
+        if "provenance_unverified" in result:
+            valid(result["provenance_unverified"] is True, "provenance_unverified")
+        if result.get("tests") is not None:
+            tests = result["tests"]
+            valid(isinstance(tests, dict), "tests")
+            for field in ("total", "passed", "failed", "errors", "skipped"):
+                valid(type(tests.get(field)) is int and tests[field] >= 0, "tests." + field)
+        if "kept" in result:
+            valid(isinstance(result["kept"], list), "kept")
+            for index, item in enumerate(result["kept"]):
+                field = "kept[%d]" % index
+                valid(isinstance(item, dict), field)
+                valid(isinstance(item.get("path"), str), field + ".path")
+                if "error" in item:
+                    valid(isinstance(item["error"], str), field + ".error")
+        code = result.get("exit_code")
+        require((result["state"] == "refused" and code is None)
+                or (result["state"] == "completed" and type(code) is int and code == 0)
+                or (result["state"] == "failed" and type(code) is int and code != 0),
+                "job result state and exit code disagree")
+        self.terminal_observed = True
+        return result
+
+    def claim(self, packet_raw, recipes_sha256=None, *, for_execution=False):
+        if (self.result_decision() != "absent" or self.attempt_observations["execution_nodes"]
+                or self.claim_candidates or self.execution_boundary_crossed):
+            return False
+        require(not self.metadata_uncertain, "job metadata observation unverified")
+        return super().claim(packet_raw, recipes_sha256, for_execution=for_execution)
+
+    def take_execution(self, packet_raw, recipes_sha256):
+        """Successful derivation admission and the separate execution claim have distinct custody."""
+        require(self.admission_detail is None, self.admission_detail or "admission marker unverified")
+        if self.result_decision() == "settle":
+            return False
+        require(not self.metadata_uncertain, "job metadata observation unverified")
+        if "execution.json" in self.attempt_observations["execution_nodes"]:
+            return False
+        self.execution_fence = None
+        self.execution_published = False
+        self.execution_boundary_crossed = False
+        marker = self.metadata_kind("admitted.json")
+        require(marker in ("absent", "regular"), "admission marker unverified")
+        admitted = marker == "regular"
+        if not admitted:
+            return self.claim(packet_raw, recipes_sha256, for_execution=True)
+        self.execution_claim_name = "execution.json"
+        with self.disposition():
+            raw = self.admission_packet if packet_raw is None else packet_raw
+            require(raw is not None, "admission packet unavailable; revalidate the original mailbox request")
+            admitted_derivation(self, raw, recipes_sha256)
+            check_settlement_processes(self, {"steps": []})
+            claim = {"pid": os.getpid(), "start": process_start(os.getpid()), "job": self.id, "at": timestamp(),
+                     "process_scope": process_scope(), "recipes_sha256": recipes_sha256}
+            try:
+                self.publish_execution_claim(encoded(claim) + b"\n")
+            except Exception as exc:
+                if self.execution_published:
+                    # The boundary was crossed even if the linked file could not be verified.
+                    raise ValueError("execution claim was published; custody requires recovery") from exc
+                if isinstance(exc, FileExistsError):
+                    return False
+                if isinstance(exc, OSError):
+                    observation = self.observe_fence()
+                    if observation.state == FENCE_VERIFIED:
+                        if observation.value == claim:
+                            self.execution_boundary_crossed = True
+                            self.execution_fence = self.execution_path
+                    elif observation.present is not False:
+                        self.execution_fence = self.execution_path
+                raise
+            self.execution_fence = self.execution_path
+            self.observe_result()
+            decision = self.result_decision()
+            if decision == "settle":
+                return False
+            require(decision == "absent", "result publication unverified")
+            observation = self.observe_fence()
+            require(observation.state == FENCE_VERIFIED and observation.value == claim
+                    and self.runner_alive(observation) is True, "execution claim ownership changed: " + self.id)
+            return True
+
+    def process_record(self):
+        return self.bounded_process_record()
+
+    def process_group(self):
+        group = (self.process_record() or {}).get("group")
+        return group if type(group) is int and group > 0 else None
 
 
 def receipt_id(job, state):
@@ -3128,7 +3308,8 @@ def finish_closed_jobs(store, ledger, initiative, records, open_ids, wait, rows,
         identifier = request["holder"][len(prefix):] if request["holder"].startswith(prefix) else None
         if identifier and identifier not in open_ids and identifier in records and identifier not in settled:
             settled.add(identifier)
-            job = Job(store.path, initiative, records[identifier]["message"])
+            job_type = PlannedJob if has_host_plan(initiative) else Job
+            job = job_type(store.path, initiative, records[identifier]["message"])
             if admission is not None:
                 admission.participate(job)
             job.observe_existing_fence()
@@ -3160,7 +3341,8 @@ def admit_requests(store, ledger, initiatives, recipes, wait, rows, admission=No
         finish_closed_jobs(store, ledger, initiative, records, {message["message_id"] for message in requests}, wait, rows,
                            admission=admission)
         for message in requests:
-            job = Job(store.path, initiative, message)
+            job_type = PlannedJob if has_host_plan(initiative) else Job
+            job = job_type(store.path, initiative, message)
             if admission is not None:
                 admission.participate(job)
             existing = visit_existing(store, job, wait)
@@ -3321,7 +3503,7 @@ def census_owner(store_path, request, initiative=None):
         return None
     if initiative is not None and has_host_plan(initiative):
         message_id = identifier.split("/")[1]
-        step = Job(store_path, initiative, {"message_id": message_id}).bounded_process_record()
+        step = PlannedJob(store_path, initiative, {"message_id": message_id}).bounded_process_record()
     else:
         process = safe_path(claim.with_name("process.json"))
         if not process.exists():
@@ -4177,7 +4359,8 @@ def resolve(store_path, identifier, reason, wait, process_stopped=False):
     record = mailbox.messages().get(message_id)
     folder = safe_path(store.path / "jobs" / initiative_id / message_id)
     require(record is not None and folder.exists(), "no running job here: " + identifier)
-    job = Job(store.path, initiative, record["message"])
+    job_type = PlannedJob if has_host_plan(initiative) else Job
+    job = job_type(store.path, initiative, record["message"])
     with job.disposition():
         require(not job.result_path.exists(), "job is already finished: " + identifier)
         runner = job.runner_alive()
@@ -4328,7 +4511,8 @@ def recovery_source(job, mailbox, result, recipes_path=None, *, recipe_digest=No
 
 
 def recovery_job(store, ledger, initiative, message, records, mailbox, recipes_path=None, *, recipe_digest=None):
-    job = Job(store.path, initiative, message)
+    job_type = PlannedJob if has_host_plan(initiative) else Job
+    job = job_type(store.path, initiative, message)
     # Deliberately kind-independent and every state, bound to the initiative: recovery reports every row this job's
     # initiative filed under its holder, and any open one keeps it settle_pending/reserved_not_started. Another
     # initiative's open rows under the holder never hold or settle this job; they are named separately.

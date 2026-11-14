@@ -208,6 +208,7 @@ AUDIT_WRITERS = {
     ("tools/hierarchy_mailbox.py", "Mailbox.write_delivery_receipt"): "existing mkdir; source lines 1050",
     ("tools/hierarchy_mailbox.py", "publish_file"): "existing mkdir, open, link, unlink; source lines 306, 309, 314, 317",
     ("tools/hierarchy_mailbox.py", "writer_lock"): "existing open, unlink; source lines 260, 270",
+    ("tools/hierarchy_router.py", "writer_lock"): "NEW no-follow, descriptor-anchored .write.lock creation and unlink; private identity checks precede directory opens; exclusive lock and failure cleanup",
     ("tools/hierarchy_native_probe.py", "cleanup_command"): "existing unlink; source lines 1671",
     ("tools/hierarchy_native_probe.py", "clear_folder"): "existing rmdir; source lines 1459",
     ("tools/hierarchy_native_probe.py", "end_hold"): "existing open; source lines 470",
