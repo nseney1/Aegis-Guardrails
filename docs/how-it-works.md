@@ -192,6 +192,64 @@ Without MCP, `aegis scan FILE...` prints the same rules for a person or a shell-
 
 **Workspace and host identity.** A call binds to the operator's `AEGIS_WORKSPACE` pin, host metadata or MCP roots, a registered workspace, or a bounded walk from the server's working directory. Conflicting sources hold the call instead of choosing another repository. An unresolved workspace returns "not governed here" and may serve a read-only personal rule layer; it writes no repo state. The model cannot choose a workspace or host identity through tool arguments. See [workspace binding](hosts-and-hooks.md#workspace-binding) for precedence and repairs.
 
+## Owner-bound queue connection
+
+The owner can register a separate queue connection with an isolated interpreter command
+(`python -I -c 'from aegis_mcp.queue_owner import main; raise SystemExit(main())' ID`).
+It exposes only `aegis_team_queue` and `aegis_team_queue_claim`; the ordinary connection's tool list is unchanged.
+Claim accepts exactly `id`, `expect` (the queue revision), and `lane`. Only an owner-bound `orchestrator` may
+claim an admitted lane. Its capability labels, branch and claim TTL come from the pinned registration;
+caller roles, metadata, environment values, workspace files and extra arguments cannot grant permission.
+The existing queue claim service still enforces revisions, holds, scope overlap, leases and capacity.
+This connection starts no hosts and creates no Git lease or execution authority.
+
+The owner installs `<account-home>/.aegis/mcp-queue/registrations/ID.json` before launch, with private
+directories (0700) and regular files (0600). Account home is obtained from the effective UID's account
+database, never HOME, USERPROFILE or XDG configuration. The exact registration shape is:
+
+```json
+{
+  "schema": "aegis.mcp.queue-registration/v1",
+  "registration_id": "alpha",
+  "endpoint": "a/orchestrator",
+  "role": "orchestrator",
+  "workspace": "/absolute/workspace",
+  "lanes": {"alpha": {"capabilities": ["core"], "branch": "refs/heads/lane/alpha"}},
+  "ttl_s": 600,
+  "session_ttl_s": 7200
+}
+```
+
+Both TTLs are integers from 1 through 86400 seconds. The launch entry writes a create-only session record
+for its Linux boot ID, PID and process start ticks, pins the registration digest and a new MCP session UUID,
+and enters the server in that same process. The server independently binds this record before requests.
+Reads walk descriptors without following symlinks, refuse files above 64 KiB before parsing, and enforce
+depth, token and collection bounds. Owner/mode checks cover account home and the authority directories;
+descriptor identities also pin the system ancestors. No hierarchy or host-plan record is used as authority.
+
+**Deployment prerequisite:** the owner must configure every hostile child's sandbox so it cannot write
+the authority directory or replace its ancestors, including through aliases. The product does not verify
+this exclusion. File modes do not isolate unrestricted processes sharing the owner UID. That boundary
+requires the separate OS principal planned under OS-PRINCIPAL-1; this surface grants no native identity.
+
+Owner policy updates and revocation must acquire `authority.lock` in the authority directory using the
+same descriptor-relative file lock as the launcher. The server holds that lock, then acquires the queue
+lock and rechecks pinned records, workspace identity and session expiry before mutation. A changed,
+removed or replaced record invalidates the current grant; restoring bytes does not renew it. Restart
+through the owner launch command after repair. A second `initialize` also invalidates this connection.
+Records are retained as owner evidence; remove expired records only under the authority lock after the
+bound process has ended. No automatic directory scan or historical-record garbage collection occurs.
+
+New fixed refusal reasons are `role_missing`, `role_invalid`, `role_foreign`, `role_stale`, `role_forbidden`,
+`role_lock_timeout`, `role_io_unavailable`, and `unsupported_platform`. Malformed client arguments return
+`invalid_arguments` before any binding or authority IO. Workspace/dispatch failures return
+`queue_io_unavailable`; core queue refusal reasons remain intact. Refusals use the queue claim envelope,
+`isError: true`, and exit code 2 for malformed arguments or 1 otherwise, without echoing input or OS errors.
+Authority and queue lock waits each have a five-second timeout. Concurrent claims use the existing queue
+revision CAS; after an uncertain acknowledgement, list and reconcile before retrying. Linux process-instance
+qualification is required; other platforms refuse this connection (`BL-16c-PORTABLE`). Ordinary MCP remains
+available on its existing platforms.
+
 ## Checks
 
 **Which files.** Files you name; with `--hook` (the pre-commit hook), the staged files, read as staged; or else the working-tree changes (`git diff HEAD` plus staged), or else what the branch adds to its base (`origin/$GITHUB_BASE_REF` in a GitHub pull request, then the branch `origin/HEAD` names, then `main`, `develop` or `master`), or else the last commit. Untracked files are never picked up on their own: `git add` a new file or name it (`aegis check app.py`).
