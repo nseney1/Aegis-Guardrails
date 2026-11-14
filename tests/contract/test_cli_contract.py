@@ -196,6 +196,22 @@ def test_top_level_help_lists_every_registered_command(capsys):
         assert cmd.help in out
 
 
+def test_team_model_help_reports_admission_refusal(capsys):
+    from aegis_cli.cli import _build_parser
+
+    try:
+        _build_parser(prog="aegis").parse_args(["team", "model", "--help"])
+    except SystemExit as exc:
+        code = exc.code
+    else:
+        raise AssertionError("team model --help did not raise SystemExit")
+    assert code == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert ("No model is launched; unprobed and rejected levels refuse with binding_not_admitted."
+            in " ".join(output.out.split()))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] != ["--write"]:
         sys.exit("usage: PYTHONPATH=. python3 tests/contract/test_cli_contract.py --write")
