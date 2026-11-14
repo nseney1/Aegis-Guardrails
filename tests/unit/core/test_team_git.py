@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from aegis_core import gitsafe, gitsafe_run, team_git as tg
+from tests.unit.core.test_gitsafe import strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
@@ -65,14 +66,15 @@ def test_runner_ambient_redirect_before_entry_refuses_and_retries(repo, monkeypa
         value = "0" if style == "disabled" else str(repo / ".git" / ("index" if key == "GIT_INDEX_FILE" else "")) if style == "hook" else os.devnull if key == "GIT_CONFIG" else str(repo / ".git/HEAD")
         scoped.setenv(key, value)
         with pytest.raises(tg.GitRefusal) as caught:
-            with new_store(repo):
+            with new_store(repo, require_program=False):
                 pytest.fail("ambient redirect was accepted")
         name = "GIT_TRACE*" if style == "unknown-trace" else key
         assert caught.value.code == "ambient_git_environment" and name in caught.value.next_action and not calls
         assert "secret" not in str(caught.value) + caught.value.next_action
     assert shared_bytes(repo) == before
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 @pytest.mark.parametrize("field,value", [("GIT_AUTHOR_NAME", "bad\x01name"), ("GIT_AUTHOR_EMAIL", "a\nb"),
@@ -292,7 +294,7 @@ def test_store_entry_environment_bounds_have_public_refusal_and_retry(repo, monk
         environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(513)})
     monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
     with pytest.raises(tg.GitRefusal) as caught:
-        with new_store(repo):
+        with new_store(repo, require_program=False):
             pytest.fail("oversized environment was accepted")
     actions = {"value": "Reduce every environment value to at most 65,536 characters, then retry.",
                "count": "Reduce the environment to at most 512 variables, then retry.",
@@ -307,15 +309,18 @@ def test_store_entry_environment_bounds_have_public_refusal_and_retry(repo, monk
             if key.startswith("AEGIS_ENV_"):
                 del environment[key]
         environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(512 - len(environment))})
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
     monkeypatch.setattr(gitsafe_run, "os", os)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def strict_request(repo, scratch, args, entry, *, stdin=None, env=None):
     """Exercise both public strict initialization paths, with an owned envelope."""
+    strict_program_guard()
     with gitsafe.custody(scratch=scratch, strict_lane=True):
         if entry == "run":
             return gitsafe.run(args, repo, stdin=stdin, _env=env)
@@ -358,6 +363,7 @@ def test_fresh_strict_runner_binds_common_objects_and_keeps_writes_private(repo,
 
 
 def test_cold_lane_runner_common_binding_is_atomic_across_workers(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     scratch = tmp_path / "cold-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -404,6 +410,7 @@ def test_fresh_strict_binding_failure_preserves_code_and_retries(repo, tmp_path,
     assert shared_bytes(repo) == before
 
 
+@pytest.mark.usefixtures("strict_program")
 def test_linked_worktree_symlink_scratch_cannot_name_common_git_dir(repo, tmp_path, monkeypatch):
     make_store(repo)
     linked = tmp_path / "linked"
@@ -459,7 +466,7 @@ def test_ambient_lowercase_key_refuses_with_its_real_spelling(repo, monkeypatch)
     environment = {**os.environ, "git_dir": "not-a-repository"}
     monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
     with pytest.raises(tg.GitRefusal) as caught:
-        with new_store(repo):
+        with new_store(repo, require_program=False):
             pytest.fail("lowercase redirect was accepted")
     assert caught.value.code == "ambient_git_environment"
     assert "git_dir" in caught.value.next_action and "GIT_DIR" not in caught.value.next_action
@@ -502,11 +509,13 @@ def test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal(r
         monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", environment_type)
         monkeypatch.setattr(gitsafe_run, "os", os)
         monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def test_issued_runner_real_index_is_correct_on_the_first_call(repo, tmp_path):
+    strict_program_guard()
     scratch = tmp_path / "issued-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -534,7 +543,7 @@ def test_missing_fenced_git_refuses_before_discovery_and_retries(repo, tmp_path,
                 with gitsafe.custody(scratch=tmp_path, strict_lane=True):
                     gitsafe.run(["version"], repo)
             elif entry == "store":
-                with new_store(repo):
+                with new_store(repo, require_program=False):
                     pytest.fail("unavailable Git was accepted")
             else:
                 runner = gitsafe.lane_runner(repo, tmp_path)
@@ -543,11 +552,13 @@ def test_missing_fenced_git_refuses_before_discovery_and_retries(repo, tmp_path,
         assert caught.value.code == "git_custody_refused" and not calls
     finally:
         monkeypatch.setattr("aegis_core.gitsafe.custody_program", lookup)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def test_direct_capture_accepts_an_issued_envelope(repo, tmp_path):
+    strict_program_guard()
     scratch = tmp_path / "envelope-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -563,6 +574,7 @@ def test_direct_capture_accepts_an_issued_envelope(repo, tmp_path):
 
 
 def test_cold_publish_uses_private_destination_and_explicit_shared_publication(repo, tmp_path):
+    strict_program_guard()
     scratch, donor = tmp_path / "publish-scratch", tmp_path / "donor"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -582,6 +594,8 @@ def test_cold_publish_uses_private_destination_and_explicit_shared_publication(r
 
 @pytest.mark.parametrize("entry", ["run", "capture", "execute", "update_ref", "empty_update_ref", "lane_runner", "publish", "store"])
 def test_relative_cwd_public_routes_share_the_git_error_hierarchy(repo, tmp_path, entry):
+    if entry == "capture":
+        strict_program_guard()
     scratch = tmp_path / "relative-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -683,6 +697,7 @@ def test_strict_custody_is_inherited_and_legacy_custody_stays_unchanged(repo, tm
 
 
 def test_strict_cas_exemption_is_single_use_and_never_leaks(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     parent = git(repo, "rev-parse", "HEAD").decode().strip()
     new = commit(repo, "next", b"next\n")
     calls, real = [], subprocess.Popen
@@ -730,6 +745,7 @@ def test_strict_mode_is_context_local_during_concurrent_legacy_work(repo, tmp_pa
 
 
 def test_cas_grant_is_consumed_before_popen_callback(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     oid = git(repo, "rev-parse", "HEAD").decode().strip()
     calls, denied, real = [], [], subprocess.Popen
     def record(argv, **kwargs):
@@ -793,6 +809,7 @@ def test_strict_argv_bounds_precede_expansion_and_input_scratch(repo, tmp_path, 
 
 
 def test_capture_freezes_validated_argv_and_environment_before_input_preparation(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     calls, real = [], subprocess.Popen
     def record(argv, **kwargs):
         calls.append((tuple(argv), kwargs["env"].get("HOME")))
@@ -862,13 +879,17 @@ def repo(tmp_path):
 
 def make_store(repo):
     if not tg.descriptor_support():
-        pytest.skip("snapshot requires descriptor-relative no-follow opens")
+        pytest.skip("snapshot requires descriptor-relative no-follow opens and bound executables")
+    strict_program_guard()
     return new_store(repo)
 
 
 @contextmanager
-def new_store(repo):
+def new_store(repo, *, require_program=True):
     # Custody service provisions scratch; tests own its creation and cleanup.
+    # Refusal-only entries opt out so their checks still run before lookup.
+    if require_program:
+        strict_program_guard()
     with tempfile.TemporaryDirectory(dir=repo.parent) as directory:
         scratch = Path(directory)
         (scratch / "objects").mkdir(mode=0o700)
