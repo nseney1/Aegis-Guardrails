@@ -29,6 +29,7 @@ _SELECTORS = (gitsafe_run.LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS"}) | {"GIT_NAMESP
 def next_action(reason):
     """Closed recovery text; no repository, environment or exception text escapes."""
     return {"ambient_git_environment": "Unset Git repository selectors, then retry.",
+            "lease_branch_missing": "Restore the recorded branch, then retry.",
             "liveness_unknown": "Restore private Git metadata, then retry."}.get(reason, "")
 
 
