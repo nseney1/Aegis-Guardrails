@@ -4,6 +4,7 @@ Filesystem cases skip without descriptor confinement. The unsupported-platform
 case patches the module probe and still runs. No test needs git history.
 """
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import json
 import os
@@ -87,6 +88,46 @@ def _enabled_profile(*names):
 
 def _row(planned, name):
     return next(row for row in planned["components"] if row["id"] == name)
+
+
+@pytest.mark.parametrize("case,action,start", [
+    ("eligible", "would_start", ["writer"]),
+    ("disabled", "disabled", []),
+    ("paused", "paused", []),
+    ("refused", None, []),
+    ("backoff", "waiting_backoff", []),
+    ("running", "already_running", []),
+    ("exhausted", "restart_exhausted", []),
+])
+def test_plan_always_starts_nothing_even_when_proposing_work(case, action, start):
+    body = _enabled_profile("writer")
+    state = team_supervisor.empty_state()
+    running = ["writer"] if case == "running" else []
+    if case == "disabled":
+        body["supervisor"]["components"]["writer"]["enabled"] = False
+    elif case == "paused":
+        body["supervisor"]["pauses"] = ["writer"]
+    elif case == "refused":
+        body["supervisor"] = None
+    elif case in ("backoff", "exhausted"):
+        state["components"]["writer"]["failures"] = [0] * (3 if case == "exhausted" else 1)
+    before = copy.deepcopy((body, state, running))
+
+    def read_plan(_attempt):
+        return team_supervisor.plan(body, state, running, 0)
+
+    expected = read_plan(0)
+    assert expected["starts_nothing"] is True
+    assert expected["start"] == start
+    if action is None:
+        assert expected == {"status": "refused", "reason": "invalid value: supervisor",
+                            "layer": "repo", "starts_nothing": True, "start": []}
+    else:
+        assert expected["status"] == "dry_run"
+        assert _row(expected, "writer")["action"] == action
+    with ThreadPoolExecutor(max_workers=3) as readers:
+        assert all(result == expected for result in readers.map(read_plan, range(6)))
+    assert (body, state, running) == before
 
 
 def test_module_exports_closed_sets_and_schema():
@@ -570,6 +611,119 @@ def _policy(**overrides):
     policy = {"initial_s": 30, "max_s": 300, "limit": 3, "window_s": 300}
     policy.update(overrides)
     return policy
+
+
+def _legacy_event_deadlines(failures, restart):
+    """Pre-refactor calculation, retained as an independent differential oracle."""
+    def delay(count):
+        value = restart["initial_s"]
+        for _step in range(max(0, count - 1)):
+            value = min(value * 2, restart["max_s"])
+        return value
+
+    return [(event + delay(len([item for item in failures
+                               if type(item) is int and item <= event
+                               and event - item < restart["window_s"]])), index)
+            for index, event in enumerate(failures)]
+
+
+def _legacy_retained(failures, now, policy):
+    candidates = [*failures, now]
+    ordered = sorted(range(len(candidates)), key=lambda index: (candidates[index], index))
+    recent = [index for index in ordered if 0 <= now - candidates[index] < policy["window_s"]]
+    keep = set(recent[-100:])
+    keep.update(index for index in ordered if candidates[index] > now)
+    keep.add(len(candidates) - 1)
+    deadline, event_index = max(_legacy_event_deadlines(candidates, policy))
+    if deadline > now:
+        event = candidates[event_index]
+        support = [index for index in ordered if 0 <= event - candidates[index] < policy["window_s"]]
+        needed, delay = 1, policy["initial_s"]
+        while delay < deadline - event:
+            delay = min(delay * 2, policy["max_s"])
+            needed += 1
+        keep.update(support[-needed:])
+    if len(keep) > 100:
+        raise ValueError("supervisor failure history limit exceeded")
+    return [event for index, event in enumerate(candidates) if index in keep]
+
+
+@pytest.mark.parametrize("history", [
+    [], [0], [0, 0, 0], [200, 10, 100, 0], [60, 0, 1, 2, 3, 4],
+    [0, 1, 2, 303], [100, 0, 0, 0, 0, 0], [0, 50, 50, 100],
+    list(range(100)), [7] * 100, [(index * 37) % 101 for index in range(100)],
+])
+@pytest.mark.parametrize("window", [1, 5, 50, 300])
+@pytest.mark.parametrize("initial,maximum", [(1, 86400), (30, 300), (200, 600), (30, 30)])
+def test_public_deadlines_match_legacy_after_recording_and_policy_reload(history, window, initial, maximum):
+    policy = _policy(initial_s=initial, max_s=maximum, limit=100, window_s=window)
+    body = profile.resolve(user={"supervisor": {"components": {"writer": {
+        "enabled": True, "interval_s": 1, "restart": policy}}}})["profile"]
+    state = team_supervisor.empty_state()
+    state["components"]["writer"]["failures"] = history[:]
+    before = copy.deepcopy(state)
+    # Reuse one snapshot across rollback, retries and policy reloads. No stored delay is trusted.
+    for active in (policy, _policy(limit=1, window_s=window, initial_s=1, max_s=86400)):
+        body["supervisor"]["components"]["writer"]["restart"] = active
+        for now in (500, 0, 0, 50, 304):
+            deadlines = _legacy_event_deadlines(history, active)
+            expected = max(max(deadline for deadline, _index in deadlines), max(history) + 1) if history else None
+            row = _row(team_supervisor.plan(body, state, [], now), "writer")
+            assert row["next_eligible_at"] == expected
+            try:
+                retained = _legacy_retained(history, now, active)
+            except ValueError:
+                for _attempt in range(2):
+                    with pytest.raises(team_supervisor.SupervisorError,
+                                       match="^supervisor failure history limit exceeded$") as refused:
+                        team_supervisor.note_failure(state, "writer", now, active)
+                    assert refused.value.layer == "state"
+                continue
+            updated = team_supervisor.note_failure(state, "writer", now, active)
+            assert updated == team_supervisor.note_failure(state, "writer", now, active)
+            assert updated["components"]["writer"]["failures"] == retained
+            expected = max(max(deadline for deadline, _index in _legacy_event_deadlines(retained, active)),
+                           max(retained) + 1)
+            assert _row(team_supervisor.plan(body, updated, [], now), "writer")["next_eligible_at"] == expected
+    assert state == before
+
+
+@pytest.mark.parametrize("history,now", [
+    ([60, 0, 1, 2, 3, 4], 59),
+    ([7] * 100, 7),
+    (list(range(1000, 1100)), 500),
+])
+def test_concurrent_record_and_plan_match_legacy_without_mutating_snapshot(history, now):
+    policy = _policy(initial_s=200, max_s=600, limit=100, window_s=50)
+    body = profile.resolve(user={"supervisor": {"components": {"writer": {
+        "enabled": True, "interval_s": 1, "restart": policy}}}})["profile"]
+    state = team_supervisor.empty_state()
+    state["components"]["writer"]["failures"] = history[:]
+    before = copy.deepcopy((body, state))
+    try:
+        expected = _legacy_retained(history, now, policy)
+    except ValueError:
+        expected = None
+
+    def record_and_plan():
+        updated = team_supervisor.note_failure(state, "writer", now, policy)
+        return updated, team_supervisor.plan(body, updated, [], now)
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(record_and_plan) for _attempt in range(6)]
+        for future in futures:
+            if expected is None:
+                with pytest.raises(team_supervisor.SupervisorError,
+                                   match="^supervisor failure history limit exceeded$") as refused:
+                    future.result(timeout=10)
+                assert refused.value.layer == "state"
+            else:
+                updated, planned = future.result(timeout=10)
+                assert updated["components"]["writer"]["failures"] == expected
+                deadline = max(max(value for value, _index in _legacy_event_deadlines(expected, policy)),
+                               max(expected) + 1)
+                assert _row(planned, "writer")["next_eligible_at"] == deadline
+    assert (body, state) == before
 
 
 def test_limit_reload_keeps_recorded_failures():

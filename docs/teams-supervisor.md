@@ -93,7 +93,10 @@ the window ending at that timestamp. Recompute that event's pending delay from
 its count and the restart policy. Its deadline is the timestamp plus the greater
 of the interval and the pending delay. `next_eligible_at` is the maximum of all
 these event deadlines. Both planning and recording a later failure preserve
-an outstanding deadline. For initial 200s, max 600s and a 300s window, failures
+an outstanding deadline. Deadlines are computed in one pass over sorted history,
+grouping equal timestamps so every duplicate counts every other duplicate.
+Original event indices are preserved when selecting a retained deadline witness.
+For initial 200s, max 600s and a 300s window, failures
 recorded at 0, 1 and 2 derive deadline 602; recording at 303 keeps 602 even
 though the earlier failures no longer count in the current window. Once that
 deadline expires, its supporting evidence can be pruned. A recorded timestamp
@@ -107,7 +110,12 @@ file does not reset counters.
 
 ## Dry-run
 
-`plan` returns `status: dry_run`, `starts_nothing`, `start` and `components`.
+`plan` returns `status: dry_run`, `starts_nothing: true`, `start` and `components`.
+Every plan, refusal and health result says `starts_nothing: true`: these calls
+start no processes. The proposed work is carried by `start` and component
+action `would_start`. For example, an enabled, eligible writer with no other
+enabled components returns `status: dry_run`, `starts_nothing: true`,
+`start: ["writer"]` and a writer row with `action: would_start`.
 A component is in `start` only when it is enabled, not held, not exhausted,
 not already in the caller-supplied running set, and the clock has reached
 `next_eligible_at`. The caller supplies `running` and `now`. The planner does
