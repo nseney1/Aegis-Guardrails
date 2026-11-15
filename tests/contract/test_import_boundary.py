@@ -58,6 +58,7 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.storage_shared": 0,
     "aegis_core.gitops_checkpoint": 0,
     "aegis_core.gitops_fds": 0,
+    "aegis_core.gitops_holder": 0,
     "aegis_core.gitops_rows": 0,
     "aegis_core.gitsafe": 0,
     "aegis_core.gitsafe_run": 0,
