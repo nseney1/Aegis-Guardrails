@@ -24,6 +24,7 @@ import hierarchy_hosts
 import hierarchy_lifecycle as life
 import hierarchy_router as router
 import hierarchy_workspace as workspace
+from hierarchy_workspace_display import _Refusal, _display
 from hierarchy_mailbox import (Mailbox, MAX_BYTES, MAX_RECORDS, SLUG, TERMINAL_JOB_STATES, digest, encoded, fields,
                                matching, parse_time, require, safe_path, strict_json, timestamp,
                                writer_lock)
@@ -625,6 +626,16 @@ class _RunnerClaim(_RetainedJob):
                                          self.entries["claim.json"]["mark"]), "retained claim changed")
 
 
+def _store_read_detail(error, operation):
+    """Keep policy failures intact; display only untrusted read diagnostics."""
+    fresh._raise_global(error, operation=operation)
+    if (isinstance(error, (router.CapturedPolicyError, router.SymlinkPathError, router.PrivatePathError))
+            or type(error) is ValueError and str(error) in {
+                "cannot determine private directory identity", "workspace store is not initialized"}):
+        raise error
+    return error.message if isinstance(error, _Refusal) else _display(error)
+
+
 class _CapturedStore:
     """Read-only workspace replay from captured bytes using the existing public reducers."""
     def __init__(self, path, operation):
@@ -641,20 +652,30 @@ class _CapturedStore:
             paths = self.operation.entries(self.path / "events")
         except NotADirectoryError as exc:
             raise ValueError("workspace store is not initialized") from exc
+        except (ValueError, OSError) as exc:
+            detail = _store_read_detail(exc, self.operation)
+            events = self.path / "events"
+            if (type(exc) is ValueError and str(exc) == "captured directory disappeared: " + str(events)
+                    and _display(events) == str(events)):
+                raise
+            raise _Refusal(detail, displayed=True) from exc
         for path in paths:
             if path.name.startswith(".pending-"):
-                checked_path(path)
+                try:
+                    checked_path(path)
+                except (ValueError, OSError) as exc:
+                    raise _Refusal(_store_read_detail(exc, self.operation), displayed=True) from exc
                 continue
             name = workspace.EVENT_NAME.fullmatch(path.name)
-            require(name is not None, "unexpected workspace store entry: " + path.name)
+            require(name is not None, "unexpected workspace store entry: " + _display(path.name))
             count += 1
             require(count <= MAX_RECORDS, "workspace event history exceeds record limit")
-            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + path.name)
+            require(int(name.group(1)) == count, "nonconsecutive workspace event: " + _display(path.name))
             try:
                 event = self.operation.json(path, private=False)
-                fields(event, {"schema", "seq", "at", "kind", "data"})
-                require(event["schema"] in workspace.REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
-                parse_time(event["at"])
+                workspace.fields(event, {"schema", "seq", "at", "kind", "data"})
+                workspace.require(event["schema"] in workspace.REPLAY_SCHEMAS and event["seq"] == count, "wrong event schema or sequence")
+                workspace.parse_time(event["at"])
                 declared = event["data"]
                 guarded = event
                 if event["kind"] in {"register", "update"} and isinstance(declared, dict):
@@ -667,9 +688,13 @@ class _CapturedStore:
                     guarded = {**event, "data": {k: v for k, v in declared.items() if k not in inert}}
                 fresh._private_paths(guarded, paths=self.operation.path_guard)
                 ledger.apply(event)
+            except OSError as exc:
+                raise _Refusal(_store_read_detail(exc, self.operation), displayed=True) from exc
             except (ValueError, TypeError, KeyError, UnicodeError) as exc:
-                fresh._raise_global(exc, operation=self.operation)
-                raise ValueError("malformed workspace event: " + str(path) + ": " + str(exc)) from exc
+                # Preserve diagnostics whose value slots already crossed the
+                # workspace display boundary, including validated identifiers.
+                detail = _store_read_detail(exc, self.operation)
+                raise ValueError("malformed workspace event: " + _display(path) + ": " + detail) from exc
         require(ledger.limits is not None, "workspace store is not initialized")
         for team, initiative in ledger.initiatives.items():
             declarations = [*initiative["checkouts"], *(initiative[k] for k in ("mailbox_root", "delivery_dir") if k in initiative)]
@@ -678,6 +703,8 @@ class _CapturedStore:
                     self.operation.path_guard.refuse(declaration)
                 except router.PrivatePathError as exc:
                     self.private_refusals.setdefault(team, []).append(str(exc))
+                except (ValueError, OSError) as exc:
+                    raise _Refusal(_store_read_detail(exc, self.operation), displayed=True) from exc
         return ledger
 
 

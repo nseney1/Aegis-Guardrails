@@ -18,7 +18,7 @@ import re
 import stat
 from typing import Any
 
-from aegis_core import hosts as host_registry, pathlookup, storage, team_supervisor
+from aegis_core import hosts as host_registry, pathlookup, storage, team_profile_schema, team_supervisor
 from aegis_core.primitives import json_preflight, sanitize_display as sanitize_display
 from aegis_core.team_profile_display import (
     NEXT_ACTION_TEMPLATES, TERMINAL_NAMES as _TERMINALS,
@@ -213,7 +213,7 @@ def _context(error, layer, file=None):
 
 def _validate(value, schema, path, layer, *, required=None, resolved=False):
     try:
-        return team_supervisor.validate_input(value, schema, path, layer, required=required, resolved=resolved)
+        return team_profile_schema.validate_input(value, schema, path, layer, required=required, resolved=resolved)
     except team_supervisor.SupervisorError as error:
         raise _context(ProfileError(str(error), path=error.path, layer=error.layer), layer) from None
 
@@ -437,7 +437,7 @@ def _complete(profile):
     if len(hosts) > MAX_HOSTS:
         raise ProfileError("profile host limit exceeded", path="model_settings.hosts")
     try:
-        team_supervisor.validate_input(profile, {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES}, resolved=True)
+        team_profile_schema.validate_input(profile, {**JSON_SCHEMA, "error_path": "", "node_budget": 4 * MAX_NODES}, resolved=True)
     except team_supervisor.SupervisorError as error:
         raise ProfileError(str(error), path=error.path) from None
     _reject_terminal_hosts(hosts, ProfileError, "model_settings.hosts")
