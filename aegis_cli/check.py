@@ -41,6 +41,7 @@ import re
 import sys
 
 from aegis_core import primitives
+from aegis_core.approval_policy import clip_rendered_text
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_cli.verify import run_verify
 
@@ -113,24 +114,10 @@ def _record_components(row: dict, *, failing: bool):
 
 
 def _receipt_text(value: str, limit: int = 120, *, identifier: bool = False) -> str:
-    # Omit the whole oversized field: controls could expose a token cut by a raw slice.
-    if len(value) > _RECORD_FIELD_MAX_CHARS:
-        return "[diagnostic omitted: too_large]"
-
     from aegis_cli import sanitize_display
-    from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets, redact_insight_text
+    from aegis_core.approval_policy import receipt_value
 
-    # Controls can split a secret; canonicalize the whole field before any redaction or cut.
-    canonical = sanitize_display(value, max_len=None)
-    if identifier:
-        # Keep repository names intact while still masking known credentials, keys and URLs.
-        for pattern, replacement in TOKEN_REDACTIONS:
-            canonical = pattern.sub(replacement, canonical)
-        redacted = redact_command_secrets(canonical)
-    else:
-        # A display-sized max_len would let the redactor discard input before masking it.
-        redacted = redact_insight_text(canonical, max_len=max(len(canonical), limit))
-    return redacted[:limit]
+    return receipt_value(value, limit, identifier=identifier, canonicalize=sanitize_display)
 
 
 def _record_config_hint(reason: str, language: str = "", *, detail: str = "", incomplete_errors=()) -> str:
@@ -184,7 +171,7 @@ def _print_record_receipt(row: dict) -> None:
         for kind, component in _record_components(row, failing=failing):
             if shown < 8:
                 # Each field is already canonical and redacted; only bound the assembled line.
-                print("  " + _record_component_text(kind, component)[:398])
+                print("  " + clip_rendered_text(_record_component_text(kind, component), 398, ellipsis=False))
                 shown += 1
             else:
                 omitted += 1
@@ -221,7 +208,8 @@ def _run_record(args: argparse.Namespace) -> int:
         if outcome.hint:
             print(f"hint: {outcome.hint}")
     else:
-        print(f"{outcome.status}: {sanitize_display(outcome.reason, max_len=300)}", file=sys.stderr)
+        print(clip_rendered_text(f"{outcome.status}: {_receipt_text(outcome.reason, _RECORD_FIELD_MAX_CHARS)}", 300),
+              file=sys.stderr)
     if outcome.status != "recorded":
         return 1
     return 0 if row.get("passed") else 1
@@ -269,136 +257,22 @@ def run_check(args: argparse.Namespace) -> int:
 
 # ── --ci: the rule weakening check ───────────────────────────────────────────
 
-_LOGIN = re.compile(r"[A-Za-z0-9-]{1,39}")
-_FULL_SHA = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
-_MAX_EVENT_BYTES = 25 * 1024 * 1024
-
-
-class _CiEventError(ValueError):
-    """Event input cannot safely identify the comparison or its target."""
-
-
-_CI_EVENT_ERROR = "invalid_ci_event: invalid event data; next_action: provide a valid CI event or run locally with --base"
-
-
-def _event_pull(field="pull_request", *, strict=False) -> dict:
-    """The ``pull_request`` object of the event file GitHub Actions names in $GITHUB_EVENT_PATH; {} anywhere else."""
-    path = os.environ.get("GITHUB_EVENT_PATH")
-    if not path:
-        return {}
-    try:
-        with open(path, "rb") as handle:
-            # The runner supplies this path; only its contents are repository-controlled.
-            if os.fstat(handle.fileno()).st_size > _MAX_EVENT_BYTES:
-                raise _CiEventError(_CI_EVENT_ERROR)
-            data = handle.read(_MAX_EVENT_BYTES + 1)
-            if len(data) > _MAX_EVENT_BYTES:
-                if strict:
-                    raise _CiEventError(_CI_EVENT_ERROR)
-                return {}
-            document = json.loads(data.decode("utf-8"))
-            if strict and not isinstance(document, dict):
-                raise _CiEventError(_CI_EVENT_ERROR)
-            pull = (document if field is None else document.get(field)) or {}
-    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
-        if strict:
-            raise _CiEventError(_CI_EVENT_ERROR) from None
-        return {}
-    return pull if isinstance(pull, dict) else {}
-
-
-def _event_shas(document=None) -> tuple[str | None, str | None]:
-    """(base, head) commit ids of the pull request this CI job runs for; (None, None) anywhere else."""
-    try:
-        pull = _event_pull() if document is None else document.get("pull_request")
-        return pull["base"]["sha"], pull["head"]["sha"]
-    except (KeyError, TypeError):
-        return None, None
-
-
-def _event_pull_request(document=None):
-    """The pull request of a ``pull_request`` or ``pull_request_target`` run (the base-sourced governance
-    job), for tier A's review approval: its number, author, full head commit id and base branch, each
-    checked; None for any other event or any value in doubt (no gh call then)."""
-    from aegis_core import human_gate
-
-    if os.environ.get("GITHUB_EVENT_NAME") not in ("pull_request", "pull_request_target"):
-        return None
-    try:
-        pull = _event_pull() if document is None else document.get("pull_request")
-        number, login, sha, ref = pull["number"], pull["user"]["login"], pull["head"]["sha"], pull["base"]["ref"]
-    except (KeyError, TypeError):
-        return None
-    if type(number) is not int or number < 1 or not isinstance(login, str) or not _LOGIN.fullmatch(login) \
-            or not isinstance(sha, str) or not _FULL_SHA.fullmatch(sha) or not human_gate.is_branch_name(ref):
-        return None
-    return human_gate.PullRequest(number, login, sha.lower(), ref)
-
-
-def _ci_policy_context(root, base, explicit_base, document=None, head="HEAD", *, resolved_target=None):
-    """Resolve comparison and landing identity without changing no-map behavior."""
-    from aegis_core import approval_policy, human_gate
-
-    event = os.environ.get("GITHUB_EVENT_NAME")
-    strict = approval_policy.policy_present(root, base)
-    if event in ("pull_request", "pull_request_target"):
-        pull = _event_pull(strict=strict) if document is None else document.get("pull_request")
-        pull = pull if isinstance(pull, dict) else {}
-        anchor, candidate = pull.get("base"), pull.get("head")
-        anchor = anchor if isinstance(anchor, dict) else {}
-        candidate = candidate if isinstance(candidate, dict) else {}
-        if strict and (not isinstance(anchor.get("sha"), str) or not _FULL_SHA.fullmatch(anchor["sha"])
-                       or not isinstance(candidate.get("sha"), str) or not _FULL_SHA.fullmatch(candidate["sha"])):
-            raise _CiEventError(_CI_EVENT_ERROR)
-        ref = anchor.get("ref")
-        if strict and "ref" in anchor and not isinstance(ref, str):
-            raise _CiEventError(_CI_EVENT_ERROR)
-        if explicit_base:
-            return base, resolved_target if resolved_target == ref else None
-        return base, ref if human_gate.is_branch_name(ref) else None
-    if event == "push":
-        full_ref = os.environ.get("GITHUB_REF", "")
-        ref = (full_ref[len("refs/heads/"):] if len(full_ref) <= len("refs/heads/") + 255
-               and full_ref.startswith("refs/heads/") else None)
-        if explicit_base:
-            return base, resolved_target if resolved_target == ref else None
-        return base, ref if human_gate.is_branch_name(ref) else None
-    return base, resolved_target
+from aegis_cli.ci_inputs import (CI_EVENT_ACTION as _CI_EVENT_ACTION, CI_EVENT_ERROR as _CI_EVENT_ERROR, CiEventError as _CiEventError,
+                               read_event as _event_pull, event_pull_request as _event_pull_request)
 
 
 def _ci_inputs(root, args):
-    """Use one event snapshot for the comparison, target and review identity."""
-    from aegis_core import approval_policy, gitsafe
+    """Read the runner event once; all consumers share its name and document."""
+    from aegis_cli.ci_inputs import Event, resolve_inputs
 
-    strict = os.environ.get("GITHUB_EVENT_NAME") in ("push", "pull_request", "pull_request_target")
-    malformed = False
+    name = os.environ.get("GITHUB_EVENT_NAME")
+    ref = os.environ.get("GITHUB_REF", "")
     try:
-        document = _event_pull(None, strict=strict)
+        document = _event_pull(None, strict=name in ("push", "pull_request", "pull_request_target"))
+        event = Event(name, document, ref)
     except _CiEventError:
-        document, malformed = {}, True
-    event_base, event_head = _event_shas(document)
-    event_base = event_base if isinstance(event_base, str) else None
-    event_head = event_head if isinstance(event_head, str) else None
-    head = getattr(args, "head", None) or event_head or "HEAD"
-    with gitsafe.scrubbed():
-        explicit = getattr(args, "base", None)
-        if explicit == "":
-            explicit = None
-        selector = explicit if explicit is not None else event_base or gitsafe.resolve_base_ref(root)
-        resolved = approval_policy.resolve_comparison(root, selector, discovered=explicit is None)
-        base = resolved.commit
-        if malformed and approval_policy.policy_present(root, base):
-            raise _CiEventError(_CI_EVENT_ERROR)
-        if os.environ.get("GITHUB_EVENT_NAME") == "push":
-            base = approval_policy.push_base(root, document.get("before"), base, head,
-                                             explicit=explicit is not None, label=selector)
-        if selector is not None and not base:
-            raise approval_policy.BaseUnavailable("base_unavailable: comparison branch is unavailable",
-                explicit_base=selector if explicit is not None else None, comparison_base=selector)
-        base, target = _ci_policy_context(root, base, explicit, document, head, resolved_target=resolved.target)
-        if approval_policy.policy_present(root, base):
-            head = gitsafe.resolve_commit(root, head) or head
-    return base, head, _event_pull_request(document), target
+        event = Event(name, {}, ref, malformed=True)
+    return resolve_inputs(root, args, event)
 
 
 # What --no-exec leaves out: both rerun the pull request's code (snapshot tests, fix-commit tests).
@@ -438,11 +312,26 @@ def _ci_blocking(report, reg_report=None, perf_report=None, trailer_checks=None,
 
 def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
                        skipped=(), scanner_results=None) -> dict:
+    from aegis_core.approval_policy import MessageRow
+
     document = report.as_dict(root)
+    if report.owner_review_required:
+        document["owner_review_required"] = [MessageRow({key: _receipt_text(value, 400, identifier=True)
+            if key in ("code", "rule", "path") else value for key, value in item.items()})
+            for item in document["owner_review_required"]]
     if report.approval_policy is not None and report.approval_policy.mode is not None:
-        document.update(report.approval_policy.as_dict(display=_receipt_text))
-        document["weakenings"] = [{key: _receipt_text(value, 400, identifier=True) for key, value in item.items()}
-                                  for item in document["weakenings"]]
+        policy_fields = report.approval_policy.as_dict(display=_receipt_text)
+        if report.owner_review_required:
+            policy_fields.pop("owner_review_required", None)
+        document.update(policy_fields)
+        # Receipt identities retain their original token redaction and bounds;
+        # they never acquire prose escapes. Completed messages stay untouched.
+        rows = []
+        for item in document["weakenings"]:
+            row = {key: value if key == "message" else _receipt_text(value, 400, identifier=True)
+                   for key, value in item.items()}
+            rows.append(MessageRow(row) if isinstance(item, MessageRow) else row)
+        document["weakenings"] = rows
         document["governance"]["paths"] = [{key: _receipt_text(value, 400, identifier=True) for key, value in item.items()}
                                           for item in document["governance"]["paths"]]
     if reg_report is not None:
@@ -466,6 +355,8 @@ def _build_ci_document(report, root: str, reg_report=None, cov_report=None, perf
 
 def _print_policy(document, fmt, blocking, span):
     """Render policy notices and permitted findings, retaining the ordinary verdict otherwise."""
+    from aegis_core.approval_policy import PERMITTED_MODES
+
     mode = document.get("approval_mode")
     if mode == "review" and fmt != "github":
         print("  owner review required")
@@ -473,47 +364,69 @@ def _print_policy(document, fmt, blocking, span):
         print("  note: target unknown; using the strictest declared mode; pass --base origin/<branch>")
     if document.get("approval_policy_error"):
         print(f"  note: {document['approval_policy_error']}")
-    if mode not in ("none", "review"):
+    if mode not in PERMITTED_MODES:
         return False
     cause = f": {blocking[0]}" if blocking else ""
     print(f"aegis check --ci: {'FAILED' if blocking else 'PASSED'}, approval mode {mode} ({span}){cause}")
-    for item in document["weakenings"]:
-        print(_receipt_text(f"  [{item['code']}] {item['rule']} ({item['path']}): {item['message']}", 400, identifier=True))
-    for entry in document["governance"]["paths"]:
-        print(_receipt_text(f"  [governance:{entry['category']}] {entry['path']}", 400, identifier=True))
+    _print_findings(document)
     return True
 
 
-def _approval_command(document):
+def _approval_command(document, ref=None):
+    from aegis_core.approval_policy import command_token, guidance_value
+
     command = "aegis approve"
-    if document.get("approval_mode") == "signature" and document.get("approval_target") is not None:
-        command += f" --base origin/{_receipt_text(document['approval_target'], 255, identifier=True)}"
+    if document.get("approval_mode") == "signature":
+        base = guidance_value(document["scope"]["base"])
+        if ref is not None:
+            displayed = guidance_value(ref)
+            if command_token(ref) and displayed == ref:
+                base = displayed
+        command += f" --base {base}"
     return command
 
 
-def _print_ci_findings(report, document, gated):
-    from aegis_cli import sanitize_display
+def _print_approval_hint(report, document, what):
+    from aegis_core.approval_policy import guidance_value
 
-    if document.get("approval_mode") is not None:
-        for item in document["weakenings"]:
-            print(_receipt_text(f"  [{item['code']}] {item['rule']} ({item['path']}): {item['message']}", 400, identifier=True))
-        for entry in document["governance"]["paths"] if gated else ():
-            print(_receipt_text(f"  [governance:{entry['category']}] {entry['path']}", 400, identifier=True))
-    else:
-        for item in report.weakenings:
-            print(sanitize_display(f"  [{item.code}] {item.rule} ({item.path}): {item.message}", 400))
-        for path, category in report.governance_paths if gated else ():
-            print(sanitize_display(f"  [governance:{category}] {path}", 400))
+    command = _approval_command(document, report.comparison_ref)
+    print(f"  A {what} passes only with a signed approval: {command} (a key listed in allowed_signers on the base "
+          "branch), or at tier A with an approving review of the head commit by someone other than its author.")
+    if report.comparison_ref is not None and document.get("approval_mode") == "signature" \
+            and command != f"aegis approve --base {report.comparison_ref}":
+        print(f"  Comparison ref: {guidance_value(report.comparison_ref, prose=True)}.")
+
+
+def _print_findings(document, gated=True):
+    from aegis_core.approval_policy import finding_message, guidance_value as show
+
+    for item in document["weakenings"]:
+        print(f"  [{show(item['code'], prose=True)}] {show(item['rule'], prose=True)} ({show(item['path'], prose=True)}): {finding_message(item, producer='weakenings')}")
+    for entry in document["governance"]["paths"] if gated else ():
+        print(f"  [governance:{show(entry['category'], prose=True)}] {show(entry['path'], prose=True)}")
+
+
+def _print_ci_findings(report, document, gated):
+    _print_findings(document, gated)
+
+
+def _print_owner_review(report, document, fmt):
+    from aegis_core.approval_policy import finding_message, guidance_value as show
+
+    if fmt != "github" and report.owner_review_required:
+        for item in document["owner_review_required"]:
+            print(f"  [{show(item['code'], prose=True)}] {show(item['rule'], prose=True)} ({show(item['path'], prose=True)}): {finding_message(item, producer='owner_review_required')}")
 
 
 def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, perf_report=None, trailer_checks=None,
               skipped=(), scanner_results=None) -> list:
     """Print the ``check --ci`` result in ``fmt`` and append the step summary; return the blocking causes."""
-    from aegis_cli import sanitize_display
     from aegis_cli.formatters.report import (coverage_explanation, coverage_omitted_count, coverage_reason, format_sarif_report,
-                                             github_annotation_lines, governance_note, perf_line)
+                                             github_annotation_lines, governance_note, perf_line, regression_findings,
+                                             render_ci_json)
     from aegis_cli.verify import _append_step_summary
     from aegis_core import regression
+    from aegis_core.approval_policy import guidance_value as show
 
     document = _build_ci_document(report, root, reg_report, cov_report, perf_report, trailer_checks=trailer_checks,
                                   skipped=skipped, scanner_results=scanner_results)
@@ -524,7 +437,7 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
         print(format_sarif_report(document, workspace_root=root))
         return blocking
     if fmt == "json":
-        print(json.dumps(document, indent=2))
+        print(json.dumps(render_ci_json(document), indent=2))
         return blocking
     gated = report.governance_gated
     note = governance_note(document)
@@ -548,54 +461,48 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
             approval = report.approval
             signer = (f"review of {approval.signer}" if approval.source == "review"
                       else approval.signer or "a key in the base allowed_signers")
-            print(f"aegis check --ci: PASSED, {done} approved by {sanitize_display(signer, 120)} ({span})")
+            print(f"aegis check --ci: PASSED, {done} approved by {show(signer, 120, prose=True)} ({span})")
         _print_ci_findings(report, document, gated)
         if not report.passed:
-            command = _approval_command(document)
-            print(f"  A {what} passes only with a signed approval: {command} (a key listed in allowed_signers on the base "
-                  "branch), or at tier A with an approving review of the head commit by someone other than its author.")
+            _print_approval_hint(report, document, what)
     if note:
-        print(sanitize_display(f"  note: {note}", 400))
+        print(clip_rendered_text(f"  note: {note}", 400))
+    _print_owner_review(report, document, fmt)
     if reg_report is not None:
         if reg_report.findings and reg_report.tier != "gate":
             print("  regression tier: warning (advisory; no setting makes it block)")
-        for finding in reg_report.findings:
-            tag = ("UNVERIFIED" if finding.code in regression.UNVERIFIED_CODES
+        for finding in regression_findings(document["regression"]):
+            tag = ("UNVERIFIED" if finding["code"] in regression.UNVERIFIED_CODES
                    else "FAIL" if reg_report.tier == "gate" else "WARN")
-            print(sanitize_display(f"  [{tag}:regression/{finding.code}] ({finding.path}): {finding.message}", 400))
+            print(f"  [{tag}:regression/{show(finding['code'], prose=True)}] ({show(finding['path'], prose=True)}): {finding['message']}")
         if reg_report.exempted_count > 0:
             print(f"  regression exemptions: {reg_report.exempted_count}/{reg_report.total_fix_commits} "
                   f"({reg_report.exemption_rate * 100:.1f}%)")
         for untested in reg_report.untested_changes:
-            files_str = ", ".join(untested.source_files[:5])
-            print(
-                sanitize_display(
-                    f"  [untested-change] {untested.commit[:10]} ({untested.subject}): {files_str}",
-                    400,
-                )
-            )
+            files_str = ", ".join(show(path, prose=True) for path in untested.source_files[:5])
+            print(f"  [untested-change] {show(untested.commit[:10], prose=True)} ({show(untested.subject, prose=True)}): {files_str}")
     for t_chk in trailer_checks or ():
         if t_chk.get("failed"):
-            print(sanitize_display(f"  [FAIL:trailer-divergence] {t_chk['commit'][:10]}: {t_chk.get('reason', '')}", 400))
+            print(f"  [FAIL:trailer-divergence] {show(t_chk['commit'][:10], prose=True)}: {show(t_chk.get('reason', ''), prose=True)}")
     if scanner_results is not None and not scanner_results:
         print("scanners: none configured")
     for result in scanner_results or ():
-        tag = f"{result['status'].upper()}:scanner/{result['name']}"
+        tag = f"{show(result['status'].upper(), prose=True)}:scanner/{show(result['name'], prose=True)}"
         if result["status"] == "unverified":
-            print(sanitize_display(f"  [{tag}] {result['reason']}", 400))
+            print(f"  [{tag}] {show(result['reason'], prose=True)}")
         elif result["status"] == "pass":
             print(f"  [{tag}] no new finding ({result['subtracted']} at the merge base)")
         for f in result["findings"]:
-            print(sanitize_display(f"  [{tag}] {f.path}:{f.line} {f.rule_id}: {f.message}", 400))
+            print(f"  [{tag}] {show(f.path, prose=True)}:{f.line} {show(f.rule_id, prose=True)}: {show(f.message, prose=True)}")
     if scanner_results:
         supp = scanner_results[0]["suppressions"]
         since = "no merge-base count" if supp["delta"] is None else f"{supp['delta']:+d} since the merge base"
         print(f"scanners: {supp['count']} security suppression(s) in tracked files ({since})")
     if perf_report is not None:
-        print(sanitize_display(perf_line(perf_report), 400))
+        print(clip_rendered_text(perf_line(perf_report), 400))
     if cov_report is not None and cov_report.get("status") == "reported":
         ratio = cov_report.get("ratio")
-        print(sanitize_display(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
+        print(clip_rendered_text(f"  coverage (report only): {'n/a' if ratio is None else f'{ratio * 100:.1f}%'} of "
                                f"{cov_report.get('executable_lines', 0)} changed executable lines "
                                f"({coverage_omitted_count(cov_report)} file(s) not measured)", 400))
     elif cov_report is not None:
@@ -607,15 +514,15 @@ def _print_ci(report, fmt: str, root: str, reg_report=None, cov_report=None, per
     return blocking
 
 
-def _ci_error(message: str, fmt: str, *, code=None, next_action=None) -> int:
+def _ci_error(message: str, fmt: str, *, code=None, next_action=None, extra=None) -> int:
     """A run that could not be judged: exit 1 with the reason, and in SARIF a valid log that says the run
     did not complete, so an upload step that always runs never meets an empty or invalid file."""
     from aegis_cli.formatters.report import format_sarif_report
 
     print(f"Error: {message}", file=sys.stderr)
     if fmt == "json" and code is not None:
-        print(json.dumps({"status": "fail", "code": code, "approval": None,
-                          "next_action": next_action or "provide a valid CI event or run locally with --base"}))
+        print(json.dumps({"status": "fail", "code": code, **({"approval": None} if extra is None else extra),
+                          "next_action": next_action or _CI_EVENT_ACTION}))
     if fmt == "sarif":
         print(format_sarif_report({}, error=message))
     return 1
@@ -624,21 +531,18 @@ def _ci_error(message: str, fmt: str, *, code=None, next_action=None) -> int:
 def _ci_base_error(exc, fmt):
     from aegis_core import approval_policy
 
-    action = approval_policy.BASE_UNAVAILABLE_ACTION
+    action = approval_policy.GuidanceMessage("base_unavailable", approval_policy.MESSAGE_TEMPLATES["base_unavailable"], {}).render()
     if exc.code == "comparison_unavailable":
-        action = "pass --base that is a proper ancestor of the head"
+        action = approval_policy.GuidanceMessage("comparison_unavailable", approval_policy.MESSAGE_TEMPLATES["comparison_unavailable"], {}).render()
     else:
         selector = exc.explicit_base if exc.explicit_base is not None else exc.comparison_base
         if selector is not None:
-            base = _receipt_text(selector, 255, identifier=True)
-            origin = "fetch origin; " if selector.startswith(("origin/", "refs/remotes/origin/")) else ""
-            action = f"cannot resolve the base {base!r}; {origin}fetch it or pass the full commit id"
+            action = approval_policy.unresolved_base_hint(selector)
     return _ci_error(f"{exc.code}: {action}", fmt, code=exc.code, next_action=action)
 
 
 def _run_ci(args: argparse.Namespace) -> int:
     """`aegis check --ci`: 0 nothing weakened or every weakening approved, 1 otherwise, 2 usage."""
-    from aegis_cli import sanitize_display
     from aegis_core import approval_policy, checkrun, gitsafe, regression, rule_integrity
 
     from aegis_cli.verify import _resolve_git_cwd
@@ -665,29 +569,30 @@ def _run_ci(args: argparse.Namespace) -> int:
     fmt = "json" if getattr(args, "json", False) else str(getattr(args, "format", None) or "text").lower()
     root = _resolve_git_cwd(args)
     try:
-        base, head, pull, target = _ci_inputs(root, args)
-        if not base:
-            return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
-                             fmt)
-        report = rule_integrity.check_ci(root, base, head, pull_request=pull, target=target)
+        with gitsafe.memo():
+            inputs = _ci_inputs(root, args)
+            base, head = inputs.resolution.commit, inputs.head
+            if not base:
+                return _ci_error("--ci needs a base to compare with: pass --base REF (a pull request job has it in the event file)",
+                                 fmt)
+            report = rule_integrity.check_ci(root, base, head, pull_request=inputs.pull, target=inputs.target,
+                                             resolution=inputs.resolution, policy=inputs.policy, head_commit=inputs.head_commit)
         # The reruns can take long; progress goes to stderr so the json and github stdout stay unchanged.
-        progress = lambda line: print(f"aegis check --ci: {sanitize_display(line, 300)}", file=sys.stderr, flush=True)  # noqa: E731
+        progress = lambda line: print(clip_rendered_text(f"aegis check --ci: {line}", 300), file=sys.stderr, flush=True)  # noqa: E731
         reg_report = None if no_exec else regression.check_ci_regressions(root, base, head, progress=progress)
         trailer_checks = [] if no_exec else checkrun.verify_commit_trailers(root, base, head, progress=progress)
     except _CiEventError:
-        return _ci_error(_CI_EVENT_ERROR, fmt, code="invalid_ci_event")
+        return _ci_error(approval_policy.GuidanceMessage("invalid_ci_event", approval_policy.MESSAGE_TEMPLATES["invalid_ci_event"], {}).render(), fmt, code="invalid_ci_event")
     except approval_policy.BaseUnavailable as exc:
         return _ci_base_error(exc, fmt)
     except approval_policy.InvalidApprovalPolicy as exc:
         unavailable = isinstance(exc, approval_policy.PolicyUnavailable)
-        if fmt == "json":
-            print(json.dumps({"status": "fail", "code": "invalid_approval_policy", "path": approval_policy.CONFIG_PATH,
-                              "key": "approvals", "next_action": approval_policy.POLICY_UNAVAILABLE_ACTION
-                              if unavailable else "fix the committed configuration"}))
-        return _ci_error(approval_policy.POLICY_UNAVAILABLE_DETAIL if unavailable else approval_policy.INVALID_DETAIL, fmt)
+        return _ci_error(approval_policy.POLICY_UNAVAILABLE_DETAIL if unavailable else approval_policy.INVALID_DETAIL, fmt,
+                         code="invalid_approval_policy", extra={"path": approval_policy.CONFIG_PATH, "key": "approvals"},
+                         next_action=approval_policy.POLICY_UNAVAILABLE_ACTION if unavailable else "fix the committed configuration")
     except (rule_integrity.IntegrityError, regression.RegressionError, gitsafe.GitError) as exc:
         coded = isinstance(exc, rule_integrity.IntegrityError)
-        return _ci_error(sanitize_display(str(exc), 400), fmt, code=exc.code if coded else None,
+        return _ci_error(clip_rendered_text(str(exc), 400 - len("Error: ")), fmt, code=exc.code if coded else None,
                          next_action=exc.next_action if coded else None)
 
     cov_report = None
@@ -701,8 +606,9 @@ def _run_ci(args: argparse.Namespace) -> int:
         checkout, named = gitsafe.head_commit(root), getattr(args, "head", None)
         asked = gitsafe.resolve_commit(root, named) if named else checkout
         if asked != checkout:  # perf measures the work tree, as coverage does
+            selector = approval_policy.guidance_value(str(asked or named), 12, prose=True)
             perf_report = {"status": "unverified", "regressed": False, "noisy": False, "passed": True,
-                           "reason": f"the checkout is not {(asked or str(named))[:12]}; check out the pull request head"}
+                           "reason": f"the checkout is not {selector}; check out the pull request head"}
         else:
             try:
                 perf_report = perf_check.run_perf_check(root, base_ref=base)
