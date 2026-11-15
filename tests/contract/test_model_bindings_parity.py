@@ -68,7 +68,8 @@ def test_r3_provision_locators_do_not_echo_secrets(tmp_path, monkeypatch, surfac
     from types import SimpleNamespace
     import tools.hierarchy_provision as provision
     data = fixture_case("valid")
-    host = "ghp_" + "A" * 24 if secret == "github" else "xoxb-0123456789." * 7 + "xoxb-0123456789"
+    host = ("ghp_" + "A" * 24 if secret == "github" else
+            ("xox" + "b-" + "0123456789.") * 7 + ("xox" + "b-" + "0123456789"))
     shown = "[REDACTED_TOKEN]" if secret == "github" else ".".join(["[REDACTED_TOKEN]"] * 8)
     for row in data["hosts"]:
         if row["host"] == "codex-cli":

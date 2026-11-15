@@ -33,6 +33,314 @@ MESSAGES = {
 }
 
 
+def test_read_context_denial_precedes_payload_and_retry_is_request_scoped(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="private")
+        rid = store.write(value)
+        reads = []
+        original = codec_store.Store._read_bytes
+
+        def counted(self, *args, **kwargs):
+            reads.append(args[0])
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+        allowed = False
+
+        def authorize(reference):
+            assert reference == rid
+            codec.require(allowed, "E_AUTH", detail="reference")
+            return {"author": value["meta"], "kind": value["kind"]}
+
+        context = codec.ReadContext(store, authorize)
+        for operation in (context.read, context.describe):
+            with pytest.raises(codec.CodecError, match="store access refused") as caught:
+                operation(rid)
+            assert (caught.value.code, caught.value.detail) == ("E_AUTH", "reference")
+        assert reads == [] and context.io.used == 0
+        allowed = True
+        assert context.read(rid) == value
+        assert context.describe(rid)["chars"] == len(raw(value))
+        assert reads == [rid] and context.io.used == len(raw(value))
+        assert store.read.__func__ is codec.Store.read
+        assert store.describe.__func__ is codec.Store.describe
+        allowed = False
+        with pytest.raises(codec.CodecError) as caught:
+            context.read(rid)
+        assert caught.value.code == "E_AUTH" and reads == [rid]
+        allowed = True
+        assert codec.ReadContext(store, authorize).read(rid) == value
+        assert reads == [rid, rid]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["hash", "metadata", "missing", "budget"])
+def test_read_context_failure_accounting_and_repair(tmp_path, failure):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="verified")
+        rid = store.write(value)
+        facts = {"author": value["meta"], "kind": value["kind"]}
+        context = codec.ReadContext(store, lambda reference: facts)
+        path = tmp_path / (rid + ".json")
+        if failure == "hash":
+            path.write_bytes(b"x" * len(raw(value)))
+        elif failure == "metadata":
+            facts["kind"] = "blob"
+        elif failure == "missing":
+            path.unlink()
+        else:
+            context.io.limit = len(raw(value)) - 1
+        with pytest.raises(codec.CodecError) as caught:
+            context.read(rid)
+        assert caught.value.code == {"hash": "E_HASH", "metadata": "E_AUTH",
+                                     "missing": "E_AUTH", "budget": "E_LIMIT"}[failure]
+        assert context.io.used == (len(raw(value)) if failure in ("hash", "metadata") else 0)
+        path.write_bytes(raw(value))
+        facts["kind"] = "text"
+        if failure in ("hash", "metadata"):
+            context.io.limit = context.io.used
+            with pytest.raises(codec.CodecError) as caught:
+                context.read(rid)
+            assert caught.value.code == "E_LIMIT"
+            assert codec.ReadContext(store, lambda reference: facts).read(rid) == value
+        context.io.limit = codec.MAX_REF_BYTES
+        assert context.read(rid) == value
+        budget = codec.Budget(len(raw(value)) - 1)
+        with pytest.raises(codec.CodecError) as caught:
+            context.describe(rid, _budget=budget)
+        assert caught.value.code == "E_LIMIT"
+    finally:
+        store.close()
+
+
+def test_read_context_concurrent_cache_and_closed_reader_boundary(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    store = make_store(tmp_path)
+    try:
+        value = record(body="child")
+        rid = store.write(value)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": "text"})
+        reads, original = [], codec_store.Store._read_bytes
+
+        def counted(self, *args, **kwargs):
+            reads.append(args[0])
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(context.read, [rid] * 4)) == [value] * 4
+        assert reads == [rid] and context.io.used == len(raw(value))
+        parent = dict(record(), refs={"child": rid})
+        assert codec.read_view(parent, store=context) == codec.read_view(parent, store=store)
+        class Reader:
+            read = context.read
+            describe = context.describe
+        class Derived(codec.ReadContext):
+            pass
+        for reader in (Reader(), Derived(store, lambda reference: {})):
+            assert_error("E_REF", lambda: codec.read_view(parent, store=reader))
+            assert_error("E_REF", lambda: codec.ReadContext(reader, lambda reference: {}))
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("options,code", [({"selectors": ["body.bad"]}, "E_SELECTOR"),
+                                         ({"expand": ["absent"]}, "E_REF"),
+                                         ({"selectors": ["body.bad"], "expand": ["absent"]}, "E_SELECTOR")])
+def test_prepare_read_record_checks_precede_child_reads(options, code):
+    assert_error(code, lambda: codec.prepare_read(record(), **options))
+
+
+@pytest.mark.parametrize("alias", ["direct", "descendant", "ancestor", "separate"])
+@pytest.mark.parametrize("payload,code", [("format", "E_FORMAT"), ("hash", "E_HASH"), ("valid", None)])
+def test_read_context_budget_aliases_preserve_verification_and_exact_charges(tmp_path, monkeypatch, alias, payload, code):
+    store = make_store(tmp_path)
+    try:
+        value = dict(record(), meta={key: "" for key in record()["meta"]})
+        value["body"] = "x" * (162 - len(raw(value)))
+        encoded = raw(value)
+        assert len(encoded) == 162
+        content = encoded if payload == "valid" else b"{}"
+        rid = hashlib.sha256(b"[]" if payload == "hash" else content).hexdigest()
+        (tmp_path / (rid + ".json")).write_bytes(content)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": "text"})
+        context.io.limit = len(content)
+        ancestor = codec.Budget(len(content))
+        if alias == "direct":
+            view = context.io
+        elif alias == "descendant":
+            view = codec.Budget(len(content), parent=context.io)
+        elif alias == "ancestor":
+            context.io.parent = ancestor
+            view = codec.Budget(len(content), parent=ancestor)
+        else:
+            view = codec.Budget(len(content))
+        reads, original = [], codec_store.Store._read_bytes
+
+        def counted(self, *args, **kwargs):
+            reads.append(args[0])
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+        if code is None:
+            assert context.read(rid, _budget=view) == value
+        else:
+            with pytest.raises(codec.CodecError) as caught:
+                context.read(rid, _budget=view)
+            assert caught.value.code == code
+        assert context.io.used == view.used == len(content)
+        if alias == "ancestor":
+            assert ancestor.used == len(content)
+        assert reads == [rid]
+        if code is None:
+            replay = codec.Budget(len(content))
+            assert context.read(rid, _budget=replay) == value
+            assert replay.used == len(content) and context.io.used == len(content)
+            assert reads == [rid]
+        else:
+            with pytest.raises(codec.CodecError) as caught:
+                context.read(rid)
+            assert caught.value.code == "E_LIMIT"
+            assert context.io.used == len(content)
+    finally:
+        store.close()
+
+
+def test_read_context_concurrent_distinct_records_share_an_ancestor_once(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    store = make_store(tmp_path)
+    try:
+        values = [record(body=body) for body in ("one", "two")]
+        ids = [store.write(value) for value in values]
+        total = sum(len(raw(value)) for value in values)
+        ancestor = codec.Budget(total)
+        context = codec.ReadContext(store, lambda reference: {"author": values[0]["meta"], "kind": "text"})
+        context.io.limit, context.io.parent = total, ancestor
+        view = codec.Budget(total, parent=ancestor)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(context.read, rid, _budget=view) for rid in ids]
+            assert [future.result(timeout=10) for future in futures] == values
+        assert context.io.used == view.used == ancestor.used == total
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("alias", ["direct", "descendant", "ancestor"])
+@pytest.mark.parametrize("headroom", [1, 2])
+def test_r9_cached_replay_charges_only_new_view_nodes(tmp_path, monkeypatch, alias, headroom):
+    store = make_store(tmp_path)
+    try:
+        value = record(body="cached")
+        rid, size = store.write(value), len(raw(value))
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": value["kind"]})
+        context.io.limit = size * headroom
+        ancestor = codec.Budget(size * headroom)
+        if alias == "ancestor":
+            context.io.parent = ancestor
+        reads, original = [], codec_store.Store._read_bytes
+
+        def counted(self, *args, **kwargs):
+            reads.append(args[0])
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+        assert context.read(rid) == value
+        for operation in (context.read, context.describe):
+            if alias == "direct":
+                view = context.io
+            else:
+                view = codec.Budget(size, parent=context.io if alias == "descendant" else ancestor)
+            result = operation(rid, _budget=view)
+            assert result == (value if operation == context.read else {"ref": rid[:16], "kind": value["kind"], "chars": size})
+            assert view.used == size and context.io.used == size
+            if alias == "ancestor":
+                assert ancestor.used == size
+        assert reads == [rid]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("chain", ["io", "view"])
+@pytest.mark.parametrize("fault", ["cycle", "negative", "overused", "parent_type", "used_type", "limit_type", "missing_parent"])
+def test_r9_malformed_budget_chains_refuse_without_io(tmp_path, monkeypatch, cached, chain, fault):
+    store = make_store(tmp_path)
+    try:
+        value = record()
+        rid = store.write(value)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": value["kind"]})
+        if cached:
+            assert context.read(rid) == value
+        view = codec.Budget(len(raw(value)))
+        damaged = context.io if chain == "io" else view
+        if fault == "cycle":
+            damaged.parent = damaged
+        elif fault == "negative":
+            damaged.used = -1
+        elif fault == "overused":
+            damaged.used = damaged.limit + 1
+        elif fault == "parent_type":
+            damaged.parent = object()
+        elif fault == "used_type":
+            damaged.used = False
+        elif fault == "limit_type":
+            damaged.limit = "invalid"
+        else:
+            del damaged.parent
+        reads, original = [], codec_store.Store._read_bytes
+
+        def counted(self, *args, **kwargs):
+            reads.append(args[0])
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(codec_store.Store, "_read_bytes", counted)
+        with pytest.raises(codec.CodecError, match="^limit exceeded; narrow the selectors$") as caught:
+            context.read(rid, _budget=view)
+        assert caught.value.as_dict() == {"error": {"code": "E_LIMIT", "message": MESSAGES["E_LIMIT"]}}
+        assert reads == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("constraining", ["io", "ancestor"])
+def test_r9_cache_miss_preserves_constraining_io_detail(tmp_path, constraining):
+    store = make_store(tmp_path)
+    try:
+        value = record()
+        rid = store.write(value)
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": value["kind"]})
+        limit = len(raw(value)) - 1
+        if constraining == "io":
+            context.io.limit, context.io.detail = limit, "record"
+        else:
+            context.io.parent = codec.Budget(limit, detail="record")
+        with pytest.raises(codec.CodecError, match="^" + RECORD_LIMIT + "$") as caught:
+            context.read(rid)
+        assert (caught.value.code, caught.value.detail, context.io.used) == ("E_LIMIT", "record", 0)
+    finally:
+        store.close()
+
+
+def test_r9_replay_refusal_does_not_partially_charge_a_view_chain(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        value = record()
+        rid, size = store.write(value), len(raw(value))
+        context = codec.ReadContext(store, lambda reference: {"author": value["meta"], "kind": value["kind"]})
+        assert context.read(rid) == value
+        parent = codec.Budget(size - 1, parent=context.io, detail="record")
+        view = codec.Budget(size, parent=parent)
+        with pytest.raises(codec.CodecError, match="^" + RECORD_LIMIT + "$") as caught:
+            context.read(rid, _budget=view)
+        assert (caught.value.code, caught.value.detail) == ("E_LIMIT", "record")
+        assert view.used == parent.used == 0 and context.io.used == size
+    finally:
+        store.close()
+
+
 def make_store(root, *, fixture_owned=False):
     capabilities = {function.__name__ for function in os.supports_dir_fd}
     if not ({"open", "stat", "link", "unlink"} <= capabilities and

@@ -380,6 +380,13 @@ def _pending(rows, lane=None):
             and (lane is None or row["lane"] == lane)]
 
 
+def _reconcile_pending(history, lane, request_id):
+    """Select before any per-request lock or observation checkpoint is touched."""
+    if request_id is not None:
+        history = [row for row in history if row["request_id"] == request_id]
+    return _pending(history, lane)
+
+
 def _admission_full(data, read, encoded, terminal_bytes):
     pending = _pending(read.rows)
     outstanding = len(pending) + 1
@@ -793,7 +800,7 @@ class GitOpsJournal:
                         or attempt + 1 == FINAL_RECORD_ATTEMPTS):
                     raise
 
-    def reconcile(self, lane, observe):
+    def reconcile(self, lane, observe, *, request_id=None):
         """Observe abandoned requests outside the journal lock; never run effects.
 
         ``observe(intent) -> Observation`` must only read external state. Its
@@ -806,15 +813,18 @@ class GitOpsJournal:
         or checkpoints needing the owner's explicit record_result recovery.
         Claims use eight-descriptor batches and three final-record attempts under
         those locks; exhausted retries leave durable checkpoints for recovery.
+        With request_id, only that request is claimed, observed and recorded.
+        Without it, reconcile the whole lane. Concurrent completion can return
+        no rows; the caller may then read the request's durable terminal history.
         """
-        if not _identifier(lane, _LANE) or not callable(observe):
+        if (not _identifier(lane, _LANE) or not callable(observe)
+                or (request_id is not None and not _identifier(request_id))):
             raise GitOpsError("invalid_request")
         results = []
         blocked, deferred = [], None
         with _refusals(self.common_dir), _directory(self.common_dir, True) as directory:
             with self._transaction(write=True, directory_fd=directory) as (fd, data, read, _):
-                all_pending = _pending(read.rows)
-                pending = [row for row in all_pending if row["lane"] == lane]
+                pending = _reconcile_pending(read.rows, lane, request_id)
                 cached = {row["request_id"]: row for row in pending}
                 generation = _committed_generation(fd, data, read)
             pending.sort(key=lambda row: row["request_id"])
@@ -840,7 +850,8 @@ class GitOpsJournal:
                         with self._transaction(directory_fd=directory) as (fd, _, read, _):
                             if fd is None:
                                 raise GitOpsError("journal_io")
-                            current = {row["request_id"]: row for row in _pending(read.rows, lane)}
+                            current = {row["request_id"]: row for row in
+                                       _reconcile_pending(read.rows, lane, request_id)}
                             compacted_requests = {row["request_id"] for row in read.rows
                                                   if row["kind"] == "tombstone"}
                     observations = []

@@ -65,6 +65,7 @@ __all__ = [
     "is_legacy_key",
     "load_rules",
     "lf_digest",
+    "rule_path_id",
     "validate_rule_names",
     "workspace_root",
 ]
@@ -308,6 +309,9 @@ def workspace_root(workspace: Any) -> str:
 
 def _stem(relative: str) -> str:
     return os.path.splitext(relative.rsplit("/", 1)[-1])[0]
+
+
+rule_path_id = _stem
 
 
 def _target_paths_error(value: Any) -> Optional[str]:

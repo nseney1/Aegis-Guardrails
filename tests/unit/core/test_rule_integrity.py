@@ -5,6 +5,7 @@ Real git repositories in tmp dirs; a corrupt object is a forged loose object on 
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -642,6 +643,40 @@ def test_a_spy_at_the_git_boundary_does_not_bypass_the_base_caches(tmp_path, mon
 
 
 # ── the CI check ─────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("mode", [None, "none", "review", "signature"])
+@pytest.mark.parametrize("with_rows", [False, True])
+def test_owner_review_wire_keys_keep_one_type_on_retry_and_concurrent_reads(mode, with_rows):
+    from aegis_core.approval_policy import Policy
+
+    rows = (Weakening("approval_mode_lowered", target, ".aegis/config.json", "ordinary")
+            for target in ("develop", "main"))
+    report = rule_integrity.CiReport("base", "head", "base", 1, (), None,
+        approval_policy=Policy(mode, "main"), owner_review_required=tuple(rows) if with_rows else ())
+    baseline = rule_integrity.CiReport("base", "head", "base", 1, (), None,
+        approval_policy=Policy(mode, "main")).as_dict()
+
+    def render(_):
+        document = report.as_dict()
+        assert document["schema"] == "aegis.rule_integrity/v1"
+        if mode is None:
+            assert "owner_review_required" not in document
+        else:
+            assert document["owner_review_required"] is (mode == "review")
+        if with_rows:
+            findings = document.pop("owner_review_findings")
+            assert [row["rule"] for row in findings] == ["develop", "main"]
+            assert all(set(row) == {"code", "rule", "path", "message"} and
+                       all(isinstance(value, str) for value in row.values()) for row in findings)
+        else:
+            assert "owner_review_findings" not in document
+        return {key: value for key, value in document.items() if key != "checked_at"}
+
+    expected = {key: value for key, value in baseline.items() if key != "checked_at"}
+    assert render(0) == render(1) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(render, range(6))) == [expected] * 6
+
 
 @needs_git
 def test_the_report_names_the_range_and_counts_the_binding_rules(tmp_path, capsys):

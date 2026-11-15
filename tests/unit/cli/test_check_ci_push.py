@@ -124,7 +124,7 @@ def _owned_message_case(kind, template, values):
     row = approval_policy.MessageRow(code=kind, rule="ordinary", path="src.py", message=message)
     document = {"status": "fail", "approval_mode": "signature", "approval_target": "main"}
     if producer in ("weakenings", "owner_review_required"):
-        document[producer] = [row]
+        document["owner_review_findings" if producer == "owner_review_required" else producer] = [row]
     elif producer == "findings":
         row = approval_policy.MessageRow(rule=kind, message=message, level="error")
         document[producer] = [row]
@@ -181,7 +181,7 @@ def _formatter_census():
     """
     owner = {"code": "approval_mode_lowered", "rule": "branch", "path": "config.json", "message": "ordinary"}
     cases = {
-        "row['code']": {"owner_review_required": [owner]},
+        "row['code']": {"owner_review_findings": [owner]},
         "w['rule']": {"weakenings": [{**owner, "code": "deleted"}]},
         'f"governance:{entry[\'category\']}"': {"governance": {"enforced": True, "approved": False,
                                                  "paths": [{"category": "workflow", "path": "ci.yml"}]}},
@@ -465,7 +465,7 @@ def test_frame_reconstruction_requires_both_the_owner_and_finding_kind(frame):
 # Ordered like the shared text table: adding/reordering a row requires a probe.
 # Secrets are source regions, not fragments guessed from the mask's spelling.
 REDACTION_FAMILY_PROBES = (
-    ("pem", "-----BEGIN PRIVATE KEY----- material -----END PRIVATE KEY-----", "material", "[REDACTED_PEM]"),
+    ("pem", "-----BEGIN " + "PRIVATE KEY-----" + " material -----END " + "PRIVATE KEY-----", "material", "[REDACTED_PEM]"),
     ("url", "https://user:actual_password@example.test/path", "actual_password", "[REDACTED]"),
     ("jwt", "eyJ" + "a" * 16 + "." + "b" * 12 + "." + "c" * 12, "eyJ" + "a" * 16, "[REDACTED_JWT]"),
     ("aws-access", "AKIA" + "A" * 16, "AKIA" + "A" * 16, "[REDACTED_AWS]"),
@@ -1507,7 +1507,11 @@ def test_unsigned_policy_changes_are_owner_review_reports(tmp_path, capsys, fmt,
         if fmt == "json":
             document = json.loads(out)
             assert document["blocking"] == [] and document["weakenings"] == []
-            assert [row["code"] for row in document["owner_review_required"]] == [code]
+            assert [row["code"] for row in document["owner_review_findings"]] == [code]
+            if change == "introduced":
+                assert "owner_review_required" not in document
+            else:
+                assert document["owner_review_required"] is True
             assert document["scope"]["base"] == base
         elif fmt == "github":
             assert "::notice" in out and "::error" not in out
@@ -1522,20 +1526,46 @@ def test_owner_review_formatter_fields_are_redacted_before_truncation(render):
     token = "ghp_" + "a" * 36
     split = "ghp_" + "a" * 10 + "\x1b[31m" + "a" * 26
     value = "x" * 380 + "/" + split
-    document = {"status": "pass", "owner_review_required": [
+    document = {"status": "pass", "owner_review_findings": [
         {"code": value, "rule": value, "path": value, "message": value}]}
     out = str(render(document))
     assert token not in out and "a" * 20 not in out and "\x1b" not in out
     assert "REDACTED" in out
 
 
+@pytest.mark.parametrize("fmt", ["text", "json", "github", "sarif", "summary"])
+@pytest.mark.parametrize("target", [
+    "x" * 380 + "/ghp_" + "a" * 10 + "\x1b[31m" + "a" * 26,
+    "x" * 10240, "branch\x00\r\n\x07name", "branch::warning::forged",
+], ids=["split-token", "oversized", "controls", "workflow"])
+def test_owner_review_target_is_a_bounded_receipt_in_every_format(fmt, target):
+    document = {"status": "pass", "approval_mode": "review", "owner_review_required": True,
+                "owner_review_findings": [{"code": "approval_mode_lowered", "rule": target,
+                    "path": ".aegis/config.json", "message": "ordinary"}]}
+    before = deepcopy(document)
+    rendered = report_formats.render_ci_json(document)
+    wire = json.loads(json.dumps(rendered))
+    assert report_formats.render_ci_json(wire) == rendered
+    expected = approval_policy.receipt_value(target, 400, identifier=True)
+    assert rendered["owner_review_required"] is True
+    assert rendered["owner_review_findings"][0]["rule"] == expected
+    assert len(expected) <= 400 and "a" * 20 not in expected
+    shown = (rendered["owner_review_findings"][0]["rule"] if fmt == "json" else
+             _human_output(document, fmt))
+    assert (expected if fmt == "json" else approval_policy.guidance_value(expected, prose=True)) in shown
+    assert "a" * 20 not in shown and "\x1b" not in shown
+    assert not any(ord(char) < 32 for char in shown.replace("\n", ""))
+    assert _human_output(wire, fmt) == _human_output(document, fmt)
+    assert document == before
+
+
 @pytest.mark.parametrize("value", ["ghp_" + "a" * 10 + "\x1b[31m" + "a" * 26,
                                   "x" * 380 + "/ghp_" + "a" * 36, "x" * 8193])
 def test_owner_review_json_identity_fields_are_redacted_and_bounded(value):
-    document = {"status": "pass", "owner_review_required": [
+    document = {"status": "pass", "owner_review_findings": [
         {"code": value, "rule": value, "path": value, "message": "ordinary"}]}
     encoded = report_formats.render_ci_json(document)
-    (row,) = encoded["owner_review_required"]
+    (row,) = encoded["owner_review_findings"]
     for key in ("code", "rule", "path"):
         shown = row[key]
         assert len(shown) <= 400 and "\x1b" not in shown and "a" * 20 not in shown
@@ -1553,7 +1583,7 @@ def test_lowered_token_named_branch_has_a_redacted_owner_review_json_receipt(tmp
     repo.commit("lower a branch policy")
     rc, out, err = run_ci(repo, capsys, "--base", base, "--no-exec", "--json")
     assert rc == 0 and token not in out + err
-    (row,) = json.loads(out)["owner_review_required"]
+    (row,) = json.loads(out)["owner_review_findings"]
     assert row["code"] == "approval_mode_lowered" and "REDACTED" in row["rule"]
 
 
@@ -1701,15 +1731,35 @@ def test_policy_events_use_the_target_base_and_report_findings(tmp_path, capsys,
         assert payload["scope"]["base"] == before
         assert payload["approval_mode"] == mode and payload["approval_target"] == target
         assert payload["weakenings"] and payload["policy_source"] == "base"
-        assert [row["code"] for row in payload["owner_review_required"]] == ["approval_mode_lowered"] * 2
-        assert [row["rule"] for row in payload["owner_review_required"]] == ["develop", "main"]
-    rc, out, _err = run_ci(repo, capsys, "--no-exec", "--format", "github")
-    if mode == "review":
-        assert "owner review required" in out and "aegis approve" not in out
-    elif mode == "signature":
-        assert "signed approval: aegis approve --base " + before + " (" in out
-    else:
-        assert "approved by" not in out and "aegis approve" not in out
+        assert payload["owner_review_required"] is (mode == "review")
+        assert [row["code"] for row in payload["owner_review_findings"]] == ["approval_mode_lowered"] * 2
+        assert [row["rule"] for row in payload["owner_review_findings"]] == ["develop", "main"]
+    summary = report_formats.format_github_step_summary(payload, repo.root)
+    for target_pattern in ("develop", "main"):
+        assert any(target_pattern in line and "approval_mode_lowered" in line for line in summary.splitlines())
+    for fmt in ("text", "github", "sarif"):
+        rc, out, _err = run_ci(repo, capsys, "--no-exec", "--format", fmt)
+        assert rc == (1 if mode == "signature" else 0)
+        if fmt == "sarif":
+            run = json.loads(out)["runs"][0]
+            owner = [row for row in run["invocations"][0]["toolExecutionNotifications"]
+                     if "approval_mode_lowered" in row["message"]["text"]]
+            assert len(owner) == 2 and all(row["level"] == "note" for row in owner)
+            assert not any(row["ruleId"] == "approval_mode_lowered" for row in run["results"])
+            shown = "\n".join(row["message"]["text"] for row in owner)
+        else:
+            shown = out
+        for target_pattern in ("develop", "main"):
+            assert any(target_pattern in line and "approval_mode_lowered" in line for line in shown.splitlines())
+        if fmt == "github":
+            assert sum(line.startswith("::notice ") and "approval_mode_lowered" in line
+                       for line in out.splitlines()) == 2
+            if mode == "review":
+                assert "owner review required" in out and "aegis approve" not in out
+            elif mode == "signature":
+                assert "signed approval: aegis approve --base " + before + " (" in out
+            else:
+                assert "approved by" not in out and "aegis approve" not in out
 
 
 @needs_git

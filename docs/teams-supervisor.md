@@ -266,3 +266,83 @@ On refusal, `profile` is `refused`, pauses are empty, and observations and
 components are omitted. Text taken from an untrusted field is canonicalized,
 then redacted, then truncated. A multi-line value is refused rather than joined
 into one line. Health never starts a component and never writes the state file.
+
+### Explicit observations
+
+`aegis_core.team_supervisor_observe.observe(resolved, workspace_root=absolute_root,
+now=integer_seconds, usage_adapter=None)` is a separate, explicitly invoked API.
+`resolved` is the complete envelope returned by profile resolution. It validates
+bounds before copying and revalidates a private snapshot before adapters run.
+The pure policy, existing health output and ordinary Codex callers are unchanged;
+no hook or MCP tool invokes observations. The caller schedules calls using the
+resolved health intervals; this API has no polling loop, shared cache or state file.
+
+Results have schema `aegis.team.supervisor.observations/v1`, `status: ok`,
+`starts_nothing: true`, `writes_nothing: true` and an `observations` object.
+Unknown is a source result, not a whole-report refusal. Each observation failure
+leaves the others visible. No observation changes pauses, claims, queues,
+profiles or supervisor state. The preflight and public services use the existing
+hardened, read-only gitsafe Git transport. Observation data never supplies
+commands. Executable resolution stays entirely in the central transport;
+`GITSAFE-ORDINARY-OUTSIDE` tracks the nondefault configuration where the owner's
+PATH contains an absolute directory inside the workspace.
+
+Before calling either lease or audit services, one hardened read runs
+`for-each-ref --count=257 --format=x refs/aegis/lanes/`. Its constant format
+emits at most 514 bytes rather than untrusted ref names. More than 256 refs
+makes both Git observations unknown with reason `lease_limit`, and neither
+service is called. A failed or malformed preflight yields `leases_unavailable`.
+The count is fresh on each invocation, not a cached authorization. It is a
+preflight snapshot; it does not make the later service reads transactional.
+Observation work is bounded by this lease-count preflight and the existing
+per-command timeouts. The preflight command has a 10-second timeout; this API
+does not enforce a shared total-operation deadline.
+
+- `writer_dead` is always `state: unknown`, with reason
+  `no_bound_liveness_source`. The existing v1 lease schema has no writer process
+  identity; a live or expired lease cannot establish life or death. Binding a
+  writer to its lease is deferred to `SUPERVISOR-WRITER-LIVENESS`.
+  Its separate `leases` object counts `live`, `expired` and `unreadable` records
+  from `team.read_leases`. No leases is a known zero count; unreadable records
+  make that object's state unknown while preserving known counts. A failed
+  read or a result over 256 records yields `leases_unavailable` and no counts.
+- `disk` uses `statvfs` on the held workspace descriptor, never a pathname
+  fallback or the doctor's scratch walk. It reports `healthy` or `below_floor`,
+  `free_bytes` and the resolved `floor_mib`; equality meets the floor.
+  Unsupported platforms yield `unknown`/`unsupported_platform`. A failed or
+  invalid measurement yields `unknown`/`disk_unavailable`.
+- `usage` and `capacity` share one `HostCapacity.usage()` pass per invocation.
+  Each declared host's adapter is read at most once. Usage exposes only the
+  service's validated numeric counters and canonical reset timestamp, together
+  with the source and host. Capacity compares that same snapshot against the
+  host's writer `hold_pct` threshold, or zero remaining credits, yielding
+  `available` or `at_limit`. It is per-host advice and grants no execution
+  authority or fallback selection. An absent, disabled, failed or malformed
+  source makes that host unknown. Aggregate states are known only when every
+  declared host is known; empty host sets remain unknown. Other host rows stay
+  visible when one host fails. There are at most the profile's 16 hosts.
+- `audit` consumes `team_queue.audit` as-is and reports `clean` or `findings`
+  with a finding count. Finding text is never returned or executed. Refused,
+  unreadable, malformed or oversized reports yield `unknown`/`audit_unavailable`.
+  Result projection accepts at most 256 items and 2048 findings; upstream
+  product services retain their own file, JSON and Git-read limits.
+
+The owner selects a trusted absolute workspace root. Confined storage opens
+each ancestor without following symlinks and holds a root descriptor across
+the observations. Disk measurements keep that identity across renames.
+Repository-service results are published only if confined root checks before
+and after the call match that descriptor; a changed or linked root leaves
+repository observations unknown. The public services retain their own storage
+and Git boundaries; these observations are separate source snapshots, not a
+transaction across the lease and queue stores. Missing or unsafe roots yield
+`workspace_unavailable`; missing descriptor capabilities yield
+`unsupported_platform`. All borrowed descriptors close on success and failure.
+
+Host display text is canonicalized, then redacted, then truncated. Lease labels,
+paths, audit diagnostics and exception text are omitted. Clock inputs must be
+integers in `0..4102444800`; invalid clocks return `status: refused`,
+`code: invalid_clock`, reason `invalid observation clock`. Invalid profiles return
+`code: invalid_profile`, reason `invalid resolved observation profile` before
+any source is probed. Both refusals retain the two true effect flags and omit
+observations. Windows can still report configured host usage while filesystem
+observations remain unknown behind their capability boundaries.

@@ -291,7 +291,7 @@ def test_status_cli_omits_all_unreviewed_rule_text(
     from aegis_cli.cli import main
 
     repo, reviewed = status_policy_repo
-    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    token = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     # This is precisely the producer's lossy ESC -> space spelling. The printable
     # filename also exercises the same path on Windows, where ESC names are invalid.
     unsafe_id = "[31m" + token + " [0m"
@@ -329,7 +329,7 @@ def test_status_cli_omits_all_unreviewed_rule_text(
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 @pytest.mark.parametrize("unsafe_id", ["Well_formed-84.v2", "_leading", "embedded space", "pending+suffix", "A" * 81,
-                                       "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"])
+                                       "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"])
 def test_status_cli_counts_removed_rules_without_identifiers(status_policy_repo, capsys, json_output, unsafe_id):
     from aegis_cli.cli import main
 
@@ -365,7 +365,7 @@ def test_status_cli_omits_esc_filename_in_removed_diagnostic(status_policy_repo,
     if os.name == "nt":
         pytest.skip("Windows forbids ESC in filenames")
     repo, reviewed = status_policy_repo
-    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    token = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     path = ".aegis/rules/invariants/\x1b" + escape + token + ".md"
     try:
         repo.write(path, reviewed.replace("id: reviewed\n", ""))
@@ -402,7 +402,7 @@ def test_status_cli_counts_every_unreviewed_state_without_titles(status_policy_r
     from aegis_cli.cli import main
 
     repo, reviewed = status_policy_repo
-    token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    token = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     fixture_text = reviewed.replace("id: reviewed\n", "").replace("# Reviewed", "# \x1b[31m" + token + "\x1b[0m")
     for name in ("changed", "broken", "removed"):
         repo.write(f".aegis/rules/invariants/{name}.md", fixture_text)

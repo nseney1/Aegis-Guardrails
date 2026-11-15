@@ -26,8 +26,11 @@ class MsgArgumentError(ValueError):
 class MsgErrorPolicy:
     """Own the argv-wide refusal policy without teaching the entry point msg rules."""
 
-    def __init__(self, argv=()):
-        self.active = "msg" in argv
+    def __init__(self, *, active=False):
+        self.active = active
+
+    def run(self, operation):
+        return operation()
 
     def __call__(self):
         if self.active:
