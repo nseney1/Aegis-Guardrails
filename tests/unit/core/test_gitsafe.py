@@ -3427,12 +3427,15 @@ def test_effect_receipt_refuses_reused_descriptor_identity(repo, tmp_path, effec
 
 @pytest.mark.usefixtures("strict_program")
 @pytest.mark.parametrize("site", ["run", "capture"])
-def test_effect_timeout_kills_and_reaps_detached_group(repo, tmp_path, effect_lock, site):
+@pytest.mark.parametrize("start_delay", [0, 2], ids=["idle", "delayed"])
+def test_effect_timeout_kills_and_reaps_detached_group(repo, tmp_path, effect_lock, monkeypatch, site, start_delay):
     import signal
+    from types import SimpleNamespace
     shim, marker = tmp_path / "ssh", tmp_path / "descendant.pid"
     _native_program(shim, "#!" + sys.executable + "\n" + f'''
 import os, signal, time
 from pathlib import Path
+time.sleep({start_delay})
 if os.fork(): os._exit(0)
 os.setsid()
 if os.fork(): os._exit(0)
@@ -3441,6 +3444,30 @@ Path({str(marker)!r}).write_text(str(os.getpid()))
 signal.pause()
 ''')
     shim.chmod(0o700)
+    # Startup is not the timeout precondition: the detached daemon must exist.
+    # Pause only this consumer's clock until that event, with a real deadline
+    # so a broken shim still fails. Never change the shared time module.
+    startup_deadline, ready_at = time.monotonic() + 30, []
+    def ready_clock():
+        now = time.monotonic()
+        if not ready_at:
+            if marker.exists():
+                ready_at.append(now)
+            else:
+                assert now < startup_deadline, "timeout fixture never started its detached child"
+                return 0.0
+        return now - ready_at[0]
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": ready_clock}))
+    # The isolated holder owns another deadline. Gate its existing one-second
+    # timeout on the same event, leaving its kill/reap loop byte-identical.
+    timer = "deadline, code, failure, group_killed ="
+    assert gitops_fds._HOLDER_SOURCE.count(timer) == 1
+    readiness = f'''
+startup_deadline = time.monotonic() + 30
+while sys.argv[7] != '-1' and not os.path.exists({str(marker)!r}) and not stopping and time.monotonic() < startup_deadline:
+    time.sleep(0.01)
+'''
+    monkeypatch.setattr(gitops_fds, "_HOLDER_SOURCE", gitops_fds._HOLDER_SOURCE.replace(timer, readiness + timer))
     import contextlib
     capture_scratch = tmp_path / "capture-scratch"
     capture_scratch.mkdir()
