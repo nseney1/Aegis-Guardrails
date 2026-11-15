@@ -32,6 +32,9 @@ For an unsettled planned persisted admission, optionally supply
 captures and hashes those bounded recipe bytes once per report, on the first
 unsettled admission that needs them. Every such row uses the same captured
 digest, including the same unavailable observation if acquisition failed.
+Omitted or missing paths report `planned recipe path absent`; refused reads,
+including unsupported descriptor platforms, report `planned recipe path unreadable`.
+Both remain blocking and expose no path or exception text.
 Reporting does not execute recipes or apply their census policy.
 
 | Planned job evidence | Recovery state and blocking behavior |
@@ -65,6 +68,17 @@ and claim while reconciling terminal source evidence. A `settle_pending` row
 keeps its own blocker reason and its instruction that run-open may settle
 without rerunning the job, even if its terminal digest is malformed. Current
 recipes are not rechecked.
+
+A planned terminal result's non-null `after` witness must be an object with
+lowercase 40-hex Git object IDs in `source_revision` and `source_tree`, and a
+lowercase 64-hex SHA-256 in `dirty_content_sha256`. Recovery validates all three
+before copying or comparing them. Missing fields, malformed values or a wrong
+container type leave source unavailable with `terminal source witness unverified`
+and `terminal_source_unverified: true`, without echoing the witness. The same
+source-unavailable blocker and terminal-source next action apply to a finished
+row; settlement-pending guidance is retained otherwise. An absent or null
+`after` keeps the existing terminal-digest fallback. No-plan reporting retains
+its historical behavior.
 
 Planned provenance copied into a result by resolve, execution or refusal uses
 bounded descriptor-based captures of admitted.json and derivation.json. The
