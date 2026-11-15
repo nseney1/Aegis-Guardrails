@@ -115,6 +115,8 @@ def _install_git(monkeypatch, table, seams):
     monkeypatch.setattr(doctor_git, "_signers", seams["_signers"])
     monkeypatch.setattr(doctor_git, "_leases", seams["_leases"])
     monkeypatch.setattr(doctor_git, "_refs", seams["_refs"])
+    if "_team_profile" in seams:
+        monkeypatch.setattr(doctor_git, "_team_profile", seams["_team_profile"])
 
 
 def _clean_table(root):
@@ -142,9 +144,21 @@ def _clean_seams():
 def test_display_refuses_multiline_before_join_then_redacts_then_truncates():
     shown, code = doctor_git_report.display("never\nevil")
     assert shown is None and code == "multiline_refused"
+    # Existing fields keep the tip renderer: U+2028 stays, a vertical tab is stripped, not refused.
+    shown, code = doctor_git_report.display("never\u2028evil")
+    assert code is None and shown == "never\u2028evil"
+    shown, code = doctor_git_report.display("never\vevil")
+    assert code is None and shown == "neverevil"
+    shown, code = doctor_git_report.display_target("never\u2028evil")
+    assert shown is None and code == "multiline_refused"
+    shown, code = doctor_git_report.display_target("never\vevil")
+    assert shown is None and code == "multiline_refused"
     token = "ghp_" + ("A" * 20)
     shown, code = doctor_git_report.display("\x1b[31m" + token + "\x1b[0m")
     assert code is None and token not in shown and "REDACTED" in shown
+    hidden = "ghp_\u202e" + ("A" * 20)
+    shown, code = doctor_git_report.display_target(hidden)
+    assert code is None and shown == "ghp_REDACTED" and hidden not in shown and "\u202e" not in shown
     shown, code = doctor_git_report.display("a" * (doctor_git.VALUE_MAX + 1))
     assert shown is None and code == "value_too_long"
     shown, code = doctor_git_report.display("b" * 200, max_len=16)
@@ -184,13 +198,17 @@ def test_matrix_clean_repo_is_advisory(tier, tmp_path, monkeypatch):
     report = doctor_git.collect(tmp_path, tier=tier, now=10)
     _assert_rows(report)
     assert report["trust_tier"] == tier
-    assert report["status"] == "pass"
+    assert report["status"] == "warn"
     assert report["git"]["present"] is True
     assert report["git"]["worktree_prune_expire"] == "never"
     assert report["git"]["prunable_count"] == 0
     assert report["disk"]["budget_slots"] == doctor_git_observe.MAX_HEAVY
     assert report["approval_modes"]["effective"] == "signature"
-    assert "warn" not in {row["status"] for row in report["rows"]}
+    assert {row["code"] for row in report["rows"] if row["status"] == "warn"} == {"approval_targets"}
+    assert _row(report, "approval_mode")["status"] == "pass"
+    assert _row(report, "approval_mode")["detail"] == "effective approval mode signature"
+    assert _row(report, "approval_targets")["detail"] == "lose the gate: * none, develop review, release/** review"
+    assert report["affects_exit"] is False
     assert _row(report, "trust_tier")["owner_action"] == "owner action: none"
 
 
@@ -331,10 +349,12 @@ def test_no_approval_map_suggests_one_and_does_not_write(tmp_path, monkeypatch):
     _quiet_tree(monkeypatch)
     seams = _clean_seams()
     seams["_policy"] = lambda root, commit: None
+    seams["_team_profile"] = lambda root, commit: True
     _install_git(monkeypatch, _clean_table(tmp_path), seams)
     report = doctor_git.collect(tmp_path, tier="B", now=10)
     row = _row(report, "no_approval_map")
-    assert row["status"] == "warn"
+    assert row["status"] == "pass"
+    assert row["detail"] == "legacy gating (no map)"
     assert "main" in row["owner_action"] and "signature" in row["owner_action"]
     assert "does not write" in row["owner_action"]
     assert report["approval_modes"] is None
@@ -541,7 +561,8 @@ def test_two_threads_collect_without_raising(tmp_path, monkeypatch):
     assert not any(thread.is_alive() for thread in threads)
     assert errors == []
     assert len(found) == 2
-    assert all(report["affects_exit"] is False and report["status"] == "pass" for report in found)
+    assert found[0] == found[1]
+    assert found[0]["affects_exit"] is False and found[0]["status"] == "warn"
 
 
 def test_real_collect_on_a_non_repo_is_advisory(tmp_path, monkeypatch):
@@ -1413,9 +1434,15 @@ def test_unknown_current_branch_never_passes_approvals(tmp_path, monkeypatch, br
     table[doctor_git._BRANCH] = _cp(doctor_git._BRANCH, branch)
     _install_git(monkeypatch, table, _clean_seams())
     report = doctor_git.collect(tmp_path, tier="A", now=10)
-    assert report["approval_modes"] is None
     assert "approval_mode" not in _codes(report)
-    assert any(row["id"] == "approvals" and row["status"] == "warn" for row in report["rows"])
+    assert _row(report, "branch_unknown")["status"] == "warn"
+    assert _row(report, "branch_unknown")["detail"] == "the current branch is unknown"
+    assert report["approval_modes"]["effective"] is None
+    assert report["approval_modes"]["target"] is None
+    assert [item["target"] + " " + item["mode"] for item in report["approval_modes"]["ungated"]] == [
+        "* none", "develop review", "release/** review"]
+    assert "develop review" in _row(report, "approval_targets")["detail"]
+    assert report["affects_exit"] is False
 
 
 @pytest.mark.parametrize("command,payload,row_id", [
@@ -2021,7 +2048,9 @@ def test_unmeasured_directories_never_leave_the_report_passing(tmp_path, monkeyp
     monkeypatch.setattr(doctor_git_observe, "_directory_identity", real_identity)
     monkeypatch.setattr(doctor_git_observe, "_confined", real_confined)
     monkeypatch.setattr(doctor_git_observe, "_scandir", os.scandir)
-    _install_git(monkeypatch, _clean_table(tmp_path), _clean_seams())
+    seams = _clean_seams()
+    seams["_policy"] = lambda root, commit: {"main": "signature", "*": "signature"}
+    _install_git(monkeypatch, _clean_table(tmp_path), seams)
     assert doctor_git.collect(tmp_path, tier="A", now=10)["status"] == "pass"
     if kind == "unreadable":
         locked = tmp_path / "locked"
@@ -2112,17 +2141,17 @@ def test_unreadable_invalid_ref_repair_command_works_in_a_fresh_repository(tmp_p
     assert gitsafe.read_ref(tmp_path, ref) is None
 
 
-# Frozen from eda617a7 before extraction; tests need no repository history.
-_SPLIT_REPORT_BYTES = {'valid_scratch': ('b995dd699643b23b6fb52b3f148a76927a4dc2773a3a1956a90f1be5ba26ab56',
-                   'b2e7f36f4d8188d08efa7d4815a2eac24cc27db6d5c951c208ed39416b21da91'),
- 'scratch_unavailable': ('4bd21b32b2780f6f243768afc44594d25517f579c9f3a4be0a636a34d5abab7d',
-                         '95bf43c9e41ced93fad50d45fe211fc3b236ce939fb8ed13b348556a565442d8'),
- 'capped_scan': ('e0db8329e61aa20d5dbcd917210e17c3974385cfc901b1be15ee7b41327d65cd',
-                 '9f3687dca4764b78f65652dbaaf1d31122652aafe82be798fcc8c92cecc2e2da'),
- 'depth_cap': ('d4d3a5fbd9a5d68031bd23ac1262ee725cd221a71f55b04ed3f376c1f31070fd',
-               '721e0f7b4c1d5ba69c96b692708a5f3108796084e3248ee81ff924641613e31c'),
- 'swapped_path': ('36888513353b4d12c5efccd28518bc730bc98125a06de7469b03c47b82d9c2ef',
-                  '80b0e1cb3ee3640f56d48f9801d77150b4aa74654eb622d8a406bc26e53d889e'),
+# Whole-report bytes include the approval_targets row. Tests need no repository history.
+_SPLIT_REPORT_BYTES = {'valid_scratch': ('ce67980c506d9555edcbcfdb0198ad522ff2dfd86338e8fdcdb1f18ca3413ded',
+                   '6e38ff297896abd3cd5fe49716c20d79b8a01ac8b93e773834f4d7c0da382101'),
+ 'scratch_unavailable': ('75af40c5c2eb2c18582a56179a6ba6ec0fb9fbb00603874ecc85dcc6484aa530',
+                         'ee533501e4bf6fbe1b8a7e2488ec862c2839fdcfcede180f82f5c4d9b5ecadfc'),
+ 'capped_scan': ('e7cb6e3e895756b0e9c185e4e365dd9d0e95caa6a4b784f2e5744a1cd3318ca1',
+                 '707d10a1486842d15e8404e5b8fb4be74d88a13a7e599ce88b1a4d52d4f1243b'),
+ 'depth_cap': ('70d866c24293cbb9e18b897e28420d797350273518d809ecd202a3af653ee1a4',
+               '72322b4b4a8244fb235a36ed76c8fac52c0918c5c70b5d5d0c8e3f5b99df88fa'),
+ 'swapped_path': ('cdfedc8c0aefca686d819abc0e502803342bf003a1db2901fcbf1d79ecb6c8bb',
+                  'f77a64c54bba94e0081aa406c8b4688f3cf212c5a346c6ff9fe00ca04dae56c5'),
  'unavailable_report': ('29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f',
                         '9f83b9406083b200822af61b9bf222ef35c2ed9e5dbb2bd17d9bedc655fb0f2a')}
 
@@ -2209,3 +2238,841 @@ def test_split_source_guards_reject_mutations_in_every_module(tmp_path, module_n
     target.write_text(target.read_text(encoding="utf-8") + "\n" + mutation, encoding="utf-8")
     with pytest.raises(AssertionError):
         guard(tmp_path)
+
+
+_UNGATED_ACTION = (
+    "owner action: set each listed target to signature and configure signers, "
+    "or accept that weakenings to it need only its mode "
+    "(doctor does not write configuration)"
+)
+
+
+def _text(report):
+    buffer = io.StringIO()
+    doctor_git_report.print_report(report, buffer)
+    return buffer.getvalue()
+
+
+def _collect(tmp_path, monkeypatch, policy, signers=2, profile=False, branch=b"main\n"):
+    _quiet_tree(monkeypatch)
+    table = _clean_table(tmp_path)
+    table[doctor_git._BRANCH] = _cp(doctor_git._BRANCH, branch)
+    seams = _clean_seams()
+    seams["_policy"] = lambda root, commit: policy
+    seams["_signers"] = lambda root, commit: signers
+    seams["_team_profile"] = lambda root, commit: profile
+    _install_git(monkeypatch, table, seams)
+    return doctor_git.collect(tmp_path, tier="A", now=10)
+
+
+def test_no_map_is_legacy_pass_and_suggests_only_with_a_team_profile(tmp_path, monkeypatch):
+    report = _collect(tmp_path, monkeypatch, None, profile=False)
+    row = _row(report, "no_approval_map")
+    assert row == {
+        "id": "approvals", "status": "pass", "code": "no_approval_map",
+        "owner_action": "owner action: none", "detail": "legacy gating (no map)",
+    }
+    assert report["approval_modes"] is None
+    assert report["affects_exit"] is False
+    text = _text(report)
+    assert "  [pass] approvals: legacy gating (no map); owner action: none\n" in text
+    assert "commit an approvals map" not in text
+    report = _collect(tmp_path, monkeypatch, None, profile=True)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert row["owner_action"] == doctor_git_report.SUGGEST
+    assert "does not write" in row["owner_action"]
+    text = _text(report)
+    assert "  [pass] approvals: legacy gating (no map); " + doctor_git_report.SUGGEST + "\n" in text
+    assert json.loads(_blob(report))["rows"][next(
+        index for index, item in enumerate(report["rows"]) if item["code"] == "no_approval_map")]["detail"] == row["detail"]
+
+
+def test_signature_targets_keep_the_gate_with_and_without_signers(tmp_path, monkeypatch, signers=None):
+    for count in (0, 2):
+        report = _collect(tmp_path, monkeypatch, {"main": "signature", "release/**": "signature"}, signers=count)
+        assert report["approval_modes"]["ungated"] == []
+        assert report["approval_modes"]["effective"] == "signature"
+        row = _row(report, "approval_targets")
+        assert row == {
+            "id": "approvals", "status": "pass", "code": "approval_targets",
+            "owner_action": "owner action: none", "detail": "every target keeps the gate",
+        }
+        mode = _row(report, "approval_mode")
+        assert mode["status"] == "pass" and mode["detail"] == "effective approval mode signature"
+        assert ("signers_absent" if count == 0 else "signers_present") in _codes(report)
+        text = _text(report)
+        assert "  [pass] approvals: every target keeps the gate; owner action: none\n" in text
+        assert "lose the gate" not in text and "lose the gate" not in _blob(report)
+        assert report["affects_exit"] is False and report["doctor_exit_effect"] == "unchanged"
+
+
+def test_review_and_none_targets_are_named_in_order(tmp_path, monkeypatch):
+    policy = {"zeta": "none", "main": "signature", "alpha": "review", "mid": "none"}
+    report = _collect(tmp_path, monkeypatch, policy)
+    ungated = [
+        {"target": "alpha", "mode": "review"},
+        {"target": "mid", "mode": "none"},
+        {"target": "zeta", "mode": "none"},
+    ]
+    assert report["approval_modes"]["ungated"] == ungated
+    assert report["approval_modes"]["effective"] == "signature"
+    assert report["approval_modes"]["present"] is True
+    row = _row(report, "approval_targets")
+    detail = "lose the gate: alpha review, mid none, zeta none"
+    assert row == {
+        "id": "approvals", "status": "warn", "code": "approval_targets",
+        "owner_action": _UNGATED_ACTION, "detail": detail,
+    }
+    assert _row(report, "approval_mode") == {
+        "id": "approvals", "status": "pass", "code": "approval_mode",
+        "owner_action": "owner action: none", "detail": "effective approval mode signature",
+    }
+    text = _text(report)
+    assert f"  [warn] approvals: {detail}; {_UNGATED_ACTION}\n" in text
+    encoded = json.loads(_blob(report))
+    assert encoded["approval_modes"]["ungated"] == ungated
+    for item in ungated:
+        assert f"{item['target']} {item['mode']}" in row["detail"]
+        assert f"{item['target']} {item['mode']}" in text
+    assert report["affects_exit"] is False
+
+
+def test_hostile_target_names_are_bounded_in_text_and_json(tmp_path, monkeypatch):
+    control = "aa\x01bb"
+    ansi = "\x1b[31mred\x1b[0m"
+    osc = "\x1b]0;title\x07osc"
+    bidi = "na\u202eme"
+    wide = "W" * 200
+    credential = "token=ghp_" + ("A" * 20)
+    label = "approvals"
+    policy = {
+        control: "none", ansi: "review", osc: "none", bidi: "review", wide: "none",
+        credential: "review", label: "none", "caf\u00e9": "none", "main": "signature",
+    }
+    report = _collect(tmp_path, monkeypatch, policy)
+    ungated = report["approval_modes"]["ungated"]
+    labels = [item["target"] for item in ungated]
+    assert "caf\u00e9" in labels and label in labels
+    blob = _blob(report)
+    text = _text(report)
+    for raw in (control, ansi, osc, wide, credential, "\x1b", "ghp_"):
+        assert raw not in blob and raw not in text
+    # Tip display() keeps U+202E on pattern rows. The lost-gate names use display_target.
+    assert "\u202e" not in text
+    assert all("\u202e" not in item["target"] for item in ungated)
+    kept = [item for item in report["approval_modes"]["patterns"] if item["pattern"] == bidi]
+    assert kept == [{"pattern": bidi, "mode": "review"}]
+    published = {doctor_git_report.digest(raw) for raw in (control, ansi, osc, bidi, wide, credential)}
+    assert published <= set(labels)
+    assert [item["mode"] for item in ungated if item["target"] == "caf\u00e9"] == ["none"]
+    assert [item["mode"] for item in ungated if item["target"] == "approvals"] == ["none"]
+    row = _row(report, "approval_targets")
+    assert row["status"] == "warn" and "\n" not in row["detail"] and len(row["detail"]) <= doctor_git_report.DISPLAY_MAX
+    for item in ungated:
+        if item["target"] in row["detail"]:
+            assert item["target"] in text
+    assert _row(report, "approval_mode")["detail"] == "effective approval mode signature"
+    assert credential not in row["detail"] and "\x01" not in row["detail"]
+
+
+def test_oversized_and_invalid_maps_are_refused_without_echo(tmp_path, monkeypatch):
+    from aegis_core import approval_policy
+
+    secret = "token=ghp_" + ("B" * 20)
+    huge = "N" + ("Q" * 10000)
+    cases = (
+        {huge: "none", "main": "signature"},
+        {f"p{index}": "none" for index in range(approval_policy.MAX_PATTERNS + 1)} | {secret: "review"},
+        {"main": "not-a-mode"},
+        {},
+        {"bad\nname": "none"},
+    )
+    for policy in cases:
+        report = _collect(tmp_path, monkeypatch, policy)
+        assert "approval_targets" not in _codes(report)
+        assert report["approval_modes"] is None
+        blob = _blob(report)
+        assert secret not in blob and huge not in blob and "not-a-mode" not in blob and "bad\nname" not in blob
+        assert report["affects_exit"] is False
+    report = _collect(tmp_path, monkeypatch, "policy_unavailable")
+    assert _row(report, "policy_unavailable")["owner_action"] == doctor_git_report.RETRY
+    assert "could not be read" in _row(report, "policy_unavailable")["detail"]
+    assert "approval_targets" not in _codes(report)
+
+
+def test_head_map_ignores_a_different_work_tree_config(tmp_path, monkeypatch):
+    config = tmp_path / ".aegis"
+    config.mkdir()
+    (config / "config.json").write_text('{"approvals": {"*": "none", "develop": "review"}}', encoding="utf-8")
+    real_policy = doctor_git._policy
+    report = _collect(tmp_path, monkeypatch, {"main": "signature", "*": "signature"})
+    assert report["approval_modes"]["ungated"] == []
+    assert _row(report, "approval_targets")["detail"] == "every target keeps the gate"
+    assert "lose the gate" not in _text(report)
+    seen = []
+
+    def read_policy(root, commit, strict=True):
+        seen.append((str(commit), strict))
+        return {"alpha": "none"}
+
+    monkeypatch.setattr(doctor_git, "_policy", real_policy)
+    monkeypatch.setattr(doctor_git, "_read_policy", read_policy)
+    monkeypatch.setattr(doctor_git, "_regular_entry", lambda *args: ("100644", "b" * 40))
+    monkeypatch.setattr(doctor_git, "_scoped", lambda root, produce: produce())
+    assert doctor_git._policy(tmp_path, "a" * 40) == {"alpha": "none"}
+    assert seen == [("a" * 40, True)]
+
+
+def test_team_profile_presence_is_the_head_blob(tmp_path, monkeypatch):
+    from aegis_core.team_profile import REPO_PATH
+
+    path = "/".join(REPO_PATH)
+    real_entry = doctor_git._regular_entry
+    seen = []
+
+    def entry(root, commit, name):
+        seen.append((commit, name))
+        return ("100644", "c" * 40)
+
+    monkeypatch.setattr(doctor_git, "_regular_entry", entry)
+    monkeypatch.setattr(doctor_git, "_scoped", lambda root, produce: produce())
+    assert doctor_git._team_profile(tmp_path, "a" * 40) is True
+    assert seen == [("a" * 40, path)]
+    monkeypatch.setattr(doctor_git, "_regular_entry", lambda *args: None)
+    assert doctor_git._team_profile(tmp_path, "a" * 40) is False
+    monkeypatch.setattr(doctor_git, "_scoped", lambda root, produce: "git_failed")
+    assert doctor_git._team_profile(tmp_path, "a" * 40) is False
+    line = b"120000 blob " + b"b" * 40 + b"\t" + path.encode() + b"\0"
+    monkeypatch.setattr(doctor_git, "_regular_entry", real_entry)
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: _cp(args, line))
+    monkeypatch.setattr(doctor_git, "_scoped", lambda root, produce: produce())
+    assert doctor_git._team_profile(tmp_path, "a" * 40) is False
+
+
+def test_unborn_head_is_not_legacy_gating(tmp_path, monkeypatch):
+    report = _collect(tmp_path, monkeypatch, None)
+    monkeypatch.setattr(doctor_git, "_head", lambda root: None)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert _row(report, "no_head")["status"] == "warn"
+    assert _row(report, "no_head")["detail"] == "HEAD has no commit"
+    assert "no_approval_map" not in _codes(report)
+    assert "legacy gating" not in _blob(report) and "legacy gating" not in _text(report)
+
+
+def test_ungated_report_does_not_change_checks_or_exit(tmp_path, monkeypatch):
+    _quiet_tree(monkeypatch)
+    seams = _clean_seams()
+    seams["_policy"] = lambda root, commit: {"develop": "review", "*": "none"}
+    _install_git(monkeypatch, _clean_table(tmp_path), seams)
+    payload = {"summary": {"passed": 3, "warnings": 1, "failed": 0, "total": 3}, "checks_ok": True}
+    out = doctor_git.with_report(dict(payload), tmp_path, None, True)
+    assert out["checks_ok"] is True and out["summary"]["failed"] == 0
+    assert payload["checks_ok"] is True and payload["summary"]["failed"] == 0
+    hygiene = out["git_hygiene"]
+    assert hygiene["affects_exit"] is False and hygiene["doctor_exit_effect"] == "unchanged"
+    assert _row(hygiene, "approval_targets")["status"] == "warn"
+    assert hygiene["approval_modes"]["ungated"] == [
+        {"target": "*", "mode": "none"}, {"target": "develop", "mode": "review"}]
+
+
+def test_partial_doctor_modes_omit_gate_targets(tmp_path, capsys):
+    from aegis_cli import doctor
+
+    (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
+    for kwargs in (
+        {"drivers": True, "json": True, "workspace": str(tmp_path)},
+        {"github": True, "json": True, "workspace": str(tmp_path)},
+        {"release": "a" * 40, "json": True, "workspace": str(tmp_path)},
+    ):
+        doctor.run_doctor(argparse.Namespace(**kwargs))
+        raw = capsys.readouterr().out
+        assert "git_hygiene" not in raw
+        assert "legacy gating" not in raw and "lose the gate" not in raw
+        assert "approval_targets" not in raw
+
+
+@pytest.mark.parametrize("mode", ["none", "review"])
+@pytest.mark.parametrize("protected", ["n", "main"])
+def test_many_ungated_targets_stay_sorted_and_one_line(tmp_path, monkeypatch, mode, protected):
+    policy = {f"n{index:02d}": mode for index in range(30)}
+    policy[protected] = "signature"
+    report = _collect(tmp_path, monkeypatch, policy)
+    ungated = report["approval_modes"]["ungated"]
+    assert [item["target"] for item in ungated] == [f"n{index:02d}" for index in range(30)]
+    assert all(item["mode"] == mode for item in ungated)
+    row = _row(report, "approval_targets")
+    assert len(row["detail"]) <= doctor_git_report.DISPLAY_MAX
+    assert row["detail"].startswith("lose the gate: ") and "+" in row["detail"]
+    shown, code = doctor_git_report.display(row["detail"])
+    assert code is None and shown == row["detail"]
+    text = _text(report)
+    assert row["detail"] in text and "\n" not in row["detail"]
+    encoded = json.loads(_blob(report))["approval_modes"]["ungated"]
+    assert encoded == ungated
+    body = row["detail"][len("lose the gate: "):]
+    shown, separator, omitted = body.rpartition(" (+")
+    assert separator and omitted.endswith(" more)")
+    hidden = int(omitted[:-len(" more)")])
+    named = [tuple(item.rsplit(" ", 1)) for item in shown.split(", ")]
+    assert named and len(named) + hidden == len(ungated)
+    for (identifier, shown_mode), item in zip(named, ungated):
+        assert identifier in (item["target"], doctor_git_report.digest(item["target"]))
+        assert identifier not in ("n", protected) and shown_mode == item["mode"]
+
+
+def test_many_release_review_targets_keep_complete_identifiers(tmp_path, monkeypatch):
+    policy = {f"release/v{index:02d}": "review" for index in range(20)}
+    report = _collect(tmp_path, monkeypatch, policy)
+    ungated = report["approval_modes"]["ungated"]
+    assert ungated == [
+        {"target": f"release/v{index:02d}", "mode": "review"} for index in range(20)]
+    detail = _row(report, "approval_targets")["detail"]
+    assert len(detail) <= doctor_git_report.DISPLAY_MAX
+    assert detail.startswith("lose the gate: ")
+    body = detail[len("lose the gate: "):]
+    shown, separator, omitted = body.rpartition(" (+")
+    assert separator and omitted.endswith(" more)")
+    hidden = int(omitted[:-len(" more)")])
+    named = [tuple(item.rsplit(" ", 1)) for item in shown.split(", ")]
+    assert named and hidden > 0 and len(named) + hidden == len(ungated)
+    for (identifier, mode), item in zip(named, ungated):
+        assert identifier in (item["target"], doctor_git_report.digest(item["target"]))
+        assert identifier not in ("main", "r", "re") and mode == "review"
+    assert detail in _text(report)
+    assert json.loads(_blob(report))["approval_modes"]["ungated"] == ungated
+
+
+def test_gate_detail_keeps_argon_feature_and_develop_identifiers():
+    pairs = [(f"feature/{index:02d}", "none") for index in range(13)] + [("develop", "review")]
+    detail = doctor_git_report.gate_detail(pairs)
+    assert len(detail) <= doctor_git_report.DISPLAY_MAX
+    body = detail[len("lose the gate: "):]
+    shown, separator, omitted = body.rpartition(" (+")
+    assert separator and omitted.endswith(" more)")
+    hidden = int(omitted[:-len(" more)")])
+    named = [tuple(item.rsplit(" ", 1)) for item in shown.split(", ")]
+    assert named and hidden > 0 and len(named) + hidden == len(pairs)
+    for (identifier, mode), (target, expected_mode) in zip(named, pairs):
+        assert identifier in (target, doctor_git_report.digest(target))
+        assert identifier != "dev" and mode == expected_mode
+
+
+def test_detached_head_still_names_ungated_targets(tmp_path, monkeypatch):
+    policy = {"develop": "review", "main": "signature"}
+    report = _collect(tmp_path, monkeypatch, policy, branch=b"HEAD\n")
+    assert _row(report, "branch_unknown") == {
+        "id": "approvals", "status": "warn", "code": "branch_unknown",
+        "owner_action": "owner action: retry aegis doctor",
+        "detail": "the current branch is unknown",
+    }
+    assert "approval_mode" not in _codes(report)
+    detail = "lose the gate: develop review"
+    assert _row(report, "approval_targets")["detail"] == detail
+    assert _row(report, "approval_targets")["status"] == "warn"
+    assert report["approval_modes"]["ungated"] == [{"target": "develop", "mode": "review"}]
+    assert report["approval_modes"]["effective"] is None
+    assert report["approval_modes"]["target"] is None
+    assert report["approval_modes"]["present"] is True
+    text = _text(report)
+    blob = _blob(report)
+    assert f"  [warn] approvals: {detail}; {_UNGATED_ACTION}\n" in text
+    assert "develop review" in blob
+    assert report["affects_exit"] is False
+    refused = _collect(tmp_path, monkeypatch, policy, branch=b"bad\nname\n")
+    assert _row(refused, "multiline_refused")["detail"] == "the current branch name was refused"
+    assert _row(refused, "approval_targets")["detail"] == detail
+    assert refused["approval_modes"]["ungated"] == [{"target": "develop", "mode": "review"}]
+    assert "approval_mode" not in _codes(refused)
+
+
+@pytest.mark.parametrize("branch", [b"HEAD\n", b"bad\nname\n"], ids=["detached", "refused"])
+@pytest.mark.parametrize("policy,code,detail", [
+    (None, "no_approval_map", "legacy gating (no map)"),
+    ("policy_unavailable", "policy_unavailable", "the map could not be read"),
+    ("invalid_approval_policy", "invalid_approval_policy", "the map was refused"),
+    ({}, "invalid_approval_policy", "the map was refused"),
+    ({"bad\nname": "none"}, "multiline_refused", "the map was refused"),
+], ids=["absent", "unavailable", "invalid", "empty", "refused-name"])
+def test_branch_refusal_keeps_map_diagnostics(tmp_path, monkeypatch, branch, policy, code, detail):
+    report = _collect(tmp_path, monkeypatch, policy, profile=True, branch=branch)
+    rows = [row for row in report["rows"] if row["code"] == code and row["detail"] == detail]
+    assert len(rows) == 1
+    assert rows[0]["status"] == ("pass" if policy is None else "warn")
+    if policy is None:
+        assert rows[0]["owner_action"] == doctor_git_report.SUGGEST
+    assert detail in _text(report) and detail in _blob(report)
+    assert "approval_mode" not in _codes(report) and report["approval_modes"] is None
+    branch_code = "branch_unknown" if branch == b"HEAD\n" else "multiline_refused"
+    assert branch_code in _codes(report)
+    assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("branch", [b"HEAD\n", b"bad\nname\n"], ids=["detached", "refused"])
+def test_branch_refusal_keeps_invalid_target_map_error(tmp_path, monkeypatch, branch):
+    class Target(str):
+        pass
+
+    report = _collect(tmp_path, monkeypatch, {Target("develop"): "none"}, branch=branch)
+    row = _row(report, "invalid_approval_policy")
+    assert row["status"] == "warn" and row["detail"] == "the map was refused"
+    assert row["detail"] in _text(report) and row["detail"] in _blob(report)
+    assert "approval_mode" not in _codes(report) and report["approval_modes"] is None
+    assert report["affects_exit"] is False
+
+
+def _live_policy(monkeypatch, tmp_path, invoke):
+    """Exercise _policy_at. The _policy seam stays the product function."""
+    _quiet_tree(monkeypatch)
+    table = _clean_table(tmp_path)
+    monkeypatch.setattr(doctor_git, "_run_git", lambda root, args: table[tuple(args)])
+    monkeypatch.setattr(doctor_git, "_head", lambda root: "a" * 40)
+    monkeypatch.setattr(doctor_git, "_leases", lambda root: team.LeaseSet((), ()))
+    monkeypatch.setattr(doctor_git, "_refs", lambda root, prefix: [])
+    monkeypatch.setattr(doctor_git, "_signers", lambda root, commit: 0)
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    monkeypatch.setattr(doctor_git, "_scoped", lambda root, produce: produce())
+
+
+def test_confirmed_absence_reaches_legacy_pass_without_mocking_policy(tmp_path, monkeypatch):
+    from aegis_core.team_profile import REPO_PATH
+
+    profile = "/".join(REPO_PATH)
+    _live_policy(monkeypatch, tmp_path, lambda *args: _cp(args, b""))
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert _row(report, "no_approval_map") == {
+        "id": "approvals", "status": "pass", "code": "no_approval_map",
+        "owner_action": "owner action: none", "detail": "legacy gating (no map)",
+    }
+    assert "policy_unavailable" not in _codes(report)
+    assert report["approval_modes"] is None
+    assert "commit an approvals map" not in _text(report)
+
+    def invoke(command, root):
+        path = command[-1] if command else ""
+        if path == profile:
+            line = b"100644 blob " + (b"c" * 40) + b"\t" + profile.encode() + b"\0"
+            return _cp(command, line)
+        return _cp(command, b"")
+
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert row["owner_action"] == doctor_git_report.SUGGEST
+    assert report["affects_exit"] is False
+
+
+def test_regular_config_without_approvals_is_legacy_pass(tmp_path, monkeypatch):
+    path = doctor_git.approval_policy.CONFIG_PATH
+    line = b"100644 blob " + (b"b" * 40) + b"\t" + path.encode() + b"\0"
+    _live_policy(monkeypatch, tmp_path, lambda *args: _cp(args, line))
+    monkeypatch.setattr(doctor_git, "_read_policy", lambda *args, **kwargs: None)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert _row(report, "no_approval_map")["detail"] == "legacy gating (no map)"
+    assert _row(report, "no_approval_map")["status"] == "pass"
+    assert "policy_unavailable" not in _codes(report)
+
+
+@pytest.mark.parametrize("mode", ["none", "review"])
+def test_one_long_target_does_not_hide_the_others(tmp_path, monkeypatch, mode):
+    long = "a" * 160
+    policy = {long: mode, "develop": "review", "main": "signature"}
+    report = _collect(tmp_path, monkeypatch, policy)
+    detail = "lose the gate: " + doctor_git_report.digest(long) + f" {mode}, develop review"
+    assert report["approval_modes"]["ungated"] == [
+        {"target": long, "mode": mode},
+        {"target": "develop", "mode": "review"},
+    ]
+    row = _row(report, "approval_targets")
+    assert row["detail"] == detail
+    assert len(row["detail"]) <= doctor_git_report.DISPLAY_MAX
+    assert "develop review" in row["detail"] and long not in row["detail"]
+    assert row["detail"] != "targets lose the gate"
+    text = _text(report)
+    blob = _blob(report)
+    assert detail in text and detail in blob
+    assert json.loads(blob)["approval_modes"]["ungated"][1] == {"target": "develop", "mode": "review"}
+    shown, code = doctor_git_report.display(row["detail"])
+    assert code is None and shown == row["detail"]
+
+
+@pytest.mark.parametrize("mode", ["none", "review"])
+def test_gate_detail_counts_every_target_when_no_identifier_fits(monkeypatch, mode):
+    pairs = tuple((f"long-target-{index:02d}", mode) for index in range(31))
+    expected = "lose the gate: (+31 more)"
+    monkeypatch.setattr(doctor_git_report, "DISPLAY_MAX", len(expected))
+    detail = doctor_git_report.gate_detail(pairs)
+    assert detail == expected
+    assert len(detail) <= doctor_git_report.DISPLAY_MAX
+
+
+def test_existing_display_keeps_the_tip_separator_and_targets_do_not(tmp_path, monkeypatch):
+    value = "ne\u00a0ver"
+    shown, code = doctor_git_report.display(value)
+    assert (shown, code) == (value, None)
+    kept, kept_code = doctor_git_report.display("never\u2028evil")
+    assert kept_code is None and "\u2028" in kept
+    target, target_code = doctor_git_report.display_target("never\u2028evil")
+    assert target is None and target_code == "multiline_refused"
+    hidden = "ghp_\u202e" + ("A" * 20)
+    redacted, redacted_code = doctor_git_report.display_target(hidden)
+    assert redacted_code is None and redacted == "ghp_REDACTED" and "\u202e" not in redacted
+    _quiet_tree(monkeypatch)
+    table = _clean_table(tmp_path)
+    table[doctor_git._EXPIRE] = _cp(doctor_git._EXPIRE, (value + "\n").encode("utf-8"))
+    seams = _clean_seams()
+    seams["_policy"] = lambda root, commit: {"main": "signature"}
+    _install_git(monkeypatch, table, seams)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert report["git"]["worktree_prune_expire"] == value
+    assert _row(report, "prune_expire_set")["detail"] == f"gc.worktreePruneExpire is {value}"
+    assert value in _text(report)
+    # JSON uses ensure_ascii, so the same character is the \\u00a0 escape, not a raw NBSP.
+    assert "\\u00a0" in _blob(report) and "never" not in report["git"]["worktree_prune_expire"]
+
+
+# Bytes of the git section at the integration tip, before the approvals-target row.
+_TIP_REPORT_BYTES = {
+    "valid_scratch": ("b995dd699643b23b6fb52b3f148a76927a4dc2773a3a1956a90f1be5ba26ab56",
+                      "b2e7f36f4d8188d08efa7d4815a2eac24cc27db6d5c951c208ed39416b21da91"),
+    "scratch_unavailable": ("4bd21b32b2780f6f243768afc44594d25517f579c9f3a4be0a636a34d5abab7d",
+                            "95bf43c9e41ced93fad50d45fe211fc3b236ce939fb8ed13b348556a565442d8"),
+    "capped_scan": ("e0db8329e61aa20d5dbcd917210e17c3974385cfc901b1be15ee7b41327d65cd",
+                    "9f3687dca4764b78f65652dbaaf1d31122652aafe82be798fcc8c92cecc2e2da"),
+    "depth_cap": ("d4d3a5fbd9a5d68031bd23ac1262ee725cd221a71f55b04ed3f376c1f31070fd",
+                  "721e0f7b4c1d5ba69c96b692708a5f3108796084e3248ee81ff924641613e31c"),
+    "swapped_path": ("36888513353b4d12c5efccd28518bc730bc98125a06de7469b03c47b82d9c2ef",
+                     "80b0e1cb3ee3640f56d48f9801d77150b4aa74654eb622d8a406bc26e53d889e"),
+    "unavailable_report": ("29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f",
+                           "9f83b9406083b200822af61b9bf222ef35c2ed9e5dbb2bd17d9bedc655fb0f2a"),
+}
+
+
+def _without_target_row(report, text):
+    import hashlib
+    body = json.loads(json.dumps(report))
+    body["rows"] = [row for row in body["rows"] if row.get("code") != "approval_targets"]
+    body["status"] = "warn" if any(row.get("status") == "warn" for row in body["rows"]) else "pass"
+    modes = body.get("approval_modes")
+    if isinstance(modes, dict):
+        modes.pop("ungated", None)
+    encoded = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    kept = "".join(
+        line for line in text.splitlines(keepends=True)
+        if "lose the gate:" not in line and "every target keeps the gate" not in line
+        and "legacy gating (no map)" not in line)
+    return hashlib.sha256(encoded).hexdigest(), hashlib.sha256(kept.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("case", ["valid_scratch", "scratch_unavailable", "capped_scan", "depth_cap", "swapped_path", "unavailable_report"])
+def test_existing_git_section_matches_the_tip(tmp_path, monkeypatch, capsys, case):
+    _split_parity_setup(tmp_path, monkeypatch, case)
+    if case == "unavailable_report":
+        payload = {"human_gate": {"tier": "B"}, "summary": {"failed": 2, "warnings": 3}}
+        result = doctor_git.with_report(payload, tmp_path, None, False)
+        report = result["git_hygiene"]
+        text = capsys.readouterr().out
+    else:
+        report = doctor_git.collect(tmp_path, tier="B", now=10)
+        doctor_git_report.print_report(report)
+        text = capsys.readouterr().out
+    assert _without_target_row(report, text) == _TIP_REPORT_BYTES[case]
+
+
+def _git_executable_is_regular():
+    import shutil
+    path = shutil.which("git")
+    if not path:
+        return False
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and os.access(path, os.X_OK)
+
+
+def _identity_commit(repo, message):
+    done = gitsafe.run(
+        ["-c", "user.email=aegis-test@example.invalid", "-c", "user.name=Aegis Test",
+         "-c", "commit.gpgsign=false", "commit", "-qm", message], repo)
+    assert done.returncode == 0, done.stderr
+
+
+@pytest.fixture
+def real_git_repo(tmp_path, monkeypatch):
+    if (os.name != "posix" or not doctor_git_observe.descriptor_support()
+            or not os.path.isdir("/proc/self/fd")):
+        pytest.skip("scratch custody descriptors unsupported")
+    if not _git_executable_is_regular():
+        pytest.skip("git executable unavailable")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert gitsafe.run(["init", "-q"], repo).returncode == 0
+    (repo / "README").write_text("pin\n", encoding="utf-8")
+    assert gitsafe.run(["add", "--", "README"], repo).returncode == 0
+    _identity_commit(repo, "pin")
+    return repo
+
+
+@pytest.fixture
+def real_doctor_report(capsys):
+    from aegis_cli.doctor import run_doctor
+
+    def report(repo):
+        args = argparse.Namespace(json=True, ws=types.SimpleNamespace(root=repo))
+        code = run_doctor(args)
+        payload = json.loads(capsys.readouterr().out)
+        assert code == (1 if payload["summary"]["failed"] else 0)
+        args.json = False
+        assert run_doctor(args) == code
+        text = capsys.readouterr().out
+        hygiene = payload["git_hygiene"]
+        assert hygiene["git"]["present"] is True, hygiene["rows"]
+        assert "scratch_outside" in _codes(hygiene), hygiene["rows"]
+        for row in hygiene["rows"]:
+            if row["id"] == "approvals":
+                assert row["detail"] in text
+        return hygiene
+
+    return report
+
+
+def test_real_repo_probe_unsupported_stays_advisory(tmp_path, monkeypatch):
+    monkeypatch.setattr(doctor_git_observe, "descriptor_support", lambda: False)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(tmp_path)})
+
+    def refuse_git(*args, **kwargs):
+        pytest.fail("git must not run without scratch custody descriptors")
+
+    monkeypatch.setattr(doctor_git, "_invoke", refuse_git)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert _row(report, "scratch_unknown")["owner_action"] == doctor_git_report.SCRATCH_ACT
+    assert _row(report, "git_failed")["status"] == "warn"
+    assert "descriptor_unsupported" in _codes(report)
+    assert report["approval_modes"] is None
+    assert "no_approval_map" not in _codes(report)
+    assert report["affects_exit"] is False and report["doctor_exit_effect"] == "unchanged"
+
+
+def test_real_repo_without_config_is_legacy_pass(real_git_repo, real_doctor_report):
+    report = real_doctor_report(real_git_repo)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert row["owner_action"] == "owner action: none"
+    assert report["approval_modes"] is None
+    assert report["affects_exit"] is False
+    assert "legacy gating (no map)" in _text(report)
+
+
+@pytest.mark.parametrize("profile", [False, True])
+def test_real_repo_detached_without_config_is_legacy_pass(real_git_repo, real_doctor_report, profile):
+    from aegis_core.team_profile import REPO_PATH
+
+    repo = real_git_repo
+    if profile:
+        path = repo.joinpath(*REPO_PATH)
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        assert gitsafe.run(["add", "--", "/".join(REPO_PATH)], repo).returncode == 0
+        _identity_commit(repo, "profile without config")
+    assert gitsafe.run(["checkout", "--detach", "HEAD"], repo).returncode == 0
+    report = real_doctor_report(repo)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert row["owner_action"] == (doctor_git_report.SUGGEST if profile else doctor_git_report.NONE)
+    assert _row(report, "branch_unknown")["detail"] == "the current branch is unknown"
+    assert "approval_mode" not in _codes(report) and report["approval_modes"] is None
+    assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_real_repo_config_without_approvals_is_legacy_pass(real_git_repo, real_doctor_report, detached):
+    repo = real_git_repo
+    config = repo / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    assert gitsafe.run(["add", "--", ".aegis/config.json"], repo).returncode == 0
+    _identity_commit(repo, "config")
+    if detached:
+        assert gitsafe.run(["checkout", "--detach", "HEAD"], repo).returncode == 0
+    report = real_doctor_report(repo)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert "policy_unavailable" not in _codes(report)
+    assert ("branch_unknown" in _codes(report)) is detached
+    assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_real_repo_team_profile_suggests_a_map(real_git_repo, real_doctor_report, detached):
+    from aegis_core.team_profile import REPO_PATH
+
+    repo = real_git_repo
+    config = repo / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    profile = repo.joinpath(*REPO_PATH)
+    profile.parent.mkdir(parents=True)
+    profile.write_text("{}\n", encoding="utf-8")
+    assert gitsafe.run(["add", "--", ".aegis/config.json", "/".join(REPO_PATH)], repo).returncode == 0
+    _identity_commit(repo, "profile")
+    if detached:
+        assert gitsafe.run(["checkout", "--detach", "HEAD"], repo).returncode == 0
+    report = real_doctor_report(repo)
+    row = _row(report, "no_approval_map")
+    assert row["status"] == "pass" and row["detail"] == "legacy gating (no map)"
+    assert row["owner_action"] == doctor_git_report.SUGGEST
+    assert "commit an approvals map" in row["owner_action"]
+    assert "does not write" in row["owner_action"]
+    assert ("branch_unknown" in _codes(report)) is detached
+    assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_real_repo_nonregular_config_stays_refused(real_git_repo, real_doctor_report, detached):
+    repo = real_git_repo
+    oid = gitsafe.run_checked(
+        ["hash-object", "-w", "--stdin"], repo,
+        stdin=b'{"approvals": {"develop": "review"}}\n').stdout.decode().strip()
+    recorded = gitsafe.run(
+        ["update-index", "--add", "--cacheinfo", f"120000,{oid},.aegis/config.json"], repo)
+    assert recorded.returncode == 0, recorded.stderr
+    _identity_commit(repo, "link")
+    if detached:
+        assert gitsafe.run(["checkout", "--detach", "HEAD"], repo).returncode == 0
+    report = real_doctor_report(repo)
+    assert _row(report, "policy_unavailable")["status"] == "warn"
+    assert "could not be read" in _row(report, "policy_unavailable")["detail"]
+    assert "legacy gating (no map)" not in _blob(report)
+    assert "approval_targets" not in _codes(report)
+    assert ("branch_unknown" in _codes(report)) is detached
+    assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_real_repo_detached_invalid_config_keeps_map_refusal(real_git_repo, real_doctor_report, oversized):
+    from aegis_core.approval_policy import MAX_CONFIG_BYTES
+
+    repo = real_git_repo
+    config = repo / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    content = {"approvals": {"main": "not-a-mode"}}
+    if oversized:
+        content = {"approvals": {"main": "none"}, "padding": "X" * (MAX_CONFIG_BYTES + 1)}
+    config.write_text(json.dumps(content), encoding="utf-8")
+    assert gitsafe.run(["add", "--", ".aegis/config.json"], repo).returncode == 0
+    _identity_commit(repo, "invalid config")
+    assert gitsafe.run(["checkout", "--detach", "HEAD"], repo).returncode == 0
+    report = real_doctor_report(repo)
+    row = _row(report, "invalid_approval_policy")
+    assert row["status"] == "warn" and row["detail"] == "the map was refused"
+    assert "not-a-mode" not in _blob(report)
+    assert _row(report, "branch_unknown")["detail"] == "the current branch is unknown"
+    assert "approval_mode" not in _codes(report) and report["approval_modes"] is None
+    assert report["affects_exit"] is False
+
+
+def test_real_repo_detached_head_names_ungated_targets(real_git_repo, real_doctor_report):
+    repo = real_git_repo
+    config = repo / ".aegis" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        '{"approvals": {"develop": "review", "main": "signature"}}\n', encoding="utf-8")
+    assert gitsafe.run(["add", "--", ".aegis/config.json"], repo).returncode == 0
+    _identity_commit(repo, "map")
+    detached = gitsafe.run(["checkout", "--detach", "HEAD"], repo)
+    assert detached.returncode == 0, detached.stderr
+    payload = {"summary": {"passed": 1, "warnings": 0, "failed": 0, "total": 1}, "checks_ok": True}
+    out = doctor_git.with_report(dict(payload), repo, None, True)
+    assert out["checks_ok"] is True and out["summary"]["failed"] == 0
+    report = real_doctor_report(repo)
+    assert out["git_hygiene"]["approval_modes"] == report["approval_modes"]
+    assert _row(report, "branch_unknown")["detail"] == "the current branch is unknown"
+    assert "approval_mode" not in _codes(report)
+    assert "develop review" in _row(report, "approval_targets")["detail"]
+    assert {"target": "develop", "mode": "review"} in report["approval_modes"]["ungated"]
+    text = _text(report)
+    blob = _blob(report)
+    assert "develop review" in text and "develop review" in blob
+    assert report["affects_exit"] is False and report["doctor_exit_effect"] == "unchanged"
+
+
+def test_target_row_spaces_unicode_whitespace_before_redaction(tmp_path, monkeypatch):
+    password = "password\u00a0is\u00a0hunter22"
+    bearer = "Bearer\u00a01" + ("a" * 19)
+    shown, code = doctor_git_report.display_target(password)
+    assert code is None and shown == "password is REDACTED" and "hunter22" not in shown
+    assert "passwordishunter22" not in shown
+    masked, masked_code = doctor_git_report.display_target(bearer)
+    assert masked_code is None and masked == "Bearer REDACTED" and "1" + ("a" * 19) not in masked
+    # Tip display() still keeps the prune-expire NBSP on the existing row.
+    assert doctor_git_report.display("ne\u00a0ver") == ("ne\u00a0ver", None)
+    report = _collect(tmp_path, monkeypatch, {password: "none", bearer: "review", "main": "signature"})
+    blob = _blob(report)
+    text = _text(report)
+    assert "hunter22" not in blob and "hunter22" not in text
+    assert "1" + ("a" * 19) not in blob and bearer not in text
+    assert "passwordishunter22" not in blob and "passwordishunter22" not in text
+    detail = _row(report, "approval_targets")["detail"]
+    assert "hunter22" not in detail and ";" not in detail
+    assert report["affects_exit"] is False
+
+
+def test_splitlines_breaks_are_refused_and_do_not_pass_the_branch(tmp_path, monkeypatch):
+    sample = "never\x85evil"
+    assert doctor_git._accepted(sample) == (None, "multiline_refused")
+    assert doctor_git._one_line(sample.encode("utf-8")) == (None, "multiline_refused")
+    assert doctor_git_report.display_target(sample) == (None, "multiline_refused")
+    # Existing fields keep the tip renderer, which strips U+0085 instead of refusing it.
+    assert doctor_git_report.display(sample) == ("neverevil", None)
+    for char in "\x1c\x1d\x1e\v\f\u2028\u2029":
+        assert doctor_git._accepted("never" + char + "evil")[1] == "multiline_refused"
+    found = set()
+    for code_point in range(0x10000):
+        char = chr(code_point)
+        if len(("a" + char + "b").splitlines()) > 1:
+            found.add(char)
+    assert found <= set("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+    report = _collect(
+        tmp_path, monkeypatch, {"develop": "review", "main": "signature"},
+        branch="feat\u2028evil".encode("utf-8") + b"\n")
+    assert "approval_mode" not in _codes(report)
+    assert _row(report, "multiline_refused")["status"] == "warn"
+    assert _row(report, "multiline_refused")["detail"] == "the current branch name was refused"
+    assert "develop review" in _row(report, "approval_targets")["detail"]
+    swallowed = _collect(
+        tmp_path, monkeypatch, {"develop": "review", "main": "signature"}, branch=b"\x01\n")
+    assert "approval_mode" not in _codes(swallowed)
+    assert _row(swallowed, "invalid_approval_policy")["status"] == "warn"
+    assert "develop review" in _row(swallowed, "approval_targets")["detail"]
+
+
+def test_forged_target_names_cannot_extend_the_detail(tmp_path, monkeypatch):
+    assert doctor_git_report.gate_detail(iter(())) == doctor_git_report.GATED_DETAIL
+    forged = ("alpha review, main", "alpha; owner action: evil")
+    for name in forged:
+        assert doctor_git_report.gate_detail(((name, "none"),)) == "targets lose the gate"
+        report = _collect(tmp_path, monkeypatch, {name: "none", "main": "signature"})
+        detail = _row(report, "approval_targets")["detail"]
+        assert detail == "lose the gate: " + doctor_git_report.digest(name) + " none"
+        assert name not in detail and ";" not in detail and "owner action: evil" not in detail
+        assert name not in _text(report) and name not in _blob(report)
+        assert report["affects_exit"] is False
+
+
+@pytest.mark.parametrize("name", ["ghp_\u202e" + "A" * 20, "na\u202eme"], ids=["split-secret", "bidi"])
+@pytest.mark.parametrize("mode", ["none", "review"])
+def test_gate_detail_refuses_noncanonical_target_names(name, mode):
+    assert doctor_git_report.gate_detail(((name, mode),)) == "targets lose the gate"
+    assert doctor_git_report.gate_detail((("develop", "review"), (name, mode))) == "targets lose the gate"
+
+
+@pytest.mark.parametrize("mode", ["none", "review"])
+def test_gate_detail_keeps_valid_long_target_as_digest(mode):
+    name = "feature/" + "a" * 200
+    assert doctor_git_report.gate_detail(((name, mode),)) == (
+        "lose the gate: " + doctor_git_report.digest(name) + " " + mode)
