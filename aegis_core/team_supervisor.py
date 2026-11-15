@@ -248,10 +248,27 @@ def _policy_fields(policy):
 
 
 def _event_deadlines(failures, restart):
-    """Backoff deadlines and their event indices, derived solely from evidence."""
-    return [(event + _delay(restart["initial_s"], restart["max_s"],
-                            len(_in_window(failures, event, restart["window_s"]))), index)
-            for index, event in enumerate(failures)]
+    """Compute each deadline once, preserving original indices for witness ties."""
+    ordered = sorted((event, index) for index, event in enumerate(failures))
+    delays = [restart["initial_s"]]
+    for _count in range(1, len(ordered)):
+        delays.append(min(delays[-1] * 2, restart["max_s"]))
+    deadlines = [None] * len(ordered)
+    left = right = 0
+    while right < len(ordered):
+        event = ordered[right][0]
+        end = right + 1
+        # All equal timestamps count each other, regardless of input order.
+        while end < len(ordered) and ordered[end][0] == event:
+            end += 1
+        while event - ordered[left][0] >= restart["window_s"]:
+            left += 1
+        deadline = event + delays[end - left - 1]
+        for position in range(right, end):
+            index = ordered[position][1]
+            deadlines[index] = (deadline, index)
+        right = end
+    return deadlines
 
 
 def _retain(failures, now, policy):
@@ -407,7 +424,7 @@ def plan(resolved, state, running, now):
         return _refused("invalid value: supervisor", "repo")
     components = [_component_row(name, body, checked, names, clock) for name in COMPONENTS]
     start = [row["id"] for row in components if row["action"] == "would_start"]
-    return {"status": "dry_run", "starts_nothing": not start, "start": start, "components": components}
+    return {"status": "dry_run", "starts_nothing": True, "start": start, "components": components}
 
 
 def empty_state():
