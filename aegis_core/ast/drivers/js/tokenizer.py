@@ -107,8 +107,8 @@ class Lexer:
         # (end of the `(` run, `)` count or -1) of the last failed transparent-group attempt.
         self.group_skip = (-1, -1)
         self.generator_pending, self.body_generator, self.class_kind = None, False, None
-        # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads.
-        self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads = set(), set(), set(), set()
+        # Frame depths: generator parameters/bodies, strict class bodies, concise arrows, for-statement heads, TS type literals.
+        self.generator_frames, self.strict_frames, self.arrow_markers, self.for_heads, self.type_literals = set(), set(), set(), set(), set()
 
     def error(self, reason, offset=None, line=None):
         raise JSLexError(reason, self.line if line is None else line, self.i if offset is None else offset)
@@ -304,6 +304,8 @@ class Lexer:
             if self.typescript and self.previous in ('>', '>>', '>>>'):
                 self.error('unsupported_lexical_context:type_angle_slash')
             self.regex()
+        elif ch == '<' and self.jsx_allowed and self.expr and self.type_literals:
+            self.error('unsupported_lexical_context:tsx_type_literal_angle')  # a generic signature, never JSX
         elif ch == '<' and self.jsx_allowed and self.expr and self.jsx_candidate():
             self.begin_jsx('code')
         elif ch == '/' and self.body is None and not self.class_fields:
@@ -752,6 +754,10 @@ class Lexer:
             return 'block'
         if self.expr:
             return 'object'
+        if (self.typescript and self.previous in ('as', 'satisfies', 'extends', 'readonly', 'is') and self.tokens[-1].value == self.previous
+                and self.tokens[-1].line == self.line and (len(self.tokens) < 2 or self.tokens[-2].value not in ('.', '?.') and self.tokens[-2].kind != 'comment')):
+            self.type_literals.add(len(self.frames) + 1)  # a TS type literal: `x as { a: T }`, `T extends { a: T }`
+            return 'object'  # `x.as`, or a newline or comment next to the word, may be an ASI block: fail closed below
         self.error('unsupported_lexical_context:brace')
 
     def punctuation(self, operator=None):
@@ -797,7 +803,7 @@ class Lexer:
             if not self.frames or self.frames[-1][0] != ch:
                 self.error('syntax:unbalanced_delimiter')
             _, role, resume = self.frames.pop()
-            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers:
+            if role.startswith('parameters_') or self.generator_frames or self.strict_frames or self.for_heads or self.arrow_markers or self.type_literals:
                 self.close_context(role)
             if role in ('class_decl', 'class_expr'):
                 del self.class_fields[len(self.frames) + 1]
@@ -877,6 +883,7 @@ class Lexer:
         self.strict_frames.discard(depth)
         self.for_heads.discard(depth)
         self.arrow_markers.discard(depth)
+        self.type_literals.discard(depth)
 
     def after_operator(self, operator):
         depth = len(self.frames)

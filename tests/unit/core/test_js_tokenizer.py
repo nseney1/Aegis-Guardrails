@@ -353,3 +353,74 @@ def test_large_template_chunks_keep_exact_tokens_with_a_bounded_process(unit):
 def test_jsx_inside_an_attribute_expression_keeps_the_enclosing_tag(source):
     # The text after the tag is still JSX text (eval(x) is not code); only {eval(y)} is.
     assert sum(t.kind == 'identifier' and t.value == 'eval' for t in tokens(source)) == 1
+
+
+@pytest.mark.parametrize('source', [
+    'const a = b as { x: number }; eval(code)',
+    'const a = [1] satisfies { x: number }[]; eval(code)',
+    'const a = (m as { arg?: { e?: unknown } } | undefined)?.arg; eval(code)',
+    'const f = <T extends { id: string }>(x: T) => x; eval(code)',
+    'function f<T extends { id: string }>(x: T) { return x; } eval(code)',
+    'type P<T> = T extends { a?: infer M } ? M : never; eval(code)',
+    'function g(u: readonly { id: string }[]) {} eval(code)',
+    'const h = (t): t is { a: number } => true; eval(code)',
+    'const a = b as {\n  x: number;\n}; eval(code)',
+    'const a = b as { f: <T>(x: T) => T }; eval(code)',
+])
+def test_typescript_type_literals_after_type_operators_are_read_as_types(source):
+    assert sum(t.kind == 'identifier' and t.value == 'eval' for t in tokens(source, 'fixture.ts')) == 1
+
+
+@pytest.mark.parametrize('source', [
+    'class A extends B { m() { eval(code) } }',
+    'class C extends D<{ x: 1 }> { m() { eval(code) } }',
+    'const o = { extends: { a: 1 }, is: { b: 2 }, as: { c: 3 } }; eval(code)',
+    'const a = [1, 2] as const; eval(code)',
+    "import * as ns from 'x'; eval(code)",
+    'export { a as b }; eval(code)',
+    'const a = x as (A | B); eval(code)',
+    'const a = { k: 1 } satisfies Record<string, number>; eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx', 'fixture.js'])
+def test_type_operator_words_keep_their_other_meanings(source, path):
+    assert sum(t.kind == 'identifier' and t.value == 'eval' for t in tokens(source, path)) == 1
+
+
+def test_a_brace_after_as_still_fails_closed_in_javascript():
+    with pytest.raises(ASTDriverError, match='unsupported_lexical_context:brace'):
+        tokens('const a = b as { x: number }; eval(code)', 'fixture.js')
+
+
+# After a newline (ASI) or a property name the `{` opens a block; read as a type literal it would hide its calls.
+@pytest.mark.parametrize('source', [
+    'x.as\n{ eval(code) }',
+    'x?.satisfies\n{ eval(code) }',
+    'x.extends\n{ eval(code) }',
+    'x.readonly\n{ eval(code) }',
+    'x.is\n{ eval(code) }',
+    'as\n{ eval(code) }',
+    'x = is /*\n*/ { eval(code) }',
+    # Not valid TypeScript, but after a property name the `{` must not open a type literal either.
+    'x?.is { eval(code) }',
+    'x./*c*/as { eval(code) }',
+    # Valid type literals that also fail closed: on the next line it looks like the block above,
+    # and the lexer does not look through a comment before `{`.
+    'const a = b as\n{ x: number }; eval(code)',
+    'const a = b as /* c */ { x: number }; eval(code)',
+])
+@pytest.mark.parametrize('path', ['fixture.ts', 'fixture.tsx', 'fixture.mts', 'fixture.cts'])
+def test_a_brace_after_a_newline_comment_or_property_name_fails_closed(source, path):
+    with pytest.raises(ASTDriverError, match='unsupported_lexical_context:brace'):
+        tokens(source, path)
+
+
+# In a type literal `<` opens a generic signature, never a JSX element.
+@pytest.mark.parametrize('source', [
+    'const a = b as { f: <T>(x: T) => T }; eval(code)',
+    'const a = b satisfies { f: <T>(x: T) => T }; eval(code)',
+    'type A = B extends { g: <T>(x: T) => T } ? 1 : 2; eval(code)',
+    'const h = (t): t is { g: <T>(x: T) => T } => true; eval(code)',
+])
+def test_jsx_cannot_start_inside_a_tsx_type_literal(source):
+    with pytest.raises(ASTDriverError, match='unsupported_lexical_context:tsx_type_literal_angle'):
+        tokens(source, 'fixture.tsx')
