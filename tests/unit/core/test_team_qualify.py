@@ -113,6 +113,119 @@ def test_first_record_retry_and_newer_record_fast_forward(rig):
     assert all(row["status"] == "done" for row in rows if row["kind"] == "result")
 
 
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("other_state", ["stuck", "active", "tombstone", "malformed", "storage", "killed"])
+def test_publication_reconciles_only_its_request(rig, monkeypatch, retry, other_state):
+    if retry:
+        assert write(rig) == "updated"
+        # A lost final append leaves the authoritative checkpoint for replay.
+        path = rig.repo / ".git" / "aegis" / "gitops.jsonl"
+        path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+    directory = rig.repo / ".git" / "aegis"
+    before = set(directory.glob("gitops-effect-*.lock"))
+    other = None
+    if other_state == "killed":
+        if os.name != "posix":
+            pytest.skip("custodian SIGKILL requires POSIX signals")
+        script = '''
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+from aegis_core.team_gitops import GitOpsJournal
+receipt = GitOpsJournal(sys.argv[2]).record_intent(op="ref_update", lane="lane-1",
+    request_id="unselected", expected_old=None, expected_new=sys.argv[3], actor="custodian-1")
+os.kill(os.getpid(), signal.SIGKILL)
+'''
+        child = subprocess.run([sys.executable, "-I", "-c", script,
+                                str(Path(__file__).resolve().parents[3]), str(rig.repo / ".git"), rig.head],
+                               capture_output=True, timeout=20)
+        assert child.returncode == -signal.SIGKILL, child.stderr
+    else:
+        other = rig.journal.record_intent(op="ref_update", lane="lane-1", request_id="unselected",
+                                         expected_old=None, expected_new=rig.head, actor="custodian-1")
+    checkpoint = (set(directory.glob("gitops-effect-*.lock")) - before).pop()
+    if other is not None and other_state != "active":
+        other.close()
+    if other_state == "stuck":
+        checkpoint.write_bytes(b"!\n")
+    if other_state == "tombstone":
+        terminal = rig.journal.record_result("unselected", "done", rig.head)
+        path = directory / "gitops.jsonl"
+        rows = [row for row in rig.journal.read().rows if row["request_id"] != "unselected"]
+        rows.append(dict(terminal, kind="tombstone"))
+        path.write_bytes(b"".join(team_gitops.rows.encoded(row) + b"\n" for row in rows))
+    if other_state == "malformed":
+        with (directory / "gitops.jsonl").open("ab") as stream:
+            stream.write(b'{"malformed":\n')
+    saved = checkpoint.read_bytes()
+    probes, original = [], team_gitops._try_effect
+
+    def probe(directory_fd, request_id, **kwargs):
+        if kwargs.get("existing_only"):
+            probes.append(request_id)
+        if request_id == "unselected" and other_state == "storage":
+            raise team_gitops.GitOpsError("journal_io")
+        return original(directory_fd, request_id, **kwargs)
+
+    monkeypatch.setattr(team_gitops, "_try_effect", probe)
+    try:
+        assert write(rig) == ("already" if retry else "updated")
+        assert probes == ["request-1"]
+        assert checkpoint.read_bytes() == saved
+        assert write(rig) == "already"
+        assert probes == ["request-1"]
+    finally:
+        if other is not None:
+            other.close()
+    assert [row["request_id"] for row in rig.journal.open_intents()] == (
+        [] if other_state == "tombstone" else ["unselected"])
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_publication_uses_reconcile_result_without_reading_history(rig, monkeypatch, retry):
+    if retry:
+        assert write(rig) == "updated"
+        path = rig.repo / ".git" / "aegis" / "gitops.jsonl"
+        path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+
+    def unavailable(self):
+        raise OSError("history must not be reread after a durable reconcile result")
+
+    monkeypatch.setattr(team_gitops.GitOpsJournal, "read", unavailable)
+    assert write(rig) == ("already" if retry else "updated")
+
+
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("compacted", [False, True])
+def test_publication_reads_history_when_request_finishes_before_effect_claim(rig, monkeypatch, retry, compacted):
+    if retry:
+        assert write(rig) == "updated"
+        path = rig.repo / ".git" / "aegis" / "gitops.jsonl"
+        path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+    original_effect, original_read = team_gitops._try_effect, team_gitops.GitOpsJournal.read
+    completed, reads = [], []
+
+    def complete(directory, request_id, **kwargs):
+        if kwargs.get("existing_only") and not completed:
+            completed.append(request_id)
+            row = next(row for row in original_read(rig.journal).rows
+                       if row["kind"] == "intent" and row["request_id"] == request_id)
+            terminal = rig.journal.record_result(request_id, "done", row["expected_new"])
+            if compacted:
+                path = rig.repo / ".git" / "aegis" / "gitops.jsonl"
+                path.write_bytes(team_gitops.rows.encoded(dict(terminal, kind="tombstone")) + b"\n")
+        return original_effect(directory, request_id, **kwargs)
+
+    def read(self):
+        reads.append(None)
+        return original_read(self)
+
+    monkeypatch.setattr(team_gitops, "_try_effect", complete)
+    monkeypatch.setattr(team_gitops.GitOpsJournal, "read", read)
+    assert write(rig) == ("already" if retry else "updated")
+    assert completed == ["request-1"]
+    assert len(reads) == 1
+
+
 def test_publication_exports_the_active_receipt_to_the_sole_writer(rig, monkeypatch):
     if not gitops_fds.descriptor_supported():
         pytest.skip("effect custody requires Linux child subreaper support")

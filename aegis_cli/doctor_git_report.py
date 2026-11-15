@@ -255,15 +255,103 @@ def row(row_id, status, code, owner_action, detail):
         row[key] = _DETAIL_FALLBACKS.get(row["code"], "finding detail unavailable") if key == "detail" and (refused or not shown or shown != row[key]) else shown
     return row
 
+_LIMIT_DETAILS = {
+    "scan_capped": "the workspace listing reached its entry cap",
+    "depth_capped": "a directory was not measured beyond the scan depth",
+}
+_LOCATION_SAMPLES = 3
+
+def _limit_code(row):
+    code = row.get("code")
+    if (code in ("scan_capped", "depth_capped") and row.get("id") == "disk_walk"
+            and row.get("status") == "warn" and row.get("owner_action") == INSPECT):
+        return code
+    return None
+
+def _limit_location(detail, code):
+    # These are captured UX-45 labels, not paths to resolve or open. Check the
+    # original field before slicing; malformed or changed spellings are omitted.
+    if not isinstance(detail, str) or len(detail) > DISPLAY_MAX:
+        return None
+    if display(detail) != (detail, None):
+        return None
+    prefix = _LIMIT_DETAILS[code]
+    if detail == prefix:
+        return "."
+    if not detail.startswith(prefix + " (") or not detail.endswith(")"):
+        return None
+    label = detail[len(prefix) + 2:-1]
+    if (not label or len(label) > 96 or display(label) != (label, None)
+            or display_target(label) != (label, None)):
+        return None
+    # Labels cannot impersonate sample separators, fields or fixed sentinels.
+    # Interior spaces remain valid, including those in opaque UX-45 labels.
+    if label != label.strip() or "," in label or ";" in label or label in ("none", "."):
+        return None
+    return label
+
+def _limit_detail(count, locations):
+    # Bound both sample count and the complete detail, including the omission
+    # count. Never truncate a location fingerprint or hide the omission count.
+    selected = list(locations)
+    while True:
+        detail = (f"{count} findings; locations: {', '.join(selected) or 'none'}; "
+                  f"omitted: {count - len(selected)}")
+        if display(detail) == (detail, None) or not selected:
+            return detail
+        selected.pop()
+
+def _healthy_lease(row):
+    if (row.get("code") != "live_lease" or row.get("status") != "pass"
+            or row.get("owner_action") != NONE):
+        return False
+    return all(shown and not refused for shown, refused in (
+        display(str(row.get("id", ""))), display(str(row.get("detail", "")))))
+
+def _print_row(row, out):
+    status = row.get("status") if row.get("status") in ("pass", "warn") else "warn"
+    ident, icode = display(str(row.get("id", "")), single_line=True)
+    detail, dcode = display(str(row.get("detail", "")), single_line=True)
+    action, acode = display(str(row.get("owner_action", "")), single_line=True, max_len=VALUE_MAX)
+    if icode or dcode or acode or not ident or not detail or not action:
+        print(f"  [{status}] refused", file=out)
+        return
+    print(f"  [{status}] {ident}: {detail}; {action}", file=out)
+
 def print_report(report, stream=None):
     out = sys.stdout if stream is None else stream
+    rows = tuple(report.get("rows", ()))
+    groups = {}
+    live = expired = unreadable = 0
+    for item in rows:
+        code = _limit_code(item)
+        if code:
+            count, locations = groups.get(code, (0, []))
+            if len(locations) < _LOCATION_SAMPLES:
+                label = _limit_location(item.get("detail"), code)
+                if label is not None and label not in locations:
+                    locations.append(label)
+            groups[code] = count + 1, locations
+        live += int(_healthy_lease(item))
+        expired += int(item.get("code") == "expired_lease")
+        unreadable += int(item.get("code") == "lease_unreadable")
     print("Git and disk hygiene (report only; doctor does not delete, prune, gc or rewrite refs):", file=out)
-    for row in report.get("rows", ()):
-        status = row.get("status") if row.get("status") in ("pass", "warn") else "warn"
-        ident, icode = display(str(row.get("id", "")), single_line=True)
-        detail, dcode = display(str(row.get("detail", "")), single_line=True)
-        action, acode = display(str(row.get("owner_action", "")), single_line=True, max_len=VALUE_MAX)
-        if icode or dcode or acode or not ident or not detail or not action:
-            print(f"  [{status}] refused", file=out)
+    emitted = set()
+    leases_printed = False
+    for item in rows:
+        code = _limit_code(item)
+        if code:
+            if code not in emitted:
+                count, locations = groups[code]
+                _print_row({"id": code, "status": "warn", "detail": _limit_detail(count, locations),
+                            "owner_action": INSPECT}, out)
+                emitted.add(code)
             continue
-        print(f"  [{status}] {ident}: {detail}; {action}", file=out)
+        healthy = _healthy_lease(item)
+        if not leases_printed and (healthy or item.get("code") in ("expired_lease", "lease_unreadable")):
+            _print_row({"id": "leases", "status": "warn" if expired or unreadable else "pass",
+                        "detail": f"live {live}, expired {expired}, unreadable {unreadable}",
+                        "owner_action": NONE}, out)
+            leases_printed = True
+        if not healthy:
+            _print_row(item, out)

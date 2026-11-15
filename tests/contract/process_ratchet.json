@@ -67,6 +67,10 @@
     "count": 1,
     "reason": "Single GitHub transport, isolated working directory and explicit timeout."
   },
+  "process:aegis_core/gitops_holder.py:main:subprocess.Popen": {
+    "count": 1,
+    "reason": "Isolated Linux holder executes source captured from its parent's co-located parsed module and spawns the descriptor-pinned effect with close_fds, separate session, bounded timeout and descendant reaping while retaining receipt custody."
+  },
   "process:aegis_core/gitsafe.py:run:subprocess.run": {
     "count": 1,
     "reason": "Single hardened git transport."
