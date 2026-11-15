@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, team_git as tg, team_git_snapshot
+from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
 from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -1140,6 +1140,91 @@ def test_single_ref_writer_and_no_force_by_construction():
                and isinstance(node.func, ast.Attribute) and node.func.attr == "cas"]
     assert len(writers) == 1
     assert not any(flag in source for flag in ("--force", "--force-with-lease", "+refspec"))
+
+
+def test_cas_borrows_receipt_descriptors_without_retaining_them(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        original, seen = gitsafe_run.LaneRunner.cas, []
+        def observe(self, *args, **kwargs):
+            seen.append(self.effect_fds)
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", observe)
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="effect-1",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "updated"
+            assert seen == [descriptors]
+            assert not os.get_inheritable(descriptors[0])
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "already"
+        # An effect-bound operation must not leave a closed receipt on the store.
+        assert tg.cas_fast_forward(store, "refs/heads/lane/plain", None, head) == "updated"
+        assert seen == [descriptors, None]
+
+
+@pytest.mark.parametrize("descriptors", [(), (True,), (-1,), (999999,), "token=PRIVATE"])
+def test_cas_invalid_effect_descriptors_refuse_before_spawn_and_allow_retry(repo, monkeypatch, descriptors):
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        before = shared_bytes(repo)
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid effect descriptors reached process creation")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=descriptors)
+        assert caught.value.code == "invalid_effect_descriptor"
+        assert str(caught.value) == "Lane Git operation refused: invalid_effect_descriptor"
+        assert shared_bytes(repo) == before
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+def test_cas_effect_platform_probe_refuses_without_consuming_receipt(repo, monkeypatch):
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        probe = gitops_fds.descriptor_supported
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", lambda: False)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=())
+        assert caught.value.code == "unsupported_effect_platform"
+        assert str(caught.value) == "Lane Git operation refused: unsupported_effect_platform"
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", probe)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+@pytest.mark.parametrize("code", ["git_cleanup_failed", "git_timeout", "git_output_limit", "ref_update_unknown", "git_failed"])
+@pytest.mark.parametrize("observation", ["old", "new", "winner"])
+def test_effect_cas_does_not_promote_a_visible_failure_to_success(repo, monkeypatch, code, observation):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        new = git(repo, "rev-parse", "HEAD").decode().strip()
+        winner = commit(repo, "winner", b"competing bytes")
+        ref = "refs/aegis/qual/visible-failure"
+        attempts = []
+        def fail(self, *args, **kwargs):
+            attempts.append(args)
+            if observation != "old":
+                git(repo, "update-ref", ref, new if observation == "new" else winner)
+            raise gitsafe.GitError("private error", code=code, process_started=True)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", fail)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="visible-failure",
+                                   expected_old=None, expected_new=new, actor="custodian-1") as receipt:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, ref, None, new, effect_fds=receipt.inheritable_fds())
+            assert caught.value.code == "ref_update_unknown"
+            assert str(caught.value) == "Lane Git operation refused: ref_update_unknown"
+        assert len(attempts) == 1
 
 
 @pytest.mark.parametrize("setting", ["text-auto", "autocrlf-true", "autocrlf-input", "text", "text-crlf", "binary"])
