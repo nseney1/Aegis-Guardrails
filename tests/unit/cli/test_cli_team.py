@@ -20,7 +20,7 @@ from typing import List, Optional
 import pytest
 
 from aegis_cli.cli import main
-from aegis_core import events, team, team_queue
+from aegis_core import events, team, team_queue, team_lease_custody
 from aegis_core._version import __version__
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -899,3 +899,272 @@ def test_cli_queue_audit_of_stored_surrogate_branch_stays_unsupported(ws: Path, 
     rc, listed = _queue_json(capsys, ws, "list")
     assert rc == 0 and listed["items"][0]["branch_supported"] is False
     assert listed["items"][0]["branch"] == branch
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_lease_liveness_uses_metadata_scratch_without_descriptor_support(ws, capsys, monkeypatch, action):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    old = team.claim(ws, "docs", ["docs/**"], owner="owner", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    common = gitsafe.common_dir(ws)
+    seen = []
+    limits = []
+    original = gitsafe.custody
+
+    @contextmanager
+    def capture(**kwargs):
+        seen.append(Path(kwargs["scratch"]))
+        limits.append((kwargs["stdout_limit"], kwargs["stderr_limit"]))
+        with original(**kwargs):
+            yield
+
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "custody": capture}))
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    rc, payload, err = _json(capsys, *args)
+    assert (rc, payload["status"], err) == (0, "renewed" if action == "renew" else "collected", "")
+    assert seen[0] == Path(ws.anchor)  # No-stdin discovery never opens this bootstrap scratch.
+    assert limits[0] == (65536, 65536)
+    assert seen[1:] and all(path == common / "aegis-lease-scratch" for path in seen[1:])
+    assert seen[1].is_dir() and list(seen[1].iterdir()) == []
+
+
+def test_lease_custody_is_absent_from_ordinary_team_import():
+    import sys
+
+    source = Path(__file__).resolve().parents[3]
+    result = subprocess.run([sys.executable, "-I", "-c", (
+        "import sys; sys.path.insert(0,sys.argv[1]); from aegis_core import team; "
+        "assert 'aegis_core.team_lease_custody' not in sys.modules"), str(source)],
+        capture_output=True, text=True, timeout=30)
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch):
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: value == "/dev/fd"})
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(path=path))
+    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: True))
+    assert team_lease_custody.descriptor_supported() is False
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+@pytest.mark.parametrize("kind", ["worktree", "bare", "configured_worktree"])
+def test_nested_workspace_lease_mutations_keep_the_workspace_identity(ws, capsys, monkeypatch, action, backend, kind):
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    repository = ws
+    common = ws / ".git"
+    if kind == "bare":
+        repository = ws.parent / "bare.git"
+        _git(ws, "clone", "-q", "--bare", "--no-hardlinks", str(ws), str(repository))
+        common = repository
+    elif kind == "configured_worktree":
+        checkout = ws.parent / "configured-checkout"
+        checkout.mkdir()
+        _git(ws, "config", "core.worktree", str(checkout))
+    nested = repository / "packages" / "app"
+    (nested / ".aegis" / "rules").mkdir(parents=True)
+    base = ["--workspace", str(nested), "team"]
+    assert main([*base, "claim", "docs", "--paths", "docs/**", "--owner", "o@h",
+                 "--branch", "main", "--json"]) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    oid = claimed["oid"]
+    if action == "gc":
+        team.release(nested, "docs", oid)
+        oid = team.claim(nested, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                         now=int(time.time()) - 100).oid
+    for _ in range(2):
+        args = ["renew", "docs", "--expect", oid] if action == "renew" else ["gc"]
+        code = main([*base, *args, "--json"])
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert (code, captured.err, payload["scope"]["workspace"]) == (0, "", str(nested))
+        if action == "renew":
+            assert payload["status"] == "renewed" and payload["oid"] != oid
+            oid = payload["oid"]
+            assert _ref(repository, "docs") == oid
+        else:
+            assert _ref(repository, "docs") is None
+    assert not (nested / ".git").exists()
+    assert not (nested / "aegis-lease-scratch").exists()
+    assert (common / "aegis-lease-scratch").is_dir()
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+def test_nested_workspace_replacement_during_discovery_refuses_and_retries(
+        ws, capsys, monkeypatch, action, backend):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    nested, moved, discarded = (ws / name for name in ("nested", "held-nested", "replacement"))
+    (nested / ".aegis" / "rules").mkdir(parents=True)
+    old = team.claim(nested, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    original = gitsafe.run
+    changed = []
+
+    def discover(argv, cwd, **kwargs):
+        result = original(argv, cwd, **kwargs)
+        if "--show-toplevel" in argv and not changed:
+            assert kwargs["stdin"] is None
+            nested.rename(moved)
+            (nested / ".aegis" / "rules").mkdir(parents=True)
+            changed.append(True)
+        return result
+
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": discover}))
+    args = ["renew", "docs", "--expect", old.oid] if action == "renew" else ["gc"]
+    try:
+        code = main(["--workspace", str(nested), "team", *args, "--json"])
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert (code, payload["reason"], payload["message"], captured.err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert changed and _ref(ws, "docs") == old.oid
+    finally:
+        if changed:
+            nested.rename(discarded)
+            moved.rename(nested)
+    assert main(["--workspace", str(nested), "team", *args, "--json"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+@pytest.mark.parametrize("failure", ["timeout", "oversized", "relative", "multiline"])
+def test_lease_repository_discovery_refuses_bad_evidence_and_retries(
+        ws, capsys, monkeypatch, backend, failure):
+    from types import SimpleNamespace
+    from aegis_core import gitsafe
+
+    if backend == "descriptor" and not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    if backend == "pathname":
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main")
+    original = gitsafe.run
+
+    def discover(argv, cwd, **kwargs):
+        if "--show-toplevel" not in argv:
+            return original(argv, cwd, **kwargs)
+        assert kwargs["stdin"] is None
+        if failure == "timeout":
+            raise gitsafe.GitError("private-discovery-marker", code="git_timeout")
+        result = original(argv, cwd, **kwargs)
+        fields = result.stdout.splitlines()
+        fields[0] = {"oversized": b"/" + b"x" * 16384, "relative": b"relative",
+                     "multiline": b"/private-discovery-marker\n/another"}[failure]
+        return subprocess.CompletedProcess(argv, 0, b"\n".join(fields) + b"\n", b"")
+
+    monkeypatch.setattr(team_lease_custody, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "run": discover}))
+    for _ in range(2):
+        code, payload, err = _json(capsys, "renew", "docs", "--expect", old.oid)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(ws, "docs") == old.oid
+    monkeypatch.setattr(team_lease_custody, "gitsafe", gitsafe)
+    assert _json(capsys, "renew", "docs", "--expect", old.oid)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("bad", ["file", "symlink", "owner", "mode"])
+def test_pathname_lease_scratch_refuses_bad_entries_and_retries(ws, capsys, monkeypatch, action, bad):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    if bad == "mode" and os.name != "posix":
+        pytest.skip("POSIX permission modes are unavailable")
+    if bad == "owner" and not hasattr(os, "geteuid"):
+        pytest.skip("numeric owner identity is unavailable")
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    scratch, outside = ws / ".git" / "aegis-lease-scratch", ws.parent / "outside"
+    outside.mkdir()
+    if bad == "file":
+        scratch.write_bytes(b"private-scratch-marker")
+    elif bad == "symlink":
+        symlink_or_skip(outside, scratch, target_is_directory=True)
+    else:
+        scratch.mkdir(mode=0o700)
+        if bad == "mode":
+            scratch.chmod(0o755)
+
+    def info(path, **kwargs):
+        result = os.stat(path, **kwargs)
+        if bad == "owner" and os.fspath(path) == str(scratch):
+            return SimpleNamespace(st_dev=result.st_dev, st_ino=result.st_ino,
+                                   st_mode=result.st_mode, st_uid=result.st_uid + 1)
+        return result
+
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(stat=info))
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    for _ in range(2):
+        code, payload, err = _json(capsys, *args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(ws, "docs") == old.oid
+    monkeypatch.setattr(team_lease_custody, "os", os)
+    assert list(outside.iterdir()) == []
+    if bad in ("file", "symlink"):
+        scratch.unlink()
+    else:
+        scratch.chmod(0o700)
+    assert _json(capsys, *args)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_pathname_repository_identity_change_refuses_and_retries(ws, capsys, monkeypatch, action):
+    from aegis_core import gitsafe
+
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    other = ws.parent / "other-repository"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    _git(other, "commit", "--allow-empty", "-q", "-m", "other")
+    old = team.claim(ws, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=int(time.time()) - 100)
+    data = gitsafe.read_object(ws, old.oid, team.MAX_LEASE_BYTES)
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(other), input=data,
+                         capture_output=True, check=True).stdout.decode().strip()
+    assert oid == old.oid
+    _git(other, "update-ref", team.lane_ref("docs"), oid)
+    original = team.lease_branch_evidence
+    held = ws.parent / "held.git"
+    changed = []
+
+    def preflight(*args, **kwargs):
+        result = original(*args, **kwargs)
+        (ws / ".git").rename(held)
+        (other / ".git").rename(ws / ".git")
+        changed.append(True)
+        return result
+
+    monkeypatch.setattr(team, "lease_branch_evidence", preflight)
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    try:
+        code, payload, err = _json(capsys, *args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+    finally:
+        if changed:
+            (ws / ".git").rename(other / ".git")
+            held.rename(ws / ".git")
+    monkeypatch.setattr(team, "lease_branch_evidence", original)
+    assert _ref(ws, "docs") == _ref(other, "docs") == old.oid
+    assert _json(capsys, *args)[0] == 0
+    assert _ref(other, "docs") == old.oid
