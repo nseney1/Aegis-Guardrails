@@ -7,11 +7,12 @@ from aegis_cli import doctor_git_report as report
 
 MAX_HEAVY, PEAK_BYTES, RESERVE_BYTES, LARGE_BYTES, MAX_DEPTH, MAX_ENTRIES, PROBE = (
     3, 8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024, 50 * 1024 * 1024, 3, 256, "aegis-doctor-probe")
-_SCRATCH_CODES = frozenset({"scratch_unusable", "multiline_refused", "value_too_long"})
 _confined, _scandir = confined_file, os.scandir
 _HELD = contextvars.ContextVar("aegis_doctor_held", default=None)
 SCRATCH = contextvars.ContextVar("aegis_doctor_scratch", default=None)
 _OVERFLOW = object()
+# Selection and both containment checks share a scratch-to-root step bound.
+_ANCESTRY_LIMIT = report.VALUE_MAX
 __all__ = [
     'descriptor_support',
     'SCRATCH',
@@ -67,16 +68,18 @@ def _private_dir(info):
 def _acl_free(fd):
     if sys.platform != "linux" or not callable(getattr(os, "getxattr", None)): return False
     for name in ("system.posix_acl_access", "system.posix_acl_default"):
-        try: os.getxattr(fd, name)
+        try: value = os.getxattr(fd, name)
         except (OSError, ValueError, NotImplementedError) as exc:
             if getattr(exc, "errno", None) == errno.ENODATA: continue
+            raise ConfinedFileError("io") from None
+        if not isinstance(value, bytes): raise ConfinedFileError("io")
         return False
     return True
 
 def _inside_root(link, root):
     root_id, seen, current = _stat_pair(root), set(), link
     if root_id is None: return True
-    for _step in range(64):
+    for _step in range(_ANCESTRY_LIMIT):
         ident = _stat_pair(current)
         if ident is None or ident in seen or ident == root_id: return True
         seen.add(ident)
@@ -85,18 +88,44 @@ def _inside_root(link, root):
         current += "/.."
     return True
 
+def _held_inside_root(root, fd, top):
+    """Check held ancestry without depending on procfs or ACL support."""
+    try:
+        root_id = _stat_pair(root)
+        if root_id is None or top is None: raise ConfinedFileError("io")
+        seen = set()
+        for step in range(_ANCESTRY_LIMIT):
+            info = os.fstat(fd) if step == 0 else os.stat(
+                "/".join(("..",) * step), dir_fd=fd, follow_symlinks=False)
+            ident = (info.st_dev, info.st_ino)
+            if ident == root_id: return True
+            if ident == top: return False
+            if ident in seen: break
+            seen.add(ident)
+    except (OSError, ValueError, NotImplementedError):
+        raise ConfinedFileError("io") from None
+    raise ConfinedFileError("io")
+
 def _scratch_ok(root, fd, dev, ino):
     if not isinstance(fd, int) or isinstance(fd, bool): return None
     try: info = os.fstat(fd)
-    except OSError: return None
+    except OSError: raise ConfinedFileError("io") from None
     if (info.st_dev, info.st_ino) != (dev, ino) or not stat.S_ISDIR(info.st_mode): return None
-    if not _private_dir(info) or not _acl_free(fd) or any(_stat_pair(path) == (dev, ino) for path in ("/", "/tmp", "/var/tmp")): return None
+    if not _private_dir(info): return None
+    shared = tuple(_stat_pair(path) for path in ("/", "/tmp", "/var/tmp"))
+    if (dev, ino) in shared or _held_inside_root(root, fd, shared[0]): return None
+    if (sys.platform != "linux" or not callable(getattr(os, "getxattr", None))
+            or not os.path.isdir("/proc/self/fd")):
+        raise ConfinedFileError("unsupported")
+    if not _acl_free(fd): return None
     link = _bind_fd(fd, dev, ino)
-    if link is None or _inside_root(link, root): return None
+    if link is None: raise ConfinedFileError("io")
+    if _inside_root(link, root): return None
     if not os.access(link, os.W_OK | os.X_OK, effective_ids=True): return None
     return link
 
 def _scratch_bad(code):
+    code = report.scratch_refusal(code)[0]
     return types.SimpleNamespace(path=None, fd=None, dev=None, ino=None, code=code, shown=None, owned=False, bind=None)
 
 def _hold_scratch(path):
@@ -115,21 +144,34 @@ def _hold_scratch(path):
 
 def validated_scratch(root):
     kind, value = _scratch_choice()
-    if kind != "path": return _scratch_bad(value if value in _SCRATCH_CODES else "scratch_unusable")
-    if not descriptor_support(): return _scratch_bad("scratch_unknown")
+    if kind != "path": return _scratch_bad("scratch_unsafe")
+    shown, refused = report.display(value)
+    if refused or not shown: return _scratch_bad("scratch_unsafe")
+    if not descriptor_support(): return _scratch_bad("scratch_unsupported")
     try: fd, dev, ino = _hold_scratch(value)
-    except (ConfinedFileError, OSError, ValueError): return _scratch_bad("scratch_unknown")
+    except (ConfinedFileError, OSError, ValueError, NotImplementedError) as exc:
+        return _scratch_bad(_scratch_error(exc))
     accepted = False
     try:
         bind = _scratch_ok(root, fd, dev, ino)
-        shown, refused = report.display(value)
-        if not isinstance(bind, str) or refused or not shown: return _scratch_bad(refused or "scratch_unknown")
+        if not isinstance(bind, str): return _scratch_bad("scratch_unsafe")
         accepted = True
         return types.SimpleNamespace(path=value, fd=fd, dev=dev, ino=ino, code=None, shown=shown, owned=True, bind=bind)
-    except (OSError, ValueError, NotImplementedError):
-        return _scratch_bad("scratch_unknown")
+    except (OSError, ValueError, NotImplementedError) as exc:
+        return _scratch_bad(_scratch_error(exc))
     finally:
         if not accepted: close_fd(fd)
+
+def _scratch_error(exc):
+    reason = getattr(exc, "reason", None)
+    number = getattr(exc, "errno", None)
+    if reason == "missing" or number == errno.ENOENT:
+        return "scratch_missing"
+    if reason in ("unsafe", "invalid_path") or number in (errno.ELOOP, errno.ENOTDIR):
+        return "scratch_unsafe"
+    # Confined helpers deliberately discard OS errno for generic I/O refusals.
+    # That cannot establish a safety violation; keep the advice neutral.
+    return "scratch_unsupported"
 
 def use_scratch(root):
     bound = SCRATCH.get()
@@ -195,15 +237,15 @@ def _scratch_choice():
         path = str(Path(selected) / ".cache" / "aegis")
     if len(path) > report.VALUE_MAX or "\n" in path or "\r" in path or "\x00" in path:
         return ("code", "multiline_refused" if "\n" in path or "\r" in path or "\x00" in path else "value_too_long")
-    if not os.path.isabs(path) or ".." in Path(path).parts:
+    parts = Path(path).parts
+    if not os.path.isabs(path) or ".." in parts or len(parts) > _ANCESTRY_LIMIT:
         return ("code", "scratch_unusable")
     return ("path", path)
 
 def scratch_rows(rows, disk, scratch):
     if scratch.code:
-        unknown = scratch.code == "scratch_unknown"
-        detail = "scratch location is unknown" if unknown else "scratch location was refused"
-        rows.append(report.row("scratch", "warn", scratch.code, report.SCRATCH_ACT, detail))
+        code, action, detail = report.scratch_refusal(scratch.code)
+        rows.append(report.row("scratch", "warn", code, action, detail))
         return
     disk["scratch"] = scratch.shown
     rows.append(report.row("scratch", "pass", "scratch_outside", report.NONE, "scratch is outside the workspace"))
@@ -220,8 +262,9 @@ class _Snap:
         self.size = size
 
 class _Bad:
-    def __init__(self, code):
+    def __init__(self, code, name=None):
         self.code = code
+        self.name = name
 
 def _held_descriptor():
     fd = getattr(_HELD.get(), "_parent", None)
@@ -252,12 +295,13 @@ def _snapshot(entry):
     if fd is None:
         return entry
     name = getattr(entry, "name", None)
-    if not isinstance(name, str):
-        return _Bad("value_too_long")
+    _shown, code = _entry_name(entry)
+    if code:
+        return _Bad(code, name if isinstance(name, str) else None)
     try:
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except OSError:
-        return _Bad("unreadable_path")
+        return _Bad("unreadable_path", name)
     return _Snap(name, info.st_mode, info.st_size)
 
 def _list_checked(root, parts, limit):
@@ -301,12 +345,14 @@ def _entry_name(entry):
     name = getattr(entry, "name", None)
     if not isinstance(name, str) or not 1 <= len(name) <= 255:
         return None, "value_too_long"
-    if name in (".", "..") or any(char in name for char in ("/", "\\", "\x00", "\n", "\r")):
+    if name in (".", "..") or any(char in name for char in ("/", "\\")) or any(char in report.LINE_BREAKS for char in name):
         return None, "multiline_refused"
-    shown, code = report.display(name)
-    return (report.digest(name) if shown and shown != name else shown), code
+    return name, None
 
-def _path_refusal(code, label):
+def _entry_parts(parts, name):
+    return parts + (name,) if isinstance(name, str) else parts
+
+def _path_refusal(code, parts):
     action = {
         "path_changed": report.RETRY, "scan_capped": report.INSPECT, "depth_capped": report.INSPECT, "symlink_refused": report.NO_FOLLOW,
         "descriptor_unsupported": report.PLATFORM, "unreadable_path": report.INSPECT,
@@ -322,54 +368,58 @@ def _path_refusal(code, label):
         "multiline_refused": "a directory entry was refused",
         "value_too_long": "a directory entry was refused",
     }.get(code, "a path was refused")
-    if label and label != "workspace":
-        shown, refused = report.display(str(label))
-        if refused is None and shown:
-            detail = f"{detail} ({shown})"
+    if parts:
+        shown = report.location(parts, prefix=detail + " (", suffix=")")
+        detail = f"{detail} ({shown})"
     return report.row("disk_walk", "warn", code, action, detail)
 
-def _file_rows(root, parts, name, shown, mode, size, rows, state, depth):
+def _file_rows(root, parts, name, mode, size, rows, state, depth):
+    location = parts + (name,)
     if stat.S_ISLNK(mode):
+        shown = report.location(location, prefix="symlink ", suffix=" was not followed")
         rows.append(report.row("disk_walk", "warn", "symlink_refused", report.NO_FOLLOW, f"symlink {shown} was not followed"))
         return
     limit = LARGE_BYTES if isinstance(LARGE_BYTES, int) and not isinstance(LARGE_BYTES, bool) else 1
     if stat.S_ISREG(mode) and size >= limit:
+        shown = report.location(location, prefix="large file ")
         rows.append(report.row("disk_walk", "warn", "large_path", report.NO_DELETE, f"large file {shown}"))
         return
     depth_limit = MAX_DEPTH if isinstance(MAX_DEPTH, int) and not isinstance(MAX_DEPTH, bool) else 1
     if stat.S_ISDIR(mode):
         if depth + 1 >= depth_limit or state["capped"]:
-            rows.append(_path_refusal("depth_capped" if depth + 1 >= depth_limit else "scan_capped", shown))
+            rows.append(_path_refusal("depth_capped" if depth + 1 >= depth_limit else "scan_capped", location))
         else:
-            _walk_dir(root, parts + (name,), rows, state, depth + 1, shown)
+            _walk_dir(root, location, rows, state, depth + 1)
 
 def _consider(root, parts, entry, rows, state, depth):
     if isinstance(entry, _Bad):
-        rows.append(_path_refusal(entry.code, "workspace"))
+        rows.append(_path_refusal(entry.code, _entry_parts(parts, entry.name)))
         return
     shown, code = _entry_name(entry)
     if code or not shown:
-        rows.append(_path_refusal(code or "value_too_long", "workspace"))
+        rows.append(_path_refusal(code or "value_too_long", _entry_parts(parts, getattr(entry, "name", None))))
         return
+    location = parts + (entry.name,)
     if isinstance(entry, _Snap):
-        _file_rows(root, parts, entry.name, shown, entry.mode, entry.size, rows, state, depth)
+        _file_rows(root, parts, entry.name, entry.mode, entry.size, rows, state, depth)
         return
     try:
         linked = bool(entry.is_symlink())
     except OSError:
-        rows.append(_path_refusal("unreadable_path", shown))
+        rows.append(_path_refusal("unreadable_path", location))
         return
     if linked:
+        shown = report.location(location, prefix="symlink ", suffix=" was not followed")
         rows.append(report.row("disk_walk", "warn", "symlink_refused", report.NO_FOLLOW, f"symlink {shown} was not followed"))
         return
     try:
         info = entry.stat(follow_symlinks=False)
     except OSError:
-        rows.append(_path_refusal("unreadable_path", shown))
+        rows.append(_path_refusal("unreadable_path", location))
         return
-    _file_rows(root, parts, entry.name, shown, info.st_mode, info.st_size, rows, state, depth)
+    _file_rows(root, parts, entry.name, info.st_mode, info.st_size, rows, state, depth)
 
-def _walk_dir(root, parts, rows, state, depth, label):
+def _walk_dir(root, parts, rows, state, depth):
     if state["capped"]: return
     cap = _entry_cap()
     if state["entries"] + state["hold"] >= cap:
@@ -379,19 +429,19 @@ def _walk_dir(root, parts, rows, state, depth, label):
             except ConfinedFileError as exc: probe = exc
         if probe:
             state["capped"] = True
-            rows.append(_path_refusal(probe if isinstance(probe, str) else "scan_capped" if isinstance(probe, list) else _confined_code(probe), label))
+            rows.append(_path_refusal(probe if isinstance(probe, str) else "scan_capped" if isinstance(probe, list) else _confined_code(probe), parts))
         return
     remaining = cap - state["entries"] - state["hold"]
     state["hold"] += remaining
     try:
         listed = _list_checked(root, parts, remaining)
     except ConfinedFileError as exc:
-        rows.append(_path_refusal(_confined_code(exc), label))
+        rows.append(_path_refusal(_confined_code(exc), parts))
         return
     finally:
         state["hold"] -= remaining
     if isinstance(listed, str):
-        rows.append(_path_refusal(listed, label))
+        rows.append(_path_refusal(listed, parts))
         return
     body, overflow = [], False
     for entry in listed:
@@ -404,7 +454,7 @@ def _walk_dir(root, parts, rows, state, depth, label):
         for entry in body:
             if state["entries"] >= cap:
                 if not state["capped"]:
-                    state["capped"] = True; rows.append(_path_refusal("scan_capped", label))
+                    state["capped"] = True; rows.append(_path_refusal("scan_capped", parts))
                 return
             state["hold"] -= 1
             local -= 1
@@ -412,7 +462,7 @@ def _walk_dir(root, parts, rows, state, depth, label):
             _consider(root, parts, entry, rows, state, depth)
         if overflow and not state["capped"]:
             state["capped"] = True
-            rows.append(_path_refusal("scan_capped", label))
+            rows.append(_path_refusal("scan_capped", parts))
     finally:
         state["hold"] -= local
 
@@ -424,4 +474,4 @@ def walk(root, rows):
     if not descriptor_support():
         rows.append(report.row("disk_walk", "warn", "descriptor_unsupported", report.PLATFORM, "untrusted paths were not opened"))
         return
-    _walk_dir(root, (), rows, {"entries": 0, "capped": False, "hold": 0}, 0, "workspace")
+    _walk_dir(root, (), rows, {"entries": 0, "capped": False, "hold": 0}, 0)
