@@ -1090,7 +1090,8 @@ def test_introduced_valid_policy_only_adds_owner_review_to_legacy_report(repo):
     repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "signature"}}))
     repo.commit("introduce map")
     result = rule_integrity.check_ci(repo.root, base, target="main").as_dict()
-    rows = result.pop("owner_review_required")
+    assert "owner_review_required" not in result
+    rows = result.pop("owner_review_findings")
     assert [row["code"] for row in rows] == ["approval_policy_introduced"]
     for document in (baseline, result):
         document.pop("checked_at")

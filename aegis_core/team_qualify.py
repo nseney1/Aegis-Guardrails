@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 import json
 import re
 
-from aegis_core import approval_shape, gitsafe, team_git, team_gitops
+from aegis_core import approval_shape, gitsafe, gitops_fds, team_git, team_gitops
 from aegis_core.primitives import sanitize_display, strict_loads
 from aegis_core.redaction import redact_command_secrets
 
@@ -65,7 +65,8 @@ class QualificationResult:
 
 
 def descriptor_supported():
-    return team_git.descriptor_support() and team_gitops.descriptor_supported()
+    return (team_git.descriptor_support() and team_gitops.descriptor_supported()
+            and gitops_fds.descriptor_supported())
 
 
 def _oid(value):
@@ -131,7 +132,7 @@ def _ref(store, ref):
     return oid
 
 
-def _record(store, oid, tree, leg):
+def _record(store, oid, tree, leg, *, validated_sources=None):
     record_tree, parents, body = _commit(store, oid, MAX_RECORD_COMMIT_BYTES)
     if len(body) > MAX_RECORD_BYTES or len(parents) != 1:
         raise QualificationError("invalid_record")
@@ -140,7 +141,10 @@ def _record(store, oid, tree, leg):
         raise QualificationError("invalid_record")
     item = QualificationResult(**{key: row[key] for key in _KEYS - {"v"}})
     _valid_result(item)
-    _commit(store, item.source_commit)
+    if validated_sources is None or item.source_commit not in validated_sources:
+        _commit(store, item.source_commit)
+        if validated_sources is not None:
+            validated_sources.add(item.source_commit)
     if record_tree != tree or item.tree != tree or item.leg != leg:
         raise QualificationError("invalid_record")
     return item
@@ -160,21 +164,15 @@ def qualified(store, tree, legs):
         refs = [qualification_ref(tree, leg) for leg in legs]
         if len(set(refs)) != len(refs):
             return False
+        validated_sources = set()  # Immutable commits; successful reads in this call only.
         for leg, ref in zip(legs, refs):
             oid = _ref(store, ref)
             if oid is None:
                 return False
-            _record(store, oid, tree, leg)
+            _record(store, oid, tree, leg, validated_sources=validated_sources)
         return True
     except (QualificationError, gitsafe.GitError, OSError, ValueError, UnicodeError, RecursionError):
         return False
-
-
-def _observed_result(store, journal, request_id, ref, expected, new, receipt=None):
-    observed = _ref(store, ref)
-    status = "done" if observed == new else "not_applied" if observed == expected else "unknown"
-    journal.record_result(request_id, status, observed, receipt=receipt)
-    return observed
 
 
 def record_pass(store, result, *, expected, identity, journal, lane, request_id, actor):
@@ -185,6 +183,11 @@ def record_pass(store, result, *, expected, identity, journal, lane, request_id,
     effects have a journal intent first and an observed result afterwards. Reusing
     a request observes its first attempt and never calls CAS again. A failed result
     append leaves an open intent for GitOpsJournal.reconcile, not another effect.
+    Indeterminate transport failures also leave the intent open: surviving holders
+    retain the receipt lock until their descendants exit, then reconciliation owns
+    a fresh lock before observing the ref. Never terminalize through the owner copy.
+    Successful CAS returns require that same fresh-lock observation: an already
+    acknowledgment can hide a transport failure while its holder still lives.
     Git refusals retain the fixed codes listed in REFUSALS; others map to git_failed.
     """
     _valid_result(result)
@@ -215,25 +218,38 @@ def record_pass(store, result, *, expected, identity, journal, lane, request_id,
                 # Reconcile owns its own effect lock and skips active writers.
                 # Calling record_result directly here could close another
                 # thread's in-flight request before that thread performs CAS.
-                journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref))
-                                  if intent["request_id"] == request_id else None)
+                rows = journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref)),
+                                         request_id=request_id)
                 # A terminal done row remains valid even after a newer record.
-                rows = journal.read().rows
-                if any(row["kind"] == "result" and row["request_id"] == request_id
+                if not rows:
+                    rows = journal.read().rows
+                if any(row["kind"] in ("result", "tombstone") and row["request_id"] == request_id
                        and row["status"] == "done" for row in rows):
                     return "already"
                 raise QualificationError("request_closed")
+            failure = None
             try:
-                status = team_git.cas_fast_forward(store, ref, expected, new)
+                status = team_git.cas_fast_forward(store, ref, expected, new,
+                                                   effect_fds=receipt.inheritable_fds())
             except gitsafe.GitError as exc:
-                observed = _observed_result(store, journal, request_id, ref, expected, new, receipt)
-                if observed == new:
-                    return "already"
-                code = exc.code if exc.code in REFUSALS else "git_failed"
-                raise QualificationError(code) from None
-            if _observed_result(store, journal, request_id, ref, expected, new, receipt) != new:
-                raise QualificationError("cas_mismatch")
-            return status
+                if exc.code in ("ref_update_unknown", "git_cleanup_failed", "git_timeout", "git_output_limit"):
+                    # The owner receipt cannot prove that its inheriting holder
+                    # exited. Only reconcile's independent lock can establish it.
+                    raise QualificationError("ref_update_unknown") from None
+                failure = exc.code if exc.code in REFUSALS else "git_failed"
+            # Neither a return nor a refusal proves every holder exited. Drop
+            # only the owner's copy, then re-observe under an independent lock.
+            receipt.close()
+            rows = journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref)),
+                                     request_id=request_id)
+            terminal = next((row for row in (rows or journal.read().rows)
+                             if row["kind"] in ("result", "tombstone")
+                             and row["request_id"] == request_id), None)
+            if terminal is None:
+                raise QualificationError("ref_update_unknown") from None
+            if terminal["status"] == "done":
+                return "already" if failure is not None else status
+            raise QualificationError(failure or "cas_mismatch") from None
     except QualificationError:
         raise
     except team_gitops.GitOpsError:

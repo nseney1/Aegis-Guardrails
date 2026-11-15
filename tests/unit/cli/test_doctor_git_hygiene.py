@@ -30,6 +30,13 @@ REPO = Path(__file__).resolve().parents[3]
 DOCTOR_GIT_MODULES = ("doctor_git.py", "doctor_git_observe.py", "doctor_git_report.py")
 
 
+def _custody_supported():
+    return (sys.platform == "linux"
+            and callable(getattr(doctor_git_observe.os, "getxattr", None))
+            and doctor_git_observe.descriptor_support()
+            and os.path.isdir("/proc/self/fd"))
+
+
 @pytest.fixture(autouse=True)
 def acl_lookup_boundary(monkeypatch):
     def absent(fd, name):
@@ -139,6 +146,696 @@ def _clean_seams():
         "_leases": lambda root: team.LeaseSet((), ()),
         "_refs": lambda root, prefix: [],
     }
+
+
+@pytest.mark.parametrize("reason,code,advice", [
+    ("missing", "scratch_missing", "create"),
+    ("unsafe", "scratch_unsafe", "private"),
+    ("unsupported", "scratch_unsupported", "primitives"),
+])
+def test_collect_names_scratch_prerequisite_without_running_git(tmp_path, monkeypatch, reason, code, advice):
+    _quiet_tree(monkeypatch)
+    calls = []
+
+    def hold(path):
+        raise doctor_git_observe.ConfinedFileError(reason)
+
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", hold)
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: calls.append(args))
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    presence = next(row for row in report["rows"] if row["id"] == "git_presence")
+    assert presence["code"] == code
+    assert presence["detail"] == "Git inspection was not run: " + {
+        "missing": "scratch directory is missing",
+        "unsafe": "scratch directory is unsafe",
+        "unsupported": "scratch access or required primitives are unavailable",
+    }[reason]
+    assert advice in presence["owner_action"]
+    assert "retry aegis doctor" not in presence["owner_action"]
+    assert next(row for row in report["rows"] if row["id"] == "scratch")["code"] == code
+    assert calls == []
+    assert "/var/empty" not in _blob(report)
+    _assert_rows(report)
+
+
+def test_collect_unavailable_scratch_probe_never_acquires_or_runs_git(tmp_path, monkeypatch):
+    _quiet_tree(monkeypatch)
+    calls = []
+    monkeypatch.setattr(doctor_git_observe, "descriptor_support", lambda: False)
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", lambda path: calls.append(path))
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: calls.append(args))
+    report = doctor_git.collect(tmp_path, tier="B", now=10)
+    assert _row(report, "scratch_unsupported")["detail"].startswith("Git inspection was not run")
+    assert calls == []
+
+
+def test_collect_scratch_repair_retries_and_preserves_genuine_git_failure(tmp_path, monkeypatch):
+    if not _custody_supported():
+        pytest.skip("scratch descriptors unsupported")
+    outside = _outside_dir(tmp_path, "repair-")
+    missing = outside / "private"
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(missing)})
+    calls = []
+
+    def invoke(args, root):
+        assert gitsafe_run.custody_active()
+        calls.append(args)
+        raise gitsafe.GitError("password=do-not-echo", code="git_failed")
+
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    before = set(os.listdir("/proc/self/fd"))
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert "scratch_missing" in _codes(report) and calls == []
+    missing.mkdir(mode=0o777)
+    missing.chmod(0o777)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert "scratch_unsafe" in _codes(report) and calls == []
+    missing.chmod(0o700)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert len(calls) == 1
+    assert _row(report, "git_failed")["owner_action"] == doctor_git_report.RETRY
+    assert "Git inspection was not run" not in _blob(report)
+    assert "do-not-echo" not in _blob(report)
+    assert before == set(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.parametrize("capability", ["platform", "missing_acl", "acl_unavailable"])
+@pytest.mark.parametrize("target", ["inside", "double_inside", "shared_root", "display_refused", "outside"])
+def test_collect_known_scratch_safety_precedes_unavailable_capability(tmp_path, monkeypatch, capability, target):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch directory descriptors unsupported")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    scratch = workspace / "scratch"
+    scratch.mkdir(mode=0o700)
+    outside = _outside_dir(tmp_path, "capability-")
+    raw = str(scratch)
+    if target == "double_inside":
+        raw = "/" + os.path.abspath(scratch)
+    elif target == "shared_root":
+        raw = "/"
+    elif target in ("display_refused", "outside"):
+        raw = str(outside)
+
+    def unavailable(fd, name):
+        raise OSError(errno.ENOTSUP, "private-capability-detail")
+
+    if capability == "platform":
+        monkeypatch.setattr(doctor_git_observe, "sys", types.SimpleNamespace(platform="darwin"))
+    acl = (None if capability == "missing_acl" else unavailable if capability == "acl_unavailable"
+           else doctor_git_observe.os.getxattr)
+    owner = os.stat("/").st_uid if target == "shared_root" else os.geteuid()
+    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(**{
+        **vars(os), "getxattr": acl, "geteuid": lambda: owner}))
+    if target == "display_refused":
+        display = doctor_git_report.display
+        monkeypatch.setattr(doctor_git_report, "display", lambda text, **kwargs: (
+            (None, "multiline_refused") if text == raw else display(text, **kwargs)))
+    invoked = []
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": raw})
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: invoked.append(args))
+    for _attempt in range(2):
+        report = doctor_git.collect(workspace, tier="A", now=10)
+        rows = [row for row in report["rows"] if row["id"] in ("git_presence", "scratch")]
+        expected = "scratch_unsupported" if target == "outside" else "scratch_unsafe"
+        assert [row["code"] for row in rows] == [expected, expected]
+        assert rows[0]["owner_action"] == rows[1]["owner_action"]
+        assert "Git inspection was not run" in rows[0]["detail"]
+        assert invoked == [] and "private-capability-detail" not in _blob(report)
+
+
+@pytest.mark.parametrize("depth", ["over64", "maximum"])
+@pytest.mark.parametrize("acl", ["available", "missing", "unavailable"])
+@pytest.mark.parametrize("inside", [True, False])
+def test_collect_deep_scratch_containment(tmp_path, monkeypatch, depth, acl, inside):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch directory descriptors unsupported")
+    if not inside and acl == "available" and not _custody_supported():
+        pytest.skip("scratch custody unsupported")
+    workspace = tmp_path / "repo"
+    workspace.mkdir(mode=0o700)
+    base = workspace if inside else tmp_path / "outside"
+    count = 65 if depth == "over64" else (doctor_git_report.VALUE_MAX - len(str(base))) // 2
+    assert count > 64
+    scratch = base.joinpath(*("d" for _ in range(count)))
+    scratch.mkdir(parents=True, mode=0o700)
+    assert len(str(scratch)) <= doctor_git_report.VALUE_MAX
+
+    def unavailable(fd, name):
+        raise OSError(errno.ENOTSUP, "private-acl-detail")
+
+    lookup = (None if acl == "missing" else unavailable if acl == "unavailable"
+              else doctor_git_observe.os.getxattr)
+    monkeypatch.setattr(doctor_git_observe, "os", types.SimpleNamespace(**{
+        **vars(doctor_git_observe.os), "getxattr": lookup}))
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
+    hold, acquired, invoked = doctor_git_observe._hold_scratch, [], []
+
+    def acquire(path):
+        held = hold(path)
+        acquired.append(held[0])
+        return held
+
+    def invoke(*args):
+        assert gitsafe_run.custody_active()
+        invoked.append(args)
+        raise gitsafe.GitError("fixed failure", code="git_failed")
+
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", acquire)
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    for _attempt in range(2):
+        report = doctor_git.collect(workspace, tier="A", now=10)
+        if inside or acl != "available":
+            expected = "scratch_unsafe" if inside else "scratch_unsupported"
+            rows = [row for row in report["rows"] if row["id"] in ("git_presence", "scratch")]
+            assert [row["code"] for row in rows] == [expected, expected]
+            assert rows[0]["owner_action"] == doctor_git_report.scratch_refusal(expected)[1]
+            assert rows[0]["owner_action"] == rows[1]["owner_action"]
+            assert rows[0]["detail"].startswith("Git inspection was not run")
+            assert invoked == []
+        else:
+            assert "scratch_outside" in _codes(report)
+            assert _row(report, "git_failed")["owner_action"] == doctor_git_report.RETRY
+            assert report["disk"]["free"] is not None
+            assert len(invoked) == _attempt + 1
+        assert "private-acl-detail" not in _blob(report)
+        assert len(acquired) == _attempt + 1
+        with pytest.raises(OSError) as error:
+            os.fstat(acquired[-1])
+        assert error.value.errno == errno.EBADF
+        _assert_rows(report)
+
+
+@pytest.mark.parametrize("mode", [0o711, 0o111])
+def test_collect_search_only_workspace_ancestor(real_git_repo, mode):
+    if os.name != "posix":
+        pytest.skip("search-only directory modes require POSIX")
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses search-only ancestor permissions")
+    ancestor = real_git_repo.parent / "search-only"
+    ancestor.mkdir(mode=0o700)
+    workspace = ancestor / "repo"
+    real_git_repo.rename(workspace)
+    try:
+        ancestor.chmod(mode)
+        # Our UID owns this directory: 0711 is a readable control; 0111 gives
+        # the same search-only access a different UID receives from 0711.
+        if not mode & stat.S_IRUSR:
+            with pytest.raises(PermissionError) as error:
+                os.listdir(ancestor)
+            assert error.value.errno == errno.EACCES
+        for _attempt in range(2):
+            report = doctor_git.collect(workspace, tier="A", now=10)
+            assert report["git"]["present"] is True
+            assert "scratch_outside" in _codes(report)
+            assert "scratch_unsupported" not in _codes(report)
+            assert report["disk"]["free"] is not None
+            _assert_rows(report)
+    finally:
+        ancestor.chmod(0o700)
+
+
+def test_collect_held_scratch_stays_inside_after_ancestor_rename(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch directory descriptors unsupported")
+    workspace = tmp_path / "workspace"
+    ancestor = workspace / "ancestor"
+    scratch = ancestor / "scratch"
+    scratch.mkdir(parents=True, mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    symlink_or_skip(outside, tmp_path / "link-probe", target_is_directory=True)
+    hold = doctor_git_observe._hold_scratch
+    renamed = []
+
+    def acquire(path):
+        held = hold(path)
+        try:
+            ancestor.rename(workspace / "renamed")
+            symlink_or_skip(outside, ancestor, target_is_directory=True)
+        except BaseException:
+            doctor_git_observe.close_fd(held[0])
+            raise
+        renamed.append(held[0])
+        return held
+
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", acquire)
+    monkeypatch.setattr(doctor_git_observe, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
+    report = doctor_git.collect(workspace, tier="A", now=10)
+    assert _row(report, "scratch_unsafe")["detail"].startswith("Git inspection was not run")
+    assert len(renamed) == 1
+    with pytest.raises(OSError) as error:
+        os.fstat(renamed[0])
+    assert error.value.errno == errno.EBADF
+
+
+def test_collect_scratch_ancestry_failure_closes_and_retries(tmp_path, monkeypatch):
+    if not _custody_supported():
+        pytest.skip("scratch custody unsupported")
+    outside = _outside_dir(tmp_path, "ancestry-io-")
+    identity, hold = doctor_git_observe._stat_pair, doctor_git_observe._hold_scratch
+    acquired, invoked = [], []
+
+    def acquire(path):
+        held = hold(path)
+        acquired.append(held[0])
+        return held
+
+    def unavailable(path):
+        return None if path == tmp_path else identity(path)
+
+    def invoke(*args):
+        assert gitsafe_run.custody_active()
+        invoked.append(args)
+        raise gitsafe.GitError("fixed failure", code="git_failed")
+
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", acquire)
+    monkeypatch.setattr(doctor_git_observe, "_stat_pair", unavailable)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert "scratch_unsupported" in _codes(report) and invoked == []
+    assert len(acquired) == 1
+    with pytest.raises(OSError) as error:
+        os.fstat(acquired[0])
+    assert error.value.errno == errno.EBADF
+    monkeypatch.setattr(doctor_git_observe, "_stat_pair", identity)
+    retried = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert "scratch_outside" in _codes(retried)
+    assert _row(retried, "git_failed")["owner_action"] == doctor_git_report.RETRY
+    assert len(invoked) == 1 and len(acquired) == 2
+    with pytest.raises(OSError) as error:
+        os.fstat(acquired[1])
+    assert error.value.errno == errno.EBADF
+
+
+def test_concurrent_collect_keeps_scratch_refusal_categories_separate(tmp_path, monkeypatch):
+    _quiet_tree(monkeypatch)
+    reports = {}
+    errors = []
+    barrier = threading.Barrier(2, timeout=5)
+
+    def hold(path):
+        barrier.wait()
+        raise doctor_git_observe.ConfinedFileError(threading.current_thread().name)
+
+    def work():
+        try:
+            reports[threading.current_thread().name] = doctor_git.collect(tmp_path, tier="A", now=10)
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", hold)
+    threads = [threading.Thread(target=work, name=name) for name in ("missing", "unsafe")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    for reason, report in reports.items():
+        presence = next(row for row in report["rows"] if row["id"] == "git_presence")
+        assert presence["code"] == "scratch_" + reason
+    assert len(reports) == 2
+
+
+def test_disk_locations_keep_ancestors_redact_then_bound_without_extra_stat(tmp_path, monkeypatch):
+    secret = "ghp_" + "A" * 20
+    hidden = "ghp_\u202e" + "B" * 20
+    long_a, long_b = "a" * 200, "b" * 200
+    long_other = "a" * 199 + "z"
+    stats = []
+    tree = {
+        (): [(name, True) for name in ("alpha", "beta", secret, hidden, "con\x1btrol", long_a, long_other)],
+        (long_a,): [(long_b, True), ("blob.bin", False)],
+        (long_other,): [("blob.bin", False)],
+        (long_a, long_b): [("c" * 200, False), ("d" * 200, False)],
+    }
+    for parent in ("alpha", "beta", secret, hidden, "con\x1btrol"):
+        tree[(parent,)] = [("blob.bin", False)]
+
+    class Entry:
+        def __init__(self, parts, name, directory):
+            self.name, self.parts, self.directory = name, parts, directory
+
+        def is_symlink(self):
+            return False
+
+        def stat(self, follow_symlinks=True):
+            assert follow_symlinks is False
+            stats.append(self.parts + (self.name,))
+            return types.SimpleNamespace(st_mode=stat.S_IFDIR if self.directory else stat.S_IFREG, st_size=10 ** 9)
+
+    def listing(target):
+        parts = Path(target).relative_to(tmp_path).parts
+        return [Entry(parts, name, directory) for name, directory in tree.get(parts, [])]
+
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", listing)
+    monkeypatch.setattr(doctor_git, "_run_git", lambda root, args: "git_missing")
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    details = [row["detail"] for row in report["rows"] if row["code"] == "large_path"]
+    assert "large file alpha/blob.bin" in details
+    assert "large file beta/blob.bin" in details
+    assert len(details) == len(set(details)) == 9
+    assert any("ghp_REDACTED/blob.bin" in detail for detail in details)
+    assert "large file path " + doctor_git_report.digest("con\x1btrol/blob.bin") in details
+    assert len([detail for detail in details if "..." in detail]) == 2
+    assert len([detail for detail in details if detail.startswith("large file path ")]) == 4
+    assert all(len(detail) <= doctor_git.DISPLAY_MAX for detail in details)
+    assert secret not in _blob(report) and hidden not in _blob(report)
+    assert "\u202e" not in _blob(report) and "\x1b" not in _blob(report)
+    assert len(stats) == sum(len(entries) for entries in tree.values())
+    assert len(stats) == len(set(stats))
+    output = io.StringIO()
+    doctor_git_report.print_report(report, output)
+    assert all(detail in output.getvalue() for detail in details)
+
+
+def test_disk_nested_symlink_location_does_not_inspect_target(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("descriptor walk unsupported")
+    workspace = tmp_path / "workspace"
+    nested = workspace / "alpha"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "outside-secret.bin").write_bytes(b"x")
+    symlink_or_skip(outside, nested / "link")
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": "relative"})
+    report = doctor_git.collect(workspace, tier="A", now=10)
+    assert _row(report, "symlink_refused")["detail"] == "symlink alpha/link was not followed"
+    assert "outside-secret" not in _blob(report)
+
+
+def test_disk_disappearing_nested_entry_keeps_location_and_retries(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("descriptor walk unsupported")
+    workspace = tmp_path / "workspace"
+    nested = workspace / "alpha" / "beta"
+    nested.mkdir(parents=True)
+    leaf = nested / "gone.bin"
+    leaf.write_bytes(b"x")
+    info = nested.stat()
+    identity = (info.st_dev, info.st_ino)
+    removed = []
+
+    def listing(fd):
+        with os.scandir(fd) as entries:
+            captured = list(entries)
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) == identity and not removed:
+            leaf.unlink()
+            removed.append(True)
+        return captured
+
+    monkeypatch.setattr(doctor_git_observe, "_scandir", listing)
+    monkeypatch.setattr(doctor_git_observe, "LARGE_BYTES", 1)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": "relative"})
+    report = doctor_git.collect(workspace, tier="A", now=10)
+    assert _row(report, "unreadable_path")["detail"] == "a directory could not be read (alpha/beta/gone.bin)"
+    leaf.write_bytes(b"x")
+    retried = doctor_git.collect(workspace, tier="A", now=10)
+    assert "unreadable_path" not in _codes(retried)
+    assert _row(retried, "large_path")["detail"] == "large file alpha/beta/gone.bin"
+
+
+@pytest.mark.parametrize("name", ["bad\nname", "bad\u2028name"])
+def test_disk_refused_entry_has_opaque_location_without_metadata(tmp_path, monkeypatch, name):
+    class Entry:
+        def __init__(self):
+            self.name = name
+
+        def is_symlink(self):
+            pytest.fail("refused entry inspected")
+
+        def stat(self, **kwargs):
+            pytest.fail("refused entry measured")
+
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", lambda target: [Entry()])
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    detail = _row(report, "multiline_refused")["detail"]
+    assert detail == "a directory entry was refused (path " + doctor_git_report.digest(name) + ")"
+    assert name not in _blob(report)
+
+
+@pytest.mark.parametrize("kind", ["redacted", "opaque", "control", "truncated"])
+def test_collect_literal_alias_cannot_impersonate_generated_location(tmp_path, monkeypatch, kind):
+    import hashlib
+
+    if kind == "redacted":
+        parts = ("ghp_" + "A" * 20,)
+        token = hashlib.sha256(parts[0].encode()).hexdigest()[:12]
+        alias = "ghp_REDACTED [" + token + "]"
+    elif kind == "opaque":
+        parts = ("a" * 200, "b" * 200, "c" * 200)
+        token = hashlib.sha256("/".join(parts).encode()).hexdigest()[:12]
+        alias = "path " + token
+    elif kind == "control":
+        parts = ("con\x1btrol",)
+        token = hashlib.sha256(parts[0].encode()).hexdigest()[:12]
+        alias = "control [" + token + "]"
+    else:
+        parts = ("a" * 200,)
+        token = hashlib.sha256(parts[0].encode()).hexdigest()[:12]
+        alias = "a" * 78 + "... [" + token + "]"
+    tree = {parts[:-1]: [doctor_git_observe._Snap(parts[-1], stat.S_IFREG, 10 ** 9)]}
+    for depth in range(len(parts) - 1):
+        tree[parts[:depth]] = [doctor_git_observe._Snap(parts[depth], stat.S_IFDIR, 0)]
+    tree.setdefault((), []).append(doctor_git_observe._Snap(alias, stat.S_IFREG, 10 ** 9))
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", lambda target: tree.get(Path(target).relative_to(tmp_path).parts, []))
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    previous = None
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        details = [row["detail"] for row in report["rows"] if row["code"] == "large_path"]
+        assert len(details) == len(set(details)) == 2
+        assert "large file " + ("path " + token if kind == "control" else alias) in details
+        assert all(len(detail) <= doctor_git.DISPLAY_MAX for detail in details)
+        if previous is not None:
+            assert details == previous
+        previous = details
+        output = io.StringIO()
+        doctor_git_report.print_report(report, output)
+        assert all(detail in output.getvalue() for detail in details)
+
+
+def test_collect_controls_cannot_form_cross_component_secret_escape(tmp_path, monkeypatch):
+    ancestor, leaf = "\x1b]x", "password=\x07swordfish"
+    tree = {
+        (): [doctor_git_observe._Snap(ancestor, stat.S_IFDIR, 0)],
+        (ancestor,): [doctor_git_observe._Snap(leaf, stat.S_IFREG, 10 ** 9)],
+    }
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", lambda target: tree.get(Path(target).relative_to(tmp_path).parts, []))
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        output = io.StringIO()
+        doctor_git_report.print_report(report, output)
+        assert "swordfish" not in _blob(report)
+        assert "swordfish" not in output.getvalue()
+        assert _row(report, "large_path")["detail"] == "large file path " + doctor_git_report.digest(ancestor + "/" + leaf)
+
+
+@pytest.mark.parametrize("fault,expected", [
+    ("wrapped_enosys", "scratch_unsupported"),
+    ("wrapped_enotsup", "scratch_unsupported"),
+    ("direct_io", "scratch_unsupported"),
+    ("raw_io", "scratch_unsupported"),
+    ("unsafe", "scratch_unsafe"),
+    ("missing", "scratch_missing"),
+])
+def test_collect_held_scratch_io_failure_is_unavailable_without_git(tmp_path, monkeypatch, fault, expected):
+    hold = doctor_git_observe._hold_scratch
+    calls = []
+
+    @contextmanager
+    def failed(*args, **kwargs):
+        if args[0] == tmp_path:
+            yield types.SimpleNamespace()
+            return
+        if fault.startswith("wrapped_"):
+            try:
+                raise OSError(errno.ENOSYS if fault == "wrapped_enosys" else errno.ENOTSUP, "private-io-detail")
+            except OSError:
+                raise doctor_git_observe.ConfinedFileError("io") from None
+        if fault == "raw_io":
+            raise OSError("private-io-detail")
+        raise doctor_git_observe.ConfinedFileError("io" if fault == "direct_io" else fault)
+        yield
+
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", hold)
+    monkeypatch.setattr(doctor_git_observe, "_confined", failed)
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: calls.append(args))
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        rows = [row for row in report["rows"] if row["id"] in ("git_presence", "scratch")]
+        assert [row["code"] for row in rows] == [expected, expected]
+        assert rows[0]["owner_action"] == rows[1]["owner_action"] == doctor_git_report.scratch_refusal(expected)[1]
+        if expected == "scratch_unsupported":
+            assert "unsafe" not in _blob(report)
+        assert "private-io-detail" not in _blob(report)
+        assert calls == []
+
+
+@pytest.mark.parametrize("case", ["relative", "multiline", "overlong", "absent", "xdg_join", "home_join"])
+@pytest.mark.parametrize("supported", [True, False])
+def test_collect_malformed_scratch_uses_one_category_without_git(tmp_path, monkeypatch, case, supported):
+    choice = doctor_git_observe._scratch_choice
+    values = {
+        "relative": {"AEGIS_SCRATCH": "private-relative"},
+        "multiline": {"AEGIS_SCRATCH": str(tmp_path / "private\nrefused")},
+        "overlong": {"AEGIS_SCRATCH": "/" + "x" * doctor_git.VALUE_MAX},
+        "absent": {},
+        "xdg_join": {"XDG_CACHE_HOME": "/" + "x" * (doctor_git.VALUE_MAX - 1)},
+        "home_join": {"HOME": "/" + "x" * (doctor_git.VALUE_MAX - 1)},
+    }
+    calls = []
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_choice", choice)
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: values[case])
+    monkeypatch.setattr(doctor_git_observe, "descriptor_support", lambda: supported)
+    monkeypatch.setattr(doctor_git_observe, "_hold_scratch", lambda path: calls.append(path))
+    monkeypatch.setattr(doctor_git, "_invoke", lambda *args: calls.append(args))
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        rows = [row for row in report["rows"] if row["id"] in ("git_presence", "scratch")]
+        assert len(rows) == 2
+        assert [row["code"] for row in rows] == ["scratch_unsafe", "scratch_unsafe"]
+        assert rows[0]["owner_action"] == rows[1]["owner_action"] == doctor_git_report.scratch_refusal("scratch_unsafe")[1]
+        assert rows[0]["detail"].startswith("Git inspection was not run")
+        assert report["disk"]["scratch"] is None
+        assert calls == []
+        assert "private-relative" not in _blob(report) and "private\\nrefused" not in _blob(report)
+
+
+@pytest.mark.parametrize("refusal", ["multiline_refused", "value_too_long", "empty"])
+def test_collect_scratch_display_refusal_has_one_category_closes_and_retries(tmp_path, monkeypatch, refusal):
+    if not _custody_supported():
+        pytest.skip("scratch descriptors unsupported")
+    outside = _outside_dir(tmp_path, "display-refusal-")
+    raw = str(outside)
+    display = doctor_git_report.display
+    refusing = [True]
+    invoked = []
+
+    def render(text, **kwargs):
+        if text == raw and refusing[0]:
+            return ("", None) if refusal == "empty" else (None, refusal)
+        return display(text, **kwargs)
+
+    def invoke(*args):
+        assert gitsafe_run.custody_active()
+        invoked.append(args)
+        raise gitsafe.GitError("fixed failure", code="git_failed")
+
+    monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": raw})
+    monkeypatch.setattr(doctor_git_report, "display", render)
+    monkeypatch.setattr(doctor_git, "_invoke", invoke)
+    before = set(os.listdir("/proc/self/fd"))
+    report = doctor_git.collect(tmp_path, tier="A", now=10)
+    rows = [row for row in report["rows"] if row["id"] in ("git_presence", "scratch")]
+    assert [row["code"] for row in rows] == ["scratch_unsafe", "scratch_unsafe"]
+    assert rows[0]["owner_action"] == rows[1]["owner_action"]
+    assert invoked == [] and raw not in _blob(report)
+    assert before == set(os.listdir("/proc/self/fd"))
+    refusing[0] = False
+    retried = doctor_git.collect(tmp_path, tier="A", now=10)
+    assert "scratch_outside" in _codes(retried)
+    assert _row(retried, "git_failed")["owner_action"] == doctor_git_report.RETRY
+    assert len(invoked) == 1
+    assert before == set(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.parametrize("case", ["suffix_assignment", "sliced_entropy", "parenthesis", "vcs_mask"])
+def test_collect_location_survives_every_display_pass(tmp_path, monkeypatch, case):
+    if case == "suffix_assignment":
+        parts = ("ghp_" + "A" * 20, "token=")
+    elif case == "sliced_entropy":
+        parts = (("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" * 2)[:90] + "a" * 155,)
+    elif case == "parenthesis":
+        parts = ("token=abc",)
+    else:
+        parts = ("a" * 63 + "-glpat-" + "A" * 20,)
+    mode = stat.S_IFDIR if case == "parenthesis" else stat.S_IFREG
+    tree = {parts[:-1]: [doctor_git_observe._Snap(parts[-1], mode, 10 ** 9)]}
+    for depth in range(len(parts) - 1):
+        tree[parts[:depth]] = [doctor_git_observe._Snap(parts[depth], stat.S_IFDIR, 0)]
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", lambda target: tree.get(Path(target).relative_to(tmp_path).parts, []))
+    monkeypatch.setattr(doctor_git_observe, "MAX_DEPTH", 1 if case == "parenthesis" else 3)
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        row = _row(report, "depth_capped" if case == "parenthesis" else "large_path")
+        detail = row["detail"]
+        assert detail != "finding detail unavailable"
+        assert doctor_git_report.digest("/".join(parts)) in detail
+        assert doctor_git_report.display(detail) == (detail, None)
+        assert "[REDACTED_VCS_" not in detail or "[REDACTED_VCS_TOKEN]" in detail
+        output = io.StringIO()
+        doctor_git_report.print_report(report, output)
+        if case == "parenthesis":
+            assert "locations: path " + doctor_git_report.digest("/".join(parts)) + "; omitted: 0; " in output.getvalue()
+        else:
+            assert detail in output.getvalue()
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("size", [256, 513])
+def test_collect_overlong_leaves_keep_complete_distinct_fingerprints(tmp_path, monkeypatch, held, nested, size):
+    if held and not doctor_git_observe.descriptor_support():
+        pytest.skip("descriptor walk unsupported")
+    parent = tmp_path / "alpha" if nested else tmp_path
+    if nested:
+        parent.mkdir()
+    real_confined, real_identity = doctor_git_observe._confined, doctor_git_observe._directory_identity
+    root_info = tmp_path.stat()
+    root_id = (root_info.st_dev, root_info.st_ino)
+    leaves = ["a" * size, "b" * size]
+    measured = []
+
+    class Entry:
+        def __init__(self, name):
+            self.name = name
+
+        def is_symlink(self):
+            measured.append(self.name)
+            pytest.fail("overlong entry inspected")
+
+        def stat(self, **kwargs):
+            measured.append(self.name)
+            pytest.fail("overlong entry measured")
+
+    def listing(target):
+        if held:
+            info = os.fstat(target)
+            root = (info.st_dev, info.st_ino) == root_id
+        else:
+            root = Path(target) == tmp_path
+        if nested and root:
+            return [doctor_git_observe._Snap("alpha", stat.S_IFDIR, 0)]
+        return [Entry(name) for name in leaves]
+
+    _quiet_tree(monkeypatch)
+    if held:
+        monkeypatch.setattr(doctor_git_observe, "_confined", real_confined)
+        monkeypatch.setattr(doctor_git_observe, "_directory_identity", real_identity)
+    monkeypatch.setattr(doctor_git_observe, "_scandir", listing)
+    monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
+    for _attempt in range(2):
+        report = doctor_git.collect(tmp_path, tier="A", now=10)
+        details = [row["detail"] for row in report["rows"] if row["code"] == "value_too_long"]
+        expected = {"a directory entry was refused (path " + doctor_git_report.digest(("alpha/" if nested else "") + name) + ")" for name in leaves}
+        assert len(details) == 2 and set(details) == expected
+        assert measured == []
 
 
 def test_display_refuses_multiline_before_join_then_redacts_then_truncates():
@@ -424,10 +1121,10 @@ def test_relative_and_multiline_scratch_are_refused(tmp_path, monkeypatch):
     _install_git(monkeypatch, _clean_table(tmp_path), _clean_seams())
     monkeypatch.setattr(doctor_git_observe, "_scratch_choice", lambda: ("code", "scratch_unusable"))
     report = doctor_git.collect(tmp_path, tier="C", now=10)
-    assert "scratch_unusable" in _codes(report)
+    assert "scratch_unsafe" in _codes(report)
     monkeypatch.setattr(doctor_git_observe, "_scratch_choice", lambda: ("code", "multiline_refused"))
     report = doctor_git.collect(tmp_path, tier="C", now=10)
-    assert "multiline_refused" in _codes(report)
+    assert "scratch_unsafe" in _codes(report)
     assert "evil" not in _blob(report)
 
 
@@ -572,10 +1269,10 @@ def test_real_collect_on_a_non_repo_is_advisory(tmp_path, monkeypatch):
     _assert_rows(report)
     blob = _blob(report)
     assert "Traceback" not in blob and "cannot run git" not in blob and "fatal:" not in blob
-    if doctor_git_observe.descriptor_support() and os.path.isdir("/proc/self/fd"):
+    if _custody_supported():
         assert set(_codes(report)) & {"git_missing", "not_a_repository", "not_a_work_tree"}
     else:
-        assert "scratch_unknown" in _codes(report)
+        assert "scratch_unsupported" in _codes(report)
 
 
 def test_with_report_bumps_warnings_and_hides_failures(monkeypatch):
@@ -785,7 +1482,7 @@ def test_million_entry_directory_stops_at_the_cap(tmp_path, monkeypatch):
 
 
 def test_oversized_signer_blob_and_ref_list_are_capped(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "sign-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -839,8 +1536,8 @@ def test_secret_shaped_name_is_redacted_after_canonical_form(tmp_path, monkeypat
     monkeypatch.setattr(doctor_git, "_run_git", lambda root, args: "git_missing")
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert secret not in _blob(report)
-    assert "REDACTED" not in _row(report, "large_path")["detail"]
-    assert len(_row(report, "large_path")["detail"].removeprefix("large file ")) == 12
+    assert "REDACTED" in _row(report, "large_path")["detail"]
+    assert doctor_git_report.digest(secret) in _row(report, "large_path")["detail"]
 
 
 def test_ref_prefixed_lease_matches_the_lane_branch(tmp_path, monkeypatch):
@@ -868,8 +1565,8 @@ def test_unresolvable_scratch_is_unknown(tmp_path, monkeypatch):
         os.unlink(link)
     assert "scratch_outside" not in _codes(report)
     assert "scratch_inside" not in _codes(report)
-    row = _row(report, "scratch_unknown")
-    assert row["status"] == "warn" and "unknown" in row["detail"]
+    row = _row(report, "scratch_unsafe")
+    assert row["status"] == "warn" and "unsafe" in row["detail"]
 
 
 def test_scratch_dotdot_is_refused_and_empty_cache_uses_home(monkeypatch):
@@ -910,7 +1607,7 @@ def test_worktree_escape_stays_outside_on_the_original_path(tmp_path, monkeypatc
 
 
 def test_human_gate_error_stays_inside_custody_as_a_fixed_code(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "gate-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -959,6 +1656,8 @@ def test_outside_directories_are_unique_across_cases(outside_allocation_cases, c
 
 
 def test_scratch_inside_the_workspace_is_unknown(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch custody descriptors unsupported")
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
@@ -966,23 +1665,25 @@ def test_scratch_inside_the_workspace_is_unknown(tmp_path, monkeypatch):
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "scratch_inside" not in _codes(report)
     assert "scratch_outside" not in _codes(report)
-    row = _row(report, "scratch_unknown")
-    assert row["status"] == "warn" and "unknown" in row["detail"]
+    row = _row(report, "scratch_unsafe")
+    assert row["status"] == "warn" and "unsafe" in row["detail"]
     assert row["owner_action"].startswith("owner action:")
 
 
 def test_shared_missing_and_unreadable_scratch_are_unknown(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch custody descriptors unsupported")
     monkeypatch.setattr(doctor_git, "_run_git", lambda root, args: "git_missing")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": "/tmp"})
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "scratch_outside" not in _codes(report)
-    assert _row(report, "scratch_unknown")["status"] == "warn"
+    assert _row(report, "scratch_unsafe")["status"] == "warn"
 
     missing = tmp_path.parent / ("missing-" + tmp_path.name)
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(missing)})
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "scratch_outside" not in _codes(report)
-    assert "scratch_unknown" in _codes(report)
+    assert "scratch_missing" in _codes(report)
 
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
         return
@@ -994,10 +1695,12 @@ def test_shared_missing_and_unreadable_scratch_are_unknown(tmp_path, monkeypatch
     finally:
         os.chmod(locked, 0o700)
     assert "scratch_outside" not in _codes(report)
-    assert "scratch_unknown" in _codes(report)
+    assert "scratch_unsupported" in _codes(report)
 
 
 def test_symlink_loop_scratch_is_unknown(tmp_path, monkeypatch):
+    if not doctor_git_observe.descriptor_support():
+        pytest.skip("scratch custody descriptors unsupported")
     link = tmp_path / "loop-scratch"
     symlink_or_skip(link, link)
     try:
@@ -1008,10 +1711,12 @@ def test_symlink_loop_scratch_is_unknown(tmp_path, monkeypatch):
         os.unlink(link)
     assert "scratch_outside" not in _codes(report)
     assert "scratch_inside" not in _codes(report)
-    assert "unknown" in _row(report, "scratch_unknown")["detail"]
+    assert "unsafe" in _row(report, "scratch_unsafe")["detail"]
 
 
 def test_full_scratch_filesystem_does_not_admit_heavy_slots(tmp_path, monkeypatch):
+    if not _custody_supported():
+        pytest.skip("scratch custody unsupported")
     scratch = _outside_dir(tmp_path, "full-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(scratch)})
     monkeypatch.setattr(doctor_git, "_run_git", lambda root, args: "git_missing")
@@ -1024,7 +1729,7 @@ def test_full_scratch_filesystem_does_not_admit_heavy_slots(tmp_path, monkeypatc
     monkeypatch.setattr(doctor_git_observe, "_disk_usage", usage)
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "disk_budget" not in _codes(report)
-    assert "disk_low" in _codes(report) or "disk_unknown" in _codes(report)
+    assert "disk_low" in _codes(report)
 
 
 def test_sibling_listing_stops_at_the_entry_cap(tmp_path, monkeypatch):
@@ -1060,7 +1765,7 @@ def test_sibling_listing_stops_at_the_entry_cap(tmp_path, monkeypatch):
 
 
 def test_oversized_lease_set_is_refused_before_object_reads(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "lease-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -1091,7 +1796,7 @@ def test_oversized_lease_set_is_refused_before_object_reads(tmp_path, monkeypatc
 def test_readonly_checkout_keeps_policy_signer_and_lease_knowledge(tmp_path, monkeypatch):
     if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0:
         pytest.skip("mode 555 is not a denial for this user")
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -1170,7 +1875,7 @@ def test_surrogate_name_survives_strict_utf8_output(tmp_path, monkeypatch):
 
 
 def test_signer_transport_and_symlink_are_unavailable(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "sign2-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -1258,7 +1963,7 @@ def test_shared_alias_inside_and_unwritable_scratch_are_unknown(tmp_path, monkey
         monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda candidate=candidate: {"AEGIS_SCRATCH": candidate})
         report = doctor_git.collect(tmp_path, tier="A", now=10)
         assert "scratch_outside" not in _codes(report)
-        assert "scratch_unknown" in _codes(report)
+        assert "scratch_unsafe" in _codes(report)
         assert "disk_budget" not in _codes(report)
     nested = tmp_path / "scratch"
     nested.mkdir()
@@ -1266,15 +1971,15 @@ def test_shared_alias_inside_and_unwritable_scratch_are_unknown(tmp_path, monkey
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": doubled})
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "scratch_outside" not in _codes(report)
-    assert "scratch_unknown" in _codes(report)
-    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+    assert "scratch_unsafe" in _codes(report)
+    if not _custody_supported() or not hasattr(os, "geteuid") or os.geteuid() == 0:
         return
     wide = _outside_dir(tmp_path, "wide-")
     os.chmod(wide, 0o1777)
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(wide)})
     report = doctor_git.collect(tmp_path, tier="A", now=10)
     assert "scratch_outside" not in _codes(report)
-    assert "scratch_unknown" in _codes(report)
+    assert "scratch_unsafe" in _codes(report)
     cold = _outside_dir(tmp_path, "cold-")
     os.chmod(cold, 0o555)
     try:
@@ -1283,11 +1988,11 @@ def test_shared_alias_inside_and_unwritable_scratch_are_unknown(tmp_path, monkey
     finally:
         os.chmod(cold, 0o700)
     assert "scratch_outside" not in _codes(report)
-    assert "scratch_unknown" in _codes(report)
+    assert "scratch_unsafe" in _codes(report)
 
 
 def test_lease_cap_uses_the_checked_snapshot(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "grow-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -1370,12 +2075,12 @@ def test_custody_without_a_bound_descriptor_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor_git_observe, "use_scratch", lambda root: (
         types.SimpleNamespace(code=None, path=str(tmp_path), fd=None, bind=None, owned=False), False))
     monkeypatch.setattr(doctor_git, "_custody", custody)
-    assert doctor_git._run_git(tmp_path, doctor_git._PRESENCE) == "git_failed"
+    assert doctor_git._run_git(tmp_path, doctor_git._PRESENCE) == "scratch_unsafe"
     assert seen == []
 
 
 def test_nonregular_signers_are_unavailable(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch descriptors unsupported")
     outside = _outside_dir(tmp_path, "kind-")
     monkeypatch.setattr(doctor_git_observe, "_scratch_env", lambda: {"AEGIS_SCRATCH": str(outside)})
@@ -1585,7 +2290,7 @@ def test_scratch_duplicate_closes_when_the_anchor_context_fails(tmp_path, monkey
     monkeypatch.setattr(doctor_git_observe, "walk", lambda *args: None)
     try:
         report = doctor_git.collect(tmp_path, tier="A", now=10)
-        assert "scratch_unknown" in _codes(report)
+        assert "scratch_unsupported" in _codes(report)
         assert len(duplicates) == 1
         with pytest.raises(OSError) as error:
             os.fstat(duplicates[0])
@@ -1600,7 +2305,7 @@ def test_scratch_duplicate_closes_when_the_anchor_context_fails(tmp_path, monkey
 
 
 def test_missing_descriptor_binding_refuses_a_replaced_scratch(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support():
+    if not _custody_supported():
         pytest.skip("directory descriptors unsupported")
     scratch = _outside_dir(tmp_path, "bind-")
     held = scratch.with_name(scratch.name + "-held")
@@ -1617,7 +2322,7 @@ def test_missing_descriptor_binding_refuses_a_replaced_scratch(tmp_path, monkeyp
     monkeypatch.setattr(doctor_git, "_custody", lambda **kwargs: entered.append(kwargs))
     monkeypatch.setattr(doctor_git_observe, "_disk_usage", lambda target: pytest.fail("unbound scratch measured"))
     report = doctor_git.collect(tmp_path, tier="A", now=10)
-    assert "scratch_unknown" in _codes(report) and "scratch_outside" not in _codes(report)
+    assert "scratch_unsupported" in _codes(report) and "scratch_outside" not in _codes(report)
     assert report["disk"]["budget_slots"] is None and entered == []
 
 
@@ -1636,7 +2341,7 @@ def test_scratch_validation_error_is_a_refusal_and_closes_the_descriptor(tmp_pat
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
     try:
         report = doctor_git.collect(tmp_path, tier="A", now=10)
-        assert "scratch_unknown" in _codes(report) and "hunter2hunter" not in _blob(report)
+        assert "scratch_unsupported" in _codes(report) and "hunter2hunter" not in _blob(report)
         assert len(held) == 1
         with pytest.raises(OSError) as error:
             os.fstat(held[0])
@@ -1700,7 +2405,7 @@ def test_unsafe_names_are_stable_hashes_and_text_keeps_the_whole_owner_action(tm
     target = report["approval_modes"]["target"]
     assert re.fullmatch("[0-9a-f]{12}", target)
     assert report["approval_modes"]["patterns"][0]["pattern"] == target
-    assert _row(report, "large_path")["detail"] == "large file " + target
+    assert _row(report, "large_path")["detail"] == "large file ghp_REDACTED [" + target + "]"
     output = io.StringIO()
     doctor_git_report.print_report(report, output)
     assert _row(report, "lease_unreadable")["owner_action"] in output.getvalue()
@@ -1728,7 +2433,9 @@ def test_unknown_rows_name_recovery_instead_of_mutating_cleanup(tmp_path, monkey
     monkeypatch.setattr(doctor_git_observe, "_scratch_choice", lambda: ("code", "scratch_unusable"))
     rows = doctor_git.collect(tmp_path, tier="A", now=10)["rows"]
     for row in rows:
-        if row["id"] in ("scratch", "disk_budget"):
+        if row["id"] == "scratch":
+            assert row["owner_action"] == doctor_git_report.scratch_refusal("scratch_unsafe")[1]
+        if row["id"] == "disk_budget":
             assert row["owner_action"] == doctor_git_report.SCRATCH_ACT
         if row["id"] in ("worktrees", "git_objects"):
             assert row["owner_action"] == doctor_git_report.RETRY
@@ -1736,7 +2443,7 @@ def test_unknown_rows_name_recovery_instead_of_mutating_cleanup(tmp_path, monkey
 
 @pytest.mark.parametrize("reason", ["other_owner", "access_denied"])
 def test_scratch_requires_ownership_and_actual_write_access(tmp_path, monkeypatch, reason):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     scratch = _outside_dir(tmp_path, "access-")
 
@@ -1753,7 +2460,7 @@ def test_scratch_requires_ownership_and_actual_write_access(tmp_path, monkeypatc
     monkeypatch.setattr(doctor_git, "_run_git", lambda *args: "git_missing")
     monkeypatch.setattr(doctor_git_observe, "walk", lambda *args: None)
     report = doctor_git.collect(tmp_path, tier="A", now=10)
-    assert "scratch_unknown" in _codes(report) and "scratch_outside" not in _codes(report)
+    assert "scratch_unsafe" in _codes(report) and "scratch_outside" not in _codes(report)
     assert report["disk"]["budget_slots"] is None
 
 
@@ -1767,7 +2474,7 @@ def test_scratch_requires_ownership_and_actual_write_access(tmp_path, monkeypatc
     (0o750, True),
 ])
 def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, admitted):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     scratch = _outside_dir(tmp_path, "shared-group-")
     scratch.chmod(mode)
@@ -1809,18 +2516,18 @@ def test_scratch_group_privacy_covers_all_consumers(tmp_path, monkeypatch, mode,
     finally:
         scratch.chmod(0o700)
     if admitted:
-        assert "scratch_outside" in _codes(report) and "scratch_unknown" not in _codes(report)
+        assert "scratch_outside" in _codes(report) and "scratch_unsafe" not in _codes(report)
         assert report["disk"]["budget_slots"] == 1
         assert len(seen["custody"]) == len(seen["invoke"]) == 2 and len(seen["disk"]) == 1
         assert standalone.returncode == 128
     else:
-        assert "scratch_unknown" in _codes(report) and "scratch_outside" not in _codes(report)
-        assert _row(report, "scratch_unknown")["owner_action"] == doctor_git_report.SCRATCH_ACT
+        assert "scratch_unsafe" in _codes(report) and "scratch_outside" not in _codes(report)
+        assert _row(report, "scratch_unsafe")["owner_action"] == doctor_git_report.scratch_refusal("scratch_unsafe")[1]
         assert report["disk"]["budget_slots"] is None
-        assert queries == {"head": "git_failed", "policy": "git_failed", "signers": "git_failed",
-                           "leases": "git_failed", "refs": "git_failed", "branch": (None, "git_failed")}
+        assert queries == {"head": "scratch_unsafe", "policy": "scratch_unsafe", "signers": "scratch_unsafe",
+                           "leases": "scratch_unsafe", "refs": "scratch_unsafe", "branch": (None, "scratch_unsafe")}
         assert not seen["custody"] and not seen["disk"] and not seen["invoke"]
-        assert standalone == "git_failed"
+        assert standalone == "scratch_unsafe"
 
 
 def test_doctor_scratch_never_imports_account_or_group_databases(source_root=REPO):
@@ -1882,13 +2589,14 @@ def test_quoted_repair_action_keeps_the_finding(tmp_path, monkeypatch, oid_size,
     ("default_acl", ["system.posix_acl_default"], False),
     ("lookup_error", [], False),
     ("missing_api", [], False),
+    ("unavailable_api", [], False),
     ("unsupported_platform", [], False),
     ("foreign_result", {}, False),
     ("acl_free", [], True),
     ("unrelated_xattr", ["user.note"], True),
 ])
 def test_scratch_acl_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, case, names, admitted):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     scratch = _outside_dir(tmp_path, "acl-")
     scratch.chmod(mode)
@@ -1904,6 +2612,8 @@ def test_scratch_acl_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, c
         seen["acl"].append(fd)
         if case == "lookup_error":
             raise OSError(errno.EACCES, secret)
+        if case == "unavailable_api":
+            raise NotImplementedError(secret)
         if case == "foreign_result":
             return None
         if name in names:
@@ -1940,11 +2650,12 @@ def test_scratch_acl_privacy_covers_all_consumers(tmp_path, monkeypatch, mode, c
         assert len(seen["custody"]) == len(seen["invoke"]) == 2 and len(seen["disk"]) == 1
         assert standalone.returncode == 128
     else:
-        assert "scratch_unknown" in _codes(report) and "scratch_outside" not in _codes(report)
-        assert _row(report, "scratch_unknown")["owner_action"] == doctor_git_report.SCRATCH_ACT
+        category = "scratch_unsupported" if not mode & stat.S_IWGRP and case in ("missing_api", "unavailable_api", "unsupported_platform", "lookup_error", "foreign_result") else "scratch_unsafe"
+        assert category in _codes(report) and "scratch_outside" not in _codes(report)
+        assert _row(report, category)["owner_action"] == doctor_git_report.scratch_refusal(category)[1]
         assert report["disk"]["budget_slots"] is None
         assert not seen["custody"] and not seen["disk"] and not seen["invoke"]
-        assert standalone == "git_failed"
+        assert standalone == category
     expected_probes = 0 if mode & stat.S_IWGRP or case in ("missing_api", "unsupported_platform") else 4 if case in ("default_acl", "acl_free", "unrelated_xattr") else 2
     assert len(seen["acl"]) == expected_probes
 
@@ -2019,7 +2730,7 @@ def test_contextual_redaction_uses_fixed_finding_text(tmp_path, monkeypatch, lan
 def test_token_assignment_ref_with_existing_object_uses_private_repair(tmp_path, monkeypatch):
     import shutil
 
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     if not shutil.which("git"):
         pytest.skip("git unavailable")
@@ -2078,7 +2789,7 @@ def test_unmeasured_directories_never_leave_the_report_passing(tmp_path, monkeyp
 
 
 def test_custody_and_disk_keep_the_same_descriptor_after_path_replacement(tmp_path, monkeypatch):
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     scratch = _outside_dir(tmp_path, "identity-")
     symlink_or_skip(tmp_path, tmp_path / "link-probe", target_is_directory=True)
@@ -2122,7 +2833,7 @@ def test_unreadable_invalid_ref_repair_command_works_in_a_fresh_repository(tmp_p
     import shlex
     import shutil
 
-    if not doctor_git_observe.descriptor_support() or not os.path.isdir("/proc/self/fd"):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     if not shutil.which("git"):
         pytest.skip("git unavailable")
@@ -2142,14 +2853,15 @@ def test_unreadable_invalid_ref_repair_command_works_in_a_fresh_repository(tmp_p
 
 
 # Whole-report bytes include the approval_targets row. Tests need no repository history.
+# Capped-scan/depth text hashes include grouping; JSON hashes remain pinned.
 _SPLIT_REPORT_BYTES = {'valid_scratch': ('ce67980c506d9555edcbcfdb0198ad522ff2dfd86338e8fdcdb1f18ca3413ded',
                    '6e38ff297896abd3cd5fe49716c20d79b8a01ac8b93e773834f4d7c0da382101'),
- 'scratch_unavailable': ('75af40c5c2eb2c18582a56179a6ba6ec0fb9fbb00603874ecc85dcc6484aa530',
-                         'ee533501e4bf6fbe1b8a7e2488ec862c2839fdcfcede180f82f5c4d9b5ecadfc'),
+ 'scratch_unavailable': ('9cec87012d4f469a4566bd1c832dc54ed2bb69643175542732524fc41112b2db',
+                         'd2363f53c82d88860df49ba4307d49d60fc0886dc5618901e1d2d4bf52703069'),
  'capped_scan': ('e7cb6e3e895756b0e9c185e4e365dd9d0e95caa6a4b784f2e5744a1cd3318ca1',
-                 '707d10a1486842d15e8404e5b8fb4be74d88a13a7e599ce88b1a4d52d4f1243b'),
+                 'f72d5e66b7810645c1475febddd45827a3673b651243a1fb502d0e24b47ed183'),
  'depth_cap': ('70d866c24293cbb9e18b897e28420d797350273518d809ecd202a3af653ee1a4',
-               '72322b4b4a8244fb235a36ed76c8fac52c0918c5c70b5d5d0c8e3f5b99df88fa'),
+               '53ce5d5301f1fd48a44e32b67d853c94e0fbb5470fd77daa4da34a45826727a4'),
  'swapped_path': ('cdfedc8c0aefca686d819abc0e502803342bf003a1db2901fcbf1d79ecb6c8bb',
                   'f77a64c54bba94e0081aa406c8b4688f3cf212c5a346c6ff9fe00ca04dae56c5'),
  'unavailable_report': ('29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f',
@@ -2733,15 +3445,16 @@ def test_existing_display_keeps_the_tip_separator_and_targets_do_not(tmp_path, m
 
 
 # Bytes of the git section at the integration tip, before the approvals-target row.
+# Capped-scan/depth text hashes include grouping; JSON hashes remain pinned.
 _TIP_REPORT_BYTES = {
     "valid_scratch": ("b995dd699643b23b6fb52b3f148a76927a4dc2773a3a1956a90f1be5ba26ab56",
                       "b2e7f36f4d8188d08efa7d4815a2eac24cc27db6d5c951c208ed39416b21da91"),
-    "scratch_unavailable": ("4bd21b32b2780f6f243768afc44594d25517f579c9f3a4be0a636a34d5abab7d",
-                            "95bf43c9e41ced93fad50d45fe211fc3b236ce939fb8ed13b348556a565442d8"),
+    "scratch_unavailable": ("000438e5a1dc434cd3f6ad67eaa52925f5f6ee4cd6b6044ba9cf038c55ddfb7a",
+                            "c436e99f213a75128949aacd32f04075ba56cebb493c8e93b6fc980038822691"),
     "capped_scan": ("e0db8329e61aa20d5dbcd917210e17c3974385cfc901b1be15ee7b41327d65cd",
-                    "9f3687dca4764b78f65652dbaaf1d31122652aafe82be798fcc8c92cecc2e2da"),
+                    "43f2161dba63dd79cc89ba1aa3d19537338773e494aae4e9c93426c7d2678cfb"),
     "depth_cap": ("d4d3a5fbd9a5d68031bd23ac1262ee725cd221a71f55b04ed3f376c1f31070fd",
-                  "721e0f7b4c1d5ba69c96b692708a5f3108796084e3248ee81ff924641613e31c"),
+                  "7142d327a3c60faff7aa30759552de522a82e132706a6266469834c5a99644c0"),
     "swapped_path": ("36888513353b4d12c5efccd28518bc730bc98125a06de7469b03c47b82d9c2ef",
                      "80b0e1cb3ee3640f56d48f9801d77150b4aa74654eb622d8a406bc26e53d889e"),
     "unavailable_report": ("29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f",
@@ -2801,8 +3514,7 @@ def _identity_commit(repo, message):
 
 @pytest.fixture
 def real_git_repo(tmp_path, monkeypatch):
-    if (os.name != "posix" or not doctor_git_observe.descriptor_support()
-            or not os.path.isdir("/proc/self/fd")):
+    if not _custody_supported():
         pytest.skip("scratch custody descriptors unsupported")
     if not _git_executable_is_regular():
         pytest.skip("git executable unavailable")
@@ -2850,8 +3562,8 @@ def test_real_repo_probe_unsupported_stays_advisory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(doctor_git, "_invoke", refuse_git)
     report = doctor_git.collect(tmp_path, tier="A", now=10)
-    assert _row(report, "scratch_unknown")["owner_action"] == doctor_git_report.SCRATCH_ACT
-    assert _row(report, "git_failed")["status"] == "warn"
+    assert _row(report, "scratch_unsupported")["owner_action"] == doctor_git_report.scratch_refusal("scratch_unsupported")[1]
+    assert _row(report, "scratch_unsupported")["status"] == "warn"
     assert "descriptor_unsupported" in _codes(report)
     assert report["approval_modes"] is None
     assert "no_approval_map" not in _codes(report)
@@ -3076,3 +3788,256 @@ def test_gate_detail_keeps_valid_long_target_as_digest(mode):
     name = "feature/" + "a" * 200
     assert doctor_git_report.gate_detail(((name, mode),)) == (
         "lose the gate: " + doctor_git_report.digest(name) + " " + mode)
+
+
+@pytest.mark.parametrize("case", ["limits", "zero", "mixed", "live", "unreadable", "expired"])
+def test_grouped_report_public_caller_matrix(tmp_path, monkeypatch, capsys, case):
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git, "time", types.SimpleNamespace(time=lambda: 1000))
+    seams = _clean_seams()
+    if case in ("limits", "mixed"):
+        monkeypatch.setattr(doctor_git_observe, "MAX_DEPTH", 1)
+        entries = [doctor_git_observe._Snap(f"path{index:02d}", stat.S_IFDIR, 0) for index in range(17)]
+        if case == "mixed":
+            entries.append(doctor_git_observe._Snap("link", stat.S_IFLNK, 0))
+        monkeypatch.setattr(doctor_git_observe, "_scandir", lambda root: entries)
+    live = 256 if case in ("live", "unreadable") else 0
+    expired = 256 if case == "expired" else 0
+    unreadable = 1 if case in ("unreadable", "mixed") else 0
+    leases = tuple(_lease(f"lane{index}", f"lane/branch{index}", 1000 if live else 1, 50)
+                   for index in range(live + expired))
+    if case == "mixed":
+        leases = (_lease("unknown", "bad..branch", 1000, 50),)
+    bad = (team.Unreadable("bad", "refs/aegis/lanes/bad", "b" * 40, "private error"),) if unreadable else ()
+    seams["_leases"] = lambda root: team.LeaseSet(leases, bad)
+    _install_git(monkeypatch, _clean_table(tmp_path), seams)
+    payload = {"human_gate": {"tier": "B"}, "summary": {"failed": 2, "warnings": 3}}
+    baseline = doctor_git.collect(tmp_path, tier="B", now=1000)
+    encoded = _blob(baseline)
+    result = doctor_git.with_report(payload, tmp_path, None, False)
+    text = capsys.readouterr().out
+    assert text.startswith("Git and disk hygiene (report only; doctor does not delete, prune, gc or rewrite refs):\n")
+    if case in ("limits", "mixed"):
+        assert text.count("  [warn] depth_capped:") == 1
+        assert ("  [warn] depth_capped: 17 findings; locations: path00, path01, path02; omitted: 14; "
+                + doctor_git_report.INSPECT + "\n") in text
+    else:
+        assert "depth_capped:" not in text and "scan_capped:" not in text
+    if live + expired + unreadable:
+        status = "warn" if expired + unreadable else "pass"
+        assert (f"  [{status}] leases: live {live}, expired {expired}, unreadable {unreadable}; "
+                + doctor_git_report.NONE + "\n") in text
+    else:
+        assert "leases: live" not in text
+    for row in baseline["rows"]:
+        if row["code"] not in ("live_lease", "scan_capped", "depth_capped"):
+            assert f"  [{row['status']}] {row['id']}: {row['detail']}; {row['owner_action']}\n" in text
+    assert not any(f"lease lane{index} is live" in text for index in range(live))
+    assert _blob(result["git_hygiene"]) == encoded
+    assert _blob(baseline) == encoded
+    assert result["summary"] == {"failed": 2, "warnings": 3 + sum(row["status"] == "warn" for row in baseline["rows"])}
+    assert payload["summary"] == {"failed": 2, "warnings": 3}
+    assert result["git_hygiene"]["affects_exit"] is False
+    assert doctor_git.with_report(payload, tmp_path, None, True) == result
+    assert capsys.readouterr().out == ""
+    assert _text(baseline) == text == _text(baseline)
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_keep_safe_locations_and_exact_omissions(code):
+    parts = [(f"path{index:02d}",) for index in range(17)]
+    report = {"rows": [doctor_git_observe._path_refusal(code, path) for path in parts]}
+    text = _text(report)
+    assert text.splitlines()[1] == (
+        f"  [warn] {code}: 17 findings; locations: path00, path01, path02; omitted: 14; "
+        + doctor_git_report.INSPECT)
+    assert len(text.splitlines()) == 2
+    long = {"rows": [doctor_git_observe._path_refusal(code, ("a" * 110 + str(index),)) for index in range(17)]}
+    locations = [doctor_git_report.location(("a" * 110 + str(index),)) for index in range(17)]
+    line = _text(long).splitlines()[1]
+    assert locations[0] in line and locations[1] not in line
+    assert "omitted: 16; " in line
+    assert "..." not in line.split("; locations: ")[0]
+    duplicate = {"rows": [report["rows"][0], report["rows"][0]]}
+    assert "2 findings; locations: path00; omitted: 1; " in _text(duplicate)
+    root = {"rows": [doctor_git_observe._path_refusal(code, ())]}
+    assert "1 findings; locations: .; omitted: 0; " in _text(root)
+
+
+@pytest.mark.parametrize("fault", ["multiline", "oversized", "control", "secret", "display-refused"])
+def test_grouped_limits_omit_undisplayable_locations_and_retry(monkeypatch, fault):
+    row = doctor_git_observe._path_refusal("depth_capped", ("bad",))
+    raw = {"multiline": "bad\nforged", "oversized": "b" * 513, "control": "bad\x1b[31m",
+           "secret": "password=hunter2hunter", "display-refused": "bad"}[fault]
+    row["detail"] = "a directory was not measured beyond the scan depth (" + raw + ")"
+    if fault == "display-refused":
+        display = doctor_git_report.display
+        monkeypatch.setattr(doctor_git_report, "display", lambda text, **kwargs: (
+            (None, "multiline_refused") if text == raw else display(text, **kwargs)))
+    report = {"rows": [row, doctor_git_observe._path_refusal("depth_capped", ("good",))]}
+    for _attempt in range(2):
+        line = _text(report).splitlines()[1]
+        assert "2 findings; locations: good; omitted: 1; " in line
+        assert raw not in line and "hunter2hunter" not in line
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+@pytest.mark.parametrize("name,sibling_count,shown", [
+    ("a; omitted: 0", 1, False),
+    ("a; omitted: 0; owner action: none", 16, False),
+    ("a, b, c", 1, False),
+    ("safe, safe", 1, False),
+    ("none", 1, False),
+    (".", 1, False),
+    ("unsafe, name [0123456789ab]", 1, False),
+    ("ordinary space", 1, True),
+    (" ", 1, False),
+    ("none ", 1, False),
+    (" none", 1, False),
+    (". ", 1, False),
+    (" .", 1, False),
+    ("alpha ", 1, False),
+    ("two words", 1, True),
+], ids=["semicolon", "forged-action", "commas", "duplicate-comma", "none-sentinel",
+        "dot-sentinel", "bracket-suffix", "ordinary-space", "blank", "none-trailing",
+        "none-leading", "dot-trailing", "dot-leading", "name-trailing", "interior-space"])
+def test_grouped_limits_admit_only_unambiguous_labels(code, name, sibling_count, shown):
+    hostile = doctor_git_observe._path_refusal(code, (name,))
+    if name == ".":
+        # Enumeration already rejects dot entries; exercise the renderer's
+        # explicit distinction between its root form and a captured '(.)'.
+        hostile["detail"] = doctor_git_observe._path_refusal(code, ())["detail"] + " (.)"
+    siblings = [doctor_git_observe._path_refusal(code, (f"p{index:02d}",)) for index in range(sibling_count)]
+    report = {"rows": [hostile] + siblings}
+    before = _blob(report)
+    samples = ([name] if shown else []) + [f"p{index:02d}" for index in range(min(sibling_count, 3))]
+    expected = (f"  [warn] {code}: {len(report['rows'])} findings; locations: {', '.join(samples)}; "
+                f"omitted: {len(report['rows']) - len(samples)}; " + doctor_git_report.INSPECT)
+    for _attempt in range(2):
+        assert _text(report).splitlines()[1:] == [expected]
+        assert _blob(report) == before
+    # Admission affects grouped labels only; an individual advisory retains
+    # its original detail bytes, including punctuation and reserved spellings.
+    single = dict(hostile, code="other")
+    assert _text({"rows": [single]}).splitlines()[1:] == [
+        "  [warn] disk_walk: " + hostile["detail"] + "; " + doctor_git_report.INSPECT]
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_count_all_rejected_labels_without_forging_root(code):
+    rows = [doctor_git_observe._path_refusal(code, (name,)) for name in ("none", "a, b", "a; omitted: 0")]
+    dot = doctor_git_observe._path_refusal(code, ())
+    dot["detail"] += " (.)"
+    rows.append(dot)
+    assert _text({"rows": rows}).splitlines()[1:] == [
+        f"  [warn] {code}: 4 findings; locations: none; omitted: 4; " + doctor_git_report.INSPECT]
+    root = doctor_git_observe._path_refusal(code, ())
+    assert _text({"rows": [root]}).splitlines()[1:] == [
+        f"  [warn] {code}: 1 findings; locations: .; omitted: 0; " + doctor_git_report.INSPECT]
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_reject_injected_fields_in_concurrent_reports(code):
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(2)
+    reports = [{"rows": [doctor_git_observe._path_refusal(code, (bad,)),
+                         doctor_git_observe._path_refusal(code, (safe,))]}
+               for bad, safe in (("a; omitted: 0", "alpha space"), ("safe, safe", "beta space"))]
+    before = [_blob(report) for report in reports]
+
+    def render(report):
+        barrier.wait(timeout=5)
+        return _text(report)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(render, report) for report in reports]
+        results = [future.result(timeout=5) for future in pending]
+    for text, safe in zip(results, ("alpha space", "beta space")):
+        assert text.splitlines()[1:] == [
+            f"  [warn] {code}: 2 findings; locations: {safe}; omitted: 1; " + doctor_git_report.INSPECT]
+    assert [_blob(report) for report in reports] == before
+
+
+def test_grouped_report_keeps_other_lines_and_actionable_leases():
+    rows = [
+        {"id": "bad", "status": "warn", "code": "other", "detail": "bad\nline", "owner_action": doctor_git_report.RETRY},
+        doctor_git_report.row("repair", "warn", "live_lease", doctor_git_report.RETRY, "repair this lease"),
+        doctor_git_report.row("repair-pass", "pass", "live_lease", doctor_git_report.RETRY, "inspect this lease"),
+        doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live"),
+        doctor_git_report.row("unknown", "warn", "lease_branch_unknown", doctor_git_report.RETRY, "unknown branch"),
+        doctor_git_report.row("disk_walk", "warn", "depth_capped", doctor_git_report.RETRY, "repair the cap"),
+    ]
+    text = _text({"rows": rows})
+    assert "  [warn] refused\n" in text
+    assert "  [warn] repair: repair this lease; owner action: retry aegis doctor\n" in text
+    assert "  [pass] repair-pass: inspect this lease; owner action: retry aegis doctor\n" in text
+    assert "  [warn] unknown: unknown branch; owner action: retry aegis doctor\n" in text
+    assert "  [warn] disk_walk: repair the cap; owner action: retry aegis doctor\n" in text
+    assert "leases: live 1, expired 0, unreadable 0; " in text
+    assert "lease good is live" not in text
+
+
+def test_grouped_reports_are_independent_during_concurrent_rendering():
+    barrier = threading.Barrier(2)
+    reports = [{"rows": [doctor_git_observe._path_refusal("scan_capped", (name,)) for _ in range(count)]}
+               for name, count in (("alpha", 17), ("beta", 4))]
+    before = [_blob(report) for report in reports]
+    results = [None, None]
+
+    def render(index):
+        barrier.wait(timeout=5)
+        results[index] = _text(reports[index])
+
+    threads = [threading.Thread(target=render, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert "17 findings; locations: alpha; omitted: 16; " in results[0]
+    assert "4 findings; locations: beta; omitted: 3; " in results[1]
+    assert "beta" not in results[0] and "alpha" not in results[1]
+    assert [_blob(report) for report in reports] == before
+
+
+def test_grouped_limits_separate_codes_and_preserve_warning_order():
+    scan = doctor_git_observe._path_refusal("scan_capped", ("scan",))
+    depth = doctor_git_observe._path_refusal("depth_capped", ("deep",))
+    warning = doctor_git_report.row("warning", "warn", "path_changed", doctor_git_report.RETRY, "changed path")
+    text = _text({"rows": [scan, warning, depth, scan, depth]})
+    assert text.splitlines()[1:] == [
+        "  [warn] scan_capped: 2 findings; locations: scan; omitted: 1; " + doctor_git_report.INSPECT,
+        "  [warn] warning: changed path; " + doctor_git_report.RETRY,
+        "  [warn] depth_capped: 2 findings; locations: deep; omitted: 1; " + doctor_git_report.INSPECT,
+    ]
+
+
+def test_grouped_report_single_pass_rows_match_list_bytes():
+    rows = [
+        doctor_git_observe._path_refusal("scan_capped", ("scan",)),
+        doctor_git_report.row("warning", "warn", "path_changed", doctor_git_report.RETRY, "changed path"),
+        doctor_git_observe._path_refusal("depth_capped", ("deep",)),
+        doctor_git_observe._path_refusal("scan_capped", ("other",)),
+        doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live"),
+        doctor_git_report.row("lease:1", "warn", "expired_lease", doctor_git_report.RETRY, "lease expired"),
+        doctor_git_report.row("lease:2", "warn", "lease_unreadable", doctor_git_report.RETRY, "lease unreadable"),
+        {"id": "bad", "status": "warn", "code": "other", "detail": "bad\nline", "owner_action": doctor_git_report.RETRY},
+    ]
+    assert _text({"rows": iter(rows)}) == _text({"rows": rows})
+
+
+def test_grouped_limits_final_display_refusal_is_still_a_refusal(monkeypatch):
+    display = doctor_git_report.display
+    monkeypatch.setattr(doctor_git_report, "display", lambda text, **kwargs: (
+        (None, "value_too_long") if text.startswith("2 findings;") else display(text, **kwargs)))
+    report = {"rows": [doctor_git_observe._path_refusal("scan_capped", ("safe",)) for _ in range(2)]}
+    assert _text(report).splitlines()[1:] == ["  [warn] refused"]
+
+
+@pytest.mark.parametrize("field", ["id", "detail"])
+def test_grouped_report_preserves_refused_live_lease_lines(field):
+    healthy = doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live")
+    refused = dict(healthy, **{field: "bad\nline"})
+    lines = _text({"rows": [refused, healthy]}).splitlines()[1:]
+    assert lines == ["  [pass] refused", "  [pass] leases: live 1, expired 0, unreadable 0; " + doctor_git_report.NONE]
