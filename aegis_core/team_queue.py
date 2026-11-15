@@ -578,6 +578,7 @@ def _compact(root, state, caller):
 
 
 def _mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments):
+    """Publish once and append the correlated transition receipt under the caller's lock."""
     previous = state["items"].get(arguments.get("identifier"))
     previous = dict(previous) if previous is not None else None
     row = _change(state, verb, moment, lanes=lanes, found=found, root=root, queue_paths=queue_paths, **arguments)
@@ -695,6 +696,61 @@ def _unclaim(root, state, moment, caller, arguments):
     return {**result, "item": _view(row, moment, blockers)}
 
 
+def _arguments(verb, valid_clock, caller, arguments):
+    """Validate and bound inputs before workspace discovery, locks or parsing state."""
+    _require(valid_clock, "invalid_arguments")
+    include_done = arguments.pop("include_done", False)
+    _require(type(include_done) is bool, "invalid_arguments")
+    if verb == "add":
+        arguments["item"] = _item(arguments["item"])
+    if verb in ("claim", "release", "unclaim", "done"):
+        _require(_key(arguments.get("identifier")), "invalid_arguments")
+        expected = arguments.get("expect")
+        _require(type(expected) is str and len(expected) == 64 and _REVISION.fullmatch(expected) is not None, "invalid_arguments")
+    capabilities = arguments.get("capabilities")
+    _require(verb != "claim" or capabilities is not None, "invalid_arguments")
+    if capabilities is not None:
+        try:
+            _strings(capabilities)
+        except QueueRefusal:
+            raise QueueRefusal("invalid_arguments") from None
+    if verb in ("claim", "release", "unclaim", "done"):
+        lane = arguments.get("lane")
+        _require((lane is None and verb not in ("claim", "unclaim")) or _lane(lane), "invalid_arguments")
+    if verb == "unclaim":
+        _require(type(arguments.get("writer_stopped")) is bool, "invalid_arguments")
+        _require(arguments["writer_stopped"], "writer_not_stopped")
+        arguments["reason"] = _text(arguments.get("reason", ""), empty=True)
+    if verb == "claim":
+        lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
+        _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
+        try:
+            arguments["branch"] = _branch_name(arguments.get("branch"))
+        except QueueRefusal:
+            raise QueueRefusal("invalid_arguments") from None
+    write = verb not in ("list", "audit")
+    if write:
+        try:
+            caller = _text(team.default_owner() if caller is None else caller, 200 if verb == "unclaim" else 256)
+        except QueueRefusal:
+            raise QueueRefusal("invalid_arguments") from None
+    return include_done, capabilities, write, caller
+
+
+def _project(payload, error=None):
+    """Render the fixed envelope after an operation or its documented refusal."""
+    if isinstance(error, (QueueRefusal, team_claims.ClaimRefusal)):
+        payload.update(refused=True, status="refused", reason=error.reason, next_action=_NEXT[error.reason],
+                       exit_code=2 if error.reason in ("invalid_item", "invalid_arguments", "credential_like_text", "brief_outside_scope") else 1)
+        if error.blockers is not None:
+            payload["blockers"] = error.blockers
+    elif isinstance(error, storage.LockTimeoutError):
+        payload.update(refused=True, status="refused", reason="queue_lock_timeout", next_action=_NEXT["queue_lock_timeout"], exit_code=1)
+    elif error is not None:
+        payload.update(refused=True, status="refused", reason="queue_io_unavailable", next_action=_NEXT["queue_io_unavailable"], exit_code=1)
+    return _shown(payload)
+
+
 def _run(root, verb, now=None, caller=None, **arguments):
     moment = int(time.time()) if now is None else now
     # Invalid clocks never reach utc_stamp or acquire a descriptor.
@@ -703,42 +759,7 @@ def _run(root, verb, now=None, caller=None, **arguments):
                                   now=moment if valid_clock else 0)
     payload.update(refused=False, status="done", exit_code=0)
     try:
-        _require(valid_clock, "invalid_arguments")
-        include_done = arguments.pop("include_done", False)
-        _require(type(include_done) is bool, "invalid_arguments")
-        if verb == "add":
-            arguments["item"] = _item(arguments["item"])
-        if verb in ("claim", "release", "unclaim", "done"):
-            _require(_key(arguments.get("identifier")), "invalid_arguments")
-            expected = arguments.get("expect")
-            _require(type(expected) is str and len(expected) == 64 and _REVISION.fullmatch(expected) is not None, "invalid_arguments")
-        capabilities = arguments.get("capabilities")
-        _require(verb != "claim" or capabilities is not None, "invalid_arguments")
-        if capabilities is not None:
-            try:
-                _strings(capabilities)
-            except QueueRefusal:
-                raise QueueRefusal("invalid_arguments") from None
-        if verb in ("claim", "release", "unclaim", "done"):
-            lane = arguments.get("lane")
-            _require((lane is None and verb not in ("claim", "unclaim")) or _lane(lane), "invalid_arguments")
-        if verb == "unclaim":
-            _require(type(arguments.get("writer_stopped")) is bool, "invalid_arguments")
-            _require(arguments["writer_stopped"], "writer_not_stopped")
-            arguments["reason"] = _text(arguments.get("reason", ""), empty=True)
-        if verb == "claim":
-            lane, ttl = arguments.get("lane"), arguments.get("ttl_s")
-            _require(type(ttl) is int and 1 <= ttl <= team.MAX_TTL_S, "invalid_arguments")
-            try:
-                arguments["branch"] = _branch_name(arguments.get("branch"))
-            except QueueRefusal:
-                raise QueueRefusal("invalid_arguments") from None
-        write = verb not in ("list", "audit")
-        if write:
-            try:
-                caller = _text(team.default_owner() if caller is None else caller, 200 if verb == "unclaim" else 256)
-            except QueueRefusal:
-                raise QueueRefusal("invalid_arguments") from None
+        include_done, capabilities, write, caller = _arguments(verb, valid_clock, caller, arguments)
         root = _root(root)
         with locked(root, timeout=5.0) if write else nullcontext():
             state = _state(root)
@@ -746,10 +767,10 @@ def _run(root, verb, now=None, caller=None, **arguments):
                 raise team_claims.recovery_refusal(state["unclaim"])
             if verb == "unclaim":
                 payload.update(_unclaim(root, state, moment, caller, arguments))
-                return _shown(payload)
+                return _project(payload)
             if verb == "compact":
                 payload.update(_compact(root, state, caller))
-                return _shown(payload)
+                return _project(payload)
             # Parse each stored queue scope once for this observation. PathSet
             # values stay separate from the JSON state that will be published.
             queue_paths = {key: team_paths.claim_paths(row["item"]["paths"])
@@ -763,16 +784,10 @@ def _run(root, verb, now=None, caller=None, **arguments):
                 payload.update(_mutate(root, state, verb, moment, caller, lanes, found, queue_paths, arguments))
             else:
                 payload.update(_observe(root, state, verb, moment, lanes, found, queue_paths, capabilities, include_done, leases_checked))
-    except (QueueRefusal, team_claims.ClaimRefusal) as error:
-        payload.update(refused=True, status="refused", reason=error.reason, next_action=_NEXT[error.reason],
-                       exit_code=2 if error.reason in ("invalid_item", "invalid_arguments", "credential_like_text", "brief_outside_scope") else 1)
-        if error.blockers is not None:
-            payload["blockers"] = error.blockers
-    except storage.LockTimeoutError:
-        payload.update(refused=True, status="refused", reason="queue_lock_timeout", next_action=_NEXT["queue_lock_timeout"], exit_code=1)
-    except (OSError, ValueError, RuntimeError, gitsafe.GitError):
-        payload.update(refused=True, status="refused", reason="queue_io_unavailable", next_action=_NEXT["queue_io_unavailable"], exit_code=1)
-    return _shown(payload)
+    except (QueueRefusal, team_claims.ClaimRefusal, storage.LockTimeoutError,
+            OSError, ValueError, RuntimeError, gitsafe.GitError) as error:
+        return _project(payload, error)
+    return _project(payload)
 
 
 def add(root, item, *, now=None, caller=None):
