@@ -36,7 +36,8 @@ the committed config is limited to 64 KiB.
   approval or qualifying tier-A review. Configure `allowed_signers` on the base;
   without a usable key or qualifying review, a flagged change cannot pass.
 - `review` lists both kinds of change and passes the approval gate with
-  `owner_review_required: true`. The owner's merge supplies the review. Restrict
+  the policy boolean `owner_review_required: true`. Individual policy changes
+  appear separately in the `owner_review_findings` array. The owner's merge supplies the review. Restrict
   pushes and merges with forge rules and separate the agent's credentials: this
   CI notice does not enforce who can merge.
 - `none` lists both kinds of change without blocking on approval.
@@ -90,8 +91,15 @@ Selectors are bounded before Git execution; invalid selector text is refused,
 and malformed Git classification output returns `invalid_approval_policy`.
 An explicit branch that disagrees with the event's PR base or push branch is
 unknown; an explicit branch on a tag push is unknown too.
-Reports add `approval_mode`, `approval_target`, `owner_review_required` and
+Reports add `approval_mode`, `approval_target`, the boolean `owner_review_required` and
 `policy_source: base` when a base policy exists (`head` when the head tightens it).
+`owner_review_required` is true only for `review`, false for `none` or `signature`,
+and absent when no approval mode is known. When a signer-less base's policy is
+introduced or lowered, `owner_review_findings` holds rows with string `code`,
+`rule` (the target pattern), `path` and `message` fields, in target order; it is
+absent when there are no rows. These advisory rows never replace the boolean.
+Each human format names the bounded, redacted target; SARIF keeps these rows as
+note notifications. The report schema remains `aegis.rule_integrity/v1`.
 Other CI checks still block and name their blocking cause. CI uses one event
 snapshot for the base, head, target and review identity.
 For PR and push events, files over 25 MiB are refused before JSON parsing
