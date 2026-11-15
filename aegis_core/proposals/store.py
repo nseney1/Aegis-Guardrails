@@ -335,7 +335,7 @@ class ProposalStore:
         raw = _read(directory, pid + ".md", MAX_PROPOSAL_BYTES, durable=durable)
         return stored(parse_proposal(raw, pid), raw)
 
-    def _ancestry(self, directory, proposal):
+    def _ancestry(self, directory, proposal, snapshot=None):
         visiting, seen = set(), set()
 
         def visit(p):
@@ -347,7 +347,9 @@ class ProposalStore:
             seen.add(p.id)
             for pid in p.parent_proposals:
                 try:
-                    parent = self._read(directory, pid).proposal
+                    parent = snapshot.get(pid) if snapshot is not None else self._read(directory, pid).proposal
+                    if parent is None:
+                        raise ProposalError("ancestry")
                 except (FileNotFoundError, ProposalError):
                     raise ProposalError("ancestry") from None
                 if (not set(parent.source_lineage) <= set(p.source_lineage)
@@ -372,16 +374,16 @@ class ProposalStore:
     def _private_rows(self, reconcile=None):
         try:
             with self._private() as (directory, name):
-                raw = _optional_read(directory, name, MAX_LOG_BYTES) or b""
-                rows = _log_rows(raw)
+                raw = _optional_read(directory, name, MAX_LOG_BYTES)
+                rows = _log_rows(raw or b"")
                 if reconcile is not None and any(row["operation_id"] == reconcile for row in rows):
                     if _read(directory, name, MAX_LOG_BYTES, durable=True) != raw:
                         raise ProposalError("stale")
-                return rows
+                return rows, raw
         except FileNotFoundError:
-            return []
+            return [], None
 
-    def _rows(self, directory, reconcile=None):
+    def _rows(self, directory, reconcile=None, snapshot=False):
         rows = []
         try:
             with _directory(directory, "decisions") as decisions:
@@ -396,12 +398,14 @@ class ProposalStore:
                     rows.append(row)
         except FileNotFoundError:
             pass
-        private = self._private_rows(reconcile=reconcile)
+        private, raw = self._private_rows(reconcile=reconcile)
         # Both lists were bounded independently before allocation/append.
         rows.extend(private)
         if len({r["operation_id"] for r in rows}) != len(rows):
             raise ProposalError("decision")
-        return sorted(rows, key=lambda row: (row["ts"], row["operation_id"]))
+        rows.sort(key=lambda row: (row["ts"], row["operation_id"]))
+        # Only reuse these bytes while the caller holds the shared log lock.
+        return (rows, raw, len(private)) if snapshot else rows
 
     def read(self, proposal_id):
         pid = checked_id(proposal_id)
@@ -413,8 +417,9 @@ class ProposalStore:
     def list(self):
         with self._session() as directory:
             result = [self._read(directory, checked_id(name[:-3])) for name in _names(directory, ".md")]
+            snapshot = {saved.proposal.id: saved.proposal for saved in result}
             for saved in result:
-                self._ancestry(directory, saved.proposal)
+                self._ancestry(directory, saved.proposal, snapshot=snapshot)
             return result
 
     def _terminal(self, proposal, rows):
@@ -590,7 +595,7 @@ class ProposalStore:
             # file_lock is reentrant by inode. Keep the shared log lock from the
             # authoritative history/quota read through either publication path.
             with self._private(create=True) as (private_dir, name):
-                rows = self._rows(directory, reconcile=operation_id)
+                rows, previous_bytes, private_count = self._rows(directory, reconcile=operation_id, snapshot=True)
                 for previous in rows:
                     if previous["operation_id"] == operation_id:
                         if {k: v for k, v in previous.items() if k != "ts"} != {k: v for k, v in row.items() if k != "ts"}:
@@ -602,9 +607,8 @@ class ProposalStore:
                 if len(raw) > MAX_ROW_BYTES:
                     raise ProposalError("too_large")
                 if private:
-                    previous_bytes = _optional_read(private_dir, name, MAX_LOG_BYTES)
                     existing = previous_bytes or b""
-                    if len(_log_rows(existing)) >= MAX_ROWS or len(existing) + len(raw) > MAX_LOG_BYTES:
+                    if private_count >= MAX_ROWS or len(existing) + len(raw) > MAX_LOG_BYTES:
                         raise ProposalError("too_large")
                     # Keep the private JSONL container with a separate proposal event.
                     if existing and not existing.endswith(b"\n"):

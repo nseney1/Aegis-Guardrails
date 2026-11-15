@@ -11,7 +11,9 @@ import hashlib
 import os
 import re
 import stat
+import sys
 import threading
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -44,6 +46,7 @@ _KINDS = tuple(name for name, _pattern in PATTERNS)
 REFUSALS = frozenset(("limit", "oversize", "unreadable", "symlink", "irregular", "multiline"))
 _REDACTED = b"[REDACTED]"
 REPO_TESTS = Path(__file__).resolve().parents[1]
+_PATH_ERRORS = (OSError, UnicodeError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,8 @@ class Finding:
 class ScanResult:
     refusal: Optional[str]
     findings: Tuple[Finding, ...]
+    location: Optional[str] = None
+    byte_limit: Optional[int] = None
 
     def public_text(self) -> str:
         if self.refusal is not None:
@@ -94,7 +99,10 @@ def _public_path_text(text: str):
         return None, "irregular"
     if "\n" in canonical or "\r" in canonical or "\x00" in canonical:
         return None, "multiline"
-    redacted = _redact(canonical)
+    try:
+        redacted = _redact(canonical)
+    except UnicodeError:
+        return None, "irregular"
     if len(redacted) > MAX_REPORT_CHARS:
         redacted = redacted[:MAX_REPORT_CHARS]
     return redacted, None
@@ -103,9 +111,33 @@ def _public_path_text(text: str):
 def _public_path(root: str, path: str):
     try:
         relative = os.path.relpath(path, root)
-    except ValueError:
+        return _public_path_text(Path(relative).as_posix())
+    except (ValueError, TypeError, UnicodeError):
         return None, "irregular"
-    return _public_path_text(Path(relative).as_posix())
+
+
+def _path_basename(path):
+    try:
+        raw = os.fspath(path)
+        separators = b"/\\" if isinstance(raw, bytes) else "/\\"
+        name = os.path.basename(raw.rstrip(separators))
+        if isinstance(name, bytes):
+            name = name.decode(sys.getfilesystemencoding(), "surrogateescape")
+        return name or "."
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return "."
+
+
+def _refused(code, relative, max_bytes):
+    try:
+        public, path_code = _public_path_text(relative)
+    except UnicodeError:
+        public, path_code = None, "irregular"
+    if path_code:
+        public = "path-sha256=" + hashlib.sha256(
+            relative.encode("utf-8", "surrogatepass")).hexdigest()[:_DIGEST_CHARS]
+    limit = max_bytes if type(max_bytes) is int and 1 <= max_bytes <= MAX_FILE_BYTES else MAX_FILE_BYTES
+    return ScanResult(_refusal(code), (), public, limit)
 
 
 def _read_capped(path: str, max_bytes: int):
@@ -114,7 +146,7 @@ def _read_capped(path: str, max_bytes: int):
     try:
         with open(path, "rb") as handle:
             return handle.read(max_bytes + 1), None
-    except OSError:
+    except _PATH_ERRORS:
         return None, "unreadable"
 
 
@@ -187,58 +219,59 @@ def _collect(data, public, findings) -> Optional[str]:
     return None
 
 
-def _scan_file(path, root, max_bytes, read_file, stat_file, findings) -> Optional[str]:
+def _scan_file(path, root, relative, max_bytes, read_file, stat_file, findings) -> Optional[ScanResult]:
     try:
         info = stat_file(path)
-    except OSError:
-        return "unreadable"
+    except _PATH_ERRORS:
+        return _refused("unreadable", relative, max_bytes)
     if stat.S_ISLNK(info.st_mode):
-        return "symlink"
+        return _refused("symlink", relative, max_bytes)
     if not stat.S_ISREG(info.st_mode):
-        return "irregular"
+        return _refused("irregular", relative, max_bytes)
     if info.st_size > max_bytes:
-        return "oversize"
+        return _refused("oversize", relative, max_bytes)
     try:
         data, code = read_file(path, max_bytes)
-    except OSError:
-        return "unreadable"
+    except _PATH_ERRORS:
+        return _refused("unreadable", relative, max_bytes)
     if code:
-        return _refusal(code)
+        return _refused(code, relative, max_bytes)
     if not isinstance(data, (bytes, bytearray)):
-        return "unreadable"
+        return _refused("unreadable", relative, max_bytes)
     if len(data) > max_bytes:
-        return "oversize"
+        return _refused("oversize", relative, max_bytes)
     public, path_code = _public_path(root, path)
     if path_code:
-        return path_code
+        return _refused(path_code, relative, max_bytes)
     return _collect(data, public, findings)
 
 
-def _scan_tree(directory, root, max_bytes, read_file, stat_file, findings) -> Optional[str]:
+def _scan_tree(directory, root, relative, max_bytes, read_file, stat_file, findings) -> Optional[ScanResult]:
     try:
         entries = list(os.scandir(directory))
-    except OSError:
-        return "unreadable"
+    except _PATH_ERRORS:
+        return _refused("unreadable", relative or ".", max_bytes)
     cache_dir = os.path.basename(os.fspath(directory)) == "__pycache__"
     for entry in entries:
+        child = entry.name if not relative else relative + "/" + entry.name
         try:
             linked = entry.is_symlink()
             is_dir = entry.is_dir(follow_symlinks=False)
             is_file = entry.is_file(follow_symlinks=False)
-        except OSError:
-            return "unreadable"
+        except _PATH_ERRORS:
+            return _refused("unreadable", child, max_bytes)
         if linked:
-            return "symlink"
+            return _refused("symlink", child, max_bytes)
         if is_dir:
-            code = _scan_tree(entry.path, root, max_bytes, read_file, stat_file, findings)
+            code = _scan_tree(entry.path, root, child, max_bytes, read_file, stat_file, findings)
             if code:
                 return code
             continue
         if not is_file:
-            return "irregular"
+            return _refused("irregular", child, max_bytes)
         if cache_dir and entry.name.endswith(".pyc"):
             continue
-        code = _scan_file(entry.path, root, max_bytes, read_file, stat_file, findings)
+        code = _scan_file(entry.path, root, child, max_bytes, read_file, stat_file, findings)
         if code:
             return code
     return None
@@ -248,7 +281,7 @@ def _read_at(dir_fd, name, max_bytes):
     """Open name relative to dir_fd. O_NOFOLLOW refuses a swapped symlink; O_NONBLOCK refuses a FIFO."""
     try:
         fd = os.open(name, _file_flags(), dir_fd=dir_fd)
-    except OSError as exc:
+    except _PATH_ERRORS as exc:
         return None, _open_refusal(exc)
     try:
         try:
@@ -289,7 +322,7 @@ def _open_directory(name, parent_fd):
             fd = os.open(name, _directory_flags(True))
         else:
             fd = os.open(name, _directory_flags(True), dir_fd=parent_fd)
-    except OSError as exc:
+    except _PATH_ERRORS as exc:
         return None, _open_refusal(exc)
     try:
         info = os.fstat(fd)
@@ -305,35 +338,35 @@ def _open_directory(name, parent_fd):
     return fd, None
 
 
-def _scan_directory(dir_fd, relative, in_cache, max_bytes, findings) -> Optional[str]:
+def _scan_directory(dir_fd, relative, in_cache, max_bytes, findings) -> Optional[ScanResult]:
     try:
         iterator = os.scandir(dir_fd)
-    except OSError:
-        return "unreadable"
+    except _PATH_ERRORS:
+        return _refused("unreadable", relative or ".", max_bytes)
     try:
         try:
             entries = list(iterator)
-        except OSError:
-            return "unreadable"
+        except _PATH_ERRORS:
+            return _refused("unreadable", relative or ".", max_bytes)
     finally:
         iterator.close()
     for entry in entries:
         name = entry.name
+        child = name if not relative else relative + "/" + name
         if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
-            return "irregular"
+            return _refused("irregular", child, max_bytes)
         try:
             info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        except OSError:
-            return "unreadable"
+        except _PATH_ERRORS:
+            return _refused("unreadable", child, max_bytes)
         if stat.S_ISLNK(info.st_mode):
-            return "symlink"
+            return _refused("symlink", child, max_bytes)
         if "\n" in name or "\r" in name:
-            return "multiline"
-        child = name if not relative else relative + "/" + name
+            return _refused("multiline", child, max_bytes)
         if stat.S_ISDIR(info.st_mode):
             nested, code = _open_directory(name, dir_fd)
             if code:
-                return code
+                return _refused(code, child, max_bytes)
             try:
                 code = _scan_directory(nested, child, name == "__pycache__", max_bytes, findings)
             finally:
@@ -342,20 +375,20 @@ def _scan_directory(dir_fd, relative, in_cache, max_bytes, findings) -> Optional
                 return code
             continue
         if not stat.S_ISREG(info.st_mode):
-            return "irregular"
+            return _refused("irregular", child, max_bytes)
         if in_cache and name.endswith(".pyc"):
             continue
         if info.st_size > max_bytes:
-            return "oversize"
+            return _refused("oversize", child, max_bytes)
         public, path_code = _public_path_text(child)
         if path_code:
-            return path_code
+            return _refused(path_code, child, max_bytes)
         data, code = _read_at(dir_fd, name, max_bytes)
         if code:
-            return code
+            return _refused(code, child, max_bytes)
         code = _collect(data, public, findings)
         if code:
-            return code
+            return _refused(code, child, max_bytes)
     return None
 
 
@@ -375,44 +408,44 @@ def _scan_anchored(root, max_bytes) -> ScanResult:
         else:
             try:
                 parent_fd = os.open(parent if parent else ".", _directory_flags(False))
-            except OSError:
-                return ScanResult("unreadable", ())
+            except _PATH_ERRORS:
+                return _refused("unreadable", name or ".", max_bytes)
         try:
             if parent_fd is None:
                 info = os.lstat(path)
             else:
                 info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError:
-            return ScanResult("unreadable", ())
+        except _PATH_ERRORS:
+            return _refused("unreadable", name or ".", max_bytes)
         if stat.S_ISLNK(info.st_mode):
-            return ScanResult("symlink", ())
+            return _refused("symlink", name or ".", max_bytes)
         findings = []
         if stat.S_ISDIR(info.st_mode):
             root_fd, code = _open_directory(path if parent_fd is None else name, parent_fd)
             if code:
-                return ScanResult(code, ())
+                return _refused(code, ".", max_bytes)
             code = _scan_directory(
                 root_fd, "", os.path.basename(path) == "__pycache__", max_bytes, findings)
         elif stat.S_ISREG(info.st_mode):
             if info.st_size > max_bytes:
-                return ScanResult("oversize", ())
+                return _refused("oversize", name, max_bytes)
             public, path_code = _public_path_text(name)
             if path_code:
-                return ScanResult(path_code, ())
+                return _refused(path_code, name, max_bytes)
             if parent_fd is None:
-                return ScanResult("unreadable", ())
+                return _refused("unreadable", name, max_bytes)
             data, code = _read_at(parent_fd, name, max_bytes)
             if code:
-                return ScanResult(code, ())
+                return _refused(code, name, max_bytes)
             code = _collect(data, public, findings)
         else:
-            code = "irregular"
+            code = _refused("irregular", name or ".", max_bytes)
         if code:
-            return ScanResult(_refusal(code), ())
+            return code
         findings.sort(key=lambda item: (item.path, item.line, item.kind, item.digest, item.length))
         return ScanResult(None, tuple(findings))
-    except OSError:
-        return ScanResult("unreadable", ())
+    except _PATH_ERRORS:
+        return _refused("unreadable", name or ".", max_bytes)
     finally:
         if root_fd is not None:
             _close(root_fd)
@@ -423,27 +456,34 @@ def _scan_anchored(root, max_bytes) -> ScanResult:
 def scan(root, max_bytes=MAX_FILE_BYTES, read_file=None, stat_file=None) -> ScanResult:
     """Scan source bytes under root. A refusal is a code, never an exception."""
     if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FILE_BYTES:
-        return ScanResult("limit", ())
+        return _refused("limit", _path_basename(root), MAX_FILE_BYTES)
+    name = _path_basename(root)
+    try:
+        target = os.fsdecode(os.fspath(root))
+    except (OSError, TypeError, ValueError, UnicodeError):
+        return _refused("unreadable", name, max_bytes)
     if read_file is None and stat_file is None and _descriptor_opens_supported():
-        return _scan_anchored(root, max_bytes)
+        try:
+            return _scan_anchored(target, max_bytes)
+        except _PATH_ERRORS:
+            return _refused("unreadable", name, max_bytes)
     reader = _read_capped if read_file is None else read_file
     stater = os.lstat if stat_file is None else stat_file
     try:
-        info = stater(os.fspath(root))
-    except OSError:
-        return ScanResult("unreadable", ())
+        info = stater(target)
+    except _PATH_ERRORS:
+        return _refused("unreadable", name, max_bytes)
     if stat.S_ISLNK(info.st_mode):
-        return ScanResult("symlink", ())
+        return _refused("symlink", name, max_bytes)
     findings = []
-    target = os.fspath(root)
     if stat.S_ISREG(info.st_mode):
-        code = _scan_file(target, os.path.dirname(target) or ".", max_bytes, reader, stater, findings)
+        code = _scan_file(target, os.path.dirname(target) or ".", name, max_bytes, reader, stater, findings)
     elif stat.S_ISDIR(info.st_mode):
-        code = _scan_tree(target, target, max_bytes, reader, stater, findings)
+        code = _scan_tree(target, target, "", max_bytes, reader, stater, findings)
     else:
-        code = "irregular"
+        code = _refused("irregular", name, max_bytes)
     if code:
-        return ScanResult(_refusal(code), ())
+        return code
     findings.sort(key=lambda item: (item.path, item.line, item.kind, item.digest, item.length))
     return ScanResult(None, tuple(findings))
 
@@ -530,7 +570,9 @@ def test_allowlisted_aws_example_is_not_detected(tmp_path):
 
 
 def _require_clean(result) -> None:
-    assert result.refusal is None
+    if result.refusal is not None:
+        pytest.fail("%s: %s (max_bytes=%s)" % (
+            _refusal(result.refusal), result.location, result.byte_limit))
     report = result.public_text()
     if report:
         pytest.fail(report)
@@ -829,35 +871,121 @@ def test_symlinked_directory_is_not_followed(tmp_path):
     _assert_hidden(result.public_text(), secret)
 
 
-def _scan_returned(root):
+def _release_fifo(pipe, worker, timeout, open_fifo=None):
+    opener = os.open if open_fifo is None else open_fifo
+    deadline = time.monotonic() + timeout
+    while worker.is_alive():
+        try:
+            fd = opener(pipe, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno != errno.ENXIO:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            worker.join(min(0.01, remaining))
+        else:
+            try:
+                os.write(fd, b"x")
+            except BaseException:
+                _close(fd)
+                raise
+            return fd
+    return None
+
+
+def _scan_returned(root, release, timeout=0.2, reap_timeout=5, **scan_kwargs):
     found = []
     errors = []
 
     def run():
         try:
-            found.append(scan(root))
+            found.append(scan(root, **scan_kwargs))
         except BaseException as exc:
             errors.append(exc)
 
-    worker = threading.Thread(target=run)
+    worker = threading.Thread(target=run, daemon=True)
     worker.start()
-    worker.join(5)
-    blocked = worker.is_alive()
-    assert blocked is False
+    try:
+        worker.join(timeout)
+        blocked = worker.is_alive()
+    finally:
+        released_fd = None
+        deadline = time.monotonic() + reap_timeout
+        try:
+            released_fd = release(worker, max(0, deadline - time.monotonic()))
+        finally:
+            try:
+                worker.join(max(0, deadline - time.monotonic()))
+            finally:
+                if released_fd is not None:
+                    _close(released_fd)
+    assert not worker.is_alive(), "scan worker was not reaped"
+    if blocked:
+        raise AssertionError("scan exceeded its bound")
     if errors:
         raise errors[0]
     assert len(found) == 1
     return found[0]
 
 
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_watchdog_reaps_a_blocked_reader_before_failing(tmp_path, monkeypatch, concurrency):
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO control needs POSIX")
+    roots = []
+    for index in range(concurrency):
+        root = tmp_path / str(index)
+        root.mkdir()
+        os.mkfifo(root / "pipe")
+        roots.append(root)
+    workers = []
+
+    def blocked_scan(root):
+        workers.append(threading.current_thread())
+        with open(root / "pipe", "rb") as handle:
+            handle.read(1)
+        return ScanResult(None, ())
+
+    def control(root):
+        with pytest.raises(AssertionError, match="^scan exceeded its bound$"):
+            _scan_returned(root, release=lambda worker, budget: _release_fifo(root / "pipe", worker, budget))
+
+    monkeypatch.setattr("tests.contract.test_no_credential_literals.scan", blocked_scan)
+    for _attempt in range(2):
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(control, root) for root in roots]
+            for future in futures:
+                future.result(timeout=5)
+        assert all(worker.daemon for worker in workers)
+        assert all(not worker.is_alive() for worker in workers)
+
+
+def test_watchdog_releases_and_reaps_on_scan_error(tmp_path, monkeypatch):
+    workers = []
+    released = []
+
+    def broken_scan(root):
+        workers.append(threading.current_thread())
+        raise OSError("controlled scan failure")
+
+    monkeypatch.setattr("tests.contract.test_no_credential_literals.scan", broken_scan)
+    with pytest.raises(OSError, match="^controlled scan failure$"):
+        _scan_returned(tmp_path, release=lambda worker, budget: released.append(True))
+    assert released == [True]
+    assert workers[0].daemon is True
+    assert workers[0].is_alive() is False
+
+
 def test_fifo_leaf_is_refused_without_blocking(tmp_path, monkeypatch):
-    if not hasattr(os, "mkfifo"):
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
         pytest.skip("mkfifo is unavailable")
     secret = _planted("anthropic")
     folder = tmp_path / "folder"
     folder.mkdir()
-    os.mkfifo(os.fspath(folder / "pipe"))
-    result = _scan_returned(folder)
+    pipe = folder / "pipe"
+    os.mkfifo(os.fspath(pipe))
+    result = _scan_returned(folder, release=lambda worker, budget: _release_fifo(pipe, worker, budget))
     assert result.refusal == "irregular"
     assert result.findings == ()
     assert result.public_text() == "irregular"
@@ -867,7 +995,7 @@ def test_fifo_leaf_is_refused_without_blocking(tmp_path, monkeypatch):
         "tests.contract.test_no_credential_literals._descriptor_opens_supported",
         _descriptors_unavailable,
     )
-    fallback = _scan_returned(folder)
+    fallback = _scan_returned(folder, release=lambda worker, budget: _release_fifo(pipe, worker, budget))
     assert _descriptors_unavailable.called is True
     assert fallback.refusal == "irregular"
     assert fallback.findings == ()
@@ -915,3 +1043,262 @@ def test_descriptor_scan_closes_every_file_descriptor(tmp_path):
     after = len(os.listdir("/proc/self/fd"))
     assert result.refusal is None and result.findings == ()
     assert after == before
+
+
+@pytest.mark.parametrize("walk", ["anchored", "fallback"])
+@pytest.mark.parametrize("fault", ["oversize", "unreadable", "symlink", "fifo"])
+def test_refusal_gate_names_the_nested_file_and_limit(tmp_path, monkeypatch, walk, fault):
+    if walk == "anchored" and not _descriptor_opens_supported():
+        pytest.skip("descriptor walk is unavailable")
+    if walk == "fallback":
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    secret = _planted("github")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    path = nested / "plant.txt"
+    if fault == "symlink":
+        outside = tmp_path / "outside.txt"
+        outside.write_text(secret, encoding="ascii")
+        symlink_or_skip(outside, path)
+        outside.unlink()
+    elif fault == "fifo":
+        if os.name != "posix" or not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO needs POSIX")
+        os.mkfifo(path)
+    else:
+        path.write_bytes(secret.encode("ascii") if fault == "oversize" else b"ok")
+
+    def broken_reader(*args):
+        raise OSError(13, secret)
+
+    reader = None
+    if fault == "unreadable":
+        if walk == "anchored":
+            monkeypatch.setattr(
+                "tests.contract.test_no_credential_literals._read_at",
+                lambda *args: (None, "unreadable"),
+            )
+        else:
+            reader = broken_reader
+    code = "irregular" if fault == "fifo" else fault
+    for _attempt in range(2):
+        if fault == "fifo":
+            result = _scan_returned(
+                tmp_path, release=lambda worker, budget: _release_fifo(path, worker, budget),
+                max_bytes=8, read_file=reader,
+            )
+        else:
+            result = scan(tmp_path, max_bytes=8, read_file=reader)
+        assert result.public_text() == code
+        with pytest.raises(pytest.fail.Exception) as caught:
+            _require_clean(result)
+        assert str(caught.value) == code + ": nested/plant.txt (max_bytes=8)"
+        _assert_hidden(str(caught.value), secret)
+        _assert_hidden(repr(result), secret)
+
+
+@pytest.mark.parametrize("walk", ["anchored", "fallback"])
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_refusal_location_reuses_path_safety_rules(tmp_path, monkeypatch, walk, unsafe):
+    if walk == "anchored" and not _descriptor_opens_supported():
+        pytest.skip("descriptor walk is unavailable")
+    if walk == "fallback":
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    if unsafe and os.name != "posix":
+        pytest.skip("multiline filenames need POSIX")
+    secret = _planted("google")
+    name = "cafe\u0301-" + "n" * 140 + secret + ("\nnext" if unsafe else "-tail")
+    (tmp_path / name).write_bytes(b"too large")
+    result = scan(tmp_path, max_bytes=1)
+    assert result.public_text() == ("multiline" if unsafe and walk == "anchored" else "oversize")
+    with pytest.raises(pytest.fail.Exception) as caught:
+        _require_clean(result)
+    message = str(caught.value)
+    if unsafe:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:_DIGEST_CHARS]
+        assert "path-sha256=" + digest in message
+        assert "\n" not in message and "\r" not in message
+    else:
+        public, code = _public_path_text(name)
+        assert code is None and len(public) == MAX_REPORT_CHARS
+        assert public.startswith("caf\u00e9-") and "[REDACTED]" in public
+        assert public in message
+    assert "max_bytes=1" in message
+    _assert_hidden(message, secret)
+    _assert_hidden(repr(result), secret)
+
+
+@pytest.mark.parametrize("walk", ["anchored", "fallback"])
+def test_refusal_location_is_local_to_each_concurrent_scan_and_retry(tmp_path, monkeypatch, walk):
+    if walk == "anchored" and not _descriptor_opens_supported():
+        pytest.skip("descriptor walk is unavailable")
+    if walk == "fallback":
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    roots = []
+    for index in range(3):
+        root = tmp_path / str(index)
+        root.mkdir()
+        (root / (str(index) + ".txt")).write_bytes(b"oversize")
+        roots.append(root)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(scan, root, max_bytes=1) for root in roots]
+        results = [future.result(timeout=5) for future in futures]
+    for index, (root, result) in enumerate(zip(roots, results)):
+        with pytest.raises(pytest.fail.Exception) as caught:
+            _require_clean(result)
+        assert str(caught.value) == "oversize: %s.txt (max_bytes=1)" % index
+        assert scan(root, max_bytes=1) == result
+        (root / (str(index) + ".txt")).write_bytes(b"x")
+        _require_clean(scan(root, max_bytes=1))
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_root_refusals_carry_a_safe_location_and_applicable_limit(tmp_path, monkeypatch, fallback):
+    if fallback:
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    path = tmp_path / "missing.txt"
+    for limit, code, applicable in [(8, "unreadable", 8), (0, "limit", MAX_FILE_BYTES)]:
+        result = scan(path, max_bytes=limit)
+        assert result.public_text() == code
+        with pytest.raises(pytest.fail.Exception) as caught:
+            _require_clean(result)
+        assert str(caught.value) == "%s: missing.txt (max_bytes=%s)" % (code, applicable)
+    path.write_bytes(b"oversize")
+    with pytest.raises(pytest.fail.Exception, match=r"^oversize: missing.txt \(max_bytes=1\)$"):
+        _require_clean(scan(path, max_bytes=1))
+
+
+def test_unencodable_refusal_location_is_fingerprinted(tmp_path):
+    secret = _planted("github")
+    name = "bad-\ud800-" + secret
+    result = scan(tmp_path / name, max_bytes=0)
+    assert result.public_text() == "limit"
+    digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:_DIGEST_CHARS]
+    with pytest.raises(pytest.fail.Exception) as caught:
+        _require_clean(result)
+    assert str(caught.value) == "limit: path-sha256=%s (max_bytes=%s)" % (digest, MAX_FILE_BYTES)
+    _assert_hidden(str(caught.value), secret)
+    _assert_hidden(repr(result), secret)
+
+
+def test_watchdog_reaps_a_reader_arriving_after_the_first_release_attempt(tmp_path, monkeypatch):
+    if os.name != "posix" or not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO control needs POSIX")
+    pipe = tmp_path / "pipe"
+    os.mkfifo(pipe)
+    allow_reader = threading.Event()
+    workers = []
+    attempts = []
+    opened = []
+    observed = []
+
+    def late_scan(root, max_bytes):
+        workers.append(threading.current_thread())
+        assert allow_reader.wait(2)
+        with open(pipe, "rb") as handle:
+            data = handle.read(1)
+            held = stat.S_ISFIFO(os.fstat(opened[0]).st_mode)
+            observed.append((root, max_bytes, data, held))
+        return ScanResult(None, ())
+
+    def observed_open(path, flags):
+        attempts.append(True)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            assert exc.errno == errno.ENXIO
+            allow_reader.set()
+            raise
+        opened.append(fd)
+        return fd
+
+    def release(worker, budget):
+        return _release_fifo(pipe, worker, budget, open_fifo=observed_open)
+
+    monkeypatch.setattr("tests.contract.test_no_credential_literals.scan", late_scan)
+    try:
+        with pytest.raises(AssertionError, match="^scan exceeded its bound$"):
+            _scan_returned(tmp_path, release=release, timeout=0.05, reap_timeout=2, max_bytes=8)
+    finally:
+        allow_reader.set()
+        for worker in workers:
+            if worker.is_alive():
+                fd = os.open(pipe, os.O_RDWR | os.O_NONBLOCK)
+                try:
+                    os.write(fd, b"x")
+                    worker.join(2)
+                finally:
+                    _close(fd)
+    assert len(attempts) >= 2 and len(opened) == 1
+    assert observed == [(tmp_path, 8, b"x", True)]
+    assert all(worker.daemon and not worker.is_alive() for worker in workers)
+    with pytest.raises(OSError) as caught:
+        os.fstat(opened[0])
+    assert caught.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("walk", ["anchored", "fallback"])
+@pytest.mark.parametrize("kind", ["limit", "file", "directory", "missing"])
+def test_bytes_paths_return_fixed_codes_without_exposing_names(tmp_path, monkeypatch, walk, kind):
+    if walk == "anchored" and not _descriptor_opens_supported():
+        pytest.skip("descriptor walk is unavailable")
+    if walk == "fallback":
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    secret = _planted("github")
+    folder = tmp_path / "tree"
+    folder.mkdir()
+    path = folder / secret
+    if kind != "missing":
+        path.write_bytes(b"oversize")
+    root = folder if kind == "directory" else path
+    limit = 0 if kind == "limit" else 1
+    expected = "limit" if kind == "limit" else "unreadable" if kind == "missing" else "oversize"
+    for _attempt in range(2):
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(scan, os.fsencode(root), max_bytes=limit) for _ in range(3)]
+            results = [future.result(timeout=5) for future in futures]
+        for result in results:
+            assert result.public_text() == expected
+            with pytest.raises(pytest.fail.Exception) as caught:
+                _require_clean(result)
+            _assert_hidden(str(caught.value), secret)
+            _assert_hidden(repr(result), secret)
+    path.write_bytes(b"x")
+    _require_clean(scan(os.fsencode(root), max_bytes=8))
+
+
+@pytest.mark.parametrize("walk", ["anchored", "fallback"])
+def test_unencodable_valid_limit_path_returns_an_opaque_refusal(tmp_path, monkeypatch, walk):
+    if walk == "anchored" and not _descriptor_opens_supported():
+        pytest.skip("descriptor walk is unavailable")
+    if walk == "fallback":
+        monkeypatch.setattr(
+            "tests.contract.test_no_credential_literals._descriptor_opens_supported",
+            _descriptors_unavailable,
+        )
+    secret = _planted("github")
+    name = "bad-\ud800-" + secret
+    digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:_DIGEST_CHARS]
+    for _attempt in range(2):
+        result = scan(tmp_path / name, max_bytes=8)
+        assert result.public_text() == "unreadable"
+        with pytest.raises(pytest.fail.Exception) as caught:
+            _require_clean(result)
+        assert str(caught.value) == "unreadable: path-sha256=%s (max_bytes=8)" % digest
+        _assert_hidden(str(caught.value), secret)
+        _assert_hidden(repr(result), secret)
