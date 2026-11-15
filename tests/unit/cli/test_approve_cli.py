@@ -80,6 +80,47 @@ def test_unknown_base_selector_does_not_claim_signature_is_unneeded(tmp_path, _p
 
 
 @needs_git
+@pytest.mark.parametrize("command,fmt", [("check", "text"), ("check", "json"), ("check", "github"),
+                                      ("check", "sarif"), ("approve", "text"), ("approve", "json")])
+@pytest.mark.parametrize("selector", ["missing;id;", "missing`id`", "missing$(id)", "missing space", "missing'quote",
+                                    'missing"quote', "développement", "-missing", "ghp_" + "a" * 36,
+                                    "o'$(id)", "foo&bar", "foo|bar", "foo>bar"],
+                         ids=["semicolon", "backtick", "substitution", "space", "single-quote", "double-quote",
+                              "unicode", "leading-hyphen", "secret", "combined-substitution", "ampersand",
+                              "pipe", "redirect"])
+def test_unresolved_base_keeps_unsafe_value_in_separate_sentence(tmp_path, _policy_environment, capsys,
+                                                               command, fmt, selector):
+    repo = hg.make_repo(tmp_path)
+    args = [command, "--workspace", str(repo.root), "--base=" + selector]
+    if command == "check":
+        args += ["--ci", "--no-exec", "--format", fmt]
+    elif fmt == "json":
+        args += ["--json"]
+    for _ in range(2):
+        assert cli.main(args) == 1
+        captured = capsys.readouterr()
+        if fmt == "json":
+            document = json.loads(captured.out)
+            assert document["code"] == ("base_unavailable" if command == "check" else "no_base")
+            instruction = document["next_action"] if command == "check" else document["reason"]
+        else:
+            if fmt == "sarif":
+                notification = json.loads(captured.out)["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]
+                assert notification["message"]["text"] == captured.err.removeprefix("Error: ").rstrip("\n")
+            else:
+                assert captured.out == ""
+            instruction = captured.err
+        assert "full commit id. Base selector: " in instruction
+        assert "ghp_" + "a" * 36 not in instruction
+        label = instruction.split("Base selector: ", 1)[1].rstrip().removesuffix(".")
+        assert not any(char in label for char in "&$`;|>"), label
+        if selector == "o'$(id)":
+            assert label == r"o\x27\x24\x28id\x29"
+        elif selector == "foo&bar":
+            assert label == r"foo\x26bar"
+
+
+@needs_git
 @pytest.mark.parametrize("selector", ["main", "origin/main", "auto-local", "auto-remote"])
 @pytest.mark.parametrize("pair", ["security", "correctness", "reverse", "review"])
 def test_approve_and_ci_use_the_same_branch_policy_despite_a_tag(tmp_path, _policy_environment, capsys, selector, pair):
@@ -112,7 +153,9 @@ def test_approve_and_ci_use_the_same_branch_policy_despite_a_tag(tmp_path, _poli
         rc = cli.main(["check", "--ci", "--workspace", str(repo.root), *extra, "--no-exec", "--json"])
         check = json.loads(capsys.readouterr().out)
         assert rc == (1 if expected_mode == "signature" else 0) and check["scope"]["base"] == expected_base
-        assert check["approval_mode"] == expected_mode and check["owner_review_required"] == (expected_mode == "review")
+        assert check["approval_mode"] == expected_mode
+        assert check["owner_review_required"]
+        assert all(row["code"] == "approval_mode_lowered" for row in check["owner_review_required"])
         assert repo.head() == head
 
 
@@ -345,6 +388,76 @@ def review_repo(tmp_path, monkeypatch):
     return repo
 
 
+@pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
+def test_successful_json_receipt_redacts_its_base_selector(review_repo, monkeypatch, capsys, exempt):
+    from aegis_cli import approve
+
+    token = "ghp_" + "a" * 36
+    selector = "refs/heads/" + token
+    review_repo.git("update-ref", selector, "main")
+    monkeypatch.setattr(human_gate, "check_key_custody", lambda top: human_gate.KeyCustody("agent", "protected key", True))
+    monkeypatch.setattr(approve, "input", lambda prompt="": "y", raising=False)
+    monkeypatch.setattr(human_gate, "signed_empty_commit", lambda *args, **kwargs: "a" * 40)
+    verdict = lambda *args: human_gate.Approval(True, "ok", "verified", "a" * 40)
+    monkeypatch.setattr(human_gate, "verify_approval", verdict)
+    monkeypatch.setattr(human_gate, "verify_test_exemption", verdict)
+    argv = ["approve", "--workspace", str(review_repo.root), "--base", selector, "--json"]
+    if exempt:
+        argv += ["--exempt-test", "HEAD", "--reason", "checked by hand"]
+    assert cli.main(argv) == 0
+    captured = capsys.readouterr()
+    assert token not in captured.out + captured.err
+    assert "REDACTED" in json.loads(captured.out)["base"]
+
+
+@pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
+@pytest.mark.parametrize("use_json", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("attack", ["$(gm1b)", "`gm1b`", ";gm1b", "&gm1b", "|gm1b", ">gm1b", "\ngm1b",
+                                  "(gm1b)", "gm1b)", "'gm1b'", '"gm1b"'],
+                         ids=["substitution", "backtick", "semicolon", "ampersand", "pipe", "redirect", "newline",
+                              "parentheses", "close-parenthesis", "single-quote", "double-quote"])
+def test_approval_output_guard_covers_subjects_paths_and_review_streams(
+        review_repo, tmp_path, monkeypatch, capsys, exempt, use_json, attack):
+    from aegis_cli import approve
+
+    monkeypatch.setattr(human_gate, "check_key_custody", lambda top: human_gate.KeyCustody("hardware", "protected", False))
+    def decline(prompt=""):
+        print(prompt, end="")  # Exercise input's ordinary terminal prompt too.
+        return "n"
+    monkeypatch.setattr(approve, "input", decline, raising=False)
+    captures = []
+    for label, subject, path in (
+        ("control", "Fix the bug", ".aegis/rules/traps/trap-safe.md"),
+        ("attack", "Fix the bug " + attack, ".aegis/rules/traps/trap-$(id).md"),
+    ):
+        repo = hg.Repo(tmp_path / label, review_repo.home)
+        repo.write("README.md", "base\n")
+        repo.commit(subject)
+        repo.branch("work")
+        repo.write(path, hg.RULE)
+        fix = repo.commit("governance change")
+        args = ["approve", "--workspace", str(repo.root), "--base", "main"]
+        if exempt:
+            reason = attack if label == "attack" and "\n" not in attack else "safely"
+            args += ["--exempt-test", fix, "--reason", "Reviewed " + reason]
+        if use_json:
+            args.append("--json")
+        assert cli.main(args) == 1
+        captured = capsys.readouterr()
+        captures.append(captured)
+        review = captured.err if use_json else captured.out
+        if label == "control":
+            assert "Fix the bug" in review and path in review
+        else:
+            assert r"trap-\x24\x28id\x29.md" in review
+        if use_json:
+            assert json.loads(captured.out)["code"] == "declined"
+    # Markers identify hostile values without banning the template's own quotes,
+    # parentheses or other protocol punctuation.
+    for hostile in (captures[1].out, captures[1].err):
+        assert attack not in hostile and "$(id)" not in hostile, hostile
+
+
 @pytest.mark.parametrize("exempt", [False, True])
 @pytest.mark.parametrize("use_json", [False, True])
 def test_resolved_tag_review_redacts_its_selector(review_repo, monkeypatch, capsys, exempt, use_json):
@@ -487,7 +600,8 @@ def test_unterminated_key_name_preserves_custody_explanation_before_confirmation
         assert len(before_prompt) == 1
         review = before_prompt[0].err if use_json else before_prompt[0].out
         assert (before_prompt[0].out if use_json else before_prompt[0].err) == ""
-        assert f"  warning: {detail.replace(chr(27), '')}\n" in review
+        displayed = detail.replace(chr(27), "")
+        assert f"  warning: {displayed}\n" in review
         assert "\x1b" not in review
         if use_json:
             assert "[y/N]" in review
@@ -653,11 +767,11 @@ def test_missing_printable_base_refusal_keeps_fetch_guidance(review_repo, monkey
     if use_json:
         doc = json.loads(captured.out)
         assert doc["status"] == "refused" and doc["code"] == "no_base"
-        assert doc["reason"] == f"cannot resolve the base {base!r}; fetch it or pass the full commit id"
+        assert doc["reason"] == f"cannot resolve the base {base}; fetch it or pass the full commit id"
         assert captured.err == ""
     else:
         assert captured.out == ""
-        assert captured.err == "aegis approve: cannot resolve the base 'missingFORGED'; fetch it or pass the full commit id\n"
+        assert captured.err == "aegis approve: cannot resolve the base missingFORGED; fetch it or pass the full commit id\n"
 
 
 @pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
@@ -770,7 +884,8 @@ def test_review_identifies_resolved_base_and_sanitizes_subject(review_repo, monk
         after = capsys.readouterr()
         assert len(before_prompt) == 1
         review = before_prompt[0].err if use_json else before_prompt[0].out
-        label = f"{base or 'main'} (= {oid} {title})"
+        displayed = base or "main"
+        label = f"{displayed} (= {oid} {title})"
         if base == "other-base":
             label += f"; comparison starts at {main_commit}"
         assert (f"Base: {label}\n" if exempt else f"Governance changed since {label}: ") in review
@@ -788,7 +903,7 @@ def test_review_identifies_resolved_base_and_sanitizes_subject(review_repo, monk
                 assert "rules" in review and "workflows" in review and "aegis-state" in review
         if use_json:
             doc = json.loads(after.out)
-            assert doc["status"] == "approved" and doc["base"] == (base or "main")
+            assert doc["status"] == "approved" and doc["base"] == displayed
 
 
 @pytest.mark.parametrize("exempt", [False, True], ids=["governance", "exemption"])
@@ -909,7 +1024,11 @@ def test_review_escapes_all_remaining_nonprintable_classes(review_repo, monkeypa
     characters = ["\u202e", "\u2066", "\u2067", "\u2068", "\u2069", "\u200e", "\u200f", "\u200b",
                   "\u2028", "\u2029", "\u00a0", "\u00ad", "\U000e0001", "\ud800"]
     detail = "custody " + "|".join(characters) + ": trusted suffix"
-    expected = "custody " + "|".join(char.encode("unicode_escape").decode("ascii") for char in characters) + ": trusted suffix"
+    # The shared redactor canonicalizes whitespace. Other controls and the pipe
+    # separators are rendered as inert hexadecimal escapes by the prose variant.
+    expected = (r"custody \u202e\x7c\u2066\x7c\u2067\x7c\u2068\x7c\u2069"
+                r"\x7c\u200e\x7c\u200f\x7c\u200b\x7c \x7c \x7c \x7c\xad"
+                r"\x7c\U000e0001\x7c\ud800: trusted suffix")
     monkeypatch.setattr(human_gate, "check_key_custody", lambda top: human_gate.KeyCustody("agent", detail, True))
     before_prompt = []
 
@@ -1028,6 +1147,7 @@ def test_dynamic_approve_diagnostics_are_safe_to_display(review_repo, monkeypatc
                     assert doc["verified"] is False and doc["verification"]["code"] == detail
                 else:
                     assert doc["status"] == "refused" and doc["code"] == code
-                    assert detail in doc["reason"]
+                    assert r"boundaryFORGED line\u202e\u2067" in doc["reason"]
             else:
-                assert "boundaryFORGED line\\u202e\\u2067" in shown
+                expected = r"boundaryFORGED line\u202e\u2067"
+                assert expected in shown
