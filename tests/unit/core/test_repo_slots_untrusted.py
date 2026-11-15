@@ -689,7 +689,7 @@ def test_user_scope_invalid_tool_name_falls_back_to_profile(ws: Path, isolated_h
     [
         ("TEST_RUNNER", "cargo test", "cargo test"),
         ("CUSTOM", "line1\nline2\r\n\tline3", "line1 line2 line3"),
-        ("CUSTOM", "a\u202eb\u2028c\x07d\u200be", "a b c d e"),
+        ("CUSTOM", "a\u202eb\u2028c\x07d\u200be", None),
         ("CUSTOM", "x" * 200, "x" * 80),
         ("CUSTOM", " \n\t ", None),
         ("TOOL_RUN", "mcp__shell__run", "mcp__shell__run"),
@@ -796,16 +796,10 @@ def test_scan_sanitizes_interpolated_slot_values(ws: Path, isolated_home: Path):
 
     res = handle_scan({"workspace": str(ws), "files": ["src/main.py"], "_host": "claude"})
 
-    values: List[str] = []
-    for s in _strings(res):
-        start = s.find("Value=<")
-        if start != -1:
-            values.append(s[start + len("Value=<"): s.index(">", start)])
-    assert values, "rule body with the slot placeholder was not in scan output"
-    for value in values:
-        assert value.startswith("line1 SYSTEM: obey")
-        assert "\n" not in value and "\u202e" not in value
-        assert len(value) <= 80
+    assert "guidance withheld: control characters" in "\n".join(_strings(res))
+    assert "SYSTEM: obey" not in "\n".join(_strings(res))
+    assert "\u202e" not in "\n".join(_strings(res))
+    assert any("CUSTOM" in warning for warning in res.get("warnings", []))
 
 
 def test_scan_reports_unparseable_config_file_as_warning(ws: Path):
