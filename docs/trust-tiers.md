@@ -93,10 +93,26 @@ unknown; an explicit branch on a tag push is unknown too.
 Reports add `approval_mode`, `approval_target`, `owner_review_required` and
 `policy_source: base` when a base policy exists (`head` when the head tightens it).
 Other CI checks still block and name their blocking cause. CI uses one event
-snapshot, bounded to 25 MiB, for the base, head, target and review identity.
-Malformed event fields produce a fixed refusal when the resolved base declares
-a map; otherwise event handling retains legacy behavior. Branch names outside
-the conservative target grammar use the strictest mode when a map exists.
+snapshot for the base, head, target and review identity.
+For PR and push events, files over 25 MiB are refused before JSON parsing
+(push events over 1 MiB are supported).
+For `pull_request` and `pull_request_target`, `pull_request.base.sha` and
+`pull_request.head.sha` must each be a full 40- or 64-character hexadecimal SHA;
+if present, `pull_request.base.ref` must be a string of at most 255 characters
+without NUL. Missing or malformed SHAs (including when `GITHUB_EVENT_NAME` names
+a PR event without `GITHUB_EVENT_PATH`) or malformed base refs refuse with
+`invalid_ci_event` before any Git or policy lookup, with or without an approval
+map and with or without `--base`.
+For `push`, supplied non-null `before` and `after` values must also be full
+40- or 64-character hexadecimal SHAs, and `GITHUB_REF` must be a string of at
+most 8192 characters without NUL; malformed values receive the same refusal,
+even with `--base`.
+An absent or all-zero push predecessor keeps the base-unavailable/fallback
+behavior described above. Other event names do not undergo these field checks.
+The fixed recovery for `invalid_ci_event` is
+`provide a valid CI event or run locally with --base`.
+Branch names outside the conservative target grammar use the strictest mode
+when a map exists.
 Git object I/O failures refuse with `invalid_approval_policy` and a fetch/repair
 instruction; an unreadable repository cannot establish the absence of a policy.
 The GitHub summary retains permitted changes with their approval mode and shows
