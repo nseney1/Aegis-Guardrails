@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
+from dataclasses import fields
 import ast
 import errno
 import json
@@ -42,6 +43,162 @@ def require_compaction_for_next_admission(store, monkeypatch):
     path = store.common_dir / "aegis" / "gitops.jsonl"
     cap = path.read_bytes().count(b"\n") + 2 * len(store.open_intents()) + 2
     monkeypatch.setattr(gitops, "MAX_RECORD_LINES", cap)
+
+
+def test_live_ownership_query_keeps_no_instance_shadow_state(make_store):
+    store = make_store()
+    first = intent(store)
+    assert len(store.in_flight()) == 1
+    first.close()
+    assert store.in_flight() == []
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW))
+    assert store.in_flight() == []
+    assert intent(store).created is False
+    tree = ast.parse(Path(gitops.__file__).read_text(encoding="utf-8"))
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    names.update(node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef))
+    assert not names & {"_in_flight", "_flight_guard", "_sync_flights",
+                        "_flight_update", "_forget_flights"}
+
+
+def closed_history_bytes(count, *, unicode_state=False):
+    parts = []
+    new = {"ref": "\U00010000" * 100} if unicode_state else NEW
+    for index in range(count):
+        row = gitops.rows.intent("push", "lane-1", "closed-%07d" % index,
+                                OLD, new, "session-1", stamp="2026-11-15T00:00:00Z")
+        result = gitops.rows.result(row, "done", new, stamp=row["ts"])
+        for item in (row, result):
+            parts.append(json.dumps(item, ensure_ascii=not unicode_state,
+                                    separators=(",", ":")).encode("utf-8") + b"\n")
+    return b"".join(parts)
+
+
+def legacy_compacted(read, data, *, max_row_bytes=gitops.MAX_ROW_BYTES):
+    """Frozen pre-O87 matching/rewrite algorithm; no repository history needed."""
+    if not data:
+        return None
+    if not data.endswith(b"\n"):
+        raise gitops.GitOpsError("journal_io")
+    closed = {row["request_id"]: gitops.rows.encoded(dict(row, kind="tombstone")) + b"\n"
+              for row in read.rows if row["kind"] == "result"}
+    closed = {request: payload for request, payload in closed.items()
+              if len(payload) <= max_row_bytes + 1}
+    if not closed:
+        return None
+    raw_lines, positions = data.split(b"\n")[:-1], {}
+    expected = iter(read.rows)
+    wanted = next(expected, None)
+    for index, raw in enumerate(raw_lines):
+        if wanted is None or len(raw) > max_row_bytes:
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8"), object_pairs_hook=gitops.rows.pairs)
+            if gitops.rows.valid_row(row) and row == wanted:
+                positions[index] = wanted
+                wanted = next(expected, None)
+        except (ValueError, UnicodeError, RecursionError):
+            pass
+    if len(positions) != len(read.rows):
+        raise gitops.GitOpsError("journal_io")
+    pair_bytes = {}
+    for index, row in positions.items():
+        if row["kind"] in ("intent", "result"):
+            request = row["request_id"]
+            pair_bytes[request] = pair_bytes.get(request, 0) + len(raw_lines[index]) + 1
+    closed = {request: payload for request, payload in closed.items()
+              if len(payload) < pair_bytes[request]}
+    if not closed:
+        return None
+    parts = []
+    for index, raw in enumerate(raw_lines):
+        row = positions.get(index)
+        terminal = closed.get(row["request_id"]) if row is not None else None
+        if terminal is not None and row["kind"] == "result":
+            continue
+        parts.append(terminal if terminal is not None else raw + b"\n")
+    return b"".join(parts)
+
+
+def test_capacity_compaction_decodes_each_source_line_once(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "seed").close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    data = closed_history_bytes(128)
+    path.write_bytes(data)
+    expected = legacy_compacted(gitops.rows.parse(data), data)
+    require_compaction_for_next_admission(store, monkeypatch)
+    loads, original = [], gitops.rows.json
+
+    def counted(*args, **kwargs):
+        loads.append(None)
+        return original.loads(*args, **kwargs)
+
+    monkeypatch.setattr(gitops.rows, "json", SimpleNamespace(**{**vars(json), "loads": counted}))
+    receipt = intent(store, "trigger")
+    receipt.close()
+    assert len(loads) == 384  # 256 source lines, then 128 output tombstones.
+    assert path.read_bytes() == expected + gitops.rows.encoded(receipt.row) + b"\n"
+    public = store.read()
+    assert [item.name for item in fields(public)] == ["rows", "skipped", "torn_tail"]
+    assert public == gitops.JournalRead(public.rows, public.skipped, public.torn_tail)
+    assert intent(store, "trigger").created is False
+
+
+@pytest.mark.parametrize("damage", ["different", "equal_copy", "public_read", "limits"])
+def test_compaction_provenance_refuses_before_rewrite_then_allows_retry(make_store, monkeypatch, damage):
+    store = make_store()
+    intent(store, "seed").close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    data = closed_history_bytes(2)
+    path.write_bytes(data)
+    require_compaction_for_next_admission(store, monkeypatch)
+    original = gitops._parse
+
+    def planted(source, **kwargs):
+        if damage == "different":
+            return original(source.replace(b"closed", b"otherx"), **kwargs)
+        if damage == "equal_copy":
+            return original(bytes(bytearray(source)), **kwargs)
+        if damage == "public_read":
+            return gitops.rows.parse(source)
+        return gitops.rows.parse(source, capture=True, max_lines=gitops.MAX_RECORD_LINES,
+                                max_row_bytes=gitops.MAX_ROW_BYTES - 1)
+
+    monkeypatch.setattr(gitops, "_parse", planted)
+    refusal("journal_io", lambda: intent(store, "trigger"))
+    monkeypatch.setattr(gitops, "_parse", original)
+    assert path.read_bytes() == data
+    receipt = intent(store, "trigger")
+    assert receipt.created is True
+    receipt.close()
+    assert intent(store, "trigger").created is False
+
+
+@pytest.mark.parametrize("case", ["closed", "evidence", "no_saving", "torn", "empty"])
+def test_compaction_matches_legacy_bytes(case):
+    data = closed_history_bytes(128)
+    if case == "evidence":
+        lines = data.splitlines(keepends=True)
+        data = b"".join([lines[1], lines[0], b"not-json\n", lines[0], lines[1],
+                         b"\xff\n", *lines[2:], b"[]\n"])
+    elif case == "no_saving":
+        data = closed_history_bytes(1, unicode_state=True)
+    elif case == "torn":
+        data += b'{"torn":'
+    elif case == "empty":
+        data = b""
+    read = gitops.rows.parse(data, capture=True)
+    if case == "torn":
+        refusal("journal_io", lambda: gitops.rows.compacted(read, data=data,
+            max_row_bytes=gitops.MAX_ROW_BYTES, max_journal_bytes=gitops.MAX_JOURNAL_BYTES))
+        return
+    expected = legacy_compacted(gitops.rows.parse(data), data)
+    actual = gitops.rows.compacted(read, data=data, max_row_bytes=gitops.MAX_ROW_BYTES,
+                                 max_journal_bytes=gitops.MAX_JOURNAL_BYTES)
+    assert actual == expected
+    if case in ("empty", "no_saving"):
+        assert actual is None
 
 
 def test_compaction_preserves_quarantine_and_malformed_evidence_in_place(make_store, monkeypatch):
