@@ -26,6 +26,7 @@ from tests.integration.test_hierarchy_mailbox import HELPER, invoke, message, pi
 
 sys.path.insert(0, str(HELPER.parent))
 import hierarchy_mailbox_mcp as mcp
+import hierarchy_mailbox_pager as pager_module
 import hierarchy_mailbox_records as records
 import hierarchy_mailbox_records_guidance as records_guidance
 import hierarchy_mailbox as mailbox_module
@@ -85,6 +86,54 @@ def test_publish_retry_legacy_stub_read_and_digest(bound):
     assert digest["messages"][0]["record"] == view
     assert data(call(reader, "mailbox_digest", {"after_message_id": "record-1"}))["messages"] == []
     assert data(call(writer, "mailbox_read_record", {"message_id": "record-1"}))["from"] == "a/orchestrator"
+
+
+def test_read_contract_keeps_store_methods_and_public_preparation(bound, monkeypatch):
+    root, writer, reader = bound
+    original = records.record_store
+    checked = []
+
+    @contextmanager
+    def observed(*args, **kwargs):
+        with original(*args, **kwargs) as store:
+            yield store
+            checked.append(store)
+            assert store.read.__func__ is codec.Store.read
+            assert store.describe.__func__ is codec.Store.describe
+
+    monkeypatch.setattr(records, "record_store", observed)
+    published = data(call(writer, "mailbox_publish_record", request()))
+    assert "id" in published
+    for _ in range(2):
+        assert data(call(reader, "mailbox_read_record", {"ref": published["id"], "fields": ["body"]}))["data"] == {
+            "body": "# Evidence\nHOSTILE_MARKER"}
+    assert checked
+    tree = ast.parse(Path(records.__file__).read_text(encoding="utf-8"))
+    assert not [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                and node.attr == "_options"]
+
+
+def test_read_contract_public_golden(bound, monkeypatch):
+    _root, writer, reader = bound
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T00:00:00Z")
+    child = data(call(writer, "mailbox_publish_record", request("private-child", to="a/front-door")))["id"]
+    # An owner-recorded direct wrapper grant with an ungranted child exercises
+    # the existing implicit outline fallback and explicit refs refusal.
+    parent = data(call(writer, "mailbox_publish_record", request("wrapper", to="a/front-door",
+        content=json.dumps({"fields": {}, "body": "wrapper", "refs": {"child": child}}))))["id"]
+    directory = _root.parent / "mailbox-records"
+    path = directory / (".grants-" + parent)
+    envelope = codec.parse(path.read_bytes())
+    entry = envelope["fields"]["value"]
+    entry["grants"].append(dict(entry["grants"][0], endpoint="a/lane/review"))
+    path.write_bytes(codec.canonical(envelope))
+    outputs = [data(call(reader, "mailbox_read_record", dict(ref=parent, **options))) for options in (
+        {}, {"outline": True}, {"fields": ["body"]}, {"fields": ["refs"]},
+        {"fields": ["body.invalid"], "expand": ["absent"]}, {"max_chars": 1},
+    )]
+    # Captured against 7456d772 before product edits; outputs contain no root token.
+    digest = hashlib.sha256(json.dumps(outputs, sort_keys=True).encode()).hexdigest()
+    assert digest == "6b4f4e7c0aa9d55e99e26d93c25b5bbde9d17edd93157921a2003a9b7778be65"
 
 
 @pytest.mark.parametrize("change,code", [("tamper", "E_HASH"), ("stub", "E_FORMAT"),
@@ -3250,7 +3299,7 @@ def test_digest_history_limit_keeps_the_owner_guidance(bound, monkeypatch):
 
 
 def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trace=None):
-    """Follow actual codec imports, method calls, callbacks and saved Store.read.
+    """Follow actual codec imports, method calls and the closed read context.
 
     Constant public options prune unavailable CLI/span/cursor/format branches.
     Store paths and full IDs have already passed the adapter's lexical/grant
@@ -3330,6 +3379,8 @@ def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trac
             if isinstance(node.value, ast.Call) and node.attr == "planned" and env.get("selectors", unknown) == ():
                 return {}
             owner = value(node.value, env, namespace)
+            if type(owner) is SimpleNamespace and node.attr == "planned":
+                return owner.planned
             if owner is canonical_path and node.attr in ("parent", "root"):
                 return canonical_path
             if owner is canonical_path and node.attr == "parts":
@@ -3386,8 +3437,8 @@ def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trac
                 return canonical_path
             if name == "_read_selectors" and args and args[0] == ():
                 return ()
-            if name == "_options" and env.get("selectors", unknown) == ():
-                return {}
+            if name in ("preflight_read", "prepare_read") and env.get("selectors", unknown) == ():
+                return SimpleNamespace(planned={})
             if isinstance(node.func, ast.Attribute):
                 owner = value(node.func.value, env, namespace)
                 if owner is canonical_path:
@@ -3441,6 +3492,12 @@ def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trac
             return (strings(node.body, env, namespace) if test is not unknown and test else
                     strings(node.orelse, env, namespace) if test is not unknown else
                     strings(node.body, env, namespace) | strings(node.orelse, env, namespace))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                and not node.keywords and len(node.args) in (2, 3)
+                and isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is str):
+            attribute = ast.Attribute(value=node.args[0], attr=node.args[1].value, ctx=ast.Load())
+            found = strings(attribute, env, namespace)
+            return found | strings(node.args[2], env, namespace) if len(node.args) == 3 else found
         if isinstance(node, ast.Attribute) and node.attr == "detail":
             # Budget defaults to no detail; compose and canonical parsing also
             # construct record budgets. Both are real constructor bindings.
@@ -3584,8 +3641,10 @@ def _codec_refusal_pairs(local_functions, local_edges, roots, sources=None, trac
                     target = resolve(ast.Name(id=name), "codec.read_view")
                     if target in functions:
                         found.add(target)
-                elif name == "original_read":
-                    found.add("store.Store.read")
+                elif (name == "read" and isinstance(receiver, ast.Attribute)
+                      and isinstance(receiver.value, ast.Name) and receiver.value.id == "self"
+                      and receiver.attr == "reader"):
+                    found.add("codec.ReadContext.read")
                 elif name == "write" and isinstance(receiver, ast.Name) and receiver.id == "store":
                     found.add("store.Store.write")
                 elif name in ("render", "measure", "json_size", "json_array_extra"):
@@ -3658,11 +3717,10 @@ def _reachable_refusal_pairs(*, sources=None, codec_sources=None, codec_trace=No
                 member = owner.split(".")[0] + "." + node.func.attr
                 if member in functions:
                     return member
-            # _RecordAccess.__init__ rebinds Store.read for the per-call access
-            # object. Calls through store.read must reach that method too.
+            # Adapter payload reads explicitly use the grant-policy access
+            # object; its reader is the core-controlled ReadContext.
             if node.func.attr == "read" and (
-                    isinstance(receiver, ast.Name) and receiver.id == "store"
-                    or isinstance(receiver, ast.Attribute) and receiver.attr == "store"):
+                    isinstance(receiver, ast.Name) and receiver.id in ("access", "_access")):
                 return "_RecordAccess.read"
         found = by_tail.get(called(node) or "", [])
         return found[0] if len(found) == 1 else None
@@ -4366,6 +4424,126 @@ def test_digest_unavailable_inbox_probe_keeps_the_ordinary_failure(bound, monkey
     assert "HOSTILE" not in json.dumps(refused) and reader.returned == []
 
 
+@pytest.mark.parametrize("planned", [False, True])
+@pytest.mark.parametrize("failure", ["none", "render", "missing", "history"])
+def test_inbox_preview_isolated_assembly_and_snapshot(bound, monkeypatch, planned, failure):
+    from copy import deepcopy
+    root, writer, reader = bound
+    if planned:
+        import hierarchy_hosts
+        plan = hierarchy_hosts.plan_record("a", "codex-cli", "codex-cli", {}, "0" * 64)
+        (root.parent / hierarchy_hosts.PLAN_FILE).write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(mailbox_module, "timestamp", lambda: "2026-11-14T19:24:00Z")
+    for identifier, body in (("a-small", "small"), ("b-overflow", "h" * 61000), ("c-small", "small")):
+        _ordinary(writer, identifier, body)
+    history = reader.checked_mailbox().messages()
+    delivery = root.parent / "preview-delivery"
+    reader.delivery_dir = reader.checked_mailbox().delivery_directory(delivery)
+    assembly = pager_module.assemble_inbox
+    assembled = []
+
+    def observed_assembly(*args, **kwargs):
+        assembled.append(kwargs["note_returned"])
+        return assembly(*args, **kwargs)
+
+    monkeypatch.setattr(pager_module, "assemble_inbox", observed_assembly)
+    # Leave a real response staged. Preview must preserve even unflushed state.
+    call(reader, "mailbox_inbox", {"limit": 1})
+    assert assembled == [reader.note_returned]
+    assembled.clear()
+    live = reader.pager
+
+    def state():
+        return deepcopy((live.session, live.briefs_session, live.offered, live.pending,
+                         live.cutoffs, live.cursors, live.retained_cursor_pairs))
+
+    before = state()
+    returned, mode = reader.returned[:], reader.inbox_pager
+    options = {"limit": 1, "after_message_id": "a-small"}
+    original_options = dict(options)
+    target = "absent" if failure == "missing" else "b-overflow"
+    original_commit = pager_module.InboxPager.commit
+    commits = []
+
+    def isolated_commit(pager):
+        assert pager is not live, "preview committed the live pager"
+        commits.append(pager)
+        original_commit(pager)
+
+    monkeypatch.setattr(pager_module.InboxPager, "commit", isolated_commit)
+    retained = Path(history["b-overflow"]["path"])
+    original_bytes = retained.read_bytes()
+    if failure == "history":
+        # Change the retained file concurrently after the digest snapshot.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(retained.write_bytes, b"HOSTILE").result(timeout=5)
+    render = mcp._response_line
+
+    def observed_render(frame):
+        assert frame["id"] == 0
+        if failure == "render":
+            raise OSError(errno.EIO, "HOSTILE")
+        return render(frame)
+
+    monkeypatch.setattr(mcp, "_response_line", observed_render)
+    if failure == "render":
+        with pytest.raises(OSError, match="HOSTILE"):
+            reader.preview_inbox(options, history.values(), target)
+        assert not commits
+    else:
+        preview = reader.preview_inbox(options, history.values(), target)
+        assert commits and all(pager is commits[0] for pager in commits)
+        if failure == "missing":
+            assert preview is None
+        else:
+            raw, restart = preview
+            assert restart is planned
+            page = json.loads(json.loads(raw)["result"]["content"][0]["text"])
+            assert [row["message"]["message_id"] for row in page["messages"]] == [target]
+            assert page["messages"][0]["message"]["body"] == "h" * 61000
+            assert page["next_after"] == target and page["remaining"] == 1
+    assert options == original_options
+    assert reader._pager is live and state() == before
+    assert reader.returned == returned and reader.inbox_pager == mode
+    assert not delivery.exists()
+    assert assembled and reader.note_returned not in assembled
+    # The guard must detect a planted implementation committing the live pager.
+    original_preview = pager_module.InboxPager.preview
+
+    def planted_preview(*args, **kwargs):
+        live.commit()
+
+    monkeypatch.setattr(pager_module.InboxPager, "preview", planted_preview)
+    with pytest.raises(AssertionError, match="preview committed the live pager"):
+        reader.preview_inbox(options, history.values(), target)
+    monkeypatch.setattr(pager_module.InboxPager, "preview", original_preview)
+    monkeypatch.setattr(pager_module.InboxPager, "commit", original_commit)
+    monkeypatch.setattr(mcp, "_response_line", render)
+    if failure == "history":
+        retained.write_bytes(original_bytes)
+    if failure in ("none", "history"):
+        # Compare exact preview wire bytes against a fresh real inbox walk.
+        fresh = connection(root, reader.sender["from"])
+        retry = {"limit": 1} if planned else dict(options)
+        for _ in range(3):
+            result = mcp.handle(fresh, {"jsonrpc": "2.0", "id": 0, "method": "tools/call",
+                                       "params": {"name": "mailbox_inbox", "arguments": retry}})
+            expected = data(result)
+            fresh.record_inbox_page()
+            if any(row["message"]["message_id"] == target for row in expected["messages"]):
+                assert raw == render({"jsonrpc": "2.0", "id": 0, "result": result})
+                break
+            retry["after_message_id"] = expected["next_after"]
+        else:
+            pytest.fail("fresh inbox did not reach the preview target")
+    # A later real response still stages and commits through the live pager.
+    result = call(reader, "mailbox_inbox", {"limit": 1})
+    assert data(result)["messages"][0]["message"]["message_id"] == "a-small"
+    reader.record_inbox_page()
+    reader.record_read()
+    assert delivery.exists()
+
+
 def test_digest_record_retry_identifies_the_failing_reference(bound):
     root, writer, _reader = bound
     identifiers = []
@@ -4410,12 +4588,15 @@ def test_digest_minimum_retry_can_read_first_record_before_a_later_bad_stub(boun
 
 @pytest.mark.parametrize("namespace,site,tools", [
     ("codec", "preflight_read", tuple(_RECORD_ARGUMENTS)),
+    ("codec", "prepare_read", tuple(_RECORD_ARGUMENTS)),
+    ("codec", "ReadContext.read", tuple(_RECORD_ARGUMENTS)),
     ("codec", "_read_selectors", tuple(_RECORD_ARGUMENTS)),
     ("format", "compose", ("mailbox_publish_record",)),
     ("store", "Store.read", tuple(_RECORD_ARGUMENTS)),
     ("store", "_store_error", tuple(_RECORD_ARGUMENTS)),
 ])
-def test_refusal_inventory_detects_a_new_codec_error_site(namespace, site, tools):
+@pytest.mark.parametrize("detail", ['"codec_probe"', 'getattr(probe, "detail", "codec_probe")'])
+def test_refusal_inventory_detects_a_new_codec_error_site(namespace, site, tools, detail):
     modules = {"codec": codec, "format": codec_format, "store": codec_store, "views": codec_views}
     sources = {name: Path(module.__file__).read_text(encoding="utf-8") for name, module in modules.items()}
     source = sources[namespace]
@@ -4429,7 +4610,7 @@ def test_refusal_inventory_detects_a_new_codec_error_site(namespace, site, tools
     target = next(node for node in candidates if isinstance(node, ast.FunctionDef) and node.name == name)
     lines = source.splitlines(keepends=True)
     lines.insert(target.body[0].lineno - 1,
-                 " " * target.body[0].col_offset + 'raise CodecError("E_AUTH", detail="codec_probe")\n')
+                 " " * target.body[0].col_offset + 'raise CodecError("E_AUTH", detail=' + detail + ')\n')
     sources[namespace] = "".join(lines)
     required, _history = _reachable_refusal_pairs(codec_sources=sources)
     for tool in tools:
