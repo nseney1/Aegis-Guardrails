@@ -15,10 +15,13 @@ measures latency and size, never efficacy; these tests hold the numbers to what 
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,8 +31,10 @@ import pytest
 
 from aegis_core import benchmark, events
 from aegis_core.benchmark import BenchmarkError
+from aegis_core.hosts import GENERIC
 from aegis_core.rules import load_rules
-from aegis_core.scan import estimate_tokens
+from aegis_core.scan import estimate_tokens, scan
+from aegis_core.skills.slots import scan_registry
 
 CORPUS_SHA256 = "87b60f1de624fdfbbb2ac2047845ec36d32ebb3f8c18636dbf56bc6ca55fc908"
 
@@ -178,16 +183,13 @@ def test_the_scan_is_timed_over_runs_after_a_first_run_that_is_reported_apart(ro
 
 
 def test_the_scan_reports_the_bytes_and_approximate_tokens_of_the_payload_it_sent(root, corpus):
-    from aegis_core.hosts import GENERIC
-    from aegis_core.scan import scan
-    from aegis_core.skills.slots import render_scan_result
-
     out = benchmark.measure_scan(root, corpus, runs=1, clock=Ticks(0.001))
-    expected = json.dumps(render_scan_result(scan(str(root), changed_files=list(corpus.scan_files)), GENERIC, root))
+    result = scan(str(root), changed_files=list(corpus.scan_files), registry=scan_registry(GENERIC, root))
+    expected = json.dumps(result)
     assert out["payload_bytes"] == len(expected.encode("utf-8")) > 1000
     assert out["approx_tokens"] == estimate_tokens(expected) > 100
     assert out["files"] == list(corpus.scan_files)
-    assert out["rules_served"] == 3
+    assert out["rules_served"] == len(result["relevant_rules"]) == 3
     assert "not a model tokenizer" in out["approx_tokens_method"]
 
 
@@ -195,6 +197,112 @@ def test_a_scan_that_fails_closed_is_an_error_not_a_fast_answer(root, corpus):
     (root / ".aegis/rules/traps/trap-bare-except.md").write_text("no frontmatter\n", encoding="utf-8")
     with pytest.raises(BenchmarkError, match="the scan failed on the fixture workspace"):
         benchmark.measure_scan(root, corpus, runs=1, clock=Ticks(0.001))
+
+
+@pytest.fixture
+def slot_dense_corpus(corpus):
+    rule = (
+        "---\nid: slot-dense\ntype: trap\nenforcement: advisory\nhypothesis: "
+        + json.dumps(" ".join(["${SLOT.MODEL_FAST}"] * 191))
+        + "\nprediction: Render before budgeting.\ntarget_paths: ['src/*.py']\n---\nRead.\n"
+    )
+    return replace(corpus, files={"src/a.py": "value = 1\n"},
+                   rules={"traps/slot-dense.md": rule}, scan_files=("src/a.py",))
+
+
+@pytest.mark.parametrize("dense", [False, True], ids=["frozen", "slot_dense"])
+def test_scan_binds_one_registry_inside_each_timed_region(tmp_path, corpus, slot_dense_corpus, dense, monkeypatch):
+    fixture = slot_dense_corpus if dense else corpus
+    root = tmp_path / "fixture"
+    benchmark.materialize(fixture, root)
+    expected = scan(str(root), changed_files=list(fixture.scan_files), registry=scan_registry(GENERIC, root))
+    assert len(expected["relevant_rules"]) == (1 if dense else 3)
+    if dense:
+        assert scan(str(root), changed_files=list(fixture.scan_files))["relevant_rules"] == []
+    clock = Ticks(0.200, 0.010, 0.020, 0.030, 0.040)
+    calls = []
+
+    def observed_scan(workspace, changed_files, **kwargs):
+        result = scan(workspace, changed_files=changed_files, **kwargs)
+        calls.append((clock.calls, kwargs.get("registry"), result))
+        return result
+
+    # Observe the real public scan; do not replace its selection or projection.
+    monkeypatch.setattr(benchmark, "run_scan", observed_scan)
+    loads = []
+
+    def observed_registry(host, workspace):
+        loads.append((clock.calls, host, workspace))
+        return scan_registry(host, workspace)
+
+    monkeypatch.setattr(benchmark, "scan_registry", observed_registry)
+    out = benchmark.measure_scan(root, fixture, runs=4, clock=clock)
+    assert [tick for tick, _, _ in calls] == [1, 3, 5, 7, 9]
+    assert [tick for tick, _, _ in loads] == [1, 3, 5, 7, 9]
+    assert all(host == GENERIC and workspace == root for _, host, workspace in loads)
+    assert all(registry is not None and result == expected for _, registry, result in calls)
+    assert out["rules_served"] == len(expected["relevant_rules"])
+    assert out["payload_bytes"] == len(json.dumps(expected).encode("utf-8"))
+    assert out["approx_tokens"] == estimate_tokens(json.dumps(expected))
+    assert clock.calls == 10
+
+
+@pytest.mark.parametrize("fail_on", [1, 2, 3], ids=["cold", "first_timed", "later_timed"])
+@pytest.mark.parametrize("failure", ["projection", "broken"])
+def test_scan_refuses_failures_in_every_iteration_and_on_retry(
+    tmp_path, slot_dense_corpus, monkeypatch, fail_on, failure
+):
+    corpus = slot_dense_corpus
+    root = tmp_path / "fixture"
+    benchmark.materialize(corpus, root)
+    path = root / ".aegis/rules/traps/slot-dense.md"
+    original = path.read_text(encoding="utf-8")
+    invalid = (re.sub(r"^hypothesis: .*$", "hypothesis: 3", original, flags=re.MULTILINE)
+               if failure == "projection" else "no frontmatter\n")
+    calls = []
+
+    def failing_scan(workspace, changed_files, **kwargs):
+        calls.append(None)
+        if len(calls) == fail_on:
+            path.write_text(invalid, encoding="utf-8")
+        return scan(workspace, changed_files=changed_files, **kwargs)
+
+    monkeypatch.setattr(benchmark, "run_scan", failing_scan)
+    message = "the scan failed on the fixture workspace: "
+    if failure == "projection":
+        message += "guidance_projection_invalid_field"
+    with pytest.raises(BenchmarkError, match=message):
+        benchmark.measure_scan(root, corpus, runs=3, clock=Ticks(0.001))
+    assert len(calls) == fail_on
+    with pytest.raises(BenchmarkError, match=message):
+        benchmark.measure_scan(root, corpus, runs=3, clock=Ticks(0.001))
+    assert len(calls) == fail_on + 1
+
+
+@pytest.mark.parametrize("failure", [False, True], ids=["slot_dense", "projection_failure"])
+def test_repeated_and_concurrent_scan_measurements_agree(tmp_path, slot_dense_corpus, failure):
+    corpus = slot_dense_corpus
+    root = tmp_path / "fixture"
+    benchmark.materialize(corpus, root)
+    path = root / ".aegis/rules/traps/slot-dense.md"
+    if failure:
+        path.write_text(re.sub(r"^hypothesis: .*$", "hypothesis: 3", path.read_text(encoding="utf-8"),
+                               flags=re.MULTILINE), encoding="utf-8")
+    original = path.read_bytes()
+
+    def measure(_):
+        if failure:
+            with pytest.raises(BenchmarkError, match="^the scan failed on the fixture workspace: "
+                                                    "guidance_projection_invalid_field$"):
+                benchmark.measure_scan(root, corpus, runs=2, clock=Ticks(0.001))
+            return None
+        return benchmark.measure_scan(root, corpus, runs=2, clock=Ticks(0.001))
+
+    expected = measure(None)
+    assert measure(None) == expected
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert list(pool.map(measure, range(3))) == [expected] * 3
+    assert path.read_bytes() == original
 
 
 # ── the Layer 1 measurement ──────────────────────────────────────────────────
@@ -370,6 +478,7 @@ def test_the_event_detail_is_the_numbers_a_later_run_is_compared_with():
     }
     assert benchmark.event_detail(result) == {
         "runs": 5, "corpus_sha256": "ab" * 32, "scan_p50_ms": 1.5, "scan_p95_ms": 2.5,
+        "scan_method": "bound-single-selection",
         "scan_payload_bytes": 4300, "scan_approx_tokens": 1080, "hook_p50_ms": 90.0, "hook_p95_ms": 120.0,
         "layer1_files_per_s": 250.0, "python": "3.12.3", "platform": "linux",
     }
