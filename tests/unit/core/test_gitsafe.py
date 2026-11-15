@@ -3528,7 +3528,11 @@ startup_deadline = time.monotonic() + 30
 while sys.argv[7] != '-1' and not os.path.exists({str(marker)!r}) and not stopping and time.monotonic() < startup_deadline:
     time.sleep(0.01)
 '''
-    monkeypatch.setattr(gitops_fds, "_HOLDER_SOURCE", gitops_fds._HOLDER_SOURCE.replace(timer, readiness + timer))
+    holder_source = gitops_fds._HOLDER_SOURCE
+    timer_line = next(line for line in holder_source.splitlines() if timer in line)
+    indentation = timer_line[:len(timer_line) - len(timer_line.lstrip())]
+    readiness = readiness.replace("\n", "\n" + indentation)
+    monkeypatch.setattr(gitops_fds, "_HOLDER_SOURCE", holder_source.replace(timer, readiness + timer))
     import contextlib
     capture_scratch = tmp_path / "capture-scratch"
     capture_scratch.mkdir()
