@@ -590,7 +590,7 @@ class CiReport:
             "rules_checked": self.rules_checked,
             "weakenings": [w.as_dict() for w in self.weakenings],
             "approval": None if self.approval is None else self.approval.as_dict(workspace),
-            **({"owner_review_required": [w.as_dict() for w in self.owner_review_required]}
+            **({"owner_review_findings": [w.as_dict() for w in self.owner_review_required]}
                if self.owner_review_required else {}),
             "governance": {
                 "categories": list(self.governance_categories),
