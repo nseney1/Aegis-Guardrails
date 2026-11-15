@@ -341,6 +341,10 @@ Enqueue a bounded inline JSON item
 
 Report held work needing a decision
 
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--view` | one of `full`, `findings` | `"full"` | Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions |
+
 ### `aegis team queue claim`
 
 Claim a current item revision with a lease
@@ -374,8 +378,9 @@ List items, blockers and lane labels
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--capability` | `CAPABILITIES` |  | Filter by a team capability label; repeat for each label |
+| `--capability` | `CAPABILITIES` |  | Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label |
 | `--include-done` |  |  | Include completed items hidden by default |
+| `--view` | one of `full`, `fingerprint` | `"full"` | Full item detail (default), or fingerprint only; run the full list after a change |
 
 ### `aegis team queue release`
 

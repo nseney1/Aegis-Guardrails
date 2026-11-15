@@ -353,15 +353,15 @@ def _entry_parts(parts, name):
     return parts + (name,) if isinstance(name, str) else parts
 
 def _path_refusal(code, parts):
+    if code in report.LIMIT_CODES:
+        return report.limit_row(code, parts)
     action = {
-        "path_changed": report.RETRY, "scan_capped": report.INSPECT, "depth_capped": report.INSPECT, "symlink_refused": report.NO_FOLLOW,
+        "path_changed": report.RETRY, "symlink_refused": report.NO_FOLLOW,
         "descriptor_unsupported": report.PLATFORM, "unreadable_path": report.INSPECT,
         "multiline_refused": report.RENAME, "value_too_long": report.RENAME,
     }.get(code, report.RETRY)
     detail = {
         "path_changed": "a directory changed while it was listed",
-        "scan_capped": "the workspace listing reached its entry cap",
-        "depth_capped": "a directory was not measured beyond the scan depth",
         "symlink_refused": "a symlink was not followed",
         "descriptor_unsupported": "untrusted paths were not opened",
         "unreadable_path": "a directory could not be read",

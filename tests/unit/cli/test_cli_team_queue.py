@@ -233,6 +233,27 @@ CLI_BYTE_GOLDENS = {'team model/text/help': '532200670f8b5b09d6cb0987738defddab0
  'msg verify/json/oversized': 'a51bcbc3b21b43ea958abc025b9f0a2361fcdca80e3f7a7c9b13c64f74120a20'}
 
 
+# UX-31/32 and O65 change only list/audit help. UX-33 adds fixed diagnostics
+# when a structurally known command is missing required arguments, including
+# when an unknown token or oversized workspace accompanies that same refusal.
+# Keep the pre-change bytes above; pin each intended replacement separately.
+CLI_UX_GOLDENS = {
+    **{"team queue " + verb + "/" + mode + "/" + case: digest
+       for verb, digest in {
+           "add": "0593d64168bd09e4f1e7d3a22cb1eeff3a2eebc64abfcb5abf6dcd29ef4d2b5c",
+           "claim": "6abaf5b6af3adf6de384c942c8ee38f045819e9f2676de98beb1deb187c876c2",
+           "release": "042a10c48eafc656aae2a47086e0b751c6bfb7f53753ae3139079754e0b21421",
+           "done": "bcb1c6e4bd6753aac560948054a2a2b4f82ebf98a008a48d46a5284958cde373",
+           "unclaim": "0020b3faa0659243c9ad11538333a86c504de3bc6283f1a44c57abecce9186a5",
+       }.items() for mode in ("text", "json") for case in ("missing", "malformed", "oversized")},
+    **{"team queue " + verb + "/" + mode + "/help": digest
+       for verb, digest in {
+           "list": "77a430891f2264cef34b496f167d69d41f5c891a20243abff1dec9853053bedd",
+           "audit": "08eda48b73fae65a126f915decbe5ef8293e665d2fa13860e6c6433f0098da9a",
+       }.items() for mode in ("text", "json")},
+}
+
+
 @pytest.mark.parametrize("cwd_length", [1, 120], ids=["short-cwd", "long-cwd"])
 def test_cli_path_byte_goldens(workspace, tmp_path, capsys, monkeypatch, cwd_length):
     monkeypatch.setenv("COLUMNS", "80")
@@ -280,7 +301,7 @@ def _check_cli_path_byte_goldens(tmp_path, capsys):
                 observations[path + "/" + mode + "/" + case] = [code, *streams]
     actual = {key: hashlib.sha256(json.dumps(value, ensure_ascii=True).encode()).hexdigest()
               for key, value in observations.items()}
-    assert actual == CLI_BYTE_GOLDENS
+    assert actual == {**CLI_BYTE_GOLDENS, **CLI_UX_GOLDENS}
 
 
 def _canonical_cli_os_error(stream, *, diagnostic=None):
@@ -472,6 +493,134 @@ def run(capsys, root, *arguments):
     captured = capsys.readouterr()
     assert captured.err == ""
     return code, json.loads(captured.out)
+
+
+@pytest.mark.parametrize("arguments,category,names,verb", [
+    (["add"], "missing_required", ["--item"], "add"),
+    (["claim", "private-value"], "missing_required", ["--expect", "--lane"], "claim"),
+    (["claim", "private-value", "--lane", "writer"], "missing_required", ["--expect"], "claim"),
+    (["claim", "--expect", "a" * 64, "--lane", "writer"], "missing_required", ["ITEM"], "claim"),
+    (["claim", "private-value", "--expect", "a" * 64, "--lane"], "missing_value", ["--lane"], "claim"),
+    (["claim", "private-value", "--expect", "a" * 64, "--lane", "writer", "--ttl", "token=private-value\n--expect"],
+     "invalid_value", ["--ttl"], "claim"),
+    (["list", "--view", "token=x\n"], "invalid_value", ["--view"], "list"),
+    (["list", "--view", "private-value" * 100], "limit_exceeded", ["--view"], "list"),
+    (["audit", "--view", "private-value" * 100], "limit_exceeded", ["--view"], "audit"),
+    (["list", "--capability", "private-value" * 100], "limit_exceeded", ["--capability"], "list"),
+    (["list", *[word for _ in range(129) for word in ("--capability", "private-value")]],
+     "limit_exceeded", ["--capability"], "list"),
+    (["release", "private-value"], "missing_required", ["--expect"], "release"),
+    (["done", "private-value"], "missing_required", ["--expect"], "done"),
+    (["unclaim", "private-value"], "missing_required", ["--expect", "--lane"], "unclaim"),
+])
+def test_queue_parser_actionable_safe_categories(capsys, arguments, category, names, verb):
+    for _ in range(2):
+        code, payload = run(capsys, ".", *arguments)
+        assert code == 2 and payload["reason"] == "invalid_arguments"
+        assert payload["argument_error"] == {"category": category, "arguments": names,
+                                              "help_command": "aegis team queue " + verb + " --help"}
+        assert "private-value" not in json.dumps(payload)
+        assert "token=x" not in json.dumps(payload)
+    assert main(["team", "queue", verb, "--help"]) == 0
+    assert "usage:" in capsys.readouterr().out
+
+
+def test_queue_parser_without_invocation_policy_uses_fixed_help(capsys):
+    from aegis_cli.cli import _build_parser
+
+    parser = _build_parser(prog="token=private-value\n--expect")
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["team", "queue", "claim", "private-value", "--lane", "writer"])
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert captured.err == "" and "private-value" not in captured.out
+    assert payload["argument_error"] == {"category": "missing_required", "arguments": ["--expect"],
+                                          "help_command": "aegis team queue claim --help"}
+
+
+def test_queue_parser_concurrent_processes_keep_diagnostics_local():
+    from concurrent.futures import ThreadPoolExecutor
+
+    commands = [["team", "queue", "claim", "private-value", "--lane", "writer"],
+                ["team", "queue", "list", "--view", "token=x"],
+                ["team", "queue", "audit", "--view", "findings", "--help"]]
+    root = Path(__file__).resolve().parents[3]
+    def invoke(words):
+        return subprocess.run([sys.executable, "-m", "aegis_cli", *words], cwd=root,
+                              capture_output=True, text=True, timeout=30)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(invoke, words) for words in commands]
+        results = [future.result(timeout=35) for future in futures]
+    for result, category, names in zip(results, ("missing_required", "invalid_value"), (["--expect"], ["--view"])):
+        assert result.returncode == 2 and result.stderr == ""
+        assert "private-value" not in result.stdout and "token=x" not in result.stdout
+        diagnostic = json.loads(result.stdout)["argument_error"]
+        assert diagnostic["category"] == category and diagnostic["arguments"] == names
+    assert results[2].returncode == 0 and results[2].stderr == "" and "--view" in results[2].stdout
+
+
+@pytest.mark.parametrize("arguments", [["list", "--unknown=token=private-value"],
+                                       ["private-value\n--expect"],
+                                       ["list", "--workspace", "../private-value"]])
+def test_queue_parser_unknown_input_stays_generic(capsys, arguments):
+    code, payload = run(capsys, ".", *arguments)
+    assert code == 2 and payload["reason"] == "invalid_arguments"
+    assert "argument_error" not in payload
+    assert "private-value" not in json.dumps(payload)
+
+
+def test_cli_partial_views_and_capability_help(workspace, capsys):
+    code, added = run(capsys, workspace, "add", "--item", json.dumps({
+        "id": "ONE", "title": "Queue work", "paths": ["src/**"], "capabilities": [],
+        "hold": "Await decision", "hold_until": [{"kind": "lease_free", "paths": ["src/**"]}]}))
+    assert code == 0
+    code, full = run(capsys, workspace, "list")
+    code, small = run(capsys, workspace, "list", "--view", "fingerprint")
+    assert code == 0 and "items" not in small
+    assert small["claimable_fingerprint"] == full["claimable_fingerprint"]
+    code, findings = run(capsys, workspace, "audit", "--view", "findings")
+    assert code == 0 and "items" not in findings
+    assert findings["affected_items"][0]["revision"] == added["item"]["revision"]
+    code, complete = run(capsys, workspace, "audit")
+    assert complete["findings"] == findings["findings"] and "items" in complete
+    assert main(["team", "queue", "list", "--help"]) == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "list items whose requirements are all satisfied" in help_text
+
+
+@pytest.mark.parametrize("state,effective,expired", [("active", "claimed", False),
+                                                    ("expired", "queued", True),
+                                                    ("completed", "done", False)])
+def test_cli_findings_pointer_displays_every_affected_item(workspace, capsys, monkeypatch, state, effective, expired):
+    root = workspace
+    value = {"id": "ONE", "title": "Legacy work", "paths": ["src/**"], "capabilities": []}
+    added = team_queue.add(root, value, now=100)
+    assert added["exit_code"] == 0
+    claimed = team_queue.claim(root, "ONE", expect=added["item"]["revision"], lane="writer",
+                               branch="lane/writer", ttl_s=10, now=101)
+    assert claimed["exit_code"] == 0
+    if state == "completed":
+        assert team_queue.done(root, "ONE", expect=claimed["item"]["revision"], lane="writer", now=102)["exit_code"] == 0
+    path = root / ".aegis/state/team-queue.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["items"]["ONE"]["branch"] = "refs/heads/refs/tags/legacy"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    original = path.read_bytes()
+    moment = 112 if state == "expired" else 103
+    monkeypatch.setattr(team_queue, "time", SimpleNamespace(time=lambda: moment))
+    command = "aegis team queue list --include-done --view full --json"
+    for _ in range(2):
+        code, findings = run(capsys, root, "audit", "--view", "findings")
+        assert code == 0 and any(row["code"] == "CLAIM-BRANCH-UNSUPPORTED" for row in findings["findings"])
+        assert findings["next_action"] == "Run " + command + " and read full constraints before changing holds or work."
+        code, inspected = run(capsys, root, *command.split()[3:])
+        assert code == 0
+        full_item = next(row for row in inspected["items"] if row["id"] == "ONE")
+        assert full_item["state"] == effective and full_item["lease_expired"] is expired
+        assert findings["affected_items"] == [{key: full_item[key]
+            for key in ("id", "revision", "lane", "state", "lease_expired", "expires_at")}]
+    assert path.read_bytes() == original
 
 
 def test_cli_unclaim_releases_lane_lease_and_preserves_refusal_envelope(workspace, capsys):

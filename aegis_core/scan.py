@@ -26,7 +26,7 @@ rule into a system prompt, it returns only the rules for the changed files:
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path, PurePath
 import posixpath
@@ -34,19 +34,30 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from aegis_core.adjudication import Adjudications
 from aegis_core.fitness import Fitness, compute, for_rules
+from aegis_core.guidance_projection import (
+    ASCII_CHARS_PER_TOKEN as ASCII_CHARS_PER_TOKEN,
+    GuidanceProjectionError, GuidanceResult,
+    MAX_GUIDANCE_CHARS, WITHHELD_GUIDANCE,
+    assembled_text, checked_result_copy, raw_rule_text,
+    estimate_tokens as estimate_tokens,
+    field_text, finish_payload, project_detail, project_display_data, project_display_text,
+    project_error_name, project_field, project_identifier,
+)
 from aegis_core.match import normalize_path, workspace_files
 from aegis_core import gitsafe, rule_integrity
 from aegis_core.rule_integrity import MANDATORY_SLOT_CAP
 from aegis_core.rule_inventory import RuleInventoryError
 from aegis_core.rules import Rule, RuleCache, RuleSet, workspace_root
+from aegis_core.skills.slots import SlotRegistry
 from aegis_core.taxonomy import (
     JIT_DEFAULT_MAX_TOKENS,
     JIT_DEFAULT_RULE_COUNT_BUDGET,
     RULE_TYPES,
     RuleType,
-    WORDS_TO_TOKENS_FACTOR,
+    WORDS_TO_TOKENS_FACTOR as WORDS_TO_TOKENS_FACTOR,
 )
 from aegis_core.workspace.layout import RULES_RELDIR
+from aegis_core.yaml_engine.frontmatter import split_frontmatter
 
 __all__ = [
     "MANDATORY_SLOT_CAP",
@@ -57,6 +68,7 @@ __all__ = [
     "resolve_token_budget",
     "scan",
     "scan_user_layer",
+    "select_guidance",
 ]
 
 # Per-process cache of parsed rules; the MCP server keeps it across tool calls.
@@ -68,31 +80,10 @@ RULE_CACHE = RuleCache()
 
 # The server sends a scan as json.dumps(result), which is ASCII, so a response the
 # budget admits is at most 4 bytes per budgeted token.
-ASCII_CHARS_PER_TOKEN = 4
 
 NO_CHANGES_TEXT = "No changed files detected. Governance guidance will be provided when files are modified."
 NO_MATCH_TEXT = "No governance rules match your current changes."
 _STATUS_FAIL = "FAIL"
-
-
-def estimate_tokens(text: object | None) -> int:
-    """Estimate a token count: the larger of ~1.35 per word and one per 4 ASCII characters
-    plus one per non-ASCII character.
-
-    A word count alone sees text without spaces (CJK, base64, a minified line) as a
-    single word, so the character floor is what lets the budget bound the bytes sent.
-    """
-    if text is None:
-        return 0
-    if not isinstance(text, str):
-        try:
-            text = str(text)
-        except Exception:
-            return 0
-    ascii_chars = len(text.encode("ascii", "ignore"))
-    by_chars = -(-ascii_chars // ASCII_CHARS_PER_TOKEN) + (len(text) - ascii_chars)
-    by_words = int(len(text.split()) * WORDS_TO_TOKENS_FACTOR)
-    return max(by_words, by_chars)
 
 
 def resolve_token_budget(workspace: Any, max_tokens: Optional[int] = None) -> int:
@@ -120,6 +111,62 @@ class _Match:
     files: Tuple[str, ...]
     exact: bool
     fitness: Fitness
+
+
+class _SelectedPayload(dict):
+    """Rendered selection plus non-serialized canonical telemetry identities."""
+
+    def __init__(self, payload: Dict[str, Any], staged: List[Dict[str, Any]]) -> None:
+        super().__init__(payload)
+        self.rule_ids = tuple(entry["match"].rule.id for entry in staged)
+        self.mandatory_count = sum(entry["match"].rule.mandatory for entry in staged)
+
+
+@dataclass(frozen=True)
+class _Projection:
+    """Request-local source/fitness snapshot, never serialized or reread from disk."""
+
+    matches: Tuple[_Match, ...]
+    total_rules: int
+    changed_files: int
+    budget: int
+    token_budget: int
+    stale: Tuple[Dict[str, Any], ...]
+    warnings: Tuple[str, ...]
+    extras: Dict[str, Any]
+
+    def render(self, registry: Optional[SlotRegistry]) -> GuidanceResult:
+        identities: Tuple[str, ...] = ()
+        mandatory_count = 0
+        try:
+            selected = _select_projection(self, registry)
+            selected_mandatory = selected.mandatory_count if isinstance(selected, _SelectedPayload) else None
+            payload = finish_payload(selected, preserve_omissions=True,
+                                     staged_mandatory_count=selected_mandatory)
+            if isinstance(selected, _SelectedPayload) and payload is selected:
+                identities = selected.rule_ids
+                mandatory_count = selected.mandatory_count
+        except GuidanceProjectionError as exc:
+            payload = _failure(exc.code)
+        return _ScanResult(payload, self, identities, mandatory_count)
+
+
+class _ScanResult(GuidanceResult):
+    def __init__(self, payload: Dict[str, Any], projection: _Projection,
+                 identities: Tuple[str, ...], mandatory_count: int) -> None:
+        super().__init__(payload)
+        self._projection = projection
+        self._canonical_rule_ids = identities
+        self._mandatory_count = mandatory_count
+
+    def with_registry(self, registry: SlotRegistry) -> Dict[str, Any]:
+        return self._projection.render(registry)
+
+    def exposure_rule_ids(self) -> Tuple[str, ...]:
+        return self._canonical_rule_ids
+
+    def staged_mandatory_count(self) -> int:
+        return self._mandatory_count
 
 
 def _match(rule: Rule, matched: Tuple[str, ...], fitness: Fitness) -> _Match:
@@ -166,22 +213,54 @@ def _fitness_text(fit: Fitness) -> str:
     return fit.status_label or "—"
 
 
-def _text(m: _Match) -> str:
+def _unstripped_body(rule: Rule) -> str:
+    """Recover structure from bounded raw bytes; never trust the stripped body."""
+    if type(rule.raw) is not bytes or not rule.raw:
+        return WITHHELD_GUIDANCE
+    try:
+        text = raw_rule_text(rule.raw, split_frontmatter)
+    except GuidanceProjectionError:
+        raise
+    except ValueError:
+        raise GuidanceProjectionError("guidance_projection_limit") from None
+    if text is None:
+        return WITHHELD_GUIDANCE
+    status, frontmatter, body = split_frontmatter(text)
+    return body if status == "ok" and frontmatter and frontmatter.strip() else WITHHELD_GUIDANCE
+
+
+def _text(m: _Match, registry: Optional[SlotRegistry] = None) -> str:
     rule = m.rule
     spec = RULE_TYPES.get(rule.type or "")
     emoji = spec.emoji if spec else "📋"
     label = spec.label if spec else str(rule.type).upper()
     out = f"{emoji} [{label}] {rule.id}\n"
-    out += f"   Hypothesis: {rule.meta.get('hypothesis', '')}\n"
+    out += f"   Hypothesis: {field_text(rule.meta.get('hypothesis', ''))}\n"
     prediction = rule.meta.get("prediction")
     if prediction:
-        out += f"   If violated: {prediction}\n"
+        out += f"   If violated: {field_text(prediction)}\n"
     out += f"   Triggered by: {', '.join(m.files[:5])}\n"
-    if rule.body:
-        lines = rule.body.strip().split("\n")[:8]
-        out += f"   Detail: {' '.join(line.strip() for line in lines)[:300]}\n"
+    body = _unstripped_body(rule)
+    if body.strip():
+        out += f"   Detail: {project_detail(body, registry)}\n"
     out += f"   Fitness: {_fitness_text(m.fitness)}\n"
     return out
+
+
+def _entry(m: _Match, registry: Optional[SlotRegistry]) -> Dict[str, Any]:
+    # Do not mutate cached rules or enforcement metadata. All served copies of
+    # hypothesis/prediction share this one rendering, including invariant text.
+    meta = dict(m.rule.meta)
+    for key in ("hypothesis", "prediction"):
+        meta[key] = project_field(meta.get(key, ""), registry)
+    if len(m.files) > 4096:
+        raise GuidanceProjectionError("guidance_projection_limit")
+    display_files = project_display_data({"matched_files": list(m.files)}, registry)["matched_files"]
+    projected = replace(m, rule=replace(m.rule, meta=meta,
+                                        id=project_identifier(m.rule.id),
+                                        path=project_identifier(m.rule.path)), files=tuple(display_files))
+    return {"match": m, "item": _item(projected), "text": _text(projected, registry),
+            "constraint": _constraint(projected)}
 
 
 def _constraint(m: _Match) -> Dict[str, Any]:
@@ -216,7 +295,7 @@ def _omitted_mandatory_line(total: int, names: List[str]) -> str:
 
 
 def _invariant_line(constraint: Dict[str, Any]) -> str:
-    return f"- 🧱 [INVARIANT] {constraint['name']}: {constraint['hypothesis']}\n"
+    return f"- 🧱 [INVARIANT] {constraint['name']}: {field_text(constraint['hypothesis'])}\n"
 
 
 def _render(staged: List[Dict[str, Any]], omitted: int, mandatory_total: int, mandatory_named: List[str]) -> str:
@@ -233,7 +312,7 @@ def _render(staged: List[Dict[str, Any]], omitted: int, mandatory_total: int, ma
         parts.append(f"\n{_omitted_line(omitted)}\n")
     if mandatory_total:
         parts.append(f"\n{_omitted_mandatory_line(mandatory_total, mandatory_named)}\n")
-    return "\n".join(parts) if parts else NO_MATCH_TEXT
+    return assembled_text("\n".join(parts) if parts else NO_MATCH_TEXT)
 
 
 def _payload(
@@ -273,10 +352,16 @@ def _tokens(value: object) -> int:
 
 
 def _failure(message: str, rule_errors: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-    result: Dict[str, Any] = {"status": _STATUS_FAIL, "error": message}
+    result: Dict[str, Any] = {"status": _STATUS_FAIL, "error": assembled_text(message)}
     if rule_errors is not None:
         result["rule_errors"] = rule_errors
-    return result
+    try:
+        # The message and rows are assembled here from projected components.
+        # Validate their envelope bounds without redacting across boundaries.
+        checked_result_copy(result, None)
+        return result
+    except GuidanceProjectionError as exc:
+        return {"status": _STATUS_FAIL, "error": exc.code}
 
 
 _IGNORED_NAMED = 3
@@ -284,25 +369,44 @@ _IGNORED_NAMED = 3
 
 def _ignored_warning(ruleset: RuleSet) -> str:
     """One bounded line however many files are ignored: every scan response pays for it."""
-    paths = [i.path for i in ruleset.ignored]
+    total = len(ruleset.ignored)
     head = (
-        f"1 file under {RULES_RELDIR} is not a rule and was ignored" if len(paths) == 1
-        else f"{len(paths)} files under {RULES_RELDIR} are not rules and were ignored"
+        f"1 file under {RULES_RELDIR} is not a rule and was ignored" if total == 1
+        else f"{total} files under {RULES_RELDIR} are not rules and were ignored"
     )
-    named = ", ".join(paths[:_IGNORED_NAMED])
-    more = f" and {len(paths) - _IGNORED_NAMED} more" if len(paths) > _IGNORED_NAMED else ""
-    return f"{head} (aegis status lists why): {named}{more}"
+    paths = [project_identifier(item.path) for item in ruleset.ignored[:_IGNORED_NAMED]]
+    more = f" and {total - _IGNORED_NAMED} more" if total > _IGNORED_NAMED else ""
+    if sum(map(len, paths)) + len(head) + len(more) + 64 > MAX_GUIDANCE_CHARS:
+        raise GuidanceProjectionError("guidance_projection_limit")
+    named = ", ".join(paths)
+    return assembled_text(f"{head} (aegis status lists why): {named}{more}")
 
 
 def _broken(ruleset: RuleSet) -> Dict[str, Any]:
-    errors = [{"path": r.path, "error": r.error or ""} for r in ruleset.errors]
-    listed = "; ".join(f"{e['path']}: {e['error']}" for e in errors[:5])
-    more = f" (and {len(errors) - 5} more)" if len(errors) > 5 else ""
-    return _failure(
-        f"{len(errors)} rule file(s) cannot be served, so no partial rule set is returned: "
-        f"{listed}{more}. Fix or move them; `aegis status` lists them.",
-        errors,
-    )
+    broken = ruleset.errors
+    # The failure envelope has nine fixed JSON nodes and six per error row.
+    # Match checked_result_copy's node cap before allocating those rows.
+    if 9 + 6 * len(broken) > 4096:
+        return _failure("guidance_projection_limit")
+    errors, size = [], 0
+    try:
+        for rule in broken:
+            path = project_error_name(rule.path)
+            reason = project_display_text(rule.error or "", max_len=None)
+            size += len(path) + len(reason)
+            if size > MAX_GUIDANCE_CHARS:
+                raise GuidanceProjectionError("guidance_projection_limit")
+            errors.append({"path": path, "error": assembled_text(reason)})
+        head = f"{len(errors)} rule file(s) cannot be served, so no partial rule set is returned: "
+        more = f" (and {len(errors) - 5} more)" if len(errors) > 5 else ""
+        tail = ". Fix or move them; `aegis status` lists them."
+        listed_size = sum(len(item["path"]) + len(item["error"]) + 4 for item in errors[:5])
+        if listed_size + len(head) + len(more) + len(tail) > MAX_GUIDANCE_CHARS:
+            raise GuidanceProjectionError("guidance_projection_limit")
+        listed = "; ".join(f"{item['path']}: {item['error']}" for item in errors[:5])
+        return _failure(head + listed + more + tail, errors)
+    except GuidanceProjectionError as exc:
+        return _failure(exc.code)
 
 
 def scan(
@@ -310,28 +414,34 @@ def scan(
     changed_files: Optional[List[str]] = None,
     budget: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    *,
+    registry: Optional[SlotRegistry] = None,
 ) -> Dict[str, Any]:
     """The rules for ``changed_files`` (default: the git working tree and index changes).
 
     ``budget`` is the number of rule slots (default JIT_DEFAULT_RULE_COUNT_BUDGET);
     ``max_tokens`` bounds the whole response. Returns ``{"status": "FAIL", "error"}``
     (with ``rule_errors``) when the rules cannot all be loaded.
+    ``registry`` is a sanitized request snapshot; None preserves unresolved
+    templates for direct callers. Projection resource refusal uses the fixed
+    error code ``guidance_projection_limit`` without quoting rule content.
     """
     with gitsafe.memo():  # one answer per repository question for the whole scan
-        return _scan(workspace, changed_files, budget, max_tokens)
+        return _scan(workspace, changed_files, budget, max_tokens, registry)
 
 
 def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[int],
-          max_tokens: Optional[int]) -> Dict[str, Any]:
+          max_tokens: Optional[int], registry: Optional[SlotRegistry]) -> Dict[str, Any]:
     from aegis_core.sync import read_derived, stale_rules
 
     token_budget = resolve_token_budget(workspace, max_tokens)
     try:
         view = rule_integrity.effective(workspace, RULE_CACHE)
     except RuleInventoryError as exc:
-        return _failure(f"the rules directory cannot be read safely: {exc}")
+        return _failure(f"the rules directory cannot be read safely: {project_display_text(str(exc))}")
     except rule_integrity.IntegrityError as exc:
-        return _failure(f"the reviewed (base) version of the rules cannot be read, so none is served: {exc}")
+        reason = project_display_text(str(exc))
+        return _failure(f"the reviewed (base) version of the rules cannot be read, so none is served: {reason}")
     ruleset = view.ruleset
     if ruleset.errors:
         return _broken(ruleset)
@@ -340,8 +450,9 @@ def _scan(workspace: Any, changed_files: Optional[List[str]], budget: Optional[i
     files = workspace_files(workspace_root(workspace), changed_files if changed_files else _git_changed_files(workspace))
     stale = stale_rules(ruleset, read_derived(workspace))
     # Labels are read only by decision callers: scan ranks without them and spawns no git for them.
-    return _select(ruleset, files, budget, token_budget, stale,
-                   lambda served: for_rules(workspace, served, adjudications=Adjudications()), _integrity_extras(view))
+    return select_guidance(ruleset, files, budget, token_budget, stale,
+                   lambda served: for_rules(workspace, served, adjudications=Adjudications()),
+                   _integrity_extras(view), registry)
 
 
 # Titles are branch-local text that reaches an agent: only the first few are listed.
@@ -376,6 +487,9 @@ def scan_user_layer(
     changed_files: Optional[List[str]] = None,
     budget: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    *,
+    registry: Optional[SlotRegistry] = None,
+    extras: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The rules of the read-only user layer (``~/.aegis/rules``, ADR 0005 H8) for files
     in no governed workspace.
@@ -394,15 +508,15 @@ def scan_user_layer(
         try:
             ruleset = RULE_CACHE.get(layout.home)
         except RuleInventoryError as exc:
-            return _failure(f"the user rules directory cannot be read safely: {exc}")
+            return _failure(f"the user rules directory cannot be read safely: {project_display_text(str(exc))}")
         if ruleset.errors:
             return _broken(ruleset)
     neutral = compute({})
-    payload = _select(ruleset, _layer_files(changed_files or []), budget, token_budget, [],
-                      lambda served: {rule.id: neutral for rule in served})
-    payload["user_layer"] = {"path": _layer_path(layout.rules_dir) if layout is not None else None,
-                             "rules": len(ruleset.served)}
-    return payload
+    envelope = dict(extras or {})
+    envelope["user_layer"] = {"path": _layer_path(layout.rules_dir) if layout is not None else None,
+                              "rules": len(ruleset.served)}
+    return select_guidance(ruleset, _layer_files(changed_files or []), budget, token_budget, [],
+                   lambda served: {rule.id: neutral for rule in served}, envelope, registry)
 
 
 def _layer_path(rules_dir: Path) -> str:
@@ -432,7 +546,7 @@ def _layer_files(files: List[str]) -> List[str]:
     return out
 
 
-def _select(
+def select_guidance(
     ruleset: RuleSet,
     files: List[str],
     budget: Optional[int],
@@ -440,21 +554,55 @@ def _select(
     stale: List[Dict[str, Any]],
     fitness_of: Callable[[List[Rule]], Dict[str, Fitness]],
     extras: Optional[Dict[str, Any]] = None,
+    registry: Optional[SlotRegistry] = None,
 ) -> Dict[str, Any]:
-    """Match, rank, slot and clamp ``ruleset``'s served rules for ``files``."""
+    """Capture matching source and fitness once, then select and project it.
+
+    The result retains private, non-serialized inputs so the legacy renderer can
+    bind its registry before truncation and budgeting, with no second source or
+    ledger read. Simulation supplies pure fitness; scan supplies its lazy reader.
+    """
     slots = JIT_DEFAULT_RULE_COUNT_BUDGET if budget is None else max(0, int(budget))
     served = list(ruleset.served)
-    warnings = [_ignored_warning(ruleset)] if ruleset.ignored else []
+    hits = [(r, f) for r, f in ((r, tuple(r.matching_files(files))) for r in served) if f] if files else []
+    fits = fitness_of([r for r, _f in hits]) if hits else {}
+    try:
+        source = checked_result_copy(dict(extras or {}, stale_rules=stale,
+                                      warnings=[_ignored_warning(ruleset)] if ruleset.ignored else []), None)
+    except GuidanceProjectionError as exc:
+        return _failure(exc.code)
+    projection = _Projection(
+        tuple(_match(r, f, fits[r.id]) for r, f in hits), len(served), len(files), slots, token_budget,
+        tuple(source["stale_rules"]), tuple(source["warnings"]),
+        {k: v for k, v in source.items() if k not in {"stale_rules", "warnings"}},
+    )
+    return projection.render(registry)
+
+
+def _select_projection(projection: _Projection, registry: Optional[SlotRegistry]) -> Dict[str, Any]:
+    """Pure rendering/selection over the original request's captured inputs."""
+    slots, token_budget = projection.budget, projection.token_budget
+    matches = projection.matches
+    warnings = list(projection.warnings)
+    if registry is not None:
+        warnings.extend(w for w in registry.sanitized().warnings if w not in warnings)
+    # Only this producer owns the structured warning components. A later public
+    # re-render treats these assembled strings as untrusted text.
+    auxiliary = project_display_data(dict(projection.extras, stale_rules=list(projection.stale)), registry)
+    # Finalized warning identifiers are literal even when they spell a slot.
+    source = checked_result_copy(dict(auxiliary, warnings=warnings), None)
+    warnings = source["warnings"]
     stats = {
-        "total_rules": len(served),
-        "matched": 0,
+        "total_rules": projection.total_rules,
+        "matched": len(matches),
         "budget": slots,
-        "changed_files": len(files),
+        "changed_files": projection.changed_files,
         "estimated_tokens": 0,
         "max_tokens_budget": token_budget,
     }
-    extras = dict(extras or {})
-    if not files:
+    stale = auxiliary["stale_rules"]
+    extras = {k: v for k, v in auxiliary.items() if k not in {"stale_rules", "warnings"}}
+    if not projection.changed_files:
         while True:
             payload = _payload([], 0, [], 0, stats, stale, warnings, extras)
             payload["guidance"] = NO_CHANGES_TEXT
@@ -462,11 +610,6 @@ def _select(
             if payload["stats"]["estimated_tokens"] <= token_budget or not _trim_unreviewed(extras):
                 return payload
 
-    # Fitness reads the ledger and projects credit: only for rules that matched, and only if any did.
-    hits = [(r, f) for r, f in ((r, tuple(r.matching_files(files))) for r in served) if f]
-    fits = fitness_of([r for r, _f in hits]) if hits else {}
-    matches = [_match(r, f, fits[r.id]) for r, f in hits]
-    stats["matched"] = len(matches)
     mandatory = _rank([m for m in matches if m.rule.mandatory], mandatory=True)
     advisory = _rank([m for m in matches if not m.rule.mandatory], mandatory=False)
     cap = min(MANDATORY_SLOT_CAP, slots)
@@ -474,8 +617,12 @@ def _select(
     capped = mandatory[cap:]
     chosen += advisory[:max(0, slots - len(chosen))]
 
-    entries = [{"match": m, "item": _item(m), "text": _text(m), "constraint": _constraint(m)} for m in chosen]
-    omitted_mandatory = [{"name": m.rule.id, "type": m.rule.type, "reason": "slot_cap"} for m in capped]
+    try:
+        entries = [_entry(m, registry) for m in chosen]
+    except GuidanceProjectionError as exc:
+        return _failure(exc.code)
+    omitted_mandatory = [{"name": project_identifier(m.rule.id), "type": m.rule.type,
+                          "reason": "slot_cap"} for m in capped]
 
     # Fill in priority order and stop at the first rule that does not fit, so a
     # lower-priority rule never displaces a higher one. Then confirm against the
@@ -498,7 +645,8 @@ def _select(
     def note_clamped(entry: Dict[str, Any]) -> None:
         rule = entry["match"].rule
         if rule.mandatory:
-            omitted_mandatory.append({"name": rule.id, "type": rule.type, "reason": "token_budget"})
+            omitted_mandatory.append({"name": project_identifier(rule.id), "type": rule.type,
+                                      "reason": "token_budget"})
 
     for entry in clamped:
         note_clamped(entry)
@@ -520,6 +668,13 @@ def _select(
             note_clamped(entry)
             shown = 0
         else:
-            break  # a budget below the empty response: nothing more can go
+            # The full warning and verbose omission prose are optional costs;
+            # the mandatory omission count is not. Compact inside selection,
+            # before final accounting, rather than replacing it with FAIL.
+            payload["guidance"] = "Guidance omitted."
+            if _tokens(payload) > token_budget and warnings:
+                payload["warnings"] = ["scan warning; slot placeholders may be unresolved"]
+            tokens = _tokens(payload)
+            break
     payload["stats"]["estimated_tokens"] = tokens
-    return payload
+    return _SelectedPayload(payload, staged)

@@ -76,17 +76,36 @@ repository path leases above. They do not launch sessions or grant execution aut
 The service uses Python 3.9's standard library and requires POSIX descriptor-relative
 no-follow operations. Unsupported platforms return a structured refusal.
 
+Before the first queue claim:
+
+- Initialize the repository and declare the selected lane in `.aegis/team.json`,
+  using the [minimal policy example](#committed-policy-and-provenance). Declaration
+  is required for queue claims; repository path leases can operate without it.
+- Have the owner review policy changes and use `aegis approve` before merge.
+- List the item, read its full constraints, satisfy its dependencies and holds,
+  and use its current revision. Supply all capabilities the item requires.
+- Establish the lane's separate repository path lease and record its branch;
+  queue claims grant neither path leases nor execution authority.
+
 ```sh
 aegis team queue add --item '{"id":"DOCS-1","title":"Update guide","paths":["docs/**"],"capabilities":["docs"]}' --json
 aegis team queue list --capability docs --json
 aegis team queue list --include-done --json
 aegis team queue claim DOCS-1 --lane docs --branch lane/docs --capability docs --expect REVISION --ttl 3600 --json
-aegis team queue release DOCS-1 --lane docs --expect CLAIM_REVISION --json
-aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION --writer-stopped --reason 'Waiting for review' --json
 aegis team queue done DOCS-1 --lane docs --expect CLAIM_REVISION --json
 aegis team queue audit --json
 aegis team queue compact --json
 ```
+
+To return unfinished work instead of completing it, use `aegis team queue release
+DOCS-1 --lane docs --expect CLAIM_REVISION --json`. To return its intersecting lane
+leases too, use `aegis team queue unclaim DOCS-1 --lane docs --expect CLAIM_REVISION
+--writer-stopped --reason 'Waiting for review' --json` after stopping the writer.
+
+`list --capability` names capabilities available to the team: list items whose
+requirements are all satisfied. Repeat it to supply multiple capabilities.
+Omitting the option disables this filter; items with empty requirements match
+every supplied set. This filter does not bypass other claim-time checks.
 
 Use the actual `revision` returned by add, list, claim or release in place of the
 example placeholders. Release and done are alternative transitions from a claim;
@@ -151,6 +170,23 @@ release or expiry, completion and clearing a hold change it. A changed digest
 signals callers to inspect the queue again; it grants no claim authority and
 does not replace the revision check. Automatic supervisor retries are separate.
 
+For polling, `aegis team queue list --view fingerprint --json` returns the same
+response envelope and fingerprint without constructing full item views. It marks
+`view: fingerprint`, names omitted `items` and `completed_ids`, and instructs the
+caller to run `aegis team queue list --view full --json` after a change. Display
+filters do not affect the fingerprint. A fingerprint never authorizes a claim.
+
+For triage, `aegis team queue audit --view findings --json` retains findings,
+affected item IDs with their current revisions, states and lanes, the claim expiry
+time and whether each claim expired, and counts of items, findings and affected
+items. States and expiry evidence match the full views. It marks `view: findings`,
+identifies omitted item detail and points to
+`aegis team queue list --include-done --view full --json`, which also displays
+retained completed items. Read full constraints before deciding to change holds
+or work. Both commands default to
+`--view full`; refusal envelopes are unchanged by view selection. These view
+options are available through the CLI and core service; MCP keeps its full list.
+
 Pass the lane's branch explicitly with `claim --branch`; it can be a short local
 name or `refs/heads/` name. Queue claims never infer a lane branch from the shared
 workspace's HEAD. Omitted branches are recorded as unknown. Queue claims use the
@@ -183,6 +219,11 @@ malformed hook arguments, including ones mentioning `team queue`, exit 0 silentl
 to preserve the hook's must-not-block contract. Only a successful parse as `team queue`
 exempts queue data named `model` from the raw model-token policy. Workspace bounds
 apply equally before `team`, between `team` and `queue`, and after `queue` or its verb.
+For a structurally established queue command, parser refusals may also carry
+`argument_error`: a fixed category (`missing_required`, `missing_value`,
+`invalid_value` or `limit_exceeded`), allowlisted argument names, and a concrete
+`help_command`. Unknown tokens and supplied values remain opaque. When the
+command or diagnostic cannot be safely established, the generic refusal remains.
 Empty workspace values, NUL bytes and `..` components refuse before workspace
 resolution, as do values exceeding the length or separator limits.
 CLI and core use one bounded tokenizer independent of Python's Windows path parser.
