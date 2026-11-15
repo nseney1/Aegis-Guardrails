@@ -439,6 +439,18 @@ def test_record_transaction_uses_the_single_pinned_publish_write_boundary():
     assert publish.body[-2].value is writes[0]
 
 
+def test_inbox_preview_dependency_and_size_contract():
+    records = (REPO / "tools/hierarchy_mailbox_records.py").read_text(encoding="utf-8")
+    imports = [node.module for node in ast.walk(ast.parse(records)) if isinstance(node, ast.ImportFrom)]
+    imports += [alias.name for node in ast.walk(ast.parse(records)) if isinstance(node, ast.Import)
+                for alias in node.names]
+    assert "hierarchy_mailbox_mcp" not in imports, "records must not import the MCP transport"
+    assert len(records.splitlines()) < 951
+    mcp = (REPO / "tools/hierarchy_mailbox_mcp.py").read_text(encoding="utf-8")
+    assert len(mcp.splitlines()) < 1000
+    assert sum(isinstance(node, ast.stmt) for node in ast.walk(ast.parse(mcp))) <= 613
+
+
 def test_profiles_cover_every_registry_role():
     roles = json.loads((REPO / "tools/hierarchy_templates/role-registry.json").read_text(encoding="utf-8"))["roles"]
     expected = read_snapshot()

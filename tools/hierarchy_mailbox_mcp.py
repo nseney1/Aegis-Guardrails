@@ -691,11 +691,22 @@ class Connection:
     def pager(self):
         """Load planned state lazily, preserving the standalone legacy adapter."""
         if self._pager is None:
-            from hierarchy_mailbox_pager import InboxPager
-            self._pager = InboxPager(clock=lambda: _inbox_now(), brief_dedupe_max_bytes=BRIEF_DEDUPE_MAX_BYTES,
-                                     since_clock_skew_seconds=SINCE_CLOCK_SKEW_SECONDS,
-                                     capacity_error=INBOX_CURSOR_CAPACITY)
+            self._pager = self.new_pager()
         return self._pager
+
+    def new_pager(self):
+        from hierarchy_mailbox_pager import InboxPager
+        return InboxPager(clock=lambda: _inbox_now(), brief_dedupe_max_bytes=BRIEF_DEDUPE_MAX_BYTES,
+                          since_clock_skew_seconds=SINCE_CLOCK_SKEW_SECONDS, capacity_error=INBOX_CURSOR_CAPACITY)
+
+    def preview_inbox(self, arguments, records, message_id):
+        """Supply fencing and MCP framing, without lending the preview a connection."""
+        slimming = self.slim_inbox_metadata()
+        pager = self._pager if slimming and self._pager is not None else self.new_pager()
+        return pager.preview(arguments, records, message_id, checked_binding=self.checked_binding,
+                             slimming=slimming, bound=_bounded_inbox if slimming else _legacy_bounded_inbox,
+                             render=lambda page: _response_line({"jsonrpc": "2.0", "id": 0, "result": _tool_result(page)}),
+                             max_cursor_pairs=MAX_INBOX_CURSOR_PAIRS)
 
     def begin_response(self):
         # Staging is response-local, including malformed requests and failed writes.
@@ -741,21 +752,8 @@ class Connection:
 
     def inbox(self, arguments, *, slimming=None):
         """Authorize one snapshot, then delegate planned page selection and state."""
-        request = self.pager.prepare(arguments)
-        try:
-            mailbox, snapshot = self.checked_binding()
-        except ValueError as exc:
-            if request.since and str(exc).startswith("endpoint has no session binding:"):
-                raise ValueError("current_generation requires a binding; bind the endpoint and reconnect") from exc
-            raise
-        ready = mailbox.ready(snapshot)
-        if slimming is None:
-            slimming = self.slim_inbox_metadata()
-        limit = arguments.get("limit", 20)
-        integer(limit, "inbox limit", maximum=100)
-        return self.pager.page(request, snapshot=snapshot, ready=ready, records=mailbox.messages().values(),
-                               limit=limit, after=arguments.get("after_message_id"), read_brief=mailbox.brief,
-                               brief_status=lambda brief: _brief_status(mailbox, brief), slimming=slimming)
+        return self.pager.inbox(arguments, checked_binding=self.checked_binding, brief_status=_brief_status,
+                                slim_metadata=lambda: self.slim_inbox_metadata() if slimming is None else slimming)
 
     def record_read(self):
         # After flush only; uncertain delivery leaves mail unread so the session wakes again.
@@ -886,12 +884,8 @@ def handle(connection, request):
         return {"tools": connection.definitions()}
     if method == "tools/call":
         fields(params, {"name"}, {"arguments", "_meta"})
-        rendered_sizes = {}
         def render(page):
-            raw = _response_line({"jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)})
-            if params["name"] == "mailbox_inbox":
-                rendered_sizes[len(page["messages"])] = len(raw)
-            return raw
+            return _response_line({"jsonrpc": "2.0", "id": identifier, "result": _tool_result(page)})
 
         render.board_page_framing = (_board_fragment_size, 2)
 
@@ -899,11 +893,9 @@ def handle(connection, request):
             result = connection.call(params["name"], params.get("arguments", {}), render)
             # A binding-only view has no messages to page and nothing to record as read.
             if params["name"] == "mailbox_inbox" and not params.get("arguments", {}).get("binding_only"):
+                from hierarchy_mailbox_pager import assemble_inbox
                 pager = _bounded_inbox if getattr(connection, "inbox_pager", True) else _legacy_bounded_inbox
-                result = pager(result, render)
-                # Every selected count was rendered by the pager, including zero
-                # and one. Reuse its size to retain the logarithmic render bound.
-                connection.note_returned(result, rendered_sizes[len(result["messages"])])
+                result = assemble_inbox(result, render, bound=pager, note_returned=connection.note_returned)
             return _tool_result(result, record=bool(getattr(connection, "records", False)
                                                    and params["name"] in RECORD_TOOLS))
         except (ValueError, OSError, UnicodeError, RecursionError) as exc:

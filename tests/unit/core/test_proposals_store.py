@@ -24,6 +24,7 @@ from aegis_core.insights.keys import insights_path
 from aegis_core.storage import confined_descriptor_supported, file_lock
 from aegis_core.redaction import redact_insight_text
 from conftest import symlink_or_skip
+from tests import helpers_proposal_workers
 
 
 def make_store(tmp_path):
@@ -2019,19 +2020,154 @@ def test_generated_text_cleaning_and_model_round_trips_are_fixpoints():
                 assert model_module.parse_proposal(p.to_bytes(), p.id) == p
 
 
-def test_generated_truncation_boundaries_are_cleaning_fixpoints():
+CORPUS_SEED = 1492
+CORPUS_COUNT = 5000
+CORPUS_BATCH_LIMIT = 250
+CORPUS_LIMITS = (64, 120, 200, 300, 512)
+CORPUS_PIECES = (
+    "a", "[0]", "[1]", "[", "[REDACTED_IP]", "]", "x", "/", "=", ":", " ", "1",
+    "ghp_", "HTTPS://example.org/a?x=y", "password=aaaa", "a@b.com", "192.0.2.1",
+    "😀", "/home/me/file", "ｅｘａｍｐｌｅ", "\u200d", "\u0301",
+)
+_BATCH_IDS = ["batch-%02d" % index for index in range(CORPUS_COUNT // CORPUS_BATCH_LIMIT)]
+
+
+def corpus_cases():
+    """Historical seeded sequence: seed 1492, the same pieces, limits and lengths."""
+    if CORPUS_COUNT > 5000 or not 1 <= CORPUS_BATCH_LIMIT <= 500:
+        raise AssertionError("seed=%s batch=bound index=0" % CORPUS_SEED)
+    rng = Random(CORPUS_SEED)
+    cases = []
+    for _ in range(CORPUS_COUNT):
+        text = "".join(rng.choices(CORPUS_PIECES, k=rng.randrange(1, 25)))
+        cases.append((text, rng.choice(CORPUS_LIMITS)))
+    return cases
+
+
+def corpus_batches(cases):
+    if len(cases) != CORPUS_COUNT:
+        raise AssertionError("seed=%s batch=union index=%s" % (CORPUS_SEED, len(cases)))
+    batches = []
+    start = 0
+    while start < CORPUS_COUNT:
+        batch = tuple(cases[start:start + CORPUS_BATCH_LIMIT])
+        if not batch or len(batch) > CORPUS_BATCH_LIMIT:
+            raise AssertionError("seed=%s batch=%s index=%s" % (CORPUS_SEED, len(batches), len(batch)))
+        batches.append(batch)
+        start += CORPUS_BATCH_LIMIT
+    return tuple(batches)
+
+
+_CORPUS_CASES = corpus_cases()
+_CORPUS_BATCHES = corpus_batches(_CORPUS_CASES)
+
+
+def _case_label(batch_index, index):
+    return "seed=%s batch=%s index=%s" % (CORPUS_SEED, batch_index, index)
+
+
+def _refusal_token(code):
+    if (type(code) is str and 1 <= len(code) <= 32 and code.isascii()
+            and all(char.isalnum() or char in "_-" for char in code)):
+        return code
+    return "invalid"
+
+
+def _raise_labeled(label, exc):
+    """Replace an operation failure with the case label and keep the cause."""
+    if type(exc) is AssertionError:
+        message = str(exc)
+        if ("\n" not in message and "\r" not in message
+                and (message == label or message.startswith(label + " code="))):
+            raise exc
+        raise AssertionError(label) from exc
+    if type(exc) is ProposalError:
+        raise AssertionError(label + " code=" + _refusal_token(exc.code)) from exc
+    raise AssertionError(label) from exc
+
+
+def _assert_cleaning_fixpoint(batch_index, index, text, limit, *, plant=False, replaced_by=None):
+    label = _case_label(batch_index, index)
+    try:
+        cleaned = model_module.clean_text(text, limit)
+        again = model_module.clean_text(cleaned, limit)
+        proposal = candidate(hypothesis=text, prediction=text, do=text, labels=(text,), guidance=(text,))
+        parsed = model_module.parse_proposal(proposal.to_bytes(), proposal.id)
+        replaced = replace(proposal) if replaced_by is None else replaced_by(proposal)
+        if plant:
+            raise AssertionError(label)
+        if again != cleaned or replaced != proposal or parsed != proposal:
+            raise AssertionError(label)
+    except Exception as exc:
+        _raise_labeled(label, exc)
+
+
+@pytest.mark.parametrize("batch_index", range(len(_CORPUS_BATCHES)), ids=_BATCH_IDS)
+def test_generated_truncation_boundaries_are_cleaning_fixpoints(batch_index):
+    batch = _CORPUS_BATCHES[batch_index]
+    assert len(batch) <= CORPUS_BATCH_LIMIT
+    for index, (text, limit) in enumerate(batch):
+        _assert_cleaning_fixpoint(batch_index, index, text, limit)
+
+
+def test_corpus_batches_union_equals_seeded_sequence():
     rng = Random(1492)
     pieces = ("a", "[0]", "[1]", "[", "[REDACTED_IP]", "]", "x", "/", "=", ":", " ", "1",
               "ghp_", "HTTPS://example.org/a?x=y", "password=aaaa", "a@b.com", "192.0.2.1",
               "😀", "/home/me/file", "ｅｘａｍｐｌｅ", "\u200d", "\u0301")
+    limits = (64, 120, 200, 300, 512)
+    original = []
     for _ in range(5000):
         text = "".join(rng.choices(pieces, k=rng.randrange(1, 25)))
-        limit = rng.choice((64, 120, 200, 300, 512))
-        cleaned = model_module.clean_text(text, limit)
-        assert model_module.clean_text(cleaned, limit) == cleaned
-        p = candidate(hypothesis=text, prediction=text, do=text, labels=(text,), guidance=(text,))
-        assert replace(p) == p
-        assert model_module.parse_proposal(p.to_bytes(), p.id) == p
+        original.append((text, rng.choice(limits)))
+    assert pieces == CORPUS_PIECES and limits == CORPUS_LIMITS
+    assert (CORPUS_SEED, CORPUS_COUNT, CORPUS_BATCH_LIMIT) == (1492, 5000, 250)
+    flat = [case for batch in _CORPUS_BATCHES for case in batch]
+    assert len(flat) == len(original) == len(_CORPUS_CASES) == 5000
+    for index, case in enumerate(original):
+        if flat[index] != case or _CORPUS_CASES[index] != case:
+            raise AssertionError("seed=1492 batch=union index=%s" % index)
+    assert [len(batch) for batch in _CORPUS_BATCHES] == [250] * 20
+
+
+@pytest.mark.parametrize("slot", ["first", "last", "planted"])
+@pytest.mark.parametrize("batch_index", range(len(_CORPUS_BATCHES)), ids=_BATCH_IDS)
+def test_corpus_failure_names_seed_batch_and_index(batch_index, slot):
+    batch = _CORPUS_BATCHES[batch_index]
+    index = {"first": 0, "last": len(batch) - 1, "planted": 1}[slot]
+    text, limit = batch[index]
+    with pytest.raises(AssertionError) as caught:
+        _assert_cleaning_fixpoint(batch_index, index, text, limit, plant=True)
+    message = str(caught.value)
+    assert message == _case_label(batch_index, index)
+    assert "\n" not in message and "\r" not in message
+
+
+def test_corpus_unexpected_failure_names_seed_batch_and_index(monkeypatch):
+    """An exception from a wrapped case operation keeps the label and the cause."""
+    def boom(text, limit):
+        raise RuntimeError("secret\ncase")
+
+    monkeypatch.setattr(model_module, "clean_text", boom)
+    with pytest.raises(AssertionError) as caught:
+        _assert_cleaning_fixpoint(0, 0, "a", 64)
+    message = str(caught.value)
+    assert message == _case_label(0, 0)
+    assert "\n" not in message and "\r" not in message and "secret" not in message
+    assert type(caught.value.__cause__) is RuntimeError
+
+
+def test_corpus_replace_refusal_names_seed_batch_and_index():
+    """ProposalError from the wrapped replace call stays inside the labeled boundary."""
+    def broken(proposal):
+        raise ProposalError("stale")
+
+    with pytest.raises(AssertionError) as caught:
+        _assert_cleaning_fixpoint(0, 3, "a", 64, replaced_by=broken)
+    message = str(caught.value)
+    assert message == _case_label(0, 3) + " code=stale"
+    assert "\n" not in message and "\r" not in message
+    assert type(caught.value.__cause__) is ProposalError
 
 
 def test_decision_directory_entry_limit_refuses_before_new_publication(tmp_path, monkeypatch):
@@ -2344,3 +2480,264 @@ def test_proposal_parser_wrong_input_types_refuse_invalid(data):
 def test_text_clip_limits_refuse_invalid_types_and_negative_values(limit):
     with refusal("invalid"):
         model_module.clean_text("Keep the literal text.", limit)
+
+
+def _worker_outcomes(report, count):
+    import multiprocessing
+
+    assert report.timed_out is False
+    assert report.forced is False
+    assert report.exitcodes == (0,) * count
+    assert len(report.results) == count
+    found = {}
+    for worker, status, code in report.results:
+        assert worker not in found
+        assert "\n" not in worker and "\n" not in status and "\n" not in code
+        assert "\r" not in worker and "\r" not in status and "\r" not in code
+        found[worker] = (status, code)
+    assert all(status != "error" for status, _code in found.values())
+    live = {proc.pid for proc in multiprocessing.active_children()}
+    assert not (set(report.pids) & live)
+    return found
+
+
+def _insight(pid):
+    return candidate(pid, source="insight", source_lineage=("insight",), insight_ids=("ins-aaaaaaaaaaaa",))
+
+
+def _log_rows(home):
+    logs = [path for path in home.rglob("*.jsonl") if path.is_file() and not path.is_symlink()]
+    assert len(logs) == 1
+    return logs[0], [json.loads(line) for line in logs[0].read_text().splitlines() if line]
+
+
+def test_process_compare_replace_has_one_winner(tmp_path):
+    store = make_store(tmp_path)
+    saved = store.write(candidate())
+    root, home = str(store.root), str(store.home)
+    texts = {"a": "First guidance.", "b": "Second guidance."}
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.compare_replace,
+         (root, home, saved.proposal.id, saved.digest, texts["a"], "a")),
+        (helpers_proposal_workers.compare_replace,
+         (root, home, saved.proposal.id, saved.digest, texts["b"], "b")),
+    ], timeout=60)
+    outcomes = _worker_outcomes(report, 2)
+    winners = [worker for worker, (status, _code) in outcomes.items() if status == "written"]
+    losers = [worker for worker, (status, _code) in outcomes.items() if status == "refused"]
+    assert len(winners) == 1 and len(losers) == 1
+    assert outcomes[losers[0]] == ("refused", "stale")
+    current = store.read(saved.proposal.id)
+    assert current.proposal.do == texts[winners[0]]
+    assert [item.proposal.id for item in store.list()] == [saved.proposal.id]
+    before = snapshot(tmp_path)
+    assert store.write(current.proposal) == current
+    with refusal("stale"):
+        store.write(replace(saved.proposal, do=texts[losers[0]]), expected_digest=saved.digest)
+    assert snapshot(tmp_path) == before
+
+
+def test_process_private_quota_has_one_winner_and_too_large(tmp_path, monkeypatch):
+    first, second = shared_worktree_stores(tmp_path)
+    first.write(_insight("ins-first"))
+    second.write(_insight("ins-second"))
+    first.decide(["ins-first"], decision="propose", operation_id="op-seed")
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.decide,
+         (str(first.root), str(first.home), "ins-first", "op-first", "confirm", 2, "a")),
+        (helpers_proposal_workers.decide,
+         (str(second.root), str(second.home), "ins-second", "op-second", "confirm", 2, "b")),
+    ], timeout=60)
+    outcomes = _worker_outcomes(report, 2)
+    winners = [worker for worker, (status, _code) in outcomes.items() if status == "written"]
+    losers = [worker for worker, (status, _code) in outcomes.items() if status == "refused"]
+    assert len(winners) == 1 and len(losers) == 1
+    winner_op = {"a": "op-first", "b": "op-second"}[winners[0]]
+    loser_op = {"a": "op-first", "b": "op-second"}[losers[0]]
+    assert outcomes[winners[0]] == ("written", winner_op)
+    assert outcomes[losers[0]] == ("refused", "too_large")
+    _log, rows = _log_rows(first.home)
+    assert {row["operation_id"] for row in rows} == {"op-seed", winner_op}
+    assert len(rows) == 2
+    assert first.read("ins-first").proposal.id == "ins-first"
+    assert second.read("ins-second").proposal.id == "ins-second"
+    monkeypatch.setattr(store_module, "MAX_ROWS", 2)
+    before = snapshot(tmp_path)
+    winner_store, winner_id = (first, "ins-first") if winners[0] == "a" else (second, "ins-second")
+    loser_store, loser_id = (second, "ins-second") if winners[0] == "a" else (first, "ins-first")
+    assert winner_store.decide([winner_id], decision="confirm", operation_id=winner_op)["operation_id"] == winner_op
+    with refusal("too_large"):
+        loser_store.decide([loser_id], decision="confirm", operation_id=loser_op)
+    assert snapshot(tmp_path) == before
+    assert first.state("ins-first") == second.state("ins-second") == "needs_draft"
+
+
+def test_process_concurrent_identical_publication_is_one_row(tmp_path):
+    """Two processes publishing one new operation leave a single readable row."""
+    store = make_store(tmp_path)
+    proposal = _insight("ins-race")
+    store.write(proposal)
+    root, home = str(store.root), str(store.home)
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.decide, (root, home, proposal.id, "op-race", "propose", None, "a")),
+        (helpers_proposal_workers.decide, (root, home, proposal.id, "op-race", "propose", None, "b")),
+    ], timeout=60)
+    outcomes = _worker_outcomes(report, 2)
+    assert outcomes == {"a": ("written", "op-race"), "b": ("written", "op-race")}
+    _log, rows = _log_rows(store.home)
+    assert len(rows) == 1 and rows[0]["operation_id"] == "op-race" and rows[0]["decision"] == "propose"
+    assert store.read(proposal.id).proposal == proposal
+    assert store.state(proposal.id) == "needs_draft"
+
+
+def test_process_identical_retry_is_byte_identical(tmp_path):
+    """Retries of an older seeded operation leave the captured snapshot unchanged."""
+    import time
+
+    from aegis_core.primitives import utc_stamp
+
+    store = make_store(tmp_path)
+    proposal = _insight("ins-retry")
+    store.write(proposal)
+    seeded = store.decide([proposal.id], decision="propose", operation_id="op-retry")
+    deadline = time.monotonic() + 3
+    while utc_stamp() == seeded["ts"]:
+        if time.monotonic() >= deadline:
+            raise AssertionError("seed=1492 batch=retry index=0")
+        time.sleep(0.05)
+    before = snapshot(tmp_path)
+    log, rows = _log_rows(store.home)
+    assert len(rows) == 1 and rows[0]["operation_id"] == "op-retry" and rows[0]["ts"] == seeded["ts"]
+    root, home = str(store.root), str(store.home)
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.decide, (root, home, proposal.id, "op-retry", "propose", None, "a")),
+        (helpers_proposal_workers.decide, (root, home, proposal.id, "op-retry", "propose", None, "b")),
+    ], timeout=60)
+    outcomes = _worker_outcomes(report, 2)
+    assert outcomes == {"a": ("written", "op-retry"), "b": ("written", "op-retry")}
+    assert snapshot(tmp_path) == before
+    assert log.read_bytes() == before[log.relative_to(tmp_path).as_posix()]
+    assert store.decide([proposal.id], decision="propose", operation_id="op-retry")["operation_id"] == "op-retry"
+    assert snapshot(tmp_path) == before
+    assert store.read(proposal.id).proposal == proposal
+    assert store.state(proposal.id) == "needs_draft"
+
+
+@pytest.mark.parametrize("private", [False, True], ids=["public", "private"])
+def test_process_shared_log_lock_timeout_refuses_without_mutation(tmp_path, private):
+    first, second = shared_worktree_stores(tmp_path)
+    first.write(_insight("ins-first"))
+    first.decide(["ins-first"], decision="propose", operation_id="op-seed")
+    proposal = _insight("ins-second") if private else candidate("mine-second")
+    second.write(proposal)
+    lock_path = str(insights_path(first.root, home=first.home).with_suffix(".lock"))
+    before = snapshot(tmp_path)
+    context = helpers_proposal_workers.worker_context()
+    ready = context.Event()
+    done = context.Event()
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.hold_shared_lock,
+         (str(first.root), str(first.home), lock_path, ready, done, "holder")),
+        (helpers_proposal_workers.decide_locked,
+         (str(second.root), str(second.home), proposal.id, "op-retry", "propose", 0.25, ready, done, "waiter")),
+    ], timeout=30, context=context)
+    outcomes = _worker_outcomes(report, 2)
+    assert outcomes["holder"] == ("released", "")
+    assert outcomes["waiter"] == ("refused", "timeout")
+    assert snapshot(tmp_path) == before
+    assert second.decide([proposal.id], decision="propose", operation_id="op-retry")["operation_id"] == "op-retry"
+    after = snapshot(tmp_path)
+    assert second.decide([proposal.id], decision="propose", operation_id="op-retry")["operation_id"] == "op-retry"
+    assert snapshot(tmp_path) == after
+    assert second.read(proposal.id).proposal.id == proposal.id
+
+
+def _reaped(report):
+    import multiprocessing
+
+    live = {proc.pid for proc in multiprocessing.active_children()}
+    assert report.pids and not (set(report.pids) & live)
+
+
+def test_hung_proposal_worker_is_terminated_and_reaped():
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.hang, ("sleeper",)),
+    ], timeout=5)
+    assert report.timed_out is True
+    assert report.forced is True
+    assert report.results == ()
+    assert report.exitcodes != (0,)
+    assert len(report.exitcodes) == 1 and report.exitcodes[0] not in (None, 0)
+    _reaped(report)
+    with pytest.raises(AssertionError):
+        _worker_outcomes(report, 1)
+
+
+def test_reported_then_crashed_worker_is_not_a_successful_exit():
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.report_then_crash, ("crasher",)),
+    ], timeout=15)
+    assert report.timed_out is False
+    assert report.forced is False
+    assert report.results == (("crasher", "written", ""),)
+    assert report.exitcodes == (1,)
+    _reaped(report)
+    with pytest.raises(AssertionError):
+        _worker_outcomes(report, 1)
+
+
+def test_reported_then_hung_worker_is_forced_cleanup():
+    report = helpers_proposal_workers.run_workers([
+        (helpers_proposal_workers.report_then_hang, ("linger",)),
+    ], timeout=15)
+    assert report.timed_out is False
+    assert report.forced is True
+    assert report.results == (("linger", "written", ""),)
+    assert len(report.exitcodes) == 1 and report.exitcodes[0] not in (None, 0)
+    _reaped(report)
+    with pytest.raises(AssertionError):
+        _worker_outcomes(report, 1)
+
+
+def test_spawned_worker_reports_unsupported_when_the_probe_is_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "descriptor_supported", lambda: False)
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    box = []
+
+    class Barrier:
+        def wait(self, timeout=None):
+            return 0
+
+    class Results:
+        def put(self, item):
+            box.append(item)
+
+    helpers_proposal_workers.compare_replace(
+        str(root), str(home), "mine-example", "ab" * 32, "Next guidance.", "worker", Barrier(), Results())
+    assert box == [("worker", "refused", "unsupported")]
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("text", ["First\nSecond", "First\rSecond", "First\r\nSecond"], ids=["lf", "cr", "crlf"])
+def test_worker_refuses_multiline_replacement_before_publication(tmp_path, text):
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    box = []
+
+    class Barrier:
+        def wait(self, timeout=None):
+            return 0
+
+    class Results:
+        def put(self, item):
+            box.append(item)
+
+    helpers_proposal_workers.compare_replace(
+        str(root), str(home), "mine-example", "ab" * 32, text, "worker", Barrier(), Results())
+    assert box == [("worker", "refused", "invalid")]
+    assert list(root.iterdir()) == []
