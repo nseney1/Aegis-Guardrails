@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tracemalloc
+from xml.etree import ElementTree
 from types import SimpleNamespace
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
@@ -2313,6 +2314,8 @@ _PERF_RETAINED_CEILING = 64 * 1024
 _PERF_GRANT_FLOOR = 100 * 1024
 _PERF_TRACE_DEPTH = 25
 _PERF_SPANS = {}
+# The pytest request fixture below shares the record-payload helper's name.
+_perf_record_request = request
 
 
 def _perf_sha(text):
@@ -2357,13 +2360,15 @@ def _perf_count_payloads(monkeypatch):
 
 
 @contextmanager
-def _perf_trace_depth():
-    """Trace at _PERF_TRACE_DEPTH, then restore a shallower session that was already on.
+def _perf_trace_depth(*, owned_shallow=False):
+    """Trace at _PERF_TRACE_DEPTH without discarding another owner's history.
 
     start() ignores its argument when tracing is already active, and a 1-frame
-    traceback never reaches _grant_entry. Stop and start again to raise the limit.
+    traceback never reaches _grant_entry. Only lift a session this test owns.
     """
     was_tracing = tracemalloc.is_tracing()
+    if was_tracing and not owned_shallow:
+        pytest.skip("outer tracemalloc session must keep its history")
     previous_limit = tracemalloc.get_traceback_limit() if was_tracing else None
     restarted = not was_tracing or previous_limit < _PERF_TRACE_DEPTH
     if restarted and was_tracing:
@@ -2377,6 +2382,25 @@ def _perf_trace_depth():
             tracemalloc.stop()
             if was_tracing:
                 tracemalloc.start(previous_limit)
+
+
+@pytest.mark.parametrize("depth", [1, _PERF_TRACE_DEPTH])
+def test_mc_records_perf_trace_depth_preserves_outer_history(depth):
+    if tracemalloc.is_tracing():
+        pytest.skip("requires ownership of the outer tracing session")
+    tracemalloc.start(depth)
+    try:
+        retained = bytearray(8192)
+        before = tracemalloc.get_object_traceback(retained)
+        assert before is not None
+        with pytest.raises(pytest.skip.Exception, match="outer tracemalloc session"):
+            with _perf_trace_depth():
+                pytest.fail("an outer tracing session must be refused before measurement")
+        assert tracemalloc.is_tracing()
+        assert tracemalloc.get_traceback_limit() == depth
+        assert tracemalloc.get_object_traceback(retained) == before
+    finally:
+        tracemalloc.stop()
 
 
 def _perf_grant_traced():
@@ -2507,11 +2531,24 @@ def test_mc_records_perf_digest_bytes_limits_and_render_count(bound, monkeypatch
     assert len(legacy_renders) == 1
 
 
-def test_mc_records_perf_large_grant_read_bounds_retained_bytes(bound, monkeypatch):
+def test_mc_records_perf_large_grant_read_bounds_retained_bytes(request, monkeypatch, tmp_path):
     """A large grant authorizes the same view without retaining its original bytes."""
-    root, writer, reader = bound
+    if tracemalloc.is_tracing():
+        make_store(tmp_path).close()
+        retained = bytearray(8192)
+        before = tracemalloc.get_object_traceback(retained)
+        depth = tracemalloc.get_traceback_limit()
+        assert before is not None
+        try:
+            completed = _perf_grant_child(tmp_path)
+        finally:
+            assert tracemalloc.is_tracing() and tracemalloc.get_traceback_limit() == depth
+            assert tracemalloc.get_object_traceback(retained) == before
+        assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
+        return
+    root, writer, reader = request.getfixturevalue("bound")
     monkeypatch.setattr(mailbox_module, "timestamp", lambda: _PERF_STAMP)
-    published = data(call(writer, "mailbox_publish_record", request("r00")))
+    published = data(call(writer, "mailbox_publish_record", _perf_record_request("r00")))
     rid = published["id"]
     small = call(reader, "mailbox_read_record", {"message_id": "r00", "fields": ["body"]})
     assert not small.get("isError")
@@ -2519,6 +2556,10 @@ def test_mc_records_perf_large_grant_read_bounds_retained_bytes(bound, monkeypat
     refs = call(reader, "mailbox_digest", {"limit": 100, "fields": ["body"], "refs": [rid]})
     assert not refs.get("isError")
     assert _perf_sha(refs["content"][0]["text"]) == _PERF_REFS_SHA
+    # The public read/digest above warm the product path. Inspect's first source
+    # lookup and tracemalloc's statistics setup must also precede every start.
+    _perf_source_span(records._grant_entry)
+    tracemalloc.Snapshot([], _PERF_TRACE_DEPTH).statistics("traceback")
     grant = root.parent / "mailbox-records" / (".grants-" + rid)
     envelope = codec.parse(grant.read_bytes())
     entry = envelope["fields"]["value"]
@@ -2573,7 +2614,7 @@ def test_mc_records_perf_large_grant_read_bounds_retained_bytes(bound, monkeypat
     try:
         if shallow_owned:
             assert tracemalloc.get_traceback_limit() == 1
-        with _perf_trace_depth():
+        with _perf_trace_depth(owned_shallow=shallow_owned):
             gc.collect()
             tracemalloc.clear_traces()
             with pytest.raises(AssertionError, match="grant ceiling traced=") as planted:
@@ -2617,23 +2658,150 @@ def test_mc_records_perf_large_grant_read_bounds_retained_bytes(bound, monkeypat
     assert concurrent[0]["content"][0]["text"] == concurrent[1]["content"][0]["text"] == small_text
 
 
+def _perf_assert_grant_result(completed, report):
+    assert completed.returncode == 0, completed.stdout[-3000:] + completed.stderr[-1500:]
+    assert report.is_file(), "grant child did not write its JUnit result"
+    cases = ElementTree.parse(report).findall(".//testcase")
+    assert len(cases) == 1
+    assert cases[0].get("name") == "test_mc_records_perf_large_grant_read_bounds_retained_bytes"
+    assert not any(cases[0].find(tag) is not None for tag in ("failure", "error", "skipped"))
+
+
+def _perf_child_env(environment=None):
+    env = dict(os.environ if environment is None else environment)
+    env.pop("PYTHONTRACEMALLOC", None)
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("PYTHONSAFEPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _perf_grant_child(tmp_path, *, startup_trace=False, environment=None):
+    """A child owns tracing; an inherited startup session stays with its owner."""
+    env = _perf_child_env(environment)
+    if startup_trace:
+        env["PYTHONTRACEMALLOC"] = "1"
+    root = Path(__file__).resolve().parents[2]
+    child_base = tmp_path / "child"
+    child_base.mkdir()
+    report = tmp_path / "grant-results.xml"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest",
+         "tests/integration/test_hierarchy_mailbox_records.py::test_mc_records_perf_large_grant_read_bounds_retained_bytes",
+         "-o", "addopts=--import-mode=importlib", "-p", "no:cacheprovider",
+         "--basetemp", str(child_base), "--junitxml", str(report), "-q", "--tb=line"],
+        cwd=str(root), env=env, capture_output=True, text=True,
+        timeout=240 if startup_trace else 180, check=False)
+    _perf_assert_grant_result(completed, report)
+    return completed
+
+
 def test_mc_records_perf_pythontracemalloc_keeps_the_grant_ceiling(tmp_path):
     """PYTHONTRACEMALLOC=1 still raises the planted ceiling and passes the real read."""
     store = make_store(tmp_path)
     store.close()
-    env = os.environ.copy()
-    env["PYTHONTRACEMALLOC"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    root = Path(__file__).resolve().parents[2]
-    child_base = tmp_path / "child"
-    child_base.mkdir()
-    completed = subprocess.run(
-        [sys.executable, "-m", "pytest",
-         "tests/integration/test_hierarchy_mailbox_records.py::test_mc_records_perf_large_grant_read_bounds_retained_bytes",
-         "-p", "no:cacheprovider", "--basetemp", str(child_base), "-q", "--tb=line"],
-        cwd=str(root), env=env, capture_output=True, text=True, timeout=180, check=False)
+    completed = _perf_grant_child(tmp_path, startup_trace=True)
     assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
-    assert "1 passed" in completed.stdout
+
+
+@pytest.mark.parametrize("addopts", [None, "-p no:xdist", "-q", "-k pythontracemalloc"],
+                         ids=["no-addopts", "disabled-xdist", "quiet", "outer-selection"])
+def test_mc_records_perf_grant_child_ignores_outer_options(tmp_path, addopts):
+    make_store(tmp_path).close()
+    environment = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    if addopts is None:
+        environment.pop("PYTEST_ADDOPTS", None)
+    else:
+        environment["PYTEST_ADDOPTS"] = addopts
+    completed = _perf_grant_child(tmp_path, environment=environment)
+    assert completed.returncode == 0, completed.stdout[-1500:] + completed.stderr[-1500:]
+
+
+def test_mc_records_perf_traced_child_does_not_setup_bound(tmp_path):
+    make_store(tmp_path).close()
+    root = HELPER.parent.parent
+    report = tmp_path / "guard-results.xml"
+    child_base = tmp_path / "guard-child"
+    child_base.mkdir()
+    code = """
+import sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + '/tests']
+import pytest
+import tracemalloc
+class Guard:
+    def pytest_fixture_setup(self, fixturedef, request):
+        if tracemalloc.is_tracing() and fixturedef.argname in {'bound', 'pilot'}:
+            pytest.fail('tracing parent eagerly resolved the mailbox fixture')
+raise SystemExit(pytest.main([
+    '-o', 'addopts=--import-mode=importlib', '-p', 'no:cacheprovider',
+    '--basetemp', sys.argv[2], '--junitxml', sys.argv[3], '-q', '--tb=short',
+    'tests/integration/test_hierarchy_mailbox_records.py::test_mc_records_perf_large_grant_read_bounds_retained_bytes',
+], plugins=[Guard()]))
+"""
+    env = _perf_child_env()
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONTRACEMALLOC"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(root), str(child_base), str(report)],
+        cwd=str(root), env=env, capture_output=True, text=True, timeout=300, check=False)
+    _perf_assert_grant_result(completed, report)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("foreign_tests", [False, True], ids=["namespace-tests", "foreign-tests-package"])
+@pytest.mark.parametrize("safe_path", [False, True], ids=["normal-path", "safe-path"])
+def test_mc_records_perf_child_keeps_outer_history(tmp_path, failure, foreign_tests, safe_path):
+    """A passing measurement and a failing ceiling control leave outer traces intact."""
+    if tracemalloc.is_tracing():
+        pytest.skip("requires ownership of the outer tracing session")
+    code = """
+import sys
+import tracemalloc
+if sys.argv[2]:
+    sys.path.insert(0, sys.argv[2])
+    import tests
+    assert tests.FOREIGN_TRACE_TESTS is True
+sys.path[:0] = [sys.argv[3], sys.argv[3] + '/tests']
+import conftest  # Bootstrap this repository's test namespace before qualified imports.
+from tests.integration.test_hierarchy_mailbox_records import (
+    _perf_trace_depth, _perf_assert_retained, _PERF_GRANT_FLOOR)
+assert sys.dont_write_bytecode
+try:
+    with _perf_trace_depth():
+        _perf_assert_retained(0, _PERF_GRANT_FLOOR if sys.argv[1] == 'True' else 0)
+finally:
+    assert not tracemalloc.is_tracing()
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    if safe_path:
+        environment["PYTHONSAFEPATH"] = "1"
+    else:
+        environment.pop("PYTHONSAFEPATH", None)
+    env = _perf_child_env(environment)
+    foreign = tmp_path / "foreign"
+    if foreign_tests:
+        package = foreign / "tests"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("FOREIGN_TRACE_TESTS = True\n", encoding="utf-8")
+    tracemalloc.start(1)
+    try:
+        retained = bytearray(8192)
+        before = tracemalloc.get_object_traceback(retained)
+        assert before is not None
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(failure), str(foreign) if foreign_tests else "",
+             str(HELPER.parent.parent)],
+            cwd=str(HELPER.parent.parent),
+            env=env, capture_output=True, text=True, timeout=30, check=False)
+        assert tracemalloc.is_tracing() and tracemalloc.get_traceback_limit() == 1
+        assert tracemalloc.get_object_traceback(retained) == before
+        assert completed.returncode == (1 if failure else 0), completed.stdout + completed.stderr
+        refusal = "grant ceiling traced=%d ceiling=%d margin=%d" % (
+            _PERF_GRANT_FLOOR, _PERF_RETAINED_CEILING, _PERF_GRANT_FLOOR - _PERF_RETAINED_CEILING)
+        assert (refusal in completed.stderr) == failure
+    finally:
+        tracemalloc.stop()
 
 
 def test_mc_records_perf_publish_rollback_restores_original_bytes(bound, monkeypatch):
