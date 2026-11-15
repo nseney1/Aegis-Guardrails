@@ -20,6 +20,315 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "pyproject.toml").exists())
 
 
+def test_policy_process_environment_defaults_to_ambient_allowlist(tmp_path):
+    from aegis_core import gitsafe_policy
+    assert "PYTEST_CURRENT_TEST" in os.environ
+    envelope = gitsafe_policy.request_environment(os.environ, profile="strict/effect", root=tmp_path)
+    leaked = "PYTEST_CURRENT_TEST" in envelope or "PYTEST_CURRENT_TEST" in envelope.source
+    allowlisted = set(envelope.source).issubset(gitsafe_policy.AMBIENT_ENV)
+    assert not leaked
+    assert allowlisted
+    ordinary = gitsafe_policy.request_environment(os.environ, base={})
+    ordinary_retained = "PYTEST_CURRENT_TEST" in ordinary
+    assert ordinary_retained
+
+
+def test_policy_explicit_map_keeps_explicit_values(tmp_path):
+    from aegis_core import gitsafe_policy
+    envelope = gitsafe_policy.request_environment({"EXPLICIT_MARKER": "caller"},
+        profile="strict/effect", root=tmp_path)
+    assert envelope["EXPLICIT_MARKER"] == "caller"
+
+
+@pytest.mark.parametrize("operation", ["strict", "identity", "layer", "scope", "overrides",
+                                       "inherited", "with_vars", "replace"])
+def test_policy_environment_type_reaches_every_validation_layer(tmp_path, operation):
+    from aegis_core import gitsafe_policy as policy
+    class ChangingEnvironment(dict):
+        pass
+    values = ChangingEnvironment({"LANGUAGE": "en"})
+    if operation == "strict":
+        assert policy.strict_environment(values, environ_type=ChangingEnvironment) == dict(values)
+    elif operation == "identity":
+        assert policy.identity_environment(ChangingEnvironment(), ("version",),
+            environ_type=ChangingEnvironment) == {}
+    elif operation == "layer":
+        assert policy.environment_layer(values, allowed=None, error=gitsafe.GitError,
+            code="git_custody_refused", environ_type=ChangingEnvironment) == dict(values)
+    else:
+        options = dict(profile="strict/effect", root=tmp_path, environ_type=ChangingEnvironment)
+        source = ChangingEnvironment({"LANG": "C"})
+        if operation in ("scope", "overrides"):
+            envelope = policy.request_environment(source, **options, **{operation: values})
+        else:
+            envelope = policy.request_environment(source, **options)
+            if operation == "inherited":
+                envelope = policy.request_environment(envelope, overrides=values, **options)
+            else:
+                envelope = envelope.with_vars(values, replace=operation == "replace")
+        assert envelope["LANGUAGE"] == "en"
+        with pytest.raises(gitsafe.GitError) as caught:
+            envelope.with_vars(ChangingEnvironment({"GIT_DIR": "private-selector"}))
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+            "git_custody_refused", "Strict lane Git command refused.",
+            "Use the lane Git APIs or the CAS fast-forward writer.")
+        assert envelope.with_vars(ChangingEnvironment({"LANGUAGE": "retry"}))["LANGUAGE"] == "retry"
+
+
+@pytest.mark.usefixtures("strict_program")
+@pytest.mark.parametrize("entry", ["run", "execute", "capture", "lane"])
+@pytest.mark.parametrize("mode", ["effect", "strict", "strict-effect"])
+@pytest.mark.parametrize("case", ["stable", "selector"])
+def test_runner_environment_type_seam_preserves_results_and_refusals(
+        repo, tmp_path, effect_lock, monkeypatch, entry, mode, case):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    class ChangingEnvironment(dict):
+        pass
+    program = gitsafe.git_executable()
+    source = ChangingEnvironment({"PATH": os.path.dirname(program)})
+    monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", ChangingEnvironment)
+    monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": source}))
+    strict = mode != "effect"
+    fds = (effect_lock,) if mode != "strict" else None
+    identity = ChangingEnvironment() if fds is None else {}
+    def invoke():
+        context = gitsafe.custody(scratch=tmp_path, strict_lane=strict,
+            env=ChangingEnvironment() if strict else None, worktree_root=repo) if strict or entry == "capture" else nullcontext()
+        with context:
+            options = dict(effect_fds=fds, worktree_root=repo)
+            if entry == "run":
+                return gitsafe.run(["version"], repo, _env=identity if strict else None, **options)
+            if entry == "execute":
+                return gitsafe_run.execute(["version"], repo, executable=gitsafe.git_executable,
+                    legacy_runner=gitsafe.subprocess.run, error=gitsafe.GitError, environ=None,
+                    timeout=5, stdin=None, hardening=gitsafe_run.DEFAULT_HARDENING,
+                    env=identity if strict else None, tty=False, **options)
+            if entry == "capture":
+                argv = [program, *gitsafe_run.DEFAULT_HARDENING, *gitsafe_run._LANE_OPTIONS, "version"] if strict else [program, "version"]
+                return gitsafe_run.capture(argv, cwd=repo, env=source if strict else None,
+                    stdin=None, timeout=5, **options)
+            lane = gitsafe.lane_runner(repo, tmp_path, **options)
+            return lane.run(["version"], _env=identity if strict else None)
+    if case == "selector":
+        source["GIT_DIR"] = "private-selector"
+        with pytest.raises(gitsafe.GitError) as caught:
+            invoke()
+        if entry == "capture" and strict:
+            expected = ("git_custody_refused", "Strict lane Git command refused.",
+                        "Use the lane Git APIs or the CAS fast-forward writer.")
+        elif mode == "strict":
+            expected = ("ambient_git_environment", "Ambient Git environment refused: GIT_DIR.",
+                        "Unset GIT_DIR in the environment, then retry.")
+        else:
+            expected = ("ambient_git_environment", "Ambient Git environment refused.",
+                        "Unset Git program and repository selectors, then retry.")
+        assert (caught.value.code, str(caught.value), caught.value.next_action) == expected
+        assert caught.value.process_started is False
+        del source["GIT_DIR"]
+    for _ in range(2):
+        result = invoke()
+        assert result.returncode == 0 and result.stdout.startswith(b"git version ")
+        assert not gitsafe_run.custody_active()
+
+
+def test_policy_environment_type_proofs_stay_separate_across_threads(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from aegis_core import gitsafe_policy as policy
+    class LeftEnvironment(dict):
+        pass
+    class RightEnvironment(dict):
+        pass
+    gate = Barrier(2, timeout=5)
+    def edit(own, foreign):
+        envelope = policy.request_environment(own({"LANG": "C"}), profile="strict/effect",
+            root=tmp_path, environ_type=own)
+        gate.wait()
+        for _ in range(2):
+            with pytest.raises(gitsafe.GitError) as caught:
+                envelope.with_vars(foreign({"LANGUAGE": "foreign"}))
+            assert caught.value.code == "effect_environment_limit"
+            changed = envelope.with_vars(own({"LANGUAGE": own.__name__}))
+            assert changed["LANGUAGE"] == own.__name__ and changed.origin is envelope.origin
+            envelope = policy.request_environment(changed, profile="strict/effect", environ_type=own)
+        gate.wait()
+        return envelope["LANGUAGE"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        left = pool.submit(edit, LeftEnvironment, RightEnvironment)
+        right = pool.submit(edit, RightEnvironment, LeftEnvironment)
+        assert left.result(timeout=10) == "LeftEnvironment"
+        assert right.result(timeout=10) == "RightEnvironment"
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("ordinary", {"marker": "override"}),
+    ("strict", "valid"),
+    ("profile", "git_custody_refused"),
+    ("root", "git_custody_refused"),
+    ("roots", "effect_environment_limit"),
+    ("kind", "git_custody_refused"),
+    ("entries", "ambient_environment_too_large"),
+    ("key", "ambient_environment_too_large"),
+    ("value", "ambient_environment_too_large"),
+    ("nul", "git_custody_refused"),
+    ("type", "git_custody_refused"),
+    ("redirect", "ambient_git_environment"),
+    ("program", "ambient_git_environment"),
+    ("override", "git_custody_refused"),
+])
+def test_policy_environment_golden_before_and_after_extraction(tmp_path, case, expected):
+    source, options = {}, {"profile": "strict/effect", "root": tmp_path}
+    if case == "ordinary":
+        source = {"marker": "source"}
+        options = dict(base={}, scope={"marker": "scope"}, overrides={"marker": "override"})
+    elif case == "profile": options["profile"] = "invalid"
+    elif case == "root": options["root"] = "relative"
+    elif case == "roots": options["roots"] = [tmp_path] * 65
+    elif case == "kind": options["kind"] = "invalid"
+    elif case == "entries": source = {str(i): "value" for i in range(513)}
+    elif case == "key": source = {"k" * 257: "value"}
+    elif case == "value": source = {"key": "v" * 65537}
+    elif case == "nul": source = {"key": "\0"}
+    elif case == "type": source = {"key": 1}
+    elif case == "redirect": source = {"GIT_DIR": "private"}
+    elif case == "program": source = {"GIT_SSH": "private"}
+    elif case == "override": options["overrides"] = {"GIT_DIR": "private"}
+    refusals = {
+        "git_custody_refused": ("Strict lane Git command refused.", "Use the lane Git APIs or the CAS fast-forward writer."),
+        "effect_environment_limit": ("Git operation effect environment exceeds supported limits.", "Reduce the supplied environment to bounded string entries; no effect process started."),
+        "entries": ("Ambient environment has too many variables.", "Reduce the environment to at most 512 variables, then retry."),
+        "key": ("Ambient environment variable name exceeds its limit.", "Shorten every environment variable name to at most 256 characters, then retry."),
+        "value": ("Ambient environment value exceeds its limit.", "Reduce every environment value to at most 65,536 characters, then retry."),
+        "redirect": ("Ambient Git environment refused: GIT_DIR.", "Unset GIT_DIR in the environment, then retry."),
+        "ambient_git_environment": ("Ambient Git environment refused.", "Unset Git program and repository selectors, then retry."),
+    }
+    if case in ("ordinary", "strict"):
+        result = gitsafe_run.request_environment(source, **options)
+        if case == "ordinary": assert result == expected
+        else:
+            assert isinstance(result, gitsafe_run.Environment)
+            assert result["GIT_TERMINAL_PROMPT"] == "0" and result["GIT_ALLOW_PROTOCOL"] == ""
+            assert result.root == os.path.normcase(str(tmp_path.resolve()))
+        return
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.request_environment(source, **options)
+    error = caught.value
+    assert (error.code, str(error), error.next_action, error.process_started) == (
+        expected, *refusals.get(case, refusals.get(expected, (None, None))), False)
+
+
+@pytest.mark.parametrize("operation", ["headers", "object", "objects"])
+@pytest.mark.parametrize("case", ["valid", "malformed", "oversized", "missing", "corrupt", "limit"])
+def test_policy_private_reader_golden_before_and_after_extraction(tmp_path, operation, case):
+    from contextlib import nullcontext
+    data, oid = b"payload", gitsafe.blob_id(b"payload")
+    oids = [oid] if case != "malformed" else ["private-input"]
+    if case == "oversized": oids = [oid] * 20001
+    body = oid.encode() + b" blob 7\n"
+    if case == "missing": body = oid.encode() + b" missing\n"
+    if case == "corrupt": body = b"private-input\n"
+    def runner(args, cwd, *, stdin):
+        output = body if args == ["cat-file", "--batch-check"] else data
+        if args == ["cat-file", "--batch"]: output = body + data + b"\n"
+        return subprocess.CompletedProcess(args, 0, output, b"")
+    def custody(**kwargs): return nullcontext()
+    def headers(cwd, values, **kwargs):
+        return gitsafe_run.private_headers(cwd, values, runner=runner,
+            batch=["cat-file", "--batch-check"], custody=custody, error=gitsafe.GitError, **kwargs)
+    def read():
+        if operation == "headers": return headers(tmp_path, oids, env={}, scratch=tmp_path)
+        if operation == "object":
+            # The single reader has a scalar OID and a separate bounded cap.
+            value = oids[0] if case != "oversized" else "o" * 16385
+            return gitsafe_run.private_object(tmp_path, value, kind="blob", max_bytes=6 if case == "limit" else 7,
+                env={}, scratch=tmp_path, headers=headers, runner=runner, custody=custody, error=gitsafe.GitError)
+        return gitsafe_run.private_objects(tmp_path, oids, max_bytes=6 if case == "limit" else 7,
+            max_object_bytes=7, env={}, scratch=tmp_path, headers=headers, runner=runner,
+            batch=["cat-file", "--batch"], custody=custody, error=gitsafe.GitError)
+    if case == "valid" or operation == "headers" and case in ("missing", "limit"):
+        result = read()
+        expected = {oid: None if case == "missing" else ("blob", 7)} if operation == "headers" else (
+            data if operation == "object" else {oid: ("blob", data)})
+        assert result == expected
+    else:
+        with pytest.raises(gitsafe.GitError) as caught: read()
+        code, message = ("git_object_limit", "private object size limit exceeded") if case == "limit" else (
+            "invalid_object", "invalid private object request" if case in ("malformed", "oversized") else "invalid private object")
+        assert (caught.value.code, str(caught.value), getattr(caught.value, "next_action", None)) == (code, message, None)
+
+
+def test_policy_implementation_is_below_runner_and_test_only_facades_are_removed():
+    from aegis_core import gitsafe_policy
+    for name in ("private_headers", "private_object", "private_objects"):
+        assert getattr(gitsafe_run, name) is getattr(gitsafe_policy, name)
+    for name in ("private_object_headers", "read_private_object", "read_private_objects"):
+        assert not hasattr(gitsafe, name)
+    tree = ast.parse((ROOT / "aegis_core/gitsafe_policy.py").read_text(encoding="utf-8"))
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assert not any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                   and n.value.id == "os" and n.attr in ("environ", "getenv")
+                   for function in functions for n in ast.walk(function))
+
+
+def test_policy_facade_imports_are_public_and_declared():
+    from aegis_core import gitsafe_policy
+    tree = ast.parse((ROOT / "aegis_core/gitsafe_run.py").read_text(encoding="utf-8"))
+    imports = [alias for node in tree.body if isinstance(node, ast.ImportFrom)
+               and node.module == "aegis_core.gitsafe_policy" for alias in node.names]
+    assert imports
+    assert all(not alias.name.startswith("_") and alias.name in gitsafe_policy.__all__
+               for alias in imports)
+    # ChangingEnvironment tests own this facade patch point; it must still feed
+    # the request constructor rather than a copied policy-module global.
+    assert gitsafe_run._ENVIRON_TYPE is gitsafe_policy.ENVIRON_TYPE
+
+
+@pytest.mark.parametrize("name", ["HARDENING_KEEP_HOOKS_PATH", "DEFAULT_HARDENING",
+                                  "_LANE_OPTIONS", "_FIXED_CONFIG", "_argv", "_command"])
+def test_selector_pinned_policy_sites_stay_in_transport(name):
+    def definitions(module):
+        tree = ast.parse((ROOT / "aegis_core" / (module + ".py")).read_text(encoding="utf-8"))
+        return {node.name if isinstance(node, ast.FunctionDef) else target.id
+                for node in tree.body
+                for target in ([node] if isinstance(node, ast.FunctionDef) else
+                               node.targets if isinstance(node, ast.Assign) else [])
+                if isinstance(target, (ast.Name, ast.FunctionDef))}
+    assert name in definitions("gitsafe_run")
+    assert name not in definitions("gitsafe_policy")
+
+
+@pytest.mark.parametrize("entry", ["facade", "transport"])
+@pytest.mark.parametrize("options, message", [
+    ({"strict_lane": 1}, "invalid custody mode"),
+    ({"stdout_limit": True}, "invalid custody limit"),
+    ({"stderr_limit": -1}, "invalid custody limit"),
+    ({"scratch": "relative"}, "invalid custody scratch"),
+    ({"scratch": "x" * 16385}, "invalid custody scratch"),
+    ({"env": []}, "invalid custody environment"),
+    ({"env": {str(i): "v" for i in range(65)}}, "invalid custody environment"),
+    ({"env": {"key": "v" * 65537}}, "invalid custody environment"),
+    ({"env": {"key": "\0"}}, "invalid custody environment"),
+])
+def test_retained_custody_surfaces_raise_git_error_and_recover(tmp_path, entry, options, message):
+    context = gitsafe.custody if entry == "facade" else gitsafe_run.custody
+    with pytest.raises(gitsafe.GitError) as caught:
+        with context(**{**dict(scratch=tmp_path), **options}):
+            pytest.fail("invalid request entered custody")
+    assert (caught.value.code, str(caught.value), getattr(caught.value, "next_action", None)) == (
+        "invalid_custody", message, None)
+    assert not gitsafe_run.custody_active()
+    with context(scratch=tmp_path): assert gitsafe_run.custody_active()
+    assert not gitsafe_run.custody_active()
+
+
+def test_retained_capture_default_refusal_is_git_error(tmp_path):
+    with pytest.raises(gitsafe.GitError) as caught:
+        gitsafe_run.capture([], cwd=tmp_path, env={}, stdin=None, timeout=1)
+    assert (caught.value.code, str(caught.value), caught.value.process_started) == (
+        "invalid_custody", "invalid custody capture", False)
+
+
 def strict_program_guard(*, optional=False, native_fixture=False):
     """One capability check, exposed as a fixture and for conditional helper setup."""
     supported = gitsafe_run._program_supported()
@@ -1215,7 +1524,7 @@ def test_no_package_module_reaches_gitsafe_private_names():
     for pkg in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
         for path in sorted((ROOT / pkg).rglob("*.py")):
             rel = path.relative_to(ROOT).as_posix()
-            if rel not in ("aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"):
+            if rel not in ("aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py", "aegis_core/gitsafe_policy.py"):
                 offenders += _single_reader_offenders(rel, path.read_text(encoding="utf-8"))
     assert offenders == []
 
@@ -1385,7 +1694,7 @@ def _run_subcommand_offenders(rel, source, *, root=ROOT):
         protected = {"cas", "paths", "publish", "_run"}
         lane_methods = {"run", "run_checked", "paths", "environment", "read_ref", "cas", "publish",
                         "read_private_object", "read_private_objects", "private_object_headers"}
-        for module in ("gitsafe.py", "gitsafe_run.py"):
+        for module in ("gitsafe.py", "gitsafe_run.py", "gitsafe_policy.py"):
             protected.update(n.name for n in ast.parse((root / "aegis_core" / module).read_text(encoding="utf-8")).body
                              if isinstance(n, ast.FunctionDef))
         for node in ast.walk(tree):
@@ -1504,7 +1813,7 @@ def test_strict_structural_guard_refuses_names_without_resolving_bindings(source
 
 
 def _copy_lane_guard_sources(root):
-    for relative in LANE_MODULES | {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"}:
+    for relative in LANE_MODULES | {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py", "aegis_core/gitsafe_policy.py"}:
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
@@ -2210,6 +2519,7 @@ def test_windows_pipe_reader_start_failure_is_typed_and_input_free(repo, tmp_pat
     assert "hostile-payload" not in str(caught.value)
 
 
+@pytest.mark.usefixtures("strict_program")
 @pytest.mark.parametrize("kind", ["blob", "tree", "commit"])
 def test_private_object_reader_keeps_objects_private_and_enforces_size(repo, tmp_path, kind):
     scratch = tmp_path / "private"
@@ -2223,58 +2533,61 @@ def test_private_object_reader_keeps_objects_private_and_enforces_size(repo, tmp
         b"tree " + _git(repo, "rev-parse", "HEAD^{tree}").strip().encode() +
         b"\nauthor A <a@example.com> 1700000000 +0000\ncommitter A <a@example.com> 1700000000 +0000\n\nprivate\n")}[kind]
     oid = gitsafe.run(["hash-object", "-w", "-t", kind, "--stdin"], repo, stdin=data, _env=env).stdout.decode().strip()
-    assert gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=len(data), env=env, scratch=scratch) == data
+    lane = gitsafe.lane_runner(repo, scratch)
+    assert lane.read_private_object(repo, oid, kind=kind, max_bytes=len(data)) == data
     if data:
         with pytest.raises(gitsafe.GitError) as caught:
-            gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=len(data)-1, env=env, scratch=scratch)
+            lane.read_private_object(repo, oid, kind=kind, max_bytes=len(data)-1)
         assert caught.value.code == "git_object_limit"
     absent = gitsafe.run(["cat-file", "-e", oid], repo)
     assert absent.returncode != 0
 
 
+@pytest.mark.usefixtures("strict_program")
 def test_private_batch_reads_mixed_objects_and_preflights_aggregate_limit(repo, tmp_path, monkeypatch):
+    lane = gitsafe.lane_runner(repo, tmp_path)
     oids = [_git(repo, "rev-parse", rev).strip() for rev in ("HEAD", "HEAD^{tree}", "HEAD:a.py")]
-    expected = {oid: (kind, gitsafe.read_private_object(repo, oid, kind=kind, max_bytes=10000,
-                env={}, scratch=tmp_path)) for oid, kind in zip(oids, ("commit", "tree", "blob"))}
+    expected = {oid: (kind, lane.read_private_object(repo, oid, kind=kind, max_bytes=10000))
+                for oid, kind in zip(oids, ("commit", "tree", "blob"))}
     total = sum(len(data) for kind, data in expected.values())
-    calls, real = [], gitsafe.run
+    calls, real = [], gitsafe_run.capture
     def record(args, *rest, **kwargs):
-        calls.append(args)
+        calls.append(list(args[args.index("cat-file"):]))
         return real(args, *rest, **kwargs)
-    monkeypatch.setattr(gitsafe, "run", record)
-    assert gitsafe.read_private_objects(repo, oids, max_bytes=total, max_object_bytes=10000,
-                                        env={}, scratch=tmp_path) == expected
+    monkeypatch.setattr(gitsafe_run, "capture", record)
+    assert lane.read_private_objects(repo, oids, max_bytes=total, max_object_bytes=10000) == expected
     assert calls == [["cat-file", "--batch-check"], ["cat-file", "--batch"]]
     calls.clear()
     with pytest.raises(gitsafe.GitError) as caught:
-        gitsafe.read_private_objects(repo, oids, max_bytes=total - 1, max_object_bytes=10000,
-                                     env={}, scratch=tmp_path)
+        lane.read_private_objects(repo, oids, max_bytes=total - 1, max_object_bytes=10000)
     assert caught.value.code == "git_object_limit"
     assert calls == [["cat-file", "--batch-check"]]
 
 
+@pytest.mark.usefixtures("strict_program")
 @pytest.mark.parametrize("failure", ["large-size", "wrong-kind", "missing", "trailing", "hash"])
 def test_private_batch_refuses_malformed_frames_without_echo(repo, tmp_path, monkeypatch, failure):
+    lane = gitsafe.lane_runner(repo, tmp_path)
     oid = _git(repo, "rev-parse", "HEAD:a.py").strip()
-    real = gitsafe.run
+    real = gitsafe_run.capture
     calls = []
     def corrupt(args, *rest, **kwargs):
-        calls.append(args)
+        command = list(args[args.index("cat-file"):])
+        calls.append(command)
         result = real(args, *rest, **kwargs)
-        if args == ["cat-file", "--batch-check"]:
+        if command == ["cat-file", "--batch-check"]:
             if failure == "large-size":
                 result.stdout = oid.encode() + b" blob " + b"9" * 21 + b"\n"
             elif failure == "wrong-kind":
                 result.stdout = oid.encode() + b" hostile-payload 1\n"
             elif failure == "missing":
                 result.stdout = oid.encode() + b" missing\n"
-        elif args == ["cat-file", "--batch"]:
+        elif command == ["cat-file", "--batch"]:
             result.stdout = result.stdout + b"hostile-payload" if failure == "trailing" else result.stdout.replace(b"a = 1", b"a = 2")
         return result
-    monkeypatch.setattr(gitsafe, "run", corrupt)
+    monkeypatch.setattr(gitsafe_run, "capture", corrupt)
     with pytest.raises(gitsafe.GitError) as caught:
-        gitsafe.read_private_objects(repo, [oid], max_bytes=10000, max_object_bytes=10000,
-                                     env={}, scratch=tmp_path)
+        lane.read_private_objects(repo, [oid], max_bytes=10000, max_object_bytes=10000)
     assert caught.value.code == "invalid_object"
     assert str(caught.value) == "invalid private object"
     if failure in ("large-size", "wrong-kind", "missing"):
@@ -3851,7 +4164,7 @@ def test_effect_fetch_policy_uses_first_configured_url(repo, tmp_path, effect_lo
 
 def test_effect_functions_do_not_read_ambient_environment():
     """All recipe inputs and executable candidates cross the two shared boundaries."""
-    names = ("gitsafe", "gitsafe_run", "gitops_fds", "ghcli", "team_gitops")
+    names = ("gitsafe", "gitsafe_run", "gitsafe_policy", "gitops_fds", "ghcli", "team_gitops")
     sources = {name: (ROOT / "aegis_core" / (name + ".py")).read_text(encoding="utf-8") for name in names}
     # Allowed sinks and callbacks retain existing custody/platform behavior.
     sinks = {("gitsafe_run", "capture", "subprocess.Popen"): "bounded capture or isolated holder",
@@ -3867,7 +4180,7 @@ def test_effect_functions_do_not_read_ambient_environment():
                         "default_gh_runner", "_gh_command", "prepare_capture", "holder_recipe"}
     recipe_calls = {"request_environment", "gitsafe_run.request_environment", "transport.environment",
                     "effect_environment", "gitops_fds.effect_environment", "gitops_fds.prepare_capture",
-                    "gitops_fds.capture_recipe", "_gh_command", "_lane.environment", "_environment_layer"}
+                    "gitops_fds.capture_recipe", "_gh_command", "_lane.environment", "environment_layer"}
     def census(texts):
         readers, seen_sinks, seen_lookups, errors = set(), set(), set(), []
         for module, source in texts.items():
@@ -3889,7 +4202,7 @@ def test_effect_functions_do_not_read_ambient_environment():
                         for variant in variants:
                             valid = isinstance(variant, ast.Call) and ast.unparse(variant.func) in recipe_calls
                             valid |= isinstance(variant, (ast.Name, ast.Tuple)) and isinstance(value, ast.IfExp)
-                            valid |= function.name == "environment" and isinstance(variant, ast.DictComp) and any(isinstance(x, ast.Name) and x.id == "_LOCATION_ENV" for x in ast.walk(variant))
+                            valid |= function.name == "environment" and isinstance(variant, ast.DictComp) and any(isinstance(x, ast.Name) and x.id == "LOCATION_ENV" for x in ast.walk(variant))
                             if not valid:
                                 errors.append((module, function.name, "environment recipe bypass"))
                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr in ("environ", "environb", "getenv"):
@@ -3939,7 +4252,8 @@ def test_effect_functions_do_not_read_ambient_environment():
     binder = next(n for n in leaf.body if isinstance(n, ast.FunctionDef) and n.name == "effect_environment")
     returns = [n for n in ast.walk(binder) if isinstance(n, ast.Return)]
     assert len(returns) == 1 and ast.unparse(returns[0].value.func) == "transport.environment"
-    profiles = next(n for n in ast.walk(constructors[0]) if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "profile")
+    policy = ast.parse(sources["gitsafe_policy"])
+    profiles = next(n for n in ast.walk(policy) if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "profile")
     assert ast.literal_eval(profiles.comparators[0]) == ("ordinary", "strict/effect")
     holder = ast.parse(gitops_fds._HOLDER_SOURCE)
     spawns = [n for n in ast.walk(holder) if isinstance(n, ast.Call) and ast.unparse(n.func) == "subprocess.Popen"]
