@@ -3352,6 +3352,75 @@
             "description": null,
             "help": "Capture, review, and enable human correction insights (add, review, enable)"
           },
+          "lint": {
+            "aliases": [],
+            "arguments": [
+              {
+                "default": "==SUPPRESS==",
+                "dest": "help",
+                "flags": [
+                  "-h",
+                  "--help"
+                ],
+                "help": "show this help message and exit",
+                "kind": "help",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "plain",
+                "flags": [
+                  "--plain"
+                ],
+                "help": null,
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "const": true,
+                "default": "==SUPPRESS==",
+                "dest": "json",
+                "flags": [
+                  "--json"
+                ],
+                "help": null,
+                "kind": "store_true",
+                "metavar": null,
+                "nargs": 0,
+                "required": false
+              },
+              {
+                "default": "==SUPPRESS==",
+                "dest": "workspace",
+                "flags": [
+                  "--workspace"
+                ],
+                "help": null,
+                "kind": "_WorkspaceArg",
+                "metavar": null,
+                "nargs": null,
+                "required": false,
+                "type": "str"
+              },
+              {
+                "default": [],
+                "dest": "paths",
+                "flags": [],
+                "help": "Rule files or directories below .aegis/rules (default: all rules)",
+                "kind": "store",
+                "metavar": "PATH",
+                "nargs": "*",
+                "required": false
+              }
+            ],
+            "description": null,
+            "help": "Report rule lint findings without changing rules"
+          },
           "list": {
             "aliases": [],
             "arguments": [
@@ -5153,6 +5222,22 @@
                     "nargs": null,
                     "required": false,
                     "type": "str"
+                  },
+                  {
+                    "choices": [
+                      "full",
+                      "findings"
+                    ],
+                    "default": "full",
+                    "dest": "view",
+                    "flags": [
+                      "--view"
+                    ],
+                    "help": "Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
+                    "required": false
                   }
                 ],
                 "description": null,
@@ -5501,7 +5586,7 @@
                     "flags": [
                       "--capability"
                     ],
-                    "help": "Filter by a team capability label; repeat for each label",
+                    "help": "Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label",
                     "kind": "Capabilities",
                     "metavar": null,
                     "nargs": null,
@@ -5518,6 +5603,22 @@
                     "kind": "store_true",
                     "metavar": null,
                     "nargs": 0,
+                    "required": false
+                  },
+                  {
+                    "choices": [
+                      "full",
+                      "fingerprint"
+                    ],
+                    "default": "full",
+                    "dest": "view",
+                    "flags": [
+                      "--view"
+                    ],
+                    "help": "Full item detail (default), or fingerprint only; run the full list after a change",
+                    "kind": "store",
+                    "metavar": null,
+                    "nargs": null,
                     "required": false
                   }
                 ],

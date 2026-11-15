@@ -18,24 +18,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import wraps
 import errno
-import codecs
-import hashlib
 import os
 from pathlib import Path
 import re
 import stat
-import zlib
 from threading import Lock
 from typing import Optional, Sequence, Tuple, Union
 
-from aegis_core import gitsafe, gitsafe_run
+from aegis_core import gitsafe, gitsafe_run, team_git_snapshot
 from aegis_core.errors import AegisError
+from aegis_core.team_git_snapshot import (
+    GitRefusal, conversion_settings as _conversion_settings, decode_worktree as _decode_worktree,
+    index_clean as _index_clean, index_records as _index_records, snapshot_entries as _snapshot_entries,
+)
 from aegis_core.primitives import sanitize_display
 from aegis_core.redaction import redact_insight_text
-from aegis_core.workspace.git_objects import object_id
 
 __all__ = ["CommitIdentity", "GitRefusal", "GitStore", "Plan", "cas_fast_forward", "commit_tested",
-           "descriptor_support", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree"]
+           "descriptor_support", "plan_merge", "plan_pick", "plan_revert", "snapshot_tree",
+           # Export the internal runner-transfer surface for the lane guard's accounting.
+           "_current", "_publish", "_require_runner", "_snapshot_baselines", "_write_snapshot"]
 
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
@@ -46,16 +48,9 @@ MAX_PICKS = 256
 MAX_OBJECT_BYTES = 16 * 1024 * 1024
 MAX_OBJECTS = 20000
 MAX_RESPONSE_BYTES = MAX_PATHS * (MAX_PATH_BYTES + 1)
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_OID = team_git_snapshot.OID_PATTERN
 _DATE = re.compile(r"[0-9]{1,12} [+-](?:[01][0-9]|2[0-3])[0-5][0-9]\Z")
 _FORBIDDEN = re.compile(r"^\s*Aegis-(?:Approve(?:-Insight)?|Exempt-Test)\s*:", re.I | re.M)
-class GitRefusal(gitsafe.GitError):
-    """Stable library refusal. code is the machine-readable refusal, never stderr."""
-
-    def __init__(self, code: str, *, next_action=None) -> None:
-        actions = {"index_flags_unsupported": "Clear assume-unchanged and skip-worktree flags, then retry.",
-                   "index_stat_unprovable": "Run `git update-index --refresh` in the worktree, then retry."}
-        super().__init__("Lane Git operation refused: " + code, code=code, next_action=actions.get(code, next_action))
 
 
 def _error_code(exc, default="git_failed"):
@@ -151,7 +146,9 @@ def _lane_operation(function):
         if "_runner" in kwargs:
             raise GitRefusal("lane_runner_required")
         try:
-            runner = store._lane if store._temp is not None else gitsafe.lane_runner(store.repo, store.scratch)
+            effect_fds = kwargs.get("effect_fds") if function.__name__ == "cas_fast_forward" else None
+            runner = store._lane if store._temp is not None and effect_fds is None else gitsafe.lane_runner(
+                store.repo, store.scratch, effect_fds=effect_fds, worktree_root=store.repo)
             return function(store, *args, _runner=runner, **kwargs)
         except AegisError as exc:
             raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
@@ -348,86 +345,6 @@ def _read_path(root_fd: int, raw: bytes, remaining: int):
 
 
 
-_INDEX_STAT = re.compile(rb"  ctime: ([0-9]{1,20}):([0-9]{1,10})\n  mtime: ([0-9]{1,20}):([0-9]{1,10})\n"
-    rb"  dev: ([0-9]{1,20})\tino: ([0-9]{1,20})\n  uid: ([0-9]{1,20})\tgid: ([0-9]{1,20})\n"
-    rb"  size: ([0-9]{1,20})\tflags: ([0-9a-fA-F]{1,16})\n")
-
-
-def _index_refuse(code="conversion_unavailable"):
-    raise GitRefusal(code)
-
-
-def _index_records(raw, *, max_paths, max_path_bytes, max_bytes):
-    """Bound before parsing; select stage 0, otherwise Git's stage-2 baseline."""
-    if type(raw) is not bytes or len(raw) > max_bytes or raw.count(b"\0") > max_paths * 3:
-        _index_refuse("size_limit")
-    grouped, position = {}, 0
-    while position < len(raw):
-        end = raw.find(b"\0", position, position + max_path_bytes + 84)
-        if end < 0:
-            _index_refuse("size_limit")
-        meta, separator, path = raw[position:end].partition(b"\t")
-        if not separator or len(meta) > 75 or not 1 <= len(path) <= max_path_bytes:
-            _index_refuse()
-        fields = meta.split(b" ")
-        if (len(fields) != 3 or fields[0] not in (b"100644", b"100755", b"120000", b"160000")
-                or _OID.fullmatch(fields[1].decode("ascii", "replace")) is None or fields[2] not in (b"0", b"1", b"2", b"3")):
-            _index_refuse()
-        stats = _INDEX_STAT.match(raw, end + 1, min(len(raw), end + 1 + 256))
-        if stats is None:
-            _index_refuse()
-        cache = tuple(int(x) for x in stats.groups()[:-1]) + (int(stats.group(10), 16),)
-        if any(x > 0xffffffff for x in cache) or cache[1] >= 1000000000 or cache[3] >= 1000000000:
-            _index_refuse()
-        stage = fields[2]
-        flags = cache[9]
-        if flags & ~0x6000f000 or flags & 0x3000 != int(stage) << 12:
-            _index_refuse()
-        if bool(flags & 0x4000) != bool(flags & 0x60000000) or flags & 0x20000000 and stage != b"0":
-            _index_refuse()
-        if flags & 0x40008000:
-            _index_refuse("index_flags_unsupported")
-        if path not in grouped and len(grouped) >= max_paths:
-            _index_refuse("size_limit")
-        stages = grouped.setdefault(path, {})
-        if stage in stages:
-            _index_refuse()
-        stages[stage] = (fields[0].decode("ascii"), None if flags & 0x20000000 else fields[1].decode("ascii"), cache)
-        position = stats.end()
-    result = {}
-    for path, stages in grouped.items():
-        if b"0" in stages and len(stages) != 1:
-            _index_refuse()
-        if b"0" in stages:
-            result[path] = stages[b"0"]
-        else:
-            mode = next(stages[s][0] for s in (b"2", b"1", b"3") if s in stages)
-            result[path] = (mode, *stages.get(b"2", (None, None, None))[1:])
-    return result
-
-
-def _index_matches(cache, observed, settings, index_time):
-    """Git's stat-clean shortcut, with racy mtimes treated as dirty."""
-    if cache is None or index_time is None or cache[9] & 0x3000 or observed.st_mtime_ns >= index_time:
-        return False
-    ct, cn, mt, mn, dev, ino, uid, gid, size, _ = cache
-    if mt != observed.st_mtime_ns // 1000000000 or size != observed.st_size:
-        return False
-    minimal = settings["checkstat"] == b"minimal"
-    if not minimal and (ino, uid, gid) != tuple(x & 0xffffffff for x in
-                            (observed.st_ino, observed.st_uid, observed.st_gid)):
-        return False
-    if not minimal and settings["trustctime"] != b"false" and ct != observed.st_ctime_ns // 1000000000:
-        return False
-    # USE_NSEC and USE_STDEV are build options Git does not expose. A mismatch
-    # in these fields alone cannot prove whether Git would re-clean the bytes.
-    if (observed.st_mtime_ns // 1000000000 == index_time // 1000000000 or not minimal and
-            (mn != observed.st_mtime_ns % 1000000000 or dev != observed.st_dev & 0xffffffff
-             or settings["trustctime"] != b"false" and cn != observed.st_ctime_ns % 1000000000)):
-        return None
-    return True
-
-
 def _index_stamp(store):
     # This is the custodian-bound Git service index, not a model-selected path.
     # No content is opened here; worktree payloads still use the descriptor walk.
@@ -443,24 +360,6 @@ def _index_stamp(store):
 _CONFIG_QUERY = r"^core\.(autocrlf|safecrlf|filemode|symlinks|eol|trustctime|checkstat)$"
 
 
-def _eol_rule(values, settings):
-    text = values["crlf"] if values["text"] == b"unspecified" else values["text"]
-    if text not in (b"set", b"unset", b"auto", b"input", b"unspecified"):
-        raise GitRefusal("conversion_unavailable")
-    eol = values["eol"]
-    if eol not in (b"lf", b"crlf", b"set", b"unset", b"unspecified"):
-        raise GitRefusal("conversion_unavailable")
-    action = "binary" if text == b"unset" else ("auto" if text == b"auto" else "text")
-    if text == b"unspecified" and eol not in (b"lf", b"crlf"):
-        action = "auto" if settings["autocrlf"] in (b"true", b"input") else "binary"
-    output_crlf = settings["autocrlf"] == b"true" or (
-        settings["autocrlf"] != b"input" and (settings["eol"] == b"crlf" or
-        settings["eol"] in (b"", b"native") and os.name == "nt"))
-    output_crlf = {b"lf": False, b"crlf": True}.get(eol, text != b"input" and output_crlf)
-    encoding = values["working-tree-encoding"]
-    return action, output_crlf, values["ident"] == b"set", encoding if encoding not in (b"unset", b"unspecified") else None
-
-
 def _snapshot_rules(store, paths):
     for path in paths:
         _path_parts(path)
@@ -468,143 +367,12 @@ def _snapshot_rules(store, paths):
     out = store._run(["check-attr", "-z", "--stdin", *names],
         real_index=True,
         stdin=b"".join(path + b"\0" for path in paths)).stdout
-    if out.count(b"\0") != 3 * len(paths) * len(names) or (out and not out.endswith(b"\0")):
-        raise GitRefusal("conversion_unavailable")
-    attrs, rules = out.split(b"\0"), {}
+    attrs = team_git_snapshot.snapshot_attributes(out, paths)
     raw = store._run(["config", "--null", "--get-regexp", _CONFIG_QUERY], allowed=(0, 1), stdout_limit=4096).stdout
     settings = _conversion_settings(raw)
-    for index, path in enumerate(paths):
-        values = {}
-        for offset, name in enumerate(names):
-            position = (index * len(names) + offset) * 3
-            found, attribute, value = attrs[position:position + 3]
-            if found != path or attribute != name.encode():
-                raise GitRefusal("conversion_unavailable")
-            values[name] = value
-        if values["filter"] not in (b"unspecified", b"unset"):
-            raise GitRefusal("conversion_unavailable")
-        rules[path] = _eol_rule(values, settings)
+    rules = team_git_snapshot.snapshot_rules(paths, attrs, settings, native_crlf=os.name == "nt")
     length = 64 if store._run(["rev-parse", "--show-object-format"]).stdout.strip() == b"sha256" else 40
     return settings, rules, length
-
-
-def _conversion_settings(raw):
-    """Parse one bounded, NUL-framed config observation; no lenient bool coercion."""
-    defaults = dict(autocrlf=b"false", safecrlf=b"false", filemode=b"true", symlinks=b"true",
-                    eol=b"", trustctime=b"true", checkstat=b"default")
-    if type(raw) is not bytes:
-        _index_refuse()
-    if len(raw) > 4096 or raw.count(b"\0") > 64 or raw and not raw.endswith(b"\0"):
-        _index_refuse()
-    for record in raw.split(b"\0")[:-1]:
-        key, sep, value = record.partition(b"\n")
-        if not key.startswith(b"core.") or len(value) > 32:
-            _index_refuse()
-        name = key[5:].decode("ascii", "replace").lower()
-        if name not in defaults:
-            _index_refuse()
-        boolean = name in ("filemode", "symlinks", "trustctime", "autocrlf", "safecrlf")
-        if not sep and not boolean and name != "eol":
-            _index_refuse()
-        value = value.lower() if sep else b"true" if boolean else b""
-        if name == "eol" and value not in (b"lf", b"crlf", b"native"):
-            value = b""
-        if name in ("filemode", "symlinks", "trustctime", "autocrlf", "safecrlf") and value not in (b"input", b"warn"):
-            if value in (b"true", b"yes", b"on"):
-                value = b"true"
-            elif value in (b"false", b"no", b"off", b""):
-                value = b"false"
-            elif re.fullmatch(rb"[+-]?[0-9]{1,16}", value):
-                if not -2147483648 <= int(value) <= 2147483647:
-                    _index_refuse()
-                value = b"true" if int(value) else b"false"
-            else:
-                _index_refuse()
-        allowed = ((b"false", b"true", b"input") if name == "autocrlf" else
-                   (b"false", b"true", b"warn") if name == "safecrlf" else
-                   (b"", b"lf", b"crlf", b"native") if name == "eol" else
-                   (b"default", b"minimal") if name == "checkstat" else (b"true", b"false"))
-        if value not in allowed:
-            _index_refuse()
-        defaults[name] = value
-    return defaults
-
-
-def _binary_text(data):
-    """Git convert.c's byte statistics, including bare CR and terminal DOS EOF."""
-    crlf = data.count(b"\r\n")
-    if b"\0" in data or data.count(b"\r") != crlf:
-        return True
-    nonprintable = sum(data.count(bytes((c,))) for c in (*range(8), 11, *range(14, 27), *range(28, 32), 127))
-    printable = len(data) - nonprintable - data.count(b"\r") - data.count(b"\n")
-    nonprintable -= data.endswith(b"\x1a")
-    return (printable >> 7) < nonprintable
-
-
-def _clean_eol(data, rule, preserve, safe):
-    action, output_crlf, _, _ = rule
-    if action == "binary" or not data:
-        return data
-    crlf, lone_lf = data.count(b"\r\n"), data.count(b"\n") - data.count(b"\r\n")
-    automatic = action == "auto"
-    if automatic and _binary_text(data):
-        return data
-    convert = bool(crlf) and not (automatic and preserve)
-    # Simulate the round trip exactly where git add would refuse core.safecrlf.
-    checkout_crlf = output_crlf and not (automatic and not convert and crlf)
-    if safe == b"true" and ((crlf and convert and not output_crlf) or (lone_lf and checkout_crlf)):
-        raise GitRefusal("conversion_unavailable")
-    return data.replace(b"\r\n", b"\n") if convert else data
-
-
-def _clean_bytes(data, rule, preserve, safe):
-    data = _clean_eol(data, rule, preserve, safe)
-    return re.sub(rb"\$Id:[^\n$]*\$", b"$Id$", data) if rule[2] else data
-
-
-def _decode_worktree(data, rule, limit):
-    """Decode the resolved index/worktree rule, without re-resolving attributes."""
-    encodings = {b"UTF-8": "utf-8", b"UTF-16": "utf-16", b"UTF-16LE": "utf-16-le",
-              b"UTF-16BE": "utf-16-be", b"UTF-32": "utf-32", b"UTF-32LE": "utf-32-le",
-              b"UTF-32BE": "utf-32-be", b"ASCII": "ascii", b"ISO-8859-1": "latin-1",
-              b"LATIN1": "latin-1", b"SHIFT_JIS": "shift_jis", b"CP1252": "cp1252"}
-    if len(rule[3]) > 32 or rule[3].upper() not in encodings:
-        raise GitRefusal("conversion_unavailable")
-    encoding = rule[3].upper()
-    if (encoding in (b"UTF-16LE", b"UTF-16BE") and data.startswith((b"\xff\xfe", b"\xfe\xff"))
-        or encoding in (b"UTF-32LE", b"UTF-32BE") and data.startswith((b"\xff\xfe\0\0", b"\0\0\xfe\xff"))):
-        raise GitRefusal("conversion_unavailable")
-    decoder = codecs.getincrementaldecoder(encodings[encoding])()
-    encoder = codecs.getincrementalencoder("shift_jis")() if encoding == b"SHIFT_JIS" else None
-    chunks, size, offset = [], 0, 0
-    try:
-        for start in range(0, max(1, len(data)), 65536):
-            final = start + 65536 >= len(data)
-            text = decoder.decode(data[start:start + 65536], final=final)
-            if encoder is not None:
-                text = text.replace("\\", "\u00a5").replace("~", "\u203e")
-                raw = encoder.encode(text, final=final)
-                if raw != data[offset:offset + len(raw)]:
-                    raise GitRefusal("conversion_unavailable")
-                offset += len(raw)
-            count = sum(1 if ord(c) < 128 else 2 if ord(c) < 2048 else 3 if ord(c) < 65536 else 4 for c in text)
-            if count > limit - size:
-                raise GitRefusal("size_limit")
-            chunks.append(text.encode("utf-8"))
-            size += count
-    except UnicodeError:
-        raise GitRefusal("conversion_unavailable") from None
-    return b"".join(chunks)
-
-
-def _index_clean(mode, data, observed, prior, settings, oid_length, index_time):
-    prior_mode, prior_oid, cache = prior
-    if cache and cache[8] == 0 and prior_oid != object_id(b"", oid_length):
-        return False
-    same_mode = (mode == prior_mode or mode in ("100644", "100755") and
-        (prior_mode == "120000" and settings["symlinks"] == b"false"
-         or prior_mode in ("100644", "100755") and settings["filemode"] == b"false"))
-    return _index_matches(cache, observed, settings, index_time) if prior_oid and same_mode else False
 
 
 def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_length, index_time):
@@ -630,59 +398,12 @@ def _snapshot_contents(store, root_fd, paths, baseline, rules, settings, oid_len
 
 def _snapshot_baselines(store, contents, baseline, rules, runner):
     _require_runner(runner)
-    wanted = [baseline[path][1] for path, mode, data, _ in contents if mode != "120000"
-              and b"\r\n" in data and rules[path][0] == "auto" and path in baseline and baseline[path][1]]
+    wanted = team_git_snapshot.baseline_requests(contents, baseline, rules)
     objects = runner.read_private_objects(store.repo, wanted, max_bytes=MAX_SNAPSHOT_BYTES,
         max_object_bytes=MAX_OBJECT_BYTES)
     if any(kind != "blob" for kind, _ in objects.values()):
         raise GitRefusal("invalid_object")
-    return {p for p, (_, oid, _) in baseline.items() if oid in objects
-            and b"\r\n" in objects[oid][1] and not _binary_text(objects[oid][1])}
-
-
-def _snapshot_entries(contents, settings, baseline, rules, preserved, oid_length, index_time):
-    entries = []
-    for path, mode, data, observed in contents:
-        prior = baseline.get(path, ("100644", None, None))
-        prior_mode = prior[0]
-        unchanged = _index_clean(mode, data, observed, prior, settings, oid_length, index_time)
-        if unchanged:
-            entries.append((path, prior_mode, prior[1], None))
-            continue
-        if mode != "120000" and not unchanged:
-            data = _clean_bytes(data, rules[path], path in preserved, settings["safecrlf"])
-        if mode != "120000":
-            if prior_mode == "120000" and settings["symlinks"] == b"false":
-                mode = "120000"
-            elif settings["filemode"] == b"false":
-                mode = prior_mode if prior_mode in ("100644", "100755") else "100644"
-        oid = object_id(data, oid_length)
-        if unchanged is None and oid != prior[1]:
-            raise GitRefusal("index_stat_unprovable")
-        entries.append((path, mode, oid, data))
-    return entries
-
-
-def _blob_pack(blobs, oid_length):
-    """One bounded, non-delta pack; Git alone writes the private object paths."""
-    pack = bytearray(b"PACK" + (2).to_bytes(4, "big") + len(blobs).to_bytes(4, "big"))
-    for data in blobs.values():
-        size = len(data)
-        bound = size + (size >> 12) + (size >> 14) + (size >> 25) + 13
-        if len(pack) + 10 + bound + oid_length // 2 > MAX_SNAPSHOT_BYTES:
-            raise GitRefusal("size_limit")
-        header = bytearray()
-        value = 0x30 | (size & 15)
-        size >>= 4
-        while size:
-            header.append(value | 0x80)
-            value, size = size & 127, size >> 7
-        header.append(value)
-        pack.extend(header)
-        pack.extend(zlib.compress(data))
-    digest = (hashlib.sha256 if oid_length == 64 else hashlib.sha1)(pack).digest()
-    pack.extend(digest)
-    return bytes(pack)
+    return team_git_snapshot.preserved_paths(baseline, objects)
 
 
 def _write_snapshot(store, entries, runner):
@@ -700,7 +421,7 @@ def _write_snapshot(store, entries, runner):
                 missing[oid] = data
         records.append(mode.encode() + b" " + oid.encode() + b"\t" + path + b"\0")
     if missing:
-        pack = _blob_pack(missing, len(next(iter(missing))))
+        pack = team_git_snapshot.blob_pack(missing, len(next(iter(missing))), max_bytes=MAX_SNAPSHOT_BYTES)
         store._run(["unpack-objects", "-q", "--strict"], stdin=pack)
     store._run(["update-index", "-z", "--index-info"], stdin=b"".join(records))
     return _oid(store._run(["write-tree"]).stdout.decode().strip())
@@ -824,7 +545,7 @@ def _publish(store: GitStore, new: str, runner) -> None:
 
 
 @_lane_operation
-def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: str, *, _runner=None) -> str:
+def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: str, *, effect_fds=None, _runner=None) -> str:
     """Sole ref writer: allowlist + expected OID + ancestry, then atomic CAS.
 
     None is create-only. Returns updated or already (including lost acknowledgments
@@ -832,6 +553,11 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
     after validation can leave unreachable objects, but can never overwrite a winner.
     Other failures include cas_mismatch, ref_unreadable, ref_update_failed or ref_update_unknown;
     the latter requires observation by the caller, never a blind retry.
+    effect_fds borrows an active receipt's exported descriptors for this operation
+    only. Its custody holders retain the lock until all effect descendants exit;
+    the caller still owns and closes the receipt. None preserves ordinary calls.
+    With effect_fds, visible indeterminate capture failures stay unknown even if
+    a ref observation could match new; the caller must reconcile under a fresh lock.
     """
     _require_runner(_runner)
     _check_ref(store, ref)
@@ -858,6 +584,10 @@ def cas_fast_forward(store: GitStore, ref: str, expected: Optional[str], new: st
         if code not in ("git_failed", "git_timeout", "ref_update_unknown", "ref_update_failed",
                         "git_cleanup_failed", "git_output_limit"):
             raise GitRefusal(_error_code(exc), next_action=getattr(exc, "next_action", None)) from None
+        if (effect_fds is not None
+                and (code in ("git_timeout", "ref_update_unknown", "git_cleanup_failed", "git_output_limit")
+                     or code == "git_failed" and getattr(exc, "process_started", None) is True)):
+            raise GitRefusal("ref_update_unknown") from None
         observed = _current(store, ref, _runner)
         if observed == new:
             return "already"

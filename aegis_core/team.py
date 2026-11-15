@@ -95,6 +95,8 @@ __all__ = [
     "event_counts",
     "gc",
     "lane_ref",
+    "lease_branch_evidence",
+    "lease_custody", "verify_lease_repository", "lease_next_action",
     "lease_view",
     "live_lease",
     "load_team",
@@ -852,3 +854,136 @@ def gc(root: Any, now: Optional[int] = None, caller: Optional[str] = None) -> Gc
         else:
             kept.append((lease.lane, "changed after it was read"))
     return GcResult(tuple(collected), tuple(sorted(kept)))
+
+
+def lease_custody(root: Any, limit: int = 2 * MAX_LEASE_BYTES):
+    from aegis_core.team_lease_custody import custody
+    return custody(root, limit=limit)
+
+
+def verify_lease_repository(root: Any) -> None:
+    from aegis_core.team_lease_custody import verify
+    verify(root)
+
+
+def lease_next_action(reason: str) -> str:
+    from aegis_core.team_lease_custody import next_action
+    return next_action(reason)
+
+
+def _worktree_branches(root: Path) -> Set[bytes]:
+    """Read Git's NUL-delimited administrative evidence, never open reported paths."""
+    with lease_custody(root, limit=MAX_LEASE_BYTES):
+        data = gitsafe.run_checked(["worktree", "list", "--porcelain", "-z"], root).stdout
+    if len(data) > MAX_LEASE_BYTES or not data.endswith(b"\0\0"):
+        raise gitsafe.GitError("liveness_unknown", code="git_failed")
+    branches: Set[bytes] = set()
+    for record in data[:-2].split(b"\0\0"):
+        fields = record.split(b"\0")
+        if not fields[0].startswith(b"worktree ") or len(fields[0]) == len(b"worktree "):
+            raise gitsafe.GitError("liveness_unknown", code="git_failed")
+        recorded = [field[7:] for field in fields[1:] if field.startswith(b"branch ")]
+        if len(recorded) > 1 or any(not ref.startswith(b"refs/heads/") for ref in recorded):
+            raise gitsafe.GitError("liveness_unknown", code="git_failed")
+        heads = [field[5:] for field in fields[1:] if field.startswith(b"HEAD ")]
+        if b"bare" in fields[1:]:
+            if any(field not in (b"bare", b"locked") and not field.startswith((b"locked ", b"prunable "))
+                   for field in fields[1:]):
+                raise gitsafe.GitError("liveness_unknown", code="git_failed")
+        elif (len(heads) != 1 or re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", heads[0]) is None or
+              len(recorded) + fields[1:].count(b"detached") != 1):
+            raise gitsafe.GitError("liveness_unknown", code="git_failed")
+        branches.update(recorded)
+    return branches
+
+
+def _lease_branch_ref(branch: str) -> Optional[str]:
+    ref = branch if branch.startswith("refs/") else "refs/heads/" + branch
+    return ref if ref.startswith(("refs/heads/", "refs/remotes/")) else None
+
+
+def _liveness_lease(root: Path, lane: str, oid: str) -> Lease:
+    try:
+        return _read_one(root, lane, oid)
+    except (gitsafe.GitError, ValueError) as error:
+        if isinstance(error, gitsafe.GitError) and error.code in (
+                "git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"):
+            raise
+        raise LeaseFormatError("unreadable lease object") from None
+
+
+def _liveness_branch_present(root: Path, branch: str) -> bool:
+    checked = gitsafe.run(["check-ref-format", branch], root)
+    if checked.returncode == 1:
+        return False
+    if checked.returncode != 0 or checked.stdout:
+        raise gitsafe.GitError("liveness_unknown", code="git_failed")
+    data = gitsafe.run_checked(["for-each-ref", "--format=%(refname)", branch], root).stdout
+    if len(data) > 2 * MAX_LEASE_BYTES:
+        raise gitsafe.GitError("liveness_unknown", code="git_output_limit")
+    if branch.encode("utf-8") in data.splitlines():
+        return True  # One observation admits direct and symbolic refs without a type race.
+    symbolic = gitsafe.run(["symbolic-ref", "-q", branch], root)
+    if symbolic.returncode not in (0, 1):
+        raise gitsafe.GitError("liveness_unknown", code="git_failed")
+    return symbolic.returncode == 0  # A dangling symbolic declaration still exists.
+
+
+def lease_branch_evidence(root: Any, lane: Optional[str] = None, expect: Optional[str] = None,
+                          now: Optional[int] = None, *, worktrees: bool = False,
+                          ttl_s: Optional[int] = None) -> Dict[str, bool]:
+    """Read-only CLI evidence keyed by exact lease OID, not actor-liveness proof.
+
+    Default: whether the expected lane's recorded branch exists (an unrecorded
+    branch contributes no evidence). ``worktrees``: whether each expired lease's
+    branch appears in Git's worktree registrations. Paths are never followed.
+    Output is bounded during capture, before parsing, with headroom for blob
+    protocol headers around a maximum-sized lease. Git failure stays unknown.
+    The shared ``renew`` and ``gc`` services deliberately never call this observer.
+    """
+    repo = Path(os.fspath(root)).absolute()
+    if not worktrees:
+        ref, expect = lane_ref(lane), _expect(expect)
+        if ttl_s is not None:
+            _ttl(ttl_s)
+    with lease_custody(repo):
+        leases: List[Lease] = []
+        if worktrees:
+            moment = _now(now)
+            for ref, oid in gitsafe.list_refs(repo, LANES_REF):
+                name = ref[len(LANES_REF) + 1:]
+                if not valid_lane(name):
+                    continue
+                try:
+                    lease = _liveness_lease(repo, name, oid)
+                except LeaseFormatError:
+                    continue  # unreadable expiry remains the shared gc service's decision
+                if lease.expired(moment) and lease.branch is not None:
+                    leases.append(lease)
+        else:
+            oid = gitsafe.read_ref(repo, ref)
+            if oid != expect:
+                raise _stale(repo, lane, oid, expect)
+            try:
+                current = _liveness_lease(repo, lane, oid)
+            except LeaseFormatError:
+                raise LeaseRefused(
+                    f"unreadable: lane {lane} holds {oid}, which is no readable lease; release it with --expect {oid}",
+                    "unreadable", lane, current=oid) from None
+            current = _expected(repo, LeaseSet((current,)), lane, expect)
+            if current.branch is not None:
+                leases.append(current)
+        if not leases:
+            return {}
+        attached = _worktree_branches(repo) if worktrees else set()
+        evidence: Dict[str, bool] = {}
+        for lease in leases:
+            branch = _lease_branch_ref(lease.branch)
+            try:
+                if branch is None or worktrees:
+                    evidence[lease.oid] = branch is not None and branch.encode("utf-8") in attached
+                else:
+                    evidence[lease.oid] = _liveness_branch_present(repo, branch)
+            except gitsafe.RefNameError:
+                evidence[lease.oid] = False  # legacy display labels need not be Git branch names
+        return evidence

@@ -1,6 +1,7 @@
 """Queue behaviour through its service, with real storage and process races."""
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -9,7 +10,143 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import symlink_or_skip
-from aegis_core import atomicio, storage, storage_confined, team, team_queue as queue
+from aegis_core import atomicio, primitives, storage, storage_confined, team, team_queue as queue
+
+
+@pytest.mark.parametrize("limit,bound", [("bytes", 0), ("depth", 2), ("nodes", 11),
+                                         ("items", 4), ("string", 13)])
+@pytest.mark.parametrize("as_bytes", [False, True])
+@pytest.mark.parametrize("over", [False, True])
+def test_json_preflight_inline_boundaries(monkeypatch, limit, bound, as_bytes, over):
+    value = item(title="Work")
+    raw = json.dumps(value, separators=(",", ":"))
+    if limit == "bytes":
+        bound = len(raw.encode("utf-8"))
+    limits = dict(bytes=1000, depth=16, nodes=100, items=100, string=100)
+    limits[limit] = bound - int(over)
+    monkeypatch.setattr(queue, "MAX_BYTES", limits["bytes"])
+    monkeypatch.setattr(queue, "MAX_JSON_DEPTH", limits["depth"])
+    monkeypatch.setattr(queue, "MAX_JSON_NODES", limits["nodes"])
+    monkeypatch.setattr(queue, "MAX_JSON_ITEMS", limits["items"])
+    monkeypatch.setattr(queue, "MAX_JSON_STRING", limits["string"])
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    if as_bytes:
+        raw = raw.encode("utf-8")
+    for _ in range(2):
+        result = queue.parse_item(raw)
+        if over:
+            assert result == {"refused": True, "reason": "invalid_item",
+                              "next_action": "Supply a bounded queue item with the documented fields and single-line values."}
+        else:
+            assert result == {"refused": False, "item": value}
+    assert len(parsed) == (0 if over else 2)
+
+
+@pytest.mark.parametrize("string_units", ["escaped", "source"])
+@pytest.mark.parametrize("raw,limit,bound", [
+    ('"é"', "bytes", 4), ('[[0]]', "depth", 2), ('[0,0]', "nodes", 3),
+    ('[0,0]', "items", 2), ('{"a":0,"b":0}', "items", 2),
+    ('"abcd"', "string", 4), ('"\\u0061\\u0062"', "string", 2),
+    ('"\\\\\\""', "string", 2), ('1234', "atom", 4),
+])
+@pytest.mark.parametrize("over", [False, True])
+def test_shared_json_preflight_boundaries(string_units, raw, limit, bound, over):
+    if limit == "string" and string_units == "source":
+        bound = len(raw) - 1  # Includes the closing quote, as the queue always has.
+    limits = dict(max_bytes=100, max_depth=16, max_nodes=100, max_items=100,
+                  max_string=100, max_atom=64)
+    limits["max_" + limit] = bound - int(over)
+    for value in (raw, raw.encode("utf-8")):
+        if over:
+            reason = {"bytes": "size", "depth": "nesting", "items": "container"}.get(limit, limit)
+            with pytest.raises(ValueError, match="^" + reason + "$"):
+                primitives.json_preflight(value, string_units=string_units, **limits)
+        else:
+            assert primitives.json_preflight(value, string_units=string_units, **limits) == raw
+
+
+@pytest.mark.parametrize("over", [False, True])
+def test_json_atom_limit_precedes_parser(monkeypatch, over):
+    raw = json.dumps(item(hold=True))
+    parsed = []
+    def loads(text):
+        parsed.append(text)
+        return primitives.strict_loads(text)
+    monkeypatch.setattr(queue, "MAX_JSON_ATOM", 4 - int(over))
+    monkeypatch.setattr(queue, "primitives", SimpleNamespace(
+        json_preflight=primitives.json_preflight, strict_loads=loads, sanitize_display=primitives.sanitize_display))
+    assert queue.parse_item(raw)["reason"] == "invalid_item"
+    assert parsed == ([] if over else [raw])
+
+
+@pytest.mark.parametrize("raw", ['"é"', '"😀"'])
+@pytest.mark.parametrize("as_bytes", [False, True])
+def test_shared_json_byte_limit_is_utf8_before_parsing(raw, as_bytes):
+    value = raw.encode("utf-8") if as_bytes else raw
+    limits = dict(max_bytes=len(raw.encode("utf-8")), max_depth=16,
+                  max_nodes=100, max_items=100, max_string=100)
+    assert primitives.json_preflight(value, **limits) == raw
+    limits["max_bytes"] -= 1
+    with pytest.raises(ValueError, match="^size$"):
+        primitives.json_preflight(value, **limits)
+
+
+def test_json_preflight_callers_share_no_concurrent_state(make_store):
+    from aegis_core import team_profile
+    root = make_store
+    target = root.joinpath(*team_profile.REPO_PATH)
+    target.parent.mkdir(mode=0o700, parents=True)
+    target.write_bytes(b'{"version":1}')
+    expected = team_profile.load(root, user_root=root)
+    def observe(index):
+        raw = json.dumps(item()) if index % 2 else "["
+        inline = queue.parse_item(raw)
+        loaded = team_profile.load(root, user_root=root)
+        assert loaded == expected
+        return inline["refused"]
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        assert list(workers.map(observe, range(24))) == [i % 2 == 0 for i in range(24)]
+
+
+@pytest.mark.parametrize("verb", ["add", "list", "audit", "compact", "claim", "release", "unclaim", "done"])
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b'{"version":NaN}', b'{"version":1,"version":1}', b" " * 101])
+def test_json_caller_refusal_golden(make_store, monkeypatch, verb, raw):
+    root = make_store
+    add(root)
+    target = root / ".aegis/state/team-queue.json"
+    target.write_bytes(raw)
+    monkeypatch.setattr(queue, "MAX_BYTES", 100)
+    arguments = {"now": 100}
+    if verb == "add":
+        arguments["item"] = item("TWO")
+    elif verb in ("claim", "release", "unclaim", "done"):
+        arguments.update(identifier="ONE", expect="a" * 64, lane="alpha")
+        if verb == "unclaim":
+            arguments["writer_stopped"] = True
+    for _ in range(2):
+        result = getattr(queue, verb)(root, **arguments)
+        assert result == {
+            "schema": "aegis.team.queue." + verb + "/v1",
+            "source": "aegis team queue " + verb, "aegis_version": result["aegis_version"],
+            "checked_at": "1970-01-01T00:01:40Z", "scope": {},
+            "refused": True, "status": "refused", "exit_code": 1,
+            "reason": "invalid_queue_state",
+            "next_action": "Ask the coordinator to repair the queue state from trusted evidence.",
+        }
+        assert target.read_bytes() == raw
+
+
+@pytest.mark.parametrize("raw", [b"[", b"\xff", b"NaN", b'{"id":1,"id":1}', "\ud800", None])
+def test_json_inline_refusal_golden(raw):
+    assert queue.parse_item(raw) == {
+        "refused": True, "reason": "invalid_item",
+        "next_action": "Supply a bounded queue item with the documented fields and single-line values.",
+    }
 
 
 @pytest.fixture
@@ -34,6 +171,93 @@ def make_store(tmp_path):
 def item(identifier="ONE", **fields):
     return {"id": identifier, "title": "Queue work", "paths": ["src/**"],
             "capabilities": ["core"], **fields}
+
+
+def test_partial_views_preserve_full_results_and_skip_item_projection(make_store, monkeypatch):
+    root = make_store
+    revision = add(root, hold="Await decision", hold_until=[{"kind": "lease_free", "paths": ["src/**"]}])
+    full_list = queue.list(root, now=101)
+    full_audit = queue.audit(root, now=101)
+    before = (root / ".aegis/state/team-queue.json").read_bytes()
+    def no_item_projection(*args, **kwargs):
+        pytest.fail("partial observations must not build full item views")
+    monkeypatch.setattr(queue, "_view", no_item_projection)
+    for _ in range(2):
+        small = queue.list(root, view="fingerprint", capabilities=["unrelated"], include_done=True, now=101)
+        assert small == {**{key: value for key, value in full_list.items() if key != "items"},
+                         "view": "fingerprint", "omitted": ["items", "completed_ids"],
+                         "next_action": "After a fingerprint change, run aegis team queue list --view full --json; the fingerprint never authorizes a claim."}
+        audit = queue.audit(root, view="findings", now=101)
+        assert audit["findings"] == full_audit["findings"]
+        assert audit["affected_items"] == [{"id": "ONE", "revision": revision, "lane": None,
+                                            "state": "queued", "lease_expired": False, "expires_at": None}]
+        assert audit["counts"] == {"items": 1, "findings": 1, "affected_items": 1}
+        assert audit["view"] == "findings" and audit["omitted"] == ["items"]
+        assert "aegis team queue list --include-done --view full --json" in audit["next_action"]
+        assert "items" not in audit
+    assert (root / ".aegis/state/team-queue.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_empty_failure_and_retry(make_store, verb, view):
+    root = make_store
+    observe = getattr(queue, verb)
+    empty = observe(root, view=view, now=100)
+    assert empty["exit_code"] == 0 and "items" not in empty
+    if verb == "audit":
+        assert empty["findings"] == [] and empty["affected_items"] == []
+        assert empty["counts"] == {"items": 0, "findings": 0, "affected_items": 0}
+    add(root)
+    state = root / ".aegis/state/team-queue.json"
+    original = state.read_bytes()
+    for raw in (b"{", b" " * (queue.MAX_BYTES + 1)):
+        state.write_bytes(raw)
+        assert observe(root, view=view, now=101) == observe(root, now=101)
+        assert state.read_bytes() == raw
+    state.write_bytes(original)
+    retried = observe(root, view=view, now=102)
+    assert retried["exit_code"] == 0
+    if verb == "audit":
+        assert retried["findings"] == [] and retried["affected_items"] == []
+        assert retried["counts"] == {"items": 1, "findings": 0, "affected_items": 0}
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(observe, root, view=view, now=102) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [retried] * 3
+
+
+@pytest.mark.parametrize("verb,view", [("list", "findings"), ("audit", "fingerprint"),
+                                      ("list", ["full"]), ("audit", "private-value" * 4096)],
+                         ids=["list-wrong-view", "audit-wrong-view", "wrong-type", "oversized"])
+def test_invalid_view_precedes_platform_probe(monkeypatch, verb, view):
+    def unavailable():
+        pytest.fail("invalid view must refuse before platform discovery")
+    monkeypatch.setattr(queue, "descriptor_supported", unavailable)
+    result = getattr(queue, verb)(None, view=view, now=100)
+    assert result["reason"] == "invalid_arguments" and result["exit_code"] == 2
+    assert "private-value" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("verb,view", [("list", "fingerprint"), ("audit", "findings")])
+def test_partial_view_unsupported_platform(tmp_path, monkeypatch, verb, view):
+    monkeypatch.setattr(queue, "descriptor_supported", lambda: False)
+    result = getattr(queue, verb)(tmp_path, view=view, now=100)
+    assert result["reason"] == "unsupported_platform" and result["exit_code"] == 1
+
+
+def test_fingerprint_view_concurrency_expiry_and_revision_authority(make_store):
+    root = make_store
+    revision = add(root)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.list, root, view="fingerprint", now=101) for _ in range(3)]
+        results = [future.result(timeout=30) for future in futures]
+    assert results[0] == results[1] == results[2]
+    token = results[0]["claimable_fingerprint"]
+    assert queue.claim(root, "ONE", expect=token, lane="alpha", capabilities=["core"], now=101)["reason"] == "stale_revision"
+    claimed = claim(root, revision)
+    active = queue.list(root, view="fingerprint", now=102)
+    assert active["claimable_fingerprint"] != token
+    assert queue.list(root, view="fingerprint", now=112)["claimable_fingerprint"] != active["claimable_fingerprint"]
+    assert not claimed["refused"]
 
 
 def add(root, identifier="ONE", **fields):
@@ -105,8 +329,8 @@ def test_claim_cas_expiry_release_done_and_retry(make_store):
 def test_concurrent_process_claims_have_one_winner(make_store):
     root = make_store
     revision = add(root)
-    with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_claim, [(root, revision)] * 2))
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
+        results = list(pool.map(race_claim, [(root, revision)] * 2, timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
 
@@ -207,7 +431,7 @@ def test_concurrent_overlapping_lease_scopes_have_one_winner(make_store):
     root = make_store
     first = add(root, paths=["/src/one.py"])
     second = add(root, "TWO", paths=["/src/*.txt"])
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_scoped_claim, [(root, first, "ONE", "alpha"),
                                                   (root, second, "TWO", "beta")], timeout=30))
     assert sorted(row["refused"] for row in results) == [False, True]
@@ -626,7 +850,7 @@ def test_concurrent_finishes_emit_one_transition(make_store, verb):
     from aegis_core import events
     revision = add(make_store)
     claimed = claim(make_store, revision)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2, timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
@@ -670,7 +894,7 @@ def test_added_dependencies_and_unobserved_lease_conditions_are_visible(make_sto
 def test_concurrent_disjoint_claims_enforce_writer_capacity(make_store):
     first = add(make_store, paths=["/src/one.py"])
     second = add(make_store, "TWO", paths=["/docs/one.md"])
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
             (make_store, second, "TWO", "beta")], timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
@@ -815,7 +1039,7 @@ def test_compaction_concurrency_failure_and_retry(make_store, monkeypatch):
     assert "private-value" not in json.dumps(refused)
     assert path.read_bytes() == before
     monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_compact, [make_store] * 2, timeout=30))
     assert all(not row["refused"] for row in results)
     assert sorted(row["removed_count"] for row in results) == [0, 1]
@@ -997,7 +1221,7 @@ def race_branch_claim(arguments):
 
 def test_concurrent_claims_record_only_the_winners_branch(make_store):
     revision = add(make_store)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_branch_claim, [(make_store, revision, "lane/a"),
                                                   (make_store, revision, "lane/b")], timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
@@ -1135,6 +1359,39 @@ def stored_branch_item(root, branch, state):
     return path, document["items"]["ONE"]["revision"], second, 112 if state == "expired" else 103
 
 
+@pytest.mark.parametrize("state,effective,expired", [("active", "claimed", False),
+                                                    ("expired", "queued", True),
+                                                    ("completed", "done", False)])
+def test_findings_state_and_expiry_match_full_views_after_retry(make_store, state, effective, expired):
+    root = make_store
+    path, revision, _, moment = stored_branch_item(root, "refs/heads/refs/tags/legacy", state)
+    original = path.read_bytes()
+    full = queue.list(root, include_done=True, view="full", now=moment)
+    expected = next(row for row in full["items"] if row["id"] == "ONE")
+    assert expected["state"] == effective and expected["lease_expired"] is expired
+    assert expected["revision"] == revision and expected["expires_at"] == 111
+    fields = ("id", "revision", "lane", "state", "lease_expired", "expires_at")
+    for _ in range(2):
+        findings = queue.audit(root, view="findings", now=moment)
+        assert findings["exit_code"] == 0 and any(
+            row["code"] == "CLAIM-BRANCH-UNSUPPORTED" for row in findings["findings"])
+        assert findings["affected_items"] == [{key: expected[key] for key in fields}]
+        assert findings["next_action"] == (
+            "Run aegis team queue list --include-done --view full --json and read full constraints before changing holds or work.")
+    if state != "completed":
+        audited = queue.audit(root, view="full", now=moment)
+        assert next(row for row in audited["items"] if row["id"] == "ONE") == expected
+    path.write_bytes(b"{")
+    failed = queue.audit(root, view="findings", now=moment)
+    assert failed["reason"] == "invalid_queue_state" and failed["exit_code"] == 1
+    assert failed == queue.audit(root, view="full", now=moment)
+    path.write_bytes(original)
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        futures = [workers.submit(queue.audit, root, view="findings", now=moment) for _ in range(3)]
+        assert [future.result(timeout=30) for future in futures] == [findings] * 3
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("branch,unsupported", [
     ("refs/heads/refs/tags/x", True), ("refs/heads/refs/heads/x", True),
     ("refs/heads/refs/remotes/origin/x", True), ("lane/alpha", False),
@@ -1239,3 +1496,131 @@ def test_unsupported_branch_preserves_independent_lease_findings(make_store, lea
                row["refused"] and row["reason"] and row["next_action"] for row in findings)
     assert "private-value" not in json.dumps(findings)
     assert json.loads(path.read_text(encoding="utf-8"))["items"]["ONE"]["branch"] == branch
+
+
+def _pending_state(root):
+    revision = add(root)
+    claimed = claim(root, revision)
+    assert not claimed["refused"], claimed
+    path = root / ".aegis" / "state" / "team-queue.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    row = state["items"]["ONE"]
+    state["unclaim"] = {
+        "id": "ONE", "revision": row["revision"], "lane": row["lane"], "caller": "owner",
+        "reason": "Waiting", "lease_oid": None, "to_revision": "ab" * 32}
+    return path, state, row
+
+
+def _write_state(path, state):
+    raw = json.dumps(state, separators=(",", ":")).encode("ascii")
+    path.write_bytes(raw)
+    return raw
+
+
+def race_list(arguments):
+    root, moment = arguments
+    return queue.list(root, now=moment)
+
+
+def test_valid_pending_intent_stays_recoverable(make_store):
+    path, state, _row = _pending_state(make_store)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    assert listed["reason"] == "unclaim_recovery_required" and listed["exit_code"] == 1
+    assert listed["blockers"][0]["reason_text"] == "Waiting"
+    assert path.read_bytes() == before
+    state.pop("unclaim")
+    _write_state(path, state)
+    restored = queue.list(make_store, now=102)
+    assert not restored["refused"], restored
+    assert restored["items"][0]["id"] == "ONE"
+
+
+@pytest.mark.parametrize("shape", [
+    "non-dict", "missing-key", "extra-key", "bad-id", "bad-lane", "bad-revision", "bad-to-revision",
+    "bad-lease-oid", "bad-lease-type", "writer-stopped", "released-other", "released-shape",
+    "released-without-oid", "reason-length", "reason-multiline", "reason-credential", "caller-length",
+    "caller-multiline", "stale-revision", "not-claimed", "lane-mismatch"])
+def test_malformed_pending_intent_is_invalid_queue_state(make_store, shape):
+    path, state, row = _pending_state(make_store)
+    intent = state["unclaim"]
+    hostile = "private-value"
+    if shape == "non-dict":
+        state["unclaim"] = hostile
+    elif shape == "missing-key":
+        del intent["caller"]
+    elif shape == "extra-key":
+        intent["note"] = hostile
+    elif shape == "bad-id":
+        intent["id"] = "../" + hostile
+    elif shape == "bad-lane":
+        intent["lane"] = "BETA"
+    elif shape == "bad-revision":
+        intent["revision"] = hostile
+    elif shape == "bad-to-revision":
+        intent["to_revision"] = hostile
+    elif shape == "bad-lease-oid":
+        intent["lease_oid"] = hostile
+    elif shape == "bad-lease-type":
+        intent["lease_oid"] = 1
+    elif shape == "writer-stopped":
+        intent["writer_stopped"] = hostile
+    elif shape == "released-other":
+        intent["lease_oid"] = "cd" * 20
+        intent["released_lease_ids"] = [hostile]
+    elif shape == "released-shape":
+        intent["released_lease_ids"] = hostile
+    elif shape == "released-without-oid":
+        intent["released_lease_ids"] = ["ab" * 20]
+    elif shape == "reason-length":
+        intent["reason"] = hostile + ("x" * queue.MAX_TEXT)
+    elif shape == "reason-multiline":
+        intent["reason"] = hostile + "\ntrailer"
+    elif shape == "reason-credential":
+        intent["reason"] = "token=" + hostile
+    elif shape == "caller-length":
+        intent["caller"] = hostile + ("c" * 200)
+    elif shape == "caller-multiline":
+        intent["caller"] = hostile + "\ntrailer"
+    elif shape == "stale-revision":
+        intent["revision"] = "f" * 64
+    elif shape == "not-claimed":
+        row["state"] = "queued"
+        row["lane"] = None
+        row["expires_at"] = None
+    elif shape == "lane-mismatch":
+        intent["lane"] = "beta"
+    else:
+        raise AssertionError(shape)
+    before = _write_state(path, state)
+    listed = queue.list(make_store, now=101)
+    again = queue.list(make_store, now=102)
+    refused = queue.unclaim(make_store, "ONE", expect="0" * 64, lane="alpha", now=103,
+                            caller="owner", writer_stopped=True)
+    for result in (listed, again, refused):
+        assert result["reason"] == "invalid_queue_state" and result["exit_code"] == 1, result
+        rendered = json.dumps(result)
+        assert hostile not in rendered and "trailer" not in rendered, rendered
+        assert "Waiting" not in rendered and "f" * 64 not in rendered
+        if shape == "bad-lane":
+            assert "BETA" not in rendered
+        if shape == "lane-mismatch":
+            assert "beta" not in rendered
+        assert "\n" not in rendered
+    assert path.read_bytes() == before
+
+
+def test_malformed_pending_intent_retries_after_repair(make_store):
+    path, state, _row = _pending_state(make_store)
+    state["unclaim"] = "private-value"
+    before = _write_state(path, state)
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
+        results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
+    assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
+    assert all("private-value" not in json.dumps(result) for result in results)
+    assert path.read_bytes() == before
+    repaired = json.loads(before)
+    repaired.pop("unclaim")
+    _write_state(path, repaired)
+    restored = queue.list(make_store, now=103)
+    assert not restored["refused"], restored

@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
+from dataclasses import fields
 import ast
 import errno
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -20,7 +22,13 @@ import pytest
 
 from aegis_core import team_gitops as gitops
 from aegis_core import storage_confined
+from aegis_core import team_qualify
 from tests.conftest import symlink_or_skip
+from tests.unit.core.test_team_git import (IDENTITY, commit as git_commit,
+                                          git as run_git, make_store as open_git_store)
+from tests.unit.core.test_team_publish import (rig as publisher_rig,
+    request as publication_request, execute as execute_publication,
+    effect_count as publication_effect_count)
 
 
 OLD = "a" * 40
@@ -28,6 +36,806 @@ NEW = "b" * 40
 OPS = ("worktree_add", "worktree_remove", "commit", "ref_update", "push", "pr_open",
        "pr_ready", "pr_close", "merge", "run_cancel", "lease_claim", "lease_renew",
        "lease_transfer", "lease_release")
+
+
+def require_compaction_for_next_admission(store, monkeypatch):
+    """Reserve existing results, leaving the next intent one record slot short."""
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    cap = path.read_bytes().count(b"\n") + 2 * len(store.open_intents()) + 2
+    monkeypatch.setattr(gitops, "MAX_RECORD_LINES", cap)
+
+
+def test_live_ownership_query_keeps_no_instance_shadow_state(make_store):
+    store = make_store()
+    first = intent(store)
+    assert len(store.in_flight()) == 1
+    first.close()
+    assert store.in_flight() == []
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW))
+    assert store.in_flight() == []
+    assert intent(store).created is False
+    tree = ast.parse(Path(gitops.__file__).read_text(encoding="utf-8"))
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    names.update(node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef))
+    assert not names & {"_in_flight", "_flight_guard", "_sync_flights",
+                        "_flight_update", "_forget_flights"}
+
+
+def closed_history_bytes(count, *, unicode_state=False):
+    parts = []
+    new = {"ref": "\U00010000" * 100} if unicode_state else NEW
+    for index in range(count):
+        row = gitops.rows.intent("push", "lane-1", "closed-%07d" % index,
+                                OLD, new, "session-1", stamp="2026-11-15T00:00:00Z")
+        result = gitops.rows.result(row, "done", new, stamp=row["ts"])
+        for item in (row, result):
+            parts.append(json.dumps(item, ensure_ascii=not unicode_state,
+                                    separators=(",", ":")).encode("utf-8") + b"\n")
+    return b"".join(parts)
+
+
+def legacy_compacted(read, data, *, max_row_bytes=gitops.MAX_ROW_BYTES):
+    """Frozen pre-O87 matching/rewrite algorithm; no repository history needed."""
+    if not data:
+        return None
+    if not data.endswith(b"\n"):
+        raise gitops.GitOpsError("journal_io")
+    closed = {row["request_id"]: gitops.rows.encoded(dict(row, kind="tombstone")) + b"\n"
+              for row in read.rows if row["kind"] == "result"}
+    closed = {request: payload for request, payload in closed.items()
+              if len(payload) <= max_row_bytes + 1}
+    if not closed:
+        return None
+    raw_lines, positions = data.split(b"\n")[:-1], {}
+    expected = iter(read.rows)
+    wanted = next(expected, None)
+    for index, raw in enumerate(raw_lines):
+        if wanted is None or len(raw) > max_row_bytes:
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8"), object_pairs_hook=gitops.rows.pairs)
+            if gitops.rows.valid_row(row) and row == wanted:
+                positions[index] = wanted
+                wanted = next(expected, None)
+        except (ValueError, UnicodeError, RecursionError):
+            pass
+    if len(positions) != len(read.rows):
+        raise gitops.GitOpsError("journal_io")
+    pair_bytes = {}
+    for index, row in positions.items():
+        if row["kind"] in ("intent", "result"):
+            request = row["request_id"]
+            pair_bytes[request] = pair_bytes.get(request, 0) + len(raw_lines[index]) + 1
+    closed = {request: payload for request, payload in closed.items()
+              if len(payload) < pair_bytes[request]}
+    if not closed:
+        return None
+    parts = []
+    for index, raw in enumerate(raw_lines):
+        row = positions.get(index)
+        terminal = closed.get(row["request_id"]) if row is not None else None
+        if terminal is not None and row["kind"] == "result":
+            continue
+        parts.append(terminal if terminal is not None else raw + b"\n")
+    return b"".join(parts)
+
+
+def test_capacity_compaction_decodes_each_source_line_once(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "seed").close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    data = closed_history_bytes(128)
+    path.write_bytes(data)
+    expected = legacy_compacted(gitops.rows.parse(data), data)
+    require_compaction_for_next_admission(store, monkeypatch)
+    loads, original = [], gitops.rows.json
+
+    def counted(*args, **kwargs):
+        loads.append(None)
+        return original.loads(*args, **kwargs)
+
+    monkeypatch.setattr(gitops.rows, "json", SimpleNamespace(**{**vars(json), "loads": counted}))
+    receipt = intent(store, "trigger")
+    receipt.close()
+    assert len(loads) == 384  # 256 source lines, then 128 output tombstones.
+    assert path.read_bytes() == expected + gitops.rows.encoded(receipt.row) + b"\n"
+    public = store.read()
+    assert [item.name for item in fields(public)] == ["rows", "skipped", "torn_tail"]
+    assert public == gitops.JournalRead(public.rows, public.skipped, public.torn_tail)
+    assert intent(store, "trigger").created is False
+
+
+@pytest.mark.parametrize("damage", ["different", "equal_copy", "public_read", "limits"])
+def test_compaction_provenance_refuses_before_rewrite_then_allows_retry(make_store, monkeypatch, damage):
+    store = make_store()
+    intent(store, "seed").close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    data = closed_history_bytes(2)
+    path.write_bytes(data)
+    require_compaction_for_next_admission(store, monkeypatch)
+    original = gitops._parse
+
+    def planted(source, **kwargs):
+        if damage == "different":
+            return original(source.replace(b"closed", b"otherx"), **kwargs)
+        if damage == "equal_copy":
+            return original(bytes(bytearray(source)), **kwargs)
+        if damage == "public_read":
+            return gitops.rows.parse(source)
+        return gitops.rows.parse(source, capture=True, max_lines=gitops.MAX_RECORD_LINES,
+                                max_row_bytes=gitops.MAX_ROW_BYTES - 1)
+
+    monkeypatch.setattr(gitops, "_parse", planted)
+    refusal("journal_io", lambda: intent(store, "trigger"))
+    monkeypatch.setattr(gitops, "_parse", original)
+    assert path.read_bytes() == data
+    receipt = intent(store, "trigger")
+    assert receipt.created is True
+    receipt.close()
+    assert intent(store, "trigger").created is False
+
+
+@pytest.mark.parametrize("case", ["closed", "evidence", "no_saving", "torn", "empty"])
+def test_compaction_matches_legacy_bytes(case):
+    data = closed_history_bytes(128)
+    if case == "evidence":
+        lines = data.splitlines(keepends=True)
+        data = b"".join([lines[1], lines[0], b"not-json\n", lines[0], lines[1],
+                         b"\xff\n", *lines[2:], b"[]\n"])
+    elif case == "no_saving":
+        data = closed_history_bytes(1, unicode_state=True)
+    elif case == "torn":
+        data += b'{"torn":'
+    elif case == "empty":
+        data = b""
+    read = gitops.rows.parse(data, capture=True)
+    if case == "torn":
+        refusal("journal_io", lambda: gitops.rows.compacted(read, data=data,
+            max_row_bytes=gitops.MAX_ROW_BYTES, max_journal_bytes=gitops.MAX_JOURNAL_BYTES))
+        return
+    expected = legacy_compacted(gitops.rows.parse(data), data)
+    actual = gitops.rows.compacted(read, data=data, max_row_bytes=gitops.MAX_ROW_BYTES,
+                                 max_journal_bytes=gitops.MAX_JOURNAL_BYTES)
+    assert actual == expected
+    if case in ("empty", "no_saving"):
+        assert actual is None
+
+
+def test_compaction_preserves_quarantine_and_malformed_evidence_in_place(make_store, monkeypatch):
+    store = make_store()
+    receipt = intent(store)
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    duplicate = path.read_bytes()
+    with path.open("ab") as stream:
+        stream.write(b"not-json\n" + duplicate + b'{"torn":')
+    saved = store.record_result("request-1", "done", NEW, receipt=receipt)
+    before = path.read_bytes().split(b"\n")
+    assert store.read().skipped == 3
+    require_compaction_for_next_admission(store, monkeypatch)
+    intent(store, "trigger").close()
+    after = path.read_bytes().split(b"\n")
+    assert json.loads(after[0])["kind"] == "tombstone"
+    assert after[1:4] == before[1:4]
+    assert store.read().skipped == 3
+    assert store.record_result("request-1", "done", NEW) == saved
+    assert intent(store).created is False
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW))[0]["request_id"] == "trigger"
+
+
+@pytest.mark.parametrize("query", ["read", "open_intents", "in_flight"])
+def test_public_read_survives_replacement_of_its_open_inode(make_store, monkeypatch, query):
+    store = make_store()
+    intent(store, "closed")
+    store.record_result("closed", "done", NEW)
+    intent(store).close()
+    original, replaced = gitops.os, []
+    require_compaction_for_next_admission(store, monkeypatch)
+
+    def opened(name, flags, *args, **kwargs):
+        fd = original.open(name, flags, *args, **kwargs)
+        if name == "gitops.jsonl" and flags & os.O_ACCMODE == os.O_RDONLY and not replaced:
+            replaced.append(None)
+            try:
+                intent(gitops.GitOpsJournal(store.common_dir), "trigger").close()
+                assert original.fstat(fd).st_nlink == 0
+            except BaseException:
+                original.close(fd)
+                raise
+        return fd
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": opened}))
+    answer = {"read": store.read, "open_intents": store.open_intents,
+              "in_flight": store.in_flight}[query]()
+    assert replaced == [None]
+    if query == "read":
+        assert [row["request_id"] for row in answer.rows] == ["closed", "closed", "request-1"]
+    elif query == "open_intents":
+        assert [row["request_id"] for row in answer] == ["request-1"]
+    else:
+        assert answer == []
+
+
+@pytest.mark.parametrize("cut", ["missing", "detached", "detached_locked"])
+def test_in_flight_refreshes_after_terminal_lock_retirement(make_store, monkeypatch, cut):
+    store = make_store()
+    intent(store).close()
+    original, retired, guards = gitops.os, [], []
+
+    def opened(name, flags, *args, **kwargs):
+        if not str(name).startswith("gitops-effect-") or flags & os.O_ACCMODE != os.O_RDONLY or retired:
+            return original.open(name, flags, *args, **kwargs)
+        retired.append(None)
+        fd = original.open(name, flags, *args, **kwargs) if cut != "missing" else None
+        try:
+            if cut == "detached_locked":
+                guards.append(original.open(name, flags, *args, **kwargs))
+            store.record_result("request-1", "done", NEW)
+            require_compaction_for_next_admission(store, monkeypatch)
+            intent(store, "trigger").close()
+            if guards:
+                gitops.fcntl.flock(guards[0], gitops.fcntl.LOCK_EX | gitops.fcntl.LOCK_NB)
+            return fd if fd is not None else original.open(name, flags, *args, **kwargs)
+        except BaseException:
+            if fd is not None:
+                original.close(fd)
+            raise
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": opened}))
+    try:
+        assert store.in_flight() == []
+    finally:
+        for fd in guards:
+            original.close(fd)
+    assert retired == [None]
+
+
+@pytest.mark.parametrize("competitor", ["query", "result", "reconcile"])
+def test_in_flight_probe_does_not_claim_effect_ownership(make_store, monkeypatch, competitor):
+    store = make_store()
+    intent(store).close()
+    original = gitops.fcntl
+    entered, release, done = Event(), Event(), Event()
+    probe_thread = []
+
+    def flock(fd, operation):
+        original.flock(fd, operation)
+        if get_ident() in probe_thread and operation in (original.LOCK_EX | original.LOCK_NB,
+                                                         original.LOCK_SH | original.LOCK_NB):
+            entered.set()
+            assert release.wait(15)
+        elif operation == original.LOCK_SH | original.LOCK_NB:
+            release.set()
+            assert done.wait(15)
+
+    def query():
+        probe_thread.append(get_ident())
+        try:
+            return store.in_flight()
+        finally:
+            done.set()
+
+    monkeypatch.setattr(gitops, "fcntl", SimpleNamespace(**{**vars(original), "flock": flock}))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(query)
+        try:
+            assert entered.wait(15)
+            if competitor == "query":
+                assert store.in_flight() == []
+            elif competitor == "result":
+                assert store.record_result("request-1", "done", NEW)["status"] == "done"
+            else:
+                assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW))[0]["status"] == "done"
+        finally:
+            release.set()
+        assert first.result(timeout=20) == []
+
+
+@pytest.mark.parametrize("finisher", ["local", "other_instance"])
+def test_archived_request_reused_on_another_lane_has_no_stale_in_flight(make_store, finisher):
+    store = make_store()
+    receipt = intent(store)
+    assert store.reconcile("lane-1", lambda row: pytest.fail("live owner observed")) == []
+    writer = store if finisher == "local" else gitops.GitOpsJournal(store.common_dir)
+    writer.record_result("request-1", "done", NEW, receipt=receipt)
+    if finisher == "local":
+        assert store.in_flight() == []
+    (store.common_dir / "aegis" / "gitops.jsonl").write_bytes(b"")
+    intent(store, lane="other-lane").close()
+    assert store.in_flight() == []
+
+
+def test_reconcile_does_not_recreate_a_compacted_terminal_lock(make_store, monkeypatch):
+    store = make_store()
+    intent(store).close()
+    path = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    entered, release = Event(), Event()
+    worker = []
+    original = gitops._try_effect
+
+    def delayed(directory, request_id, **kwargs):
+        if get_ident() in worker and request_id == "request-1":
+            entered.set()
+            assert release.wait(15)
+        return original(directory, request_id, **kwargs)
+
+    def reconcile():
+        worker.append(get_ident())
+        return store.reconcile("lane-1", lambda row: pytest.fail("terminal request observed"))
+
+    monkeypatch.setattr(gitops, "_try_effect", delayed)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(reconcile)
+        try:
+            assert entered.wait(15)
+            store.record_result("request-1", "done", NEW)
+            require_compaction_for_next_admission(store, monkeypatch)
+            intent(store, "trigger").close()
+            assert not path.exists()
+        finally:
+            release.set()
+        assert future.result(timeout=20) == []
+    assert not path.exists()
+    assert store.in_flight() == []
+
+
+def test_display_row_facade_propagates_limits_to_nested_fields(monkeypatch):
+    monkeypatch.setattr(gitops, "MAX_ROW_BYTES", 8)
+    monkeypatch.setattr(gitops, "DISPLAY_LIMIT", 4)
+    assert gitops.display_row({"n": {"k": "abcdefgh", "o": "x" * 9}}) == {
+        "n": {"k": "a...", "o": "[oversized]"}}
+
+
+@pytest.fixture
+def interrupted_compaction(make_store, monkeypatch):
+    """Model a replace whose namespace is not committed until that directory flushes."""
+    store = make_store()
+    intent(store, "closed")
+    store.record_result("closed", "done", NEW)
+    pending = intent(store, "pending")
+    pending.close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    before = path.read_bytes()
+    directory_inode = path.parent.stat().st_ino
+    model = SimpleNamespace(uncommitted=False, fail_next=False)
+    original = gitops.os
+
+    def replaced(*args, **kwargs):
+        original.replace(*args, **kwargs)
+        model.uncommitted = model.fail_next = True
+
+    def flushed(fd):
+        info = original.fstat(fd)
+        anchored = stat.S_ISDIR(info.st_mode) and info.st_ino == directory_inode
+        if anchored and model.fail_next:
+            model.fail_next = False
+            raise OSError(errno.EIO, "token=private-namespace-error")
+        original.fsync(fd)
+        if anchored:
+            model.uncommitted = False
+
+    require_compaction_for_next_admission(store, monkeypatch)
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "replace": replaced, "fsync": flushed}))
+    refusal("journal_io", lambda: intent(store, "trigger"))
+    assert model.uncommitted
+    return SimpleNamespace(store=store, path=path, before=before, model=model, intent=pending.row)
+
+
+@pytest.mark.parametrize("completion", ["direct", "reconcile", "replay"])
+def test_result_after_interrupted_compaction_survives_namespace_crash(interrupted_compaction, completion):
+    case = interrupted_compaction
+    if completion == "replay":
+        # Model complete but unacknowledged bytes in the replacement inode.
+        row = dict(case.intent, kind="result", status="done", observed=NEW)
+        with case.path.open("ab") as stream:
+            stream.write(json.dumps(row).encode("ascii") + b"\n")
+
+    def complete():
+        writer = gitops.GitOpsJournal(case.store.common_dir)
+        if completion == "reconcile":
+            return writer.reconcile("lane-1", lambda row: gitops.Observation(NEW))[0]
+        return writer.record_result("pending", "done", NEW)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        acknowledged = pool.submit(complete).result(timeout=20)
+    assert acknowledged["status"] == "done"
+    # A crash can restore the old directory entry unless this exact directory
+    # (not its parent) was flushed after replace. Restore its old bytes then.
+    if case.model.uncommitted:
+        case.path.write_bytes(case.before)
+    recovered = gitops.GitOpsJournal(case.store.common_dir)
+    assert recovered.open_intents() == []
+    assert recovered.record_result("pending", "done", NEW) == acknowledged
+
+
+def test_competing_result_writers_commit_interrupted_namespace(interrupted_compaction):
+    case = interrupted_compaction
+    barrier = Barrier(2)
+
+    def complete():
+        writer = gitops.GitOpsJournal(case.store.common_dir)
+        barrier.wait(timeout=15)
+        return writer.record_result("pending", "done", NEW)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(complete) for _ in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+    assert results[0] == results[1]
+    if case.model.uncommitted:
+        case.path.write_bytes(case.before)
+    assert gitops.GitOpsJournal(case.store.common_dir).open_intents() == []
+
+
+@pytest.mark.parametrize("completion", ["direct", "reconcile", "replay"])
+def test_result_namespace_flush_failure_refuses_without_observation(make_store, monkeypatch, completion):
+    store = make_store()
+    pending = intent(store)
+    pending.close()
+    if completion == "replay":
+        store.record_result("request-1", "done", NEW)
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    before, directory_inode, calls = path.read_bytes(), path.parent.stat().st_ino, []
+    original = gitops.os
+
+    def failed_flush(fd):
+        info = original.fstat(fd)
+        if stat.S_ISDIR(info.st_mode) and info.st_ino == directory_inode:
+            raise OSError(errno.EIO, "token=private-namespace-error")
+        return original.fsync(fd)
+
+    def observe(row):
+        calls.append(row)
+        return gitops.Observation(NEW)
+
+    def complete():
+        if completion == "reconcile":
+            return store.reconcile("lane-1", observe)
+        return store.record_result("request-1", "done", NEW)
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "fsync": failed_flush}))
+    refusal("journal_io", complete)
+    assert calls == []
+    assert path.read_bytes() == before
+    monkeypatch.setattr(gitops, "os", original)
+    assert store.record_result("request-1", "done", NEW)["status"] == "done"
+
+
+def test_public_reads_keep_terminal_result_semantics_after_compaction(make_store, monkeypatch):
+    store = make_store()
+    intent(store)
+    saved = store.record_result("request-1", "done", NEW)
+    require_compaction_for_next_admission(store, monkeypatch)
+    intent(store, "trigger").close()
+    assert next(row for row in store.read().rows if row["request_id"] == "request-1") == saved
+    assert [row["request_id"] for row in store.open_intents()] == ["trigger"]
+    assert store.in_flight() == []
+
+
+def test_publication_replays_terminal_result_after_compaction(publisher_rig, monkeypatch):
+    rig = publisher_rig
+    item = publication_request()
+    saved = execute_publication(rig, item)
+    assert saved["status"] == "done"
+    effects = publication_effect_count(rig)
+    require_compaction_for_next_admission(rig.journal, monkeypatch)
+    intent(rig.journal, "trigger").close()
+    assert execute_publication(rig, item) == saved
+    assert publication_effect_count(rig) == effects
+
+
+def test_qualification_replays_already_after_compaction(make_store, monkeypatch):
+    root = make_store().common_dir  # Capability guard before POSIX/Git operations.
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    repo = root / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "main")
+    head = git_commit(repo, "x", b"base\n")
+    tree = run_git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    journal = gitops.GitOpsJournal(repo / ".git")
+    result = team_qualify.QualificationResult(tree, "linux-3.12", head, "run-1", True)
+    with open_git_store(repo) as store:
+        fields = dict(expected=None, identity=IDENTITY, journal=journal, lane="lane-1",
+                      request_id="qualification", actor="custodian-1")
+        assert team_qualify.record_pass(store, result, **fields) == "updated"
+        reference = team_qualify.qualification_ref(tree, result.leg)
+        tip = run_git(repo, "rev-parse", reference)
+        require_compaction_for_next_admission(journal, monkeypatch)
+        intent(journal, "trigger").close()
+        assert team_qualify.record_pass(store, result, **fields) == "already"
+        assert run_git(repo, "rev-parse", reference) == tip
+
+
+def test_compaction_waits_for_an_admission_that_needs_capacity(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "terminal")
+    store.record_result("terminal", "done", NEW)
+    pending = intent(store, "pending")
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    generation = path.stat().st_ino
+    monkeypatch.setattr(gitops, "MAX_RECORD_LINES", 8)
+    # Four current rows plus one new intent and its two reserved slots fit.
+    store.record_result("pending", "done", NEW, receipt=pending)
+    assert path.stat().st_ino == generation
+    assert len(store.read().rows) == 4
+    with intent(store, "fits"):
+        assert path.stat().st_ino == generation
+    assert [row["kind"] for row in store.read().rows] == ["intent", "result", "intent", "result", "intent"]
+
+
+def test_capacity_compaction_retries_admission_exactly_once(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "terminal")
+    saved = store.record_result("terminal", "done", NEW)
+    pending = intent(store, "pending")
+    original, calls = gitops._compact, []
+
+    def counted(*args):
+        calls.append(None)
+        return original(*args)
+
+    monkeypatch.setattr(gitops, "_compact", counted)
+    monkeypatch.setattr(gitops, "MAX_RECORD_LINES", 6)
+    refusal("journal_capacity", lambda: intent(store, "still-full"))
+    assert calls == [None]
+    assert store.open_intents() == [pending.row]
+    assert store.record_result("terminal", "done", NEW) == saved
+    assert intent(store, "terminal").created is False
+    assert all(row["request_id"] != "still-full" for row in store.read().rows)
+
+
+def test_closed_history_compacts_before_admission_capacity_refusal(make_store, monkeypatch):
+    store = make_store()
+    saved = {}
+    for index in range(100):
+        request = "closed-" + str(index)
+        receipt = intent(store, request)
+        saved[request] = store.record_result(request, "done", NEW, receipt=receipt)
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    before = path.stat()
+    monkeypatch.setattr(gitops, "MAX_JOURNAL_BYTES", before.st_size + gitops.MAX_ROW_BYTES // 2)
+    receipt = intent(store, "after-compaction")
+    assert receipt.created is True
+    assert path.stat().st_ino != before.st_ino
+    assert store.open_intents() == [receipt.row]
+    for request, result in saved.items():
+        assert intent(store, request).created is False
+        assert store.record_result(request, "done", NEW) == result
+    assert store.read().skipped == 0
+
+
+def test_compaction_retires_only_terminal_unheld_effect_locks(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "terminal")
+    store.record_result("terminal", "done", NEW)
+    terminal = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    live = intent(store, "live")
+    require_compaction_for_next_admission(store, monkeypatch)
+    intent(store, "trigger").close()
+    assert not terminal.exists()
+    assert live.inheritable_fds()
+    assert [row["request_id"] for row in store.open_intents()] == ["live", "trigger"]
+
+
+def test_held_reconcile_is_visible_through_readonly_in_flight_query(make_store):
+    store = make_store()
+    receipt = intent(store)
+    assert store.reconcile("lane-1", lambda row: pytest.fail("live effect observed")) == []
+    rows = store.in_flight("lane-1")
+    assert len(rows) == 1
+    assert rows[0]["request_id"] == receipt.row["request_id"]
+    assert rows[0]["status"] == "in_flight"
+    assert rows[0]["next_action"] == {
+        "actor": "owner", "command": "wait for the effect owner to exit, then reconcile by observation; never retry the effect"}
+    assert intent(store).created is False
+    store.record_result("request-1", "done", NEW)
+    assert store.in_flight() == []
+
+
+def test_warm_transactions_flush_only_new_durable_information(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "warmup").close()
+    flushes = []
+    original = os.fsync
+
+    def counted(fd):
+        flushes.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        return original(fd)
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "fsync": counted}))
+    monkeypatch.setattr(storage_confined, "os", SimpleNamespace(**{**vars(os), "fsync": counted}))
+    intent(store)
+    assert flushes == [True, True, True, False]
+    flushes.clear()
+    store.record_result("request-1", "done", NEW)
+    assert flushes == [True, True, False]
+    flushes.clear()
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW))[0]["status"] == "done"
+    assert flushes == [True, True, False, False, True, False]
+
+
+@pytest.mark.parametrize("cut", ["write", "fsync", "replace", "directory_fsync"])
+def test_compaction_crash_cuts_keep_whole_authoritative_journal(make_store, monkeypatch, cut):
+    store = make_store()
+    receipt = intent(store, "terminal")
+    result = store.record_result("terminal", "done", NEW)
+    pending = intent(store, "pending")
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    before = path.read_bytes()
+    original, scratch = gitops.os, set()
+    require_compaction_for_next_admission(store, monkeypatch)
+
+    def opened(name, *args, **kwargs):
+        fd = original.open(name, *args, **kwargs)
+        if str(name).startswith(".gitops-compact-"):
+            scratch.add(fd)
+        return fd
+
+    def written(fd, data):
+        if cut == "write" and fd in scratch:
+            original.write(fd, data[:7])
+            raise OSError(errno.EIO, "token=private-compaction-error")
+        return original.write(fd, data)
+
+    def flushed(fd):
+        if ((cut == "fsync" and fd in scratch)
+                or (cut == "directory_fsync" and scratch and stat.S_ISDIR(os.fstat(fd).st_mode))):
+            raise OSError(errno.EIO, "token=private-compaction-error")
+        return original.fsync(fd)
+
+    def replaced(*args, **kwargs):
+        if cut == "replace":
+            raise OSError(errno.EIO, "token=private-compaction-error")
+        return original.replace(*args, **kwargs)
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": opened,
+                       "write": written, "fsync": flushed, "replace": replaced}))
+    refusal("journal_io", lambda: intent(store, "trigger"))
+    monkeypatch.setattr(gitops, "os", original)
+    compacted = b"".join(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n"
+                         for row in (dict(result, kind="tombstone"), pending.row))
+    assert path.read_bytes() == (compacted if cut == "directory_fsync" else before)
+    assert store.read().skipped == 0
+    assert store.open_intents() == [pending.row]
+    assert intent(store, "terminal").created is False
+    assert store.record_result("terminal", "done", NEW) == result
+    assert not list(path.parent.glob(".gitops-compact-*"))
+    for fd in scratch:
+        with pytest.raises(OSError) as error:
+            os.fstat(fd)
+        assert error.value.errno == errno.EBADF
+    assert receipt.created is True
+    assert intent(store, "trigger").created is True
+
+
+def test_compaction_keeps_terminal_lock_until_all_receipt_copies_close(make_store, monkeypatch):
+    store = make_store()
+    receipt = intent(store)
+    inherited = os.dup(receipt.inheritable_fds()[0])
+    path = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    try:
+        result = store.record_result("request-1", "done", NEW)
+        require_compaction_for_next_admission(store, monkeypatch)
+        intent(store, "trigger").close()
+        assert path.exists()
+        assert path.stat().st_ino == os.fstat(inherited).st_ino
+        assert os.fstat(inherited).st_nlink == 1
+        assert store.record_result("request-1", "done", NEW) == result
+    finally:
+        os.close(inherited)
+    store.record_result("trigger", "done", NEW)
+    require_compaction_for_next_admission(store, monkeypatch)
+    intent(store, "next").close()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("damage", ["extra", "missing", "contradiction", "duplicate", "intent_after_terminal"])
+def test_tombstones_have_exact_schema_and_terminal_dedup(make_store, monkeypatch, damage):
+    store = make_store()
+    original = intent(store).row
+    result = store.record_result("request-1", "done", NEW)
+    require_compaction_for_next_admission(store, monkeypatch)
+    intent(store, "trigger").close()
+    path = store.common_dir / "aegis" / "gitops.jsonl"
+    tombstone = dict(result, kind="tombstone")
+    if damage == "extra":
+        tombstone["extra"] = True
+    elif damage == "missing":
+        del tombstone["observed"]
+    elif damage == "contradiction":
+        tombstone["observed"] = OLD
+    elif damage == "intent_after_terminal":
+        tombstone = original
+    with path.open("ab") as stream:
+        stream.write(json.dumps(tombstone).encode("ascii") + b"\n")
+    assert store.read().skipped == 1
+    assert intent(store).created is False
+    refusal("request_conflict", lambda: intent(store, expected_new="c" * 40))
+    refusal("result_conflict", lambda: store.record_result("request-1", "not_applied", OLD))
+    assert store.record_result("request-1", "done", NEW) == result
+
+
+def test_compaction_during_reconcile_refreshes_the_new_inode(make_store, monkeypatch):
+    store = make_store()
+    intent(store, "closed")
+    store.record_result("closed", "done", NEW)
+    intent(store).close()
+    claimed, resume = Event(), Event()
+    original = gitops._try_effect
+
+    def delayed(directory, request_id, **kwargs):
+        if request_id == "request-1" and not kwargs.get("new_intent", False):
+            claimed.set()
+            assert resume.wait(15)
+        return original(directory, request_id, **kwargs)
+
+    monkeypatch.setattr(gitops, "_try_effect", delayed)
+    calls = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(store.reconcile, "lane-1", lambda row: calls.append(row["request_id"]) or gitops.Observation(NEW))
+        try:
+            assert claimed.wait(15)
+            require_compaction_for_next_admission(store, monkeypatch)
+            intent(store, "unrelated", lane="lane-2").close()
+        finally:
+            resume.set()
+        assert [row["status"] for row in future.result(timeout=20)] == ["done"]
+    assert calls == ["request-1"]
+    assert [row["request_id"] for row in store.open_intents()] == ["unrelated"]
+
+
+def test_waiter_on_retired_effect_inode_reopens_the_current_name(make_store, monkeypatch):
+    store = make_store()
+    intent(store).close()
+    opened, resume = Event(), Event()
+    original = gitops.os
+    waiter = []
+
+    def delayed(name, *args, **kwargs):
+        fd = original.open(name, *args, **kwargs)
+        if str(name).startswith("gitops-effect-") and get_ident() in waiter and not opened.is_set():
+            opened.set()
+            assert resume.wait(15)
+        return fd
+
+    def reconcile():
+        waiter.append(get_ident())
+        return store.reconcile("lane-1", lambda row: pytest.fail("terminal effect observed"))
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": delayed}))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(reconcile)
+        try:
+            assert opened.wait(15)
+            store.record_result("request-1", "done", NEW)
+            require_compaction_for_next_admission(store, monkeypatch)
+            intent(store, "trigger", lane="lane-2").close()
+        finally:
+            resume.set()
+        assert future.result(timeout=20) == []
+    assert store.record_result("request-1", "done", NEW)["status"] == "done"
+
+
+@pytest.mark.parametrize("phase", ["stuck", "deferred"])
+def test_reconcile_refusal_carries_results_already_recorded(make_store, monkeypatch, phase):
+    store = make_store()
+    intent(store, "a-blocked").close()
+    path = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    intent(store, "b-healthy").close()
+    if phase == "stuck":
+        path.write_bytes(b"!\n")
+    original, inode = gitops.os, path.stat().st_ino
+
+    def failed_write(fd, data):
+        if phase == "deferred" and os.fstat(fd).st_ino == inode:
+            raise OSError(errno.ENOSPC, "private observation storage error")
+        return original.write(fd, data)
+
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "write": failed_write}))
+    with pytest.raises(gitops.GitOpsError) as error:
+        store.reconcile("lane-1", lambda row: gitops.Observation(NEW))
+    assert error.value.code == ("checkpoint_stuck" if phase == "stuck" else "journal_io")
+    assert [row["request_id"] for row in error.value.results] == ["b-healthy"]
+    assert [row["request_id"] for row in store.open_intents()] == ["a-blocked"]
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +891,139 @@ def refusal(code, call):
         call()
     assert error.value.code == code
     assert str(error.value) == gitops.REFUSALS[code]
+
+
+@pytest.mark.parametrize("request_id", ["", "../request", "request\nsecret", "x" * 129, 7, []])
+def test_reconcile_selector_refuses_invalid_request_before_access(tmp_path, request_id):
+    store = gitops.GitOpsJournal(tmp_path / "missing")
+    refusal("invalid_request", lambda: store.reconcile("lane-1", lambda row: None,
+                                                      request_id=request_id))
+    assert not store.common_dir.exists()
+
+
+def test_reconcile_selector_unsupported_platform_refuses_with_fixed_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(gitops, "descriptor_supported", lambda: False)
+    store = gitops.GitOpsJournal(tmp_path / "missing")
+    refusal("unsupported_platform", lambda: store.reconcile("lane-1", lambda row: None,
+                                                           request_id="request-1"))
+    assert not store.common_dir.exists()
+
+
+def test_reconcile_selector_touches_one_of_128_pending_requests(make_store, monkeypatch):
+    store = make_store()
+    for index in range(128):
+        intent(store, "request-%03d" % index).close()
+    probes, observations, flushed, effects = [], [], [], set()
+    original_effect, original_os = gitops._try_effect, gitops.os
+
+    def probe(directory, request_id, **kwargs):
+        probes.append(request_id)
+        effect = original_effect(directory, request_id, **kwargs)
+        if effect is not None:
+            effects.add(os.fstat(effect).st_ino)
+        return effect
+
+    def flush(fd):
+        if os.fstat(fd).st_ino in effects:
+            flushed.append(None)
+        return original_os.fsync(fd)
+
+    def observe(row):
+        observations.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "_try_effect", probe)
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "fsync": flush}))
+    recorded = store.reconcile("lane-1", observe, request_id="request-063")
+    assert probes == observations == ["request-063"]
+    assert len(flushed) == 2  # Selected checkpoint reservation and saved result.
+    assert recorded == [store.read().rows[-1]]
+    assert recorded[0]["status"] == "done"
+    assert len(store.open_intents()) == 127
+    before = (store.common_dir / "aegis" / "gitops.jsonl").read_bytes()
+    assert store.reconcile("lane-1", observe, request_id="request-063") == []
+    assert store.reconcile("other-lane", observe, request_id="request-000") == []
+    assert store.reconcile("lane-1", observe, request_id="missing") == []
+    assert probes == observations == ["request-063"]
+    assert (store.common_dir / "aegis" / "gitops.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("state,status", [(NEW, "done"), (OLD, "not_applied"), ("c" * 40, "unknown")])
+def test_reconcile_selector_recovers_a_dead_custodian_once(make_store, state, status):
+    store = make_store()
+    intent(store, "unselected").close()
+    orphan_intent(store)
+    calls = []
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(state)
+
+    recorded = store.reconcile("lane-1", observe, request_id="request-1")
+    assert [row["status"] for row in recorded] == [status]
+    assert calls == ["request-1"]
+    assert store.reconcile("lane-1", observe, request_id="request-1") == []
+    assert intent(store).created is False
+    assert [row["request_id"] for row in store.open_intents()] == ["unselected"]
+
+
+@pytest.mark.parametrize("failure", ["observer", "storage", "stuck", "active"])
+def test_reconcile_selector_failure_retry_preserves_other_requests(make_store, monkeypatch, failure):
+    store = make_store()
+    receipt = intent(store)
+    checkpoint = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    if failure != "active":
+        receipt.close()
+    if failure == "stuck":
+        checkpoint.write_bytes(b"!\n")
+    other = intent(store, "unselected")
+    other.close()
+    calls, original_append = [], gitops._append
+    journal_inode = (store.common_dir / "aegis" / "gitops.jsonl").stat().st_ino
+
+    def observe(row):
+        calls.append(row["request_id"])
+        if failure == "observer" and len(calls) == 1:
+            raise TimeoutError("token=never-echo")
+        return gitops.Observation(NEW)
+
+    def unavailable(fd, row, size):
+        if os.fstat(fd).st_ino == journal_inode:
+            raise OSError(errno.ENOSPC, "token=never-echo")
+        return original_append(fd, row, size)
+
+    if failure == "storage":
+        monkeypatch.setattr(gitops, "_append", unavailable)
+    if failure in ("storage", "stuck"):
+        refusal("journal_io" if failure == "storage" else "checkpoint_stuck",
+                lambda: store.reconcile("lane-1", observe, request_id="request-1"))
+    else:
+        assert store.reconcile("lane-1", observe, request_id="request-1") == []
+    monkeypatch.setattr(gitops, "_append", original_append)
+    receipt.close()
+    if failure == "stuck":
+        store.record_result("request-1", "done", NEW)
+        assert store.reconcile("lane-1", observe, request_id="request-1") == []
+        assert calls == []
+    else:
+        assert store.reconcile("lane-1", observe, request_id="request-1")[0]["status"] == "done"
+        assert calls == ["request-1"] * (2 if failure == "observer" else 1)
+    assert store.open_intents() == [other.row]
+    assert store.reconcile("lane-1", observe, request_id="request-1") == []
+
+
+def test_reconcile_without_selector_preserves_exact_rows_and_bytes(make_store, monkeypatch):
+    monkeypatch.setattr(gitops, "utc_stamp", lambda: "2026-11-15T00:00:00Z")
+    store = make_store()
+    receipts = [intent(store, name) for name in ("request-2", "request-1")]
+    for receipt in receipts:
+        receipt.close()
+    expected = [gitops.rows.result(receipt.row, "done", NEW, stamp=receipt.row["ts"])
+                for receipt in reversed(receipts)]
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW)) == expected
+    payload = b"".join(gitops.rows.encoded(row) + b"\n"
+                       for row in [receipt.row for receipt in receipts] + expected)
+    assert (store.common_dir / "aegis" / "gitops.jsonl").read_bytes() == payload
 
 
 @pytest.mark.parametrize("op", OPS)
@@ -198,6 +1139,7 @@ def test_unsupported_probe_has_documented_refusal(tmp_path, monkeypatch):
     store = gitops.GitOpsJournal(tmp_path)
     refusal("unsupported_platform", lambda: intent(store))
     refusal("unsupported_platform", store.read)
+    refusal("unsupported_platform", store.in_flight)
     refusal("unsupported_platform", lambda: store.reconcile("lane-1", lambda row: pytest.fail("unsupported observer")))
     assert not (tmp_path / "aegis").exists()
 
@@ -250,19 +1192,21 @@ def test_parallel_reservations_results_and_reconcile_are_once_only(make_store):
 
 @pytest.mark.parametrize("state,status", [(NEW, "done"), (OLD, "not_applied"), ("c" * 40, "unknown")])
 @pytest.mark.parametrize("completion", ["reconcile", "receipt", "effect_fd"])
-def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monkeypatch, state, status, completion):
+@pytest.mark.parametrize("selected", [False, True])
+def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monkeypatch, state, status, completion, selected):
     store = make_store()
     receipt = orphan_intent(store) if completion == "reconcile" else intent(store)
     delayed = gitops.GitOpsJournal(store.common_dir)
     pending_read, resume = Event(), Event()
     original = gitops._try_effect
     calls = []
+    selection = {"request_id": "request-1"} if selected else {}
 
-    def pause_before_acquire(directory, request_id):
+    def pause_before_acquire(directory, request_id, **kwargs):
         if not pending_read.is_set():
             pending_read.set()
             assert resume.wait(10), "delayed reconciler was not released"
-        return original(directory, request_id)
+        return original(directory, request_id, **kwargs)
 
     def observe(row):
         calls.append(row["request_id"])
@@ -270,13 +1214,13 @@ def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monke
 
     monkeypatch.setattr(gitops, "_try_effect", pause_before_acquire)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        waiting = pool.submit(delayed.reconcile, "lane-1", observe)
+        waiting = pool.submit(delayed.reconcile, "lane-1", observe, **selection)
         try:
             assert pending_read.wait(10), "delayed reconciler did not read pending intents"
             # A records its result and closes its effect descriptor before B
             # may acquire that lock using its now-stale pending snapshot.
             if completion == "reconcile":
-                assert [row["status"] for row in store.reconcile("lane-1", observe)] == [status]
+                assert [row["status"] for row in store.reconcile("lane-1", observe, **selection)] == [status]
             elif completion == "receipt":
                 assert store.record_result("request-1", status, state, receipt=receipt)["status"] == status
             else:
@@ -304,7 +1248,7 @@ finally:
 
     expected_calls = ["request-1"] if completion == "reconcile" else []
     assert calls == expected_calls
-    assert store.reconcile("lane-1", observe) == []
+    assert store.reconcile("lane-1", observe, **selection) == []
     assert calls == expected_calls
     assert intent(store).created is False
     assert len(store.read().rows) == 2
@@ -318,14 +1262,16 @@ def test_reconcile_generation_failure_refuses_without_observing_and_releases_loc
     original_os = gitops.os
     acquired, calls = [], []
 
-    def track_effect(directory, request_id):
-        fd = original_effect(directory, request_id)
+    def track_effect(directory, request_id, **kwargs):
+        fd = original_effect(directory, request_id, **kwargs)
         if fd is not None:
             acquired.append(fd)
         return fd
 
-    def failed_stat(*args, **kwargs):
-        raise OSError(errno.EIO, "token=private-generation-error")
+    def failed_stat(name, *args, **kwargs):
+        if name == "gitops.jsonl":
+            raise OSError(errno.EIO, "token=private-generation-error")
+        return original_os.stat(name, *args, **kwargs)
 
     def observe(row):
         calls.append(row["request_id"])
@@ -346,6 +1292,43 @@ def test_reconcile_generation_failure_refuses_without_observing_and_releases_loc
     assert [result["status"] for result in store.reconcile("lane-1", observe)] == ["done"]
     assert calls == ["request-1"]
     assert intent(store).created is False
+
+
+def test_effect_inode_inspection_failure_refuses_closes_and_releases_lock(make_store, monkeypatch):
+    store = make_store()
+    receipt = intent(store)
+    row = receipt.row
+    receipt.close()
+    original_os, original_fcntl = gitops.os, gitops.fcntl
+    acquired, calls = [], []
+
+    def tracked_flock(fd, operation):
+        original_fcntl.flock(fd, operation)
+        acquired.append(fd)
+
+    def failed_stat(name, *args, **kwargs):
+        if str(name).startswith("gitops-effect-"):
+            assert acquired, "inode check must follow the successful flock"
+            raise OSError(errno.EIO, "token=private-inode-error")
+        return original_os.stat(name, *args, **kwargs)
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "fcntl", SimpleNamespace(**{**vars(original_fcntl), "flock": tracked_flock}))
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "stat": failed_stat}))
+    refusal("journal_io", lambda: store.reconcile("lane-1", observe))
+    assert calls == []
+    assert len(acquired) == 1
+    with pytest.raises(OSError) as error:
+        os.fstat(acquired[0])
+    assert error.value.errno == errno.EBADF
+    monkeypatch.setattr(gitops, "os", original_os)
+    monkeypatch.setattr(gitops, "fcntl", original_fcntl)
+    assert store.open_intents() == [row]
+    assert store.reconcile("lane-1", observe)[0]["status"] == "done"
+    assert calls == ["request-1"]
 
 
 @pytest.mark.parametrize("failure,code", [("stat", "journal_io"), ("reread", "journal_busy")])
@@ -480,11 +1463,11 @@ def test_final_record_retry_keeps_waiting_reconciler_from_observing_twice(make_s
     journal_inode = (store.common_dir / "aegis" / "gitops.jsonl").stat().st_ino
     calls, attempts = [], []
 
-    def delayed_claim(directory, request_id):
+    def delayed_claim(directory, request_id, **kwargs):
         if observed.is_set() and not waiting.is_set():
             waiting.set()
             assert finished.wait(15), "first reconciler did not finish"
-        return original_effect(directory, request_id)
+        return original_effect(directory, request_id, **kwargs)
 
     @contextmanager
     def fail_transaction(self, write=False, **kwargs):
@@ -631,8 +1614,8 @@ def test_checkpoint_write_failure_never_allows_second_authoritative_observation(
     journal_inode = (store.common_dir / "aegis" / "gitops.jsonl").stat().st_ino
     calls, acquired = [], []
 
-    def track_effect(*args):
-        fd = original_effect(*args)
+    def track_effect(*args, **kwargs):
+        fd = original_effect(*args, **kwargs)
         if fd is not None:
             acquired.append(fd)
         return fd
@@ -695,11 +1678,12 @@ def test_checkpoint_corruption_refuses_without_observing_or_leaking_descriptors(
             return original_os.read(fd, count)
 
         monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "read": bounded_read}))
+        monkeypatch.setattr(gitops.checkpoints, "os", gitops.os)
     original_effect = gitops._try_effect
     acquired, calls = [], []
 
-    def track_effect(*args):
-        fd = original_effect(*args)
+    def track_effect(*args, **kwargs):
+        fd = original_effect(*args, **kwargs)
         if fd is not None:
             acquired.append(fd)
         return fd
@@ -773,11 +1757,11 @@ def test_later_batch_claim_failure_preserves_completed_batches_on_retry(make_sto
     original_effect = gitops._try_effect
     calls, failed = [], []
 
-    def failed_later_claim(directory, request_id):
+    def failed_later_claim(directory, request_id, **kwargs):
         if request_id == "request-08" and not failed:
             failed.append(None)
             raise OSError(errno.EMFILE, "token=private-descriptor-error")
-        return original_effect(directory, request_id)
+        return original_effect(directory, request_id, **kwargs)
 
     def observe(row):
         calls.append(row["request_id"])
@@ -1384,6 +2368,7 @@ def test_fresh_intent_skips_checkpoint_reset_and_uses_three_fsyncs(make_store, m
 
     monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": track_open,
                                                        "ftruncate": track_truncate, "fsync": track_fsync}))
+    monkeypatch.setattr(gitops.checkpoints, "os", gitops.os)
     with intent(store) as receipt:
         assert receipt.created is True
         assert truncations == []
@@ -1676,12 +2661,14 @@ def test_failed_new_intent_checkpoint_reset_closes_descriptors_before_retry(chec
         raise OSError(errno.ENOSPC, "token=private-reset-error")
 
     monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "open": track_open, "ftruncate": failed_reset}))
+    monkeypatch.setattr(gitops.checkpoints, "os", gitops.os)
     refusal("journal_io", lambda: intent(store, expected_old=NEW, expected_new="c" * 40))
     for fd in opened:
         with pytest.raises(OSError) as error:
             os.fstat(fd)
         assert error.value.errno == errno.EBADF
     monkeypatch.setattr(gitops, "os", original_os)
+    monkeypatch.setattr(gitops.checkpoints, "os", original_os)
     assert store.read().rows == []
     receipt = intent(store, expected_old=NEW, expected_new="c" * 40)
     assert receipt.created is True
@@ -1718,11 +2705,11 @@ def test_delayed_reconciler_preserves_healthy_completion_beside_stuck_checkpoint
     pending_read, resume = Event(), Event()
     calls = []
 
-    def delayed_claim(directory, request_id):
+    def delayed_claim(directory, request_id, **kwargs):
         if not pending_read.is_set():
             pending_read.set()
             assert resume.wait(15), "delayed reconciler not released"
-        return original_effect(directory, request_id)
+        return original_effect(directory, request_id, **kwargs)
 
     def observe(row):
         calls.append(row["request_id"])
@@ -2124,9 +3111,10 @@ def test_lane_grammar_matches_team_exactly():
 def test_redaction_policy_cannot_hide_stored_intents(make_store, monkeypatch):
     store = make_store()
     row = intent(store, expected_new={"branch": "lane/allowed"}).row
-    monkeypatch.setattr(gitops, "redact_command_secrets", lambda text: "[changed-policy]")
+    monkeypatch.setattr(gitops.rows, "redact_command_secrets", lambda text: "[changed-policy]")
     assert store.read().rows == [row]
     assert store.open_intents() == [row]
+    refusal("invalid_intent", lambda: intent(store, "new-policy", expected_new={"branch": "lane/next"}))
 
 
 def test_slow_observer_does_not_hold_the_journal_lock(make_store):
@@ -2218,9 +3206,9 @@ def test_reconcile_rechecks_terminal_state_before_appending(make_store, monkeypa
     intent(owner)
     observer = gitops.GitOpsJournal(owner.common_dir)
     original = gitops._try_effect
-    def finish_before_acquire(directory, request_id):
+    def finish_before_acquire(directory, request_id, **kwargs):
         owner.record_result(request_id, "done", NEW)
-        return original(directory, request_id)
+        return original(directory, request_id, **kwargs)
     monkeypatch.setattr(gitops, "_try_effect", finish_before_acquire)
     assert observer.reconcile("lane-1", lambda row: gitops.Observation(OLD)) == []
     assert len(observer.read().rows) == 2

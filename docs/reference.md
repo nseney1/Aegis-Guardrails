@@ -341,6 +341,10 @@ Enqueue a bounded inline JSON item
 
 Report held work needing a decision
 
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `--view` | one of `full`, `findings` | `"full"` | Full item detail (default), or findings with affected revisions and counts; inspect full constraints before decisions |
+
 ### `aegis team queue claim`
 
 Claim a current item revision with a lease
@@ -374,8 +378,9 @@ List items, blockers and lane labels
 
 | Argument | Value | Default | Description |
 | --- | --- | --- | --- |
-| `--capability` | `CAPABILITIES` |  | Filter by a team capability label; repeat for each label |
+| `--capability` | `CAPABILITIES` |  | Capabilities available to this team; list items whose requirements are all satisfied. Repeat for each label |
 | `--include-done` |  |  | Include completed items hidden by default |
+| `--view` | one of `full`, `fingerprint` | `"full"` | Full item detail (default), or fingerprint only; run the full list after a change |
 
 ### `aegis team queue release`
 
@@ -516,7 +521,7 @@ Inspect audit, approval and native enforcement states
 
 Manage rule lifecycle (list, create, promote, demote, archive) and share rules as unsigned packs
 
-Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `create`, `demote`, `export`, `import`, `insight`, `list`, `promote`.
+Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `create`, `demote`, `export`, `import`, `insight`, `lint`, `list`, `promote`.
 
 ### `aegis rule adjudicate`
 
@@ -633,6 +638,14 @@ List insights with their top-3 neighbours or record a decision on some
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
 | `--reason` | `REASON` |  | Reason for the decision (required with reject) |
+
+### `aegis rule lint`
+
+Report rule lint findings without changing rules
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `paths` | `[PATH ...]` | `[]` | Rule files or directories below .aegis/rules (default: all rules) |
 
 ### `aegis rule list`
 

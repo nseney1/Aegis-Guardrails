@@ -616,17 +616,50 @@ def lease_tools():
 @_display_response
 def check_paths(ledger, identifier, paths):
     initiative = ledger.initiative(identifier)
-    require(isinstance(paths, list) and bool(paths) and len(paths) <= 256, "invalid paths")
-    match, team, team_paths = lease_tools()
-    for path in paths:
-        text(path, "path")
-        require(team.glob_problem(path) is None and not path.startswith(("/", "\\")) and ":" not in path
-                and "\\" not in path and ".." not in path.split("/"), "invalid path: " + _display(path))
+    _, team, team_paths = lease_tools()
     try:
-        requested = team_paths.stored_paths(paths)
+        requested = team_paths.claim_paths(paths)
     except team_paths.LeasePathError as exc:
-        # stored_paths owns this fixed diagnostic and never includes the input.
-        raise _Refusal(team_paths.STORED_PATH_ERROR, displayed=True) from exc
+        # The claim parser bounds inputs before normalization and owns these
+        # trusted diagnostics, which never echo request values.
+        raise _Refusal(str(exc), displayed=True) from exc
+    # The public claim also accepts tuples. Display responses expect JSON arrays.
+    if isinstance(paths, tuple):
+        paths = list(paths)
+    return _check_path_overlap(ledger, initiative, paths, requested, team, team_paths)
+
+
+@_display_response
+def check_initiative_paths(ledger, identifier):
+    """Inspect a registered declaration with the lease reader's legacy semantics."""
+    initiative = ledger.initiative(identifier)
+    paths = initiative["touched_paths"]
+    _, team, team_paths = lease_tools()
+    try:
+        requested = team_paths.stored_paths(paths) if paths else team_paths.PathSet((), ())
+    except team_paths.LeasePathError:
+        # A readable ledger can retain a scope no lease reader can interpret.
+        # Inventory it as a conflict; it is not a malformed new request.
+        requested = None
+    return _check_path_overlap(ledger, initiative, paths, requested, team, team_paths)
+
+
+def _check_path_overlap(ledger, initiative, paths, requested, team, team_paths):
+    identifier = initiative["id"]
+
+    def stored_overlap(scope):
+        if not scope or not paths:
+            return False  # An undeclared workspace scope reserves no paths.
+        if requested is None:
+            return True  # An unreadable requested scope cannot prove disjointness.
+        try:
+            parsed = team_paths.stored_paths(scope)
+        except team_paths.LeasePathError:
+            # Like an unreadable lease, an unparseable stored scope cannot prove
+            # disjointness. Keep legacy declarations/reservations fail-closed.
+            return True
+        return team_paths.overlap(parsed, requested)
+
     now = int(time.time())
     peers = [i for i in ledger.initiatives.values()
              if i["repository"] == initiative["repository"] and i["state"] != "done"]
@@ -634,7 +667,7 @@ def check_paths(ledger, identifier, paths):
     # share lease refs. A lease is this initiative's own only if its lane is assigned here and it is
     # visible through this initiative's checkout. Everything else conflicts: unsure means conflict.
     assigned = {lane: peer["id"] for peer in peers for lane in peer["lanes"]}
-    ordered = [initiative] + [peer for peer in peers if peer["id"] != identifier]
+    ordered = ([initiative] + [peer for peer in peers if peer["id"] != identifier]) if paths else []
     visible_here, seen, conflicts, own_overlaps, unreadable_checkouts = set(), set(), [], [], []
     checked = 0
     for peer in ordered:
@@ -649,7 +682,8 @@ def check_paths(ledger, identifier, paths):
                 key = (lease.lane, lease.oid)
                 if peer["id"] == identifier:
                     visible_here.add(key)
-                if key in seen or lease.expired(now) or not team_paths.overlap(lease.path_set, requested):
+                if (key in seen or lease.expired(now)
+                        or (requested is not None and not team_paths.overlap(lease.path_set, requested))):
                     continue
                 seen.add(key)
                 row = {"lane": lease.lane, "paths": list(lease.paths), "owner": lease.owner, "initiative": peer["id"],
@@ -663,20 +697,23 @@ def check_paths(ledger, identifier, paths):
                     conflicts.append({"lane": bad.lane, "initiative": peer["id"],
                                       "checkout": checkout, "unreadable": bad.error})
     declared = [peer["id"] for peer in peers if peer["id"] != identifier
-                and match.sets_overlap(peer["touched_paths"], paths)]
+                and stored_overlap(peer["touched_paths"])]
     # A lease's expiry or a successor's updated declaration is not terminal evidence for
     # the original capacity claim. Replay pins scope at request time, including old stores.
     reserved = [{"request_id": r["request_id"], "initiative": r["initiative"], "holder": r["holder"],
                  "paths": r["reserved_paths"]} for r in ledger.held("writer")
                 if r["initiative"] != identifier and r["reserved_repository"] == initiative["repository"]
-                and match.sets_overlap(r["reserved_paths"], paths)]
-    conflict = bool(conflicts or unreadable_checkouts or reserved)
-    return (3 if conflict else 0), {
+                and stored_overlap(r["reserved_paths"])]
+    conflict = requested is None or bool(conflicts or unreadable_checkouts or reserved)
+    result = {
         "initiative": identifier, "paths": paths, "conflict": conflict, "conflicts": conflicts[:MAX_VIEW_ROWS],
         "reserved_conflicts": reserved[:MAX_VIEW_ROWS],
         "unreadable_checkouts": unreadable_checkouts[:MAX_VIEW_ROWS], "own_overlaps": own_overlaps[:MAX_VIEW_ROWS],
         "declared_overlaps": declared, "checked_checkouts": checked,
         "note": "A clear result is advice, not a lock: run the check and the lease claim one after another."}
+    if requested is None:
+        result["reason"] = "stored_paths_unreadable"
+    return (3 if conflict else 0), result
 
 
 @_display_response

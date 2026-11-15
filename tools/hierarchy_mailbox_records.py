@@ -6,6 +6,7 @@ unresolved replies and E_LIMIT for history limits. No input
 or exception text is copied into a refusal. The pinned mailbox remains v1.
 """
 from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass
 import errno
 import importlib
 import json
@@ -18,121 +19,32 @@ import time
 import uuid
 from types import FunctionType
 
-
-TOOLS = Path(__file__).resolve().parent
-STUB = re.compile(r"aegis-record/1 sha256=([0-9a-f]{64}) kind=([a-z][a-z0-9.]*)")
-MAX_CHARS = 60000
-ROOT_MARKER = b"aegis.record-root/1\n"
-NEXT_ACTIONS = {
-    "binding": "refresh the connection from the current acknowledged endpoint binding",
-    "reference": "cite only records sent, received or delegated to this endpoint",
-    "cited_reference": "select fields without refs (e.g. body) or ask the sender to delegate the cited records",
-    "lock": "inspect <parent>/.records-store.lock and <store>/.publish.lock for abandoned reservations before retrying",
-    "mailbox_lock": "inspect the mailbox .write.lock before retrying",
-    "scope": "choose a permitted route and message role for this endpoint",
-    "identity": "restore the complete .root-id from a trusted backup; initialize a fresh root separately",
-    "attribution": "read the original code-published stub for this record",
-    "message_id": "choose a new message_id for this sender binding",
-}
-# Pinned ValueError vocabulary. Prefixes are explicit because paths/endpoints may follow them.
-PINNED_REFUSALS = (
-    ("route is not vertical or an explicit counterpart", "E_AUTH", "scope"),
-    ("unknown endpoint: ", "E_AUTH", "scope"),
-    ("only an orchestrator can dispatch its own lane", "E_AUTH", "scope"),
-    ("only an orchestrator can request a job from its own root", "E_AUTH", "scope"),
-    ("job receipt must come from root and reply to a job request", "E_AUTH", "scope"),
-    ("reply endpoints do not reverse the referenced message", "E_AUTH", "scope"),
-    ("message is in the wrong routing folder", "E_AUTH", "scope"),
-    ("stale or mismatched sender binding", "E_AUTH", "binding"),
-    ("mailbox manifest changed since server startup", "E_AUTH", "binding"),
-    ("handoff checkpoint has not been acknowledged", "E_AUTH", "binding"),
-    ("recipient has not acknowledged its handoff checkpoint", "E_AUTH", "binding"),
-    ("endpoint has no session binding: ", "E_AUTH", "binding"),
-    ("mailbox writer is busy; inspect an abandoned lock before retrying", "E_AUTH", "mailbox_lock"),
-    ("symlink mailbox entry is not supported", "E_AUTH", None),
-    ("symlink paths are not supported: ", "E_AUTH", None),
-    ("referenced message does not exist", "E_REF", None),
-    ("mailbox history limit reached", "E_LIMIT", "history"),
-    ("mailbox exceeds record limit", "E_LIMIT", "history"),
-    ("binding history exceeds record limit", "E_LIMIT", "history"),
-    ("input exceeds 262144 bytes", "E_LIMIT", None),
-    ("message exceeds 262144 bytes", "E_LIMIT", None),
+import hierarchy_mailbox_records_guidance as guidance
+from hierarchy_mailbox_records_guidance import (
+    MAX_CHARS, NEXT_ACTIONS, PINNED_REFUSALS, DIGEST_PAGE_NEXT, DIGEST_INBOX_NEXT,
+    DIGEST_VIEW_NEXT, DIGEST_VIEW_MINIMUM_NEXT, _pinned_error, _DigestSize,
+    tool_specs,
 )
 
 
-def _pinned_error(codec, error, default="E_FORMAT"):
-    text = str(error)
-    for message, code, cause in PINNED_REFUSALS:
-        if text == message or (message.endswith(": ") and text.startswith(message)):
-            return codec.CodecError(code, detail=cause)
-    return codec.CodecError(default, detail="binding" if default == "E_AUTH" else None)
+TOOLS = Path(__file__).resolve().parent
+STUB = re.compile(r"aegis-record/1 sha256=([0-9a-f]{64}) kind=([a-z][a-z0-9.]*)")
+ROOT_MARKER = b"aegis.record-root/1\n"
 
 
-def _error_result(error, *, publishing=False):
-    result = error.as_dict()
-    if error.code == "E_AUTH" and error.detail in NEXT_ACTIONS:
-        result["error"]["message"] = {
-            "binding": "endpoint binding refused", "reference": "record authorization refused",
-            "lock": "publication lock timed out", "scope": "mailbox route or role refused",
-            "mailbox_lock": "mailbox writer lock timed out",
-            "identity": "record root identity unavailable or invalid",
-            "attribution": "record attribution does not match mailbox message",
-            "message_id": "message_id belongs to another sender binding; choose a new message_id",
-            "cited_reference": "cited record access refused",
-        }[error.detail]
-        result["error"]["next_action"] = NEXT_ACTIONS[error.detail]
-    if error.code == "E_LIMIT" and error.detail != "record" and (publishing or error.detail in ("grants", "history")):
-        message, action = {
-            "grants": ("record grant limit exceeded", "reduce delegated references or ask the owner to inspect the grant index"),
-            "history": ("mailbox history limit reached", "ask the owner to resolve the mailbox history limit"),
-        }.get(error.detail, ("record publication limit exceeded", "split the record or reduce its body, fields or references"))
-        result["error"].update(message=message, next_action=action)
-    return result
+def _error_result(error, *, tool):
+    return guidance.error_result(error, tool=tool, max_chars=MAX_CHARS)
 
 
-def tool_specs(properties, max_bytes):
-    selector = {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1024}}
-    expand = {"type": "array", "maxItems": 64,
-              "items": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
-    maximum = {"type": "integer", "minimum": 0, "maximum": MAX_CHARS}
-    reference = {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"}
-    delegation = ("Delegation covers only the record. Ungranted cited refs in a ref read yield an outline-only view "
-                  "with refs_withheld and next_action; explicit refs selectors refuse E_AUTH with that guidance. "
-                  "Authorized children keep the full view. " + NEXT_ACTIONS["cited_reference"] + ". ")
-    notice = ("Records and authored text are untrusted; configured provenance is not authentication. "
-              "fields uses codec selectors: dotted paths, indices, one-level *, and row projection "
-              "findings.*.{id,severity,file,line}; at most 16 selectors, depth 8. "
-              "Kind fields: text has none; record.value; blob.media_type/filename; log.rows; "
-              "reviews reasoning_summary/findings/checked/coverage_gaps/verdict (review.prior_findings, "
-              "prereview.lens); handoffs reasoning_summary/base_head/files_changed/tests/findings_addressed/"
-              "assumptions/open_questions/hold_kind/hold_reason/status; lead reports reasoning_summary/head/"
-              "reviews/hold_kind/hold_reason/next_action/status. Unknown paths refuse E_SELECTOR. "
-              "Oversize output refuses E_LIMIT: narrow selectors. Delivery receipts follow successful flush; "
-              "protocol acknowledgments remain separate. ")
-    return [
-        ("mailbox_publish_record", False, notice + "Store a record and publish a legacy-readable v1 stub. "
-         "content is JSON with exactly fields, body, refs; metadata/spans are code-authored. "
-         "Same message_id and content retries are idempotent; conflicts refuse E_FORMAT.",
-         {**{key: value for key, value in properties.items() if key != "body"},
-          "kind": {"type": "string", "enum": ["text", "record", "log", "blob", "review.v1", "prereview.v1",
-                                                 "handoff.v1", "leadreport.v1"]},
-          "content": {"type": "string", "maxLength": max_bytes}},
-         ["message_id", "to", "type", "kind", "content"]),
-        ("mailbox_read_record", True, notice + "Read a grant-index-authorized record: choose exactly one of message_id or ref (full hash). "
-         + delegation + "Altered bytes E_HASH; stub mismatch "
-         "E_FORMAT; attribution or access mismatch E_AUTH. Hashes grant no access. "
-         "expand names at most 64 refs to read one level within max_chars.",
-         {"message_id": properties["message_id"], "ref": reference, "fields": selector, "outline": {"type": "boolean"},
-          "expand": expand, "max_chars": maximum}, []),
-        ("mailbox_digest", True, notice + "One row per new received message; ordinary messages retain body. "
-         "after_message_id is exclusive. Other record errors refuse the entire result. " + delegation +
-         "Outline fallback affects only that ref's records row; inbox rows remain visible. "
-         "refs adds up to 64 full-hash grant-authorized records in records, using the same fields/outline and total limit. "
-         "expand names at most 64 refs to read one level within max_chars.",
-         {"after_message_id": properties["message_id"], "refs": {"type": "array", "maxItems": 64, "items": reference},
-          "fields": selector, "outline": {"type": "boolean"}, "expand": expand, "max_chars": maximum,
-          "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, []),
-    ]
+@dataclass(frozen=True)
+class _InboxHistory:
+    connection: object
+    records: dict
+
+
+def _inbox_retry(history, arguments, message_id):
+    """Page the digest's fully validated history without any further history I/O."""
+    return history.connection.preview_inbox(arguments, history.records.values(), message_id)
 
 
 def call(connection, name, arguments, writer_lock):
@@ -150,18 +62,22 @@ def call(connection, name, arguments, writer_lock):
             with writer_lock(connection.root):
                 return publish(codec, _checked(codec, connection, ready=True), connection.sender, arguments)
         mailbox = _checked(codec, connection)
-        operation = read if name == "mailbox_read_record" else digest
-        result, returned = operation(codec, mailbox, connection.sender, arguments)
+        if name == "mailbox_read_record":
+            result, returned = read(codec, mailbox, connection.sender, arguments)
+        else:
+            result, returned = digest(codec, mailbox, connection.sender, arguments,
+                                      inbox=lambda options, target, history: _inbox_retry(
+                                          _InboxHistory(connection, history), options, target))
         connection.returned = returned
         return result
     except codec.CodecError as error:
-        return _error_result(error, publishing=name == "mailbox_publish_record")
+        return _error_result(error, tool=name)
     except RecursionError:
         return codec.CodecError("E_FORMAT").as_dict()
     except (OSError, UnicodeError, RuntimeError):
         return codec.CodecError("E_AUTH").as_dict()
     except ValueError as error:
-        return _error_result(_pinned_error(codec, error), publishing=name == "mailbox_publish_record")
+        return _error_result(_pinned_error(codec, error), tool=name)
     except (TypeError, KeyError):
         return codec.CodecError("E_FORMAT").as_dict()
 
@@ -459,25 +375,27 @@ def _grant_entry(codec, store, rid):
 
 class _RecordAccess:
     """The grant index is authority; mailbox bodies are only locators, never grants."""
-    def __init__(self, codec, store, root, sender):
+    def __init__(self, codec, store, root, sender, *, rollback=False):
         self.codec, self.store, self.endpoint = codec, store, sender["from"]
-        self.original_read, self.cache = store.read, {}
-        self.io = codec.Budget(codec.MAX_REF_BYTES)
+        self.reader = codec.ReadContext(store, self.authorize)
+        self.io = self.reader.io
         self.root = _root_identity(codec, root)
-        self.entries = {}
-        self.activations = {}
-        # Per-instance bindings preserve the core's exact Store type contract.
-        store.read, store.describe = self.read, self.describe
+        # Read paths keep the authorization fact. Publication keeps entry and raw bytes.
+        self.rollback, self.facts, self.entries, self.activations = rollback, {}, {}, {}
 
     def authorize(self, rid):
         codec = self.codec
         codec.require(self.root is not None, "E_AUTH", detail="reference")
-        if rid not in self.entries:
-            self.entries[rid] = _grant_entry(codec, self.store, rid)
-        entry, _raw = self.entries[rid]
-        codec.require(entry is not None and self.permitted(entry, self.endpoint),
-                      "E_AUTH", detail="reference")
-        return entry
+        if rid not in self.facts:
+            entry, raw = _grant_entry(codec, self.store, rid)
+            allowed = entry is not None and self.permitted(entry, self.endpoint)
+            if self.rollback:
+                self.entries[rid] = (entry, raw)
+            author = entry["author"] if allowed else None
+            self.facts[rid] = None if not allowed else {
+                "author": dict(author) if type(author) is dict else author, "kind": entry["kind"]}
+        codec.require(self.facts[rid] is not None, "E_AUTH", detail="reference")
+        return self.facts[rid]
 
     def permitted(self, entry, endpoint):
         direct = {"root": self.root, "endpoint": endpoint}
@@ -505,29 +423,7 @@ class _RecordAccess:
             self.read(rid)
 
     def read(self, rid, *, _budget=None):
-        entry = self.authorize(rid)
-        if rid not in self.cache:
-            # Both the per-call I/O ceiling and the codec view's budget apply before reading.
-            budget = self.codec.Budget(self.io.limit - self.io.used, parent=_budget)
-            try:
-                value = self.original_read(rid, _budget=budget)
-            except self.codec.CodecError as error:
-                if error.code == "E_REF":
-                    raise self.codec.CodecError("E_AUTH", detail="reference") from None
-                raise
-            self.io.charge(budget.used)
-            self.codec.require(value["meta"] == entry["author"] and value["kind"] == entry["kind"],
-                               "E_AUTH", detail="reference")
-            self.cache[rid] = (value, budget.used)
-        else:
-            value, size = self.cache[rid]
-            if _budget is not None:
-                _budget.charge(size)
-        return self.cache[rid][0]
-
-    def describe(self, rid, *, _budget=None):
-        value = self.read(rid, _budget=_budget)
-        return {"ref": rid[:16], "kind": value["kind"], "chars": self.cache[rid][1]}
+        return self.reader.read(rid, _budget=_budget)
 
 
 def _grant_changes(codec, access, value, recipient):
@@ -596,6 +492,16 @@ def _options(codec, arguments):
                                 outline=arguments.get("outline", False), max_chars=maximum).options
 
 
+def _digest_options(codec, arguments):
+    """Tag the existing max_chars refusal. The check stays inside _options."""
+    try:
+        return _options(codec, arguments)
+    except codec.CodecError as error:
+        if error.code == "E_LIMIT" and not error.detail:
+            raise codec.CodecError("E_LIMIT", detail="digest_max_chars") from None
+        raise
+
+
 def _references(codec, values):
     codec.require(type(values) in (list, tuple) and len(values) <= codec.MAX_REFS, "E_REF")
     for value in values:
@@ -633,8 +539,8 @@ def _stub_id(codec, message):
     return match.group(1)
 
 
-def _read(codec, store, message):
-    value = store.read(_stub_id(codec, message))
+def _read(codec, access, message):
+    value = access.read(_stub_id(codec, message))
     _check_stub(codec, value, message)
     return value
 
@@ -667,18 +573,19 @@ def _check_stub(codec, value, message):
 
 
 def _view(codec, store, message, options, access):
-    value = _read(codec, store, message)
+    value = _read(codec, access, message)
     return _value_view(codec, store, message, value, options, access)
 
 
 def _value_view(codec, store, message, value, options, access):
     # Share read_view's record-specific validation without describing any child.
-    codec._options(value, store=store, unknown={}, **options)
+    reader = access.reader if access is not None else store
+    codec.prepare_read(value, store=reader, **options)
     if access is not None:
         access.authorize_refs(value, options)
     else:
         codec.require(not value["refs"], "E_AUTH", detail="reference")
-    view = json.loads(codec.read_view(value, store=store, **options))
+    view = json.loads(codec.read_view(value, store=reader, **options))
     if message is not None:
         view["mailbox_from"] = message["from"]
     view["attribution"] = "match" if message is not None else "grant-index"
@@ -686,9 +593,9 @@ def _value_view(codec, store, message, value, options, access):
 
 
 def _reference_view(codec, store, access, reference, options):
-    value = store.read(reference)
+    value = access.read(reference)
     # Share read_view's record-specific validation without describing any child.
-    planned = codec._options(value, store=store, unknown={}, **options)
+    planned = codec.prepare_read(value, store=access.reader, **options).planned
     try:
         for child in _reference_ids(codec, value, options):
             access.authorize(child)
@@ -704,11 +611,15 @@ def _reference_view(codec, store, access, reference, options):
     return _value_view(codec, store, None, value, options, access)
 
 
-def _bounded(codec, value, maximum):
-    # Core's renderer accounts before allocating the final output and escapes controls.
+def _digest_renderer(codec, maximum):
     renderer = importlib.import_module("aegis_core.message_codec_views").Renderer
     fmt = importlib.import_module("aegis_core.message_codec_format")
-    return renderer(codec.require, fmt.escape_char, fmt.neutral_text, maximum).render(value, "json")
+    return renderer(codec.require, fmt.escape_char, fmt.neutral_text, maximum)
+
+
+def _bounded(codec, value, maximum):
+    # Core's renderer accounts before allocating the final output and escapes controls.
+    return _digest_renderer(codec, maximum).render(value, "json")
 
 
 def _staged_exists(codec, directory, name):
@@ -801,7 +712,7 @@ def _commit_record(codec, mailbox, sender, value, path, raw, state):
         _bounded(codec, _value_view(codec, None, sender, value, options, None), MAX_CHARS)
     with record_store(codec, mailbox.root, write=True, state=state) as store:
         with _publication_lock(codec, store.fd) as lease, _directory(codec, path.parent) as destination:
-            access = _RecordAccess(codec, store, mailbox.root, sender)
+            access = _RecordAccess(codec, store, mailbox.root, sender, rollback=True)
             for reference in set(value["refs"].values()):
                 access.authorize(reference)
             # Exactly the default read's accounting, including the wrapper itself.
@@ -898,7 +809,7 @@ def publish(codec, mailbox, sender, arguments):
         codec.require(all(original[key] == sender[key]
                           for key in ("from", "host", "session", "binding_generation")), "E_AUTH", detail="message_id")
         with _reader(codec, mailbox.root, original, sender) as (store, _access):
-            stored = _read(codec, store, original)
+            stored = _read(codec, _access, original)
             value = codec.compose(arguments["kind"], raw, dict(meta, created_at=stored["meta"]["created_at"]))
             request["body"] = _stub(codec, value)
             codec.require(all(original.get(k) == v for k, v in request.items()) and
@@ -930,16 +841,19 @@ def read(codec, mailbox, sender, arguments):
     return result, [record["message_id"]] if record["to"] == sender["from"] else []
 
 
-def digest(codec, mailbox, sender, arguments):
+def digest(codec, mailbox, sender, arguments, *, inbox):
     _arguments(codec, arguments, (), {"after_message_id", "refs", "fields", "outline", "expand", "limit", "max_chars"})
     references = _references(codec, arguments.get("refs", ()))
-    options = None if references else _options(codec, arguments)
+    # No explicit ref: options before cursor and page limit.
+    # Explicit refs: authorize first; options after that grant check.
+    options = None if references else _digest_options(codec, arguments)
     after = arguments.get("after_message_id")
     if after is not None:
         _identifier(codec, after)
     limit = arguments.get("limit", 20)
-    codec.require(type(limit) is int and 1 <= limit <= 100, "E_LIMIT")
-    messages = [row["message"] for row in mailbox.messages().values()]
+    codec.require(type(limit) is int and 1 <= limit <= 100, "E_LIMIT", detail="digest_limit")
+    history = mailbox.messages()
+    messages = [row["message"] for row in history.values()]
     received = [message for message in messages if message["to"] == sender["from"]]
     ordered = sorted(received, key=lambda message: (message["created_at"], message["message_id"]))
     if after is not None:
@@ -947,28 +861,53 @@ def digest(codec, mailbox, sender, arguments):
         codec.require(bool(positions), "E_REF")
         ordered = ordered[positions[0] + 1:]
     selected = ordered[:limit]
-    next_after = selected[-1]["message_id"] if len(ordered) > limit else None
-    result = {"messages": [], "next_after": next_after}
-    if "refs" in arguments:
-        result["records"] = []
+    failure = (None, None, 0, 0)
     with ExitStack() as stack:
-        store = None
+        reader = [None, None]
         if references:
-            store, access = stack.enter_context(_reference_store(codec, mailbox.root, sender, references))
-            options = _options(codec, arguments)
-        for message in selected:
-            row = {key: message[key] for key in ("message_id", "from", "type")}
-            row["untrusted"] = True
-            if message["body"].startswith("aegis-record/1"):
-                if store is None:
-                    store, access = stack.enter_context(_reader(codec, mailbox.root, message, sender))
-                row["record"] = _view(codec, store, message, options, access)
+            reader[:] = stack.enter_context(_reference_store(codec, mailbox.root, sender, references))
+            options = _digest_options(codec, arguments)
+
+        def row(item, chosen, key):
+            if key == "records":
+                return _reference_view(codec, *reader, item, chosen)
+            value = {key: item[key] for key in ("message_id", "from", "type")}
+            value["untrusted"] = True
+            if item["body"].startswith("aegis-record/1"):
+                if reader[0] is None:
+                    reader[:] = stack.enter_context(_reader(codec, mailbox.root, item, sender))
+                value["record"] = _view(codec, reader[0], item, chosen, reader[1])
             else:
-                row["body"] = message["body"]
-            result["messages"].append(row)
-            # Check the aggregate before retaining another row's view.
-            _bounded(codec, result, options["max_chars"])
-        for reference in references:
-            result["records"].append(_reference_view(codec, store, access, reference, options))
-            _bounded(codec, result, options["max_chars"])
-    return _bounded(codec, result, options["max_chars"]), [message["message_id"] for message in selected]
+                value["body"] = item["body"]
+            return value
+
+        def probe(tool, edits):
+            key, item, _messages, _references = failure
+            if tool == "mailbox_inbox":
+                retry = {"limit": 100}
+                if after is not None:
+                    retry["after_message_id"] = after
+                try:
+                    return inbox(retry, item["message_id"], history)
+                except ValueError as error:
+                    raise _pinned_error(codec, error) from None
+            chosen = _options(codec, dict(arguments, **edits))
+            if tool == "mailbox_read_record":
+                view = row(item, chosen, "messages")["record"] if key == "messages" else row(item, chosen, "records")
+                return _bounded(codec, view, chosen["max_chars"])
+            count = edits.get("limit", limit)
+            next_after = ordered[count - 1]["message_id"] if len(ordered) > count else None
+            return guidance.render_digest(codec, _digest_renderer, chosen, ordered[:count], next_after,
+                                          references, "refs" in arguments, row)
+
+        try:
+            next_after = selected[-1]["message_id"] if len(ordered) > limit else None
+            rendered = guidance.render_digest(codec, _digest_renderer, options, selected, next_after,
+                                              references, "refs" in arguments, row)
+        except codec.CodecError as error:
+            if error.code != "E_LIMIT" or error.detail not in ("", "digest_floor", "digest_page", "digest_view", "digest_inbox"):
+                raise
+            failure = getattr(error, "digest_failure", (None, None, 0, 0))
+            raise guidance.measured_refusal(codec, error, options["max_chars"], probe,
+                                             failure=failure) from None
+    return rendered, [message["message_id"] for message in selected]

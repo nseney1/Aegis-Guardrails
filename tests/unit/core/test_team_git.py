@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_core import gitsafe, gitsafe_run, team_git as tg
+from aegis_core import gitsafe, gitsafe_run, gitops_fds, team_git as tg, team_git_snapshot
+from tests.unit.core.test_gitsafe import LANE_MODULES, strict_program, strict_program_guard
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 IDENTITY = tg.CommitIdentity("Lane", "lane@example.com", "1700000000 +0000")
@@ -65,14 +66,25 @@ def test_runner_ambient_redirect_before_entry_refuses_and_retries(repo, monkeypa
         value = "0" if style == "disabled" else str(repo / ".git" / ("index" if key == "GIT_INDEX_FILE" else "")) if style == "hook" else os.devnull if key == "GIT_CONFIG" else str(repo / ".git/HEAD")
         scoped.setenv(key, value)
         with pytest.raises(tg.GitRefusal) as caught:
-            with new_store(repo):
+            with new_store(repo, require_program=False):
                 pytest.fail("ambient redirect was accepted")
         name = "GIT_TRACE*" if style == "unknown-trace" else key
         assert caught.value.code == "ambient_git_environment" and name in caught.value.next_action and not calls
         assert "secret" not in str(caught.value) + caught.value.next_action
     assert shared_bytes(repo) == before
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
+
+
+@pytest.mark.parametrize("native_crlf", [False, True])
+def test_snapshot_calculations_use_explicit_native_eol(native_crlf):
+    from aegis_core import team_git_snapshot as snapshot
+    values = dict.fromkeys(("text", "crlf", "eol", "ident", "working-tree-encoding"), b"unspecified")
+    values["text"] = b"set"
+    settings = snapshot.conversion_settings(b"core.eol\nnative\0")
+    assert snapshot.eol_rule(values, settings, native_crlf=native_crlf) == (
+        "text", native_crlf, False, None)
 
 
 @pytest.mark.parametrize("field,value", [("GIT_AUTHOR_NAME", "bad\x01name"), ("GIT_AUTHOR_EMAIL", "a\nb"),
@@ -292,7 +304,7 @@ def test_store_entry_environment_bounds_have_public_refusal_and_retry(repo, monk
         environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(513)})
     monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
     with pytest.raises(tg.GitRefusal) as caught:
-        with new_store(repo):
+        with new_store(repo, require_program=False):
             pytest.fail("oversized environment was accepted")
     actions = {"value": "Reduce every environment value to at most 65,536 characters, then retry.",
                "count": "Reduce the environment to at most 512 variables, then retry.",
@@ -307,15 +319,18 @@ def test_store_entry_environment_bounds_have_public_refusal_and_retry(repo, monk
             if key.startswith("AEGIS_ENV_"):
                 del environment[key]
         environment.update({"AEGIS_ENV_%d" % n: "x" for n in range(512 - len(environment))})
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
     monkeypatch.setattr(gitsafe_run, "os", os)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def strict_request(repo, scratch, args, entry, *, stdin=None, env=None):
     """Exercise both public strict initialization paths, with an owned envelope."""
+    strict_program_guard()
     with gitsafe.custody(scratch=scratch, strict_lane=True):
         if entry == "run":
             return gitsafe.run(args, repo, stdin=stdin, _env=env)
@@ -358,6 +373,7 @@ def test_fresh_strict_runner_binds_common_objects_and_keeps_writes_private(repo,
 
 
 def test_cold_lane_runner_common_binding_is_atomic_across_workers(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     scratch = tmp_path / "cold-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -404,6 +420,7 @@ def test_fresh_strict_binding_failure_preserves_code_and_retries(repo, tmp_path,
     assert shared_bytes(repo) == before
 
 
+@pytest.mark.usefixtures("strict_program")
 def test_linked_worktree_symlink_scratch_cannot_name_common_git_dir(repo, tmp_path, monkeypatch):
     make_store(repo)
     linked = tmp_path / "linked"
@@ -459,7 +476,7 @@ def test_ambient_lowercase_key_refuses_with_its_real_spelling(repo, monkeypatch)
     environment = {**os.environ, "git_dir": "not-a-repository"}
     monkeypatch.setattr(gitsafe_run, "os", SimpleNamespace(**{**vars(os), "environ": environment}))
     with pytest.raises(tg.GitRefusal) as caught:
-        with new_store(repo):
+        with new_store(repo, require_program=False):
             pytest.fail("lowercase redirect was accepted")
     assert caught.value.code == "ambient_git_environment"
     assert "git_dir" in caught.value.next_action and "GIT_DIR" not in caught.value.next_action
@@ -502,11 +519,13 @@ def test_ambient_environment_disappearing_during_snapshot_has_a_public_refusal(r
         monkeypatch.setattr(gitsafe_run, "_ENVIRON_TYPE", environment_type)
         monkeypatch.setattr(gitsafe_run, "os", os)
         monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def test_issued_runner_real_index_is_correct_on_the_first_call(repo, tmp_path):
+    strict_program_guard()
     scratch = tmp_path / "issued-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -534,7 +553,7 @@ def test_missing_fenced_git_refuses_before_discovery_and_retries(repo, tmp_path,
                 with gitsafe.custody(scratch=tmp_path, strict_lane=True):
                     gitsafe.run(["version"], repo)
             elif entry == "store":
-                with new_store(repo):
+                with new_store(repo, require_program=False):
                     pytest.fail("unavailable Git was accepted")
             else:
                 runner = gitsafe.lane_runner(repo, tmp_path)
@@ -543,11 +562,13 @@ def test_missing_fenced_git_refuses_before_discovery_and_retries(repo, tmp_path,
         assert caught.value.code == "git_custody_refused" and not calls
     finally:
         monkeypatch.setattr("aegis_core.gitsafe.custody_program", lookup)
-    with new_store(repo) as store:
-        assert store._run(["version"]).returncode == 0
+    if strict_program_guard(optional=True):
+        with new_store(repo) as store:
+            assert store._run(["version"]).returncode == 0
 
 
 def test_direct_capture_accepts_an_issued_envelope(repo, tmp_path):
+    strict_program_guard()
     scratch = tmp_path / "envelope-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -563,6 +584,7 @@ def test_direct_capture_accepts_an_issued_envelope(repo, tmp_path):
 
 
 def test_cold_publish_uses_private_destination_and_explicit_shared_publication(repo, tmp_path):
+    strict_program_guard()
     scratch, donor = tmp_path / "publish-scratch", tmp_path / "donor"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -582,6 +604,8 @@ def test_cold_publish_uses_private_destination_and_explicit_shared_publication(r
 
 @pytest.mark.parametrize("entry", ["run", "capture", "execute", "update_ref", "empty_update_ref", "lane_runner", "publish", "store"])
 def test_relative_cwd_public_routes_share_the_git_error_hierarchy(repo, tmp_path, entry):
+    if entry == "capture":
+        strict_program_guard()
     scratch = tmp_path / "relative-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "objects").mkdir()
@@ -683,6 +707,7 @@ def test_strict_custody_is_inherited_and_legacy_custody_stays_unchanged(repo, tm
 
 
 def test_strict_cas_exemption_is_single_use_and_never_leaks(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     parent = git(repo, "rev-parse", "HEAD").decode().strip()
     new = commit(repo, "next", b"next\n")
     calls, real = [], subprocess.Popen
@@ -730,6 +755,7 @@ def test_strict_mode_is_context_local_during_concurrent_legacy_work(repo, tmp_pa
 
 
 def test_cas_grant_is_consumed_before_popen_callback(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     oid = git(repo, "rev-parse", "HEAD").decode().strip()
     calls, denied, real = [], [], subprocess.Popen
     def record(argv, **kwargs):
@@ -793,6 +819,7 @@ def test_strict_argv_bounds_precede_expansion_and_input_scratch(repo, tmp_path, 
 
 
 def test_capture_freezes_validated_argv_and_environment_before_input_preparation(repo, tmp_path, monkeypatch):
+    strict_program_guard()
     calls, real = [], subprocess.Popen
     def record(argv, **kwargs):
         calls.append((tuple(argv), kwargs["env"].get("HOME")))
@@ -862,13 +889,17 @@ def repo(tmp_path):
 
 def make_store(repo):
     if not tg.descriptor_support():
-        pytest.skip("snapshot requires descriptor-relative no-follow opens")
+        pytest.skip("snapshot requires descriptor-relative no-follow opens and bound executables")
+    strict_program_guard()
     return new_store(repo)
 
 
 @contextmanager
-def new_store(repo):
+def new_store(repo, *, require_program=True):
     # Custody service provisions scratch; tests own its creation and cleanup.
+    # Refusal-only entries opt out so their checks still run before lookup.
+    if require_program:
+        strict_program_guard()
     with tempfile.TemporaryDirectory(dir=repo.parent) as directory:
         scratch = Path(directory)
         (scratch / "objects").mkdir(mode=0o700)
@@ -1109,6 +1140,91 @@ def test_single_ref_writer_and_no_force_by_construction():
                and isinstance(node.func, ast.Attribute) and node.func.attr == "cas"]
     assert len(writers) == 1
     assert not any(flag in source for flag in ("--force", "--force-with-lease", "+refspec"))
+
+
+def test_cas_borrows_receipt_descriptors_without_retaining_them(repo, monkeypatch):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        original, seen = gitsafe_run.LaneRunner.cas, []
+        def observe(self, *args, **kwargs):
+            seen.append(self.effect_fds)
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", observe)
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="effect-1",
+                                   expected_old=None, expected_new=head, actor="custodian-1") as receipt:
+            descriptors = receipt.inheritable_fds()
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "updated"
+            assert seen == [descriptors]
+            assert not os.get_inheritable(descriptors[0])
+            assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head,
+                                       effect_fds=descriptors) == "already"
+        # An effect-bound operation must not leave a closed receipt on the store.
+        assert tg.cas_fast_forward(store, "refs/heads/lane/plain", None, head) == "updated"
+        assert seen == [descriptors, None]
+
+
+@pytest.mark.parametrize("descriptors", [(), (True,), (-1,), (999999,), "token=PRIVATE"])
+def test_cas_invalid_effect_descriptors_refuse_before_spawn_and_allow_retry(repo, monkeypatch, descriptors):
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        before = shared_bytes(repo)
+        def unexpected(*args, **kwargs):
+            pytest.fail("invalid effect descriptors reached process creation")
+        monkeypatch.setattr(gitsafe_run, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": unexpected}))
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=descriptors)
+        assert caught.value.code == "invalid_effect_descriptor"
+        assert str(caught.value) == "Lane Git operation refused: invalid_effect_descriptor"
+        assert shared_bytes(repo) == before
+        monkeypatch.setattr(gitsafe_run, "subprocess", subprocess)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+def test_cas_effect_platform_probe_refuses_without_consuming_receipt(repo, monkeypatch):
+    with make_store(repo) as store:
+        head = git(repo, "rev-parse", "HEAD").decode().strip()
+        probe = gitops_fds.descriptor_supported
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", lambda: False)
+        with pytest.raises(tg.GitRefusal) as caught:
+            tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head, effect_fds=())
+        assert caught.value.code == "unsupported_effect_platform"
+        assert str(caught.value) == "Lane Git operation refused: unsupported_effect_platform"
+        monkeypatch.setattr(gitops_fds, "descriptor_supported", probe)
+        assert tg.cas_fast_forward(store, "refs/heads/lane/effect", None, head) == "updated"
+
+
+@pytest.mark.parametrize("code", ["git_cleanup_failed", "git_timeout", "git_output_limit", "ref_update_unknown", "git_failed"])
+@pytest.mark.parametrize("observation", ["old", "new", "winner"])
+def test_effect_cas_does_not_promote_a_visible_failure_to_success(repo, monkeypatch, code, observation):
+    from aegis_core import team_gitops
+    if not gitops_fds.descriptor_supported():
+        pytest.skip("effect custody requires Linux child subreaper support")
+    with make_store(repo) as store:
+        new = git(repo, "rev-parse", "HEAD").decode().strip()
+        winner = commit(repo, "winner", b"competing bytes")
+        ref = "refs/aegis/qual/visible-failure"
+        attempts = []
+        def fail(self, *args, **kwargs):
+            attempts.append(args)
+            if observation != "old":
+                git(repo, "update-ref", ref, new if observation == "new" else winner)
+            raise gitsafe.GitError("private error", code=code, process_started=True)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "cas", fail)
+        journal = team_gitops.GitOpsJournal(repo / ".git")
+        with journal.record_intent(op="ref_update", lane="lane-1", request_id="visible-failure",
+                                   expected_old=None, expected_new=new, actor="custodian-1") as receipt:
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.cas_fast_forward(store, ref, None, new, effect_fds=receipt.inheritable_fds())
+            assert caught.value.code == "ref_update_unknown"
+            assert str(caught.value) == "Lane Git operation refused: ref_update_unknown"
+        assert len(attempts) == 1
 
 
 @pytest.mark.parametrize("setting", ["text-auto", "autocrlf-true", "autocrlf-input", "text", "text-crlf", "binary"])
@@ -1489,13 +1605,13 @@ def test_snapshot_pack_budget_is_checked_before_compression_and_can_retry(repo, 
     before = shared_bytes(repo)
     with context as store:
         monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 128)
-        monkeypatch.setattr(tg, "zlib", SimpleNamespace(compress=unexpected))
+        monkeypatch.setattr(team_git_snapshot, "zlib", SimpleNamespace(compress=unexpected))
         with pytest.raises(tg.GitRefusal) as caught:
             tg.snapshot_tree(store)
         assert caught.value.code == "size_limit"
         monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 128 * 1024 * 1024)
         import zlib
-        monkeypatch.setattr(tg, "zlib", zlib)
+        monkeypatch.setattr(team_git_snapshot, "zlib", zlib)
         assert store.read_blob(tg.snapshot_tree(store), "new") == b"a" * 100
     assert shared_bytes(repo) == before
 
@@ -2327,9 +2443,10 @@ STATIC_LANE_FORBIDDEN = {
 
 
 @pytest.mark.parametrize("form", sorted(STATIC_LANE_FORBIDDEN))
-def test_lane_structure_refuses_every_unrestricted_reference(form):
+@pytest.mark.parametrize("module", sorted(LANE_MODULES), ids=lambda module: Path(module).stem)
+def test_lane_structure_refuses_every_unrestricted_reference(form, module):
     from tests.unit.core.test_gitsafe import _run_subcommand_offenders
-    assert _run_subcommand_offenders("aegis_core/team_git.py", STATIC_LANE_FORBIDDEN[form])
+    assert _run_subcommand_offenders(module, STATIC_LANE_FORBIDDEN[form])
 
 
 @pytest.mark.parametrize("worker", ["direct", "thread", "executor"])
@@ -2706,11 +2823,206 @@ def test_native_decode_checks_remaining_snapshot_budget_before_utf8_allocation(r
     with context as store:
         before = shared_bytes(repo)
         monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", 9)
-        monkeypatch.setattr(tg, "codecs", SimpleNamespace(**{**vars(codecs), "getincrementaldecoder": decoder}))
+        monkeypatch.setattr(team_git_snapshot, "codecs", SimpleNamespace(**{**vars(codecs), "getincrementaldecoder": decoder}))
         with pytest.raises(tg.GitRefusal) as caught:
             tg.snapshot_tree(store)
         assert caught.value.code == "size_limit"
         assert shared_bytes(repo) == before
-        monkeypatch.setattr(tg, "codecs", codecs)
+        monkeypatch.setattr(team_git_snapshot, "codecs", codecs)
         monkeypatch.setattr(tg, "MAX_SNAPSHOT_BYTES", original_limit)
         assert store.read_blob(tg.snapshot_tree(store), "!first.txt") == b"\xc3\xa9" * 8
+
+
+def test_snapshot_and_planner_golden_bytes(repo):
+    """Captured on the pre-extraction tree; history is built entirely in this test."""
+    context = make_store(repo)
+    def fixed_git(*args, data=None):
+        return subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false", *args], cwd=str(repo), input=data,
+            env={**os.environ, "GIT_AUTHOR_DATE": IDENTITY.date, "GIT_COMMITTER_DATE": IDENTITY.date},
+            capture_output=True, check=True).stdout
+    def fixed_commit(name, data):
+        (repo / name).write_bytes(data)
+        fixed_git("add", "--", name)
+        fixed_git("commit", "-qm", "change " + name)
+        return fixed_git("rev-parse", "HEAD").decode().strip()
+    initial_tree = fixed_git("rev-parse", "HEAD^{tree}").decode().strip()
+    root = fixed_git("commit-tree", initial_tree, data=b"base\n").decode().strip()
+    fixed_git("update-ref", "refs/heads/main", root)
+    fixed_git("checkout", "-qb", "golden-topic")
+    source = fixed_commit("feature", b"feature\n")
+    fixed_git("checkout", "-q", "main")
+    tip = fixed_commit("other", b"other\n")
+    before = shared_bytes(repo)
+    with context as store:
+        snapshot = tg.snapshot_tree(store)
+        merged = tg.plan_merge(store, tip, source)
+        picked = tg.plan_pick(store, tip, (source,), IDENTITY)
+        merge = tg.commit_tested(store, merged.tree, (tip, source), "merge", IDENTITY)
+        reverted = tg.plan_revert(store, merge, merge)
+        actual = {
+            "snapshot": snapshot,
+            "snapshot_blob": store.read_blob(snapshot, "x").hex(),
+            "merge": [merged.status, merged.tree, list(merged.commits), list(merged.conflicts)],
+            "pick": [picked.status, picked.tree, list(picked.commits), list(picked.conflicts)],
+            "pick_commit": store.object(picked.commits[0], "commit").hex(),
+            "commit": merge,
+            "revert": [reverted.status, reverted.tree, list(reverted.commits), list(reverted.conflicts)],
+        }
+        expected = {'commit': 'e7ae790b13bac87c73d5caf95ef21ab1c232feb7',
+         'merge': ['clean', '7ecad3fab41ff45bb35913f238f56b25c11dd98b', [], []],
+         'pick': ['clean',
+                  '7ecad3fab41ff45bb35913f238f56b25c11dd98b',
+                  ['1ef42fc33e0816926d8231115ed5ce68e8c913a2'],
+                  []],
+         'pick_commit': '7472656520376563616433666162343166663435626233353931336632333866353662323563313164643938620a706172656e7420643564653663303963383062393935636563646138336464303966366635643332373830643536630a617574686f72204c616e65203c6c616e65406578616d706c652e636f6d3e2031373030303030303030202b303030300a636f6d6d6974746572204c616e65203c6c616e65406578616d706c652e636f6d3e2031373030303030303030202b303030300a0a6368616e676520666561747572650a0a28636865727279207069636b65642066726f6d20636f6d6d69742032643137663833393264356562316636373130313531613331373134316439646666353865306632290a',
+         'revert': ['clean', '8bf5247e7864759605db9fa80cdf4842cb9d5098', [], []],
+         'snapshot': '8bf5247e7864759605db9fa80cdf4842cb9d5098',
+         'snapshot_blob': '626173650a'}
+        assert actual == expected
+        assert tg.snapshot_tree(store) == snapshot
+        assert tg.plan_pick(store, tip, (source,), IDENTITY) == picked
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("fault,code", [
+    ("config-malformed", "conversion_unavailable"),
+    ("config-oversized", "conversion_unavailable"),
+    ("index-malformed", "conversion_unavailable"),
+    ("index-oversized", "size_limit"),
+    ("external-filter", "conversion_unavailable"),
+    ("invalid-encoding", "conversion_unavailable"),
+])
+def test_snapshot_conversion_refusal_golden_bytes_and_retry(repo, monkeypatch, fault, code):
+    context = make_store(repo)
+    if fault in ("external-filter", "invalid-encoding"):
+        attribute = b"filter=hostile" if fault == "external-filter" else b"working-tree-encoding=unknown"
+        (repo / ".gitattributes").write_bytes(b"x text " + attribute + b"\n")
+        (repo / "x").write_bytes(b"changed\r\n")
+    def damaged(real, args, *rest, **kwargs):
+        result = real(args, *rest, **kwargs)
+        data = result.stdout
+        if "--get-regexp" in args and tg._CONFIG_QUERY in args:
+            if fault == "config-malformed":
+                data = b"core.autocrlf\nhostile\0"
+            elif fault == "config-oversized":
+                data = b"x" * 4097
+        if "ls-files" in args and "--debug" in args:
+            if fault == "index-malformed":
+                data = data.replace(b" 0\t", b" 4\t", 1)
+            elif fault == "index-oversized":
+                data = b"\0" * (tg.MAX_PATHS * 3 + 1)
+        return subprocess.CompletedProcess(result.args, result.returncode, data, result.stderr)
+    before = shared_bytes(repo)
+    with context as store:
+        restore = patch_lane_run(monkeypatch, damaged)
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                tg.snapshot_tree(store)
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+        restore()
+        if fault in ("external-filter", "invalid-encoding"):
+            (repo / ".gitattributes").write_bytes(b"x text\n")
+        assert store.read_blob(tg.snapshot_tree(store), "x") == (
+            b"changed\n" if fault in ("external-filter", "invalid-encoding") else b"base\n")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("entry,code", [
+    ("object", "invalid_oid"), ("read_blob", "unsafe_path"),
+    ("commit_tested", "invalid_message"), ("cas_fast_forward", "ref_not_allowed"),
+    ("plan_merge", "invalid_oid"), ("plan_pick", "invalid_picks"), ("plan_revert", "invalid_oid"),
+])
+@pytest.mark.parametrize("case", ["malformed", "oversized"])
+def test_public_refusal_golden_bytes(repo, entry, code, case):
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    oid = None if case == "malformed" else "a" * 65
+    path = "../hostile" if case == "malformed" else "x" * (tg.MAX_PATH_BYTES + 1)
+    message = None if case == "malformed" else "x" * (tg.MAX_MESSAGE_BYTES + 1)
+    ref = "refs/heads/main" if case == "malformed" else "refs/heads/lane/" + "x" * 241
+    sources = None if case == "malformed" else [head] * (tg.MAX_PICKS + 1)
+    before = shared_bytes(repo)
+    with new_store(repo) as store:
+        operations = {
+            "object": lambda: store.object(oid, "commit"),
+            "read_blob": lambda: store.read_blob(tree, path),
+            "commit_tested": lambda: tg.commit_tested(store, tree, head, message, IDENTITY),
+            "cas_fast_forward": lambda: tg.cas_fast_forward(store, ref, head, head),
+            "plan_merge": lambda: tg.plan_merge(store, oid, head),
+            "plan_pick": lambda: tg.plan_pick(store, head, sources, IDENTITY),
+            "plan_revert": lambda: tg.plan_revert(store, head, oid),
+        }
+        for _ in range(2):
+            with pytest.raises(tg.GitRefusal) as caught:
+                operations[entry]()
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                code, "Lane Git operation refused: " + code, None)
+        assert store.object(head, "commit").startswith(b"tree ")
+    assert shared_bytes(repo) == before
+
+
+@pytest.mark.parametrize("code,action", [
+    ("conversion_unavailable", None), ("size_limit", None),
+    ("index_flags_unsupported", "Clear assume-unchanged and skip-worktree flags, then retry."),
+    ("index_stat_unprovable", "Run `git update-index --refresh` in the worktree, then retry."),
+])
+def test_snapshot_refusal_actions_golden_bytes(code, action):
+    refusal = tg.GitRefusal(code)
+    assert isinstance(refusal, gitsafe.GitError)
+    assert type(refusal).__module__ == "aegis_core.team_git"
+    assert (refusal.code, str(refusal), refusal.next_action) == (
+        code, "Lane Git operation refused: " + code, action)
+
+
+# Captured through each public caller on the original module as well as its extraction.
+# The external adapter may return any stable code; native branch coverage above
+# separately proves when each refusal is selected, including retry and races.
+GOLDEN_REFUSAL_CODES = (
+    "cas_mismatch", "conversion_unavailable", "descriptor_cleanup_failed", "git_failed",
+    "index_flags_unsupported", "index_stat_unprovable", "invalid_identity", "invalid_message",
+    "invalid_object", "invalid_oid", "invalid_parent", "invalid_picks", "invalid_repository",
+    "lane_runner_required", "merge_unavailable", "not_fast_forward", "not_merge", "path_missing",
+    "path_unreadable", "pick_not_fresh", "ref_not_allowed", "ref_unreadable", "ref_update_failed",
+    "ref_update_unknown", "size_limit", "store_busy", "store_closed", "unsafe_index", "unsafe_path",
+    "unsafe_scratch", "unsupported_file", "unsupported_platform", "worktree_changed",
+)
+
+
+@pytest.mark.parametrize("entry", ["snapshot_tree", "object", "read_blob", "commit_tested",
+    "cas_fast_forward", "plan_merge", "plan_pick", "plan_revert"])
+def test_public_caller_refusal_matrix_golden_bytes(repo, monkeypatch, entry):
+    context = make_store(repo)
+    head = git(repo, "rev-parse", "HEAD").decode().strip()
+    tree = git(repo, "rev-parse", "HEAD^{tree}").decode().strip()
+    code = [None]
+    def unavailable(*args, **kwargs):
+        raise gitsafe.GitError("hostile token=secret", code=code[0], next_action="Recover boundary.")
+    with context as store:
+        operations = {
+            "snapshot_tree": lambda: tg.snapshot_tree(store),
+            "object": lambda: store.object(head, "commit"),
+            "read_blob": lambda: store.read_blob(tree, "x"),
+            "commit_tested": lambda: tg.commit_tested(store, tree, head, "message", IDENTITY),
+            "cas_fast_forward": lambda: tg.cas_fast_forward(store, "refs/heads/lane/x", head, head),
+            "plan_merge": lambda: tg.plan_merge(store, head, head),
+            "plan_pick": lambda: tg.plan_pick(store, head, (head,), IDENTITY),
+            "plan_revert": lambda: tg.plan_revert(store, head, head),
+        }
+        run, read = gitsafe_run.LaneRunner.run, gitsafe_run.LaneRunner.read_private_object
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "run", unavailable)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", unavailable)
+        for value in GOLDEN_REFUSAL_CODES:
+            code[0] = value
+            action = {
+                "index_flags_unsupported": "Clear assume-unchanged and skip-worktree flags, then retry.",
+                "index_stat_unprovable": "Run `git update-index --refresh` in the worktree, then retry.",
+            }.get(value, "Recover boundary.")
+            with pytest.raises(tg.GitRefusal) as caught:
+                operations[entry]()
+            assert (caught.value.code, str(caught.value), caught.value.next_action) == (
+                value, "Lane Git operation refused: " + value, action)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "run", run)
+        monkeypatch.setattr(gitsafe_run.LaneRunner, "read_private_object", read)
+        assert store.object(head, "commit").startswith(b"tree ")

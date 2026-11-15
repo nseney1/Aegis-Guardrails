@@ -161,32 +161,32 @@ def _reset_for_tests() -> None:
     _GIT_FOUND.clear()
 
 
-def git_executable() -> str:
-    """The git ``run`` starts, looked up once per PATH value; a git removed since raises GitError."""
-    # Absolute PATH entries only: an empty or relative entry names the cwd (the
-    # repository, where a clone can plant a git), and so does the current directory
-    # the standard library's lookup searches first on Windows.
-    return gitsafe_run.find_executable(_GIT_FOUND, os.environ, lambda: pathlookup.which("git"), error=GitError)
+def git_executable(*, environ=None, cwd=None) -> str:
+    """Resolve Git centrally; effects use their environment/fence and a fresh cache."""
+    return gitsafe_run.find_executable(_GIT_FOUND if environ is None else {}, environ,
+        lambda effective: pathlookup.which("git",
+            **({"path": effective.get("PATH", os.defpath), "outside": getattr(effective, "root", cwd)} if environ is not None else {})),
+        error=GitError, cwd=cwd)
 
 
-def custody_program(cwd) -> Optional[str]:
+def custody_program(cwd, *, environ=None) -> Optional[str]:
     """Strict custody resolves Git outside the owner-bound worktree."""
-    return pathlookup.which("git", outside=cwd)
+    return gitsafe_run.find_executable({}, environ, lambda effective: pathlookup.which("git", outside=getattr(effective, "root", cwd), path=effective.get("PATH", os.defpath)), error=GitError, cwd=cwd, profile="strict/effect", missing_ok=True)
 
 
-def lane_runner(cwd, scratch):
+def lane_runner(cwd, scratch, *, effect_fds=None, environ=None, write_roots=(), worktree_root=None):
     """Packaged explicit lane runner; Team constructs it only at its operation entry."""
     return gitsafe_run.issue_runner(cwd, scratch,
-        gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable))
+        gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable), effect_fds, environ=environ, write_roots=write_roots, worktree_root=worktree_root)
 
 
 @contextmanager
 def custody(*, scratch: Path, env: Optional[Mapping[str, str]] = None,
-            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False):
+            stdout_limit: int = 16 * 1024 * 1024, stderr_limit: int = 65536, strict_lane: bool = False, worktree_root=None):
     """Bounded custody; strict scopes receive only the packaged facade services."""
     with gitsafe_run.custody(scratch=scratch, env=env, stdout_limit=stdout_limit,
             stderr_limit=stderr_limit, strict_lane=strict_lane,
-            _services=gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable)):
+            _services=gitsafe_run._LaneServices(custody_program, GitError, RefConflict, git_executable), worktree_root=worktree_root):
         yield
 
 
@@ -197,16 +197,16 @@ def run(
     stdin: Optional[bytes] = None,
     _hardening: Sequence[str] = _HARDENING,
     _env: Optional[Mapping[str, str]] = None,
-    tty: bool = False,
+    tty: bool = False, *, effect_fds=None, _environ=None, write_roots=(), worktree_root=None,
 ) -> subprocess.CompletedProcess:
     """Run ``git <args>`` hardened as described above; return the completed process (bytes).
 
-    A non-zero exit is returned, not raised. Raises GitError when git cannot be started
-    or exceeds ``timeout``. ``tty``: git (and a signing program it runs) reads the caller's stdin.
+    Nonzero exits are returned; spawn/timeout raises GitError. tty permits caller stdin.
+    Effects require effect_fds and an owner-bound worktree_root; the caller owns the receipt.
     """
     return gitsafe_run.execute(args, cwd, executable=git_executable, legacy_runner=subprocess.run,
-                               error=GitError, environ=os.environ, timeout=timeout, stdin=stdin,
-                               hardening=_hardening, env=_env, tty=tty, legacy_namespace=subprocess)
+                               error=GitError, environ=_environ, timeout=timeout, stdin=stdin,
+                               hardening=_hardening, env=_env, tty=tty, legacy_namespace=subprocess, effect_fds=effect_fds, write_roots=write_roots, worktree_root=worktree_root)
 
 
 def run_checked(args: Sequence[str], cwd: Path | str, *, error: Callable[[str], Exception] = GitError,
@@ -408,7 +408,7 @@ def resolve_base_ref(cwd: Path | str, environ: Optional[dict] = None) -> Optiona
     ``origin/$GITHUB_BASE_REF``, ``$GITHUB_BASE_REF``, the branch ``refs/remotes/origin/HEAD``
     names (``origin/<name>``, ``<name>``), ``origin/main``, ``main``, ``origin/develop``,
     ``develop``, ``origin/master``, ``master``. Returns the ref name, or None."""
-    env = os.environ if environ is None else environ
+    env = gitsafe_run.request_environment(environ, profile="ordinary", base={})
     base = (env.get("GITHUB_BASE_REF") or "").strip()  # set by GitHub Actions on pull requests
     for ref in [f"origin/{base}", base] if base else []:
         if resolve_commit(cwd, ref):

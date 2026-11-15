@@ -59,9 +59,17 @@
     "count": 1,
     "reason": "Forwards the injected child-process runner to hook measurements."
   },
+  "process:aegis_core/ghcli.py:default_gh_runner:subprocess.Popen": {
+    "count": 1,
+    "reason": "Effect-only built-in GitHub API child: exactly one borrowed receipt descriptor, a new process group, concurrent bounded stdout/stderr capture, timeout, kill/reap/close cleanup; the existing no-opt-in subprocess.run recipe is unchanged."
+  },
   "process:aegis_core/ghcli.py:default_gh_runner:subprocess.run": {
     "count": 1,
     "reason": "Single GitHub transport, isolated working directory and explicit timeout."
+  },
+  "process:aegis_core/gitops_holder.py:main:subprocess.Popen": {
+    "count": 1,
+    "reason": "Isolated Linux holder executes source captured from its parent's co-located parsed module and spawns the descriptor-pinned effect with close_fds, separate session, bounded timeout and descendant reaping while retaining receipt custody."
   },
   "process:aegis_core/gitsafe.py:run:subprocess.run": {
     "count": 1,
@@ -74,6 +82,10 @@
   "process:aegis_core/inference_provider.py:CommandBackend.generate:subprocess.run": {
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
+  },
+  "process:aegis_core/team_supervisor_start.py:_spawn:subprocess.Popen": {
+    "count": 1,
+    "reason": "SUPERVISOR-START-1: explicit owner argv starts only from a lock-held eligible supervisor plan; no shell or repository cwd; close_fds; kernel identity registration and atomic failure/success checkpoints."
   },
   "process:aegis_core/testexec.py:kill_group:subprocess.run": {
     "count": 1,
@@ -99,17 +111,17 @@
     "count": 1,
     "reason": "Configured test/tool process boundary with timeout and output capture."
   },
-  "typeerror:aegis_cli/check.py:_event_pull:TypeError": {
+  "typeerror:aegis_cli/ci_inputs.py:_event_shas:TypeError": {
     "count": 1,
-    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+    "reason": "CI event input validation moved from check.py to ci_inputs.py; same bounded parser and refusal behavior, not a signature retry."
   },
-  "typeerror:aegis_cli/check.py:_event_pull_request:TypeError": {
+  "typeerror:aegis_cli/ci_inputs.py:event_pull_request:TypeError": {
     "count": 1,
-    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+    "reason": "CI event input validation moved from check.py to ci_inputs.py; same bounded parser and refusal behavior, not a signature retry."
   },
-  "typeerror:aegis_cli/check.py:_event_shas:TypeError": {
+  "typeerror:aegis_cli/ci_inputs.py:read_event:TypeError": {
     "count": 1,
-    "reason": "Input validation/conversion failure is refused or reported; this is not a signature retry."
+    "reason": "CI event input validation moved from check.py to ci_inputs.py; same bounded parser and refusal behavior, not a signature retry."
   },
   "typeerror:aegis_cli/status.py:_format_adaptive_expiry:TypeError": {
     "count": 1,

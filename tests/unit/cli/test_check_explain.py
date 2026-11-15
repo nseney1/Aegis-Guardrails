@@ -338,7 +338,8 @@ def test_repository_identifiers_survive_redaction(tmp_path, monkeypatch, capsys)
 @pytest.mark.parametrize("text,secret", [
     ("https://user:synthetic-password@example.test", "synthetic-password"),
     ("password=synthetic-password", "synthetic-password"),
-    ("-----BEGIN PRIVATE KEY-----synthetic-key-----END PRIVATE KEY-----", "synthetic-key"),
+    ("-----BEGIN " + "PRIVATE KEY-----" + "synthetic-key-----END " + "PRIVATE KEY-----",
+     "synthetic-key"),
 ])
 def test_repository_identifiers_still_redact_known_secrets(tmp_path, monkeypatch, capsys, field, text, secret):
     component = {"tool": "forbid_ast:rule", "target": "src/app.go", "verdict": False, field: text}

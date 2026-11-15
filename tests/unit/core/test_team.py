@@ -19,6 +19,7 @@ import queue
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -27,6 +28,7 @@ from typing import Dict, List, Optional
 import pytest
 
 from aegis_core import events, gitsafe, lane_gate, match, storage_confined, team, team_paths, team_queue, team_status
+from aegis_core import team_lease_custody
 from tests import helpers_teamrace
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -1963,3 +1965,957 @@ def test_stored_lease_surrogate_branch_is_unreadable_and_renew_does_not_crash(re
         team.renew(repo, "docs", oid, now=NOW)
     assert caught.value.reason == "unreadable"
     assert _ref(repo, "docs") == oid
+
+
+@pytest.fixture
+def lease_now():
+    return int(time.time())
+
+
+@pytest.fixture
+def lease_cli(repo, capsys):
+    from aegis_cli.cli import main
+
+    (repo / ".aegis" / "rules").mkdir(parents=True)
+
+    def invoke(*args, as_json=True):
+        code = main(["--workspace", str(repo), "team", *args, *(["--json"] if as_json else [])])
+        captured = capsys.readouterr()
+        return code, json.loads(captured.out) if as_json else captured.out, captured.err
+
+    return invoke
+
+
+@pytest.mark.parametrize("branch", [None, "lane/docs", "refs/heads/lane/docs", "refs/remotes/origin/docs"])
+def test_cli_liveness_renew_accepts_existing_branch_without_worktree(repo, lease_cli, lease_now, branch):
+    if branch is not None:
+        ref = branch if branch.startswith("refs/") else "refs/heads/" + branch
+        _git(repo, "update-ref", ref, "HEAD")
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", now=lease_now)
+    code, payload, err = lease_cli("renew", "docs", "--expect", old.oid)
+    assert (code, payload["status"], err) == (0, "renewed", "")
+    assert _ref(repo, "docs") == payload["oid"] != old.oid
+
+
+@pytest.mark.parametrize("age", [0, 120])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_cli_liveness_missing_branch_refuses_without_echo_and_retries(repo, lease_cli, lease_now, age, as_json):
+    branch = "token=private-value"
+    _git(repo, "branch", branch)
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", ttl_s=60, now=lease_now - 100 + age)
+    _git(repo, "branch", "-D", branch)
+    for _ in range(2):
+        code, output, err = lease_cli("renew", "docs", "--expect", old.oid, as_json=as_json)
+        assert code == 1
+        if as_json:
+            assert (output["status"], output["reason"], output["message"], err) == (
+                "refused", "lease_branch_missing", "lease_branch_missing", "")
+            assert output["next_action"] == "Restore the recorded branch, then retry."
+        else:
+            assert (output, err) == ("", "lease_branch_missing\nRestore the recorded branch, then retry.\n")
+        assert "private-value" not in json.dumps(output) + err
+        assert _ref(repo, "docs") == old.oid
+    _git(repo, "branch", branch)
+    code, payload, _ = lease_cli("renew", "docs", "--expect", old.oid)
+    assert (code, payload["status"]) == (0, "renewed")
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("failure", ["timeout", "nonzero", "oversize", "lease_read"])
+def test_cli_liveness_unavailable_evidence_refuses_without_writes_and_retries(
+        repo, lease_cli, lease_now, monkeypatch, action, failure):
+    _git(repo, "branch", "lane/docs")
+    old = team.claim(repo, "docs", ["docs/**"], branch="lane/docs", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real_run, real_read = gitsafe.run, gitsafe.read_object
+
+    def failed_run(args, cwd, **kwargs):
+        probe = args[0] == "worktree" or any(arg.startswith("refs/heads/") for arg in args)
+        if probe:
+            if failure == "timeout":
+                raise gitsafe.GitError("token=private-value", code="git_timeout")
+            return subprocess.CompletedProcess(args, 128 if failure == "nonzero" else 0,
+                                               b"x" * (team.MAX_LEASE_BYTES + 1), b"token=private-value")
+        return real_run(args, cwd, **kwargs)
+
+    def failed_read(*args, **kwargs):
+        raise gitsafe.GitError("token=private-value", code="git_failed")
+
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    before = _events(repo, "lease_claimed")
+    if failure == "lease_read":
+        monkeypatch.setattr(gitsafe, "read_object", failed_read)
+    else:
+        monkeypatch.setattr(gitsafe, "run", failed_run)
+    for _ in range(2):
+        code, payload, err = lease_cli(*args)
+        assert (code, payload["status"], payload["reason"], payload["message"], err) == (
+            1, "refused", "liveness_unknown", "liveness_unknown", "")
+        assert "private-value" not in json.dumps(payload)
+        assert _ref(repo, "docs") == old.oid
+    monkeypatch.setattr(gitsafe, "read_object", real_read)
+    monkeypatch.setattr(gitsafe, "run", real_run)
+    assert _events(repo, "lease_claimed") == before
+    assert lease_cli(*args)[0] == 0
+
+
+@pytest.mark.parametrize("branch", ["lane/other", "refs/heads/lane/other"])
+def test_cli_liveness_gc_collects_expired_with_worktree_warning_and_retry(repo, worktree, lease_cli, lease_now, branch):
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", ttl_s=60, now=lease_now - 100)
+    live = team.claim(repo, "api", ["src/**"], branch="main", owner="o@h", ttl_s=600, now=lease_now)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["status"], err) == (0, "collected", "")
+    assert [(row["lane"], row["previous"]) for row in payload["collected"]] == [("docs", old.oid)]
+    assert payload["warnings"] == [{"lane": "docs", "reason": "expired_with_worktree"}]
+    assert _ref(repo, "docs") is None and _ref(repo, "api") == live.oid
+    assert worktree.is_dir()
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["collected"], payload["warnings"], err) == (0, [], [], "")
+
+
+@pytest.mark.parametrize("branch", [None, "missing", "main"])
+def test_cli_liveness_gc_expiry_is_independent_of_branch_and_worktree(repo, lease_cli, lease_now, branch):
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", ttl_s=60, now=lease_now - 100)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["collected"][0]["previous"], err) == (0, old.oid, "")
+    assert payload["warnings"] == ([{"lane": "docs", "reason": "expired_with_worktree"}] if branch == "main" else [])
+
+
+def test_cli_liveness_gc_text_warns_without_retaining_expired_lease(repo, worktree, lease_cli, lease_now):
+    team.claim(repo, "docs", ["docs/**"], branch="lane/other", owner="o@h", ttl_s=60, now=lease_now - 100)
+    code, out, err = lease_cli("gc", as_json=False)
+    assert (code, out, err) == (0, "collected docs\n", "Warning: expired_with_worktree\n")
+    assert _ref(repo, "docs") is None
+
+
+def test_cli_liveness_renew_preserves_stale_cas_during_preflight(repo, lease_cli, lease_now, monkeypatch):
+    _git(repo, "branch", "lane/docs")
+    old = team.claim(repo, "docs", ["docs/**"], branch="lane/docs", owner="o@h", now=lease_now)
+    real = gitsafe.run
+    replacement = []
+
+    def renew_during_probe(args, cwd, **kwargs):
+        if not replacement and any(arg.startswith("refs/heads/") for arg in args):
+            replacement.append(team.renew(repo, "docs", old.oid, now=lease_now + 1).oid)
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", renew_during_probe)
+    code, payload, _ = lease_cli("renew", "docs", "--expect", old.oid)
+    assert (code, payload["reason"], payload["current"]) == (1, "stale", replacement[0])
+    assert _ref(repo, "docs") == replacement[0]
+
+
+def test_cli_liveness_gc_does_not_warn_about_a_concurrently_renewed_lease(repo, worktree, lease_cli, lease_now, monkeypatch):
+    old = team.claim(repo, "docs", ["docs/**"], branch="lane/other", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.run
+    replacement = []
+
+    def renew_during_probe(args, cwd, **kwargs):
+        if args[0] == "worktree" and not replacement:
+            replacement.append(team.renew(repo, "docs", old.oid, now=lease_now).oid)
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", renew_during_probe)
+    code, payload, _ = lease_cli("gc")
+    assert (code, payload["collected"], payload["warnings"]) == (0, [], [])
+    assert _ref(repo, "docs") == replacement[0]
+
+
+def test_core_lease_liveness_contract_stays_ttl_and_cas(repo, worktree):
+    old = team.claim(repo, "docs", ["docs/**"], branch="missing", owner="o@h", ttl_s=60, now=NOW)
+    renewed = team.renew(repo, "docs", old.oid, now=NOW + 100)
+    assert renewed.action == "renewed"
+    attached = team.claim(repo, "api", ["src/**"], branch="lane/other", owner="o@h", ttl_s=60, now=NOW)
+    result = team.gc(repo, now=NOW + 100)
+    assert [(change.lane, change.previous) for change in result.collected] == [("api", attached.oid)]
+    assert _ref(repo, "docs") == renewed.oid and _ref(repo, "api") is None
+
+
+@pytest.mark.parametrize("report", [
+    b"", b"worktree /private\0HEAD abc\0branch refs/heads/main\0",
+    b"worktree /private\0\0", b"worktree /private\0garbage\0\0",
+    b"worktree /private\0HEAD abc\0branch refs/heads/main\0\0",
+    b"worktree /private\0HEAD " + b"a" * 40 + b"\0branch refs/heads/main\0detached\0\0",
+], ids=["empty", "unterminated", "no-head", "unknown-state", "bad-oid", "ambiguous-state"])
+def test_cli_liveness_malformed_worktree_report_is_unknown(repo, lease_cli, lease_now, monkeypatch, report):
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.run
+
+    def malformed(args, cwd, **kwargs):
+        if args[0] == "worktree":
+            return subprocess.CompletedProcess(args, 0, report, b"token=private-value")
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", malformed)
+    for _ in range(2):
+        code, payload, err = lease_cli("gc")
+        assert (code, payload["reason"], err) == (1, "liveness_unknown", "")
+        assert "/private" not in json.dumps(payload)
+        assert "private-value" not in json.dumps(payload)
+        assert _ref(repo, "docs") == old.oid
+    with pytest.raises(gitsafe.GitError) as caught:
+        team.lease_branch_evidence(repo, now=lease_now, worktrees=True)
+    assert caught.value.code == "git_failed"
+    monkeypatch.setattr(gitsafe, "run", real)
+    assert lease_cli("gc")[0] == 0
+
+
+def test_cli_liveness_worktree_paths_cannot_forge_branch_records(repo, lease_cli, lease_now, monkeypatch):
+    old = team.claim(repo, "docs", ["docs/**"], branch="lane/docs", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.run
+    report = (b"worktree /not-a-real-path\nbranch refs/heads/lane/docs\0HEAD " + b"a" * 40 +
+              b"\0detached\0\0worktree /not-a-real-bare-path\0bare\0\0")
+
+    def forged_path(args, cwd, **kwargs):
+        if args[0] == "worktree":
+            return subprocess.CompletedProcess(args, 0, report, b"")
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", forged_path)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["warnings"], err) == (0, [], "")
+    assert payload["collected"][0]["previous"] == old.oid
+
+
+def test_cli_liveness_real_oversized_worktree_output_refuses_then_retries(repo, worktree, lease_cli, lease_now):
+    old = team.claim(repo, "docs", ["docs/**"], branch="lane/other", owner="o@h", ttl_s=60, now=lease_now - 100)
+    lock = repo / ".git" / "worktrees" / "other" / "locked"
+    lock.write_bytes(b"token=private-value " + b"x" * team.MAX_LEASE_BYTES)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["reason"], err) == (1, "liveness_unknown", "")
+    assert "private-value" not in json.dumps(payload)
+    assert _ref(repo, "docs") == old.oid
+    lock.unlink()
+    assert lease_cli("gc")[0] == 0
+
+
+def test_cli_liveness_maximum_lease_blob_keeps_transport_header_headroom(repo, lease_cli, lease_now):
+    blob = _valid_blob(branch="main", paths=["a"], ts=lease_now)
+    blob["paths"] = ["a" * (1 + team.MAX_LEASE_BYTES - len(json.dumps(blob).encode()))]
+    raw = json.dumps(blob).encode()
+    assert len(raw) == team.MAX_LEASE_BYTES
+    oid = _plant(repo, "refs/aegis/lanes/docs", raw)
+    code, payload, err = lease_cli("renew", "docs", "--expect", oid)
+    assert (code, payload["status"], err) == (0, "renewed", "")
+    assert _ref(repo, "docs") == payload["oid"] != oid
+
+
+@pytest.mark.parametrize("action,terms", [
+    ("renew", ("lease_branch_missing", "worktree is not required", "liveness_unknown")),
+    ("gc", ("expired_with_worktree", "expired leases are still collected", "liveness_unknown")),
+])
+def test_cli_liveness_help_documents_preflight(repo, capsys, action, terms):
+    from aegis_cli.cli import main
+
+    with pytest.raises(SystemExit) as caught:
+        main(["--workspace", str(repo), "team", action, "--help"])
+    assert caught.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    text = " ".join(captured.out.split())
+    assert all(term in text for term in terms)
+
+
+def test_cli_liveness_preserves_unreadable_lease_recovery(repo, lease_cli):
+    oid = _plant(repo, "refs/aegis/lanes/docs", b"token=private-value")
+    code, payload, err = lease_cli("renew", "docs", "--expect", oid)
+    assert (code, payload["reason"], err) == (1, "unreadable", "")
+    assert payload["message"] == (
+        f"unreadable: lane docs holds {oid}, which is no readable lease; release it with --expect {oid}")
+    assert "private-value" not in json.dumps(payload)
+    assert _ref(repo, "docs") == oid
+
+
+@pytest.mark.parametrize("ttl", ["0", "86401"])
+def test_cli_liveness_invalid_ttl_precedes_branch_probe(repo, lease_cli, lease_now, monkeypatch, ttl):
+    old = team.claim(repo, "docs", ["docs/**"], branch="missing", owner="o@h", now=lease_now)
+    real = gitsafe.run
+
+    def no_branch_probe(args, cwd, **kwargs):
+        if any(arg.startswith("refs/heads/") for arg in args):
+            raise AssertionError("invalid TTL must refuse before branch probing")
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", no_branch_probe)
+    code, payload, err = lease_cli("renew", "docs", "--expect", old.oid, "--ttl", ttl)
+    assert (code, payload["error"], err) == (2, "ttl must be a whole number of seconds from 1 to 86400", "")
+    assert _ref(repo, "docs") == old.oid
+
+
+def _assert_team_worktree_list_only(source):
+    calls = []
+    for node in ast.walk(ast.parse(source)):
+        if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or
+                not isinstance(node.func.value, ast.Name) or node.func.value.id != "gitsafe" or
+                node.func.attr not in ("run", "run_checked", "_run", "execute", "capture", "checked", "output", "text")):
+            continue
+        argv = node.args[0] if node.args else next(
+            (keyword.value for keyword in node.keywords if keyword.arg in ("args", "argv")), None)
+        assert (isinstance(argv, (ast.List, ast.Tuple)) and argv.elts and
+                isinstance(argv.elts[0], ast.Constant) and isinstance(argv.elts[0].value, str) and
+                not argv.elts[0].value.startswith("-")), "team Git argv must have a literal command head"
+        if argv.elts[0].value == "worktree":
+            calls.append(argv)
+    assert len(calls) == 1, "expected exactly one team worktree invocation"
+    expected = ast.parse("['worktree', 'list', '--porcelain', '-z']", mode="eval").body
+    assert ast.dump(calls[0]) == ast.dump(expected), "team worktree command must be exactly list --porcelain -z"
+
+
+def test_team_worktree_invocation_is_exactly_read_only_list():
+    path = Path(__file__).resolve().parents[3] / "aegis_core" / "team.py"
+    _assert_team_worktree_list_only(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("command", ["add", "remove", "prune", "move", "lock", "unlock", "repair"])
+def test_team_worktree_shape_guard_refuses_mutations(command):
+    source = f"gitsafe.run_checked(['worktree', {command!r}, '--porcelain', '-z'], root)"
+    with pytest.raises(AssertionError, match="(?m)^team worktree command must be exactly list --porcelain -z$"):
+        _assert_team_worktree_list_only(source)
+
+
+@pytest.mark.parametrize("argv", [
+    "['worktree', 'list']", "['worktree', 'list', '--porcelain']",
+    "['worktree', 'list', '--porcelain', '-z', '--verbose']", "['worktree', operation, '--porcelain', '-z']",
+], ids=["missing-format", "missing-nul", "extra-option", "dynamic-subcommand"])
+def test_team_worktree_shape_guard_refuses_changed_argv(argv):
+    with pytest.raises(AssertionError, match="(?m)^team worktree command must be exactly list --porcelain -z$"):
+        _assert_team_worktree_list_only(f"gitsafe.run_checked({argv}, root)")
+
+
+@pytest.mark.parametrize("extra", [
+    "gitsafe.run(['worktree', 'add', 'other'], root)", "gitsafe.run_checked(['worktree', 'list', '--porcelain', '-z'], root)",
+], ids=["additional-mutation", "duplicate-list"])
+def test_team_worktree_shape_guard_refuses_additional_invocations(extra):
+    source = "gitsafe.run_checked(['worktree', 'list', '--porcelain', '-z'], root)\n" + extra
+    with pytest.raises(AssertionError, match="(?m)^expected exactly one team worktree invocation$"):
+        _assert_team_worktree_list_only(source)
+
+
+@pytest.mark.parametrize("source", [
+    "gitsafe.run(['-c', 'a=b', 'worktree', 'add', 'other'], root)", "gitsafe.run(command, root)",
+], ids=["leading-global-option", "dynamic-argv"])
+def test_team_worktree_shape_guard_refuses_indeterminate_commands(source):
+    with pytest.raises(AssertionError, match="(?m)^team Git argv must have a literal command head$"):
+        _assert_team_worktree_list_only(source)
+
+
+def test_team_worktree_shape_guard_does_not_pass_vacuously():
+    with pytest.raises(AssertionError, match="(?m)^expected exactly one team worktree invocation$"):
+        _assert_team_worktree_list_only("gitsafe.run(['ls-tree', '-z', commit], root)")
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("selector", [
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+])
+def test_cli_liveness_rejects_ambient_repository_selectors_before_both_phases(
+        repo, tmp_path, lease_cli, lease_now, action, selector):
+    other = tmp_path / "other-repository"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    _git(other, "commit", "--allow-empty", "-q", "-m", "other")
+    _git(repo, "branch", "only-in-a")
+    first = team.claim(repo, "docs", ["docs/**"], branch="only-in-a", owner="o@h", ttl_s=60, now=lease_now - 100)
+    raw = gitsafe.read_object(repo, first.oid, team.MAX_LEASE_BYTES)
+    assert _plant(other, team.lane_ref("docs"), raw) == first.oid
+    values = {
+        "GIT_DIR": other / ".git", "GIT_WORK_TREE": other, "GIT_COMMON_DIR": other / ".git",
+        "GIT_INDEX_FILE": other / ".git" / "index", "GIT_OBJECT_DIRECTORY": other / ".git" / "objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": other / ".git" / "objects", "GIT_NAMESPACE": "other-namespace",
+        "GIT_CEILING_DIRECTORIES": tmp_path,
+    }
+    args = ("renew", "docs", "--expect", first.oid) if action == "renew" else ("gc",)
+    source = Path(__file__).resolve().parents[3]
+    environment = dict(os.environ)
+    environment.pop("AEGIS_WORKSPACE", None)
+    environment[selector] = str(values[selector])
+    entry = [sys.executable, "-I", "-c", (
+        "import sys; sys.path.insert(0, sys.argv[1]); from aegis_cli.cli import main; "
+        "sys.exit(main(sys.argv[2:]))"), str(source), "--workspace", str(repo), "team", *args, "--json"]
+    for _ in range(2):
+        result = subprocess.run(entry, cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+        payload = json.loads(result.stdout)
+        assert (result.returncode, payload.get("reason"), payload.get("message"), result.stderr) == (
+            1, "ambient_git_environment", "ambient_git_environment", "")
+        assert payload.get("next_action") == "Unset Git repository selectors, then retry."
+    assert (_ref(repo, "docs"), _ref(other, "docs")) == (first.oid, first.oid)
+    code, payload, _ = lease_cli(*args)
+    assert code == 0
+    assert _ref(other, "docs") == first.oid
+    assert _ref(repo, "docs") != first.oid
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_cli_liveness_readonly_checkout_uses_external_git_metadata(
+        repo, tmp_path, lease_cli, lease_now, action):
+    from tests.unit.core.test_storage_confined import make_store
+
+    make_store(repo)
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses the read-only checkout permission check")
+    common = tmp_path / "external-metadata.git"
+    (repo / ".git").rename(common)
+    (repo / ".git").write_text(f"gitdir: {common}\n", encoding="utf-8")
+    first = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    before = {path.relative_to(repo) for path in repo.rglob("*")}
+    old_mode = stat.S_IMODE(repo.stat().st_mode)
+    repo.chmod(0o555)
+    try:
+        args = ("renew", "docs", "--expect", first.oid) if action == "renew" else ("gc",)
+        code, payload, err = lease_cli(*args)
+        assert (code, payload["status"], err) == (0, "renewed" if action == "renew" else "collected", "")
+        assert {path.relative_to(repo) for path in repo.rglob("*")} == before
+    finally:
+        repo.chmod(old_mode)
+
+
+def _require_lease_descriptors(root):
+    from tests.unit.core.test_storage_confined import make_store
+
+    if not team_lease_custody.descriptor_supported():
+        pytest.skip("requires parent-addressable lease descriptors")
+    return make_store(root)
+
+
+def test_lease_descriptor_guard_uses_the_custody_probe(repo, monkeypatch):
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    with pytest.raises(pytest.skip.Exception, match="parent-addressable lease descriptors"):
+        _require_lease_descriptors(repo)
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("bad", ["symlink", "file", "owner", "mode"])
+def test_cli_liveness_private_scratch_refuses_bad_entry_and_retries(
+        repo, tmp_path, lease_cli, lease_now, monkeypatch, action, bad):
+    from conftest import symlink_or_skip
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    _require_lease_descriptors(repo)
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    scratch = repo / ".git" / "aegis-lease-scratch"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if bad == "symlink":
+        symlink_or_skip(outside, scratch, target_is_directory=True)
+    elif bad == "file":
+        scratch.write_bytes(b"private-marker")
+    else:
+        scratch.mkdir(mode=0o700)
+        if bad == "mode":
+            scratch.chmod(0o755)
+    original = os.fstat
+    identity = scratch.stat() if bad == "owner" else None
+
+    def fstat(fd):
+        info = original(fd)
+        if identity is not None and (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            from types import SimpleNamespace
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino,
+                                   st_mode=info.st_mode, st_uid=info.st_uid + 1)
+        return info
+
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(fstat=fstat))
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    for _ in range(2):
+        code, payload, err = lease_cli(*args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(repo, "docs") == old.oid
+    monkeypatch.setattr(team_lease_custody, "os", os)
+    assert list(outside.iterdir()) == []
+    if bad in ("file", "symlink"):
+        scratch.unlink()
+    else:
+        scratch.chmod(0o700)
+    assert lease_cli(*args)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("when", ["after_preflight", "after_verify"])
+def test_cli_liveness_repository_transition_never_mutates_replacement(
+        repo, tmp_path, lease_cli, lease_now, monkeypatch, action, when):
+    _require_lease_descriptors(repo)
+    other = tmp_path / "replacement"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    assert _plant(other, team.lane_ref("docs"), gitsafe.read_object(repo, old.oid, team.MAX_LEASE_BYTES)) == old.oid
+    original_metadata = tmp_path / "original.git"
+    original = getattr(team, "lease_branch_evidence" if when == "after_preflight" else action)
+    swapped = []
+
+    def replace(*args, **kwargs):
+        result = original(*args, **kwargs) if when == "after_preflight" else None
+        (repo / ".git").rename(original_metadata)
+        (other / ".git").rename(repo / ".git")
+        swapped.append(True)
+        return result if when == "after_preflight" else original(*args, **kwargs)
+
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    if when == "after_preflight":
+        monkeypatch.setattr(team, "lease_branch_evidence", replace)
+    elif action == "renew":
+        monkeypatch.setattr(team, "renew", replace)
+    else:
+        monkeypatch.setattr(team, "gc", replace)
+    try:
+        code, payload, err = lease_cli(*args)
+        assert err == ""
+        assert code == (1 if when == "after_preflight" else 0)
+        if code:
+            assert payload["reason"] == "liveness_unknown"
+    finally:
+        if swapped:
+            (repo / ".git").rename(other / ".git")
+            original_metadata.rename(repo / ".git")
+    if when == "after_preflight":
+        monkeypatch.setattr(team, "lease_branch_evidence", original)
+    elif action == "renew":
+        monkeypatch.setattr(team, "renew", original)
+    else:
+        monkeypatch.setattr(team, "gc", original)
+    assert _ref(other, "docs") == old.oid
+    if when == "after_preflight":
+        assert _ref(repo, "docs") == old.oid
+        assert lease_cli(*args)[0] == 0
+    else:
+        assert _ref(repo, "docs") != old.oid
+
+
+@pytest.mark.parametrize("failure", ["none", "scratch_open", "scratch_stat", "verify", "capture", "final_close"])
+def test_cli_liveness_custody_closes_owned_descriptors(
+        repo, lease_cli, lease_now, monkeypatch, failure):
+    from types import SimpleNamespace
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    _require_lease_descriptors(repo)
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", now=lease_now)
+    live, opened, closed = set(), [], []
+    scratch_fds = set()
+
+    def open_fd(path, flags, *args, **kwargs):
+        if failure == "scratch_open" and path == "aegis-lease-scratch":
+            raise OSError("private-marker")
+        fd = os.open(path, flags, *args, **kwargs)
+        assert fd not in live
+        live.add(fd)
+        opened.append(fd)
+        if path == "aegis-lease-scratch":
+            scratch_fds.add(fd)
+        return fd
+
+    def close_fd(fd):
+        assert fd in live
+        live.remove(fd)
+        closed.append(fd)
+        os.close(fd)
+        if failure == "final_close" and fd in scratch_fds:
+            scratch_fds.remove(fd)
+            raise OSError("private-marker")
+
+    def fstat(fd):
+        if failure == "scratch_stat" and fd in scratch_fds:
+            raise OSError("private-marker")
+        return os.fstat(fd)
+
+    def refuse(*args, **kwargs):
+        raise gitsafe.GitError("private-marker", code="git_failed")
+
+    original_verify = team_lease_custody.verify
+    facade = ModuleOS(open=open_fd, close=close_fd, fstat=fstat)
+    monkeypatch.setattr(storage_confined, "os", facade)
+    monkeypatch.setattr(team_lease_custody, "os", facade)
+    if failure == "verify":
+        monkeypatch.setattr(team_lease_custody, "verify", refuse)
+    if failure == "capture":
+        monkeypatch.setattr(team, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_object": refuse}))
+    code, payload, err = lease_cli("renew", "docs", "--expect", old.oid)
+    assert (code, err) == (0 if failure == "none" else 1, "")
+    if code:
+        assert (payload["reason"], payload["message"]) == ("liveness_unknown", "liveness_unknown")
+    monkeypatch.setattr(storage_confined, "os", os)
+    monkeypatch.setattr(team_lease_custody, "os", os)
+    monkeypatch.setattr(team_lease_custody, "verify", original_verify)
+    monkeypatch.setattr(team, "gitsafe", gitsafe)
+    assert opened and len(opened) == len(closed) and not live
+    if failure == "final_close":
+        current = _ref(repo, "docs")
+        assert current != old.oid
+        assert lease_cli("renew", "docs", "--expect", current)[0] == 0
+    elif failure != "none":
+        assert _ref(repo, "docs") == old.oid
+        assert lease_cli("renew", "docs", "--expect", old.oid)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_cli_liveness_scratch_rename_keeps_the_open_directory(
+        repo, tmp_path, lease_cli, lease_now, monkeypatch, action):
+    from types import SimpleNamespace
+    from conftest import symlink_or_skip
+    _require_lease_descriptors(repo)
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    scratch, moved = repo / ".git" / "aegis-lease-scratch", repo / ".git" / "held-scratch"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = gitsafe.read_object
+    changed = []
+
+    def read(*args, **kwargs):
+        if not changed:
+            scratch.rename(moved)
+            changed.append(True)
+            symlink_or_skip(outside, scratch, target_is_directory=True)
+        return original(*args, **kwargs)
+
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    monkeypatch.setattr(team, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_object": read}))
+    try:
+        code, payload, err = lease_cli(*args)
+        assert (code, err) == (0, "")
+        assert list(outside.iterdir()) == [] and list(moved.iterdir()) == []
+    finally:
+        if changed:
+            scratch.unlink()
+            moved.rename(scratch)
+    monkeypatch.setattr(team, "gitsafe", gitsafe)
+    retry = ("renew", "docs", "--expect", payload["oid"]) if action == "renew" else ("gc",)
+    assert lease_cli(*retry)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+def test_cli_liveness_metadata_ancestor_swap_refuses_without_following_link(
+        repo, tmp_path, lease_cli, lease_now, monkeypatch, action):
+    from conftest import symlink_or_skip
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    _require_lease_descriptors(repo)
+    parent, moved, outside = (tmp_path / name for name in ("metadata", "held-metadata", "outside"))
+    parent.mkdir()
+    outside.mkdir()
+    common = parent / "common.git"
+    (repo / ".git").rename(common)
+    (repo / ".git").write_text(f"gitdir: {common}\n", encoding="utf-8")
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    changed = []
+
+    def mkdir(path, mode=0o777, **kwargs):
+        os.mkdir(path, mode, **kwargs)
+        if path == "aegis-lease-scratch" and not changed:
+            parent.rename(moved)
+            changed.append(True)
+            symlink_or_skip(outside, parent, target_is_directory=True)
+
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    monkeypatch.setattr(team_lease_custody, "os", ModuleOS(mkdir=mkdir))
+    try:
+        code, payload, err = lease_cli(*args)
+        assert (code, payload["reason"], payload["message"], err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert list(outside.iterdir()) == []
+    finally:
+        if changed:
+            parent.unlink()
+            moved.rename(parent)
+    monkeypatch.setattr(team_lease_custody, "os", os)
+    assert _ref(repo, "docs") == old.oid
+    assert lease_cli(*args)[0] == 0
+
+
+@pytest.mark.parametrize("root", [None, 42, "x" * 16385, "bad\0root", "/a/../b"],
+                         ids=["none", "integer", "long", "nul", "traversal"])
+def test_lease_custody_bounds_roots_before_platform_or_filesystem_probe(monkeypatch, root):
+    def unexpected():
+        raise AssertionError("invalid root reached platform/filesystem discovery")
+
+    monkeypatch.setattr(team_lease_custody, "descriptor_supported", unexpected)
+    with pytest.raises(gitsafe.GitError, match="^liveness_unknown$") as caught:
+        with team.lease_custody(root):
+            pytest.fail("invalid root entered custody")
+    assert caught.value.code == "git_failed"
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("directory", ["workspace", "external_git", "common"])
+def test_cli_liveness_confined_directory_close_refuses_and_closes_every_fd(
+        repo, tmp_path, lease_now, capsys, monkeypatch, action, directory):
+    import errno
+    from aegis_cli.cli import main
+    from tests.unit.core.test_storage_confined import ModuleOS
+
+    _require_lease_descriptors(repo)
+    workspace, target = repo, repo
+    if directory == "external_git":
+        target = tmp_path / "external.git"
+        (repo / ".git").rename(target)
+        (repo / ".git").write_text(f"gitdir: {target}\n", encoding="utf-8")
+    elif directory == "common":
+        workspace = tmp_path / "linked"
+        _git(repo, "worktree", "add", "-q", "-b", "lane/cleanup", str(workspace))
+        target = repo / ".git"
+    (workspace / ".aegis" / "rules").mkdir(parents=True, exist_ok=True)
+    old = team.claim(workspace, "docs", ["docs/**"], owner="o@h", branch="main", ttl_s=60,
+                     now=lease_now if action == "renew" else lease_now - 100)
+    identity = (target.stat().st_dev, target.stat().st_ino)
+    live, opened, closed, fired, changed = set(), [], [], [], []
+    original = team.renew if action == "renew" else team.gc
+
+    def mutate(*args, **kwargs):
+        result = original(*args, **kwargs)
+        changed.append(True)
+        return result
+
+    def open_fd(*args, **kwargs):
+        fd = os.open(*args, **kwargs)
+        assert fd not in live
+        live.add(fd)
+        opened.append(fd)
+        return fd
+
+    def close_fd(fd):
+        info = os.fstat(fd)
+        fail = changed and not fired and not gitsafe.custody_active() and (info.st_dev, info.st_ino) == identity
+        assert fd in live
+        live.remove(fd)
+        closed.append(fd)
+        os.close(fd)
+        if fail:
+            fired.append(True)
+            raise OSError(errno.EIO, "private-directory-close-marker")
+
+    facade = ModuleOS(open=open_fd, close=close_fd)
+    monkeypatch.setattr(storage_confined, "os", facade)
+    monkeypatch.setattr(team_lease_custody, "os", facade)
+    if action == "renew":
+        monkeypatch.setattr(team, "renew", mutate)
+    else:
+        monkeypatch.setattr(team, "gc", mutate)
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    try:
+        code = main(["--workspace", str(workspace), "team", *args, "--json"])
+        captured = capsys.readouterr()
+        assert (code, captured.err) == (1, "")
+        payload = json.loads(captured.out)
+        assert (code, payload["reason"], payload["message"], captured.err) == (
+            1, "liveness_unknown", "liveness_unknown", "")
+        assert fired == [True]
+    finally:
+        monkeypatch.setattr(storage_confined, "os", os)
+        monkeypatch.setattr(team_lease_custody, "os", os)
+        if action == "renew":
+            monkeypatch.setattr(team, "renew", original)
+        else:
+            monkeypatch.setattr(team, "gc", original)
+        assert opened and len(opened) == len(closed) and not live
+    current = _ref(repo, "docs")
+    assert current != old.oid
+    retry = ("renew", "docs", "--expect", current) if action == "renew" else ("gc",)
+    assert main(["--workspace", str(workspace), "team", *retry, "--json"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("as_json", [True, False])
+def test_cli_lease_refusal_keeps_custody_after_git_entry_disappears(
+        repo, tmp_path, lease_cli, monkeypatch, as_json):
+    from types import SimpleNamespace
+
+    _require_lease_descriptors(repo)
+    bad = _plant(repo, team.lane_ref("docs"), b"private-refusal-blob-marker")
+    held = tmp_path / "held.git"
+    original = gitsafe.read_object
+    changed = []
+    observed = []
+
+    def read(*args, **kwargs):
+        data = original(*args, **kwargs)
+        observed.append(gitsafe.custody_active())
+        if not changed:
+            (repo / ".git").rename(held)
+            changed.append(True)
+        return data
+
+    monkeypatch.setattr(team, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_object": read}))
+    try:
+        code, result, err = lease_cli("renew", "docs", "--expect", bad, as_json=as_json)
+        assert code == 1
+        if as_json:
+            assert (result["reason"], result["current"], result["lease"], err) == ("unreadable", bad, None, "")
+            assert "private-refusal-blob-marker" not in json.dumps(result)
+        else:
+            assert result == "" and err.startswith("unreadable: lane docs holds ")
+            assert f"release it with --expect {bad}" in err
+        assert len(observed) >= 2 and all(observed)
+    finally:
+        if changed:
+            held.rename(repo / ".git")
+    monkeypatch.setattr(team, "gitsafe", gitsafe)
+    assert _ref(repo, "docs") == bad
+    repaired = _plant(repo, team.lane_ref("docs"), json.dumps(_valid_blob(ts=int(time.time()), branch="main")).encode())
+    assert lease_cli("renew", "docs", "--expect", repaired)[0] == 0
+
+
+@pytest.mark.parametrize("backend", ["descriptor", "pathname"])
+@pytest.mark.parametrize("failure", ["git", "os", "value"])
+def test_cli_lease_refusal_view_failure_is_one_typed_document(
+        repo, lease_cli, monkeypatch, backend, failure):
+    from types import SimpleNamespace
+
+    if backend == "descriptor":
+        _require_lease_descriptors(repo)
+    else:
+        monkeypatch.setattr(team_lease_custody, "descriptor_supported", lambda: False)
+    bad = _plant(repo, team.lane_ref("docs"), b"private-refusal-blob-marker")
+    original_read, original_refs = gitsafe.read_object, gitsafe.list_refs
+    ready, failed = [], []
+
+    def read(*args, **kwargs):
+        data = original_read(*args, **kwargs)
+        ready.append(True)
+        return data
+
+    def refs(*args, **kwargs):
+        if ready:
+            failed.append(True)
+            if failure == "git":
+                raise gitsafe.GitError("private-view-marker", code="git_timeout")
+            if failure == "os":
+                raise OSError("private-view-marker")
+            raise ValueError("private-view-marker")
+        return original_refs(*args, **kwargs)
+
+    monkeypatch.setattr(team, "gitsafe", SimpleNamespace(**{**vars(gitsafe), "read_object": read, "list_refs": refs}))
+    for _ in range(2):
+        code, result, err = lease_cli("renew", "docs", "--expect", bad)
+        assert (code, result["reason"], result["message"], err) == (1, "liveness_unknown", "liveness_unknown", "")
+        assert _ref(repo, "docs") == bad
+    assert failed
+    monkeypatch.setattr(team, "gitsafe", gitsafe)
+    repaired = _plant(repo, team.lane_ref("docs"), json.dumps(_valid_blob(ts=int(time.time()), branch="main")).encode())
+    assert lease_cli("renew", "docs", "--expect", repaired)[0] == 0
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("kind", ["commit", "oversized", "malformed", "value-error"])
+def test_cli_liveness_object_error_is_one_unreadable_lane(
+        repo, lease_cli, lease_now, monkeypatch, action, kind):
+    docs = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    if kind == "commit":
+        bad = _git(repo, "rev-parse", "HEAD").strip()
+        _git(repo, "update-ref", team.lane_ref("api"), bad)
+    else:
+        raw = b"private-lease-marker" + (b"x" * team.MAX_LEASE_BYTES if kind == "oversized" else b"")
+        bad = _plant(repo, team.lane_ref("api"), raw)
+    real = gitsafe.read_object
+
+    def object_value_error(cwd, oid, limit):
+        if oid == bad:
+            raise ValueError("private-lease-marker")
+        return real(cwd, oid, limit)
+
+    if kind == "value-error":
+        monkeypatch.setattr(gitsafe, "read_object", object_value_error)
+    args = ("renew", "api", "--expect", bad) if action == "renew" else ("gc",)
+    code, payload, err = lease_cli(*args)
+    assert err == "" and "private-lease-marker" not in json.dumps(payload)
+    if action == "gc":
+        assert (code, payload["kept"]) == (0, [{"lane": "api", "reason": "unreadable"}])
+        assert [(row["lane"], row["previous"]) for row in payload["collected"]] == [("docs", docs.oid)]
+    else:
+        assert (code, payload["reason"], payload["message"]) == (
+            1, "unreadable", f"unreadable: lane api holds {bad}, which is no readable lease; release it with --expect {bad}")
+    assert _ref(repo, "api") == bad
+    repaired = _plant(repo, team.lane_ref("api"), json.dumps(
+        _valid_blob(lane="api", paths=["src/**"], branch="main", ts=lease_now)).encode())
+    retry = ("renew", "api", "--expect", repaired) if action == "renew" else ("gc",)
+    assert lease_cli(*retry)[0] == 0
+
+
+@pytest.mark.parametrize("branch,target", [
+    ("refs/remotes/origin/HEAD", "refs/remotes/origin/main"),
+    ("refs/heads/lane/docs", "refs/heads/main"),
+])
+def test_cli_liveness_symbolic_branch_is_present(repo, lease_cli, lease_now, branch, target):
+    _git(repo, "update-ref", target, "HEAD")
+    _git(repo, "symbolic-ref", branch, target)
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", now=lease_now)
+    for _ in range(2):
+        code, payload, err = lease_cli("renew", "docs", "--expect", old.oid)
+        assert (code, payload["status"], err) == (0, "renewed", "")
+        old = team.read_leases(repo).get("docs")
+
+
+@pytest.mark.parametrize("metadata", [b"locked", b"locked private-reason", b"prunable private-reason"])
+def test_cli_liveness_bare_worktree_record_accepts_administrative_metadata(
+        repo, lease_cli, lease_now, monkeypatch, metadata):
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.run
+
+    def bare_record(args, cwd, **kwargs):
+        if args[0] == "worktree":
+            return subprocess.CompletedProcess(args, 0, b"worktree /private-path\0bare\0" + metadata + b"\0\0", b"")
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", bare_record)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["status"], payload["warnings"], err) == (0, "collected", [], "")
+    assert payload["collected"][0]["previous"] == old.oid
+    assert "private-" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("illegal", [b"HEAD " + b"a" * 40, b"branch refs/heads/main", b"detached"])
+def test_cli_liveness_bare_worktree_record_still_rejects_checkout_state(
+        repo, lease_cli, lease_now, monkeypatch, illegal):
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.run
+
+    def bare_record(args, cwd, **kwargs):
+        if args[0] == "worktree":
+            return subprocess.CompletedProcess(args, 0, b"worktree /private\0bare\0locked\0" + illegal + b"\0\0", b"")
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", bare_record)
+    code, payload, err = lease_cli("gc")
+    assert (code, payload["reason"], err) == (1, "liveness_unknown", "")
+    assert _ref(repo, "docs") == old.oid
+
+
+@pytest.mark.parametrize("action", ["renew", "gc"])
+@pytest.mark.parametrize("failure_code", ["git_failed", "git_timeout", "git_output_limit", "git_cleanup_failed"])
+def test_cli_liveness_transport_read_failure_is_global_and_retryable(
+        repo, lease_cli, lease_now, monkeypatch, action, failure_code):
+    old = team.claim(repo, "docs", ["docs/**"], branch="main", owner="o@h", ttl_s=60, now=lease_now - 100)
+    real = gitsafe.read_object
+
+    def transport_failure(cwd, oid, limit):
+        if oid == old.oid:
+            raise gitsafe.GitError("private-transport-marker", code=failure_code)
+        return real(cwd, oid, limit)
+
+    monkeypatch.setattr(gitsafe, "read_object", transport_failure)
+    args = ("renew", "docs", "--expect", old.oid) if action == "renew" else ("gc",)
+    for _ in range(2):
+        code, payload, err = lease_cli(*args)
+        assert (code, payload["reason"], err) == (1, "liveness_unknown", "")
+        assert "private-transport-marker" not in json.dumps(payload)
+        assert _ref(repo, "docs") == old.oid
+    monkeypatch.setattr(gitsafe, "read_object", real)
+    assert lease_cli(*args)[0] == 0
+
+
+def test_cli_liveness_direct_branch_can_become_symbolic_during_probe(repo, lease_cli, lease_now, monkeypatch):
+    branch = "refs/heads/lane/docs"
+    _git(repo, "update-ref", branch, "HEAD")
+    old = team.claim(repo, "docs", ["docs/**"], branch=branch, owner="o@h", now=lease_now)
+    real = gitsafe.run
+    changed = []
+
+    def symbolize_during_read(args, cwd, **kwargs):
+        if args[0] == "for-each-ref" and branch in args and not changed:
+            _git(repo, "symbolic-ref", branch, "refs/heads/main")
+            changed.append(True)
+        return real(args, cwd, **kwargs)
+
+    monkeypatch.setattr(gitsafe, "run", symbolize_during_read)
+    code, payload, err = lease_cli("renew", "docs", "--expect", old.oid)
+    assert changed == [True]
+    assert (code, payload["status"], err) == (0, "renewed", "")
+    assert _ref(repo, "docs") == payload["oid"] != old.oid

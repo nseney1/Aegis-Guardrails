@@ -36,9 +36,14 @@ PROFILES = {
     "board": ("a/orchestrator", ("board",)),
     "root": ("a/root", ("lifecycle",)),
 }
-CASES = {profile if profile in {"board", "root"} else profile + ("_planned" if planned else "_legacy"):
-         (profile, planned) for profile in PROFILES
-         for planned in ((False,) if profile in {"board", "root"} else (False, True))}
+# Records are an opt-in stdio surface. Base keys stay first so regeneration appends them.
+_BASE_CASES = {profile if profile in {"board", "root"} else profile + ("_planned" if planned else "_legacy"):
+               (profile, planned, False) for profile in PROFILES
+               for planned in ((False,) if profile in {"board", "root"} else (False, True))}
+_RECORD_CASES = {key + "_records": (profile, planned, True)
+                 for key, (profile, planned, _enabled) in _BASE_CASES.items()
+                 if profile not in {"board", "root"}}
+CASES = {**_BASE_CASES, **_RECORD_CASES}
 EXPECTED_EXTRAS = {
     "role_source": {"source_show", "source_grep"},
     "router_lifecycle": {"router_status"},
@@ -174,13 +179,14 @@ def build_base(directory):
     return directory
 
 
-def connection_result(directory, profile, *, planned=False, plan_host="codex-cli", enabled=None, expected_returncode=0):
+def connection_result(directory, profile, *, planned=False, plan_host="codex-cli", enabled=None,
+                      expected_returncode=0, records=False):
     endpoint, configured = PROFILES[profile]
     if enabled is None:
         enabled = configured
     mailbox = directory / ("planned-" + plan_host if planned else "standalone") / "mailbox"
-    script = "hierarchy_mailbox_mcp.py" if profile == "root" else "hierarchy_mailbox.py"
-    options = []
+    script = "hierarchy_mailbox_mcp.py" if profile == "root" or records else "hierarchy_mailbox.py"
+    options = ["--records"] if records else []
     if "board" in enabled:
         options += ["--board", directory / "board"]
     if "workspace" in enabled:
@@ -208,8 +214,8 @@ def connection_result(directory, profile, *, planned=False, plan_host="codex-cli
 
 
 def live_tools_list(directory, case, *, plan_host="codex-cli"):
-    profile, planned = CASES[case]
-    return connection_result(directory, profile, planned=planned, plan_host=plan_host)
+    profile, planned, records_enabled = CASES[case]
+    return connection_result(directory, profile, planned=planned, plan_host=plan_host, records=records_enabled)
 
 
 def refused_tools_list(directory, case):
@@ -239,7 +245,7 @@ def legacy_tools_result(contract_base):
 @pytest.mark.parametrize("case", CASES)
 def test_mailbox_tools_match_their_connection_contract(contract_base, case):
     actual = live_tools_list(contract_base, case)
-    profile, planned = CASES[case]
+    profile, planned, _records_enabled = CASES[case]
     tools = {tool["name"]: tool for tool in actual["tools"]}
     optional = set().union(*EXPECTED_EXTRAS.values())
     assert tools.keys() & optional == EXPECTED_EXTRAS.get(profile, set())
@@ -253,9 +259,10 @@ def test_mailbox_tools_match_their_connection_contract(contract_base, case):
         assert live_tools_list(contract_base, case, plan_host="claude-code") == actual, "host plan changed tools/list"
 
 
-def assert_matches_snapshot(actual, case):
-    assert SNAPSHOT.is_file(), "regenerate the mailbox MCP contract snapshot with --write"
-    expected = read_snapshot()
+def assert_matches_snapshot(actual, case, *, snapshot=None):
+    snapshot = SNAPSHOT if snapshot is None else snapshot
+    assert snapshot.is_file(), "regenerate the mailbox MCP contract snapshot with --write"
+    expected = read_snapshot(snapshot=snapshot)
     assert set(expected) == set(CASES) | set(REFUSAL_CASES)
     for tool, expected_tool in zip(actual["tools"], expected[case]["tools"]):
         assert canonical_json(tool) == canonical_json(expected_tool), (
@@ -265,8 +272,8 @@ def assert_matches_snapshot(actual, case):
         tool["name"] for tool in expected[case]["tools"]])
 
 
-def read_snapshot():
-    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+def read_snapshot(*, snapshot=None):
+    snapshot = json.loads((SNAPSHOT if snapshot is None else snapshot).read_text(encoding="utf-8"))
     return {case: {"tools": [snapshot["tools"][name][variant] for name, variant in surface]}
             if isinstance(surface, list) else surface for case, surface in snapshot["cases"].items()}
 
@@ -381,7 +388,27 @@ def test_opt_in_records_preserve_legacy_definitions_and_have_closed_schemas():
         assert schema["additionalProperties"] is False
         assert not {"root", "store", "from", "host", "session", "meta", "spans"} & schema["properties"].keys()
         assert tool["annotations"]["readOnlyHint"] is (name != "mailbox_publish_record")
-        assert "untrusted" in tool["description"] and "findings.*.{id,severity,file,line}" in tool["description"]
+        assert "untrusted" in tool["description"]
+        if name == "mailbox_read_record":
+            assert "findings.*.{id,severity,file,line}" in tool["description"]
+            assert "narrow fields" in tool["description"]
+        else:
+            assert "findings.*.{id,severity,file,line}" not in tool["description"]
+            assert "E_SELECTOR" not in tool["description"]
+            if name == "mailbox_publish_record":
+                assert "narrow" not in tool["description"]
+            else:
+                assert "narrow fields" in tool["description"]
+        if name == "mailbox_publish_record":
+            assert "legacy-readable v1 stub" in tool["description"]
+        if name == "mailbox_digest":
+            assert ("reduce limit, keep after_message_id, and read an individually oversized "
+                    "ordinary message through the inbox path") in tool["description"]
+            assert "request fewer refs, or narrow fields (for example body) or outline" in tool["description"]
+            assert "read the ordinary message through the inbox path" in tool["description"]
+            assert "restart mailbox_inbox from the start without after_message_id" in tool["description"]
+            assert "1 to 100" in tool["description"]
+            assert "0 to 60000" in tool["description"]
         if name in {"mailbox_read_record", "mailbox_digest"}:
             assert schema["properties"]["expand"] == {"type": "array", "maxItems": 64,
                 "items": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"}}
@@ -412,6 +439,18 @@ def test_record_transaction_uses_the_single_pinned_publish_write_boundary():
     assert publish.body[-2].value is writes[0]
 
 
+def test_inbox_preview_dependency_and_size_contract():
+    records = (REPO / "tools/hierarchy_mailbox_records.py").read_text(encoding="utf-8")
+    imports = [node.module for node in ast.walk(ast.parse(records)) if isinstance(node, ast.ImportFrom)]
+    imports += [alias.name for node in ast.walk(ast.parse(records)) if isinstance(node, ast.Import)
+                for alias in node.names]
+    assert "hierarchy_mailbox_mcp" not in imports, "records must not import the MCP transport"
+    assert len(records.splitlines()) < 951
+    mcp = (REPO / "tools/hierarchy_mailbox_mcp.py").read_text(encoding="utf-8")
+    assert len(mcp.splitlines()) < 1000
+    assert sum(isinstance(node, ast.stmt) for node in ast.walk(ast.parse(mcp))) <= 613
+
+
 def test_profiles_cover_every_registry_role():
     roles = json.loads((REPO / "tools/hierarchy_templates/role-registry.json").read_text(encoding="utf-8"))["roles"]
     expected = read_snapshot()
@@ -426,7 +465,7 @@ def test_profiles_cover_every_registry_role():
             assert endpoint.split("/")[1] == entry["endpoint"]["role"], name
             if "lane_kind" in entry["endpoint"]:
                 assert LANE_ENDPOINTS[endpoint] == entry["endpoint"]["lane_kind"], name
-            assert any(case in expected for case, (candidate, _) in CASES.items() if candidate == profile), name
+            assert any(case in expected for case, value in CASES.items() if value[0] == profile), name
 
 
 def test_forbidden_option_cases_cover_the_registry_gates():
@@ -469,6 +508,62 @@ def test_snapshot_covers_provisioned_tool_order(profile, extras):
         assert case in expected, "missing provisioned connection contract: " + case
         assert [tool["name"] for tool in expected[case]["tools"]] == [
             "mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self", *extras]
+
+
+RECORD_TOOL_NAMES = ["mailbox_publish_record", "mailbox_read_record", "mailbox_digest"]
+
+
+@pytest.mark.parametrize("profile,extras", [
+    ("role", []),
+    ("front_door", ["workspace_initiative"]),
+    ("orchestrator_provisioned", ["workspace_capacity", "workspace_initiative", "source_show", "source_grep"]),
+    ("decider_provisioned", ["source_show", "source_grep", "decider_record"]),
+])
+def test_snapshot_covers_records_enabled_definitions_and_order(profile, extras):
+    """Records-enabled stdio discovery keeps every definition, in adapter order."""
+    expected = read_snapshot()
+    for suffix in ("_legacy_records", "_planned_records"):
+        case = profile + suffix
+        assert case in expected, "missing records-enabled connection contract: " + case
+        tools = expected[case]["tools"]
+        assert [tool["name"] for tool in tools] == [
+            "mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self",
+            *RECORD_TOOL_NAMES, *extras]
+        for tool in tools:
+            assert set(tool) == {"annotations", "description", "inputSchema", "name"}
+            assert tool["inputSchema"]["additionalProperties"] is False
+        plain = expected[profile + suffix.replace("_records", "")]
+        assert [tool["name"] for tool in plain["tools"]] == [
+            "mailbox_inbox", "mailbox_publish", "mailbox_ack_handoff", "mailbox_self", *extras]
+        assert tools[:4] == plain["tools"][:4]
+
+
+def test_root_and_board_record_adoption_are_refused(contract_base):
+    mailbox = contract_base / "standalone" / "mailbox"
+    root_output = run_tool(
+        "hierarchy_mailbox_mcp.py", "--root", mailbox, "serve", "--records",
+        "--endpoint", "a/root", "--host", "contract-host", "--session", "a/root", "--generation", "1",
+        input="", expected_returncode=2)
+    assert json.loads(root_output) == {"error": "ROOT takes no record tools"}
+    board_output = run_tool(
+        "hierarchy_mailbox_mcp.py", "--root", mailbox, "serve", "--records",
+        "--endpoint", "a/orchestrator", "--host", "contract-host", "--session", "a/orchestrator",
+        "--generation", "1", "--board", contract_base / "board",
+        input="", expected_returncode=2)
+    assert json.loads(board_output) == {"error": "records require a mailbox connection"}
+
+
+def test_records_snapshot_rejects_an_unlisted_schema_change(contract_base, tmp_path):
+    actual = live_tools_list(contract_base, "role_legacy_records")
+    snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    references = snapshot["cases"]["role_legacy_records"]
+    name, variant = next(item for item in references if item[0] == "mailbox_read_record")
+    snapshot["tools"][name][variant]["inputSchema"]["additionalProperties"] = True
+    path = tmp_path / "changed-snapshot.json"
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    with pytest.raises(AssertionError) as failure:
+        assert_matches_snapshot(actual, "role_legacy_records", snapshot=path)
+    assert str(failure.value).splitlines()[0] == "MCP tool changed: mailbox_read_record (snapshot: mailbox_read_record)"
 
 
 def test_setup_preserves_the_callers_git_index(tmp_path, monkeypatch):

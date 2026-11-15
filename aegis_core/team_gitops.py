@@ -3,9 +3,9 @@
 The caller supplies the trusted absolute git common directory, outside role-writable
 roots. This module runs neither git nor gh nor an effect callback. A *new*, durable
 IntentReceipt permits the caller's one attempt; an existing receipt never does.
-Every process that may perform the effect must hold the receipt's effect-lock
-descriptor; pass receipt.inheritable_fds() as subprocess pass_fds. Each process
-closes its copy after its effect has stopped. After a lost reply, reconcile uses
+The effect transport passes receipt.inheritable_fds() only to its custody holder.
+Supply effect_fds and the owner-bound worktree_root; the holder retains the lock
+until every effect descendant exits. After a lost reply, reconcile uses
 only the caller's read-only observer. Unknown
 is terminal only for an observed foreign state. Unavailable observations keep
 the intent pending; neither condition authorizes another effect attempt.
@@ -32,9 +32,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import threading
+import uuid
 
 try:
     import fcntl
@@ -44,93 +44,49 @@ except ImportError:
 from aegis_core import storage
 from aegis_core.errors import LockTimeoutError, PathTraversalError
 from aegis_core.storage import ConfinedFileError, confined_file
-from aegis_core.primitives import parse_utc, sanitize_display, utc_stamp
-from aegis_core.redaction import (CANDIDATE_TOKEN_RE, is_high_entropy_secret,
-                                  redact_command_secrets)
+from aegis_core.primitives import utc_stamp
 
 __all__ = ["GitOpsJournal", "GitOpsError", "IntentReceipt", "JournalRead", "Observation",
            "OPS", "REFUSALS", "display_row", "descriptor_supported"]
 
-OPS = ("worktree_add", "worktree_remove", "commit", "ref_update", "push", "pr_open",
-       "pr_ready", "pr_close", "merge", "run_cancel", "lease_claim", "lease_renew",
-       "lease_transfer", "lease_release")
-MAX_JOURNAL_BYTES = 8 * 1024 * 1024
-MAX_ROW_BYTES = 65536
-MAX_RECORD_LINES = 32768
-RECONCILE_BATCH_SIZE = 8
-FINAL_RECORD_ATTEMPTS = 3
-MAX_CHECKPOINT_REQUEST_IDS = 16
-DISPLAY_LIMIT = 256
-REFUSALS = {
-    "invalid_intent": "invalid git operation intent",
-    "invalid_result": "invalid git operation result",
-    "invalid_request": "invalid git operation request identifier",
-    "request_conflict": "git operation request already reserved with different inputs",
-    "result_conflict": "git operation already has a different terminal result",
-    "missing_intent": "git operation result requires a durable intent",
-    "unsupported_platform": "descriptor-relative git operation journal unavailable",
-    "unsafe_journal": "unsafe git operation journal path or file; use the trusted root's realpath spelling",
-    "journal_too_large": "git operation journal size limit exceeded; ask the owner to archive closed history",
-    "journal_capacity": "git operation result capacity reserved; reconcile pending intents and ask the owner to archive closed history",
-    "journal_busy": "git operation journal lock timed out",
-    "effect_busy": "git operation effect is still owned; wait for its result or reconcile after its owner exits",
-    "journal_io": "git operation journal I/O failed; observe before any further action",
-    "checkpoint_stuck": "git operation observation checkpoints require owner recovery",
-}
-_RESULT_ACTIONS = {
-    "observation": "correct the result status and observation to match the durable intent; then record the result",
-    "receipt": "provide the matching active receipt for this request; then record the observed result",
-    "descriptor": "provide the inherited effect-lock descriptor for this request; then record the observed result",
-    "ownership": "supply one ownership argument: a matching receipt or an inherited effect-lock descriptor; then record the observed result",
-    "capacity": "inspect the pending intent and restore journal capacity or storage; reconcile by observation before any further action",
-}
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
-_LANE = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}\Z")
-_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_STATE_TEXT = {"ref", "head", "base", "state", "path", "owner", "branch", "lease_id", "oid"}
-_STATE_NUMBER = {"number", "run_id", "pr_number", "generation"}
-_BASE_KEYS = {"v", "kind", "op", "lane", "request_id", "expected_old", "expected_new",
-              "actor", "created_at", "ts"}
+from aegis_core import gitops_checkpoint as checkpoints
+from aegis_core import gitops_rows as rows
+from aegis_core.gitops_rows import (GitOpsError, JournalRead, OPS, REFUSALS,
+    MAX_JOURNAL_BYTES, MAX_ROW_BYTES, MAX_RECORD_LINES, RECONCILE_BATCH_SIZE,
+    FINAL_RECORD_ATTEMPTS, DISPLAY_LIMIT, BASE_KEYS as _BASE_KEYS,
+    LANE as _LANE, identifier as _identifier, state as _state,
+    same_intent as _same_intent, encoded as _encoded, terminal_bytes as _terminal_bytes)
+
+
+def _parse(data, *, capture=False):
+    return rows.parse(data, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES, capture=capture)
+
+
+def display_row(value, _depth=0):
+    """Render through the shared codec using this facade's configured limits."""
+    return rows.display_row(value, _depth, max_row_bytes=MAX_ROW_BYTES, display_limit=DISPLAY_LIMIT)
+
+
+def _intent(op, lane, request_id, expected_old, expected_new, actor):
+    return rows.intent(op, lane, request_id, expected_old, expected_new, actor, stamp=utc_stamp())
+
+
+def _result(intent, status, observed):
+    return rows.result(intent, status, observed, stamp=utc_stamp())
+
+
 _OWNERS = {}
 _OWNER_GUARD = threading.RLock()
-
-
-class GitOpsError(ValueError):
-    """Documented refusal, safe to render verbatim."""
-
-    def __init__(self, code, root=None, *, result_cause="observation", request_ids=()):
-        super().__init__(REFUSALS[code])
-        self.code = code
-        self.next_action = {"actor": "owner", "command": REFUSALS[code]}
-        if code == "invalid_result":
-            self.next_action["command"] = _RESULT_ACTIONS[result_cause]
-        elif code == "journal_io":
-            self.next_action["command"] = _RESULT_ACTIONS["capacity"]
-        elif code == "unsupported_platform":
-            self.next_action["command"] = "use a supported descriptor platform and a local filesystem for the git common dir"
-        elif code == "result_conflict":
-            self.next_action["command"] = ("read the durable result for this request; never retry the effect"
-                                           if result_cause == "durable" else
-                                           "reconcile the lane to publish the saved observation, then read its result")
-        elif code == "checkpoint_stuck":
-            self.next_action["command"] = "owner reads external state for each listed request, then calls record_result(request_id, status, observed) to resolve it; never retry the effect; at most 16 request IDs are listed, reconcile again after resolving them"
-            self.next_action["request_ids"] = [_clean(request)[:DISPLAY_LIMIT] for request in request_ids[:MAX_CHECKPOINT_REQUEST_IDS]]
-            self.next_action["request_ids_truncated"] = len(request_ids) > MAX_CHECKPOINT_REQUEST_IDS
-        if code == "unsafe_journal" and root is not None:
-            try:
-                canonical = sanitize_display(os.path.realpath(root), max_len=None)
-                self.next_action["path"] = sanitize_display(redact_command_secrets(canonical), max_len=DISPLAY_LIMIT)
-            except (OSError, ValueError):
-                self.next_action["path"] = "[canonical root unavailable]"
+_IN_FLIGHT_ACTION = {"actor": "owner", "command": "wait for the effect owner to exit, then reconcile by observation; never retry the effect"}
 
 
 @dataclass(frozen=True)
 class IntentReceipt:
     """One attempt's ownership, independent of the GitOpsJournal instance.
 
-    Every process that may perform the effect must hold this descriptor. Pass
-    inheritable_fds() to subprocess pass_fds; a child may finish with
-    record_result(effect_fd=fd), then must close its inherited copy. The parent
+    One custody holder retains this descriptor until all effect descendants exit.
+    inheritable_fds() exports a close-on-exec tuple; pass it as effect_fds to
+    the admitted transport. Effect programs receive no descriptor; the parent
     closes its receipt after all of its own effect activity has stopped.
     The shared lock descriptor is read-only: children cannot write checkpoints.
     Closing an abandoned receipt never grants a retry of the durable intent.
@@ -144,12 +100,8 @@ class IntentReceipt:
     _token: object = field(default=None, repr=False, compare=False)
 
     def inheritable_fds(self):
-        with _OWNER_GUARD:
-            held = _OWNERS.get(self._key)
-            if (not self.created or held is None or held[1] != os.getpid()
-                    or held[2] is not self._token):
-                raise GitOpsError("effect_busy")
-            return (held[0],)
+        from aegis_core import gitops_fds
+        return gitops_fds.export_receipt(self, _OWNERS, _OWNER_GUARD, GitOpsError)
 
     def release(self):
         with _refusals(None):
@@ -162,13 +114,6 @@ class IntentReceipt:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
-
-
-@dataclass(frozen=True)
-class JournalRead:
-    rows: list
-    skipped: int = 0
-    torn_tail: bool = False
 
 
 @dataclass(frozen=True)
@@ -206,15 +151,65 @@ def _pin_effect(effect_fd):
         os.close(closing)
 
 
-def _try_effect(directory, request_id, pinned_fd=None, *, new_intent=False):
-    name = "gitops-effect-" + hashlib.sha256(request_id.encode("ascii")).hexdigest() + ".lock"
+def _effect_name(request_id):
+    return "gitops-effect-" + hashlib.sha256(request_id.encode("ascii")).hexdigest() + ".lock"
+
+
+def _effect_named(directory, name, fd):
+    info = os.fstat(fd)
+    try:
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return (info.st_nlink == named.st_nlink == 1
+            and (info.st_dev, info.st_ino) == (named.st_dev, named.st_ino))
+
+
+def _try_effect(directory, request_id, pinned_fd=None, *, new_intent=False, existing_only=False):
+    # A waiter may have opened the old inode before compaction unlinked it.
+    # Reopen after flock rather than granting ownership of a detached inode.
+    for _ in range(3):
+        effect = _acquire_effect(directory, request_id, pinned_fd,
+                                 new_intent=new_intent, existing_only=existing_only)
+        if effect is not _RETIRED_EFFECT:
+            return effect
+    raise GitOpsError("journal_busy")
+
+
+_RETIRED_EFFECT = object()
+
+
+def _flock(fd, mode):
+    try:
+        fcntl.flock(fd, mode)
+    except OSError as error:
+        if error.errno in (errno.EBADF, errno.ENOLCK):
+            raise GitOpsError("unsupported_platform") from None
+        raise
+
+
+def _acquire_effect(directory, request_id, pinned_fd=None, *, new_intent=False, existing_only=False):
+    name = _effect_name(request_id)
     if new_intent:
         fd = _open_receipt_lock(directory, name)
     else:
-        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+        created = False
+        try:
+            if existing_only:
+                fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            else:
+                fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            if existing_only:
+                return None
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=directory)
+            created = True
     try:
+        if not new_intent and created:
+            os.fsync(directory)
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink not in (0, 1) or info.st_uid != os.geteuid():
             raise GitOpsError("unsafe_journal")
         if pinned_fd is not None:
             # record_result pinned this descriptor at entry, before any open.
@@ -238,16 +233,27 @@ def _try_effect(directory, request_id, pinned_fd=None, *, new_intent=False):
             inherited = None
             os.close(closing)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return None
-        except OSError as error:
-            if error.errno in (errno.EBADF, errno.ENOLCK):
-                raise GitOpsError("unsupported_platform") from None
-            raise
-        os.fchmod(fd, 0o600)
-        os.fsync(directory)
+            try:
+                _flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            _flock(fd, fcntl.LOCK_UN)
+            # Only a shared ownership probe blocked us. Reopen and briefly
+            # retry the exclusive claim, never misreport it as a live owner.
+            return _RETIRED_EFFECT
+        if not _effect_named(directory, name, fd):
+            if pinned_fd is not None:
+                raise GitOpsError("invalid_result", result_cause="descriptor")
+            return _RETIRED_EFFECT
+        if not existing_only:
+            os.fchmod(fd, 0o600)
         if new_intent:
+            # A failed prior admission may have created this checkpoint name
+            # without flushing it. The first successful admission must commit
+            # the namespace before its durable intent can authorize an effect.
+            os.fsync(directory)
             _clear_retired_checkpoint(directory, name, fd)
         owned, fd = fd, None
         return owned
@@ -264,22 +270,7 @@ def _open_receipt_lock(directory, name):
 
 
 def _clear_retired_checkpoint(directory, name, effect):
-    # Only record_intent reaches this, under the journal lock after proving
-    # there is no existing intent and while holding the read-only effect flock.
-    # A retired request's saved checkpoint must not become authoritative for
-    # the new intent; the writable descriptor must be the same inode.
-    info = os.fstat(effect)
-    if info.st_size == 0:
-        return
-    writable = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-    try:
-        fresh = os.fstat(writable)
-        if (fresh.st_dev, fresh.st_ino) != (info.st_dev, info.st_ino):
-            raise GitOpsError("unsafe_journal")
-        os.ftruncate(writable, 0)
-        os.fsync(writable)
-    finally:
-        os.close(writable)
+    return checkpoints.reset_retired(directory, name, effect, truncate=os.ftruncate, flush=os.fsync)
 
 
 def _release_owner(key, token=None):
@@ -300,179 +291,6 @@ def _receipt_guard():
         for key, token in granted:
             _release_owner(key, token)
         raise
-
-
-def _clean(text):
-    canonical = sanitize_display(text, max_len=None)
-    redacted = redact_command_secrets(canonical)
-    return CANDIDATE_TOKEN_RE.sub(
-        lambda match: "[REDACTED]" if is_high_entropy_secret(match.group()) else match.group(), redacted)
-
-
-def _text(value, limit, *, check_secrets=True):
-    return (type(value) is str and 0 < len(value) <= limit
-            and all(char.isprintable() for char in value)
-            and (not check_secrets or redact_command_secrets(value) == value))
-
-
-def _identifier(value, pattern=_ID):
-    return type(value) is str and 0 < len(value) <= 128 and pattern.fullmatch(value) is not None
-
-
-def _state(value, *, check_secrets=True):
-    if value is None:
-        return None
-    if type(value) is str and len(value) in (40, 64) and _OID.fullmatch(value):
-        return value
-    if type(value) is not dict or not 1 <= len(value) <= 12:
-        raise ValueError("state shape")
-    result, size = {}, 0
-    for key, child in value.items():
-        if type(key) is not str or len(key) > 16:
-            raise ValueError("state field")
-        if key in _STATE_TEXT:
-            if not _text(child, 1024, check_secrets=check_secrets):
-                raise ValueError("state text")
-            size += len(child)
-        elif key in _STATE_NUMBER:
-            if type(child) is not int or not 0 <= child <= 2 ** 63 - 1:
-                raise ValueError("state number")
-        elif key == "exists":
-            if type(child) is not bool:
-                raise ValueError("state presence")
-        else:
-            raise ValueError("unknown state field")
-        if size > 4096:
-            raise ValueError("state size")
-        result[key] = child
-    return result
-
-
-def display_row(value, _depth=0):
-    """Canonicalize, redact, then truncate every string, including dictionary keys.
-
-    Over-limit containers/fields are replaced by a fixed marker, never sliced
-    before redaction. This is display only, never an observation or identity key.
-    """
-    if _depth > 4:
-        return "[oversized]"
-    if type(value) is str:
-        if len(value) > MAX_ROW_BYTES:
-            return "[oversized]"
-        return sanitize_display(_clean(value), max_len=DISPLAY_LIMIT)
-    if type(value) is dict:
-        if len(value) > 32:
-            return "[oversized]"
-        return {display_row(key, _depth + 1): display_row(child, _depth + 1)
-                for key, child in value.items() if type(key) is str}
-    if value is None or type(value) in (bool, int):
-        return value
-    return "[invalid]"
-
-
-def _binding(op, lane, request_id, expected_old, expected_new, actor, *, check_secrets=True):
-    if (type(op) is not str or op not in OPS or not _identifier(lane, _LANE)
-            or not _identifier(request_id) or not _identifier(actor)):
-        raise ValueError("intent fields")
-    old = _state(expected_old, check_secrets=check_secrets)
-    new = _state(expected_new, check_secrets=check_secrets)
-    if old == new:
-        raise ValueError("indeterminate expected transition")
-    return old, new
-
-
-def _intent(op, lane, request_id, expected_old, expected_new, actor):
-    try:
-        old, new = _binding(op, lane, request_id, expected_old, expected_new, actor)
-    except ValueError:
-        raise GitOpsError("invalid_intent") from None
-    stamp = utc_stamp()
-    return dict(v=1, kind="intent", op=op, lane=lane, request_id=request_id,
-                expected_old=old, expected_new=new, actor=actor, created_at=stamp, ts=stamp)
-
-
-def _result_state(intent, status, observed, *, check_secrets=True):
-    if type(status) is not str or status not in ("done", "not_applied", "unknown"):
-        raise ValueError("status")
-    observed = _state(observed, check_secrets=check_secrets)
-    if ((status == "done" and observed != intent["expected_new"])
-            or (status == "not_applied" and observed != intent["expected_old"])):
-        raise ValueError("contradictory observation")
-    return observed
-
-
-def _result(intent, status, observed):
-    try:
-        observed = _result_state(intent, status, observed)
-    except ValueError:
-        raise GitOpsError("invalid_result", result_cause="observation") from None
-    return dict(intent, kind="result", status=status, observed=observed,
-                ts=max(utc_stamp(), intent["ts"]))
-
-
-def _pairs(pairs):
-    value = {}
-    for key, child in pairs:
-        if key in value:
-            raise ValueError("duplicate field")
-        value[key] = child
-    return value
-
-
-def _valid_row(row):
-    if type(row) is not dict or type(row.get("v")) is not int or row["v"] != 1:
-        return False
-    keys = _BASE_KEYS if row.get("kind") == "intent" else _BASE_KEYS | {"status", "observed"}
-    if row.keys() != keys or row["kind"] not in ("intent", "result"):
-        return False
-    try:
-        _binding(*(row[key] for key in ("op", "lane", "request_id", "expected_old", "expected_new", "actor")),
-                 check_secrets=False)
-        if any(not _text(row[key], 32, check_secrets=False) or parse_utc(row[key]) is None
-               for key in ("ts", "created_at")):
-            return False
-        if row["ts"] < row["created_at"]:
-            return False
-        if row["kind"] == "result":
-            _result_state(row, row["status"], row["observed"], check_secrets=False)
-        return True
-    except ValueError:
-        return False
-
-
-def _same_intent(left, right):
-    return all(left[key] == right[key] for key in _BASE_KEYS - {"kind", "ts"})
-
-
-def _parse(data):
-    if data.count(b"\n") > MAX_RECORD_LINES:
-        raise GitOpsError("journal_too_large")
-    rows, skipped, intents, results = [], 0, {}, set()
-    lines = data.split(b"\n")
-    torn = bool(data and not data.endswith(b"\n"))
-    for index, raw in enumerate(lines):
-        if index == len(lines) - 1 and not raw:
-            break
-        try:
-            # A complete JSON object without its newline is still uncommitted.
-            if len(raw) > MAX_ROW_BYTES or (torn and index == len(lines) - 1):
-                raise ValueError("line size or torn tail")
-            row = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs)
-            if not _valid_row(row):
-                raise ValueError("schema")
-            request = row["request_id"]
-            if row["kind"] == "intent":
-                if request in intents:
-                    raise ValueError("duplicate intent")
-                intents[request] = row
-            elif request not in intents or request in results or not _same_intent(row, intents[request]):
-                raise ValueError("orphan or conflicting result")
-            else:
-                results.add(request)
-            rows.append(row)
-        except (ValueError, UnicodeError, RecursionError):
-            skipped += 1
-    return JournalRead(rows, skipped, torn)
 
 
 @contextmanager
@@ -517,43 +335,6 @@ def _read_fd(fd):
     raise GitOpsError("journal_too_large")
 
 
-def _encoded(row):
-    return json.dumps(row, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")
-
-
-def _maximum_observation_bytes():
-    """Measure the largest legal state, including ensure_ascii surrogate pairs.
-
-    All four 19-digit numbers and false occupy more bytes than another text
-    key at the fixed 4096-character budget. Fill the remaining seven slots
-    with the longest text keys. Ref and oid are the two shortest keys.
-    """
-    maximum = {key: "\U00010000" * (1024 if key in ("branch", "lease_id", "head")
-                                    else 1021 if key == "base" else 1)
-               for key in _STATE_TEXT - {"oid", "ref"}}
-    maximum.update({key: 2 ** 63 - 1 for key in _STATE_NUMBER})
-    maximum["exists"] = False
-    return len(_encoded(maximum))
-
-
-MAX_OBSERVATION_BYTES = _maximum_observation_bytes()
-
-
-def _terminal_bytes(intent):
-    """Measure this intent's largest terminal row, including duplicated state.
-
-    Substitute the measured maximum observation for JSON null without allocating
-    that state for every pending intent. Bound observations also participate:
-    not_applied has a longer status than unknown. Timestamps retain the fixed
-    utc_stamp width (or a longer timestamp already present in stored intent).
-    """
-    unknown = len(_encoded(dict(intent, kind="result", status="unknown", observed=None)))
-    return max(unknown - len(b"null") + MAX_OBSERVATION_BYTES,
-               *(len(_encoded(dict(intent, kind="result", status=status, observed=state)))
-                 for status, state in (("done", intent["expected_new"]),
-                                       ("not_applied", intent["expected_old"]))))
-
-
 def _append(fd, row, size):
     payload = _encoded(row)
     if len(payload) > MAX_ROW_BYTES:
@@ -594,9 +375,104 @@ def _quarantine(fd, data):
 
 
 def _pending(rows, lane=None):
-    completed = {row["request_id"] for row in rows if row["kind"] == "result"}
+    completed = {row["request_id"] for row in rows if row["kind"] in ("result", "tombstone")}
     return [row for row in rows if row["kind"] == "intent" and row["request_id"] not in completed
             and (lane is None or row["lane"] == lane)]
+
+
+def _reconcile_pending(history, lane, request_id):
+    """Select before any per-request lock or observation checkpoint is touched."""
+    if request_id is not None:
+        history = [row for row in history if row["request_id"] == request_id]
+    return _pending(history, lane)
+
+
+def _admission_full(data, read, encoded, terminal_bytes):
+    pending = _pending(read.rows)
+    outstanding = len(pending) + 1
+    # Include each terminal newline and one durable quarantine marker.
+    reserved = terminal_bytes + 3 + sum(_terminal_bytes(old) + 3 for old in pending)
+    return (len(data) + len(encoded) + 1 + reserved > MAX_JOURNAL_BYTES
+            or data.count(b"\n") + 1 + 2 * outstanding > MAX_RECORD_LINES)
+
+
+def _retire_effect(directory, request_id, held=None):
+    """Caller proved terminal state under gitops.lock; never unlink a held effect."""
+    effect = os.dup(held) if held is not None else _try_effect(directory, request_id, existing_only=True)
+    if effect is None:
+        return
+    try:
+        name = _effect_name(request_id)
+        if _effect_named(directory, name, effect):
+            os.unlink(name, dir_fd=directory)
+        # Lock names/checkpoints carry no authority once the result is durable.
+        # A crash resurrecting this name is harmless; no directory flush needed.
+    finally:
+        os.close(effect)
+
+
+def _effect_held(directory, request_id):
+    """Probe ownership without changing filesystem contents or granting a retry."""
+    name = _effect_name(request_id)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink not in (0, 1) or info.st_uid != os.geteuid():
+            raise GitOpsError("unsafe_journal")
+        try:
+            _flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True if _effect_named(directory, name, fd) else None
+        try:
+            return False if _effect_named(directory, name, fd) else None
+        finally:
+            _flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _compact(directory, old_fd, read, data):
+    """Replace, never truncate, the active authority while holding gitops.lock."""
+    payload = rows.compacted(read, data=data, max_row_bytes=MAX_ROW_BYTES,
+                             max_journal_bytes=MAX_JOURNAL_BYTES, max_lines=MAX_RECORD_LINES)
+    if payload is None:
+        return None
+    parsed = _parse(payload)
+    if parsed.skipped != read.skipped:
+        raise GitOpsError("journal_io")
+    # A complete prior append can have failed its fsync. Flush the old whole
+    # journal too: a crash after replace but before directory fsync may restore
+    # that inode, and either generation must retain every terminal result.
+    os.fsync(old_fd)
+    name = ".gitops-compact-" + uuid.uuid4().hex
+    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 0o600, dir_fd=directory)
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(fd, remaining)
+            if count <= 0:
+                raise GitOpsError("journal_io")
+            remaining = remaining[count:]
+        os.fsync(fd)
+        os.replace(name, "gitops.jsonl", src_dir_fd=directory, dst_dir_fd=directory)
+        name = None
+        os.fsync(directory)
+        result, fd = (fd, payload, parsed), None
+        return result
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            if name is not None:
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
 
 
 def _committed_generation(fd, data, read, *, appended=0):
@@ -610,66 +486,14 @@ def _committed_generation(fd, data, read, *, appended=0):
 
 
 def _observation_checkpoint(effect, intent, *, result=None, reset=False, reserve=True, flush=True):
-    """Reserve one observation durably in its already-locked effect file.
-
-    Empty means unobserved; ! followed by a newline reserves the callback. A
-    complete result after that marker can be replayed into the journal. A torn
-    checkpoint refuses closed: even permanent storage failure or process death
-    after observation must never authorize another observation. An invalid or
-    unavailable callback response clears its reservation for a later pass, as
-    does a failed reservation before the callback has run (best effort).
-    The owner UID is trusted, just as for the journal and effect-lock inode.
-    """
     if reset:
-        os.ftruncate(effect, 0)
-        os.fsync(effect)
-        return None
+        return checkpoints.reset(effect, truncate=os.ftruncate, flush=os.fsync)
     if result is not None:
-        _append(effect, result, 2)
-        return result
-    size = os.fstat(effect).st_size
-    if size == 0:
-        if not reserve:
-            return None
-        # Admission reserved this capacity. Recheck before reserving/observing
-        # in case a caller changed the configured row bound since admission.
-        if _terminal_bytes(intent) > MAX_ROW_BYTES:
-            raise GitOpsError("invalid_result", result_cause="capacity")
-        os.lseek(effect, 0, os.SEEK_SET)
-        try:
-            if os.write(effect, b"!\n") != 2:
-                raise GitOpsError("journal_io")
-            os.fsync(effect)
-        except (OSError, GitOpsError):
-            # Observe has not run. Best-effort rollback restores liveness; a
-            # crash or failed cleanup still leaves a fail-closed reservation.
-            try:
-                os.ftruncate(effect, 0)
-                os.fsync(effect)
-            except OSError:
-                pass
-            raise
-        return None
-    if not 2 < size <= MAX_ROW_BYTES + 3:
-        raise GitOpsError("checkpoint_stuck")
-    os.lseek(effect, 0, os.SEEK_SET)
-    data = bytearray()
-    while len(data) < size:
-        chunk = os.read(effect, min(8192, size - len(data)))
-        if not chunk:
-            raise GitOpsError("checkpoint_stuck")
-        data.extend(chunk)
-    try:
-        if not data.startswith(b"!\n") or not data.endswith(b"\n") or data.count(b"\n") != 2:
-            raise ValueError("checkpoint framing")
-        row = json.loads(data[2:-1].decode("ascii"), object_pairs_hook=_pairs)
-        if not _valid_row(row) or row["kind"] != "result" or not _same_intent(row, intent):
-            raise ValueError("checkpoint binding")
-    except (ValueError, UnicodeError, RecursionError):
-        raise GitOpsError("checkpoint_stuck") from None
-    # A previous writer may have failed its fsync after writing a complete row.
-    if flush:
-        os.fsync(effect)
+        return checkpoints.publish(effect, result, append=_append)
+    row = checkpoints.inspect(effect, intent, max_row_bytes=MAX_ROW_BYTES, flush=os.fsync if flush else None)
+    if row is None and reserve:
+        checkpoints.reserve(effect, intent, max_row_bytes=MAX_ROW_BYTES,
+                            write=os.write, flush=os.fsync, truncate=os.ftruncate)
     return row
 
 
@@ -726,6 +550,12 @@ class GitOpsJournal:
             raise GitOpsError("unsafe_journal")
         self.common_dir = root
 
+    def _retire_completed_claim(self, directory, intent, effect):
+        with self._transaction(write=True, directory_fd=directory) as (_, _, read, _):
+            if any(row["kind"] == "tombstone" and _same_intent(row, intent)
+                   for row in read.rows):
+                _retire_effect(directory, intent["request_id"], held=effect)
+
     @contextmanager
     def _transaction(self, write=False, *, directory_fd=None):
         with _refusals(self.common_dir):
@@ -738,8 +568,12 @@ class GitOpsJournal:
                 with lock:
                     try:
                         if write:
-                            fd = os.open("gitops.jsonl", os.O_RDWR | os.O_CREAT |
-                                         os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+                            try:
+                                fd = os.open("gitops.jsonl", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                             dir_fd=directory)
+                            except FileNotFoundError:
+                                fd = os.open("gitops.jsonl", os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                                             os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
                         else:
                             fd = os.open("gitops.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                                          dir_fd=directory)
@@ -748,25 +582,29 @@ class GitOpsJournal:
                             raise
                         yield None, b"", JournalRead([]), directory
                         return
-                    try:
+                    with ExitStack() as handles:
+                        handles.callback(os.close, fd)
                         info = os.fstat(fd)
-                        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        if (not stat.S_ISREG(info.st_mode) or info.st_nlink not in ((1,) if write else (0, 1))
                                 or info.st_uid != os.geteuid()):
                             raise GitOpsError("unsafe_journal")
                         if write:
                             os.fchmod(fd, 0o600)
+                            # An earlier replace may have survived without its
+                            # directory fsync. Commit that namespace before any
+                            # writer acknowledges new or replayed result bytes.
                             os.fsync(directory)
                         data = _read_fd(fd)
                         if write:
                             data = _quarantine(fd, data)
-                        yield fd, data, _parse(data), directory
-                    finally:
-                        os.close(fd)
+                        read = _parse(data, capture=write)
+                        yield fd, data, read, directory
 
     def read(self):
-        """Bounded strict-schema read; malformed/torn rows are skipped and counted."""
+        """Bounded public history; compacted terminal rows retain result semantics."""
         with self._transaction() as (_, _, read, _):
-            return read
+            return JournalRead([rows.as_result(row) if row["kind"] == "tombstone" else row
+                                for row in read.rows], read.skipped, read.torn_tail)
 
     def open_intents(self, lane=None):
         """Intents with no result. Unknown results stay terminal and are not retried."""
@@ -774,24 +612,56 @@ class GitOpsJournal:
             raise GitOpsError("invalid_request")
         return _pending(self.read().rows, lane)
 
+    def in_flight(self, lane=None):
+        """Read-only live ownership query, including held rows from this reconcile.
+
+        Shared probes never create files or retain execution ownership.
+        A retired/missing name gets one anchored journal refresh.
+        """
+        if lane is not None and not _identifier(lane, _LANE):
+            raise GitOpsError("invalid_request")
+        reported = []
+        with self._transaction() as (_, _, read, directory):
+            for intent in _pending(read.rows, lane):
+                request = intent["request_id"]
+                held = _effect_held(directory, request)
+                if held is None:
+                    with self._transaction(directory_fd=directory) as (_, _, fresh, _):
+                        current = next((row for row in _pending(fresh.rows, lane)
+                                        if row["request_id"] == request), None)
+                    held = current is not None
+                    if current is not None:
+                        intent = current
+                if held:
+                    reported.append(dict(intent, kind="in_flight", status="in_flight",
+                                         next_action=dict(_IN_FLIGHT_ACTION)))
+        return reported
+
     def record_intent(self, *, op, lane, request_id, expected_old, expected_new, actor):
         row = _intent(op, lane, request_id, expected_old, expected_new, actor)
         encoded, terminal_bytes = _encoded(row), _terminal_bytes(row)
         if max(len(encoded), terminal_bytes) > MAX_ROW_BYTES:
             raise GitOpsError("invalid_intent")
-        with _receipt_guard() as granted, self._transaction(write=True) as (fd, data, read, directory):
+        with _receipt_guard() as granted, self._transaction(write=True) as (fd, data, read, directory), \
+                ExitStack() as replacements:
             for old in read.rows:
-                if old["kind"] == "intent" and old["request_id"] == request_id:
-                    if any(old[key] != row[key] for key in _BASE_KEYS - {"ts", "created_at"}):
+                if old["kind"] in ("intent", "tombstone") and old["request_id"] == request_id:
+                    original = rows.as_intent(old)
+                    if any(original[key] != row[key] for key in _BASE_KEYS - {"ts", "created_at"}):
                         raise GitOpsError("request_conflict")
-                    return IntentReceipt(old, False)
-            pending = _pending(read.rows)
-            outstanding = len(pending) + 1
-            # Include each terminal newline and one durable quarantine marker.
-            reserved = terminal_bytes + 3 + sum(_terminal_bytes(old) + 3 for old in pending)
-            if (len(data) + len(encoded) + 1 + reserved > MAX_JOURNAL_BYTES
-                    or data.count(b"\n") + 1 + 2 * outstanding > MAX_RECORD_LINES):
-                raise GitOpsError("journal_capacity")
+                    return IntentReceipt(original, False)
+            if _admission_full(data, read, encoded, terminal_bytes):
+                compacted = _compact(directory, fd, read, data)
+                if compacted is not None:
+                    fd, data, read = compacted
+                    replacements.callback(os.close, fd)
+                    for old in read.rows:
+                        if old["kind"] == "tombstone":
+                            _retire_effect(directory, old["request_id"])
+                # One rewrite and one retry only. Full tombstones/open intents
+                # remain authoritative; failed capacity never grants an effect.
+                if _admission_full(data, read, encoded, terminal_bytes):
+                    raise GitOpsError("journal_capacity")
             key = _effect_key(directory, request_id)
             effect = _try_effect(directory, request_id, new_intent=True)
             if effect is None:
@@ -831,7 +701,7 @@ class GitOpsJournal:
         with _refusals(self.common_dir), _pin_effect(effect_fd) as pinned, \
                 self._transaction(write=True) as (fd, data, read, directory):
             intent = next((row for row in read.rows
-                           if row["kind"] == "intent" and row["request_id"] == request_id), None)
+                           if row["kind"] in ("intent", "tombstone") and row["request_id"] == request_id), None)
             if intent is None:
                 raise GitOpsError("missing_intent")
             key = _effect_key(directory, request_id)
@@ -839,12 +709,12 @@ class GitOpsJournal:
                 raise GitOpsError("invalid_result", result_cause="receipt")
             row = _result(intent, status, observed)
             for old in read.rows:
-                if old["kind"] == "result" and old["request_id"] == request_id:
+                if old["kind"] in ("result", "tombstone") and old["request_id"] == request_id:
                     if old["status"] != status or old["observed"] != row["observed"]:
                         raise GitOpsError("result_conflict", result_cause="durable")
                     os.fsync(fd)
                     _release_owner(key)
-                    return old
+                    return rows.as_result(old)
             with _OWNER_GUARD:
                 held = _OWNERS.get(key)
                 owned = (held is not None and held[1] == os.getpid()
@@ -900,7 +770,37 @@ class GitOpsJournal:
             _observation_checkpoint(effect, intent, result=row)
             return row
 
-    def reconcile(self, lane, observe):
+    def _record_observations(self, directory, lane, observations):
+        for attempt in range(FINAL_RECORD_ATTEMPTS):
+            try:
+                with _refusals(self.common_dir), self._transaction(
+                        write=True, directory_fd=directory) as (fd, data, read, _):
+                    completed = {row["request_id"]: rows.as_result(row) for row in read.rows
+                                 if row["kind"] in ("result", "tombstone")}
+                    size, recorded = len(data), []
+                    replayed = False
+                    for row in observations:
+                        old = completed.get(row["request_id"])
+                        if old is None:
+                            size = _append(fd, row, size)
+                        else:
+                            replayed = True
+                            if (not _same_intent(old, row) or old["status"] != row["status"]
+                                    or old["observed"] != row["observed"]):
+                                raise GitOpsError("result_conflict", result_cause="durable")
+                        recorded.append(old if old is not None else row)
+                    if replayed:
+                        os.fsync(fd)
+                    next_generation = _committed_generation(fd, data, read, appended=size - len(data))
+                    next_cached = {row["request_id"]: row for row in
+                                   _pending(read.rows + recorded, lane)}
+                return next_cached, next_generation, recorded
+            except GitOpsError as error:
+                if (error.code not in ("journal_busy", "journal_io")
+                        or attempt + 1 == FINAL_RECORD_ATTEMPTS):
+                    raise
+
+    def reconcile(self, lane, observe, *, request_id=None):
         """Observe abandoned requests outside the journal lock; never run effects.
 
         ``observe(intent) -> Observation`` must only read external state. Its
@@ -913,44 +813,53 @@ class GitOpsJournal:
         or checkpoints needing the owner's explicit record_result recovery.
         Claims use eight-descriptor batches and three final-record attempts under
         those locks; exhausted retries leave durable checkpoints for recovery.
+        With request_id, only that request is claimed, observed and recorded.
+        Without it, reconcile the whole lane. Concurrent completion can return
+        no rows; the caller may then read the request's durable terminal history.
         """
-        if not _identifier(lane, _LANE) or not callable(observe):
+        if (not _identifier(lane, _LANE) or not callable(observe)
+                or (request_id is not None and not _identifier(request_id))):
             raise GitOpsError("invalid_request")
         results = []
         blocked, deferred = [], None
         with _refusals(self.common_dir), _directory(self.common_dir, True) as directory:
             with self._transaction(write=True, directory_fd=directory) as (fd, data, read, _):
-                pending = _pending(read.rows, lane)
+                pending = _reconcile_pending(read.rows, lane, request_id)
                 cached = {row["request_id"]: row for row in pending}
                 generation = _committed_generation(fd, data, read)
             pending.sort(key=lambda row: row["request_id"])
             for start in range(0, len(pending), RECONCILE_BATCH_SIZE):
                 with ExitStack() as effects:
-                    claimed = []
+                    claimed, unclaimed = [], []
                     # Claim the whole bounded batch before observing. Writers
                     # probe effects nonblockingly even under the journal lock.
                     for intent in pending[start:start + RECONCILE_BATCH_SIZE]:
-                        effect = _try_effect(directory, intent["request_id"])
+                        effect = _try_effect(directory, intent["request_id"], existing_only=True)
                         if effect is not None:
                             effects.callback(os.close, effect)
                             claimed.append((intent, effect))
-                    if not claimed:
-                        continue
+                        else:
+                            unclaimed.append(intent)
                     # Only lock-held snapshots seed the cache; refresh for this batch alone.
-                    current = cached
+                    current, compacted_requests = cached, set()
                     try:
                         info = os.stat("gitops.jsonl", dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
                         raise GitOpsError("journal_io") from None
-                    if (info.st_dev, info.st_ino, info.st_size) != generation:
+                    if unclaimed or (info.st_dev, info.st_ino, info.st_size) != generation:
                         with self._transaction(directory_fd=directory) as (fd, _, read, _):
                             if fd is None:
                                 raise GitOpsError("journal_io")
-                            current = {row["request_id"]: row for row in _pending(read.rows, lane)}
+                            current = {row["request_id"]: row for row in
+                                       _reconcile_pending(read.rows, lane, request_id)}
+                            compacted_requests = {row["request_id"] for row in read.rows
+                                                  if row["kind"] == "tombstone"}
                     observations = []
                     for intent, effect in claimed:
                         live = current.get(intent["request_id"])
                         if live is None or not _same_intent(live, intent):
+                            if intent["request_id"] in compacted_requests:
+                                self._retire_completed_claim(directory, intent, effect)
                             continue
                         try:
                             row = self._observe_once(effect, intent, observe)
@@ -966,34 +875,13 @@ class GitOpsJournal:
                             observations.append(row)
                     if not observations:
                         continue
-                    for attempt in range(FINAL_RECORD_ATTEMPTS):
-                        try:
-                            with _refusals(self.common_dir), self._transaction(
-                                    write=True, directory_fd=directory) as (fd, data, read, _):
-                                completed = {row["request_id"]: row for row in read.rows
-                                             if row["kind"] == "result"}
-                                size, recorded = len(data), []
-                                for row in observations:
-                                    old = completed.get(row["request_id"])
-                                    if old is None:
-                                        size = _append(fd, row, size)
-                                    elif (not _same_intent(old, row) or old["status"] != row["status"]
-                                          or old["observed"] != row["observed"]):
-                                        raise GitOpsError("result_conflict", result_cause="durable")
-                                    recorded.append(old if old is not None else row)
-                                os.fsync(fd)
-                                next_generation = _committed_generation(fd, data, read, appended=size - len(data))
-                                next_cached = {row["request_id"]: row for row in
-                                               _pending(read.rows + recorded, lane)}
-                            cached, generation = next_cached, next_generation
-                            results.extend(recorded)
-                            break
-                        except GitOpsError as error:
-                            if (error.code not in ("journal_busy", "journal_io")
-                                    or attempt + 1 == FINAL_RECORD_ATTEMPTS):
-                                raise
+                    cached, generation, recorded = self._record_observations(directory, lane, observations)
+                    results.extend(recorded)
             if blocked:
-                raise GitOpsError("checkpoint_stuck", request_ids=blocked)
+                error = GitOpsError("checkpoint_stuck", request_ids=blocked)
+                error.results = results
+                raise error
             if deferred is not None:
+                deferred.results = results
                 raise deferred
         return results
