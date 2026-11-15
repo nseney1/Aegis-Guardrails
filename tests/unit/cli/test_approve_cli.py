@@ -154,8 +154,9 @@ def test_approve_and_ci_use_the_same_branch_policy_despite_a_tag(tmp_path, _poli
         check = json.loads(capsys.readouterr().out)
         assert rc == (1 if expected_mode == "signature" else 0) and check["scope"]["base"] == expected_base
         assert check["approval_mode"] == expected_mode
-        assert check["owner_review_required"]
-        assert all(row["code"] == "approval_mode_lowered" for row in check["owner_review_required"])
+        assert check["owner_review_required"] is (expected_mode == "review")
+        assert check["owner_review_findings"]
+        assert all(row["code"] == "approval_mode_lowered" for row in check["owner_review_findings"])
         assert repo.head() == head
 
 
