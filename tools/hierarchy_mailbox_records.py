@@ -415,13 +415,11 @@ class _RecordAccess:
     """The grant index is authority; mailbox bodies are only locators, never grants."""
     def __init__(self, codec, store, root, sender, *, rollback=False):
         self.codec, self.store, self.endpoint = codec, store, sender["from"]
-        self.original_read, self.cache = store.read, {}
-        self.io = codec.Budget(codec.MAX_REF_BYTES)
+        self.reader = codec.ReadContext(store, self.authorize)
+        self.io = self.reader.io
         self.root = _root_identity(codec, root)
         # Read paths keep the authorization fact. Publication keeps entry and raw bytes.
         self.rollback, self.facts, self.entries, self.activations = rollback, {}, {}, {}
-        # Per-instance bindings preserve the core's exact Store type contract.
-        store.read, store.describe = self.read, self.describe
 
     def authorize(self, rid):
         codec = self.codec
@@ -463,29 +461,7 @@ class _RecordAccess:
             self.read(rid)
 
     def read(self, rid, *, _budget=None):
-        entry = self.authorize(rid)
-        if rid not in self.cache:
-            # Both the per-call I/O ceiling and the codec view's budget apply before reading.
-            budget = self.codec.Budget(self.io.limit - self.io.used, parent=_budget)
-            try:
-                value = self.original_read(rid, _budget=budget)
-            except self.codec.CodecError as error:
-                if error.code == "E_REF":
-                    raise self.codec.CodecError("E_AUTH", detail="reference") from None
-                raise
-            self.io.charge(budget.used)
-            self.codec.require(value["meta"] == entry["author"] and value["kind"] == entry["kind"],
-                               "E_AUTH", detail="reference")
-            self.cache[rid] = (value, budget.used)
-        else:
-            value, size = self.cache[rid]
-            if _budget is not None:
-                _budget.charge(size)
-        return self.cache[rid][0]
-
-    def describe(self, rid, *, _budget=None):
-        value = self.read(rid, _budget=_budget)
-        return {"ref": rid[:16], "kind": value["kind"], "chars": self.cache[rid][1]}
+        return self.reader.read(rid, _budget=_budget)
 
 
 def _grant_changes(codec, access, value, recipient):
@@ -601,8 +577,8 @@ def _stub_id(codec, message):
     return match.group(1)
 
 
-def _read(codec, store, message):
-    value = store.read(_stub_id(codec, message))
+def _read(codec, access, message):
+    value = access.read(_stub_id(codec, message))
     _check_stub(codec, value, message)
     return value
 
@@ -635,18 +611,19 @@ def _check_stub(codec, value, message):
 
 
 def _view(codec, store, message, options, access):
-    value = _read(codec, store, message)
+    value = _read(codec, access, message)
     return _value_view(codec, store, message, value, options, access)
 
 
 def _value_view(codec, store, message, value, options, access):
     # Share read_view's record-specific validation without describing any child.
-    codec._options(value, store=store, unknown={}, **options)
+    reader = access.reader if access is not None else store
+    codec.prepare_read(value, store=reader, **options)
     if access is not None:
         access.authorize_refs(value, options)
     else:
         codec.require(not value["refs"], "E_AUTH", detail="reference")
-    view = json.loads(codec.read_view(value, store=store, **options))
+    view = json.loads(codec.read_view(value, store=reader, **options))
     if message is not None:
         view["mailbox_from"] = message["from"]
     view["attribution"] = "match" if message is not None else "grant-index"
@@ -654,9 +631,9 @@ def _value_view(codec, store, message, value, options, access):
 
 
 def _reference_view(codec, store, access, reference, options):
-    value = store.read(reference)
+    value = access.read(reference)
     # Share read_view's record-specific validation without describing any child.
-    planned = codec._options(value, store=store, unknown={}, **options)
+    planned = codec.prepare_read(value, store=access.reader, **options).planned
     try:
         for child in _reference_ids(codec, value, options):
             access.authorize(child)
@@ -870,7 +847,7 @@ def publish(codec, mailbox, sender, arguments):
         codec.require(all(original[key] == sender[key]
                           for key in ("from", "host", "session", "binding_generation")), "E_AUTH", detail="message_id")
         with _reader(codec, mailbox.root, original, sender) as (store, _access):
-            stored = _read(codec, store, original)
+            stored = _read(codec, _access, original)
             value = codec.compose(arguments["kind"], raw, dict(meta, created_at=stored["meta"]["created_at"]))
             request["body"] = _stub(codec, value)
             codec.require(all(original.get(k) == v for k, v in request.items()) and
