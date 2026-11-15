@@ -2425,7 +2425,7 @@ MR1C_ROLE_NEXT_ACTIONS = [
 
 @pytest.mark.parametrize("name,suffix", MR1C_ROLE_NEXT_ACTIONS)
 @pytest.mark.parametrize("state", ["unprobed", "rejected"])
-def test_mr1c_registry_roles_offer_only_caller_selectable_next_actions(team, mr1_cli, name, suffix, state):
+def test_mr1c_registry_roles_offer_only_caller_selectable_next_actions(request, mr1_cli, name, suffix, state):
     from concurrent.futures import ThreadPoolExecutor
     module, _ = mr1_cli
     roles = module.hierarchy_roles.registry()["roles"]
@@ -2434,6 +2434,7 @@ def test_mr1c_registry_roles_offer_only_caller_selectable_next_actions(team, mr1
     if entry["endpoint"] is None:
         assert suffix is None  # These roles have no host session or model resolution.
         return
+    team = request.getfixturevalue("team")
     kind = entry["endpoint"].get("lane_kind", entry["endpoint"]["role"])
     mr1_plan(team, "codex-cli")
     data = mr1_bindings()

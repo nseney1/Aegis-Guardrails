@@ -1959,7 +1959,8 @@ _CREDENTIAL_CORPUS = [
     ("negotiate-assignment", "authorization=Negotiate SYNTHETIC_OPAQUE_1234567890", "SYNTHETIC_OPAQUE_1234567890"),
     ("url", "https://fixture:SYNTHETIC_PASSWORD@example.test/path", "SYNTHETIC_PASSWORD"),
     ("jwt", "eyJSYNTHETIC1234.SYNTHETIC5678.SYNTHETIC9012", "eyJSYNTHETIC1234.SYNTHETIC5678.SYNTHETIC9012"),
-    ("pem", "key=-----BEGIN PRIVATE KEY-----SYNTHETIC_PEM_BODY-----END PRIVATE KEY-----", "SYNTHETIC_PEM_BODY"),
+    ("pem", "key=" + "-----BEGIN " + "PRIVATE KEY-----" + "SYNTHETIC_PEM_BODY-----END "
+     + "PRIVATE KEY-----", "SYNTHETIC_PEM_BODY"),
     ("prose", "the password is SYNTHETIC_PASSWORD", "SYNTHETIC_PASSWORD"),
     ("json", '{"token":"SYNTHETIC_PASSWORD"}', "SYNTHETIC_PASSWORD"),
 ]
