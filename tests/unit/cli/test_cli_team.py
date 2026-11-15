@@ -3,7 +3,7 @@
 The dispatcher runs these. Text mode prints the new lease oid alone on stdout (so a
 script can pass it to ``--expect``); ``--json`` prints one document carrying
 ``source``, ``aegis_version``, ``checked_at`` and ``scope``. Exit codes: 0 done, 1
-refused (taken, overlap, stale, absent, expired, unreadable) or a git error, 2 usage.
+refused (CLAIM_REFUSALS, including legacy_paths) or a git error, 2 usage.
 ``list`` and ``metrics`` are side-effect free. Real temp git repositories throughout.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ import pytest
 
 from aegis_cli.cli import main
 from aegis_core import events, team, team_queue, team_lease_custody
+from aegis_core import gitsafe as rendering_git
 from aegis_core._version import __version__
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -1168,3 +1169,452 @@ def test_pathname_repository_identity_change_refuses_and_retries(ws, capsys, mon
     assert _ref(ws, "docs") == _ref(other, "docs") == old.oid
     assert _json(capsys, *args)[0] == 0
     assert _ref(other, "docs") == old.oid
+
+
+# ── lease refusal reasons are one source with the core ───────────────────────
+
+_LEGACY_SECRET = "docs/token=secret src/**"
+
+
+def _core_lease_reasons():
+    """Every LeaseRefused reason literal in the core, the one refusal set."""
+    import ast
+
+    root = Path(__file__).resolve().parents[3] / "aegis_core"
+    reasons = set()
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "LeaseRefused":
+                continue
+            reason = None
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                if isinstance(node.args[1].value, str):
+                    reason = node.args[1].value
+            for keyword in node.keywords:
+                if keyword.arg == "reason" and isinstance(keyword.value, ast.Constant):
+                    if isinstance(keyword.value.value, str):
+                        reason = keyword.value.value
+            if reason is None:
+                raise AssertionError(f"LeaseRefused reason is not a literal at {path}:{node.lineno}")
+            reasons.add(reason)
+    return reasons
+
+
+def _plant_blob(repo: Path, lane: str, payload) -> str:
+    raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    oid = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=str(repo), input=raw,
+                         capture_output=True, check=True).stdout.decode().strip()
+    _git(repo, "update-ref", f"refs/aegis/lanes/{lane}", oid)
+    return oid
+
+
+def _fresh_repo(parent: Path, name: str) -> Path:
+    root = parent / name
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    (root / ".aegis").mkdir()
+    (root / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "init")
+    return root.resolve()
+
+
+def _refusal_argv(repo: Path, reason: str):
+    """Drive one core reason through the public CLI. The repo stays writable."""
+    if reason == "absent":
+        return ["release", "docs", "--expect", "a" * 40]
+    if reason == "expired":
+        old = team.claim(repo, "docs", ["docs/**"], owner="a@h", ttl_s=60, now=NOW)
+        return ["transfer", "docs", "--expect", old.oid, "--owner", "b@h"]
+    if reason == "legacy_paths":
+        oid = _plant_blob(repo, "docs", {
+            "v": 1, "lane": "docs", "role": "implementer", "owner": "o@h",
+            "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+            "paths": [_LEGACY_SECRET], "ts": int(time.time()), "ttl_s": 3600,
+        })
+        return ["renew", "docs", "--expect", oid]
+    if reason == "overlap":
+        team.claim(repo, "api", ["src/**"], owner="o@h")
+        return ["claim", "core", "--paths", "src/core/**", "--owner", "o@h"]
+    if reason == "stale":
+        first = team.claim(repo, "docs", ["docs/**"], owner="a@h")
+        team.renew(repo, "docs", first.oid)
+        return ["renew", "docs", "--expect", first.oid]
+    if reason == "taken":
+        team.claim(repo, "docs", ["docs/**"], owner="holder@box")
+        return ["claim", "docs", "--paths", "docs/**", "--owner", "late@box"]
+    if reason == "unreadable":
+        oid = _plant_blob(repo, "docs", b"junk")
+        return ["renew", "docs", "--expect", oid]
+    raise AssertionError("no CLI driver for " + reason)
+
+
+def _invoke(root: Path, *argv: str):
+    from contextlib import redirect_stderr, redirect_stdout
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = main(["--workspace", str(root), "team", *argv])
+    return code, out.getvalue(), err.getvalue()
+
+
+def _concurrent_refusal_cli(root, argv, *, unavailable_view=False):
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    script = (
+        "import json,sys\n"
+        "from aegis_core import gitsafe,team\n"
+        "from aegis_cli.cli import main\n"
+        "def unavailable(*args,**kwargs):\n"
+        "    raise gitsafe.GitError('view unavailable')\n"
+        "if sys.argv[2] == '1':\n"
+        "    team.describe = unavailable\n"
+        "sys.exit(main(json.loads(sys.argv[1])))\n"
+    )
+
+    def once(_slot):
+        return subprocess.run(
+            [sys.executable, "-c", script, json.dumps(["--workspace", str(root), "team", *argv]),
+             "1" if unavailable_view else "0"],
+            cwd=str(Path(__file__).resolve().parents[3]), capture_output=True, text=True, timeout=30)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(once, range(3)))
+
+
+def test_claim_refusal_text_is_the_core_reason_set(ws: Path):
+    """Each core lease reason exits 1 with its fixed text; legacy paths are not echoed."""
+    from aegis_cli import team as cli_team
+    from aegis_core.primitives import utc_stamp
+
+    reasons = _core_lease_reasons()
+    assert cli_team.CLAIM_REFUSALS == {reason: reason + ":" for reason in reasons}
+    assert "legacy_paths" in reasons
+    held = {}
+    for reason in sorted(reasons):
+        repo = _fresh_repo(ws, reason)
+        argv = _refusal_argv(repo, reason)
+        lane = "core" if reason == "overlap" else "docs"
+        current = _ref(repo, lane)
+        expected = {
+            "absent": "absent: lane docs has no lease",
+            "expired": f"expired: lane docs's lease expired at {utc_stamp(NOW + 60)}; claim or renew it instead",
+            "legacy_paths": ("legacy_paths: lane docs has legacy whitespace paths; "
+                             f"release docs --expect {current}, then claim each path as its own entry"),
+            "overlap": "overlap: lane core may overlap live lease(s) of api",
+            "stale": f"stale: lane docs holds {current}, not {argv[-1]}",
+            "taken": f"taken: lane docs is leased (oid {current})",
+            "unreadable": (f"unreadable: lane docs holds {current}, which is no readable lease; "
+                           f"release it with --expect {current}"),
+        }[reason]
+        code, out, err = _invoke(repo, *argv)
+        assert code == 1, (reason, out, err)
+        fixed = cli_team.CLAIM_REFUSALS[reason]
+        assert err.splitlines()[0] == expected, (reason, err)
+        assert _LEGACY_SECRET not in out + err
+        assert _ref(repo, lane) == current
+        code, out, err = _invoke(repo, *argv, "--json")
+        assert (code, err) == (1, ""), (reason, err)
+        payload = json.loads(out)
+        assert payload["reason"] == reason
+        assert payload["message"] == expected
+        assert _LEGACY_SECRET not in out
+        assert _ref(repo, lane) == current
+        if reason == "legacy_paths":
+            assert payload["lease"] is None
+            assert payload["message"].endswith("claim each path as its own entry")
+            code, out, err = _invoke(repo, "transfer", "docs", "--expect", _ref(repo, "docs"),
+                                     "--owner", "n@h")
+            assert code == 1 and err.startswith(fixed) and _LEGACY_SECRET not in out + err
+        held[reason] = (lane, _ref(repo, lane))
+    # Retry uses the lease left by the first refusal and must not write another.
+    retry = {
+        "absent": ["release", "docs", "--expect", "a" * 40],
+        "expired": ["transfer", "docs", "--expect", "{oid}", "--owner", "c@h"],
+        "legacy_paths": ["renew", "docs", "--expect", "{oid}"],
+        "overlap": ["claim", "core", "--paths", "src/core/**", "--owner", "o@h"],
+        "stale": ["renew", "docs", "--expect", "b" * 40],
+        "taken": ["claim", "docs", "--paths", "docs/**", "--owner", "again@box"],
+        "unreadable": ["renew", "docs", "--expect", "{oid}"],
+    }
+    assert set(retry) == reasons
+    for reason, (lane, oid) in held.items():
+        argv = [part.replace("{oid}", oid or "") for part in retry[reason]]
+        code, out, err = _invoke(ws / reason, *argv, "--json")
+        assert code == 1 and json.loads(out)["reason"] == reason, (reason, out, err)
+        assert _LEGACY_SECRET not in out + err
+        assert _ref(ws / reason, lane) == oid
+
+
+@pytest.mark.parametrize("action", ["renew", "transfer"])
+def test_legacy_paths_refusal_survives_view_failure_retry_and_concurrency(ws: Path, monkeypatch, action):
+    """Display failure, a second caller, and overlapping callers still exit 1."""
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo = _fresh_repo(ws, "legacy")
+    oid = _plant_blob(repo, "docs", {
+        "v": 1, "lane": "docs", "role": "implementer", "owner": "o@h",
+        "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+        "paths": [_LEGACY_SECRET], "ts": int(time.time()), "ttl_s": 3600,
+    })
+    argv = [action, "docs", "--expect", oid]
+    if action == "transfer":
+        argv.extend(["--owner", "n@h"])
+
+    def boom(*_args, **_kwargs):
+        raise OSError("token=secret view failed")
+
+    original = team.describe
+    monkeypatch.setattr(team, "describe", boom)
+    try:
+        for _ in range(2):
+            code, out, err = _invoke(repo, *argv)
+            assert code == 1 and err.startswith("legacy_paths:")
+            assert "token=secret" not in out + err and "view failed" not in out + err
+            code, out, err = _invoke(repo, *argv, "--json")
+            payload = json.loads(out)
+            assert (code, err, payload["reason"], payload["lease"]) == (1, "", "legacy_paths", None)
+            assert "token=secret" not in out
+            assert _ref(repo, "docs") == oid
+    finally:
+        monkeypatch.setattr(team, "describe", original)
+
+    def once(_slot):
+        # Separate processes: lease_operation redirects this process's stdout.
+        script = "import json,sys\nfrom aegis_cli.cli import main\nsys.exit(main(json.loads(sys.argv[1])))\n"
+        result = subprocess.run([sys.executable, "-c", script, json.dumps(
+            ["--workspace", str(repo), "team", *argv])], capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parents[3]), timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        raced = list(pool.map(once, range(3)))
+    assert [code for code, _out, _err in raced] == [1, 1, 1]
+    assert all(err.startswith("legacy_paths:") and _LEGACY_SECRET not in out + err
+               for _code, out, err in raced)
+    assert _ref(repo, "docs") == oid
+    code, out, err = _invoke(repo, *argv, "--json")
+    assert code == 1 and json.loads(out)["reason"] == "legacy_paths"
+    assert _ref(repo, "docs") == oid
+
+
+def test_unknown_lease_reason_exits_1_without_echoing_input(ws: Path, monkeypatch, capsys):
+    """A reason outside the core set is fixed text, never the exception or a joined line."""
+    def refused(*_args, **_kwargs):
+        raise team.LeaseRefused("token=secret\nstill secret", "not_a_core_reason", "docs")
+
+    monkeypatch.setattr(team, "claim", refused)
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h")
+    assert rc == 1 and out == "" and err == "refused\n"
+    rc, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", "--owner", "o@h", "--json")
+    assert rc == 1 and err == ""
+    payload = json.loads(out)
+    assert payload["reason"] == "not_a_core_reason"
+    assert payload["message"] == "refused"
+    assert "token=secret" not in out + err
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("taken: token=private-marker", "taken: token=REDACTED"),
+    ("taken: token=private\x1b[31m-marker", "taken: token=REDACTED"),
+    ("taken: token=private-marker\nsecond line", "taken:"),
+    ("taken: token=private-marker\rsecond line", "taken:"),
+], ids=["secret", "canonical-secret", "newline", "carriage-return"])
+def test_known_refusal_message_is_safe(ws, capsys, monkeypatch, message, expected):
+    def refused(*_args, **_kwargs):
+        raise team.LeaseRefused(message, "taken", "docs")
+
+    monkeypatch.setattr(team, "claim", refused)
+    for mode in ([], ["--json"]):
+        code, out, err = _run(capsys, "claim", "docs", "--paths", "docs/**", *mode)
+        assert code == 1
+        if mode:
+            assert err == ""
+            assert json.loads(out)["message"] == expected
+        else:
+            assert (out, err) == ("", expected + "\n")
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["ten-live-leases", "three-legacy-leases"])
+def test_long_overlap_refusal_preserves_complete_message(ws, mode, legacy):
+    """Long existing refusals retain every lane and complete recovery command."""
+    lanes = []
+    held = {}
+    commands = []
+    for index in range(3 if legacy else 10):
+        lane = f"lane{index:02d}-".ljust(63, "a")
+        lanes.append(lane)
+        if legacy:
+            oid = _plant_blob(ws, lane, {
+                "v": 1, "lane": lane, "role": "implementer", "owner": "o@h",
+                "claim_id": "0123456789abcdef", "gen": 1, "branch": None,
+                "paths": [f"scope{index}/one/** scope{index}/two/**"],
+                "ts": int(time.time()), "ttl_s": 3600,
+            })
+            commands.append(f"release {lane} --expect {oid}")
+        else:
+            oid = team.claim(ws, lane, [f"scope{index}/**"], owner="o@h").oid
+        held[lane] = oid
+    assert all(len(lane) == 63 for lane in lanes)
+    expected = "overlap: lane core may overlap live lease(s) of " + ", ".join(lanes)
+    expected += "".join(f"; {command}, then claim each path as its own entry" for command in commands)
+    assert len(expected) > 512
+    with pytest.raises(team.LeaseRefused) as refused:
+        team.claim(ws, "core", ["**"], owner="o@h")
+    assert str(refused.value) == expected
+
+    argv = ["claim", "core", "--paths", "**", "--owner", "o@h"]
+    if mode == "json":
+        argv.append("--json")
+    for _ in range(2):
+        code, out, err = _invoke(ws, *argv)
+        assert code == 1
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            assert (payload["status"], payload["reason"], payload["lanes"]) == (
+                "refused", "overlap", lanes)
+            assert payload["current"] is payload["lease"] is None
+            message = payload["message"]
+        else:
+            assert out == ""
+            assert err == expected + "\n"
+            message = err.removesuffix("\n")
+        assert message == expected
+        assert all(command in message for command in commands)
+        assert _ref(ws, "core") is None
+        assert {lane: _ref(ws, lane) for lane in lanes} == held
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("action", ["claim", "renew", "transfer", "release"])
+def test_legacy_lease_refusal_never_displays_paths(ws, mode, action):
+    """Taken and stale refusals retain recovery while omitting legacy lease detail."""
+    oid = _refusal_argv(ws, "legacy_paths")[-1]
+    expect = "0" * 40
+    assert expect != oid
+    if action == "claim":
+        argv = [action, "docs", "--paths", "docs/**", "--owner", "late@box"]
+        reason = "taken"
+        expected = f"taken: lane docs is leased (oid {oid})"
+    else:
+        argv = [action, "docs", "--expect", expect]
+        if action == "transfer":
+            argv.extend(["--owner", "late@box"])
+        reason = "stale"
+        expected = f"stale: lane docs holds {oid}, not {expect}"
+    expected += f"; release docs --expect {oid}, then claim each path as its own entry"
+    if mode == "json":
+        argv.append("--json")
+    for _ in range(2):
+        code, out, err = _invoke(ws, *argv)
+        assert code == 1
+        assert "token=secret" not in out + err
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            assert (payload["reason"], payload["message"], payload["current"], payload["lease"]) == (
+                reason, expected, oid, None)
+        else:
+            assert (out, err) == ("", expected + "\n")
+        assert _ref(ws, "docs") == oid
+    for result in _concurrent_refusal_cli(ws, argv):
+        assert result.returncode == 1
+        assert "token=secret" not in result.stdout + result.stderr
+        if mode == "json":
+            assert result.stderr == ""
+            payload = json.loads(result.stdout)
+            assert (payload["reason"], payload["message"], payload["lease"]) == (reason, expected, None)
+        else:
+            assert (result.stdout, result.stderr) == ("", expected + "\n")
+    assert _ref(ws, "docs") == oid
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("action", ["claim", "renew"])
+@pytest.mark.parametrize("failure", ["git", "os", "repository", "value"])
+def test_refusal_view_failure_follows_action_contract(ws, monkeypatch, mode, action, failure):
+    """Claims keep their refusal; renew retains the typed liveness fallback."""
+    held = team.claim(ws, "docs", ["docs/**"], owner="holder@box")
+    expect = "0" * 40
+    assert expect != held.oid
+    if action == "claim":
+        argv = [action, "docs", "--paths", "docs/**", "--owner", "late@box"]
+        reason, expected = "taken", f"taken: lane docs is leased (oid {held.oid})"
+    else:
+        argv = [action, "docs", "--expect", expect]
+        reason, expected = "stale", f"stale: lane docs holds {held.oid}, not {expect}"
+    if mode == "json":
+        argv.append("--json")
+    original_describe, original_listing = team.describe, rendering_git.list_refs
+    rendering, failures, available = [], [], [False]
+
+    def describe(*args, **kwargs):
+        if failure != "git" and not available[0]:
+            failures.append(True)
+            error = {"os": OSError, "repository": team.TeamUsageError, "value": ValueError}[failure]
+            raise error("token=secret view repository unavailable")
+        rendering.append(True)
+        try:
+            return original_describe(*args, **kwargs)
+        finally:
+            rendering.pop()
+
+    def listing(*args, **kwargs):
+        if rendering and not available[0]:
+            failures.append(True)
+            raise rendering_git.GitError("token=secret view listing failed")
+        return original_listing(*args, **kwargs)
+
+    monkeypatch.setattr(team, "describe", describe)
+    monkeypatch.setattr(rendering_git, "list_refs", listing)
+
+    def assert_refusal(code, out, err):
+        assert code == 1
+        assert "token=secret" not in out + err
+        if mode == "json":
+            assert err == ""
+            payload = json.loads(out)
+            if action == "claim":
+                assert (payload["reason"], payload["message"], payload["current"], payload["lease"]) == (
+                    reason, expected, held.oid, None)
+            else:
+                assert (payload["reason"], payload["message"], payload["next_action"]) == (
+                    "liveness_unknown", "liveness_unknown", "Restore private Git metadata, then retry.")
+                assert "current" not in payload and "lease" not in payload
+        else:
+            message = (expected + "\n" if action == "claim" else
+                       "liveness_unknown\nRestore private Git metadata, then retry.\n")
+            assert (out, err) == ("", message)
+
+    for _ in range(2):
+        assert_refusal(*_invoke(ws, *argv))
+        assert not rendering
+        assert _ref(ws, "docs") == held.oid
+    assert len(failures) == 2
+
+    if failure == "git":
+        for result in _concurrent_refusal_cli(ws, argv, unavailable_view=True):
+            assert_refusal(result.returncode, result.stdout, result.stderr)
+
+    available[0] = True
+    code, out, err = _invoke(ws, *argv)
+    assert code == 1 and not rendering
+    if mode == "json":
+        assert err == ""
+        payload = json.loads(out)
+        assert (payload["reason"], payload["message"], payload["lease"]["oid"]) == (
+            reason, expected, held.oid)
+    else:
+        assert out == "" and err.startswith(expected + "\n")
+        assert "paths: docs/**" in err
+    assert _ref(ws, "docs") == held.oid
