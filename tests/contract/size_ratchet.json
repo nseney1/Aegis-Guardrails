@@ -134,8 +134,8 @@
       "stmts": 213
     },
     "aegis_core/verification/runner.py": {
-      "lines": 986,
-      "stmts": 630
+      "lines": 927,
+      "stmts": 581
     }
   }
 }
