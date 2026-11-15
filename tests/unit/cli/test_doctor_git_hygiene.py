@@ -781,7 +781,10 @@ def test_collect_location_survives_every_display_pass(tmp_path, monkeypatch, cas
         assert "[REDACTED_VCS_" not in detail or "[REDACTED_VCS_TOKEN]" in detail
         output = io.StringIO()
         doctor_git_report.print_report(report, output)
-        assert detail in output.getvalue()
+        if case == "parenthesis":
+            assert "locations: path " + doctor_git_report.digest("/".join(parts)) + "; omitted: 0; " in output.getvalue()
+        else:
+            assert detail in output.getvalue()
 
 
 @pytest.mark.parametrize("held", [False, True])
@@ -2850,15 +2853,15 @@ def test_unreadable_invalid_ref_repair_command_works_in_a_fresh_repository(tmp_p
 
 
 # Whole-report bytes include the approval_targets row. Tests need no repository history.
-# Only scratch_unavailable changes for the round-2 normalized scratch taxonomy.
+# Capped-scan/depth text hashes include grouping; JSON hashes remain pinned.
 _SPLIT_REPORT_BYTES = {'valid_scratch': ('ce67980c506d9555edcbcfdb0198ad522ff2dfd86338e8fdcdb1f18ca3413ded',
                    '6e38ff297896abd3cd5fe49716c20d79b8a01ac8b93e773834f4d7c0da382101'),
  'scratch_unavailable': ('9cec87012d4f469a4566bd1c832dc54ed2bb69643175542732524fc41112b2db',
                          'd2363f53c82d88860df49ba4307d49d60fc0886dc5618901e1d2d4bf52703069'),
  'capped_scan': ('e7cb6e3e895756b0e9c185e4e365dd9d0e95caa6a4b784f2e5744a1cd3318ca1',
-                 '707d10a1486842d15e8404e5b8fb4be74d88a13a7e599ce88b1a4d52d4f1243b'),
+                 'f72d5e66b7810645c1475febddd45827a3673b651243a1fb502d0e24b47ed183'),
  'depth_cap': ('70d866c24293cbb9e18b897e28420d797350273518d809ecd202a3af653ee1a4',
-               '72322b4b4a8244fb235a36ed76c8fac52c0918c5c70b5d5d0c8e3f5b99df88fa'),
+               '53ce5d5301f1fd48a44e32b67d853c94e0fbb5470fd77daa4da34a45826727a4'),
  'swapped_path': ('cdfedc8c0aefca686d819abc0e502803342bf003a1db2901fcbf1d79ecb6c8bb',
                   'f77a64c54bba94e0081aa406c8b4688f3cf212c5a346c6ff9fe00ca04dae56c5'),
  'unavailable_report': ('29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f',
@@ -3442,16 +3445,16 @@ def test_existing_display_keeps_the_tip_separator_and_targets_do_not(tmp_path, m
 
 
 # Bytes of the git section at the integration tip, before the approvals-target row.
-# Only scratch_unavailable changes for the round-2 normalized scratch taxonomy.
+# Capped-scan/depth text hashes include grouping; JSON hashes remain pinned.
 _TIP_REPORT_BYTES = {
     "valid_scratch": ("b995dd699643b23b6fb52b3f148a76927a4dc2773a3a1956a90f1be5ba26ab56",
                       "b2e7f36f4d8188d08efa7d4815a2eac24cc27db6d5c951c208ed39416b21da91"),
     "scratch_unavailable": ("000438e5a1dc434cd3f6ad67eaa52925f5f6ee4cd6b6044ba9cf038c55ddfb7a",
                             "c436e99f213a75128949aacd32f04075ba56cebb493c8e93b6fc980038822691"),
     "capped_scan": ("e0db8329e61aa20d5dbcd917210e17c3974385cfc901b1be15ee7b41327d65cd",
-                    "9f3687dca4764b78f65652dbaaf1d31122652aafe82be798fcc8c92cecc2e2da"),
+                    "43f2161dba63dd79cc89ba1aa3d19537338773e494aae4e9c93426c7d2678cfb"),
     "depth_cap": ("d4d3a5fbd9a5d68031bd23ac1262ee725cd221a71f55b04ed3f376c1f31070fd",
-                  "721e0f7b4c1d5ba69c96b692708a5f3108796084e3248ee81ff924641613e31c"),
+                  "7142d327a3c60faff7aa30759552de522a82e132706a6266469834c5a99644c0"),
     "swapped_path": ("36888513353b4d12c5efccd28518bc730bc98125a06de7469b03c47b82d9c2ef",
                      "80b0e1cb3ee3640f56d48f9801d77150b4aa74654eb622d8a406bc26e53d889e"),
     "unavailable_report": ("29fe9401756a6b141be6e71f61ec8d395d1da5340df744dd694607a6678a235f",
@@ -3785,3 +3788,256 @@ def test_gate_detail_keeps_valid_long_target_as_digest(mode):
     name = "feature/" + "a" * 200
     assert doctor_git_report.gate_detail(((name, mode),)) == (
         "lose the gate: " + doctor_git_report.digest(name) + " " + mode)
+
+
+@pytest.mark.parametrize("case", ["limits", "zero", "mixed", "live", "unreadable", "expired"])
+def test_grouped_report_public_caller_matrix(tmp_path, monkeypatch, capsys, case):
+    _quiet_tree(monkeypatch)
+    monkeypatch.setattr(doctor_git, "time", types.SimpleNamespace(time=lambda: 1000))
+    seams = _clean_seams()
+    if case in ("limits", "mixed"):
+        monkeypatch.setattr(doctor_git_observe, "MAX_DEPTH", 1)
+        entries = [doctor_git_observe._Snap(f"path{index:02d}", stat.S_IFDIR, 0) for index in range(17)]
+        if case == "mixed":
+            entries.append(doctor_git_observe._Snap("link", stat.S_IFLNK, 0))
+        monkeypatch.setattr(doctor_git_observe, "_scandir", lambda root: entries)
+    live = 256 if case in ("live", "unreadable") else 0
+    expired = 256 if case == "expired" else 0
+    unreadable = 1 if case in ("unreadable", "mixed") else 0
+    leases = tuple(_lease(f"lane{index}", f"lane/branch{index}", 1000 if live else 1, 50)
+                   for index in range(live + expired))
+    if case == "mixed":
+        leases = (_lease("unknown", "bad..branch", 1000, 50),)
+    bad = (team.Unreadable("bad", "refs/aegis/lanes/bad", "b" * 40, "private error"),) if unreadable else ()
+    seams["_leases"] = lambda root: team.LeaseSet(leases, bad)
+    _install_git(monkeypatch, _clean_table(tmp_path), seams)
+    payload = {"human_gate": {"tier": "B"}, "summary": {"failed": 2, "warnings": 3}}
+    baseline = doctor_git.collect(tmp_path, tier="B", now=1000)
+    encoded = _blob(baseline)
+    result = doctor_git.with_report(payload, tmp_path, None, False)
+    text = capsys.readouterr().out
+    assert text.startswith("Git and disk hygiene (report only; doctor does not delete, prune, gc or rewrite refs):\n")
+    if case in ("limits", "mixed"):
+        assert text.count("  [warn] depth_capped:") == 1
+        assert ("  [warn] depth_capped: 17 findings; locations: path00, path01, path02; omitted: 14; "
+                + doctor_git_report.INSPECT + "\n") in text
+    else:
+        assert "depth_capped:" not in text and "scan_capped:" not in text
+    if live + expired + unreadable:
+        status = "warn" if expired + unreadable else "pass"
+        assert (f"  [{status}] leases: live {live}, expired {expired}, unreadable {unreadable}; "
+                + doctor_git_report.NONE + "\n") in text
+    else:
+        assert "leases: live" not in text
+    for row in baseline["rows"]:
+        if row["code"] not in ("live_lease", "scan_capped", "depth_capped"):
+            assert f"  [{row['status']}] {row['id']}: {row['detail']}; {row['owner_action']}\n" in text
+    assert not any(f"lease lane{index} is live" in text for index in range(live))
+    assert _blob(result["git_hygiene"]) == encoded
+    assert _blob(baseline) == encoded
+    assert result["summary"] == {"failed": 2, "warnings": 3 + sum(row["status"] == "warn" for row in baseline["rows"])}
+    assert payload["summary"] == {"failed": 2, "warnings": 3}
+    assert result["git_hygiene"]["affects_exit"] is False
+    assert doctor_git.with_report(payload, tmp_path, None, True) == result
+    assert capsys.readouterr().out == ""
+    assert _text(baseline) == text == _text(baseline)
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_keep_safe_locations_and_exact_omissions(code):
+    parts = [(f"path{index:02d}",) for index in range(17)]
+    report = {"rows": [doctor_git_observe._path_refusal(code, path) for path in parts]}
+    text = _text(report)
+    assert text.splitlines()[1] == (
+        f"  [warn] {code}: 17 findings; locations: path00, path01, path02; omitted: 14; "
+        + doctor_git_report.INSPECT)
+    assert len(text.splitlines()) == 2
+    long = {"rows": [doctor_git_observe._path_refusal(code, ("a" * 110 + str(index),)) for index in range(17)]}
+    locations = [doctor_git_report.location(("a" * 110 + str(index),)) for index in range(17)]
+    line = _text(long).splitlines()[1]
+    assert locations[0] in line and locations[1] not in line
+    assert "omitted: 16; " in line
+    assert "..." not in line.split("; locations: ")[0]
+    duplicate = {"rows": [report["rows"][0], report["rows"][0]]}
+    assert "2 findings; locations: path00; omitted: 1; " in _text(duplicate)
+    root = {"rows": [doctor_git_observe._path_refusal(code, ())]}
+    assert "1 findings; locations: .; omitted: 0; " in _text(root)
+
+
+@pytest.mark.parametrize("fault", ["multiline", "oversized", "control", "secret", "display-refused"])
+def test_grouped_limits_omit_undisplayable_locations_and_retry(monkeypatch, fault):
+    row = doctor_git_observe._path_refusal("depth_capped", ("bad",))
+    raw = {"multiline": "bad\nforged", "oversized": "b" * 513, "control": "bad\x1b[31m",
+           "secret": "password=hunter2hunter", "display-refused": "bad"}[fault]
+    row["detail"] = "a directory was not measured beyond the scan depth (" + raw + ")"
+    if fault == "display-refused":
+        display = doctor_git_report.display
+        monkeypatch.setattr(doctor_git_report, "display", lambda text, **kwargs: (
+            (None, "multiline_refused") if text == raw else display(text, **kwargs)))
+    report = {"rows": [row, doctor_git_observe._path_refusal("depth_capped", ("good",))]}
+    for _attempt in range(2):
+        line = _text(report).splitlines()[1]
+        assert "2 findings; locations: good; omitted: 1; " in line
+        assert raw not in line and "hunter2hunter" not in line
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+@pytest.mark.parametrize("name,sibling_count,shown", [
+    ("a; omitted: 0", 1, False),
+    ("a; omitted: 0; owner action: none", 16, False),
+    ("a, b, c", 1, False),
+    ("safe, safe", 1, False),
+    ("none", 1, False),
+    (".", 1, False),
+    ("unsafe, name [0123456789ab]", 1, False),
+    ("ordinary space", 1, True),
+    (" ", 1, False),
+    ("none ", 1, False),
+    (" none", 1, False),
+    (". ", 1, False),
+    (" .", 1, False),
+    ("alpha ", 1, False),
+    ("two words", 1, True),
+], ids=["semicolon", "forged-action", "commas", "duplicate-comma", "none-sentinel",
+        "dot-sentinel", "bracket-suffix", "ordinary-space", "blank", "none-trailing",
+        "none-leading", "dot-trailing", "dot-leading", "name-trailing", "interior-space"])
+def test_grouped_limits_admit_only_unambiguous_labels(code, name, sibling_count, shown):
+    hostile = doctor_git_observe._path_refusal(code, (name,))
+    if name == ".":
+        # Enumeration already rejects dot entries; exercise the renderer's
+        # explicit distinction between its root form and a captured '(.)'.
+        hostile["detail"] = doctor_git_observe._path_refusal(code, ())["detail"] + " (.)"
+    siblings = [doctor_git_observe._path_refusal(code, (f"p{index:02d}",)) for index in range(sibling_count)]
+    report = {"rows": [hostile] + siblings}
+    before = _blob(report)
+    samples = ([name] if shown else []) + [f"p{index:02d}" for index in range(min(sibling_count, 3))]
+    expected = (f"  [warn] {code}: {len(report['rows'])} findings; locations: {', '.join(samples)}; "
+                f"omitted: {len(report['rows']) - len(samples)}; " + doctor_git_report.INSPECT)
+    for _attempt in range(2):
+        assert _text(report).splitlines()[1:] == [expected]
+        assert _blob(report) == before
+    # Admission affects grouped labels only; an individual advisory retains
+    # its original detail bytes, including punctuation and reserved spellings.
+    single = dict(hostile, code="other")
+    assert _text({"rows": [single]}).splitlines()[1:] == [
+        "  [warn] disk_walk: " + hostile["detail"] + "; " + doctor_git_report.INSPECT]
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_count_all_rejected_labels_without_forging_root(code):
+    rows = [doctor_git_observe._path_refusal(code, (name,)) for name in ("none", "a, b", "a; omitted: 0")]
+    dot = doctor_git_observe._path_refusal(code, ())
+    dot["detail"] += " (.)"
+    rows.append(dot)
+    assert _text({"rows": rows}).splitlines()[1:] == [
+        f"  [warn] {code}: 4 findings; locations: none; omitted: 4; " + doctor_git_report.INSPECT]
+    root = doctor_git_observe._path_refusal(code, ())
+    assert _text({"rows": [root]}).splitlines()[1:] == [
+        f"  [warn] {code}: 1 findings; locations: .; omitted: 0; " + doctor_git_report.INSPECT]
+
+
+@pytest.mark.parametrize("code", ["scan_capped", "depth_capped"])
+def test_grouped_limits_reject_injected_fields_in_concurrent_reports(code):
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(2)
+    reports = [{"rows": [doctor_git_observe._path_refusal(code, (bad,)),
+                         doctor_git_observe._path_refusal(code, (safe,))]}
+               for bad, safe in (("a; omitted: 0", "alpha space"), ("safe, safe", "beta space"))]
+    before = [_blob(report) for report in reports]
+
+    def render(report):
+        barrier.wait(timeout=5)
+        return _text(report)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(render, report) for report in reports]
+        results = [future.result(timeout=5) for future in pending]
+    for text, safe in zip(results, ("alpha space", "beta space")):
+        assert text.splitlines()[1:] == [
+            f"  [warn] {code}: 2 findings; locations: {safe}; omitted: 1; " + doctor_git_report.INSPECT]
+    assert [_blob(report) for report in reports] == before
+
+
+def test_grouped_report_keeps_other_lines_and_actionable_leases():
+    rows = [
+        {"id": "bad", "status": "warn", "code": "other", "detail": "bad\nline", "owner_action": doctor_git_report.RETRY},
+        doctor_git_report.row("repair", "warn", "live_lease", doctor_git_report.RETRY, "repair this lease"),
+        doctor_git_report.row("repair-pass", "pass", "live_lease", doctor_git_report.RETRY, "inspect this lease"),
+        doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live"),
+        doctor_git_report.row("unknown", "warn", "lease_branch_unknown", doctor_git_report.RETRY, "unknown branch"),
+        doctor_git_report.row("disk_walk", "warn", "depth_capped", doctor_git_report.RETRY, "repair the cap"),
+    ]
+    text = _text({"rows": rows})
+    assert "  [warn] refused\n" in text
+    assert "  [warn] repair: repair this lease; owner action: retry aegis doctor\n" in text
+    assert "  [pass] repair-pass: inspect this lease; owner action: retry aegis doctor\n" in text
+    assert "  [warn] unknown: unknown branch; owner action: retry aegis doctor\n" in text
+    assert "  [warn] disk_walk: repair the cap; owner action: retry aegis doctor\n" in text
+    assert "leases: live 1, expired 0, unreadable 0; " in text
+    assert "lease good is live" not in text
+
+
+def test_grouped_reports_are_independent_during_concurrent_rendering():
+    barrier = threading.Barrier(2)
+    reports = [{"rows": [doctor_git_observe._path_refusal("scan_capped", (name,)) for _ in range(count)]}
+               for name, count in (("alpha", 17), ("beta", 4))]
+    before = [_blob(report) for report in reports]
+    results = [None, None]
+
+    def render(index):
+        barrier.wait(timeout=5)
+        results[index] = _text(reports[index])
+
+    threads = [threading.Thread(target=render, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert "17 findings; locations: alpha; omitted: 16; " in results[0]
+    assert "4 findings; locations: beta; omitted: 3; " in results[1]
+    assert "beta" not in results[0] and "alpha" not in results[1]
+    assert [_blob(report) for report in reports] == before
+
+
+def test_grouped_limits_separate_codes_and_preserve_warning_order():
+    scan = doctor_git_observe._path_refusal("scan_capped", ("scan",))
+    depth = doctor_git_observe._path_refusal("depth_capped", ("deep",))
+    warning = doctor_git_report.row("warning", "warn", "path_changed", doctor_git_report.RETRY, "changed path")
+    text = _text({"rows": [scan, warning, depth, scan, depth]})
+    assert text.splitlines()[1:] == [
+        "  [warn] scan_capped: 2 findings; locations: scan; omitted: 1; " + doctor_git_report.INSPECT,
+        "  [warn] warning: changed path; " + doctor_git_report.RETRY,
+        "  [warn] depth_capped: 2 findings; locations: deep; omitted: 1; " + doctor_git_report.INSPECT,
+    ]
+
+
+def test_grouped_report_single_pass_rows_match_list_bytes():
+    rows = [
+        doctor_git_observe._path_refusal("scan_capped", ("scan",)),
+        doctor_git_report.row("warning", "warn", "path_changed", doctor_git_report.RETRY, "changed path"),
+        doctor_git_observe._path_refusal("depth_capped", ("deep",)),
+        doctor_git_observe._path_refusal("scan_capped", ("other",)),
+        doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live"),
+        doctor_git_report.row("lease:1", "warn", "expired_lease", doctor_git_report.RETRY, "lease expired"),
+        doctor_git_report.row("lease:2", "warn", "lease_unreadable", doctor_git_report.RETRY, "lease unreadable"),
+        {"id": "bad", "status": "warn", "code": "other", "detail": "bad\nline", "owner_action": doctor_git_report.RETRY},
+    ]
+    assert _text({"rows": iter(rows)}) == _text({"rows": rows})
+
+
+def test_grouped_limits_final_display_refusal_is_still_a_refusal(monkeypatch):
+    display = doctor_git_report.display
+    monkeypatch.setattr(doctor_git_report, "display", lambda text, **kwargs: (
+        (None, "value_too_long") if text.startswith("2 findings;") else display(text, **kwargs)))
+    report = {"rows": [doctor_git_observe._path_refusal("scan_capped", ("safe",)) for _ in range(2)]}
+    assert _text(report).splitlines()[1:] == ["  [warn] refused"]
+
+
+@pytest.mark.parametrize("field", ["id", "detail"])
+def test_grouped_report_preserves_refused_live_lease_lines(field):
+    healthy = doctor_git_report.row("lease:0", "pass", "live_lease", doctor_git_report.NONE, "lease good is live")
+    refused = dict(healthy, **{field: "bad\nline"})
+    lines = _text({"rows": [refused, healthy]}).splitlines()[1:]
+    assert lines == ["  [pass] refused", "  [pass] leases: live 1, expired 0, unreadable 0; " + doctor_git_report.NONE]
