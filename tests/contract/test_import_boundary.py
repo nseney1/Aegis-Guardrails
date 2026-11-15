@@ -121,6 +121,8 @@ CORE_LAYERS: Dict[str, int] = {
     "aegis_core.manager_config": 2,
     # Shared manager decision/report service over the pinned activation service.
     "aegis_core.manager": 3,
+    "aegis_core.guidance_grammar": 0,
+    "aegis_core.guidance_projection": 0,
     # Host hook payload normalization (stdlib only).
     "aegis_core.hook_events": 1,
     # Pure AST inspection of lane declarations and pytest configuration.

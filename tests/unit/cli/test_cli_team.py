@@ -1064,14 +1064,25 @@ def test_lease_custody_is_absent_from_ordinary_team_import():
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
 
 
-def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch):
+def test_lease_custody_documents_backend_selection_and_residual():
+    documentation = " ".join(team_lease_custody.__doc__.split())
+    for term in ("descriptor backend", "pathname backend", "storage_confined.descriptor_supported()",
+                 "/proc/self/fd", "/proc/<pid>/fd", "Linux", "macOS", "Windows", "rename race residual"):
+        assert term in documentation
+
+
+@pytest.mark.parametrize("confined", [False, True])
+@pytest.mark.parametrize("proc_fds", [False, True])
+@pytest.mark.parametrize("dev_fds", [False, True])
+def test_lease_descriptor_probe_requires_parent_addressable_fds(monkeypatch, confined, proc_fds, dev_fds):
     from types import SimpleNamespace
     from tests.unit.core.test_storage_confined import ModuleOS
 
-    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: value == "/dev/fd"})
+    directories = {"/proc/self/fd": proc_fds, "/dev/fd": dev_fds}
+    path = SimpleNamespace(**{**vars(os.path), "isdir": lambda value: directories.get(value, False)})
     monkeypatch.setattr(team_lease_custody, "os", ModuleOS(path=path))
-    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: True))
-    assert team_lease_custody.descriptor_supported() is False
+    monkeypatch.setattr(team_lease_custody, "storage_confined", SimpleNamespace(descriptor_supported=lambda: confined))
+    assert team_lease_custody.descriptor_supported() is (confined and proc_fds)
 
 
 @pytest.mark.parametrize("action", ["renew", "gc"])
