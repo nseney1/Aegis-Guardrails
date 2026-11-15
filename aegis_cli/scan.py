@@ -9,8 +9,8 @@ be served (a rule file cannot be loaded or the rules tree cannot be read safely:
 scan fails closed and names them), 2 for a usage or workspace error. With --json,
 stdout carries only the JSON document.
 
-${SLOT.*} placeholders in rule text are rendered as aegis_scan renders them, by the one
-renderer in aegis_core.skills.slots. The CLI has no host, so it uses the generic
+${SLOT.*} placeholders in rule text are rendered before scan truncation and budgeting,
+using the same pure guidance projection as aegis_scan. The CLI uses the generic
 profile (with the user's ~/.aegis/config.json overrides); warnings go to stderr in
 text mode. Text from rule files, and the errors naming them, reach the terminal without
 control sequences.
@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import List
 import uuid
 
-from aegis_cli import sanitize_display
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core.errors import WorkspaceError
+from aegis_core.guidance_grammar import clip_redacted
+from aegis_core.guidance_projection import CONTROL_GUIDANCE, contains_control_characters, project_display_text
 from aegis_core.hosts import GENERIC
 from aegis_core.workspace.layout import is_aegis_workspace
 
@@ -52,37 +53,41 @@ def run_scan(args: argparse.Namespace) -> int:
     from aegis_core.workspace.base import Workspace
 
     raw_ws = getattr(args, "workspace", None)
-    # Discovery walks up from a missing path, so its error would name a parent.
-    if raw_ws and not os.path.exists(raw_ws):
-        _error(f"workspace path does not exist: {raw_ws}")
-        return EXIT_USAGE
     try:
+        # Discovery walks up from a missing path, so its error would name a parent.
+        if raw_ws and not os.path.exists(raw_ws):
+            _error(f"workspace path does not exist: {_terminal_text(str(raw_ws), max_len=1024)}", projected=True)
+            return EXIT_USAGE
         root = Workspace.resolve(raw_ws).root.resolve()
-    except WorkspaceError as exc:
+    except (WorkspaceError, OSError, RuntimeError, ValueError) as exc:
         _error(str(exc))
         return EXIT_USAGE
     if not is_aegis_workspace(root):
-        _error(f"not an Aegis workspace (no .aegis/ in {root}); run aegis init")
+        displayed_root = _terminal_text(str(root), max_len=1024)
+        _error(f"not an Aegis workspace (no .aegis/ in {displayed_root}); run aegis init", projected=True)
         return EXIT_USAGE
 
     from aegis_core.scan import scan
 
-    from aegis_core.skills.slots import render_scan_result
+    from aegis_core.skills.slots import scan_registry
 
-    files = [_workspace_relative(f, root) for f in args.files]
-    result = scan(str(root), changed_files=files)
+    try:
+        files = [_workspace_relative(f, root) for f in args.files]
+    except (OSError, RuntimeError, ValueError) as exc:
+        _error(str(exc))
+        return EXIT_USAGE
+    result = scan(str(root), changed_files=files, registry=scan_registry(GENERIC, root))
     failed = result.get("status") == "FAIL"
     if not failed:
-        result = render_scan_result(result, GENERIC, root)
         _record_scan(root, args.files)
     if args.json:  # AegisParser.parse_args always sets it
         print(json.dumps(result, indent=2, default=str))
     elif failed:
-        _error(str(result.get("error")))
+        _error(result.get("error", ""), projected=True)
     else:
-        print(_terminal_text(result.get("guidance", "")))
+        print(_served_text(result.get("guidance", "")))
         for warning in result.get("warnings") or []:
-            print(f"Warning: {sanitize_display(str(warning), max_len=1024)}", file=sys.stderr)
+            print("Warning: " + _served_text(warning, max_len=1024), file=sys.stderr)
     return EXIT_UNSERVED if failed else EXIT_SCANNED
 
 
@@ -98,7 +103,7 @@ def _record_scan(root: Path, raw_files: List[str]) -> None:
     for raw in raw_files:
         try:
             inside.append(confine_path_internal(root, os.path.join(os.getcwd(), raw))[1])
-        except ValueError:  # PathTraversalError: outside the workspace or unresolvable
+        except (ValueError, OSError, RuntimeError):  # outside or unresolvable; telemetry never fails scan
             continue
     if not inside:
         return
@@ -106,18 +111,26 @@ def _record_scan(root: Path, raw_files: List[str]) -> None:
         scan_compliance.record(root, "scan", host=scan_compliance.CLI_HOST, session=uuid.uuid4().hex,
                                files=inside, basis="files")
     except Exception as exc:  # telemetry only: never fail the scan
-        print("Warning: scan event not recorded: " + _terminal_text(str(exc)), file=sys.stderr)
+        print("Warning: scan event not recorded: " + _terminal_text(str(exc), max_len=1024), file=sys.stderr)
 
 
-def _error(message: str) -> None:
+def _error(message: str, *, projected: bool = False) -> None:
     # Errors name rule files and directories, which a cloned repository chooses.
-    print("Error: " + _terminal_text(message), file=sys.stderr)
+    print("Error: " + (_served_text(message, max_len=1024) if projected else _terminal_text(message, max_len=1024)), file=sys.stderr)
 
 
-def _terminal_text(text: str) -> str:
-    """``text`` line by line without escape or control sequences: rule files are
-    repository content, and a terminal would act on them."""
-    return "\n".join(sanitize_display(line, max_len=None) for line in str(text).split("\n"))
+def _served_text(text: str, *, max_len: int | None = None) -> str:
+    """Check controls and retain the terminal cap, without another redaction."""
+    if contains_control_characters(text):
+        return CONTROL_GUIDANCE
+    if max_len is not None and len(text) > max_len:
+        return clip_redacted(text, max_len - 3) + "..."
+    return text
+
+
+def _terminal_text(text: str, *, max_len: int | None = None) -> str:
+    """Project untrusted text, refusing whole values with non-layout controls."""
+    return project_display_text(text, max_len=max_len)
 
 
 class ScanCommand(AegisCommand):
