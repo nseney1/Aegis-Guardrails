@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from aegis_core import primitives
 from aegis_cli import sanitize_display, team_queue as queue_cli
+from aegis_cli import team_lease_output as lease_output
 from aegis_cli.base import AegisCommand, CommandCategory
 from aegis_core import gitsafe, team
 from aegis_core.primitives import utc_stamp
@@ -288,11 +289,6 @@ def _emit(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, indent=2))
 
 
-def _warn(warnings: List[str]) -> None:
-    for line in warnings:
-        print(f"Warning: {sanitize_display(line, max_len=None)}", file=sys.stderr)
-
-
 def _view(root: Path, now: int, oid: Optional[str]) -> Optional[Dict[str, Any]]:
     """The list view (current overlaps included) of the lease blob ``oid``, or None when
     no lane holds it now (released, replaced since, or unreadable)."""
@@ -321,7 +317,8 @@ def _lease_lines(lease: Optional[Dict[str, Any]]) -> List[str]:
 
 # ── Lease changes ────────────────────────────────────────────────────────────
 
-def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange) -> int:
+def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseChange, *, pending=False):
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_OK)
     if args.json:
         payload = _team_payload(args.team_action, root, now, refs=team.LANES_REF, lane=change.lane)
         payload.update({
@@ -332,11 +329,11 @@ def _changed(args: argparse.Namespace, root: Path, now: int, change: team.LeaseC
             "caller": change.caller,
             "warnings": list(change.warnings),
         })
-        _emit(payload)
-        return EXIT_OK
-    _warn(list(change.warnings))
-    print(change.oid if change.oid is not None else f"released {change.lane}")
-    return EXIT_OK
+        response.json(payload)
+    else:
+        response.warn(change.warnings)
+        response.line(change.oid if change.oid is not None else f"released {change.lane}")
+    return response if pending else response.publish()
 
 
 def _claim(args: argparse.Namespace, root: Path, now: int) -> int:
@@ -345,15 +342,15 @@ def _claim(args: argparse.Namespace, root: Path, now: int) -> int:
     return _changed(args, root, now, change)
 
 
-def _renew(args: argparse.Namespace, root: Path, now: int) -> int:
+def _renew(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingResponse:
     try:
         evidence = team.lease_branch_evidence(root, lane=args.lane, expect=args.expect, ttl_s=args.ttl)
     except gitsafe.GitError:
-        return _liveness_refused(args, root, now, "liveness_unknown")
+        return _liveness_refused(args, root, now, "liveness_unknown", pending=True)
     if not all(evidence.values()):
-        return _liveness_refused(args, root, now, "lease_branch_missing")
+        return _liveness_refused(args, root, now, "lease_branch_missing", pending=True)
     team.verify_lease_repository(root)
-    return _changed(args, root, now, team.renew(root, args.lane, args.expect, ttl_s=args.ttl, now=now))
+    return _changed(args, root, now, team.renew(root, args.lane, args.expect, ttl_s=args.ttl, now=now), pending=True)
 
 
 def _transfer(args: argparse.Namespace, root: Path, now: int) -> int:
@@ -365,16 +362,17 @@ def _release(args: argparse.Namespace, root: Path, now: int) -> int:
     return _changed(args, root, now, team.release(root, args.lane, args.expect))
 
 
-def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
+def _gc(args: argparse.Namespace, root: Path, now: int) -> lease_output.PendingResponse:
     try:
         evidence = team.lease_branch_evidence(root, now=now, worktrees=True)
     except gitsafe.GitError:
-        return _liveness_refused(args, root, now, "liveness_unknown")
+        return _liveness_refused(args, root, now, "liveness_unknown", pending=True)
     team.verify_lease_repository(root)
     result = team.gc(root, now=now)
     rows = [{"lane": sanitize_display(redact_command_secrets(sanitize_display(c.lane, max_len=None)), max_len=63),
              "reason": "expired_with_worktree"} for c in result.collected if evidence.get(c.previous)]
     warnings = [line for change in result.collected for line in change.warnings]
+    response = lease_output.PendingResponse(EXIT_OK)
     if args.json:
         payload = _team_payload("gc", root, now, refs=team.LANES_REF)
         payload.update({
@@ -383,17 +381,17 @@ def _gc(args: argparse.Namespace, root: Path, now: int) -> int:
             "kept": [{"lane": lane, "reason": reason} for lane, reason in result.kept],
             "warnings": warnings + rows,
         })
-        _emit(payload)
-        return EXIT_OK
-    _warn(warnings)
-    _warn([row["reason"] for row in rows])
+        response.json(payload)
+        return response
+    response.warn(warnings)
+    response.warn([row["reason"] for row in rows])
     for change in result.collected:
-        print(f"collected {change.lane}")
+        response.line(f"collected {change.lane}")
     if not result.collected:
-        print("nothing to collect")
+        response.line("nothing to collect")
     for lane, reason in result.kept:
-        print(f"kept {sanitize_display(lane, max_len=None)}: {reason}", file=sys.stderr)
-    return EXIT_OK
+        response.line(f"kept {sanitize_display(lane, max_len=None)}: {reason}", "stderr")
+    return response
 
 
 # ── Reading ──────────────────────────────────────────────────────────────────
@@ -461,7 +459,7 @@ def _metrics(args: argparse.Namespace, root: Path, now: int) -> int:
     return EXIT_OK
 
 
-_HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], int]] = {
+_HANDLERS: Dict[str, Callable[[argparse.Namespace, Path, int], Any]] = {
     "claim": _claim,
     "renew": _renew,
     "transfer": _transfer,
@@ -589,15 +587,16 @@ def _hosts_result(args, resolved, payload):
 
 # ── Failures ─────────────────────────────────────────────────────────────────
 
-def _liveness_refused(args: argparse.Namespace, root: Path, now: int, reason: str) -> int:
+def _liveness_refused(args: argparse.Namespace, root: Path, now: int, reason: str, *, pending=False):
     action = team.lease_next_action(reason)
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_REFUSED)
     if args.json:
         payload = _team_payload(args.team_action, root, now)
         payload.update({"status": "refused", "reason": reason, "message": reason, "next_action": action})
-        _emit(payload)
+        response.json(payload)
     else:
-        print(reason + ("\n" + action if action else ""), file=sys.stderr)
-    return EXIT_REFUSED
+        response.line(reason + ("\n" + action if action else ""), "stderr")
+    return response if pending else response.publish()
 
 
 def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: int) -> int:
@@ -610,7 +609,8 @@ def _failed(args: argparse.Namespace, root: Path, now: int, message: str, code: 
     return code
 
 
-def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused) -> int:
+def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefused, *, pending=False):
+    response = (lease_output.PendingResponse if pending else lease_output.Response)(EXIT_REFUSED)
     fixed = CLAIM_REFUSALS.get(exc.reason)
     message = str(exc)
     if not fixed or "\n" in message or "\r" in message or not message.startswith(fixed):
@@ -632,15 +632,15 @@ def _refused(args: argparse.Namespace, root: Path, now: int, exc: team.LeaseRefu
                        warnings=list(exc.warnings))
         if exc.next_action:
             payload["next_action"] = exc.next_action
-        _emit(payload)
-        return EXIT_REFUSED
-    _warn(list(exc.warnings))
-    print(sanitize_display(text, max_len=None), file=sys.stderr)
-    if exc.next_action:
-        print(sanitize_display(exc.next_action, max_len=None), file=sys.stderr)
-    for line in _lease_lines(lease):
-        print(line, file=sys.stderr)
-    return EXIT_REFUSED
+        response.json(payload)
+    else:
+        response.warn(exc.warnings)
+        response.line(sanitize_display(text, max_len=None), "stderr")
+        if exc.next_action:
+            response.line(sanitize_display(exc.next_action, max_len=None), "stderr")
+        for line in _lease_lines(lease):
+            response.line(line, "stderr")
+    return response if pending else response.publish()
 
 
 def run_team(args: argparse.Namespace) -> int:
@@ -666,7 +666,7 @@ def run_team(args: argparse.Namespace) -> int:
     root = Path(args.ws.root) if getattr(args, "ws", None) is not None else Path(args.workspace)
     now = int(time.time())
     try:
-        return (team.lease_operation(root, _HANDLERS[action], args, now, _refused) if action in ("renew", "gc")
+        return (lease_output.operation(root, _HANDLERS[action], args, now, _refused) if action in ("renew", "gc")
                 else _HANDLERS[action](args, root, now))
     except team.LeaseRefused as exc:
         return _refused(args, root, now, exc)

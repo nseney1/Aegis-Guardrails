@@ -2634,25 +2634,6 @@ def test_lease_custody_bounds_roots_before_platform_or_filesystem_probe(monkeypa
     assert caught.value.code == "git_failed"
 
 
-@pytest.mark.parametrize("stream", ["stdout", "stderr"])
-def test_lease_operation_bounds_pending_output_and_retries(repo, capsys, stream):
-    def oversized(args, root, now):
-        target = sys.stdout if stream == "stdout" else sys.stderr
-        print("x" * (2 * 1024 * 1024 + 1), file=target)
-
-    with pytest.raises(gitsafe.GitError, match="^liveness_unknown$") as caught:
-        team.lease_operation(repo, oversized, None, NOW)
-    assert caught.value.code == "git_output_limit"
-    assert capsys.readouterr() == ("", "")
-
-    def retry(args, root, now):
-        print("one result")
-        return 0
-
-    assert team.lease_operation(repo, retry, None, NOW) == 0
-    assert capsys.readouterr() == ("one result\n", "")
-
-
 @pytest.mark.parametrize("action", ["renew", "gc"])
 @pytest.mark.parametrize("directory", ["workspace", "external_git", "common"])
 def test_cli_liveness_confined_directory_close_refuses_and_closes_every_fd(
