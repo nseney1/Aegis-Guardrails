@@ -272,26 +272,70 @@ def _print_hold(args: argparse.Namespace, exc: Exception) -> None:
         print(f"Hold ({binding['reason']}): {binding['message']}", file=sys.stderr)
 
 
-def _is_model_invocation(argv: List[str]) -> bool:
-    """Classify raw tokens without importing command or model modules."""
-    seen_team = False
-    for token in argv:
-        if token == "--":
-            break
-        if token == "model" and seen_team:
-            return True
-        if token == "team":
-            seen_team = True
-    return False
+# Command path -> (policy module, policy class, stop scanning at --).
+# These are deliberately raw-token scopes, including option values. Successful
+# parsing alone can establish an exemption from the conservative privacy policy.
+_POLICY_REGISTRY = {
+    ("msg",): ("aegis_cli.msg", "MsgErrorPolicy", False),
+    ("team", "model"): ("aegis_cli.team", "ModelErrorPolicy", True),
+    ("team", "queue"): ("aegis_cli.team_queue", "QueueErrorPolicy", False),
+}
+
+
+class _DefaultErrorPolicy:
+    """Ordinary argparse behavior without importing a command-specific policy."""
+
+    def __call__(self):
+        pass
+
+    def run(self, operation):
+        return operation()
+
+    def parse(self, parser, argv):
+        return parser.parse_args(argv)
+
+    def removed_pointer(self, argv, lookup):
+        return lookup(argv)
+
+    def workspace_error(self, args, error):
+        return None
+
+
+def _invocation_policy(argv):
+    """Select each scope once and compose fresh policies for this invocation."""
+    from importlib import import_module
+
+    argv = list(argv)
+    scopes = {}
+    factories = {}
+    for path, (module, name, stop_at_separator) in _POLICY_REGISTRY.items():
+        matched = 0
+        for token in argv:
+            if stop_at_separator and token == "--":
+                break
+            if token == path[matched]:
+                matched += 1
+                if matched == len(path):
+                    break
+        scopes[path] = matched == len(path)
+        if scopes[path]:
+            factories[path] = getattr(import_module(module), name)
+    policy = factories[("msg",)](active=True) if scopes[("msg",)] else _DefaultErrorPolicy()
+    model = (factories[("team", "model")](model_invocation=True)
+             if scopes[("team", "model")] else None)
+    if scopes[("team", "queue")]:
+        options = ({"output": model.queue_output, "parser_error": model.parser_error}
+                   if model is not None else {})
+        policy = factories[("team", "queue")](policy, active=True, **options)
+    if model is not None:
+        model.fallback = policy
+        return model
+    return policy
 
 
 def main(argv: Optional[List[str]] = None, prog: str = PROG) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if not _is_model_invocation(argv):
-        return _main(argv, prog)
-    from aegis_cli.team import ModelErrorPolicy
-
-    policy = ModelErrorPolicy(argv=argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    policy = _invocation_policy(argv)
     return policy.run(partial(_main, argv, prog, policy))
 
 
@@ -311,12 +355,8 @@ def _main(argv: List[str], prog: str, policy=None) -> int:
 
         return run_hook_argv(argv[2:])
 
-    from aegis_cli.msg import MsgErrorPolicy
-
     if policy is None:
-        policy = MsgErrorPolicy(argv)
-    else:
-        policy.fallback = MsgErrorPolicy(argv)
+        policy = _invocation_policy(argv)
     parser = _build_parser(prog=prog, error_policy=policy)
     pointer = policy.removed_pointer(argv, partial(removed_command_pointer, parser=parser))
     if pointer is not None:

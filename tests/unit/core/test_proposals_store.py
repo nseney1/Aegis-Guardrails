@@ -52,6 +52,226 @@ def refusal(code):
     return pytest.raises(ProposalError, match="^proposal refused: " + code + "$")
 
 
+@pytest.mark.parametrize("caller", ["list", "read"])
+@pytest.mark.parametrize("shape", ["chain", "diamond", "cycle", "missing", "malformed",
+                                  "lineage", "evidence", "insight", "over-bound"])
+def test_transaction_ancestry_snapshot(tmp_path, monkeypatch, caller, shape):
+    store = make_store(tmp_path)
+    store.write(candidate("node-000"))
+    directory = store.root / ".aegis/proposals"
+    count = 128 if shape == "chain" else 129 if shape == "over-bound" else 4
+    proposals = [candidate(f"node-{i:03d}", parent_proposals=(f"node-{i + 1:03d}",)
+                           if i + 1 < count else ()) for i in range(count)]
+    if shape == "diamond":
+        proposals[0] = replace(proposals[0], parent_proposals=("node-001", "node-002"))
+        proposals[1] = replace(proposals[1], parent_proposals=("node-003",))
+    elif shape in ("cycle", "missing"):
+        proposals[-1] = replace(proposals[-1], parent_proposals=(
+            "node-000" if shape == "cycle" else "node-missing",))
+    elif shape in ("lineage", "evidence", "insight"):
+        field, value = {"lineage": ("source_lineage", ("mine", "lint")),
+                        "evidence": ("evidence_ids", ("extra:evidence",)),
+                        "insight": ("insight_ids", ("ins-extra",))}[shape]
+        if shape == "insight":
+            proposals = [replace(p, source_lineage=("mine", "insight"), insight_ids=("ins-base",))
+                         for p in proposals]
+        proposals[-1] = replace(proposals[-1], **{field: value})
+    for p in proposals:
+        (directory / (p.id + ".md")).write_bytes(p.to_bytes())
+    if shape == "malformed":
+        (directory / (proposals[-1].id + ".md")).write_bytes(b"not a proposal")
+    reads, parses = [], []
+    original_read, original_parse = store_module._read, store_module.parse_proposal
+
+    def reading(directory, name, limit, durable=False):
+        reads.append(name[:-3])
+        return original_read(directory, name, limit, durable=durable)
+
+    def parsing(raw, pid):
+        parses.append(pid)
+        return original_parse(raw, pid)
+
+    monkeypatch.setattr(store_module, "_read", reading)
+    monkeypatch.setattr(store_module, "parse_proposal", parsing)
+    expected = None if shape in ("chain", "diamond") else (
+        "invalid" if shape == "malformed" and caller == "list" else "ancestry")
+    for _ in range(2):  # A new transaction must read fresh bytes after either result.
+        reads.clear()
+        parses.clear()
+        if expected:
+            with refusal(expected):
+                store.list() if caller == "list" else store.read("node-000")
+        elif caller == "list":
+            assert [s.proposal for s in store.list()] == proposals
+        else:
+            assert store.read("node-000").proposal == proposals[0]
+        if caller == "list":
+            assert reads == parses == [p.id for p in proposals]
+    # A completed transaction's snapshot must never hide a subsequent edit.
+    (directory / "node-000.md").write_bytes(b"not a proposal")
+    with refusal("invalid"):
+        store.list() if caller == "list" else store.read("node-000")
+
+
+@pytest.mark.parametrize("case", ["history-256", "byte-limit", "row-limit", "no-newline",
+                                 "retry", "malformed", "empty", "absent"])
+def test_private_decision_history_snapshot(tmp_path, monkeypatch, case):
+    store = make_store(tmp_path)
+    p = candidate("ins-snapshot", source="insight", source_lineage=("insight",),
+                  insight_ids=("ins-snapshot",))
+    store.write(p)
+    first = store.decide([p.id], decision="propose", operation_id="op-seed")
+    path, = store.home.rglob("*.jsonl")
+    history = path.read_bytes()
+    if case == "history-256":
+        history = b"".join((json.dumps(dict(first, operation_id=f"op-{i}")) + "\n").encode()
+                           for i in range(256))
+    elif case == "byte-limit":
+        remaining = store_module.MAX_LOG_BYTES - len(history)
+        padding = b" " * (store_module.MAX_ROW_BYTES - 1) + b"\n"
+        history += padding * (remaining // len(padding))
+        tail = remaining % len(padding)
+        if tail:
+            history += b" " * (tail - 1) + b"\n"
+    elif case == "row-limit":
+        history = b"".join((json.dumps(dict(first, operation_id=f"op-{i}")) + "\n").encode()
+                           for i in range(store_module.MAX_ROWS))
+    elif case == "no-newline":
+        history = history.rstrip(b"\n")
+    elif case == "malformed":
+        history = b"{broken\n"
+    elif case in ("empty", "absent"):
+        history = b""
+    path.write_bytes(history)
+    if case == "absent":
+        path.unlink()
+    reads, parses = [], []
+    original_read, original_rows = store_module._read, store_module._log_rows
+
+    def reading(directory, name, limit, durable=False):
+        if name == path.name:
+            reads.append(durable)
+        return original_read(directory, name, limit, durable=durable)
+
+    def parsing(raw):
+        parses.append(raw)
+        return original_rows(raw)
+
+    monkeypatch.setattr(store_module, "_read", reading)
+    monkeypatch.setattr(store_module, "_log_rows", parsing)
+    expected = {"byte-limit": "too_large", "row-limit": "too_large",
+                "no-newline": "decision", "malformed": "decision"}.get(case)
+    operation = "op-seed" if case == "retry" else "op-new"
+    if expected:
+        with refusal(expected):
+            store.decide([p.id], decision="propose", operation_id=operation)
+        assert path.read_bytes() == history
+    else:
+        row = store.decide([p.id], decision="propose", operation_id=operation)
+        assert row == dict(first, operation_id=operation, ts=row["ts"])
+        if case == "retry":
+            assert row == first
+        added = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        assert path.read_bytes() == (history if case == "retry" else history + added)
+    assert reads == ([False] if case == "malformed" else
+                     [False, False, True] if case == "retry" else [False, False])
+    assert parses == [history] * (1 if case == "malformed" else 2)
+
+
+def test_list_snapshot_releases_lock_before_next_transaction(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    saved = store.write(candidate())
+    started, release = threading.Event(), threading.Event()
+    original = store_module._read
+
+    def reading(directory, name, limit, durable=False):
+        if not started.is_set():
+            started.set()
+            assert release.wait(timeout=5)
+        return original(directory, name, limit, durable=durable)
+
+    monkeypatch.setattr(store_module, "_read", reading)
+    waiting = ProposalStore(store.root, home=store.home, timeout=0.01)
+    changed = replace(saved.proposal, do="Updated after listing.")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(store.list)
+        try:
+            assert started.wait(timeout=5)
+            with refusal("timeout"):
+                waiting.write(changed, expected_digest=saved.digest)
+        finally:
+            release.set()
+        assert future.result(timeout=5) == [saved]
+    updated = waiting.write(changed, expected_digest=saved.digest)
+    assert store.list() == [updated]
+
+
+@pytest.mark.parametrize("change", ["append", "quota", "malformed"])
+def test_private_snapshot_uses_authoritative_locked_history(tmp_path, monkeypatch, change):
+    store = make_store(tmp_path)
+    p = candidate("ins-snapshot", source="insight", source_lineage=("insight",),
+                  insight_ids=("ins-snapshot",))
+    store.write(p)
+    seed = store.decide([p.id], decision="propose", operation_id="op-seed")
+    path, = store.home.rglob("*.jsonl")
+    original = path.read_bytes()
+    interleaved = original + (json.dumps(dict(seed, operation_id="op-other")) + "\n").encode()
+    if change == "malformed":
+        interleaved = b"{broken\n"
+    if change == "quota":
+        monkeypatch.setattr(store_module, "MAX_ROWS", 2)
+    shared_reads = []
+
+    @contextmanager
+    def entering(lock_path, *args, **kwargs):
+        with file_lock(lock_path, *args, **kwargs):
+            if lock_path.suffix == ".lock":
+                shared_reads.append(True)
+                if len(shared_reads) == 2:  # Preflight released; authoritative lock is now held.
+                    path.write_bytes(interleaved)
+            yield
+
+    monkeypatch.setattr(store_module, "file_lock", entering)
+    try:
+        if change == "append":
+            result = store.decide([p.id], decision="confirm", operation_id="op-new")
+            assert result["operation_id"] == "op-new"
+            assert path.read_bytes().startswith(interleaved)
+            assert len(path.read_bytes().splitlines()) == 3
+        else:
+            with refusal("too_large" if change == "quota" else "decision"):
+                store.decide([p.id], decision="confirm", operation_id="op-new")
+            assert path.read_bytes() == interleaved
+    finally:
+        monkeypatch.setattr(store_module, "file_lock", file_lock)
+    path.write_bytes(original)
+    assert store.decide([p.id], decision="confirm", operation_id="op-new")["operation_id"] == "op-new"
+
+
+def test_private_snapshot_retry_keeps_durable_reread_and_stale_refusal(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    p = candidate("ins-snapshot", source="insight", source_lineage=("insight",),
+                  insight_ids=("ins-snapshot",))
+    store.write(p)
+    row = store.decide([p.id], decision="propose", operation_id="op-seed")
+    path, = store.home.rglob("*.jsonl")
+    before = path.read_bytes()
+    original = store_module._read
+
+    def reading(directory, name, limit, durable=False):
+        raw = original(directory, name, limit, durable=durable)
+        return raw + b"\n" if durable and name == path.name else raw
+
+    monkeypatch.setattr(store_module, "_read", reading)
+    try:
+        with refusal("stale"):
+            store.decide([p.id], decision="propose", operation_id="op-seed")
+    finally:
+        monkeypatch.setattr(store_module, "_read", original)
+    assert path.read_bytes() == before
+    assert store.decide([p.id], decision="propose", operation_id="op-seed") == row
+
+
 def test_stale_collision_and_terminal_updates_leave_tree_unchanged(tmp_path):
     store = make_store(tmp_path)
     original = store.write(candidate())

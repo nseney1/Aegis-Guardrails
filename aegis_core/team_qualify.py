@@ -218,11 +218,12 @@ def record_pass(store, result, *, expected, identity, journal, lane, request_id,
                 # Reconcile owns its own effect lock and skips active writers.
                 # Calling record_result directly here could close another
                 # thread's in-flight request before that thread performs CAS.
-                journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref))
-                                  if intent["request_id"] == request_id else None)
+                rows = journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref)),
+                                         request_id=request_id)
                 # A terminal done row remains valid even after a newer record.
-                rows = journal.read().rows
-                if any(row["kind"] == "result" and row["request_id"] == request_id
+                if not rows:
+                    rows = journal.read().rows
+                if any(row["kind"] in ("result", "tombstone") and row["request_id"] == request_id
                        and row["status"] == "done" for row in rows):
                     return "already"
                 raise QualificationError("request_closed")
@@ -239,9 +240,9 @@ def record_pass(store, result, *, expected, identity, journal, lane, request_id,
             # Neither a return nor a refusal proves every holder exited. Drop
             # only the owner's copy, then re-observe under an independent lock.
             receipt.close()
-            journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref))
-                              if intent["request_id"] == request_id else None)
-            terminal = next((row for row in journal.read().rows
+            rows = journal.reconcile(lane, lambda intent: team_gitops.Observation(_ref(store, ref)),
+                                     request_id=request_id)
+            terminal = next((row for row in (rows or journal.read().rows)
                              if row["kind"] in ("result", "tombstone")
                              and row["request_id"] == request_id), None)
             if terminal is None:
