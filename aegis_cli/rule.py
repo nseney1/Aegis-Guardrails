@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from aegis_core import primitives
 from aegis_cli import sanitize_display
 from aegis_cli.base import CommandCategory, AegisCommand
+from aegis_cli.rule_lint_cmd import add_lint_parser, run_lint, workspace_refusal as lint_workspace_refusal
 from aegis_core.errors import WorkspaceNotFoundError
 from aegis_core.lifecycle.creation import MAX_RULE_BODY_BYTES, validate_rule_body
 from aegis_core.primitives import utc_stamp
@@ -53,6 +54,7 @@ def run_rule(args: argparse.Namespace) -> int:
         "list": _run_list, "create": _run_create, "promote": _run_promote,
         "demote": _run_demote, "archive": _run_archive, "export": _run_export,
         "import": _run_import, "insight": _run_insight, "adjudicate": _run_adjudicate,
+        "lint": lambda namespace: run_lint(namespace, _resolve_workspace_root),
     }
     if action not in handlers:
         print(f"Unknown rule subcommand: {action}", file=sys.stderr)
@@ -647,7 +649,7 @@ class RuleCommand(AegisCommand):
         for flag in ("--plain", "--json"):
             common.add_argument(flag, action="store_true", default=argparse.SUPPRESS)
         common.add_argument("--workspace", type=str, default=argparse.SUPPRESS, action=_WorkspaceArg)
-        sub = parser.add_subparsers(dest="rule_action", metavar="ACTION")
+        sub = add_lint_parser(parser, common)
 
         p_list = sub.add_parser("list", parents=[common], help="List active rules and fitness metrics")
         p_list.add_argument("--type", choices=list(CANONICAL_RULE_TYPES), help="Filter by rule type")
@@ -750,6 +752,12 @@ class RuleCommand(AegisCommand):
         p_adj.add_argument("--line", type=int, default=None, help="Optional line number in --file")
         p_adj.add_argument("--session", default=None, help="Optional session identifier")
         p_adj.add_argument("--repo", default=None, help="Optional repository identifier")
+
+    def workspace_refusal(self, args: argparse.Namespace, exc: Exception):
+        """Report lint workspace failures; preserve the dispatcher policy otherwise."""
+        if getattr(args, "rule_action", None) == "lint":
+            return lint_workspace_refusal(args)
+        return None
 
     def execute(self, args: argparse.Namespace) -> int:
         return run_rule(args)

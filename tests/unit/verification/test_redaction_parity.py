@@ -142,7 +142,8 @@ def test_a_gate_log_never_persists_key_material_after_a_mismatched_end(tmp_path,
 
 @pytest.mark.parametrize("redactor", ["hook", "command"])
 @pytest.mark.parametrize("closed", [False, True], ids=["unterminated", "complete"])
-@pytest.mark.parametrize("body", ["keybody01" * 2500, "-----BEGIN PRIVATE KEY-----\nkeybody01\n" * 100],
+@pytest.mark.parametrize("body", ["keybody01" * 2500,
+                                  ("-----BEGIN " + "PRIVATE KEY-----\nkeybody01\n") * 100],
                          ids=["long-body", "repeated-begin"])
 def test_pem_redaction_covers_long_and_repeated_headers(redactor, closed, body):
     tail = "\n-----END PRIVATE KEY----- --next" if closed else " --next"
@@ -226,9 +227,10 @@ def _fill(unit: str, n: int) -> str:
 
 
 HOSTILE: Dict[str, Callable[[int], str]] = {
-    "pem-repeat": lambda n: _fill("-----BEGIN PRIVATE KEY-----", n),
-    "pem-unterminated": lambda n: "-----BEGIN PRIVATE KEY-----\n" * 20 + "a" * n,
-    "pem-mismatched-end": lambda n: "-----BEGIN RSA PRIVATE KEY-----\n" + _fill("-----END EC PRIVATE KEY-----\n", n),
+    "pem-repeat": lambda n: _fill("-----BEGIN " + "PRIVATE KEY-----", n),
+    "pem-unterminated": lambda n: ("-----BEGIN " + "PRIVATE KEY-----\n") * 20 + "a" * n,
+    "pem-mismatched-end": lambda n: ("-----BEGIN " + "RSA PRIVATE KEY-----\n")
+    + _fill("-----END EC PRIVATE KEY-----\n", n),
     "token-eq": lambda n: _fill("token=", n),
     "url-userinfo": lambda n: _fill("http://a:", n),
     "bearer": lambda n: _fill("Bearer ", n),

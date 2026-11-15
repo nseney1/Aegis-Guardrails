@@ -1293,6 +1293,7 @@ _RUN_ALLOWED = {
 # `aegis sync --pr` (SECURITY.md, the git row) reads its remote's push URLs and the committer
 # identity, writes its own aegis/lifecycle-* branch, and pushes that one branch.
 _RUN_ALLOWED_IN = {
+    "aegis_core/team_git_snapshot.py": set(),
     "aegis_core/sync.py": {"remote", "var", "update-ref", "push"},
     # GM-1 maps refs/remotes/R/B to target B only through the longest configured remote name,
     # so the approval policy lists remote names (read-only, size-bounded by the caller).
@@ -1305,6 +1306,7 @@ _RUN_ALLOWED_IN = {
 # This is a spelling/shape guard only. The spawn-boundary runtime classifier
 # enforces strict custody; this check deliberately performs no Python dataflow.
 _STRICT_RUNNERS = {"run", "run_checked", "_run", "execute", "capture", "checked", "output", "text"}
+LANE_MODULES = frozenset({"aegis_core/team_git.py", "aegis_core/team_git_snapshot.py"})
 
 
 def _literal_command(argument):
@@ -1325,9 +1327,26 @@ def _literal_command(argument):
     return None
 
 
-def _run_subcommand_offenders(rel, source):
+def _lane_transfer_helpers(root):
+    """Only exported, undecorated module functions can transfer a runner."""
+    transfers = set()
+    for relative in LANE_MODULES:
+        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
+        exports = next((ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__all__"
+                                                    for target in node.targets)), ())
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in exports and not node.decorator_list:
+                arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+                if any(argument.arg in ("runner", "_runner") for argument in arguments):
+                    transfers.add(node.name)
+    return transfers
+
+
+def _run_subcommand_offenders(rel, source, *, root=ROOT):
     tree, offenders = ast.parse(source), []
-    if rel == "aegis_core/team_git.py":
+    if rel in LANE_MODULES:
+        transfers = _lane_transfer_helpers(root)
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_lane_operation"), None)
         wrapper = next((n for n in entry.body if isinstance(n, ast.FunctionDef) and n.name == "wrapped"), None) if entry else None
@@ -1367,7 +1386,7 @@ def _run_subcommand_offenders(rel, source):
         lane_methods = {"run", "run_checked", "paths", "environment", "read_ref", "cas", "publish",
                         "read_private_object", "read_private_objects", "private_object_headers"}
         for module in ("gitsafe.py", "gitsafe_run.py"):
-            protected.update(n.name for n in ast.parse((ROOT / "aegis_core" / module).read_text(encoding="utf-8")).body
+            protected.update(n.name for n in ast.parse((root / "aegis_core" / module).read_text(encoding="utf-8")).body
                              if isinstance(n, ast.FunctionDef))
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id in ("runner", "_runner") and isinstance(node.ctx, ast.Load):
@@ -1376,7 +1395,7 @@ def _run_subcommand_offenders(rel, source):
                 while scope is not None and not isinstance(scope, ast.FunctionDef):
                     scope = parents.get(scope)
                 call = isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
-                transfer = call and parent.func.id in ("_require_runner", "_current", "_publish", "_snapshot_baselines", "_write_snapshot")
+                transfer = call and parent.func.id in transfers
                 type_check = call and parent.func.id == "isinstance" and require is not None and scope is require
                 retain = isinstance(parent, ast.Assign) and enter is not None and scope is enter and ast.unparse(parent.targets[0]) == "self._lane"
                 inject = isinstance(parent, ast.keyword) and parent.arg == "_runner" and wrapper is not None and scope is wrapper
@@ -1484,13 +1503,67 @@ def test_strict_structural_guard_refuses_names_without_resolving_bindings(source
     assert _run_subcommand_offenders("aegis_core/team_git.py", source)
 
 
-def test_exemption_carrier_is_private_to_central_writer():
+def _copy_lane_guard_sources(root):
+    for relative in LANE_MODULES | {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"}:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_lane_guard_refuses_forbidden_form_in_snapshot_copy(tmp_path):
+    _copy_lane_guard_sources(tmp_path)
+    relative = "aegis_core/team_git_snapshot.py"
+    copied = tmp_path / relative
+    source = copied.read_text(encoding="utf-8")
+    test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+    assert not _run_subcommand_offenders(relative, source, root=tmp_path)
+    copied.write_text(source + "\ngitsafe_run.lane_update_ref(root, ref, new, old)\n", encoding="utf-8")
+    assert _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    with pytest.raises(AssertionError, match="unrestricted Git reference"):
+        test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+    copied.write_text(source, encoding="utf-8")
+    assert not _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    test_exemption_carrier_is_private_to_central_writer(root=tmp_path)
+
+
+@pytest.mark.parametrize("shape", ["runner", "value", "decorated"])
+def test_lane_guard_transfer_helpers_follow_exports(tmp_path, shape):
+    _copy_lane_guard_sources(tmp_path)
+    relative = "aegis_core/team_git_snapshot.py"
+    copied = tmp_path / relative
+    source = copied.read_text(encoding="utf-8")
+    argument = "value" if shape == "value" else "runner"
+    definition = ("\n@decorator\n" if shape == "decorated" else "\n") + (
+        "def transfer_helper(" + argument + "):\n    _require_runner(" + argument + ")\n")
+    source += definition + "\ntransfer_helper(runner)\n"
+    copied.write_text(source, encoding="utf-8")
+    assert any("unproved lane capability escape" in message
+               for message in _run_subcommand_offenders(relative, source, root=tmp_path))
+    tree = ast.parse(source)
+    export = next(node for node in tree.body if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets))
+    lines = source.splitlines(keepends=True)
+    lines[export.lineno - 1:export.end_lineno] = [
+        "__all__ = " + repr(ast.literal_eval(export.value) + ["transfer_helper"]) + "\n"]
+    exported = "".join(lines)
+    copied.write_text(exported, encoding="utf-8")
+    offenders = _run_subcommand_offenders(relative, copied.read_text(encoding="utf-8"), root=tmp_path)
+    if shape == "runner":
+        assert not offenders
+    else:
+        assert any("unproved lane capability escape" in message for message in offenders)
+    copied.write_text(source, encoding="utf-8")
+    assert any("unproved lane capability escape" in message
+               for message in _run_subcommand_offenders(relative, source, root=tmp_path))
+
+
+def test_exemption_carrier_is_private_to_central_writer(root=ROOT):
     owner = {"aegis_core/gitsafe.py", "aegis_core/gitsafe_run.py"}
     carriers = {"_REF_WRITE", "_STRICT_SERVICES", "_LaneServices", "_strict_services", "_LaneBinding", "_lane_binding", "issue_runner"}
     violations = []
     for package in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
-        for path in (ROOT / package).rglob("*.py"):
-            rel = path.relative_to(ROOT).as_posix()
+        for path in (root / package).rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
             if rel in owner:
                 if rel == "aegis_core/gitsafe.py":
                     assert not any(isinstance(n, ast.keyword) and n.arg == "_grant"
@@ -1506,27 +1579,15 @@ def test_exemption_carrier_is_private_to_central_writer():
                         or (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in carriers)
                         or (isinstance(node, ast.ImportFrom) and any(a.name in carriers for a in node.names))):
                     violations.append((rel, node.lineno))
-    assert not violations
-    for package in ("aegis_core", "aegis_cli", "aegis_mcp", "aegis_sdk"):
-        for path in (ROOT / package).rglob("*.py"):
-            rel = path.relative_to(ROOT).as_posix()
-            if rel in owner:
-                if rel == "aegis_core/gitsafe.py":
-                    assert not any(isinstance(n, ast.keyword) and n.arg == "_grant"
-                                   for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            assert not any((isinstance(n, ast.keyword) and n.arg == "_grant")
-                           or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == "_grant")
-                           for n in ast.walk(tree)), rel
-            if rel == "aegis_core/team_git.py":
-                assert not _run_subcommand_offenders(rel, path.read_text(encoding="utf-8"))
+            if rel in LANE_MODULES:
+                assert not _run_subcommand_offenders(rel, path.read_text(encoding="utf-8"), root=root)
                 continue
             for node in ast.walk(tree):
                 assert not (isinstance(node, ast.Attribute) and node.attr in ("LaneRunner", "lane_runner")), (rel, node.lineno)
                 assert not (isinstance(node, ast.ImportFrom) and node.module in ("aegis_core.gitsafe", "aegis_core.gitsafe_run")
                             and any(a.name in ("LaneRunner", "lane_runner") for a in node.names)), (rel, node.lineno)
-    tree = ast.parse(Path(gitsafe_run.__file__).read_text(encoding="utf-8"))
+    assert not violations
+    tree = ast.parse((root / "aegis_core/gitsafe_run.py").read_text(encoding="utf-8"))
     parents = {child: n for n in ast.walk(tree) for child in ast.iter_child_nodes(n)}
     grants, launches = [], []
     for node in ast.walk(tree):
@@ -3427,12 +3488,15 @@ def test_effect_receipt_refuses_reused_descriptor_identity(repo, tmp_path, effec
 
 @pytest.mark.usefixtures("strict_program")
 @pytest.mark.parametrize("site", ["run", "capture"])
-def test_effect_timeout_kills_and_reaps_detached_group(repo, tmp_path, effect_lock, site):
+@pytest.mark.parametrize("start_delay", [0, 2], ids=["idle", "delayed"])
+def test_effect_timeout_kills_and_reaps_detached_group(repo, tmp_path, effect_lock, monkeypatch, site, start_delay):
     import signal
+    from types import SimpleNamespace
     shim, marker = tmp_path / "ssh", tmp_path / "descendant.pid"
     _native_program(shim, "#!" + sys.executable + "\n" + f'''
 import os, signal, time
 from pathlib import Path
+time.sleep({start_delay})
 if os.fork(): os._exit(0)
 os.setsid()
 if os.fork(): os._exit(0)
@@ -3441,6 +3505,34 @@ Path({str(marker)!r}).write_text(str(os.getpid()))
 signal.pause()
 ''')
     shim.chmod(0o700)
+    # Startup is not the timeout precondition: the detached daemon must exist.
+    # Pause only this consumer's clock until that event, with a real deadline
+    # so a broken shim still fails. Never change the shared time module.
+    startup_deadline, ready_at = time.monotonic() + 30, []
+    def ready_clock():
+        now = time.monotonic()
+        if not ready_at:
+            if marker.exists():
+                ready_at.append(now)
+            else:
+                assert now < startup_deadline, "timeout fixture never started its detached child"
+                return 0.0
+        return now - ready_at[0]
+    monkeypatch.setattr(gitsafe_run, "time", SimpleNamespace(**{**vars(time), "monotonic": ready_clock}))
+    # The isolated holder owns another deadline. Gate its existing one-second
+    # timeout on the same event, leaving its kill/reap loop byte-identical.
+    timer = "deadline, code, failure, group_killed ="
+    assert gitops_fds._HOLDER_SOURCE.count(timer) == 1
+    readiness = f'''
+startup_deadline = time.monotonic() + 30
+while sys.argv[7] != '-1' and not os.path.exists({str(marker)!r}) and not stopping and time.monotonic() < startup_deadline:
+    time.sleep(0.01)
+'''
+    holder_source = gitops_fds._HOLDER_SOURCE
+    timer_line = next(line for line in holder_source.splitlines() if timer in line)
+    indentation = timer_line[:len(timer_line) - len(timer_line.lstrip())]
+    readiness = readiness.replace("\n", "\n" + indentation)
+    monkeypatch.setattr(gitops_fds, "_HOLDER_SOURCE", holder_source.replace(timer, readiness + timer))
     import contextlib
     capture_scratch = tmp_path / "capture-scratch"
     capture_scratch.mkdir()

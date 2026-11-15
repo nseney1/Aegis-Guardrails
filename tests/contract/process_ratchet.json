@@ -67,6 +67,10 @@
     "count": 1,
     "reason": "Single GitHub transport, isolated working directory and explicit timeout."
   },
+  "process:aegis_core/gitops_holder.py:main:subprocess.Popen": {
+    "count": 1,
+    "reason": "Isolated Linux holder executes source captured from its parent's co-located parsed module and spawns the descriptor-pinned effect with close_fds, separate session, bounded timeout and descendant reaping while retaining receipt custody."
+  },
   "process:aegis_core/gitsafe.py:run:subprocess.run": {
     "count": 1,
     "reason": "Single hardened git transport."
@@ -78,6 +82,10 @@
   "process:aegis_core/inference_provider.py:CommandBackend.generate:subprocess.run": {
     "count": 1,
     "reason": "Explicit user-configured model command boundary."
+  },
+  "process:aegis_core/team_supervisor_start.py:_spawn:subprocess.Popen": {
+    "count": 1,
+    "reason": "SUPERVISOR-START-1: explicit owner argv starts only from a lock-held eligible supervisor plan; no shell or repository cwd; close_fds; kernel identity registration and atomic failure/success checkpoints."
   },
   "process:aegis_core/testexec.py:kill_group:subprocess.run": {
     "count": 1,

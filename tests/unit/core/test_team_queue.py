@@ -1,6 +1,7 @@
 """Queue behaviour through its service, with real storage and process races."""
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -241,8 +242,8 @@ def test_claim_cas_expiry_release_done_and_retry(make_store):
 def test_concurrent_process_claims_have_one_winner(make_store):
     root = make_store
     revision = add(root)
-    with ProcessPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(race_claim, [(root, revision)] * 2))
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
+        results = list(pool.map(race_claim, [(root, revision)] * 2, timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
 
@@ -343,7 +344,7 @@ def test_concurrent_overlapping_lease_scopes_have_one_winner(make_store):
     root = make_store
     first = add(root, paths=["/src/one.py"])
     second = add(root, "TWO", paths=["/src/*.txt"])
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_scoped_claim, [(root, first, "ONE", "alpha"),
                                                   (root, second, "TWO", "beta")], timeout=30))
     assert sorted(row["refused"] for row in results) == [False, True]
@@ -762,7 +763,7 @@ def test_concurrent_finishes_emit_one_transition(make_store, verb):
     from aegis_core import events
     revision = add(make_store)
     claimed = claim(make_store, revision)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_finish, [(make_store, verb, claimed["item"]["revision"])] * 2, timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
     assert next(result for result in results if result["refused"])["reason"] == "stale_revision"
@@ -806,7 +807,7 @@ def test_added_dependencies_and_unobserved_lease_conditions_are_visible(make_sto
 def test_concurrent_disjoint_claims_enforce_writer_capacity(make_store):
     first = add(make_store, paths=["/src/one.py"])
     second = add(make_store, "TWO", paths=["/docs/one.md"])
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_scoped_claim, [(make_store, first, "ONE", "alpha"),
             (make_store, second, "TWO", "beta")], timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
@@ -951,7 +952,7 @@ def test_compaction_concurrency_failure_and_retry(make_store, monkeypatch):
     assert "private-value" not in json.dumps(refused)
     assert path.read_bytes() == before
     monkeypatch.setattr(queue, "atomic_write_bytes", atomicio.atomic_write_bytes)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_compact, [make_store] * 2, timeout=30))
     assert all(not row["refused"] for row in results)
     assert sorted(row["removed_count"] for row in results) == [0, 1]
@@ -1133,7 +1134,7 @@ def race_branch_claim(arguments):
 
 def test_concurrent_claims_record_only_the_winners_branch(make_store):
     revision = add(make_store)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_branch_claim, [(make_store, revision, "lane/a"),
                                                   (make_store, revision, "lane/b")], timeout=30))
     assert sorted(result["refused"] for result in results) == [False, True]
@@ -1493,7 +1494,7 @@ def test_malformed_pending_intent_retries_after_repair(make_store):
     path, state, _row = _pending_state(make_store)
     state["unclaim"] = "private-value"
     before = _write_state(path, state)
-    with ProcessPoolExecutor(max_workers=2) as pool:
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn")) as pool:
         results = list(pool.map(race_list, [(make_store, 101), (make_store, 102)], timeout=30))
     assert [result["reason"] for result in results] == ["invalid_queue_state", "invalid_queue_state"]
     assert all("private-value" not in json.dumps(result) for result in results)

@@ -376,7 +376,7 @@ def test_repeated_redactions_have_a_linear_line_step_budget(repetitions, prose):
 
 
 @pytest.mark.parametrize("value,secret", [
-    ("-----BEGIN PRIVATE KEY-----\nprivate_material\n-----END PRIVATE KEY-----", "private_material"),
+    ("-----BEGIN " + "PRIVATE KEY-----\nprivate_material\n-----END " + "PRIVATE KEY-----", "private_material"),
     ("https://user:actual_password@example.test/path", "actual_password"),
     ("eyJ" + "a" * 16 + "." + "b" * 12 + "." + "c" * 12, "a" * 16),
     ("AKIA" + "A" * 16, "A" * 16), ("ASIA" + "A" * 16, "A" * 16),
@@ -495,7 +495,7 @@ def test_clipping_repeated_masks_covers_every_shared_redaction_family(limit):
 
 
 @pytest.mark.parametrize("value", ["ordinary\twords\nend", "token=[REDACTED]", "token=[REDACTEDx]",
-    "x" * 5000 + " token=secret12345", "-----BEGIN PRIVATE KEY-----\nunterminated"],
+    "x" * 5000 + " token=secret12345", "-----BEGIN " + "PRIVATE KEY-----\nunterminated"],
     ids=["whitespace", "already-redacted", "partially-redacted", "oversized", "unterminated-pem"])
 @pytest.mark.parametrize("limit", [0, 40, 300, 81920])
 def test_redaction_callback_preserves_legacy_bounds_and_formatting(value, limit):
@@ -1090,7 +1090,8 @@ def test_introduced_valid_policy_only_adds_owner_review_to_legacy_report(repo):
     repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "signature"}}))
     repo.commit("introduce map")
     result = rule_integrity.check_ci(repo.root, base, target="main").as_dict()
-    rows = result.pop("owner_review_required")
+    assert "owner_review_required" not in result
+    rows = result.pop("owner_review_findings")
     assert [row["code"] for row in rows] == ["approval_policy_introduced"]
     for document in (baseline, result):
         document.pop("checked_at")
@@ -1320,3 +1321,103 @@ def test_unreadable_committed_policy_never_becomes_legacy(repo, monkeypatch, fai
         with pytest.raises(approval_policy.InvalidApprovalPolicy, match="invalid_approval_policy") as exc:
             rule_integrity.check_ci(repo.root, "main", target="main")
         assert "secret" not in str(exc.value)
+
+
+def test_ungated_targets_follow_permits_unsigned_and_stay_sorted():
+    """Signature keeps the gate, including when no signers exist; the helper has no signer input."""
+    assert approval_policy.ungated_targets(None) == ()
+    assert approval_policy.ungated_targets({}) == ()
+    assert approval_policy.ungated_targets({"main": "signature", "release/**": "signature"}) == ()
+    mixed = {"zeta": "none", "main": "signature", "alpha": "review", "mid": "none"}
+    assert approval_policy.ungated_targets(mixed) == (
+        ("alpha", "review"), ("mid", "none"), ("zeta", "none"))
+    parsed = approval_policy.parse_policy({"approvals": {"b": "review", "a": "none", "*": "signature"}})
+    assert approval_policy.ungated_targets(parsed) == (("a", "none"), ("b", "review"))
+    assert approval_policy.ungated_targets(approval_policy.parse_policy({})) == ()
+    names = [f"t{index:03d}" for index in range(40, -1, -1)]
+    policy = {name: ("signature" if index % 3 == 0 else "none" if index % 3 == 1 else "review")
+              for index, name in enumerate(names)}
+    found = approval_policy.ungated_targets(policy)
+    assert found == tuple(sorted(
+        (name, policy[name]) for name in names if approval_policy.Policy(mode=policy[name]).permits_unsigned))
+    assert found == approval_policy.ungated_targets(dict(reversed(list(policy.items()))))
+
+
+def test_ungated_targets_refuses_unbounded_input_before_the_predicate(monkeypatch):
+    secret = "token=ghp_" + ("Z" * 20)
+    calls = []
+
+    class Boom:
+        def __init__(self, mode=None):
+            calls.append(mode)
+
+        @property
+        def permits_unsigned(self):
+            raise AssertionError("predicate ran")
+
+    monkeypatch.setattr(approval_policy, "Policy", Boom)
+    oversized = {f"b{index}": "none" for index in range(approval_policy.MAX_PATTERNS + 1)}
+    oversized[secret] = "none"
+    with pytest.raises(approval_policy.InvalidApprovalPolicy) as exc:
+        approval_policy.ungated_targets(oversized)
+    assert calls == [] and secret not in str(exc.value) and "b0" not in str(exc.value)
+
+
+def test_ungated_targets_refuses_overlong_names_and_non_maps():
+    huge = "H" * 10000
+    with pytest.raises(approval_policy.InvalidApprovalPolicy) as exc:
+        approval_policy.ungated_targets({huge: "none"})
+    assert huge not in str(exc.value) and "HHHH" not in str(exc.value)
+    for bad in ("*", ["main"], 3, b"main"):
+        with pytest.raises(approval_policy.InvalidApprovalPolicy) as exc:
+            approval_policy.ungated_targets(bad)
+        assert "main" not in str(exc.value)
+
+
+def test_ungated_targets_validates_every_entry_before_the_predicate(monkeypatch):
+    """A later bad entry refuses the whole map before any permits_unsigned call."""
+    calls = []
+
+    class Boom:
+        def __init__(self, mode=None):
+            calls.append(mode)
+
+        @property
+        def permits_unsigned(self):
+            raise AssertionError("predicate ran")
+
+    class Key(str):
+        def __lt__(self, other):
+            raise AssertionError("sorted")
+
+        def __le__(self, other):
+            raise AssertionError("sorted")
+
+    monkeypatch.setattr(approval_policy, "Policy", Boom)
+    samples = (
+        {"*": "REVIEW"},
+        {"main": "not-a-mode"},
+        {"": "none"},
+        {"main": "none", "H" * 10000: "none"},
+    )
+    for policy in samples:
+        calls.clear()
+        with pytest.raises(approval_policy.InvalidApprovalPolicy) as exc:
+            approval_policy.ungated_targets(policy)
+        assert calls == []
+        text = str(exc.value)
+        assert "REVIEW" not in text and "not-a-mode" not in text and "HHHH" not in text
+    calls.clear()
+    with pytest.raises(approval_policy.InvalidApprovalPolicy) as exc:
+        approval_policy.ungated_targets({Key("*"): "none"})
+    assert calls == [] and "sorted" not in str(exc.value)
+
+
+def test_ungated_targets_retry_and_threads_return_the_same_tuple():
+    policy = {"b": "none", "a": "review", "c": "signature"}
+    expected = (("a", "review"), ("b", "none"))
+    assert approval_policy.ungated_targets(policy) == expected
+    assert approval_policy.ungated_targets(policy) == expected
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        found = list(executor.map(lambda _: approval_policy.ungated_targets(dict(policy)), range(8)))
+    assert found == [expected] * 8

@@ -119,6 +119,9 @@ SPAWN_SITES = {
     "aegis_core/gitsafe.py": ("`git`",),
     # GM-5: the strict lane runner starts the same `git` (through gitsafe custody).
     "aegis_core/gitsafe_run.py": ("`git`",),
+    # PROCESS-CENSUS-LITERAL-PROGRAMS: the gitops custody holder (a real module, launched -I -c from its captured
+    # source) starts the same `git` through the descriptor-pinned executable while it owns the effect receipt.
+    "aegis_core/gitops_holder.py": ("`git`",),
     "aegis_cli/install_hosts.py": ("`codex`, `claude`",),
     # Doctor's MCP launcher check compares commands and starts nothing (no `python3`).
     "aegis_cli/doctor.py": ("`codex`, `claude`",),
@@ -128,6 +131,7 @@ SPAWN_SITES = {
     "aegis_core/verification/test_runner.py": ("`pytest`",),
     "aegis_core/verification/mutation_tester.py": ("`pytest`",),
     "aegis_core/inference_provider.py": ("your model command",),
+    "aegis_core/team_supervisor_start.py": ("owner-configured component argv (absolute executable, cwd=/, no shell)",),
     # Install runs the aegis it is about to register once, on an empty payload, in an empty directory.
     "aegis_cli/hooks/registrar.py": ("`aegis`, the hook handler",),
     # `aegis benchmark` starts the same handler under this Python (-I -c) on a fixture payload, in a temp workspace.
