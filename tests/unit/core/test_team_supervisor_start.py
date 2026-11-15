@@ -443,6 +443,108 @@ def test_structural_limits_refuse_before_json_tree_allocation(tmp_path, monkeypa
     assert parsed == [] and path.read_bytes() == frozen
 
 
+@pytest.mark.parametrize("name", [team_supervisor.STATE_NAME, module.PROCESSES_NAME])
+@pytest.mark.parametrize("over", [False, True], ids=["at_limit", "over_limit"])
+@pytest.mark.parametrize("bound", ["items", "members", "string", "utf8", "unicode_escape",
+    "short_escape", "quote_escape", "slash_escape", "surrogate_pair", "atom", "depth", "nodes", "bytes"])
+def test_json_preflight_boundaries_and_corrected_retry(tmp_path, monkeypatch, name, over, bound):
+    root, config = make_store(tmp_path)
+    calls = fake_process(monkeypatch)
+    if bound == "items":
+        frozen = json.dumps([0] * (100 + over)).encode()
+    elif bound == "members":
+        frozen = json.dumps({str(index): 0 for index in range(100 + over)}).encode()
+    elif bound in ("string", "utf8", "unicode_escape", "short_escape", "quote_escape", "slash_escape"):
+        unit = {"string": b"a", "utf8": "\u00e9".encode(), "unicode_escape": b"\\u0061",
+                "short_escape": b"\\n", "quote_escape": b'\\"', "slash_escape": b"\\\\"}[bound]
+        frozen = b'"' + unit * (64 + over) + b'"'
+    elif bound == "surrogate_pair":
+        # Escaped UTF-16 surrogates count separately, as in the original lexer.
+        frozen = b'"' + b"\\ud83d\\ude00" * 32 + b"a" * over + b'"'
+    elif bound == "atom":
+        frozen = b"1" * (20 + over)
+    elif bound == "depth":
+        frozen = b"[" * (8 + over) + b"0" + b"]" * (8 + over)
+    elif bound == "nodes":
+        count = 5 + len(team_supervisor.COMPONENTS) * 106 + over
+        # Each child array consumes one node plus at most 100 scalar nodes.
+        chunks = [json.dumps([0] * (min(101, count - 1 - offset) - 1)).encode()
+                  for offset in range(0, count - 1, 101)]
+        frozen = b"[" + b",".join(chunks) + b"]"
+    else:
+        frozen = b"0" + b" " * (team_supervisor.STATE_MAX_BYTES - 1 + over)
+    path = config / name
+    path.write_bytes(frozen)
+    parsed = []
+
+    def observe(text, **kwargs):
+        parsed.append(text)
+        return json.loads(text, **kwargs)
+
+    monkeypatch.setattr(module, "json", SimpleNamespace(**{**vars(json), "loads": observe}))
+    for _ in range(2):
+        assert run(module, root) == {"status": "refused", "code": "state_unavailable",
+            "reason": "unsafe or unreadable supervisor state", "attempts": []}
+    assert parsed == ([] if over else [frozen.decode("utf-8")] * 2)
+    assert not calls and path.read_bytes() == frozen
+    corrected = (team_supervisor.empty_state() if name == team_supervisor.STATE_NAME
+                 else {"version": 2, "processes": {}, "pending": None})
+    path.write_text(json.dumps(corrected))
+    assert run(module, root)["attempts"] == [{"id": "writer", "outcome": "started"}]
+    assert run(module, root)["attempts"] == [] and len(calls) == 1
+
+
+@pytest.mark.parametrize("reason", ["invalid", "size", "nesting", "nodes", "container", "string", "atom", "SECRET"])
+def test_preflight_value_errors_have_fixed_envelope_and_allow_retry(tmp_path, monkeypatch, reason):
+    root, config = make_store(tmp_path)
+    calls = fake_process(monkeypatch)
+    path = config / team_supervisor.STATE_NAME
+    frozen = json.dumps(team_supervisor.empty_state()).encode()
+    path.write_bytes(frozen)
+
+    def refuse(*args, **kwargs):
+        raise ValueError(reason)
+
+    original = module.json_preflight
+    monkeypatch.setattr(module, "json_preflight", refuse)
+    for _ in range(2):
+        assert run(module, root) == {"status": "refused", "code": "state_unavailable",
+            "reason": "unsafe or unreadable supervisor state", "attempts": []}
+    assert path.read_bytes() == frozen and not calls
+    monkeypatch.setattr(module, "json_preflight", original)
+    assert run(module, root)["attempts"] == [{"id": "writer", "outcome": "started"}]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("name", [team_supervisor.STATE_NAME, module.PROCESSES_NAME])
+@pytest.mark.parametrize("frozen", [b"{", b'"\\u12"', b'"\\', b"\xff", b'{"version":2,"version":2}'])
+def test_malformed_json_has_fixed_refusal_and_concurrent_recovery(tmp_path, monkeypatch, name, frozen):
+    root, config = make_store(tmp_path)
+    calls = fake_process(monkeypatch)
+    path = config / name
+    path.write_bytes(frozen)
+    for _ in range(2):
+        assert run(module, root) == {"status": "refused", "code": "state_unavailable",
+            "reason": "unsafe or unreadable supervisor state", "attempts": []}
+    gate = threading.Barrier(2)
+
+    def invoke():
+        gate.wait(timeout=3)
+        return run(module, root)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: invoke(), range(2)))
+    assert all(row["code"] in ("state_locked", "state_unavailable") for row in results)
+    assert path.read_bytes() == frozen and not calls
+    corrected = (team_supervisor.empty_state() if name == team_supervisor.STATE_NAME
+                 else {"version": 2, "processes": {}, "pending": None})
+    path.write_text(json.dumps(corrected))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: invoke(), range(2)))
+    assert sum(len(row["attempts"]) for row in results) == 1 and len(calls) == 1
+    assert run(module, root)["attempts"] == []
+
+
 def scope_sources(monkeypatch):
     values = {"boot": "12345678-1234-1234-1234-123456789abc", "namespace": "pid:[12345]"}
     boundary = module.storage_confined

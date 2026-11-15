@@ -516,7 +516,7 @@ Inspect audit, approval and native enforcement states
 
 Manage rule lifecycle (list, create, promote, demote, archive) and share rules as unsigned packs
 
-Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `create`, `demote`, `export`, `import`, `insight`, `list`, `promote`.
+Category: Rule Evolution & Intelligence. Subcommands: `adjudicate`, `archive`, `create`, `demote`, `export`, `import`, `insight`, `lint`, `list`, `promote`.
 
 ### `aegis rule adjudicate`
 
@@ -633,6 +633,14 @@ List insights with their top-3 neighbours or record a decision on some
 | `--summary` | `SUMMARY` |  | Closed-template summary bullet when --decision propose |
 | `--rule` | `RULE_ID` |  | Target rule ID for merge-into-rule or recurrence check |
 | `--reason` | `REASON` |  | Reason for the decision (required with reject) |
+
+### `aegis rule lint`
+
+Report rule lint findings without changing rules
+
+| Argument | Value | Default | Description |
+| --- | --- | --- | --- |
+| `paths` | `[PATH ...]` | `[]` | Rule files or directories below .aegis/rules (default: all rules) |
 
 ### `aegis rule list`
 

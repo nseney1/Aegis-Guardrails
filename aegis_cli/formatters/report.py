@@ -146,7 +146,7 @@ def _finding(rule_id: str, path: Any, line: int, message: str, level: str, root:
 
 def _owner_rows(document):
     """Retain identities and the marker for messages already rendered by core."""
-    rows = document.get("owner_review_required")
+    rows = document.get("owner_review_findings")
     if not isinstance(rows, list):
         return []
     cleaned = []
@@ -218,7 +218,8 @@ def _json_human_fields(value, path=()):
     # Coverage's nested reasons are raw producer evidence in JSON, not human
     # diagnostics. Text, annotations and summaries use closed availability
     # categories for that producer; keep its existing JSON bytes and key order.
-    producer = path[0] if len(path) == 1 and path[0] in ("weakenings", "owner_review_required", "findings") else None
+    producer = ("owner_review_required" if path == ("owner_review_findings",) else
+                path[0] if len(path) == 1 and path[0] in ("weakenings", "findings") else None)
     return {key: child if not path and key == "coverage" else
             child if key == "message" and path == ("regression", "findings") and isinstance(value, MessageRow) else
             finding_message(value, producer=producer, display=_workflow_value if producer == "weakenings" else None)
@@ -240,10 +241,10 @@ def render_ci_json(document):
         prepared["regression"] = {**document["regression"],
                                   "findings": [MessageRow(row) for row in regression_findings(document["regression"])]}
     result = _json_human_fields(prepared)
-    if isinstance(result.get("owner_review_required"), list):
-        result["owner_review_required"] = [{key: receipt_value(value, 400, identifier=True)
+    if isinstance(result.get("owner_review_findings"), list):
+        result["owner_review_findings"] = [{key: receipt_value(value, 400, identifier=True)
             if key in ("code", "rule", "path") else value for key, value in row.items()}
-            for row in result["owner_review_required"]]
+            for row in result["owner_review_findings"]]
     return result
 
 
@@ -257,7 +258,7 @@ def ci_findings(document: dict[str, Any], workspace_root: Optional[str | Path] =
     permitted = document.get("approval_mode") in PERMITTED_MODES
     for row in _owner_rows(document):
         found.append(_finding(row["code"], row["path"], 0,
-                              f"{guidance_value(row['code'], prose=True)}: {finding_message(row, producer='owner_review_required')}", "note", workspace_root))
+                              f"{guidance_value(row['code'], prose=True)}: {guidance_value(row['rule'], prose=True)}: {finding_message(row, producer='owner_review_required')}", "note", workspace_root))
     for w in document.get("weakenings", ()):
         label = f"; approval mode {document['approval_mode']}" if permitted else ""
         found.append(_finding(w["rule"], w["path"], 0, f"{guidance_value(w['code'], prose=True)}: {finding_message(w, producer='weakenings')}{label}",

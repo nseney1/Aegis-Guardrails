@@ -376,7 +376,7 @@ def test_repeated_redactions_have_a_linear_line_step_budget(repetitions, prose):
 
 
 @pytest.mark.parametrize("value,secret", [
-    ("-----BEGIN PRIVATE KEY-----\nprivate_material\n-----END PRIVATE KEY-----", "private_material"),
+    ("-----BEGIN " + "PRIVATE KEY-----\nprivate_material\n-----END " + "PRIVATE KEY-----", "private_material"),
     ("https://user:actual_password@example.test/path", "actual_password"),
     ("eyJ" + "a" * 16 + "." + "b" * 12 + "." + "c" * 12, "a" * 16),
     ("AKIA" + "A" * 16, "A" * 16), ("ASIA" + "A" * 16, "A" * 16),
@@ -495,7 +495,7 @@ def test_clipping_repeated_masks_covers_every_shared_redaction_family(limit):
 
 
 @pytest.mark.parametrize("value", ["ordinary\twords\nend", "token=[REDACTED]", "token=[REDACTEDx]",
-    "x" * 5000 + " token=secret12345", "-----BEGIN PRIVATE KEY-----\nunterminated"],
+    "x" * 5000 + " token=secret12345", "-----BEGIN " + "PRIVATE KEY-----\nunterminated"],
     ids=["whitespace", "already-redacted", "partially-redacted", "oversized", "unterminated-pem"])
 @pytest.mark.parametrize("limit", [0, 40, 300, 81920])
 def test_redaction_callback_preserves_legacy_bounds_and_formatting(value, limit):
@@ -1090,7 +1090,8 @@ def test_introduced_valid_policy_only_adds_owner_review_to_legacy_report(repo):
     repo.write(".aegis/config.json", json.dumps({"approvals": {"*": "signature"}}))
     repo.commit("introduce map")
     result = rule_integrity.check_ci(repo.root, base, target="main").as_dict()
-    rows = result.pop("owner_review_required")
+    assert "owner_review_required" not in result
+    rows = result.pop("owner_review_findings")
     assert [row["code"] for row in rows] == ["approval_policy_introduced"]
     for document in (baseline, result):
         document.pop("checked_at")
