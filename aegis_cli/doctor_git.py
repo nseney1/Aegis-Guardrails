@@ -52,9 +52,9 @@ def _in_custody(root, limit, produce, command=None):
         return "git_failed"
     scratch, owned = observe.use_scratch(root)
     bind = getattr(scratch, "bind", None)
-    if getattr(scratch, "code", "scratch_unknown") or not isinstance(bind, str):
+    if getattr(scratch, "code", "scratch_unsafe") or not isinstance(bind, str):
         if owned: observe.close_fd(getattr(scratch, "fd", None))
-        return "git_failed"
+        return rendering.scratch_refusal(getattr(scratch, "code", None))[0]
     try:
         with _custody(scratch=Path(bind), stdout_limit=limit, stderr_limit=GIT_STDERR_LIMIT):
             return produce(cwd)
@@ -137,6 +137,9 @@ def _object_bytes(data):
 def _presence(root, rows, info):
     result = _run_git(root, _PRESENCE)
     if isinstance(result, str):
+        if result in rendering.SCRATCH_CODES:
+            code, action, detail = rendering.scratch_refusal(result)
+            rows.append(rendering.row("git_presence", "warn", code, action, "Git inspection was not run: " + detail)); return False
         rows.append(rendering.row("git_presence", "warn", result, rendering.RETRY, "git is not available for a read-only report")); return False
     if getattr(result, "returncode", 1) != 0:
         rows.append(rendering.row("git_presence", "warn", "not_a_repository", rendering.RETRY, "the workspace is not a git repository")); return False
@@ -214,7 +217,7 @@ def _signers_at(root, commit):
 
 def _signers(root, commit):
     result = _scoped(root, lambda: _signers_at(root, commit))
-    return result if not isinstance(result, str) or result in ("git_output_limit", "git_timeout", "git_failed", "git_missing") else "signers_unavailable"
+    return result if not isinstance(result, str) or result in ("git_output_limit", "git_timeout", "git_failed", "git_missing") or result in rendering.SCRATCH_CODES else "signers_unavailable"
 
 def _branch_name(root):
     result = _run_git(root, _BRANCH)
