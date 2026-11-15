@@ -96,6 +96,16 @@ class JournalRead:
     torn_tail: bool = False
 
 
+@dataclass(frozen=True)
+class _JournalSnapshot(JournalRead):
+    """Transaction-private provenance; never returned by the public read API."""
+
+    data: bytes = b""
+    positions: tuple = ()
+    max_row_bytes: int = MAX_ROW_BYTES
+    max_lines: int = MAX_RECORD_LINES
+
+
 def clean(text):
     canonical = sanitize_display(text, max_len=None)
     redacted = redact_command_secrets(canonical)
@@ -239,10 +249,13 @@ def same_intent(left, right):
     return all(left[key] == right[key] for key in BASE_KEYS - {"kind", "ts"})
 
 
-def parse(data, *, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES):
+def parse(data, *, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES, capture=False):
+    if capture and type(data) is not bytes:
+        raise GitOpsError("journal_io")
     if data.count(b"\n") > max_lines:
         raise GitOpsError("journal_too_large")
     rows, skipped, intents, results = [], 0, {}, set()
+    positions = [] if capture else None
     lines = data.split(b"\n")
     torn = bool(data and not data.endswith(b"\n"))
     for index, raw in enumerate(lines):
@@ -269,8 +282,12 @@ def parse(data, *, max_lines=MAX_RECORD_LINES, max_row_bytes=MAX_ROW_BYTES):
             else:
                 results.add(request)
             rows.append(row)
+            if positions is not None:
+                positions.append(index)
         except (ValueError, UnicodeError, RecursionError):
             skipped += 1
+    if capture:
+        return _JournalSnapshot(rows, skipped, torn, data, tuple(positions), max_row_bytes, max_lines)
     return JournalRead(rows, skipped, torn)
 
 
@@ -287,12 +304,16 @@ def as_result(row):
 def compacted(read, *, data, max_row_bytes, max_journal_bytes, max_lines=MAX_RECORD_LINES):
     """Preserve skipped bytes in place; replace closed pairs at their intent line.
 
-    Match the already-validated sequence, so duplicate/orphan rows stay evidence
-    rather than becoming authoritative after their earlier intent is removed.
+    Use positions captured by the same transaction's parse, so duplicate/orphan
+    rows stay evidence rather than becoming authoritative after compaction.
     A pair stays intact if its canonical tombstone cannot fit or save space.
     """
     if len(data) > max_journal_bytes or data.count(b"\n") > max_lines:
         raise GitOpsError("journal_too_large")
+    if (type(read) is not _JournalSnapshot or read.data is not data
+            or read.max_row_bytes != max_row_bytes or read.max_lines != max_lines
+            or len(read.positions) != len(read.rows)):
+        raise GitOpsError("journal_io")
     if not data:
         return None
     if not data.endswith(b"\n"):
@@ -303,21 +324,8 @@ def compacted(read, *, data, max_row_bytes, max_journal_bytes, max_lines=MAX_REC
               if len(payload) <= max_row_bytes + 1}
     if not closed:
         return None
-    raw_lines, positions = data.split(b"\n")[:-1], {}
-    expected = iter(read.rows)
-    wanted = next(expected, None)
-    for index, raw in enumerate(raw_lines):
-        if wanted is None or len(raw) > max_row_bytes:
-            continue
-        try:
-            row = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
-            if valid_row(row) and row == wanted:
-                positions[index] = wanted
-                wanted = next(expected, None)
-        except (ValueError, UnicodeError, RecursionError):
-            pass
-    if len(positions) != len(read.rows):
-        raise GitOpsError("journal_io")
+    raw_lines = data.split(b"\n")[:-1]
+    positions = dict(zip(read.positions, read.rows))
     pair_bytes = {}
     for index, row in positions.items():
         if row["kind"] in ("intent", "result"):
