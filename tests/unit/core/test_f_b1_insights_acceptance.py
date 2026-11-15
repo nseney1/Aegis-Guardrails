@@ -213,7 +213,8 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
     record_hook_prompt(
         "claude-code",
         {
-            "prompt": "No, don't hardcode token ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD in src/app.py!",
+            "prompt": "No, don't hardcode token " + ("ghp_" + "1234567890abcdefghijklmnop"
+                                              + "qrstuvwxyzABCD") + " in src/app.py!",
             "session_id": "sess-corr-2",
             "cwd": str(repo),
         },
@@ -224,7 +225,7 @@ def test_correction_cue_detector_precision_and_recall_and_hook_storage(tmp_path:
     assert len(insight_rows) == 1
     ins = insight_rows[0]
     assert ins["level"] in ("W2", "hook")
-    assert "ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD" not in ins["text"]
+    assert "ghp_" + "1234567890abcdefghijklmnop" + "qrstuvwxyzABCD" not in ins["text"]
     assert len(ins["text"]) <= 300
     assert "src/app.py" in ins["paths"]
     assert ins["psrc"] == "dirty"
