@@ -893,6 +893,139 @@ def refusal(code, call):
     assert str(error.value) == gitops.REFUSALS[code]
 
 
+@pytest.mark.parametrize("request_id", ["", "../request", "request\nsecret", "x" * 129, 7, []])
+def test_reconcile_selector_refuses_invalid_request_before_access(tmp_path, request_id):
+    store = gitops.GitOpsJournal(tmp_path / "missing")
+    refusal("invalid_request", lambda: store.reconcile("lane-1", lambda row: None,
+                                                      request_id=request_id))
+    assert not store.common_dir.exists()
+
+
+def test_reconcile_selector_unsupported_platform_refuses_with_fixed_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(gitops, "descriptor_supported", lambda: False)
+    store = gitops.GitOpsJournal(tmp_path / "missing")
+    refusal("unsupported_platform", lambda: store.reconcile("lane-1", lambda row: None,
+                                                           request_id="request-1"))
+    assert not store.common_dir.exists()
+
+
+def test_reconcile_selector_touches_one_of_128_pending_requests(make_store, monkeypatch):
+    store = make_store()
+    for index in range(128):
+        intent(store, "request-%03d" % index).close()
+    probes, observations, flushed, effects = [], [], [], set()
+    original_effect, original_os = gitops._try_effect, gitops.os
+
+    def probe(directory, request_id, **kwargs):
+        probes.append(request_id)
+        effect = original_effect(directory, request_id, **kwargs)
+        if effect is not None:
+            effects.add(os.fstat(effect).st_ino)
+        return effect
+
+    def flush(fd):
+        if os.fstat(fd).st_ino in effects:
+            flushed.append(None)
+        return original_os.fsync(fd)
+
+    def observe(row):
+        observations.append(row["request_id"])
+        return gitops.Observation(NEW)
+
+    monkeypatch.setattr(gitops, "_try_effect", probe)
+    monkeypatch.setattr(gitops, "os", SimpleNamespace(**{**vars(os), "fsync": flush}))
+    recorded = store.reconcile("lane-1", observe, request_id="request-063")
+    assert probes == observations == ["request-063"]
+    assert len(flushed) == 2  # Selected checkpoint reservation and saved result.
+    assert recorded == [store.read().rows[-1]]
+    assert recorded[0]["status"] == "done"
+    assert len(store.open_intents()) == 127
+    before = (store.common_dir / "aegis" / "gitops.jsonl").read_bytes()
+    assert store.reconcile("lane-1", observe, request_id="request-063") == []
+    assert store.reconcile("other-lane", observe, request_id="request-000") == []
+    assert store.reconcile("lane-1", observe, request_id="missing") == []
+    assert probes == observations == ["request-063"]
+    assert (store.common_dir / "aegis" / "gitops.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("state,status", [(NEW, "done"), (OLD, "not_applied"), ("c" * 40, "unknown")])
+def test_reconcile_selector_recovers_a_dead_custodian_once(make_store, state, status):
+    store = make_store()
+    intent(store, "unselected").close()
+    orphan_intent(store)
+    calls = []
+
+    def observe(row):
+        calls.append(row["request_id"])
+        return gitops.Observation(state)
+
+    recorded = store.reconcile("lane-1", observe, request_id="request-1")
+    assert [row["status"] for row in recorded] == [status]
+    assert calls == ["request-1"]
+    assert store.reconcile("lane-1", observe, request_id="request-1") == []
+    assert intent(store).created is False
+    assert [row["request_id"] for row in store.open_intents()] == ["unselected"]
+
+
+@pytest.mark.parametrize("failure", ["observer", "storage", "stuck", "active"])
+def test_reconcile_selector_failure_retry_preserves_other_requests(make_store, monkeypatch, failure):
+    store = make_store()
+    receipt = intent(store)
+    checkpoint = next((store.common_dir / "aegis").glob("gitops-effect-*.lock"))
+    if failure != "active":
+        receipt.close()
+    if failure == "stuck":
+        checkpoint.write_bytes(b"!\n")
+    other = intent(store, "unselected")
+    other.close()
+    calls, original_append = [], gitops._append
+    journal_inode = (store.common_dir / "aegis" / "gitops.jsonl").stat().st_ino
+
+    def observe(row):
+        calls.append(row["request_id"])
+        if failure == "observer" and len(calls) == 1:
+            raise TimeoutError("token=never-echo")
+        return gitops.Observation(NEW)
+
+    def unavailable(fd, row, size):
+        if os.fstat(fd).st_ino == journal_inode:
+            raise OSError(errno.ENOSPC, "token=never-echo")
+        return original_append(fd, row, size)
+
+    if failure == "storage":
+        monkeypatch.setattr(gitops, "_append", unavailable)
+    if failure in ("storage", "stuck"):
+        refusal("journal_io" if failure == "storage" else "checkpoint_stuck",
+                lambda: store.reconcile("lane-1", observe, request_id="request-1"))
+    else:
+        assert store.reconcile("lane-1", observe, request_id="request-1") == []
+    monkeypatch.setattr(gitops, "_append", original_append)
+    receipt.close()
+    if failure == "stuck":
+        store.record_result("request-1", "done", NEW)
+        assert store.reconcile("lane-1", observe, request_id="request-1") == []
+        assert calls == []
+    else:
+        assert store.reconcile("lane-1", observe, request_id="request-1")[0]["status"] == "done"
+        assert calls == ["request-1"] * (2 if failure == "observer" else 1)
+    assert store.open_intents() == [other.row]
+    assert store.reconcile("lane-1", observe, request_id="request-1") == []
+
+
+def test_reconcile_without_selector_preserves_exact_rows_and_bytes(make_store, monkeypatch):
+    monkeypatch.setattr(gitops, "utc_stamp", lambda: "2026-11-15T00:00:00Z")
+    store = make_store()
+    receipts = [intent(store, name) for name in ("request-2", "request-1")]
+    for receipt in receipts:
+        receipt.close()
+    expected = [gitops.rows.result(receipt.row, "done", NEW, stamp=receipt.row["ts"])
+                for receipt in reversed(receipts)]
+    assert store.reconcile("lane-1", lambda row: gitops.Observation(NEW)) == expected
+    payload = b"".join(gitops.rows.encoded(row) + b"\n"
+                       for row in [receipt.row for receipt in receipts] + expected)
+    assert (store.common_dir / "aegis" / "gitops.jsonl").read_bytes() == payload
+
+
 @pytest.mark.parametrize("op", OPS)
 def test_every_operation_has_intent_then_result_and_retry_receipt(make_store, op):
     store = make_store()
@@ -1059,13 +1192,15 @@ def test_parallel_reservations_results_and_reconcile_are_once_only(make_store):
 
 @pytest.mark.parametrize("state,status", [(NEW, "done"), (OLD, "not_applied"), ("c" * 40, "unknown")])
 @pytest.mark.parametrize("completion", ["reconcile", "receipt", "effect_fd"])
-def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monkeypatch, state, status, completion):
+@pytest.mark.parametrize("selected", [False, True])
+def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monkeypatch, state, status, completion, selected):
     store = make_store()
     receipt = orphan_intent(store) if completion == "reconcile" else intent(store)
     delayed = gitops.GitOpsJournal(store.common_dir)
     pending_read, resume = Event(), Event()
     original = gitops._try_effect
     calls = []
+    selection = {"request_id": "request-1"} if selected else {}
 
     def pause_before_acquire(directory, request_id, **kwargs):
         if not pending_read.is_set():
@@ -1079,13 +1214,13 @@ def test_delayed_reconcile_does_not_observe_a_completed_intent(make_store, monke
 
     monkeypatch.setattr(gitops, "_try_effect", pause_before_acquire)
     with ThreadPoolExecutor(max_workers=1) as pool:
-        waiting = pool.submit(delayed.reconcile, "lane-1", observe)
+        waiting = pool.submit(delayed.reconcile, "lane-1", observe, **selection)
         try:
             assert pending_read.wait(10), "delayed reconciler did not read pending intents"
             # A records its result and closes its effect descriptor before B
             # may acquire that lock using its now-stale pending snapshot.
             if completion == "reconcile":
-                assert [row["status"] for row in store.reconcile("lane-1", observe)] == [status]
+                assert [row["status"] for row in store.reconcile("lane-1", observe, **selection)] == [status]
             elif completion == "receipt":
                 assert store.record_result("request-1", status, state, receipt=receipt)["status"] == status
             else:
@@ -1113,7 +1248,7 @@ finally:
 
     expected_calls = ["request-1"] if completion == "reconcile" else []
     assert calls == expected_calls
-    assert store.reconcile("lane-1", observe) == []
+    assert store.reconcile("lane-1", observe, **selection) == []
     assert calls == expected_calls
     assert intent(store).created is False
     assert len(store.read().rows) == 2
