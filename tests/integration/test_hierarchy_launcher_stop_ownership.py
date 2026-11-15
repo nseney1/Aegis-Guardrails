@@ -12,7 +12,9 @@ import uuid
 
 import pytest
 
-from tests.integration.test_hierarchy_launcher import (Launch, REVIEW, R2_STOP_TIMEOUT_SECONDS, R2Processes, R2Custody, R2CleanupError,
+from tests.integration.test_hierarchy_launcher import (
+    r2_exited_test_entry, r2_pending_test_entry, require_r2_indirect_exit, Launch, REVIEW,
+                                                       R2_STOP_TIMEOUT_SECONDS, R2Processes, R2Custody, R2CleanupError,
                                                        r2_map_present, R2Facade,
                                                        R2CleanupUnknown, R2_ACTOR_BOOTSTRAP, launcher_module,
                                                        r2_kernel_process, native_wait_fields, wait_until)
@@ -8612,8 +8614,7 @@ def test_unknown_teardown_exit_names_recorded_hook_checks(launch):
         control.LIMIT = 0.5
         control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
         control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
-        control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
-                                     "verified_fd": False, "lost": False, "exit": {"proof": "already-exited"}}
+        control.entries["actor"] = r2_exited_test_entry()
         closed_report = control.report_read
         os.close(closed_report)
         control._hook_released_fds = {closed_report}
@@ -8908,8 +8909,7 @@ def test_hook_diagnostics_fingerprint_every_untrusted_value(tmp_path):
     control.LIMIT = 0.5
     control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
     control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
-    control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
-                                 "verified_fd": False, "lost": False, "exit": {"proof": "already-exited"}}
+    control.entries["actor"] = r2_exited_test_entry()
     closed_report = control.report_read
     os.close(closed_report)
     control._hook_released_fds = {closed_report}
@@ -9171,9 +9171,7 @@ def test_release_custody_descriptors_closes_each_fd_once(tmp_path):
 
         errored = fresh("errored")
         errored.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
-        errored.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
-                                     "verified_fd": False, "lost": False,
-                                     "exit": {"proof": "already-exited"}}
+        errored.entries["actor"] = r2_exited_test_entry()
 
         def failed(slot):
             raise OSError("modelled custody closure failure")
@@ -9189,8 +9187,7 @@ def test_release_custody_descriptors_closes_each_fd_once(tmp_path):
 
         unknown = fresh("unknown")
         unknown.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
-        unknown.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
-                                     "verified_fd": False, "lost": False, "exit": None}
+        unknown.entries["actor"] = r2_pending_test_entry(os.getpid(), "1", process=None)
 
         def refuse(slot):
             raise RuntimeError("modelled closure refuses to signal")
@@ -9230,9 +9227,7 @@ def test_recorded_hook_checks_survive_closure_failure(tmp_path, closure_state):
     control.LIMIT = 0.5
     control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
     control.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
-    control.entries["actor"] = {"pid": os.getpid(), "process": None, "birth": "1", "fd": None,
-                                 "verified_fd": False, "lost": False,
-                                 "exit": {"proof": "already-exited"} if closure_state == "CLOSED_WITH_ERRORS" else None}
+    control.entries["actor"] = (r2_exited_test_entry() if closure_state == "CLOSED_WITH_ERRORS" else r2_pending_test_entry(os.getpid(), "1", process=None))
     if closure_state == "CLOSED_WITH_ERRORS":
         def failed(slot):
             raise OSError("modelled custody closure failure")
@@ -9656,6 +9651,8 @@ class R2Case:
             raise
 
     def make_config(self, nodes, **extra):
+        if any(row.get("parent") is not None for row in nodes.values()):
+            require_r2_indirect_exit(pidfd=True)
         self.custody.plan(nodes)
         path = self.launch.tmp / ("actor-%d.json" % len(self.configs))
         self.configs.append(path)
@@ -10572,8 +10569,7 @@ def test_custody_cached_returncode_is_not_native_wait_evidence():
     from types import SimpleNamespace
 
     physical = r2_kernel_process(os.getpid())
-    entry = {"pid": os.getpid(), "birth": physical["birth"], "process": SimpleNamespace(returncode=0),
-             "fd": None, "verified_fd": False, "lost": False, "exit": None}
+    entry = r2_pending_test_entry(os.getpid(), physical["birth"], process=SimpleNamespace(returncode=0))
     observer = SimpleNamespace(entries={"actor": entry})
     assert R2Custody.observe(observer, "actor") is None
     assert entry["exit"] is None and entry.get("wait_status") == "unavailable"
@@ -10592,8 +10588,17 @@ def test_witnessed_child_keeps_echild_distinct_from_a_real_zero_status(r2_case):
         held.wait(timeout=.1)
     slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == held.pid)
     evidence = r2_case.custody.observe(slot)
-    assert evidence["proof"] == "original_pidfd_exit" and "returncode" not in evidence
+    assert evidence is None and r2_case.custody.entries[slot]["exit"] is None
     assert r2_case.custody.entries[slot]["wait_status"] == "unavailable"
+    # Retire this real child with the actual raw waitpid result retained above.
+    held.record_wait(reaped, status)
+    confirmed = r2_case.custody.observe(slot)
+    assert confirmed["proof"] == "native_waitpid" and confirmed["returncode"] == 0
+    assert held.native_wait_unavailable is False
+    assert "wait_status" not in r2_case.custody.entries[slot]
+    report = r2_case.close()
+    assert report["entries"][slot]["exit"] == confirmed
+    assert "wait_status" not in report["entries"][slot]
 
 
 def test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit(r2_case):
@@ -10604,7 +10609,8 @@ def test_custody_uses_original_pidfd_when_metadata_read_races_actual_exit(r2_cas
 
     held = r2_case.spawn()
     slot = next(slot for slot, row in r2_case.custody.entries.items() if row["pid"] == held.pid)
-    entry = r2_case.custody.entries[slot]
+    # This independent observer borrows the original pidfd, without the direct owner Popen.
+    entry = {**r2_case.custody.entries[slot], "process": None}
     assert entry["fd"] is not None and entry["verified_fd"]
     spec = importlib.util.spec_from_file_location("exit_observer_" + uuid.uuid4().hex, helper.__file__)
     isolated = importlib.util.module_from_spec(spec)
@@ -10639,8 +10645,7 @@ def test_modelled_custody_lost_birth_cannot_be_resolved_by_numeric_absence(tmp_p
     control = isolated.R2Custody(tmp_path / "observer", tmp_path / "modelled-quarantine.json")
     control.plan({"actor": {"kind": "H", "parent": None, "child": None}})
     control.slots["actor"].update(permitted=True, hello=True, released=True)
-    control.entries["actor"] = {"pid": os.getpid(), "birth": original["birth"], "process": None,
-                                 "fd": None, "verified_fd": False, "lost": False, "exit": None}
+    control.entries["actor"] = r2_pending_test_entry(os.getpid(), original["birth"], process=None)
     reads = []
 
     def changed_then_missing(pid):
@@ -11012,20 +11017,391 @@ def test_r2_ancestor_exclusion_spares_a_ready_host_named_caller(r2_case):
 
 
 # Exact finite 28-row matrix from the Root-admitted R2 evidence, not matcher-derived expectations.
-def test_r2_fixture_closure_failed_ready_keeps_physical_custody(r2_case, monkeypatch):
+def _r2_probe_identity(pid):
+    physical = r2_kernel_process(pid)
+    return {**{key: physical[key] for key in ("pid", "ppid", "pgid", "birth")},
+            "sid": os.getsid(pid)}
+
+
+@pytest.fixture
+def r2_closure_probe_case():
+    from types import SimpleNamespace
+
+    folder = Path(os.environ["R2_CLOSURE_PROBE_FOLDER"])
+    folder.mkdir(mode=0o700)
+    made = R2Case(SimpleNamespace(tmp=folder, env=lambda: dict(os.environ)))
+    try:
+        yield made
+    finally:
+        _teardown_r2_case(made)
+
+
+def _r2_isolated_close_probe(folder, ending, pidfds, case=None):
+    """Expected UNKNOWN owns a subprocess scope; it never retires the quarantine."""
+    import ctypes
+    import errno
+    import select
+    import time
+    from types import SimpleNamespace
+    from tests.integration import test_hierarchy_launcher as handshake_tests
+
+    # Child-local subreaping contains every possible orphan before any actor starts.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "R2 fixture: closure subreaper unavailable")
+    folder = Path(folder)
+    if case is None:
+        folder.mkdir(mode=0o700)
+        case = R2Case(SimpleNamespace(tmp=folder, env=lambda: dict(os.environ)))
+    real_os, real_signal = handshake_tests.os, handshake_tests.signal
+    data = {"signals": [], "actors": {}}
+
+    identity = _r2_probe_identity
+
+    def signalled(pid, number):
+        if number != 0:
+            data["signals"].append({**identity(pid), "signal": number})
+        return real_os.kill(pid, number)
+
+    def sent(fd, number, *args):
+        if number == 0:
+            return real_signal.pidfd_send_signal(fd, number, *args)
+        matching = [row for row in case.custody.entries.values()
+                    if row["fd"] == fd or getattr(row["process"], "native_handle", None) == fd]
+        assert len(matching) == 1
+        data["signals"].append({**identity(matching[0]["pid"]), "signal": number})
+        return real_signal.pidfd_send_signal(fd, number, *args)
+
+    def unavailable(*args):
+        raise OSError(errno.ENOSYS, "modelled unavailable pidfd")
+
+    overrides = {"kill": signalled}
+    if not pidfds and ending != "orphan-kill":
+        overrides["pidfd_open"] = unavailable
+    # These references belong to the imported fixture module in this child process.
+    # The real os/signal modules, including subprocess's own wait/cleanup, stay intact.
+    handshake_tests.os = R2Facade(real_os, **overrides)
+    handshake_tests.signal = R2Facade(real_signal, pidfd_send_signal=sent)
+    sibling = None
+    recovery_fd = None
+    unknown = ending in ("ready", "pending", "report-refused", "forged-root", "lost-ancestor", "exited-parent", "unpolled-parent", "late-loss", "lost-after-unknown") or (
+        ending == "orphan-kill" and not pidfds)
+    try:
+        sibling = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import os; os.write(1,b'R'); os.read(0,1)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert select.select([sibling.stdout], [], [], 60)[0]
+        assert sibling.stdout.read(1) == b"R"
+        data["runner"] = identity(os.getpid())
+        data["sibling"] = identity(sibling.pid)
+
+        def snapshot():
+            data["actors"].update({slot: identity(row["pid"])
+                                   for slot, row in case.custody.entries.items()})
+
+        if ending in ("ready", "pending"):
+            with pytest.raises(R2CleanupUnknown) as caught:
+                case.spawn(["diagnostic", "closure-probe"], tree=True, new_session=False)
+            assert type(caught.value.__context__) is OSError
+            error = "modelled READY staging failure" if ending == "ready" else "modelled middle receipt failure"
+            assert str(caught.value.__context__) == error
+            report = caught.value.report
+            data["actors"] = case._closure_probe_actors
+        else:
+            if ending == "lost-ancestor":
+                # This real worker ignores safety EOF; close must deliver its own SIGKILL.
+                case.script.write_text(R2_ACTOR_BOOTSTRAP.replace(
+                    "threading.Thread(target=watchdog, daemon=True).start()",
+                    'if config["nodes"][slot]["kind"] != "W": threading.Thread(target=watchdog, daemon=True).start()'))
+            family = case.spawn(["diagnostic", "closure-probe"], tree=ending in (
+                                "orphan-kill", "lost-ancestor", "exited-parent", "unpolled-parent"),
+                                new_session=False)
+            snapshot()
+            if ending == "orphan-kill" and not pidfds:
+                # Admission required real handles. Model losing them only after capture,
+                # so the no-authority cleanup regression never bypasses that guard.
+                for entry in case.custody.entries.values():
+                    handshake_tests.r2_identity_transition(entry, "release")
+                    if entry["process"] is not None:
+                        entry["process"].close_native_handle()
+                handshake_tests.os = R2Facade(real_os, kill=signalled, pidfd_open=unavailable)
+                data["handles_released_after_admission"] = True
+            root = next(slot for slot, row in case.custody.slots.items() if row["parent"] is None)
+            if ending == "lost-ancestor":
+                middle, worker = root[:-1] + "M", root[:-1] + "W"
+                recovery_fd = real_os.dup(case.custody.entries[worker]["fd"])
+                reading = handshake_tests.r2_kernel_process
+
+                def changed_middle(pid):
+                    row = reading(pid)
+                    return {**row, "euid": row["euid"] + 1} if pid == family["M"].pid else row
+
+                handshake_tests.r2_kernel_process = changed_middle
+                try:
+                    assert case.custody.observe(middle) is None
+                    assert case.custody.entries[middle]["lost"]
+                finally:
+                    handshake_tests.r2_kernel_process = reading
+            elif ending == "late-loss":
+                data["prior_exit"] = dict(case.close()["entries"][root]["exit"])
+                handshake_tests.r2_identity_transition(case.custody.entries[root], "lost")
+            elif ending == "lost-after-unknown":
+                assert os.write(case.custody.report_write, b"[]\n") == 3
+                with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+                    case.custody.pump()
+                with pytest.raises(R2CleanupUnknown) as caught:
+                    case.close()
+                data["prior_exit"] = dict(caught.value.report["entries"][root]["exit"])
+                handshake_tests.r2_identity_transition(case.custody.entries[root], "lost")
+                handshake_tests._clear_r2_quarantine(case.custody, expected_unknown=True)
+                assert R2Custody.quarantine_report is caught.value.report
+                assert caught.value.report["entries"][root]["lost"]
+                assert caught.value.report["entries"][root]["exit"] is None
+            elif ending in ("exited-parent", "unpolled-parent"):
+                middle = root[:-1] + "M"
+                case.custody.kill_owned(middle)
+                if ending == "exited-parent":
+                    wait_until(lambda: family["M"].poll() is not None)
+                    retained = dict(case.custody.entries[middle]["exit"])
+                else:
+                    watcher = select.poll()
+                    watcher.register(case.custody.entries[middle]["fd"], select.POLLIN)
+                    assert watcher.poll(60000)
+                    assert case.custody.entries[middle]["exit"] is None
+                    retained = {"proof": "original_pidfd_exit"}
+                case.custody.plan({"late-worker": {"kind": "W", "parent": middle, "child": None}})
+                reading = handshake_tests.r2_kernel_process
+                candidate = reading(os.getpid())
+
+                def recycled_parent(pid):
+                    if pid == os.getpid():
+                        return {**candidate, "ppid": family["M"].pid}
+                    if pid == family["M"].pid:
+                        raise handshake_tests.R2IdentityConflict("modelled recycled parent identity")
+                    return reading(pid)
+
+                handshake_tests.r2_kernel_process = recycled_parent
+                try:
+                    with pytest.raises(handshake_tests.R2IdentityConflict):
+                        case.custody.capture("late-worker", os.getpid(), birth=candidate["birth"])
+                finally:
+                    handshake_tests.r2_kernel_process = reading
+                assert not case.custody.entries[middle]["lost"]
+                assert case.custody.entries[middle]["exit"] == retained
+                assert "late-worker" not in case.custody.entries
+            elif ending in ("kill", "orphan-kill"):
+                case.custody.kill_owned(root)
+                assert case.custody.wait_native(root) == -signal.SIGKILL
+                if ending == "orphan-kill":
+                    for label in ("M", "W"):
+                        slot = next(slot for slot, row in case.custody.entries.items()
+                                    if row["pid"] == family[label].pid)
+                        if pidfds:
+                            case.custody.kill_owned(slot)
+                            wait_until(lambda: family[label].poll() is not None)
+                        else:
+                            with pytest.raises(RuntimeError, match="^R2 fixture: original-instance signal handle unavailable$"):
+                                case.custody.kill_owned(slot)
+            elif ending == "hook-error":
+                def failed_hook(slot):
+                    raise OSError("modelled cleanup hook failure")
+                case.custody.cleanup_hook = failed_hook
+            elif ending == "report-refused":
+                assert os.write(case.custody.report_write, b"[]\n") == 3
+                with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+                    case.custody.pump()
+            elif ending == "forged-root":
+                case.custody.plan({"impostor": {"kind": "H", "parent": None, "child": None}})
+                case.custody._grant("impostor")
+                frame = (json.dumps(dict(nonce=case.custody.nonce, slot="impostor", event="hello",
+                                         pid=sibling.pid, birth=data["sibling"]["birth"])) + "\n").encode()
+                assert os.write(case.custody.report_write, frame) == len(frame)
+                with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+                    case.custody.pump()
+                assert "impostor" not in case.custody.entries
+            if unknown:
+                with pytest.raises(R2CleanupUnknown) as caught:
+                    case.close()
+                report = caught.value.report
+            elif ending == "hook-error":
+                with pytest.raises(R2CleanupError) as caught:
+                    case.close()
+                assert type(caught.value) is R2CleanupError
+                report = caught.value.report
+            else:
+                report = case.close()
+
+        assert all((ending in ("lost-ancestor", "late-loss", "lost-after-unknown") and row.get("lost") and row["exit"] is None) or
+                   (row["exit"] and row["exit"]["proof"] in (
+            "native_waitpid", "original_pidfd_exit", "matching_birth_zombie", "qualified_namespace_ESRCH")
+                    ) for row in report["entries"].values())
+        if ending == "lost-ancestor":
+            assert report["entries"][middle]["lost"] and report["entries"][middle]["exit"] is None
+            assert report["entries"][worker]["exit"]["proof"] == "original_pidfd_exit"
+            assert any(row["pid"] == family["W"].pid and row["signal"] == signal.SIGKILL
+                       for row in data["signals"])
+            assert not handshake_tests._captured_exit_proven(report)
+            handshake_tests._clear_r2_quarantine(case.custody, expected_unknown=True)
+            assert R2Custody.quarantine_report is report
+        if unknown:
+            assert report["state"] == "UNKNOWN" and case.custody.quarantine.exists()
+            assert R2Custody.quarantine_report is report
+            with pytest.raises(R2CleanupUnknown):
+                R2Custody(folder / "next", folder / "next-UNKNOWN.json")
+            with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
+                case.spawn()
+            with pytest.raises(pytest.exit.Exception) as stopped:
+                _teardown_r2_case(case)
+            assert stopped.value.returncode == 3
+            assert case.custody.quarantine.exists() and R2Custody.quarantine_report is report
+        else:
+            assert report["state"] == ("CLOSED_WITH_ERRORS" if ending == "hook-error" else "CLOSED")
+            _teardown_r2_case(case)
+        assert sibling.poll() is None
+        assert identity(sibling.pid) == data["sibling"]
+        data["report"] = report
+        data["receipts"] = case.projection.receipts
+        data["projection_events"] = case.projection.events
+        return 3 if unknown else 0
+    finally:
+        try:
+            if case.custody.report is None:
+                try:
+                    case.close()
+                except R2CleanupError:
+                    pass  # The scope ends here; quarantine stays, including on a failed assertion.
+        finally:
+            try:
+                if recovery_fd is not None:
+                    watcher = select.poll()
+                    watcher.register(recovery_fd, select.POLLIN)
+                    if not watcher.poll(0):
+                        real_signal.pidfd_send_signal(recovery_fd, signal.SIGKILL)
+                        data["independent_recovery"] = True
+                    real_os.close(recovery_fd)
+                if sibling is not None:
+                    with sibling:
+                        data["sibling_survived"] = sibling.poll() is None
+                        _, stderr = sibling.communicate(input=b"E" if data["sibling_survived"] else None,
+                                                        timeout=60)
+                        data["sibling_returncode"] = sibling.returncode
+                        assert not stderr
+                # The stand-in runner and retained direct roots have been waited.
+                # Every remaining child is adopted from this scope's own actor tree.
+                reaped = []
+                deadline = time.monotonic() + 60
+                while True:
+                    try:
+                        pid, status = os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        data["scope_exit"] = {"proof": "subreaper_native_ECHILD", "reaped": reaped,
+                                              "pid": os.getpid(), "birth": data["runner"]["birth"]}
+                        break
+                    if pid:
+                        reaped.append({"wait_pid": pid, "wait_status": status})
+                    else:
+                        assert time.monotonic() < deadline, "R2 fixture: adopted actor exit is unproven"
+                        time.sleep(0.01)
+            finally:
+                if case.custody.report is None or case.custody.report["state"] == "UNKNOWN":
+                    handshake_tests._release_r2_test_descriptors(case.custody)
+                (folder / "probe.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _run_r2_isolated_close(tmp_path, ending, pidfds=True):
+    if ending in ("ready", "pending", "orphan-kill", "lost-ancestor", "exited-parent", "unpolled-parent"):
+        require_r2_indirect_exit(pidfd=True)
+    folder = tmp_path / "isolated-close"
+    if ending in ("ready", "pending"):
+        node = ("test_r2_fixture_closure_failed_ready_keeps_physical_custody" if ending == "ready" else
+                "test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure")
+        command = [sys.executable, "-m", "pytest", "-n", "0", "-q", "--tb=short",
+                   "--basetemp=" + str(tmp_path / "child-pytest"),
+                   "tests/integration/test_hierarchy_launcher_stop_ownership.py::" + node]
+        env = {**os.environ, "R2_CLOSURE_PROBE_STAGE": ending, "R2_CLOSURE_PROBE_FOLDER": str(folder)}
+    else:
+        entry = ("import sys; sys.path.insert(0,sys.argv[1]); "
+                 "from tests.integration.test_hierarchy_launcher_stop_ownership import _r2_isolated_close_probe; "
+                 "sys.exit(_r2_isolated_close_probe(sys.argv[2],sys.argv[3],sys.argv[4]=='pidfd'))")
+        command = [sys.executable, "-I", "-B", "-c", entry, str(ROOT), str(folder), ending,
+                   "pidfd" if pidfds else "numeric"]
+        env = dict(os.environ)
+    completed = subprocess.run(command, env=env, cwd=str(ROOT), start_new_session=True,
+                               text=True, capture_output=True, timeout=60)
+    unknown = ending in ("ready", "pending", "report-refused", "forged-root", "lost-ancestor", "exited-parent", "unpolled-parent", "late-loss", "lost-after-unknown") or (
+        ending == "orphan-kill" and not pidfds)
+    assert completed.returncode == (3 if unknown else 0), completed.stdout + completed.stderr
+    if ending in ("ready", "pending"):
+        assert "R2 fixture UNKNOWN:" in completed.stdout + completed.stderr
+        assert "INTERNALERROR" not in completed.stdout + completed.stderr
+    else:
+        assert completed.stdout == completed.stderr == ""
+    data = json.loads((folder / "probe.json").read_text(encoding="utf-8"))
+    assert data["sibling_survived"] and data["sibling_returncode"] == 0
+    assert data["scope_exit"]["proof"] == "subreaper_native_ECHILD"
+    assert (data["scope_exit"]["pid"], data["scope_exit"]["birth"]) == (
+        data["runner"]["pid"], data["runner"]["birth"])
+    group, session = data["runner"]["pgid"], data["runner"]["sid"]
+    assert data["sibling"]["pgid"] == group and data["sibling"]["sid"] == session
+    assert data["actors"] and all(row["pgid"] == group and row["sid"] == session
+                                  for row in data["actors"].values())
+    assert set(data["report"]["entries"]) == set(data["actors"])
+    for slot, row in data["report"]["entries"].items():
+        assert (row["pid"], row["birth"]) == (data["actors"][slot]["pid"], data["actors"][slot]["birth"])
+        if row.get("lost"):
+            assert ending in ("lost-ancestor", "late-loss", "lost-after-unknown") and row["exit"] is None
+        elif row["exit"]["proof"] == "native_waitpid":
+            assert row["exit"]["wait_pid"] == row["pid"]
+            assert row["exit"]["returncode"] == os.waitstatus_to_exitcode(row["exit"]["wait_status"])
+    births = {row["pid"]: row["birth"] for row in data["actors"].values()}
+    assert all(row["pid"] in births and row["birth"] == births[row["pid"]] and row["signal"] == signal.SIGKILL
+               for row in data["signals"])
+    assert all(row["pid"] not in (data["runner"]["pid"], data["sibling"]["pid"]) for row in data["signals"])
+    return data
+
+
+@pytest.mark.parametrize("ending", ["lost-ancestor", "exited-parent", "unpolled-parent", "late-loss", "lost-after-unknown"])
+def test_r2_identity_loss_keeps_original_descendant_authority(tmp_path, ending):
+    data = _run_r2_isolated_close(tmp_path, ending)
+    assert data["report"]["state"] == "UNKNOWN"
+    assert not data.get("independent_recovery"), "close must signal the verified original worker itself"
+    if ending == "lost-ancestor":
+        middle = data["actors"]["actor0-M"]["pid"]
+        assert any(row["wait_pid"] == middle for row in data["scope_exit"]["reaped"])
+    elif ending in ("late-loss", "lost-after-unknown"):
+        assert data["prior_exit"]["proof"] == "native_waitpid"
+        assert data["prior_exit"]["wait_pid"] == data["actors"]["actor0-H"]["pid"]
+
+
+@pytest.mark.parametrize("pidfds", [True, False], ids=["pidfd", "numeric"])
+@pytest.mark.parametrize("ending", ["eof", "kill", "hook-error", "report-refused", "forged-root", "orphan-kill"])
+def test_r2_closure_spares_sibling_in_runner_group_and_session(tmp_path, ending, pidfds):
+    data = _run_r2_isolated_close(tmp_path, ending, pidfds)
+    if ending == "orphan-kill" and not pidfds:
+        assert data["handles_released_after_admission"] is True
+    if ending in ("kill", "orphan-kill"):
+        assert len(data["signals"]) == (3 if ending == "orphan-kill" and pidfds else 1)
+
+
+def test_r2_fixture_closure_failed_ready_keeps_physical_custody(tmp_path, monkeypatch, request):
+    if os.environ.get("R2_CLOSURE_PROBE_STAGE") != "ready":
+        data = _run_r2_isolated_close(tmp_path, "ready")
+        report = data["report"]
+        assert report["state"] == "UNKNOWN" and report["unresolved_slots"] == ["actor0-M", "actor0-W"]
+        assert len(report["entries"]) == 1 and report["uncreated_slots"] == []
+        assert all(row["state"] == "PENDING" for row in data["receipts"].values())
+        assert data["projection_events"] == []
+        return
+
+    r2_case = request.getfixturevalue("r2_closure_probe_case")
+
     def failed_ready(*args, **kwargs):
+        r2_case._closure_probe_actors = {slot: _r2_probe_identity(row["pid"])
+                                        for slot, row in r2_case.custody.entries.items()}
         raise OSError("modelled READY staging failure")
 
     monkeypatch.setattr(r2_case.projection, "ready", failed_ready)
-    with pytest.raises(OSError, match="^modelled READY staging failure$"):
-        r2_case.spawn(["claude", "--resume", str(uuid.uuid4())], tree=True)
-    report = r2_case.custody.report
-    assert report["state"] == "CLOSED" and not report["unresolved_slots"]
-    assert len(report["entries"]) == 1 and all(row["exit"] for row in report["entries"].values())
-    assert len(report["uncreated_slots"]) == 2
-    assert all(row["state"] == "PENDING" for row in r2_case.projection.receipts.values())
-    with pytest.raises(RuntimeError, match="^R2 fixture: physical actor admission is closed$"):
-        r2_case.spawn()
+    assert _r2_isolated_close_probe(r2_case.launch.tmp, "ready", True, case=r2_case) == 3
 
 
 def test_r2_sibling_fixture_retains_real_parents_and_group(r2_case):
@@ -11159,22 +11535,27 @@ def test_r2_captured_exec_closes_a_child_still_behind_its_gate(r2_case, monkeypa
     assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
 
 
-def test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure(r2_case, monkeypatch):
+def test_r2_fixture_closure_partial_tree_survives_receipt_stage_failure(tmp_path, monkeypatch, request):
+    if os.environ.get("R2_CLOSURE_PROBE_STAGE") != "pending":
+        data = _run_r2_isolated_close(tmp_path, "pending")
+        report = data["report"]
+        assert report["state"] == "UNKNOWN" and report["unresolved_slots"] == ["actor0-W"]
+        assert len(report["entries"]) == 2 and report["uncreated_slots"] == []
+        assert len(data["receipts"]) == 1  # The unreceipted M had independent physical custody.
+        return
+
+    r2_case = request.getfixturevalue("r2_closure_probe_case")
     original = r2_case.projection.pending
 
     def failed_middle(process):
         if len(r2_case.custody.entries) >= 2:
+            r2_case._closure_probe_actors = {slot: _r2_probe_identity(row["pid"])
+                                            for slot, row in r2_case.custody.entries.items()}
             raise OSError("modelled middle receipt failure")
         return original(process)
 
     monkeypatch.setattr(r2_case.projection, "pending", failed_middle)
-    with pytest.raises(OSError, match="^modelled middle receipt failure$"):
-        r2_case.spawn(["claude", "--resume", str(uuid.uuid4())], tree=True)
-    report = r2_case.custody.report
-    assert report["state"] == "CLOSED" and not report["unresolved_slots"]
-    assert len(report["entries"]) == 2 and all(row["exit"] for row in report["entries"].values())
-    assert len(report["uncreated_slots"]) == 1
-    assert len(r2_case.projection.receipts) == 1  # The unreceipted M still had independent physical custody.
+    assert _r2_isolated_close_probe(r2_case.launch.tmp, "pending", True, case=r2_case) == 3
 
 
 @pytest.mark.parametrize("ending", ["timeout", "caller-killed"])

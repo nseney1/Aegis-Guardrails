@@ -32,6 +32,7 @@ from tests.conftest import symlink_or_skip
 from tests.integration.test_hierarchy_mailbox import ROOT, git, invoke
 from tests.integration.test_hierarchy_provision import Setup, provision, worker_source_seed
 from tools import hierarchy_launcher as bootstrap_launcher
+import tests.integration.test_hierarchy_launcher as handshake_tests
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the launcher supports POSIX process groups only")
@@ -48,6 +49,23 @@ START_FOOTER = "Reply READY. Act only when woken."
 ROOT_SESSION = "01a19a8e-3073-7af2-b5c0-d0c41fe82ada"
 # Bounded outer wait for the complete stop operation, including durable checkpoints and grace.
 R2_STOP_TIMEOUT_SECONDS = 60
+# Hung-child ceiling only. A live handshake returns on report-pipe readiness or process exit.
+R2_HANDSHAKE_CEILING_SECONDS = 60.0
+# One control line, checked before json.loads. Emitters already cap a line at 4096 bytes.
+# A frame of exactly this many bytes with no newline is still waiting; one byte more is a refusal.
+# One pump or discard reads at most this many bytes, so a hostile writer cannot grow memory or
+# outrun the handshake ceiling inside a single read.
+R2_CONTROL_LINE_LIMIT = 65536
+# Complete lines parsed before pump returns to the caller's deadline check.
+R2_CONTROL_LINES_PER_PUMP = 64
+# Flat control objects stay under this nesting depth. Deeper frames are refused before parsing.
+R2_CONTROL_MAX_DEPTH = 8
+# The native-probe broker admits 128 actors (ModelledProbeProcesses.MAX_ACTORS).
+# Each needs up to five lifecycle frames: intent, created, hello, running, terminal.
+# Budget eight 4096-byte emitter frames per actor, including headroom. Both caps
+# cover the whole custody lifetime; the next frame past either is still UNKNOWN.
+R2_CONTROL_LEDGER_MESSAGES = 128 * 8
+R2_CONTROL_LEDGER_BYTES = R2_CONTROL_LEDGER_MESSAGES * 4096
 
 MR1D_PIN_ERROR = "runtime source pin differs from governing provision; use the governing base or reprovision"
 MR1D_CHECK_ERROR = "governing source pin check failed; use the governing base or reprovision"
@@ -1395,6 +1413,60 @@ def launcher_module(projection=None):
     return module
 
 
+def r2_indirect_exit_capability():
+    """Report usable pidfds and existing subreaper status independently.
+
+    Reading PR_GET_CHILD_SUBREAPER does not change ownership in the pytest worker.
+    Only dedicated child scopes establish it with PR_SET_CHILD_SUBREAPER.
+    Subreaper status cannot supply an indirect signal handle or a parent's wait.
+    """
+    capability = {"pidfd": False, "subreaper": False}
+    if not sys.platform.startswith("linux"):
+        return capability
+    descriptor, usable = None, False
+    try:
+        opening = getattr(os, "pidfd_open", None)
+        if callable(opening):
+            descriptor = opening(os.getpid())
+            if type(descriptor) is int and descriptor >= 0:
+                watcher = select.poll()
+                watcher.register(descriptor, select.POLLIN)
+                usable = not watcher.poll(0)  # Our original instance is still alive.
+                if usable:
+                    signal.pidfd_send_signal(descriptor, 0)  # Qualify indirect delivery without a signal.
+    except (AttributeError, OSError, TypeError, ValueError):
+        usable = False
+    finally:
+        if type(descriptor) is int and descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                usable = False
+    capability["pidfd"] = usable
+    try:
+        import ctypes
+        state = ctypes.c_int()
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(37, ctypes.byref(state), 0, 0, 0) == 0 and state.value == 1:
+            capability["subreaper"] = True
+    except (AttributeError, OSError, TypeError):
+        pass
+    return capability
+
+
+def require_r2_indirect_exit(*, pidfd=False):
+    capability = r2_indirect_exit_capability()
+    if isinstance(capability, dict) and (capability.get("pidfd") is True or
+                                       (not pidfd and capability.get("subreaper") is True)):
+        return capability
+    needed = "usable pidfd required" if pidfd else "usable pidfd or native subreaper ownership required"
+    pytest.skip("R2 fixture: indirect exit evidence unavailable; " + needed)
+
+
+class R2IdentityConflict(RuntimeError):
+    """Two physical observations contradicted one another; absence cannot repair this."""
+
+
 def r2_kernel_process(pid):
     """Independent Linux identity capture; no production matcher or host binary is involved."""
     folder = Path("/proc") / str(pid)
@@ -1402,8 +1474,10 @@ def r2_kernel_process(pid):
     status = (folder / "status").read_bytes()
     raw = (folder / "cmdline").read_bytes()
     after = (folder / "stat").read_bytes().rpartition(b")")[2].split()
-    if len(before) < 20 or len(after) < 20 or before[19] != after[19]:
-        raise RuntimeError("R2 fixture: unstable physical birth evidence")
+    if len(before) < 20 or len(after) < 20:
+        raise RuntimeError("R2 fixture: unavailable physical birth evidence")
+    if before[19] != after[19]:
+        raise R2IdentityConflict("R2 fixture: unstable physical birth evidence")
     uid = next((line.split()[1:] for line in status.splitlines() if line.startswith(b"Uid:")), [])
     if len(uid) < 2 or not all(word.isdigit() for word in uid[:2]):
         raise RuntimeError("R2 fixture: unavailable physical UID evidence")
@@ -1455,6 +1529,7 @@ class WitnessedPopen(subprocess.Popen):
         if pid != self.pid or not (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
             raise RuntimeError("R2 fixture: wait status is not for the original child")
         self.native_wait_evidence = {"wait_pid": pid, "wait_status": status}
+        self.native_wait_unavailable = False
         self.returncode = os.waitstatus_to_exitcode(status)
         self.capture_event("native_wait", pid=pid, status=status)
         self.close_native_handle()
@@ -1595,6 +1670,182 @@ class R2OwnedChild:
         return "CONFIRMED_EXIT" if self.custody.observe(self.slot) is not None else None
 
 
+def _r2_control_nesting(text):
+    """Bracket depth of one control line. Quoted braces are not structure."""
+    depth = 0
+    maximum = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            depth += 1
+            if depth > maximum:
+                maximum = depth
+        elif ch in "}]" and depth:
+            depth -= 1
+    return maximum
+
+
+def r2_identity_transition(entry, event, *, fd=None, verified=False, source=None):
+    """The sole writer of an entry's proof state and owned descriptor.
+
+    Pending includes a verified numeric identity without an original-instance
+    handle. Capture commits only after the caller's physical/lineage checks.
+    Native ownership is retained separately when optional pidfds are unavailable.
+    Lost is terminal, including after a previously proven exit.
+    """
+    refusal = "R2 fixture: illegal identity proof transition"
+    if event == "register":
+        if "proof_state" in entry or any(name in entry for name in ("fd", "verified", "verified_fd", "lost", "exit")):
+            raise RuntimeError(refusal)
+        entry.update(fd=None, verified=False, verified_fd=False, lost=False, exit=None, proof_state="pending")
+        return None
+    state = entry.get("proof_state", "pending")
+    if state not in ("pending", "captured", "lost", "exited"):
+        raise RuntimeError(refusal)
+    if event in ("lost", "release"):
+        previous = entry.get("fd")
+        if event == "lost":
+            entry.update(fd=None, verified=False, verified_fd=False, lost=True, exit=None, proof_state="lost")
+        else:
+            state = state if state in ("lost", "exited") else "pending"
+            entry.update(fd=None, verified_fd=False, proof_state=state)
+        if isinstance(previous, int):
+            try:
+                os.close(previous)
+            except OSError:
+                entry["descriptor_close_unavailable"] = True
+        return entry.get("exit")
+    if event == "capture":
+        if (state not in ("pending", "captured") or entry.get("lost") or verified is not True or
+                (fd is not None and (type(fd) is not int or fd < 0)) or
+                not entry.get("birth") or (entry.get("fd") is not None and entry["fd"] != fd)):
+            raise RuntimeError(refusal)
+        entry.update(fd=fd, verified=True, verified_fd=isinstance(fd, int), lost=False, exit=None,
+                     proof_state="captured" if isinstance(fd, int) else "pending")
+        return None
+    if event not in ("native_exit", "pidfd_exit", "adopt_exit") or entry.get("lost"):
+        raise RuntimeError(refusal)
+    if event == "adopt_exit":
+        if (not isinstance(source, dict) or source.get("lost") or not source.get("verified") or
+                source.get("proof_state") != "exited" or source.get("pid") != entry["pid"] or
+                source.get("birth") != entry["birth"] or
+                (source.get("exit") or {}).get("proof") not in ("native_waitpid", "original_pidfd_exit")):
+            raise RuntimeError(refusal)
+        proof = dict(source["exit"])
+    else:
+        if not entry.get("verified"):
+            raise RuntimeError(refusal)
+        if state == "exited":
+            return entry["exit"]
+        if event == "pidfd_exit":
+            if entry.get("process") is not None:
+                return r2_identity_transition(entry, "native_exit")
+            if not isinstance(entry.get("fd"), int) or not entry.get("verified_fd"):
+                raise RuntimeError(refusal)
+            watcher = select.poll()
+            watcher.register(entry["fd"], select.POLLIN)
+            if not watcher.poll(0):
+                return None
+            proof = {"proof": "original_pidfd_exit"}
+        else:
+            owner = entry.get("process") or entry.get("native_owner")
+            if owner is not None and getattr(owner, "pid", None) != entry["pid"]:
+                raise RuntimeError(refusal)
+            try:
+                if owner is None:
+                    # A child-local subreaper can acquire native ownership after
+                    # an ancestor exits. Validate the retained original instance
+                    # while its wait relationship still prevents PID reuse.
+                    try:
+                        physical = r2_kernel_process(entry["pid"])
+                    except (R2IdentityConflict, PermissionError):
+                        r2_identity_transition(entry, "lost")
+                        raise
+                    if (physical["birth"] != entry["birth"] or physical["ppid"] != os.getpid() or
+                            physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid()):
+                        r2_identity_transition(entry, "lost")
+                        raise RuntimeError(refusal)
+                    pid, status = os.waitpid(entry["pid"], os.WNOHANG)
+                    if not pid:
+                        return None
+                    fields = {"wait_pid": pid, "wait_status": status,
+                              "returncode": os.waitstatus_to_exitcode(status)}
+                elif hasattr(owner, "native_wait_evidence"):
+                    owner.poll()
+                    fields = native_wait_fields(owner)
+                    if fields is None:
+                        if owner.native_wait_unavailable:
+                            entry["wait_status"] = "unavailable"
+                        return None
+                else:
+                    if entry.get("wait_status") == "unavailable":
+                        return None
+                    pid, status = os.waitpid(entry["pid"], os.WNOHANG)
+                    if not pid:
+                        return None
+                    fields = {"wait_pid": pid, "wait_status": status,
+                              "returncode": os.waitstatus_to_exitcode(status)}
+                    owner.returncode = fields["returncode"]
+            except ChildProcessError:
+                entry["wait_status"] = "unavailable"
+                return None
+            except OSError:
+                entry["wait_status"] = "unavailable"
+                entry["wait_error"] = True
+                return None
+            proof = {"proof": "native_waitpid", **fields}
+    entry.pop("wait_status", None)
+    entry.update(exit=proof, lost=False, verified=True, proof_state="exited")
+    return proof
+
+
+def r2_entry_record(entry):
+    """Publish terminal loss before considering any saved proof."""
+    return {"pid": entry["pid"], "birth": entry["birth"], "lost": bool(entry.get("lost")),
+            "exit": entry.get("exit") if not entry.get("lost") and entry.get("verified") and
+            entry.get("proof_state") == "exited" else None,
+            **({"wait_status": "unavailable"} if entry.get("wait_status") == "unavailable" else {})}
+
+
+def r2_pending_test_entry(pid, birth, process=None):
+    """Actorless negative models start without a committed handle or exit proof."""
+    entry = dict(pid=pid, birth=birth, process=process, native_owner=process)
+    r2_identity_transition(entry, "register")
+    return entry
+
+
+def r2_exited_test_entry():
+    """Closed bookkeeping models use a real owned native wait, never an invented exit."""
+    child = WitnessedPopen([sys.executable, "-I", "-c", "import os; os.read(0,1)"], stdin=subprocess.PIPE)
+    try:
+        physical = r2_kernel_process(child.pid)
+        assert physical["ppid"] == os.getpid() and physical["uid"] == physical["euid"] == os.geteuid()
+        entry = dict(pid=child.pid, birth=physical["birth"], process=child, native_owner=child)
+        r2_identity_transition(entry, "register")
+        r2_identity_transition(entry, "capture", verified=True)
+        child.stdin.close()
+        assert child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 0
+        r2_identity_transition(entry, "native_exit")
+        return entry
+    finally:
+        if not child.stdin.closed:
+            child.stdin.close()
+        child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        child.close_native_handle()
+
+
 class R2Custody:
     """Physical fixture custody exists before projection staging and never depends on READY.
 
@@ -1602,7 +1853,7 @@ class R2Custody:
     its writer. Children announce themselves while gated, before they may fork or execute the stop runner.
     Missing original-instance/slot closure is UNKNOWN, retained, and blocks subsequent actor admission.
     """
-    LIMIT = 3.0
+    LIMIT = 3.0  # Cleanup and direct native-wait cap. Handshakes use R2_HANDSHAKE_CEILING_SECONDS.
     quarantine_report = None
 
     def __init__(self, folder, quarantine):
@@ -1610,23 +1861,48 @@ class R2Custody:
         if R2Custody.quarantine_report is not None or self.quarantine.exists():
             raise R2CleanupUnknown(R2Custody.quarantine_report or json.loads(self.quarantine.read_text()))
         self.folder.mkdir(mode=0o700)
-        self.safety_read, self.safety_write = os.pipe()
-        self.report_read, self.report_write = os.pipe()
-        os.set_blocking(self.report_read, False)
         self.nonce = uuid.uuid4().hex
+        opened = []
+        self.folder_fd = None
+        try:
+            self.folder_fd = self._open_folder_fd()
+            opened.append(self.folder_fd)
+            self.safety_read, self.safety_write = os.pipe()
+            opened.extend((self.safety_read, self.safety_write))
+            self.report_read, self.report_write = os.pipe()
+            opened.extend((self.report_read, self.report_write))
+            os.set_blocking(self.report_read, False)
+        except BaseException:
+            for fd in opened:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self.folder_fd = None
+            raise
         self.slots, self.entries, self.gates = {}, {}, {}
+        self.launched_roots = {}
+        self.slot_provenance = {}
         self.stderr_paths = {}
         self.buffer, self.messages, self.errors = b"", [], []
+        self.retained_bytes = 0
+        self._lines_this_pump = 0
         self.closed, self.report, self.cleanup_hook = False, None, None
         self.control_unknown = False
+        self.report_eof = False
+        self.report_eof_reads, self.report_eof_at = 0, None
+        self.report_writer_retired = False
+        self.report_rejected = False
         self.visited = []
 
     def admit_check(self):
         if self.closed or R2Custody.quarantine_report is not None or self.quarantine.exists():
             raise RuntimeError("R2 fixture: physical actor admission is closed")
 
-    def plan(self, nodes):
+    def plan(self, nodes, *, fixture_only=()):
         self.admit_check()
+        if any(slot not in nodes for slot in fixture_only):
+            raise RuntimeError("R2 fixture: invalid synthetic slot reservation")
         for slot, data in nodes.items():
             if (set(data) != {"kind", "parent", "child"} or data["kind"] not in ("H", "M", "W", "C", "R") or
                     (data["parent"] is not None and data["parent"] not in nodes and
@@ -1640,6 +1916,25 @@ class R2Custody:
             self.gates[slot] = os.pipe()
             self.slots[slot] = {**data, "permitted": False, "hello": False,
                                 "running": False, "released": False}
+            self.slot_provenance[slot] = {
+                "fixture_created": True, "fixture_only": slot in fixture_only,
+                "handed_to_actor": data["parent"] in self.entries,
+            }
+        self._expose_reservations(name for name, row in self.slots.items()
+                                  if row.get("starting") or name in self.entries)
+
+    def _expose_reservations(self, actors):
+        """An actor may fill every reservation beneath it, including omitted descendants."""
+        exposed = {name for name in actors if name in self.slots}
+        while True:
+            descendants = {name for name, row in self.slots.items()
+                           if row["parent"] is not None and row["parent"] in exposed}
+            added = descendants - exposed
+            if not added:
+                break
+            exposed.update(added)
+        for name in exposed:
+            self.slot_provenance[name]["handed_to_actor"] = True
 
     def config(self, nodes, script, path, **extra):
         data = {"nonce": self.nonce, "safety_read": self.safety_read, "report_write": self.report_write,
@@ -1653,37 +1948,158 @@ class R2Custody:
         return data
 
     def capture(self, slot, pid, process=None, birth=None):
-        # Store the physical object/creation slot BEFORE any fallible metadata read or receipt write.
-        entry = self.entries.setdefault(slot, {"pid": pid, "process": process, "birth": birth,
-                                               "fd": None, "verified_fd": process is not None,
-                                               "lost": False, "exit": None})
+        # A trusted Popen must be retained before fallible reads. A report's
+        # candidate stays private until validated and cannot mutate genuine custody.
+        original = self.entries.get(slot)
+        parent = self.slots[slot]["parent"]
+        if parent is None and original is None and process is None:
+            # A same-parent sibling is not one of our launches. A protocol frame
+            # cannot supply the trusted Popen that establishes a root's ownership.
+            raise R2IdentityConflict("R2 fixture: root has no retained fixture launch")
+        entry = original if original is not None else {
+            "pid": pid, "process": process, "native_owner": process, "birth": birth}
+        if original is None:
+            r2_identity_transition(entry, "register")
+        elif "proof_state" not in entry:
+            # Legacy actorless models enter unverified; their flags cannot grant proof.
+            r2_identity_transition(entry, "register")
+        if original is None and process is not None:
+            self.entries[slot] = entry
+        if entry.get("lost"):
+            raise R2IdentityConflict("R2 fixture: no physical authority after identity loss")
         if entry["pid"] != pid or (birth is not None and entry["birth"] not in (None, birth)):
-            entry["lost"] = True
             raise RuntimeError("R2 fixture: conflicting physical creation identity")
-        if entry["fd"] is None and hasattr(os, "pidfd_open"):
-            try:
-                entry["fd"] = os.pidfd_open(pid)
-            except OSError:
-                pass  # Numeric cleanup still requires fresh original birth and both UIDs.
+        retained_lineage = (original is not None and entry["process"] is None and
+                            isinstance(entry["fd"], int) and entry["verified_fd"] and entry.get("lineage"))
+        if entry.get("birth") is not None and self._retained_wait(entry):
+            # Already captured, and waitpid has reaped it. /proc is gone; the saved
+            # identity and wait evidence are the record.
+            if process is not None:
+                return process
+            if entry.get("process") is not None:
+                return entry["process"]
+            return R2OwnedChild(self, slot)
+        candidate = None
         try:
+            if entry["fd"] is None and hasattr(os, "pidfd_open"):
+                try:
+                    candidate = os.pidfd_open(pid)
+                except OSError:
+                    pass  # Native ownership can still prove an owned direct child's exit.
             physical = r2_kernel_process(pid)
-            parent = self.slots[slot]["parent"]
             expected_parent = os.getpid() if parent is None else self.entries[parent]["pid"]
-            if (physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid() or
-                    physical["ppid"] != expected_parent or
-                    (entry["birth"] is not None and physical["birth"] != entry["birth"])):
-                raise RuntimeError("R2 fixture: physical birth/UID/parent mismatch")
-            entry["birth"], entry["verified_fd"] = physical["birth"], True
-        except BaseException:
-            entry["lost"] = True
+            if entry["birth"] is not None and physical["birth"] != entry["birth"]:
+                raise R2IdentityConflict("R2 fixture: physical birth/UID/parent mismatch")
+            if entry["lost"] or physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid():
+                raise R2IdentityConflict("R2 fixture: physical birth/UID/parent mismatch")
+            if retained_lineage:
+                # A live original instance may now be adopted by another parent.
+                # Its pinned identity and captured ancestry survive that adoption;
+                # neither a new PPID nor an already-reaped ancestor replaces them.
+                return R2OwnedChild(self, slot)
+            if physical["ppid"] != expected_parent:
+                raise R2IdentityConflict("R2 fixture: physical birth/UID/parent mismatch")
+            if parent is None:
+                launched = getattr(self, "launched_roots", {}).get(slot)
+                if launched is not None:
+                    if (entry["process"] is not launched or launched.pid != pid or
+                            launched.native_birth != physical["birth"]):
+                        raise R2IdentityConflict("R2 fixture: physical birth/UID/parent mismatch")
+                    entry["lineage"] = ((slot, pid, physical["birth"]),)
+                else:
+                    # An independent observer may retain an explicitly supplied
+                    # Popen for exit evidence. It acquires no signal authority.
+                    entry["lineage"] = None
+            else:
+                ancestor = self.entries[parent]
+                if R2Custody._retained_wait(self, ancestor):
+                    raise R2IdentityConflict("R2 fixture: captured parent has exited")
+                try:
+                    physical_parent = r2_kernel_process(ancestor["pid"])
+                    if (ancestor["lost"] or physical_parent["birth"] != ancestor["birth"] or
+                            physical_parent["uid"] != os.geteuid() or physical_parent["euid"] != os.geteuid()):
+                        raise R2IdentityConflict("R2 fixture: physical birth/UID/parent mismatch")
+                except (R2IdentityConflict, PermissionError):
+                    r2_identity_transition(ancestor, "lost")
+                    self.control_unknown = True
+                    raise
+                lineage = ancestor.get("lineage")
+                entry["lineage"] = (*lineage, (slot, pid, physical["birth"])) if lineage else None
+            entry["birth"] = physical["birth"]
+            r2_identity_transition(entry, "capture", fd=entry["fd"] if entry["fd"] is not None else candidate,
+                                   verified=True)
+            candidate = None
+        except BaseException as exc:
+            if isinstance(candidate, int):
+                try:
+                    os.close(candidate)
+                except OSError:
+                    pass
+            if ((original is not None or process is not None) and
+                    (not entry.get("verified_fd") or isinstance(exc, (R2IdentityConflict, PermissionError)))):
+                r2_identity_transition(entry, "lost")
+                self.control_unknown = True
             raise
+        self.entries[slot] = entry
         return process if process is not None else R2OwnedChild(self, slot)
+
+    def _retained_wait(self, entry):
+        """True when this slot already has original-instance exit evidence."""
+        if entry.get("lost") or not entry.get("verified"):
+            return False
+        process = entry.get("process")
+        if process is not None:
+            return R2Custody._native_exit(entry) is not None
+        if entry.get("exit") is not None:
+            return True
+        if isinstance(entry.get("fd"), int) and entry.get("verified_fd"):
+            return r2_identity_transition(entry, "pidfd_exit") is not None
+        return False
+
+    @staticmethod
+    def _native_exit(entry):
+        """Reap a retained direct child; protocol status and cached returncode are not evidence."""
+        if entry.get("lost"):
+            return None
+        if not entry.get("verified"):
+            entry["wait_status"] = "unavailable"
+            return None
+        return r2_identity_transition(entry, "native_exit")
+
+    def _grant(self, slot):
+        # Exemption is revoked before the actor may fill this reservation.
+        self.slot_provenance[slot]["handed_to_actor"] = True
+        self.slots[slot]["permitted"] = True
+
+    def _unaccounted_reservations(self):
+        """Reconcile exposure before each verdict, including grants made by consumer fixtures."""
+        self._expose_reservations(name for name, row in self.slots.items()
+                                  if row.get("starting") or name in self.entries)
+        unresolved = set()
+        uncreated = []
+        for slot, row in self.slots.items():
+            origin = self.slot_provenance[slot]
+            if row["permitted"]:
+                origin["handed_to_actor"] = True
+            if slot in self.entries:
+                continue
+            if (origin["fixture_created"] and origin["fixture_only"] and not origin["handed_to_actor"]):
+                uncreated.append(slot)
+            else:
+                unresolved.add(slot)
+        return unresolved, uncreated
 
     def launch(self, config, slot, env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, extra=(),
                argv=None, cwd=None, stdin=subprocess.DEVNULL, new_session=True):
         self.admit_check()
+        if self.slots[slot]["parent"] is not None or slot in self.launched_roots:
+            raise RuntimeError("R2 fixture: root launch requires an unused root slot")
         self.slots[slot]["starting"] = True
-        self.slots[slot]["permitted"] = True
+        self._grant(slot)
+        handed = {slot, *config.get("nodes", {})}
+        for row in config.get("nodes", {}).values():
+            handed.update((row.get("parent"), row.get("child")))
+        self._expose_reservations(handed)
         command = ([sys.executable, "-I", "-B", config["script"], config["config"], slot, *extra]
                    if argv is None else list(argv))
         captured_stderr = None
@@ -1699,78 +2115,530 @@ class R2Custody:
         finally:
             if captured_stderr is not None:
                 captured_stderr.close()
+        self.launched_roots[slot] = process
         return self.capture(slot, process.pid, process)
 
     def stderr_tail(self):
         return "\n".join("%s:\n%s" % (path.name, path.read_text(errors="replace")[-4096:])
                          for path in self.stderr_paths.values())
 
-    def pump(self):
-        while True:
+    def _open_folder_fd(self):
+        """Anchor the custody directory before any child exists.
+
+        Later stderr reads use this descriptor so a rename or symlink on the
+        path cannot redirect them.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return os.open(os.fspath(self.folder), flags)
+
+    def _close_folder_fd(self):
+        fd = getattr(self, "folder_fd", None)
+        self.folder_fd = None
+        if isinstance(fd, int):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _discard_pending_report(self):
+        """Drop a bounded amount of unread report bytes. Does not retain them."""
+        discarded = 0
+        while discarded < R2_CONTROL_LINE_LIMIT:
             try:
                 part = os.read(self.report_read, 4096)
             except BlockingIOError:
-                break
+                return
+            except InterruptedError:
+                continue
             if not part:
-                break
-            self.buffer += part
-        while b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
-            message = json.loads(line)
-            slot = message.get("slot")
-            if message.get("nonce") != self.nonce or slot not in self.slots:
-                raise RuntimeError("R2 fixture: unplanned control message")
-            event = message["event"]
-            if event == "hello":
-                if not self.slots[slot]["permitted"]:
-                    raise RuntimeError("R2 fixture: child appeared without its creation permit")
-                self.capture(slot, message["pid"], birth=message["birth"])
-                self.slots[slot]["hello"] = True
-            elif event == "creation_intent":
-                child = message["child"]
-                if (slot not in self.entries or not self.slots[slot]["released"] or child not in self.slots or
-                        self.slots[child]["parent"] != slot or self.slots[child]["permitted"]):
-                    raise RuntimeError("R2 fixture: invalid reserved child creation intent")
-                self.slots[child]["permitted"] = True
-            elif event == "created":
-                child = message["child"]
-                if child not in self.slots or self.slots[child]["parent"] != slot or not self.slots[child]["permitted"]:
-                    raise RuntimeError("R2 fixture: unexpected child creation")
-                self.capture(child, message["child_pid"], birth=message["child_birth"])
-            elif event == "running":
-                if not self.slots[slot]["released"]:
-                    raise RuntimeError("R2 fixture: actor ran before physical admission")
-                self.slots[slot]["running"] = True
-            elif event == "reaped":
-                child = message["child"]
-                entry = self.entries[child]
-                if (self.slots[child]["parent"] != slot or entry["pid"] != message["child_pid"] or
-                        entry["birth"] != message["child_birth"] or message.get("wait_pid") != entry["pid"] or
-                        not isinstance(message.get("wait_status"), int) or
-                        os.waitstatus_to_exitcode(message["wait_status"]) != message["returncode"]):
-                    raise RuntimeError("R2 fixture: conflicting native child wait")
-                entry["exit"] = {"proof": "parent_Popen_wait", "returncode": message["returncode"],
-                                 "wait_pid": message["wait_pid"], "wait_status": message["wait_status"]}
-            elif event == "wait_unavailable":
-                child = message["child"]
-                entry = self.entries[child]
-                if (self.slots[child]["parent"] != slot or entry["pid"] != message["child_pid"] or
-                        entry["birth"] != message["child_birth"]):
-                    raise RuntimeError("R2 fixture: conflicting unavailable wait")
-                entry["wait_status"] = "unavailable"
-            elif event == "timeout":
-                self.closed = True  # The known runner still requires independent closure; no new actors.
-            else:
-                raise RuntimeError("R2 fixture: invalid control event")
-            self.messages.append(message)
+                self._note_report_eof()
+                return
+            discarded += len(part)
+        try:
+            extra = os.read(self.report_read, 1)
+        except BlockingIOError:
+            return
+        except InterruptedError:
+            extra = b"\x00"
+        if not extra:
+            self._note_report_eof()
+            return
+        # The writer is still producing past the discard budget. Keep no bytes.
+        self.report_rejected = True
+        self.control_unknown = True
+        if "R2 fixture: control message exceeds its bound" not in self.errors:
+            self.errors.append("R2 fixture: control message exceeds its bound")
 
-    def await_event(self, slot, field):
-        deadline = time.monotonic() + self.LIMIT
+    def _note_report_eof(self):
+        self.report_eof = True
+        self.report_eof_reads += 1
+        self.report_eof_at = time.monotonic()
+
+    def _retire_report_writer(self):
+        """Remove the fixture's writer while keeping its descriptor number owned.
+
+        dup2 replaces the pipe atomically. A late capture cannot reuse the number
+        as a pidfd and have teardown close that unrelated descriptor later.
+        """
+        if self.report_writer_retired:
+            return True
+        placeholder = None
+        try:
+            placeholder = os.open(os.devnull, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            if placeholder == self.report_write:
+                self.control_unknown = True
+                self.errors.append("R2 fixture: report writer ownership was lost")
+            else:
+                os.dup2(placeholder, self.report_write, inheritable=False)
+            self.report_writer_retired = True
+            return True
+        except OSError:
+            self.control_unknown = True
+            self.errors.append("R2 fixture: report writer retirement failed")
+            return False
+        finally:
+            if isinstance(placeholder, int) and placeholder != self.report_write:
+                os.close(placeholder)
+
+    def _reject_report(self, reason):
+        """Latch a fixed refusal. The caller's bytes are not copied into the error."""
+        self._latch_refusal(RuntimeError(reason))
+        raise RuntimeError(reason) from None
+
+    def _take_lines(self):
+        """Parse complete lines until this pump's line budget is spent.
+
+        The budget is reset by pump(), not by this method. A second read in the
+        same pump cannot start the count over.
+        """
+        while b"\n" in self.buffer and self._lines_this_pump < R2_CONTROL_LINES_PER_PUMP:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            self._lines_this_pump += 1
+            self._intake_frame(line)
+        if b"\n" not in self.buffer and len(self.buffer) > R2_CONTROL_LINE_LIMIT:
+            self._reject_report("R2 fixture: control message exceeds its bound")
+        return self._lines_this_pump >= R2_CONTROL_LINES_PER_PUMP
+
+    def pump(self):
+        """Read at most one line-limit, then return.
+
+        True means the budget stopped the read while the peer may still be writing,
+        so the caller must not treat this pump as the end of the stream.
+        A rejected report is discarded, never decoded.
+        """
+        if self.report_rejected:
+            self.buffer = b""
+            self._discard_pending_report()
+            raise RuntimeError(self._open_refusal()) from None
+        self._lines_this_pump = 0
+        read = 0
+        while read < R2_CONTROL_LINE_LIMIT:
+            if self._take_lines():
+                return True
+            try:
+                part = os.read(self.report_read, 4096)
+            except BlockingIOError:
+                return False
+            except InterruptedError:
+                continue
+            if not part:
+                self._note_report_eof()
+                self._take_lines()
+                if self.buffer and b"\n" not in self.buffer:
+                    self._reject_report("R2 fixture: control message refused")
+                return False
+            if (len(self.buffer) + len(part) > R2_CONTROL_LINE_LIMIT and b"\n" not in self.buffer
+                    and b"\n" not in part):
+                self._reject_report("R2 fixture: control message exceeds its bound")
+            self.buffer += part
+            read += len(part)
+        self._take_lines()
+        return True
+
+    def _intake_frame(self, line):
+        """Only reader of a control frame. Every failure latches UNKNOWN first."""
+        if self.report_rejected or self.control_unknown:
+            self._reject_report(self._open_refusal())
+        try:
+            self._accept_frame(line)
+        except BaseException as exc:
+            self._latch_refusal(exc)
+            raise RuntimeError(self._refusal_text(exc)) from None
+
+    def _open_refusal(self):
+        for item in reversed(self.errors):
+            if isinstance(item, str) and item.startswith("R2 fixture:"):
+                return item.split("\n", 1)[0]
+        return "R2 fixture: control message refused"
+
+    def _refusal_text(self, exc):
+        # Only diagnostics authored here may cross the intake boundary. An OS,
+        # decoder or capture exception can contain arbitrary input, even with our prefix.
+        refusals = (
+            "R2 fixture: control message refused", "R2 fixture: control message exceeds its bound",
+            "R2 fixture: control ledger exceeded", "R2 fixture: control drain exceeded",
+            "R2 fixture: unplanned control message", "R2 fixture: child appeared without its creation permit",
+            "R2 fixture: invalid reserved child creation intent", "R2 fixture: unexpected child creation",
+            "R2 fixture: actor ran before physical admission", "R2 fixture: conflicting native child wait",
+            "R2 fixture: conflicting unavailable wait", "R2 fixture: invalid control event",
+            "R2 fixture: conflicting physical creation identity", "R2 fixture: physical birth/UID/parent mismatch",
+        )
+        if isinstance(exc, RuntimeError) and str(exc) in refusals:
+            return str(exc)
+        return "R2 fixture: control message refused"
+
+    def _latch_refusal(self, exc):
+        self.report_rejected = True
+        self.control_unknown = True
+        self.buffer = b""
+        reason = self._refusal_text(exc)
+        if reason not in self.errors:
+            self.errors.append(reason)
+        try:
+            self._discard_pending_report()
+        except OSError:
+            pass  # The refusal is already latched; a drain error cannot replace it.
+
+    def _ledger_room(self, line):
+        incoming = len(line) + 1
+        if (len(self.messages) >= R2_CONTROL_LEDGER_MESSAGES or
+                self.retained_bytes + incoming > R2_CONTROL_LEDGER_BYTES):
+            raise RuntimeError("R2 fixture: control ledger exceeded")
+        return incoming
+
+    def _accept_frame(self, line):
+        if len(line) > R2_CONTROL_LINE_LIMIT:
+            raise RuntimeError("R2 fixture: control message exceeds its bound")
+        incoming = self._ledger_room(line)
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            raise RuntimeError("R2 fixture: control message refused") from None
+        if _r2_control_nesting(text) > R2_CONTROL_MAX_DEPTH:
+            raise RuntimeError("R2 fixture: control message refused")
+        try:
+            message = json.loads(text)
+        except RecursionError:
+            raise RuntimeError("R2 fixture: control message refused") from None
+        except json.JSONDecodeError:
+            raise RuntimeError("R2 fixture: control message refused") from None
+        if not isinstance(message, dict):
+            raise RuntimeError("R2 fixture: control message refused")
+        slot = message.get("slot")
+        nonce = message.get("nonce")
+        event = message.get("event")
+        if not isinstance(slot, str) or not isinstance(nonce, str) or not isinstance(event, str):
+            raise RuntimeError("R2 fixture: control message refused")
+        if nonce != self.nonce or slot not in self.slots:
+            raise RuntimeError("R2 fixture: unplanned control message")
+        # Validate every event's fields before capture or any protocol state mutation.
+        identities = {"hello": (("pid", "birth"),), "created": (("child_pid", "child_birth"),),
+                      "reaped": (("child_pid", "child_birth"),),
+                      "wait_unavailable": (("child_pid", "child_birth"),)}
+        for pid_key, birth_key in identities.get(event, ()):
+            pid, birth = message.get(pid_key), message.get(birth_key)
+            if (type(pid) is not int or pid <= 0 or not isinstance(birth, str) or
+                    re.fullmatch(r"[0-9]{1,32}", birth) is None):
+                raise RuntimeError("R2 fixture: control message refused")
+        if event in ("creation_intent", "created", "reaped", "wait_unavailable"):
+            if not isinstance(message.get("child"), str):
+                raise RuntimeError("R2 fixture: control message refused")
+        if event == "reaped" and (type(message.get("wait_pid")) is not int or
+                                   message["wait_pid"] <= 0 or
+                                   type(message.get("wait_status")) is not int or
+                                   not 0 <= message["wait_status"] <= 0xffffffff or
+                                   type(message.get("returncode")) is not int):
+            raise RuntimeError("R2 fixture: control message refused")
+        if event == "hello":
+            if not self.slots[slot]["permitted"]:
+                raise RuntimeError("R2 fixture: child appeared without its creation permit")
+            if self.slots[slot]["hello"]:
+                raise RuntimeError("R2 fixture: conflicting physical creation identity")
+            self.capture(slot, message["pid"], birth=message["birth"])
+            self.slots[slot]["hello"] = True
+        elif event == "creation_intent":
+            child = message["child"]
+            if (slot not in self.entries or not self.slots[slot]["released"] or child not in self.slots or
+                    self.slots[child]["parent"] != slot or self.slots[child]["permitted"]):
+                raise RuntimeError("R2 fixture: invalid reserved child creation intent")
+            self._grant(child)
+        elif event == "created":
+            child = message["child"]
+            if child not in self.slots or self.slots[child]["parent"] != slot or not self.slots[child]["permitted"]:
+                raise RuntimeError("R2 fixture: unexpected child creation")
+            if self.slots[child].get("created"):
+                raise RuntimeError("R2 fixture: conflicting physical creation identity")
+            self.capture(child, message["child_pid"], birth=message["child_birth"])
+            self.slots[child]["created"] = True
+        elif event == "running":
+            if not self.slots[slot]["released"]:
+                raise RuntimeError("R2 fixture: actor ran before physical admission")
+            self.slots[slot]["running"] = True
+        elif event == "reaped":
+            child = message["child"]
+            entry = self.entries.get(child)
+            if (entry is None or self.slots[child]["parent"] != slot or entry["pid"] != message["child_pid"] or
+                    entry["birth"] != message["child_birth"] or message.get("wait_pid") != entry["pid"] or
+                    not isinstance(message.get("wait_status"), int) or
+                    os.waitstatus_to_exitcode(message["wait_status"]) != message["returncode"]):
+                raise RuntimeError("R2 fixture: conflicting native child wait")
+            # Retained below in the bounded message ledger as a claim. Only an
+            # original-instance kernel observation may set this entry's exit.
+        elif event == "wait_unavailable":
+            child = message["child"]
+            entry = self.entries.get(child)
+            if (entry is None or self.slots[child]["parent"] != slot or entry["pid"] != message["child_pid"] or
+                    entry["birth"] != message["child_birth"]):
+                raise RuntimeError("R2 fixture: conflicting unavailable wait")
+            # A protocol claim cannot suppress our retained Popen's native wait.
+        elif event == "timeout":
+            self.closed = True  # The known runner still requires independent closure; no new actors.
+        else:
+            raise RuntimeError("R2 fixture: invalid control event")
+        self.messages.append(message)
+        self.retained_bytes += incoming
+
+    def await_event(self, slot, field, ceiling=None, clock=None, before_terminal=None):
+        """Block on the report pipe, its EOF, or the child's exit.
+
+        ceiling bounds only a child that never writes and never exits. Callers
+        omit it and get R2_HANDSHAKE_CEILING_SECONDS. clock and before_terminal
+        are test seams: clock replaces time.monotonic, and before_terminal runs
+        once after an empty drain and before the exit decision.
+        """
+        if slot not in self.slots or field not in self.slots[slot]:
+            raise RuntimeError("R2 fixture: invalid handshake wait")
+        if ceiling is None:
+            ceiling = R2_HANDSHAKE_CEILING_SECONDS
+        if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 600:
+            raise RuntimeError("R2 fixture: invalid handshake ceiling")
+        if clock is None:
+            clock = time.monotonic
+        deadline = clock() + ceiling
         while not self.slots[slot][field]:
-            self.pump()
-            if time.monotonic() >= deadline:
-                raise RuntimeError("R2 fixture: bounded " + field + " handshake failed")
-            time.sleep(0.01)
+            saturated = self.pump()
+            if self.slots[slot][field]:
+                return
+            if before_terminal is not None:
+                before_terminal(self)
+                before_terminal = None
+            terminal = self._handshake_terminal(slot)
+            if terminal is not None:
+                # Queued frames can outrun one pump. Keep draining while the
+                # budget says more may remain. Stop at the field, EOF, or the
+                # lifetime ledger. The ceiling only bounds a blocking read.
+                while not self.slots[slot][field]:
+                    more = self.pump()
+                    if self.slots[slot][field]:
+                        return
+                    if not more and b"\n" not in self.buffer:
+                        break
+                if self.slots[slot][field]:
+                    return
+                self._refuse_handshake(slot, field, self._handshake_terminal(slot) or terminal)
+            if saturated:
+                continue
+            if clock() >= deadline:
+                # Readiness wins a deadline race: first consume buffered or
+                # newly readable bytes without waiting. Continued traffic is
+                # bounded by the same lifetime ledger as every other intake.
+                more = self.pump()
+                if self.slots[slot][field]:
+                    return
+                if more or b"\n" in self.buffer:
+                    continue
+                self._refuse_handshake(slot, field, self._handshake_terminal(slot) or "ceiling")
+            remaining = deadline - clock()
+            if remaining <= 0:
+                continue
+            self._block_for_handshake(slot, remaining)
+
+    def _pidfd_for(self, slot):
+        entry = self.entries.get(slot)
+        if entry is None:
+            return None
+        fd = entry.get("fd")
+        if isinstance(fd, int) and entry.get("verified_fd") and entry.get("verified") and not entry.get("lost"):
+            return fd
+        process = entry.get("process")
+        handle = getattr(process, "native_handle", None)
+        return handle if isinstance(handle, int) and entry.get("verified") and not entry.get("lost") else None
+
+    def _slot_exited(self, slot):
+        entry = self.entries.get(slot)
+        if entry is None:
+            return False
+        if entry.get("lost"):
+            self.control_unknown = True
+            return False
+        if entry.get("proof_state") == "exited" and entry.get("verified"):
+            return True
+        if entry.get("process") is not None:
+            # A direct child is confirmed through its retained native owner,
+            # including when its pidfd becomes readable before waitpid is ready.
+            proof = R2Custody._native_exit(entry)
+            if entry.get("wait_status") == "unavailable":
+                self.control_unknown = True
+            return proof is not None
+        try:
+            proof = self.observe(slot)
+        except (OSError, RuntimeError, ValueError):
+            proof = None
+        if entry.get("lost"):
+            self.control_unknown = True
+        return proof is not None
+
+    def _handshake_terminal(self, slot):
+        entry = self.entries.get(slot) or {}
+        if entry.get("lost"):
+            self.control_unknown = True
+            return "identity lost"
+        exited = self._slot_exited(slot)
+        if entry.get("lost"):
+            self.control_unknown = True
+            return "identity lost"
+        if entry.get("wait_status") == "unavailable":
+            self.control_unknown = True
+            return "wait unavailable"
+        if exited:
+            return "child exited"
+        if self.report_eof:
+            return "report pipe closed"
+        return None
+
+    def _refresh_exit_code(self, slot):
+        """Refresh status through the same proof transition as ordinary observation."""
+        entry = self.entries.get(slot)
+        if entry is None or entry.get("lost"):
+            return
+        try:
+            if entry.get("process") is not None:
+                R2Custody._native_exit(entry)
+            elif entry.get("exit") is None:
+                self.observe(slot)
+        except (OSError, RuntimeError, ValueError):
+            entry["wait_status"] = "unavailable"
+            self.control_unknown = True
+        if entry.get("wait_status") == "unavailable":
+            self.control_unknown = True
+
+    def _block_for_handshake(self, slot, remaining):
+        poller = select.poll()
+        try:
+            poller.register(self.report_read, select.POLLIN)
+        except (OSError, ValueError):
+            self.report_eof = True
+            return
+        fd = self._pidfd_for(slot)
+        watching_exit = False
+        if isinstance(fd, int):
+            try:
+                poller.register(fd, select.POLLIN)
+                watching_exit = True
+            except (OSError, ValueError):
+                pass
+        # Without a process-exit descriptor the child can exit without closing
+        # the report pipe (the fixture still holds the writer). The slice only
+        # rechecks waitpid. It is not the handshake deadline.
+        limit = remaining if watching_exit else min(remaining, 0.2)
+        timeout_ms = int(limit * 1000)
+        if timeout_ms < 1:
+            timeout_ms = 1
+        try:
+            poller.poll(timeout_ms)
+        except OSError:
+            return
+
+    def _block_for_reap(self, slots, remaining):
+        """Wait until a watched child exits or the report pipe is readable.
+
+        Slots with no pidfd are rechecked on a short slice. The slice is not
+        the cleanup deadline; the caller passes the time left on the ceiling.
+        """
+        if remaining <= 0:
+            return
+        poller = select.poll()
+        try:
+            poller.register(self.report_read, select.POLLIN)
+        except (OSError, ValueError):
+            return
+        watching = False
+        for slot in slots:
+            fd = self._pidfd_for(slot)
+            if not isinstance(fd, int):
+                continue
+            try:
+                poller.register(fd, select.POLLIN)
+                watching = True
+            except (OSError, ValueError):
+                pass
+        limit = remaining if watching or not slots else min(remaining, 0.2)
+        timeout_ms = int(limit * 1000)
+        if timeout_ms < 1:
+            timeout_ms = 1
+        try:
+            poller.poll(timeout_ms)
+        except OSError:
+            return
+
+    def _bounded_stderr(self, slot):
+        path = self.stderr_paths.get(slot)
+        directory = getattr(self, "folder_fd", None)
+        if path is None or not isinstance(directory, int) or not hasattr(os, "O_NOFOLLOW"):
+            return ""
+        name = path.name
+        if not _r2_safe_name(name):
+            return ""
+        source = None
+        try:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            source = os.open(name, flags, dir_fd=directory)
+            info = os.fstat(source)
+            if not stat.S_ISREG(info.st_mode):
+                return "[stderr omitted: unsafe]"
+            if info.st_size > R2_CONTROL_LINE_LIMIT:
+                return "[stderr omitted: too_large]"
+            remaining = info.st_size
+            chunks = []
+            while remaining > 0:
+                part = os.read(source, remaining if remaining < R2_CONTROL_LINE_LIMIT else R2_CONTROL_LINE_LIMIT)
+                if not part:
+                    break
+                chunks.append(part)
+                remaining -= len(part)
+            raw = b"".join(chunks)
+        except OSError:
+            return ""
+        finally:
+            if isinstance(source, int):
+                try:
+                    os.close(source)
+                except OSError:
+                    pass
+        return _r2_untrusted_text(raw.decode("utf-8", "replace"), 1024)
+
+    def _refuse_handshake(self, slot, field, reason):
+        self._refresh_exit_code(slot)
+        entry = self.entries.get(slot) or {}
+        process = entry.get("process")
+        returncode = getattr(process, "returncode", None) if process is not None else None
+        exit_row = entry.get("exit") if isinstance(entry.get("exit"), dict) else None
+        if returncode is None and exit_row is not None:
+            returncode = exit_row.get("returncode")
+        evidence = {"slot": slot, "field": field, "reason": reason, "returncode": returncode,
+                    "stderr": self._bounded_stderr(slot)}
+        if exit_row is not None and exit_row.get("proof"):
+            evidence["exit_proof"] = exit_row["proof"]
+        elif entry.get("wait_status") == "unavailable":
+            evidence["wait_status"] = "unavailable"
+        raise RuntimeError("R2 fixture: %s handshake refused: %s\n%s" % (
+            field, reason, json.dumps(evidence, sort_keys=True)))
 
     def release(self, slot):
         self.admit_check()
@@ -1778,86 +2646,144 @@ class R2Custody:
             raise RuntimeError("R2 fixture: physical admission is incomplete")
         child = self.slots[slot].get("child")
         if child is not None:
-            self.slots[child]["permitted"] = True
+            self._grant(child)
         self.slots[slot]["released"] = True
         os.write(self.gates[slot][1], b"G")
 
     def observe(self, slot):
         entry = self.entries[slot]
-        if entry["exit"] is not None:
-            return entry["exit"]
+        if entry.get("lost"):
+            # Identity loss is UNKNOWN. It is not "still running" and not a later exit proof.
+            self.control_unknown = True
+            return None
         process = entry["process"]
-        if isinstance(process, WitnessedPopen):
-            process.poll()
-            if process.native_wait_unavailable:
-                entry["wait_status"] = "unavailable"
-        proof = native_wait_fields(process) if process is not None else None
-        if proof is not None:
-            entry["exit"] = {"proof": "native_waitpid", **proof}
+        if process is not None:
+            proof = R2Custody._native_exit(entry)
+            if entry.get("wait_error"):
+                self.control_unknown = True
+            return proof
+        if entry["exit"] is not None and entry.get("proof_state") == "exited":
             return entry["exit"]
-        if (process is not None and not isinstance(process, WitnessedPopen) and
-                entry.get("wait_status") != "unavailable"):
-            try:
-                pid, status = os.waitpid(entry["pid"], os.WNOHANG)
-            except ChildProcessError:
-                entry["wait_status"] = "unavailable"
-                pid = 0  # ECHILD is not an invented successful wait or original-instance exit proof.
-            if pid:
-                process.returncode = os.waitstatus_to_exitcode(status)
-                if isinstance(process, WitnessedPopen):
-                    process.record_wait(pid, status)
-                entry["exit"] = {"proof": "native_waitpid", "wait_pid": pid, "wait_status": status,
-                                 "returncode": process.returncode}
-                return entry["exit"]
-        if entry["fd"] is not None and entry["verified_fd"]:
-            poller = select.poll()
-            poller.register(entry["fd"], select.POLLIN)
-            if poller.poll(0):
-                entry["exit"] = {"proof": "original_pidfd_exit"}
-                return entry["exit"]
+        if isinstance(entry.get("fd"), int) and entry.get("verified_fd") and entry.get("verified"):
+            proof = r2_identity_transition(entry, "pidfd_exit")
+            if proof is not None:
+                return proof
         try:
             physical = r2_kernel_process(entry["pid"])
+        except (R2IdentityConflict, PermissionError):
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
+            return None
         except FileNotFoundError:
-            if entry["lost"]:
-                return None
+            if isinstance(entry.get("fd"), int) and entry.get("verified_fd") and entry.get("verified"):
+                return r2_identity_transition(entry, "pidfd_exit")
+            if entry.get("native_owner") is not None:
+                proof = R2Custody._native_exit(entry)
+                if entry.get("wait_error"):
+                    self.control_unknown = True
+                return proof
             try:
                 os.kill(entry["pid"], 0)
             except ProcessLookupError:
-                entry["exit"] = {"proof": "qualified_namespace_ESRCH"}
-                return entry["exit"]
-            entry["lost"] = True
+                entry["wait_status"] = "unavailable"
+                self.control_unknown = True
+                return None
+            except PermissionError:
+                r2_identity_transition(entry, "lost")
+                self.control_unknown = True
+                return None
+            except OSError:
+                return None  # The read failed open. Retry; this is not a new identity.
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
             return None
         except (OSError, ValueError, RuntimeError):
-            # Exit can occur between the first pidfd poll and a failed /proc read. Consult the original
-            # handle again, not the numeric PID or cached return code. No metadata is retried or restored.
-            if entry["fd"] is not None and entry["verified_fd"]:
-                poller = select.poll()
-                poller.register(entry["fd"], select.POLLIN)
-                if poller.poll(0):
-                    entry["exit"] = {"proof": "original_pidfd_exit"}
-                    return entry["exit"]
-            entry["lost"] = True
-            raise
-        if entry["birth"] != physical["birth"]:
-            entry["lost"] = True
-        elif not entry["lost"] and physical["state"].startswith("Z"):
-            entry["exit"] = {"proof": "matching_birth_zombie"}
-            return entry["exit"]
+            # A transient mid-exit read error means evidence is pending.
+            # The retained identity stays. Do not latch lost and do not hide a later zombie.
+            if isinstance(entry.get("fd"), int) and entry.get("verified_fd") and entry.get("verified"):
+                return r2_identity_transition(entry, "pidfd_exit")
+            return None
+        if (entry["birth"] != physical["birth"] or physical["uid"] != os.geteuid() or
+                physical["euid"] != os.geteuid()):
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
+        elif physical["state"].startswith("Z"):
+            if isinstance(entry.get("fd"), int) and entry.get("verified_fd") and entry.get("verified"):
+                # A zombie leader can precede exit of its whole thread group.
+                # Its original verified handle stays pending until readable.
+                return r2_identity_transition(entry, "pidfd_exit")
+            if entry.get("native_owner") is not None:
+                proof = R2Custody._native_exit(entry)
+            elif entry.get("verified") and physical["ppid"] == os.getpid():
+                proof = r2_identity_transition(entry, "native_exit")
+            else:
+                entry["wait_status"] = "unavailable"
+                self.control_unknown = True
+                return None
+            if entry.get("lost") or entry.get("wait_error"):
+                self.control_unknown = True
+            return proof
         return None
+
+    def _owns_lineage(self, slot):
+        """Original ancestry survives reparenting and reaping; protocol claims cannot create it."""
+        entry = self.entries[slot]
+        lineage = entry.get("lineage")
+        if not lineage or lineage[-1] != (slot, entry["pid"], entry["birth"]):
+            return False
+        root_slot, root_pid, root_birth = lineage[0]
+        launched = self.launched_roots.get(root_slot)
+        if launched is None or launched.pid != root_pid or launched.native_birth != root_birth:
+            return False
+        for index, (name, pid, birth) in enumerate(lineage):
+            retained = self.entries.get(name)
+            if (retained is None or (index == len(lineage) - 1 and retained["lost"]) or
+                    retained["pid"] != pid or retained["birth"] != birth or
+                    retained.get("lineage") != lineage[:index + 1] or
+                    self.slots[name]["parent"] != (lineage[index - 1][0] if index else None)):
+                return False
+        return self.entries[root_slot]["process"] is launched
 
     def kill_owned(self, slot):
         entry = self.entries[slot]
         if self.observe(slot) is not None:
             return
-        physical = r2_kernel_process(entry["pid"])
+        try:
+            physical = r2_kernel_process(entry["pid"])
+        except (R2IdentityConflict, PermissionError):
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
+            raise
         if (entry["lost"] or entry["birth"] != physical["birth"] or
                 physical["uid"] != os.geteuid() or physical["euid"] != os.geteuid()):
-            entry["lost"] = True
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
             raise RuntimeError("R2 fixture: no physical authority after identity loss")
-        if entry["fd"] is not None and entry["verified_fd"] and hasattr(signal, "pidfd_send_signal"):
-            signal.pidfd_send_signal(entry["fd"], signal.SIGKILL)
-        else:
-            os.kill(entry["pid"], signal.SIGKILL)  # Fresh birth/UID check; residual numeric race is not hidden.
+        if not self._owns_lineage(slot):
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
+            raise R2IdentityConflict("R2 fixture: no retained fixture launch ancestry")
+        try:
+            if entry["fd"] is not None and entry["verified_fd"] and hasattr(signal, "pidfd_send_signal"):
+                signal.pidfd_send_signal(entry["fd"], signal.SIGKILL)
+            else:
+                process = entry["process"]
+                if process is None or not hasattr(process, "native_wait_lock"):
+                    self.control_unknown = True
+                    raise RuntimeError("R2 fixture: original-instance signal handle unavailable")
+                # An unreaped direct child cannot have its PID reused. Keep the
+                # fixture's native wait and numeric delivery in one critical section.
+                with process.native_wait_lock:
+                    if self._native_exit(entry) is not None:
+                        return
+                    if process.native_wait_unavailable:
+                        self.control_unknown = True
+                        raise RuntimeError("R2 fixture: original-instance signal handle unavailable")
+                    os.kill(entry["pid"], signal.SIGKILL)
+        except PermissionError:
+            r2_identity_transition(entry, "lost")
+            self.control_unknown = True
+            raise
 
     def wait_native(self, slot, seconds=2):
         entry = self.entries[slot]
@@ -1866,40 +2792,72 @@ class R2Custody:
             raise RuntimeError("R2 fixture: invalid direct native wait")
         if isinstance(process, WitnessedPopen):
             code = process.wait(timeout=seconds)
-            entry["exit"] = {"proof": "native_waitpid", **native_wait_fields(process)}
+            r2_identity_transition(entry, "native_exit")
             return code
         deadline = time.monotonic() + seconds
         while True:
-            pid, status = os.waitpid(entry["pid"], os.WNOHANG)
-            if pid:
-                process.returncode = os.waitstatus_to_exitcode(status)
-                if isinstance(process, WitnessedPopen):
-                    process.record_wait(pid, status)
-                entry["exit"] = {"proof": "native_waitpid", "wait_pid": pid, "wait_status": status,
-                                 "returncode": process.returncode}
-                return process.returncode
+            proof = r2_identity_transition(entry, "native_exit")
+            if proof is not None:
+                return proof["returncode"]
             if time.monotonic() >= deadline:
                 raise RuntimeError("R2 fixture: native wait deadline exceeded")
             time.sleep(0.01)
 
     def close(self):
+        try:
+            return self._finish_close()
+        finally:
+            self._close_folder_fd()
+
+    def _finish_close(self):
         if self.report is not None:
+            unresolved, uncreated = self._unaccounted_reservations()
+            for slot, entry in self.entries.items():
+                if entry.get("lost"):
+                    self.control_unknown = True
+                    unresolved.add(slot)
+                    self.report["entries"][slot] = r2_entry_record(entry)
+            if unresolved:
+                self.control_unknown = True
+                self.report["state"] = "UNKNOWN"
+                self.report["unresolved_slots"] = sorted(set(self.report["unresolved_slots"]) | unresolved)
+                self.report["uncreated_slots"] = uncreated
+                self.report["slot_provenance"] = {slot: dict(row) for slot, row in self.slot_provenance.items()}
+                R2Custody.quarantine_report = self.report
             if self.report["state"] == "UNKNOWN":
+                # A later proof loss can invalidate a formerly CLOSED cached
+                # report. Retain that UNKNOWN before the caller can admit again.
+                R2Custody.quarantine_report = self.report
+                try:
+                    self.quarantine.write_text(json.dumps(self.report, indent=2) + "\n")
+                    (self.folder / "closure.json").write_text(json.dumps(self.report, indent=2) + "\n")
+                except OSError:
+                    self.errors.append("R2 fixture: UNKNOWN retention write failed")
                 raise R2CleanupUnknown(self.report)
             return self.report
         self.closed = True
-        deadline = time.monotonic() + self.LIMIT
-        # Resolve already permitted creation slots before EOF; never scan unrelated processes for a child.
-        while any(row["permitted"] and slot not in self.entries for slot, row in self.slots.items()):
+        # A permitted slot that has no process yet can only announce on the report pipe.
+        # LIMIT caps that appearance and the reap below. Exit wakes the poll immediately.
+        appear = time.monotonic() + self.LIMIT
+        while (not self.report_rejected and
+               any(row["permitted"] and slot not in self.entries for slot, row in self.slots.items())):
+            saturated = False
             try:
-                self.pump()
+                saturated = bool(self.pump())
             except BaseException as exc:
-                self.errors.append("control drain: " + str(exc))
+                self.buffer = b""
                 self.control_unknown = True
+                saturated = False
+                if not self.report_rejected:
+                    self.errors.append("control drain: " + str(exc))
+                    break
+            if not any(row["permitted"] and slot not in self.entries for slot, row in self.slots.items()):
                 break
-            if time.monotonic() >= deadline - 2:
+            if time.monotonic() >= appear:
                 break
-            time.sleep(0.01)
+            if saturated:
+                continue
+            self._block_for_reap([], appear - time.monotonic())
         try:
             os.close(self.safety_write)  # ONLY the fixture owns this writer. All actors independently see EOF.
         except OSError as exc:
@@ -1912,13 +2870,43 @@ class R2Custody:
             except BaseException as exc:
                 self.errors.append("cleanup hook " + slot + ": " + str(exc))
         kill_tried = set()
+        # EOF is the graceful stop. SIGKILL follows if the child is still alive.
+        # LIMIT is the cleanup cap (tests set it below a second to prove UNKNOWN).
+        # A child that exits wakes the pidfd wait immediately; LIMIT is not a sleep.
+        # The handshake ceiling is not used here: a slot aimed at the live test
+        # process, with kill_owned stubbed, would otherwise block for that ceiling.
         cooperative = time.monotonic() + 0.3
+        deadline = time.monotonic() + self.LIMIT
+        post_exit = None
+        drain_complete = False
+        drain_evidence = None
+        drain_unavailable = False
+        left = list(self.entries)
         while True:
-            try:
-                self.pump()
-            except BaseException as exc:
-                self.errors.append("control closure: " + str(exc))
-                self.control_unknown = True
+            if time.monotonic() >= deadline:
+                self._latch_refusal(RuntimeError("R2 fixture: control drain exceeded"))
+                break
+            saturated = False
+            if not drain_unavailable:
+                try:
+                    saturated = bool(self.pump())
+                except BaseException as exc:
+                    self.buffer = b""
+                    self.control_unknown = True
+                    if not self.report_rejected:
+                        self.errors.append("control closure: " + str(exc))
+                        drain_unavailable = True
+            # The exit snapshot predates this pump. Only a fresh EOF, observed
+            # before the deadline and with no new captured instance, completes it.
+            instances = frozenset((slot, row["pid"], row["birth"]) for slot, row in self.entries.items())
+            if (post_exit is not None and post_exit["entries"] == instances and
+                    self.report_eof_reads > post_exit["eof_reads"] and
+                    self.report_eof_at <= deadline):
+                drain_complete = True
+                drain_evidence = {"eof_reads": self.report_eof_reads, "eof_at": self.report_eof_at}
+                if self.buffer:
+                    self._latch_refusal(RuntimeError("R2 fixture: control message refused"))
+                break
             left = []
             for slot in list(self.entries):
                 if slot not in self.visited:
@@ -1937,17 +2925,58 @@ class R2Custody:
                 except BaseException as exc:
                     left.append(slot)
                     self.errors.append("observe/cleanup " + slot + ": " + str(exc))
-            if not left or time.monotonic() >= deadline:
+            # Absence of buffered bytes is never a completed drain. Even an
+            # empty pump must yield UNKNOWN if the exit observation spent the deadline.
+            if time.monotonic() >= deadline:
+                self._latch_refusal(RuntimeError("R2 fixture: control drain exceeded"))
                 break
-            time.sleep(0.01)
+            if not left:
+                if drain_unavailable:
+                    break
+                exited = instances
+                if post_exit is None or post_exit["entries"] != exited:
+                    post_exit = {"entries": exited, "eof_reads": self.report_eof_reads}
+                    if not self._retire_report_writer():
+                        break
+                    continue
+            else:
+                post_exit = None
+            if saturated:
+                continue
+            # Do not sleep through the SIGKILL point. After the signal, the pidfd
+            # wakes this wait as soon as the child actually exits.
+            remaining = deadline - time.monotonic()
+            if any(slot not in kill_tried for slot in left):
+                remaining = min(remaining, max(0.0, cooperative - time.monotonic()))
+            self._block_for_reap(left, remaining)
+        if self.report_rejected:
+            try:
+                self._discard_pending_report()
+            except OSError:
+                pass
+            self.buffer = b""
+        if self.report_rejected:
+            self.control_unknown = True
+            self.buffer = b""
         missing = [slot for slot, row in self.slots.items() if row["permitted"] and slot not in self.entries]
-        state = "UNKNOWN" if left or missing or self.buffer or self.control_unknown else "CLOSED_WITH_ERRORS" if self.errors else "CLOSED"
-        self.report = {"state": state, "errors": self.errors, "unresolved_slots": sorted(set(left + missing)),
-                       "visited": self.visited, "entries": {slot: {"pid": entry["pid"], "birth": entry["birth"],
-                       "exit": entry["exit"], **({"wait_status": "unavailable"}
-                        if entry.get("wait_status") == "unavailable" else {})}
+        reservations, uncreated = self._unaccounted_reservations()
+        unresolved = set(left + missing) | reservations
+        if self.report_rejected:
+            # Discarded frames may have created a reserved slot. Do not call it uncreated.
+            for slot in uncreated:
+                if slot not in self.entries:
+                    unresolved.add(slot)
+            uncreated = []
+        state = "UNKNOWN" if left or missing or unresolved or self.buffer or self.control_unknown or not drain_complete else "CLOSED_WITH_ERRORS" if self.errors else "CLOSED"
+        self.report = {"state": state, "errors": self.errors, "unresolved_slots": sorted(unresolved),
+                       "visited": self.visited, "entries": {slot: r2_entry_record(entry)
                         for slot, entry in self.entries.items()},
-                       "uncreated_slots": [slot for slot, row in self.slots.items() if not row["permitted"]]}
+                       "uncreated_slots": uncreated,
+                       "slot_provenance": {slot: dict(row) for slot, row in self.slot_provenance.items()},
+                       "post_exit_drain": {"complete": drain_complete,
+                                           "eof_reads": drain_evidence["eof_reads"] if drain_evidence else None,
+                                           "eof_at": drain_evidence["eof_at"] if drain_evidence else None,
+                                           "deadline": deadline}}
         if state == "UNKNOWN":
             R2Custody.quarantine_report = self.report  # Latch BEFORE fallible evidence writes.
             try:
@@ -1957,11 +2986,9 @@ class R2Custody:
                 self.errors.append("UNKNOWN retention write: " + str(exc))
             raise R2CleanupUnknown(self.report)
         for entry in self.entries.values():
-            if entry["fd"] is not None:
-                try:
-                    os.close(entry["fd"])
-                except OSError as exc:
-                    self.errors.append("pidfd close: " + str(exc))
+            r2_identity_transition(entry, "release")
+            if entry.get("descriptor_close_unavailable"):
+                self.errors.append("R2 fixture: pidfd close unavailable")
             process = entry["process"]
             if process is not None:
                 if isinstance(process, WitnessedPopen):
@@ -1973,6 +3000,8 @@ class R2Custody:
                         except OSError as exc:
                             self.errors.append("Popen stream close: " + str(exc))
         for fd in (self.safety_read, self.report_read, self.report_write, *(f for pair in self.gates.values() for f in pair)):
+            if not isinstance(fd, int):
+                continue
             try:
                 os.close(fd)
             except OSError as exc:
@@ -2552,6 +3581,62 @@ sys.exit(scope["r2_actor_main"](config, slot))
 '''
 
 
+def _r2_safe_name(name):
+    """A single custody-directory component. Rejects traversal and separators."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    if "/" in name or "\\" in name or "\x00" in name:
+        return False
+    return True
+
+
+def _r2_untrusted_text(text, limit):
+    """Canonicalize, then redact, then truncate. Newlines stay; they are not joined."""
+    import unicodedata
+    from aegis_core.redaction import TOKEN_REDACTIONS, redact_command_secrets
+
+    canonical = unicodedata.normalize("NFKC", text)
+    canonical = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", canonical)
+    canonical = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", canonical)
+    redacted = redact_command_secrets(canonical)
+    for pattern, replacement in TOKEN_REDACTIONS:
+        redacted = pattern.sub(replacement, redacted)
+    if len(redacted) > limit:
+        redacted = redacted[:limit]
+    return redacted
+
+
+def r2_wait_child_ready(child, ready, ceiling, clock=None, sleeper=None):
+    """Wait until ready() is true or the child exits.
+
+    The caller's signal may be a file with no readiness descriptor, so this polls.
+    ceiling is the only failure bound and applies only while the child is still alive.
+    A signal that becomes true as the child exits is still success.
+    sleeper replaces time.sleep for tests that have to show the wait blocked.
+    """
+    if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or not 0 < ceiling <= 600:
+        raise RuntimeError("R2 fixture: invalid handshake ceiling")
+    if clock is None:
+        clock = time.monotonic
+    if sleeper is None:
+        sleeper = time.sleep
+    deadline = clock() + ceiling
+    while True:
+        if ready():
+            return True
+        exited = child.poll() is not None
+        if ready():
+            return True
+        if exited:
+            return False
+        if clock() >= deadline:
+            return False
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return True if ready() else False
+        sleeper(min(0.05, remaining))
+
+
 def r2_actor_main(config, slot):
     """Private test-only actor protocol. This process has already been captured and admitted through its gate."""
     node = config["nodes"][slot]
@@ -2616,12 +3701,10 @@ def r2_actor_main(config, slot):
         # the pending receipt gets no positive logical projection until the caller's exact exec handshake.
         os.execvpe(command[0], command, dict(os.environ))
     if node["kind"] == "C":
-        deadline = time.monotonic() + 3
-        while not Path(config["nodes"][child_slot]["started"]).exists():
-            if child.poll() is not None or time.monotonic() >= deadline:
-                emit("timeout")
-                return 124
-            time.sleep(0.01)
+        started = config["nodes"][child_slot]["started"]
+        if not r2_wait_child_ready(child, lambda: Path(started).exists(), R2_HANDSHAKE_CEILING_SECONDS):
+            emit("timeout")
+            return 124
         try:
             out, err = child.communicate(timeout=config.get("runner_timeout", R2_STOP_TIMEOUT_SECONDS))
         except subprocess.TimeoutExpired:
@@ -2746,5 +3829,3445 @@ def test_a_census_that_fails_after_signals_were_sent_is_recorded_as_stop_failed(
         assert answer["error"] == "[Errno 2] No such file or directory: 'ps'"
         assert hung.wait(timeout=5) < 0
         assert [row["state"] for row in launch.records()] == ["bound", "stop_failed"]
+    finally:
+        context.close()
+
+
+# The child blocks on a latch. It does not sleep. The fixture must return on the report
+# pipe, pipe EOF, or process exit. A three-second poll is the defect under test.
+R2_HANDSHAKE_CHILD = """import json, os, select, sys
+from pathlib import Path
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+slot, mode, field = sys.argv[2], sys.argv[3], sys.argv[4]
+
+def emit(event, **values):
+    raw = (json.dumps({"nonce": config["nonce"], "slot": slot, "event": event, **values}) + "\\n").encode()
+    if os.write(config["report_write"], raw) != len(raw):
+        sys.exit(71)
+
+def hello():
+    birth = Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+    emit("hello", pid=os.getpid(), birth=birth)
+
+def wait_fd(fd):
+    while True:
+        readable, _, _ = select.select([fd], [], [], None)
+        if readable:
+            return os.read(fd, 1)
+
+def wait_gate():
+    if wait_fd(config["nodes"][slot]["gate"]) != b"G":
+        sys.exit(70)
+
+def hold():
+    wait_fd(config["safety_read"])
+    sys.exit(0)
+
+sys.stderr.write("\\x1b[31mtoken=supersecretvalue\\nr2-handshake-marker\\n")
+sys.stderr.flush()
+try:
+    os.fsync(sys.stderr.fileno())
+except OSError:
+    pass
+if mode == "exit" and field == "running":
+    hello()
+    wait_gate()
+    sys.exit(7)
+if mode == "exit":
+    wait_fd(config["delay_read"])
+    sys.exit(7)
+if mode == "close" and field == "running":
+    hello()
+    wait_gate()
+    wait_fd(config["delay_read"])
+    os.close(config["report_write"])
+    hold()
+if mode == "close":
+    wait_fd(config["delay_read"])
+    os.close(config["report_write"])
+    hold()
+def ack():
+    os.write(config["ack_write"], b"A")
+
+if mode == "hang" and field == "running":
+    hello()
+    wait_gate()
+    ack()
+    hold()
+if mode == "hang":
+    ack()
+    hold()
+if mode == "slow" and field == "running":
+    hello()
+    wait_gate()
+    wait_fd(config["delay_read"])
+    emit("running")
+    hold()
+if mode == "slow":
+    wait_fd(config["delay_read"])
+    hello()
+    wait_gate()
+    emit("running")
+    hold()
+if mode == "partial":
+    birth = Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+    raw = (json.dumps({"nonce": config["nonce"], "slot": slot, "event": "hello", "pid": os.getpid(), "birth": birth}) + "\\n").encode()
+    os.write(config["report_write"], raw[:3])
+    ack()
+    wait_fd(config["delay_read"])
+    os.write(config["report_write"], raw[3:])
+    wait_gate()
+    emit("running")
+    hold()
+if mode == "garbage":
+    os.write(config["report_write"], b"not-json supersecretvalue\\n")
+    hold()
+if mode == "flood":
+    budget = config["flood_bytes"]
+    if not isinstance(budget, int) or isinstance(budget, bool) or not 0 < budget <= 1048576:
+        sys.exit(71)
+    pending = budget
+    report = config["report_write"]
+    safety = config["safety_read"]
+    os.set_blocking(report, False)
+    while pending > 0:
+        readable, writable, _ = select.select([safety], [report], [])
+        if safety in readable:
+            sys.exit(0)
+        if report not in writable:
+            continue
+        try:
+            wrote = os.write(report, b"Q" * min(4096, pending))
+        except BlockingIOError:
+            continue
+        if wrote <= 0:
+            sys.exit(71)
+        pending -= wrote
+    hold()
+hello()
+wait_gate()
+emit("running")
+hold()
+"""
+
+
+def _retire_parent_report_writer(custody):
+    """Drop the fixture's report-pipe writer and keep its fd number occupied.
+
+    The child still holds its own writer. Closing the number and leaving it free would let
+    custody.close() close whatever was opened next. A /dev/null occupant preserves the number.
+    """
+    number = custody.report_write
+    os.close(number)
+    replacement = os.open(os.devnull, os.O_RDONLY)
+    if replacement != number:
+        os.dup2(replacement, number)
+        os.close(replacement)
+
+
+def _handshake_evidence(caught):
+    message, payload = str(caught.value).split("\n", 1)
+    return message, json.loads(payload)
+
+
+def _read_ack(fd):
+    """Block until the child says its bytes are in the pipe. The ceiling only bounds a hung child."""
+    readable, _, _ = select.select([fd], [], [], R2_HANDSHAKE_CEILING_SECONDS)
+    assert readable, "child did not acknowledge the handshake wait"
+    assert os.read(fd, 1) == b"A"
+
+
+def _expired_clock():
+    """A clock that stays at zero until the handshake hook jumps it past the ceiling."""
+    state = {"now": 0.0}
+
+    def clock():
+        return state["now"]
+
+    def jump(_custody):
+        state["now"] = 10 ** 9
+
+    return clock, jump
+
+
+def _start_handshake_child(custody, folder, slot, mode, field, latch_read, ack_write=None):
+    script = folder / "handshake-child.py"
+    if not script.exists():
+        script.write_text(R2_HANDSHAKE_CHILD, encoding="utf-8")
+    path = folder / ("handshake-%s.json" % slot)
+    nodes = {slot: {"kind": "H", "parent": None, "child": None}}
+    if slot not in custody.slots:
+        custody.plan(nodes)
+    extras = {"delay_read": latch_read, "flood_bytes": R2_CONTROL_LINE_LIMIT + 1}
+    if ack_write is not None:
+        extras["ack_write"] = ack_write
+    data = custody.config(nodes, script, path, **extras)
+    data["inherited"].append(latch_read)
+    if ack_write is not None:
+        data["inherited"].append(ack_write)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return custody.launch(data, slot, env, extra=(mode, field))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("field", ["hello", "running"])
+@pytest.mark.parametrize("mode", ["prompt", "slow", "exit", "close", "hang"])
+def test_r2_handshake_follows_the_child_signal(tmp_path, field, mode):
+    """A live child that announces on its latch must pass.
+
+    A child that exits or closes the report pipe fails with that evidence.
+    A child that never announces fails when the ceiling clock expires, after it has
+    acknowledged that its stderr is already written.
+    """
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        process = _start_handshake_child(custody, tmp_path, "actor", mode, field, latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        if mode == "close":
+            _retire_parent_report_writer(custody)
+        if field == "running" and mode in ("prompt", "slow", "exit", "close", "hang"):
+            custody.await_event("actor", "hello")
+            custody.release("actor")
+            if mode == "exit":
+                _wait_unreaped(process, custody.entries["actor"].get("fd"))
+        assert R2_HANDSHAKE_CEILING_SECONDS >= 60
+        if mode == "slow":
+            # The old defect returned at a 3s poll. Release only after this wait blocks,
+            # and only once a controlled clock is past that bound and still under the ceiling.
+            waited = {"blocked": 0, "now": 0.0, "released": False}
+
+            def clock():
+                return waited["now"]
+
+            real_block = R2Custody._block_for_handshake
+
+            def blocking(slot, remaining):
+                assert custody.slots["actor"][field] is False
+                waited["blocked"] += 1
+                waited["now"] = 4.0
+                if not waited["released"]:
+                    os.write(latch_write, b"X")
+                    waited["released"] = True
+                return real_block(custody, slot, remaining)
+
+            custody._block_for_handshake = blocking
+            custody.await_event("actor", field, clock=clock)
+            assert waited["blocked"] >= 1 and waited["released"] is True
+            assert waited["now"] > 3.0
+            assert custody.slots["actor"][field] is True
+            return
+        if mode == "prompt":
+            custody.await_event("actor", field)
+            assert custody.slots["actor"][field] is True
+            return
+        if mode == "hang":
+            _read_ack(ack_read)
+            clock, jump = _expired_clock()
+            with pytest.raises(RuntimeError) as caught:
+                custody.await_event("actor", field, clock=clock, before_terminal=jump)
+            message, evidence = _handshake_evidence(caught)
+            assert message == "R2 fixture: %s handshake refused: ceiling" % field
+            assert evidence["reason"] == "ceiling" and evidence["returncode"] is None
+            assert "supersecretvalue" not in evidence["stderr"] and "\x1b" not in evidence["stderr"]
+            assert "r2-handshake-marker" in evidence["stderr"]
+            assert "\n" in evidence["stderr"]
+            return
+        if mode == "exit" and field == "hello":
+            os.write(latch_write, b"X")
+        if mode == "close":
+            os.write(latch_write, b"X")
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", field)
+        message, evidence = _handshake_evidence(caught)
+        assert "bounded" not in message
+        assert "timeout" not in message.lower()
+        assert evidence["slot"] == "actor" and evidence["field"] == field
+        assert "supersecretvalue" not in message and "supersecretvalue" not in evidence["stderr"]
+        assert "r2-handshake-marker" in evidence["stderr"]
+        assert "\n" in evidence["stderr"]
+        assert "\x1b" not in evidence["stderr"]
+        if mode == "exit":
+            assert message == "R2 fixture: %s handshake refused: child exited" % field
+            assert evidence["reason"] == "child exited" and evidence["returncode"] == 7
+        else:
+            assert message == "R2 fixture: %s handshake refused: report pipe closed" % field
+            assert evidence["reason"] == "report pipe closed" and evidence["returncode"] is None
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        try:
+            if custody.report is None:
+                custody.close()
+        except R2CleanupError:
+            _clear_r2_quarantine()
+            raise
+        _clear_r2_quarantine()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_child_ready_wait_accepts_a_late_signal_and_fails_fast():
+    """The started-file wait uses the same ceiling: a later signal, an exit, a jumped clock."""
+
+    class ReadyChild:
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    waited = {"now": 0.0, "slept": 0, "ready": False}
+
+    def clock():
+        return waited["now"]
+
+    def sleeper(seconds):
+        assert waited["ready"] is False
+        waited["slept"] += 1
+        waited["now"] = 4.0
+        waited["ready"] = True
+
+    assert r2_wait_child_ready(
+        ReadyChild(), lambda: waited["ready"], R2_HANDSHAKE_CEILING_SECONDS, clock=clock, sleeper=sleeper,
+    ) is True
+    assert waited["slept"] >= 1 and waited["now"] > 3.0
+
+    dead = ReadyChild()
+    dead.returncode = 9
+    assert r2_wait_child_ready(dead, lambda: False, R2_HANDSHAKE_CEILING_SECONDS) is False
+
+    reads = {"n": 0}
+
+    def advancing():
+        reads["n"] += 1
+        if reads["n"] > 2:
+            return 10 ** 9
+        return 0
+
+    assert r2_wait_child_ready(ReadyChild(), lambda: False, 60, clock=advancing) is False
+    assert reads["n"] > 2
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_handshake_partial_line_waits_for_the_rest(tmp_path):
+    """A split hello is not an announcement. The wait resumes when the newline arrives."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        _start_handshake_child(custody, tmp_path, "actor", "partial", "hello", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        _read_ack(ack_read)
+        assert custody.pump() is False
+        assert custody.slots["actor"]["hello"] is False
+        assert b"\n" not in custody.buffer and custody.buffer
+        os.write(latch_write, b"X")
+        custody.await_event("actor", "hello")
+        assert custody.slots["actor"]["hello"] is True
+        assert custody.slots["actor"]["running"] is False
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        custody.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_handshake_two_children_share_the_report_pipe(tmp_path):
+    """One child's hello does not satisfy the other child's wait."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    try:
+        custody.plan({"north": {"kind": "H", "parent": None, "child": None},
+                      "south": {"kind": "H", "parent": None, "child": None}})
+        _start_handshake_child(custody, tmp_path, "north", "prompt", "hello", latch_read)
+        _start_handshake_child(custody, tmp_path, "south", "prompt", "hello", latch_read)
+        custody.await_event("north", "hello")
+        custody.await_event("south", "hello")
+        assert custody.slots["north"]["running"] is False and custody.slots["south"]["running"] is False
+        custody.release("north")
+        custody.await_event("north", "running")
+        assert custody.slots["south"]["running"] is False
+        custody.release("south")
+        custody.await_event("south", "running")
+        assert custody.slots["north"]["running"] is True and custody.slots["south"]["running"] is True
+    finally:
+        for fd in (latch_read, latch_write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        custody.close()
+
+
+def _close_fds(*fds):
+    for fd in fds:
+        if isinstance(fd, int) and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("mode", ["garbage", "flood"])
+def test_r2_handshake_refuses_a_hostile_report_without_echoing_it(tmp_path, mode):
+    """A hostile report is a fixed refusal. The bytes are not part of the error.
+
+    Flood delivers one byte past the line limit, waiting for the pipe to drain.
+    Closure stays UNKNOWN and does not keep the payload.
+    """
+    reason = {"garbage": "R2 fixture: control message refused",
+              "flood": "R2 fixture: control message exceeds its bound"}[mode]
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    try:
+        _start_handshake_child(custody, tmp_path, "actor", mode, "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        stored = json.loads((tmp_path / "handshake-actor.json").read_text(encoding="utf-8"))
+        assert stored["flood_bytes"] == R2_CONTROL_LINE_LIMIT + 1
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        message = str(caught.value)
+        assert message == reason
+        assert "supersecretvalue" not in message
+        assert "QQQQ" not in message
+        assert custody.control_unknown is True
+        assert custody.buffer == b""
+        with pytest.raises(R2CleanupUnknown) as closed:
+            custody.close()
+        report = closed.value.report
+        assert report["state"] == "UNKNOWN"
+        assert reason in report["errors"]
+        _assert_exit_proofs(report)
+        blob = json.dumps(report)
+        assert "supersecretvalue" not in blob and "QQQQ" not in blob
+    finally:
+        _close_fds(latch_read, latch_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("case,kind", [("silent-never", "W"), ("silent-before", "W"), ("silent-after", "W"),
+                                      ("forged-identity", "W"), ("actor-only", "M"), ("retirement-failure", "W")]
+                         + [(event, kind) for event in ("reaped", "wait_unavailable") for kind in "HMWCR"])
+def test_r2_closure_requires_independent_evidence_for_exposed_workers(tmp_path, monkeypatch, case, kind):
+    require_r2_indirect_exit(pidfd=case in ("reaped", "wait_unavailable"))
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    actor_read, actor_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    receipt_read, receipt_write = os.pipe()
+    witness = None
+    real_os, candidate_fds = handshake_tests.os, []
+
+    def candidate_pidfd(pid, *args):
+        fd = real_os.pidfd_open(pid, *args)
+        candidate_fds.append(fd)
+        return fd
+
+    try:
+        before = case in ("silent-before", "actor-only")
+        nodes = {"actor": {"kind": "H", "parent": None, "child": "worker" if before else None},
+                 "worker": {"kind": kind, "parent": "actor", "child": None}}
+        custody.plan(nodes, fixture_only=tuple(nodes))
+        script, path = tmp_path / "worker.py", tmp_path / "worker.json"
+        script.write_text(R2_UNREPORTED_WORKER)
+        handed_nodes = {"actor": {"kind": "H", "parent": None, "child": None}} if case == "actor-only" else nodes
+        config = custody.config(handed_nodes, script, path, actor_exit=actor_read, worker_stop=stop_read,
+                                 worker_receipt=receipt_write, silent=case != "actor-only", ungranted=not before)
+        config["inherited"].extend((actor_read, stop_read, receipt_write))
+        path.write_text(json.dumps(config))
+        actor = custody.launch(config, "actor", os.environ)
+        _close_fds(actor_read, stop_read, receipt_write)
+        actor_read = stop_read = receipt_write = -1
+        custody.await_event("actor", "hello")
+        if case == "actor-only":
+            assert custody.slot_provenance["worker"]["handed_to_actor"] is True
+        if before:
+            custody.release("actor")
+        worker_pid = _r2_read_worker_receipt(receipt_read)
+        witness = _r2_independent_worker_witness(custody, "worker", worker_pid)
+        if before:
+            assert custody.slot_provenance["worker"]["handed_to_actor"] is True
+        if case in ("silent-after", "forged-identity"):
+            custody.release("actor")
+            intent = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="creation_intent",
+                                      child="worker")) + "\n").encode()
+            assert os.write(custody.report_write, intent) == len(intent)
+            custody.pump()
+        if case == "forged-identity":
+            if hasattr(real_os, "pidfd_open"):
+                monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=candidate_pidfd))
+            raw = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="created", child="worker",
+                                   child_pid=1, child_birth="9")) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            with pytest.raises(RuntimeError):
+                custody.pump()
+            assert "worker" not in custody.entries
+            for fd in candidate_fds:
+                with pytest.raises(OSError):
+                    real_os.fstat(fd)
+            monkeypatch.setattr(handshake_tests, "os", real_os)
+        if case in ("reaped", "wait_unavailable"):
+            custody.capture("worker", worker_pid, birth=witness.entries["worker"]["birth"])
+            claim = dict(nonce=custody.nonce, slot="actor", event=case, child="worker",
+                         child_pid=worker_pid, child_birth=witness.entries["worker"]["birth"])
+            if case == "reaped":
+                claim.update(wait_pid=worker_pid, wait_status=0, returncode=0)
+            raw = (json.dumps(claim) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            custody.pump()
+            assert custody.entries["worker"]["exit"] is None
+            assert custody.entries["worker"].get("wait_status") is None
+            assert custody.observe("worker") is None
+            assert custody.messages[-1]["event"] == case
+        os.write(actor_write, b"X")
+        assert actor.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        if case == "retirement-failure":
+            def refuse_retirement(*args, **kwargs):
+                raise OSError("modelled report-writer retirement failure")
+            monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, dup2=refuse_retirement))
+        if case.startswith("silent-") or case in ("forged-identity", "actor-only", "retirement-failure"):
+            custody.LIMIT = 0.1  # A genuinely unaccounted slot must return UNKNOWN, not wait forever.
+            with pytest.raises(R2CleanupUnknown) as caught:
+                custody.close()
+            assert "worker" in caught.value.report["unresolved_slots"]
+            assert caught.value.report["uncreated_slots"] == []
+            if case == "retirement-failure":
+                assert "R2 fixture: report writer retirement failed" in caught.value.report["errors"]
+                assert caught.value.report["post_exit_drain"]["complete"] is False
+            assert R2Custody.observe(witness, "worker") is None
+            _clear_r2_quarantine(custody, expected_unknown=True)
+            assert R2Custody.quarantine_report is caught.value.report
+            with pytest.raises(R2CleanupUnknown):
+                R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+        else:
+            report = custody.close()
+            assert report["state"] == "CLOSED"
+            assert report["entries"]["worker"]["exit"]["proof"] in (
+                "original_pidfd_exit", "native_waitpid")
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        _close_fds(actor_read, actor_write, stop_read, stop_write, receipt_read, receipt_write)
+        if witness is not None:
+            proof = _r2_wait_worker_exit(witness, "worker")
+            entry = custody.entries.get("worker")
+            if entry is not None:
+                r2_identity_transition(entry, "adopt_exit", source=witness.entries["worker"])
+            if custody.report is not None:
+                _retain_r2_independent_exit(custody, "worker", witness)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if witness is not None:
+            _retain_r2_independent_exit(custody, "worker", witness)
+            r2_identity_transition(witness.entries["worker"], "release")
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("grant", ["release", "intent"])
+def test_r2_permission_grants_revoke_synthetic_exemptions(tmp_path, monkeypatch, grant):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": "worker" if grant == "release" else None},
+                 "worker": {"kind": "W", "parent": "actor", "child": None}}
+        custody.plan(nodes, fixture_only=tuple(nodes))
+        custody.slots["actor"].update(hello=True, permitted=True)
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), "1", process=None)
+        assert custody.slot_provenance["worker"]["handed_to_actor"] is False
+        custody.release("actor")
+        if grant == "intent":
+            raw = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="creation_intent",
+                                   child="worker")) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            custody.pump()
+        assert custody.slot_provenance["worker"]["handed_to_actor"] is True
+        custody.LIMIT = 0.01
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+    finally:
+        # No actor was spawned; only this actorless negative model's state is restored.
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.parametrize("kind", list("HMWCR"))
+def test_r2_protocol_proof_never_retires_quarantine(kind):
+    report = {"entries": {"worker": {"pid": 7, "birth": "1", "kind": kind,
+                "exit": {"proof": "parent_Popen_wait", "wait_pid": 7, "wait_status": 0, "returncode": 0}}},
+              "slot_provenance": {"worker": {"fixture_created": True, "fixture_only": False,
+                                               "handed_to_actor": True}},
+              "unresolved_slots": [], "uncreated_slots": []}
+    assert _captured_exit_proven(report) is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("case", ["permission", "uid-zombie", "euid-zombie", "capture-uid", "capture-euid"])
+def test_r2_argon_metadata_conflicts_cannot_be_repaired_by_absence(tmp_path, monkeypatch, case):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    real_os, real_kernel = handshake_tests.os, handshake_tests.r2_kernel_process
+    physical = real_kernel(os.getpid())
+    reads, kills = [], []
+
+    def metadata(pid):
+        reads.append(pid)
+        if len(reads) == 1 and case != "permission":
+            changed = dict(physical, ppid=os.getpid(), state="Z")
+            field = "euid" if "euid" in case else "uid"
+            changed[field] += 1
+            return changed
+        raise FileNotFoundError("modelled unavailable proc metadata")
+
+    def numeric(pid, number):
+        assert number == 0  # The actorless model never grants signal authority over this test process.
+        kills.append(pid)
+        if case == "permission" and len(kills) == 1:
+            raise PermissionError("modelled denied identity probe")
+        raise ProcessLookupError("modelled later numeric absence")
+
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        custody.slots["actor"]["permitted"] = True
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), physical["birth"], process=None)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", metadata)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, kill=numeric))
+        if case.startswith("capture-"):
+            raw = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="hello",
+                                   pid=os.getpid(), birth=physical["birth"])) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            with pytest.raises(RuntimeError, match="^R2 fixture: physical birth/UID/parent mismatch$"):
+                custody.pump()
+        else:
+            assert custody.observe("actor") is None
+        assert custody.observe("actor") is None
+        assert custody.entries["actor"]["lost"] and custody.control_unknown
+        assert len(reads) == 1
+        custody.kill_owned = lambda slot: None
+        custody.LIMIT = 0.01
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["entries"]["actor"]["exit"] is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_direct_exit_before_intake_is_reaped_through_retained_popen(tmp_path):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    process = None
+    try:
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "running", latch_read)
+        assert os.write(custody.gates["actor"][1], b"G") == 1
+        _wait_unreaped(process, custody.entries["actor"]["fd"])
+        assert process.native_wait_evidence is None
+        custody.await_event("actor", "hello")
+        assert process.native_wait_evidence is not None
+        assert process.native_wait_evidence["wait_pid"] == process.pid
+        assert process.returncode == 7
+        report = custody.close()
+        assert report["entries"]["actor"]["exit"]["proof"] == "native_waitpid"
+        assert report["entries"]["actor"]["exit"]["returncode"] == 7
+    finally:
+        _close_fds(latch_read, latch_write)
+        if process is not None:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_handshake_refusal_ignores_a_replaced_stderr(tmp_path):
+    """Stderr is opened from the custody directory fd. A swapped symlink is not read."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    try:
+        _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        stderr_path = tmp_path / "custody" / "actor.stderr"
+        stderr_path.unlink()
+        planted = tmp_path / "planted-stderr"
+        planted.write_bytes(b"linked-only-marker\ntoken=supersecretvalue\n")
+        symlink_or_skip(planted, stderr_path)
+        os.write(latch_write, b"X")
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        message, evidence = _handshake_evidence(caught)
+        assert message == "R2 fixture: hello handshake refused: child exited"
+        assert evidence["returncode"] == 7
+        assert "linked-only-marker" not in message and "linked-only-marker" not in evidence["stderr"]
+        assert "supersecretvalue" not in message and "supersecretvalue" not in evidence["stderr"]
+        assert b"linked-only-marker" in planted.read_bytes()
+    finally:
+        _close_fds(latch_read, latch_write)
+        custody.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_handshake_refusal_bounds_stderr_before_reading_it(tmp_path):
+    """A captured stderr larger than the cap is omitted, not parsed or echoed."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    source = None
+    try:
+        _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        stderr_path = tmp_path / "custody" / "actor.stderr"
+        source = os.open(os.fspath(stderr_path), os.O_WRONLY | os.O_CLOEXEC)
+        blob = b"token=supersecretvalue\n" + (b"Q" * 70000)
+        view = memoryview(blob)
+        while view:
+            wrote = os.write(source, view)
+            if wrote <= 0:
+                break
+            view = view[wrote:]
+        os.close(source)
+        source = None
+        os.write(latch_write, b"X")
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        message, evidence = _handshake_evidence(caught)
+        assert message == "R2 fixture: hello handshake refused: child exited"
+        assert evidence["stderr"] == "[stderr omitted: too_large]"
+        assert "supersecretvalue" not in message
+        assert "QQQQ" not in message
+    finally:
+        if isinstance(source, int):
+            os.close(source)
+        _close_fds(latch_read, latch_write)
+        custody.close()
+
+
+def _captured_exit_proven(report):
+    """Every slot has exit evidence or a positive, unexposed fixture-only origin."""
+    entries = report.get("entries") if isinstance(report, dict) else None
+    provenance = report.get("slot_provenance") if isinstance(report, dict) else None
+    if not isinstance(entries, dict) or not isinstance(provenance, dict):
+        return False
+    for row in entries.values():
+        if not isinstance(row, dict) or row.get("lost"):
+            return False
+        exit_row = row.get("exit")
+        if not isinstance(exit_row, dict) or exit_row.get("proof") not in (
+                "native_waitpid", "original_pidfd_exit"):
+            return False
+        if exit_row["proof"] == "native_waitpid":
+            status = exit_row.get("wait_status")
+            if (exit_row.get("wait_pid") != row.get("pid") or type(status) is not int or
+                    not 0 <= status <= 0xffffffff or not (os.WIFEXITED(status) or os.WIFSIGNALED(status)) or
+                    exit_row.get("returncode") != os.waitstatus_to_exitcode(status)):
+                return False
+    slots = set(provenance) | set(report.get("unresolved_slots", ())) | set(report.get("uncreated_slots", ()))
+    for slot in slots - set(entries):
+        origin = provenance.get(slot, {})
+        if not (origin.get("fixture_created") is True and origin.get("fixture_only") is True and
+                origin.get("handed_to_actor") is False):
+            return False
+    return True
+
+
+def _clear_r2_quarantine(custody=None, expected_unknown=False):
+    """Retire expected uncertainty only after every slot is independently accounted for.
+
+    A cleanup that cannot prove an actor's exit keeps the quarantine. The next
+    constructor then refuses to admit anyone.
+    """
+    report = R2Custody.quarantine_report
+    if report is not None:
+        if custody is not None and report is custody.report:
+            custody._unaccounted_reservations()
+            report["slot_provenance"] = {slot: dict(row) for slot, row in custody.slot_provenance.items()}
+            for slot, entry in custody.entries.items():
+                report["entries"][slot] = r2_entry_record(entry)
+        if (not expected_unknown or custody is None or report is not custody.report or
+                not _captured_exit_proven(report)):
+            return
+        _release_r2_test_descriptors(custody)
+    R2Custody.quarantine_report = None
+
+
+def _release_r2_test_descriptors(custody):
+    """Release a retired test scope's handles; close() already closed safety_write.
+
+    The quarantine decision stays with the caller. This also serves explicitly
+    actorless negative models, which never owned a real child.
+    """
+    released = getattr(custody, "_hook_released_fds", set())
+    custody._hook_released_fds = released
+    for entry in custody.entries.values():
+        fd = entry.get("fd")
+        r2_identity_transition(entry, "release")
+        if isinstance(fd, int):
+            released.add(fd)
+        process = entry.get("process")
+        if isinstance(process, WitnessedPopen):
+            process.close_native_handle()
+        for stream in (getattr(process, "stdin", None), getattr(process, "stdout", None),
+                       getattr(process, "stderr", None)):
+            if stream is not None:
+                stream.close()
+    fds = [custody.safety_read, custody.report_read, custody.report_write,
+           *(fd for pair in custody.gates.values() for fd in pair)]
+    if custody.report is None:
+        fds.append(custody.safety_write)
+    for fd in fds:
+        if isinstance(fd, int) and fd not in released:
+            released.add(fd)
+            _close_fds(fd)
+    custody._close_folder_fd()
+
+
+def _assert_exit_proofs(report):
+    assert _captured_exit_proven(report)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_rejected_report_keeps_the_reserved_child_unknown(tmp_path):
+    """A bad frame followed by a reserved child's lines must not close as CLOSED.
+
+    The later lines are not trusted. The unrelated fixture-only slot stays
+    unresolved in the refused stream; live descendant tests cover actual forks.
+    """
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    try:
+        _plan_reserved_sibling(custody)
+        _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        intent = json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "creation_intent",
+                              "child": "worker"})
+        created = json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "created",
+                               "child": "worker", "child_pid": 1, "child_birth": "9"})
+        os.write(custody.report_write, ("[]\n%s\n%s\n" % (intent, created)).encode())
+        os.write(latch_write, b"X")
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        assert str(caught.value) == "R2 fixture: control message refused"
+        assert "[]" not in str(caught.value)
+        assert "child_birth" not in str(caught.value)
+        with pytest.raises(R2CleanupUnknown) as closed:
+            custody.close()
+        report = closed.value.report
+        assert report["state"] == "UNKNOWN"
+        assert "worker" in report["unresolved_slots"]
+        assert "worker" not in report["uncreated_slots"]
+        assert report["errors"] == ["R2 fixture: control message refused"]
+        _assert_exit_proofs(report)
+        assert "[]" not in "".join(report["errors"])
+        assert "child_birth" not in json.dumps(report)
+        assert R2Custody.quarantine_report is report
+    finally:
+        _close_fds(latch_read, latch_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_report_stream_stops_at_the_byte_bound(tmp_path):
+    """Exactly one line-limit of bytes is still waiting. One more byte is a refusal."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}}, fixture_only=("actor",))
+        view = memoryview(b"Q" * R2_CONTROL_LINE_LIMIT)
+        while view:
+            wrote = os.write(custody.report_write, view[:4096])
+            assert wrote > 0
+            view = view[wrote:]
+            custody.pump()
+        assert custody.buffer == b"Q" * R2_CONTROL_LINE_LIMIT
+        assert custody.report_rejected is False
+        os.write(custody.report_write, b"Q")
+        with pytest.raises(RuntimeError) as one_past:
+            custody.pump()
+        assert str(one_past.value) == "R2 fixture: control message exceeds its bound"
+        assert "Q" not in str(one_past.value)
+        assert custody.control_unknown is True
+        assert custody.buffer == b""
+    finally:
+        try:
+            custody.close()
+        except R2CleanupUnknown:
+            pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_newline_does_not_unlock_the_read_budget(tmp_path):
+    """A leading newline must not let one pump swallow an unbounded hostile stream."""
+    import fcntl
+
+    custody = R2Custody(tmp_path / "stream", tmp_path / "stream-quarantine.json")
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}}, fixture_only=("actor",))
+        set_size = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+        try:
+            fcntl.fcntl(custody.report_write, set_size, R2_CONTROL_LINE_LIMIT * 4)
+        except OSError:
+            pytest.skip("report pipe capacity cannot be raised")
+        payload = b"\n" + (b"Q" * (R2_CONTROL_LINE_LIMIT * 2))
+        view = memoryview(payload)
+        while view:
+            wrote = os.write(custody.report_write, view[:65536])
+            assert wrote > 0
+            view = view[wrote:]
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == "R2 fixture: control message refused"
+        assert "QQQQ" not in str(caught.value)
+        assert custody.control_unknown is True
+        os.set_blocking(custody.report_read, False)
+        try:
+            leftover = os.read(custody.report_read, 65536)
+        except BlockingIOError:
+            leftover = b""
+        assert len(leftover) > 0
+    finally:
+        try:
+            custody.close()
+        except R2CleanupUnknown:
+            pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_child_ready_rechecks_the_signal_after_exit():
+    """Exit observed between the predicate and poll must not hide a signal that landed."""
+
+    class ReadyChild:
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    flag = {"ready": False}
+
+    class AnnounceOnExit(ReadyChild):
+        def poll(self):
+            flag["ready"] = True
+            self.returncode = 4
+            return 4
+
+    assert r2_wait_child_ready(AnnounceOnExit(), lambda: flag["ready"], R2_HANDSHAKE_CEILING_SECONDS) is True
+
+    dead = ReadyChild()
+    dead.returncode = 9
+    assert r2_wait_child_ready(dead, lambda: False, R2_HANDSHAKE_CEILING_SECONDS) is False
+
+    # The deadline is sampled once. Advancing the clock on later reads is the ceiling.
+    reads = {"n": 0}
+
+    def advancing():
+        reads["n"] += 1
+        if reads["n"] > 2:
+            return 10 ** 9
+        return 0
+
+    alive = ReadyChild()
+    assert r2_wait_child_ready(alive, lambda: False, 60, clock=advancing) is False
+
+
+def _wait_unreaped(process, extra_fd=None):
+    """Wait until the original child is dead without consuming its wait status."""
+    fds = []
+    handle = getattr(process, "native_handle", None)
+    if isinstance(handle, int):
+        fds.append(handle)
+    if isinstance(extra_fd, int) and extra_fd not in fds:
+        fds.append(extra_fd)
+    if fds:
+        poller = select.poll()
+        for fd in fds:
+            poller.register(fd, select.POLLIN)
+        assert poller.poll(int(R2_HANDSHAKE_CEILING_SECONDS * 1000)), "child did not exit"
+        return
+    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+        deadline = time.monotonic() + R2_HANDSHAKE_CEILING_SECONDS
+        while True:
+            info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if info is not None:
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError("child did not exit")
+            time.sleep(0.01)
+        return
+    deadline = time.monotonic() + R2_HANDSHAKE_CEILING_SECONDS
+    while True:
+        info = r2_kernel_process(process.pid)
+        if info["state"].startswith("Z"):
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError("child did not exit")
+        time.sleep(0.01)
+
+
+def _drop_indirect_handles(custody, slot, process):
+    """Hide the direct process and its pidfds so exit detection has to observe."""
+    entry = custody.entries[slot]
+    closed = []
+    retained_fd = entry.get("fd")
+    r2_identity_transition(entry, "release")
+    for fd in (getattr(process, "native_handle", None),):
+        if fd == retained_fd:
+            continue
+        if isinstance(fd, int) and fd not in closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            closed.append(fd)
+    entry["process"] = None
+    process.native_handle = None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_queued_announcement_survives_the_child_exit(tmp_path):
+    """A running line written as the child exits is the announcement, not an exit refusal."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        process = _start_handshake_child(
+            custody, tmp_path, "actor", "hang", "running", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        custody.await_event("actor", "hello")
+        custody.release("actor")
+        _read_ack(ack_read)
+
+        def queue_then_exit(active):
+            raw = (json.dumps({"nonce": active.nonce, "slot": "actor", "event": "running"}) + "\n").encode()
+            assert os.write(active.report_write, raw) == len(raw)
+            process.send_signal(signal.SIGKILL)
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+
+        custody.await_event("actor", "running", before_terminal=queue_then_exit)
+        assert custody.slots["actor"]["running"] is True
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_exit_status_is_reported_after_the_pidfd_wakes(tmp_path):
+    """pidfd can show the exit before the first waitpid stores the status."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    calls = {"n": 0}
+    try:
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        os.write(latch_write, b"X")
+        _wait_unreaped(process, custody.entries["actor"].get("fd"))
+        assert r2_kernel_process(process.pid)["state"].startswith("Z")
+        real = process.poll
+
+        def wrapped():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real()
+
+        process.poll = wrapped
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        message, evidence = _handshake_evidence(caught)
+        assert message == "R2 fixture: hello handshake refused: child exited"
+        assert evidence["reason"] == "child exited"
+        assert evidence["returncode"] == 7
+        assert calls["n"] >= 2
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+    finally:
+        _close_fds(latch_read, latch_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_indirect_exit_without_pidfd_is_not_a_ceiling(tmp_path):
+    """An indirect child with no pidfd still reports the exit it can see.
+
+    The status is the observed proof. It is not an invented return code and not the ceiling.
+    """
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    try:
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        os.write(latch_write, b"X")
+        _wait_unreaped(process, custody.entries["actor"].get("fd"))
+        assert r2_kernel_process(process.pid)["state"].startswith("Z")
+        _drop_indirect_handles(custody, "actor", process)
+        clock, jump = _expired_clock()
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello", clock=clock, before_terminal=jump)
+        message, evidence = _handshake_evidence(caught)
+        assert message == "R2 fixture: hello handshake refused: child exited"
+        assert evidence["reason"] == "child exited"
+        assert evidence["returncode"] == 7
+        assert evidence["exit_proof"] == "native_waitpid"
+        assert "ceiling" not in message
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+    finally:
+        _close_fds(latch_read, latch_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine()
+
+
+def _plan_reserved_sibling(custody):
+    """An unrelated fixture-only root stays unexposed to the one-actor script.
+
+    Actual descendant regressions reserve their real parent links explicitly;
+    launch revokes every exemption below those actors, even for omitted slots.
+    """
+    custody.plan({"actor": {"kind": "H", "parent": None, "child": None},
+                  "worker": {"kind": "M", "parent": None, "child": None}},
+                 fixture_only=("actor", "worker"))
+
+
+def _assert_refused_sibling(custody, reason):
+    assert custody.control_unknown is True
+    with pytest.raises(R2CleanupUnknown) as closed:
+        custody.close()
+    report = closed.value.report
+    assert report["state"] == "UNKNOWN"
+    assert reason in report["errors"]
+    assert "worker" in report["unresolved_slots"]
+    assert "worker" not in report["uncreated_slots"]
+    blob = json.dumps(report)
+    assert "supersecretvalue" not in blob and "QQQQ" not in blob
+    _assert_exit_proofs(report)
+    return report
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("kind", ["encoding", "nesting", "missing", "type", "protocol", "empty"])
+def test_r2_every_intake_refusal_keeps_custody_unknown(tmp_path, kind, monkeypatch):
+    """Every decoder, schema, and protocol failure leaves the reserved sibling unresolved."""
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        _plan_reserved_sibling(custody)
+        secret = "supersecretvalue"
+        parsed_deep = []
+        if kind == "encoding":
+            frame = b"\xff\xfe" + secret.encode() + b"\n"
+            reason = "R2 fixture: control message refused"
+        elif kind == "nesting":
+            depth = R2_CONTROL_MAX_DEPTH + 1
+            frame = (b"[" * depth) + (b"]" * depth) + b"\n"
+            reason = "R2 fixture: control message refused"
+
+            real_loads, real_dumps, real_error = json.loads, json.dumps, json.JSONDecodeError
+
+            def refuse_parse(text, *args, **kwargs):
+                if isinstance(text, str) and text.count("[") > R2_CONTROL_MAX_DEPTH:
+                    parsed_deep.append(True)
+                    raise RecursionError("parsed a frame past the depth cap")
+                return real_loads(text, *args, **kwargs)
+
+            monkeypatch.setattr(handshake_tests, "json", type("GuardJSON", (), {
+                "loads": staticmethod(refuse_parse),
+                "dumps": staticmethod(real_dumps),
+                "JSONDecodeError": real_error,
+            })())
+        elif kind == "missing":
+            frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "pad": secret}) + "\n").encode()
+            reason = "R2 fixture: control message refused"
+        elif kind == "empty":
+            frame = b"{}\n"
+            reason = "R2 fixture: control message refused"
+        elif kind == "type":
+            frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": 1, "pad": secret}) + "\n").encode()
+            reason = "R2 fixture: control message refused"
+        else:
+            frame = (json.dumps({"nonce": "not-the-nonce", "slot": "actor", "event": "timeout",
+                                 "pad": secret}) + "\n").encode()
+            reason = "R2 fixture: unplanned control message"
+        os.write(custody.report_write, frame)
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == reason
+        assert secret not in str(caught.value)
+        assert parsed_deep == []
+        _assert_refused_sibling(custody, reason)
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_report_ledger_bounds_retained_traffic(tmp_path, monkeypatch):
+    """Duplicate timeout frames with a large field stop at the lifetime ledger.
+
+    The actor handshake is still pending. Traffic after the cap is refused.
+    """
+    # Exercise byte exhaustion independently of the larger cohort message cap.
+    monkeypatch.setattr(handshake_tests, "R2_CONTROL_LEDGER_BYTES", R2_CONTROL_LINE_LIMIT)
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        _plan_reserved_sibling(custody)
+        _start_handshake_child(custody, tmp_path, "actor", "hang", "hello", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        _read_ack(ack_read)
+        assert custody.slots["actor"]["hello"] is False
+        pad = "Q" * 4000
+        frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "timeout",
+                             "pad": pad}) + "\n").encode()
+        assert R2_CONTROL_LINE_LIMIT > len(frame) > 0
+        assert len(frame) < R2_CONTROL_LEDGER_BYTES
+        fitting = R2_CONTROL_LEDGER_BYTES // len(frame)
+        assert 1 <= fitting < R2_CONTROL_LEDGER_MESSAGES
+        for _ in range(fitting):
+            os.write(custody.report_write, frame)
+            assert custody.pump() in (True, False)
+        assert custody.report_rejected is False
+        assert custody.slots["actor"]["hello"] is False
+        assert len(custody.messages) == fitting
+        os.write(custody.report_write, frame)
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == "R2 fixture: control ledger exceeded"
+        assert "QQQQ" not in str(caught.value)
+        hello = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "hello",
+                             "pid": 1, "birth": "1"}) + "\n").encode()
+        os.write(custody.report_write, hello)
+        with pytest.raises(RuntimeError):
+            custody.pump()
+        assert custody.slots["actor"]["hello"] is False
+        _assert_refused_sibling(custody, "R2 fixture: control ledger exceeded")
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_report_ledger_bounds_duplicate_messages(tmp_path):
+    """A pending handshake stops accepting duplicate events at the message cap."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        _plan_reserved_sibling(custody)
+        _start_handshake_child(custody, tmp_path, "actor", "hang", "hello", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        _read_ack(ack_read)
+        frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "timeout"}) + "\n").encode()
+        assert len(frame) * (R2_CONTROL_LEDGER_MESSAGES + 1) < R2_CONTROL_LEDGER_BYTES
+        for _ in range(R2_CONTROL_LEDGER_MESSAGES):
+            os.write(custody.report_write, frame)
+            custody.pump()
+        assert len(custody.messages) == R2_CONTROL_LEDGER_MESSAGES
+        assert all(item["event"] == "timeout" for item in custody.messages)
+        assert custody.slots["actor"]["hello"] is False
+        os.write(custody.report_write, frame)
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == "R2 fixture: control ledger exceeded"
+        assert custody.slots["actor"]["hello"] is False
+        _assert_refused_sibling(custody, "R2 fixture: control ledger exceeded")
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_reaped_sibling_hello_uses_retained_identity(tmp_path, monkeypatch):
+    """A captured sibling can say hello after it is reaped. The wait uses the saved identity."""
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    calls = {"n": 0}
+    real_kernel = handshake_tests.r2_kernel_process
+
+    def counting(pid):
+        calls["n"] += 1
+        return real_kernel(pid)
+
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None},
+                      "worker": {"kind": "H", "parent": None, "child": None}}, fixture_only=("actor",))
+        process = _start_handshake_child(
+            custody, tmp_path, "worker", "hang", "hello", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        _read_ack(ack_read)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", counting)
+        seen = {"n": calls["n"]}
+
+        def queue_hello_then_exit(active):
+            entry = active.entries["worker"]
+            raw = (json.dumps({"nonce": active.nonce, "slot": "worker", "event": "hello",
+                               "pid": entry["pid"], "birth": entry["birth"]}) + "\n").encode()
+            assert os.write(active.report_write, raw) == len(raw)
+            # os.kill, not process.kill: send_signal re-reads /proc and would hide the recapture bug.
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+
+        custody.await_event("worker", "hello", before_terminal=queue_hello_then_exit)
+        assert custody.slots["worker"]["hello"] is True
+        assert calls["n"] == seen["n"]
+        assert custody.entries["worker"]["birth"]
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+    finally:
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("exited", [False, True], ids=["live", "exited"])
+def test_r2_buffered_hello_wins_after_ceiling_jump(tmp_path, exited):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    clock = {"now": 0.0}
+
+    def jump(control):
+        assert b"\n" in control.buffer  # A complete frame remains after the saturated first pump.
+        clock["now"] = 2.0
+
+    try:
+        _enlarge_report_pipe(custody)
+        process = _start_handshake_child(custody, tmp_path, "actor", "hang", "hello",
+                                         latch_read, ack_write=ack_write)
+        _read_ack(ack_read)
+        entry = custody.entries["actor"]
+        if exited:
+            custody.kill_owned("actor")
+            assert custody.wait_native("actor") == -signal.SIGKILL
+        timeout = _exact_timeout(custody, 157)  # Avoid an exact OS read boundary at line saturation.
+        count = R2_CONTROL_LINES_PER_PUMP * (2 if exited else 1)
+        hello = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="hello",
+                                 pid=process.pid, birth=entry["birth"])) + "\n").encode()
+        _write_all(custody.report_write, timeout * count + hello)
+        custody.await_event("actor", "hello", ceiling=1.0, clock=lambda: clock["now"], before_terminal=jump)
+        assert clock["now"] == 2.0
+        assert custody.slots["actor"]["hello"] is True
+        assert len(custody.messages) == count + 1
+        assert not custody.report_rejected and not custody.control_unknown
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+def _enlarge_report_pipe(custody):
+    """Give the report pipe room for a multi-pump stream. Skip when the host cannot."""
+    import fcntl
+
+    try:
+        fcntl.fcntl(custody.report_write, getattr(fcntl, "F_SETPIPE_SZ", 1031), 1 << 20)
+    except OSError:
+        pytest.skip("report pipe capacity cannot be raised")
+
+
+def _write_all(fd, blob):
+    view = memoryview(blob)
+    while view:
+        wrote = os.write(fd, view[:65536])
+        assert wrote > 0
+        view = view[wrote:]
+
+
+def _exact_timeout(custody, size):
+    empty = {"nonce": custody.nonce, "slot": "actor", "event": "timeout", "pad": ""}
+    overhead = len((json.dumps(empty) + "\n").encode())
+    pad = size - overhead
+    assert pad >= 0
+    frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "timeout",
+                         "pad": "Q" * pad}) + "\n").encode()
+    assert len(frame) == size
+    return frame
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_rejected_report_does_not_parse_the_rest(tmp_path, monkeypatch):
+    """After a refusal, later frames in the same stream are never decoded."""
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_json = json
+    try:
+        _plan_reserved_sibling(custody)
+        _enlarge_report_pipe(custody)
+        secret = "token=supersecretvalue"
+        intent = json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "creation_intent",
+                              "child": "worker"})
+        created = json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "created",
+                               "child": "worker", "child_pid": 1, "child_birth": secret})
+        blob = b"[]\n" + (b" " * 70000) + (intent + "\n").encode() + (created + "\n").encode()
+        real_loads, real_dumps, real_error = json.loads, json.dumps, json.JSONDecodeError
+        calls = {"n": 0}
+
+        def counting(text, *args, **kwargs):
+            calls["n"] += 1
+            return real_loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(handshake_tests, "json", type("GuardJSON", (), {
+            "loads": staticmethod(counting),
+            "dumps": staticmethod(real_dumps),
+            "JSONDecodeError": real_error,
+        })())
+        _write_all(custody.report_write, blob)
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == "R2 fixture: control message refused"
+        assert calls["n"] == 1
+        assert "worker" not in custody.entries
+        report = _assert_refused_sibling(custody, "R2 fixture: control message refused")
+        assert calls["n"] == 1
+        assert secret not in json.dumps(report)
+    finally:
+        monkeypatch.setattr(handshake_tests, "json", real_json)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_close_drains_a_saturated_report(tmp_path, monkeypatch):
+    """Unread frames after a full pump are not a CLOSED report."""
+    monkeypatch.setattr(handshake_tests, "R2_CONTROL_LEDGER_BYTES", R2_CONTROL_LINE_LIMIT)
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        _plan_reserved_sibling(custody)
+        process = _start_handshake_child(
+            custody, tmp_path, "actor", "hang", "hello", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        _read_ack(ack_read)
+        _enlarge_report_pipe(custody)
+        os.kill(process.pid, signal.SIGKILL)
+        process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        frame = _exact_timeout(custody, 4096)
+        assert len(frame) * 16 == R2_CONTROL_LEDGER_BYTES
+        secret = "token=supersecretvalue"
+        intent = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "creation_intent",
+                               "child": "worker"}) + "\n").encode()
+        created = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "created",
+                                "child": "worker", "child_pid": 1, "child_birth": secret}) + "\n").encode()
+        _write_all(custody.report_write, frame * 16 + intent + created)
+        with pytest.raises(R2CleanupUnknown) as closed:
+            custody.close()
+        report = closed.value.report
+        assert report["state"] == "UNKNOWN"
+        assert "worker" in report["unresolved_slots"]
+        assert "worker" not in report["uncreated_slots"]
+        assert "worker" not in report["entries"]
+        assert secret not in json.dumps(report)
+        assert len(custody.messages) == 16
+        _assert_exit_proofs(report)
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("copies", [16, 32])
+@pytest.mark.parametrize("roomy_ledger", [False, True])
+def test_r2_queued_running_past_one_pump_is_not_a_false_exit(tmp_path, copies, roomy_ledger, monkeypatch):
+    """Bytes past one pump are drained. The result is the announcement or UNKNOWN, not a false exit."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        if roomy_ledger:
+            monkeypatch.setattr(handshake_tests, "R2_CONTROL_LEDGER_BYTES", 262144)
+            monkeypatch.setattr(handshake_tests, "R2_CONTROL_LEDGER_MESSAGES", 128)
+        else:
+            monkeypatch.setattr(handshake_tests, "R2_CONTROL_LEDGER_BYTES", R2_CONTROL_LINE_LIMIT)
+        process = _start_handshake_child(
+            custody, tmp_path, "actor", "hang", "running", latch_read, ack_write=ack_write)
+        os.close(latch_read)
+        os.close(ack_write)
+        latch_read = ack_write = -1
+        custody.await_event("actor", "hello")
+        custody.release("actor")
+        _read_ack(ack_read)
+        _enlarge_report_pipe(custody)
+        frame = _exact_timeout(custody, 4096)
+        running = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "running"}) + "\n").encode()
+
+        def dump_then_exit(active):
+            _write_all(active.report_write, frame * copies + running)
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+
+        try:
+            custody.await_event("actor", "running", before_terminal=dump_then_exit)
+        except RuntimeError as exc:
+            assert not roomy_ledger, "a queued announcement inside the ledger must succeed"
+            text = str(exc)
+            assert "child exited" not in text
+            assert "ceiling" not in text
+            assert custody.control_unknown is True
+        else:
+            assert custody.slots["actor"]["running"] is True
+    finally:
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("error", [ProcessLookupError, RuntimeError])
+def test_r2_mid_exit_read_error_retries_the_retained_identity(tmp_path, monkeypatch, error):
+    """ESRCH while reading /proc is pending evidence. The next read can still prove the exit."""
+    import errno
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    calls = {"n": 0}
+    real_kernel = handshake_tests.r2_kernel_process
+
+    def flaky(pid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise error(errno.ESRCH, "mid-exit read")
+        return real_kernel(pid)
+
+    try:
+        process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+        os.close(latch_read)
+        latch_read = -1
+        os.write(latch_write, b"X")
+        _wait_unreaped(process, custody.entries["actor"].get("fd"))
+        assert real_kernel(process.pid)["state"].startswith("Z")
+        _drop_indirect_handles(custody, "actor", process)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", flaky)
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        message, evidence = _handshake_evidence(caught)
+        assert message == "R2 fixture: hello handshake refused: child exited"
+        assert "ceiling" not in message
+        assert evidence["exit_proof"] == "native_waitpid"
+        assert custody.entries["actor"]["lost"] is False
+        assert calls["n"] >= 2
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        report = custody.close()
+        assert report["state"] == "CLOSED"
+    finally:
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        _close_fds(latch_read, latch_write)
+        try:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        except (NameError, ChildProcessError, subprocess.TimeoutExpired, OSError):
+            pass
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        _clear_r2_quarantine()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_unproven_exit_keeps_the_quarantine(tmp_path, monkeypatch):
+    """UNKNOWN without an exit proof stays latched. The next custody cannot admit actors."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        custody.slots["actor"].update(permitted=True, hello=True, released=True, running=True)
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), "1", process=None)
+        custody.LIMIT = 0.5
+
+        def refuse(slot):
+            raise RuntimeError("modelled closure refuses to signal")
+
+        custody.observe = lambda slot: None
+        custody.kill_owned = refuse
+        with pytest.raises(R2CleanupUnknown):
+            custody.close()
+        assert R2Custody.quarantine_report is not None
+        assert R2Custody.quarantine_report["state"] == "UNKNOWN"
+        assert _captured_exit_proven(R2Custody.quarantine_report) is False
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is custody.report
+        with pytest.raises(R2CleanupUnknown):
+            R2Custody(tmp_path / "next", tmp_path / "next-quarantine.json")
+    finally:
+        # Actorless negative model: the entry describes this test process and
+        # kill_owned is refused. Restore only this model's latch via monkeypatch.
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("values", [
+    {"event": "hello", "pid": True, "birth": "1"},
+    {"event": "hello", "pid": 1, "birth": "token=supersecretvalue"},
+    {"event": "hello", "pid": 1, "birth": None},
+    {"event": "hello", "pid": 1},
+    {"event": "created", "child": "worker", "child_pid": "supersecretvalue", "child_birth": "1"},
+    {"event": "creation_intent", "child": []},
+    {"event": "reaped", "child": "worker", "child_pid": 1, "child_birth": "1",
+     "wait_pid": 1, "wait_status": True, "returncode": False},
+    {"event": "wait_unavailable", "child": "worker", "child_pid": 1, "child_birth": False},
+], ids=["bool-pid", "invalid-birth", "null-birth", "missing-birth", "string-pid",
+        "list-child", "bool-wait", "bool-birth"])
+def test_r2_intake_validates_event_fields_before_protocol(tmp_path, values):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        _plan_reserved_sibling(custody)
+        frame = {"nonce": custody.nonce, "slot": "actor", **values}
+        os.write(custody.report_write, (json.dumps(frame) + "\n").encode())
+        with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+            custody.pump()
+        assert custody.entries == {} and custody.messages == []
+        _assert_refused_sibling(custody, "R2 fixture: control message refused")
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("failure", ["decode", "capture"])
+@pytest.mark.parametrize("error", [ValueError, RecursionError, RuntimeError, SystemExit])
+def test_r2_intake_does_not_echo_boundary_exceptions(tmp_path, monkeypatch, failure, error):
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_json, capture = json, R2Custody.capture
+    latch_read, latch_write = os.pipe()
+    try:
+        _plan_reserved_sibling(custody)
+
+        def failed(*args, **kwargs):
+            raise error("R2 fixture: token=supersecretvalue\nsecond line")
+
+        if failure == "decode":
+            monkeypatch.setattr(handshake_tests, "json", SimpleNamespace(
+                loads=failed, dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError))
+            event = {"event": "timeout"}
+        else:
+            process = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", latch_read)
+            monkeypatch.setattr(handshake_tests.R2Custody, "capture", failed)
+            event = {"event": "hello", "pid": process.pid, "birth": custody.entries["actor"]["birth"]}
+        frame = {"nonce": custody.nonce, "slot": "actor", **event}
+        os.write(custody.report_write, (json.dumps(frame) + "\n").encode())
+        with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+            custody.pump()
+        _assert_refused_sibling(custody, "R2 fixture: control message refused")
+    finally:
+        _close_fds(latch_read, latch_write)
+        monkeypatch.setattr(handshake_tests, "json", real_json)
+        monkeypatch.setattr(handshake_tests.R2Custody, "capture", capture)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_unavailable_wait_does_not_clear_quarantine(tmp_path, monkeypatch):
+    # Actorless report: ECHILD does not establish an original-instance exit.
+    report = {"state": "UNKNOWN", "errors": [],
+              "entries": {"actor": {"exit": None, "wait_status": "unavailable"}}}
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", report)
+    _clear_r2_quarantine()
+    assert R2Custody.quarantine_report is report
+    with pytest.raises(R2CleanupUnknown):
+        R2Custody(tmp_path / "next", tmp_path / "quarantine.json")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("event,reason", [
+    ("hello", "child appeared without its creation permit"),
+    ("creation_intent", "invalid reserved child creation intent"),
+    ("created", "unexpected child creation"),
+    ("running", "actor ran before physical admission"),
+    ("reaped", "conflicting native child wait"),
+    ("wait_unavailable", "conflicting unavailable wait"),
+    ("unknown", "invalid control event"),
+])
+def test_r2_protocol_refusals_latch_unknown(tmp_path, event, reason):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        _plan_reserved_sibling(custody)
+        frame = {"nonce": custody.nonce, "slot": "actor", "event": event,
+                 "pid": 1, "birth": "1", "child": "worker", "child_pid": 1,
+                 "child_birth": "1", "wait_pid": 1, "wait_status": 0, "returncode": 0}
+        os.write(custody.report_write, (json.dumps(frame) + "\n").encode())
+        reason = "R2 fixture: " + reason
+        with pytest.raises(RuntimeError) as caught:
+            custody.pump()
+        assert str(caught.value) == reason
+        _assert_refused_sibling(custody, reason)
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("cross_deadline", [False, True])
+def test_r2_close_drains_reports_queued_during_exit_observation(tmp_path, monkeypatch, cross_deadline):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_time = time
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    try:
+        process = _start_handshake_child(
+            custody, tmp_path, "actor", "hang", "hello", latch_read, ack_write=ack_write)
+        _read_ack(ack_read)
+        os.kill(process.pid, signal.SIGKILL)
+        process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        observe = custody.observe
+        queued = []
+        clock = {"now": 0.0}
+        custody.LIMIT = 1.0
+        monkeypatch.setattr(handshake_tests, "time", R2Facade(real_time, monotonic=lambda: clock["now"]))
+
+        def exit_then_queue(slot):
+            proof = observe(slot)
+            if not queued:
+                assert proof is not None
+                os.write(custody.report_write, b"[]\n")
+                queued.append(True)
+                if cross_deadline:
+                    clock["now"] = 2.0
+            return proof
+
+        custody.observe = exit_then_queue
+        with pytest.raises(R2CleanupUnknown) as closed:
+            custody.close()
+        assert queued and closed.value.report["state"] == "UNKNOWN"
+        _assert_exit_proofs(closed.value.report)
+    finally:
+        monkeypatch.setattr(handshake_tests, "time", real_time)
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_line_budget_is_shared_by_reads_in_one_pump(tmp_path, monkeypatch):
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_os, line_limit = os, R2_CONTROL_LINES_PER_PUMP
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}}, fixture_only=("actor",))
+        frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "timeout"}) + "\n").encode()
+        os.write(custody.report_write, frame * 6)
+        reading = os.read
+        monkeypatch.setattr(handshake_tests, "R2_CONTROL_LINES_PER_PUMP", 3)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, read=lambda fd, size: reading(fd, min(size, len(frame)))))
+        assert custody.pump() is True
+        assert len(custody.messages) == 3
+        assert custody.pump() is True
+        assert len(custody.messages) == 6
+        assert custody.pump() is False
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "R2_CONTROL_LINES_PER_PUMP", line_limit)
+        assert custody.close()["state"] == "CLOSED"
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "R2_CONTROL_LINES_PER_PUMP", line_limit)
+        if custody.report is None:
+            custody.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_expected_refusal_releases_handles_after_exit_proofs(tmp_path):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        _plan_reserved_sibling(custody)
+        descriptors = [custody.safety_read, custody.report_read, custody.report_write, custody.folder_fd,
+                       *(fd for pair in custody.gates.values() for fd in pair)]
+        os.write(custody.report_write, b"[]\n")
+        with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+            custody.pump()
+        _assert_refused_sibling(custody, "R2 fixture: control message refused")
+        _clear_r2_quarantine(custody)
+        assert R2Custody.quarantine_report is custody.report
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is None
+        for fd in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("failure", ["open", "pipe", "blocking", "nonce"])
+def test_r2_constructor_failure_releases_its_descriptors(tmp_path, monkeypatch, failure):
+
+    descriptors, pipes = [], []
+    real_os = os
+    real_uuid = uuid
+
+    def opened(*args, **kwargs):
+        if failure == "open":
+            raise OSError("modelled custody setup failure")
+        fd = real_os.open(*args, **kwargs)
+        descriptors.append(fd)
+        return fd
+
+    def piped():
+        if failure == "pipe" and pipes:
+            raise OSError("modelled custody setup failure")
+        pair = real_os.pipe()
+        pipes.append(pair)
+        descriptors.extend(pair)
+        return pair
+
+    def blocking(*args):
+        if failure == "blocking":
+            raise OSError("modelled custody setup failure")
+        return real_os.set_blocking(*args)
+
+    def nonce():
+        if failure == "nonce":
+            raise OSError("modelled custody setup failure")
+        return real_uuid.uuid4()
+
+    try:
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, open=opened, pipe=piped, set_blocking=blocking))
+        monkeypatch.setattr(handshake_tests, "uuid", R2Facade(real_uuid, uuid4=nonce))
+        with pytest.raises(OSError, match="^modelled custody setup failure$"):
+            R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+        for fd in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        _close_fds(*descriptors)
+
+
+R2_UNREPORTED_WORKER = r'''import json, os, select, sys
+from pathlib import Path
+config = json.loads(Path(sys.argv[1]).read_text())
+def wait(fd):
+    if not select.select([fd], [], [], 60)[0]:
+        os._exit(75)
+    return os.read(fd, 1)
+birth = Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+hello = {"nonce": config["nonce"], "slot": "actor", "event": "hello", "pid": os.getpid(), "birth": birth}
+os.write(config["report_write"], (json.dumps(hello) + "\n").encode())
+if not config.get("ungranted", False):
+    if wait(config["nodes"]["actor"]["gate"]) != b"G":
+        os._exit(70)
+worker = os.fork()
+if worker == 0:
+    # A real unreported worker can outlive the actor even after closing its report writer.
+    os.close(config["report_write"])
+    os.close(config["worker_receipt"])
+    wait(config["worker_stop"])
+    os._exit(0)
+os.write(config["worker_receipt"], (json.dumps({"pid": worker}) + "\n").encode())
+wait(config["actor_exit"])
+if not config.get("silent", False):
+    os.write(config["report_write"], b"[]\n")
+os._exit(7)
+'''
+
+
+def _r2_read_worker_receipt(fd):
+    pending = b""
+    deadline = time.monotonic() + R2_HANDSHAKE_CEILING_SECONDS
+    while b"\n" not in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or len(pending) >= 4096:
+            raise RuntimeError("R2 fixture: independent worker receipt refused")
+        try:
+            if not select.select([fd], [], [], remaining)[0]:
+                raise RuntimeError("R2 fixture: independent worker receipt refused")
+            part = os.read(fd, 4096 - len(pending))
+        except (OSError, ValueError):
+            raise RuntimeError("R2 fixture: independent worker receipt refused") from None
+        if not part:
+            raise RuntimeError("R2 fixture: independent worker receipt refused")
+        pending += part
+    try:
+        text = pending.decode("utf-8")
+        if _r2_control_nesting(text) > R2_CONTROL_MAX_DEPTH:
+            raise RuntimeError("R2 fixture: independent worker receipt refused")
+        receipt = json.loads(text)
+    except (ValueError, UnicodeError, RecursionError):
+        raise RuntimeError("R2 fixture: independent worker receipt refused") from None
+    if (not isinstance(receipt, dict) or set(receipt) != {"pid"} or
+            type(receipt["pid"]) is not int or not 0 < receipt["pid"] <= 0x7fffffff):
+        raise RuntimeError("R2 fixture: independent worker receipt refused")
+    return receipt["pid"]
+
+
+def _r2_independent_worker_witness(custody, slot, pid, process=None):
+    """Retain a worker's real original identity outside the control-report custody."""
+    parent = custody.slots[slot]["parent"]
+    parent_entry = custody.entries[parent] if parent is not None else r2_kernel_process(os.getpid())
+    assert r2_kernel_process(parent_entry["pid"])["birth"] == parent_entry["birth"]
+    witness = SimpleNamespace(entries={parent: parent_entry} if parent is not None else {},
+                              slots={slot: {"parent": parent}},
+                              original_parent=(parent, parent_entry["pid"], parent_entry["birth"]))
+    try:
+        R2Custody.capture(witness, slot, pid, process=process)
+    except BaseException:
+        _close_fds(witness.entries.get(slot, {}).get("fd"))
+        raise
+    return witness
+
+
+def _r2_wait_worker_exit(witness, slot):
+    deadline = time.monotonic() + R2_HANDSHAKE_CEILING_SECONDS
+    while True:
+        proof = R2Custody.observe(witness, slot)
+        if proof is not None:
+            return proof
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "independent worker exit was not observed"
+        fd = witness.entries[slot].get("fd")
+        if isinstance(fd, int):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            poller.poll(max(1, int(min(remaining, 0.05) * 1000)))
+        else:
+            time.sleep(min(remaining, 0.05))
+
+
+def _retain_r2_independent_exit(custody, slot, witness):
+    """Add an independently captured original-instance exit to an UNKNOWN report.
+
+    The original UNKNOWN verdict is retained. No unresolved slot is removed;
+    quarantine retirement must check this additional exit evidence itself.
+    """
+    parent = custody.slots[slot]["parent"]
+    actor = custody.entries[parent] if parent is not None else r2_kernel_process(os.getpid())
+    assert witness.original_parent == (parent, actor["pid"], actor["birth"])
+    entry = witness.entries[slot]
+    assert entry["verified"] and not entry["lost"]
+    proof = R2Custody.observe(witness, slot)
+    assert proof is not None, "independent exit evidence is still pending"
+    original = custody.entries.get(slot)
+    if original is not None and original.get("lost"):
+        # Independent recovery may end the physical scope, but never repairs its
+        # terminal proof state or retires the UNKNOWN quarantine.
+        return
+    # Import only an already-closed original instance into the same state
+    # ledger, without borrowing the observer's descriptors or process object.
+    if original is None:
+        original = {"pid": entry["pid"], "birth": entry["birth"], "process": None}
+        r2_identity_transition(original, "register")
+        custody.entries[slot] = original
+    r2_identity_transition(original, "adopt_exit", source=entry)
+    custody.slots[slot]["permitted"] = True
+    if custody.report is not None:
+        custody.report["entries"][slot] = r2_entry_record(original)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_launch_exposes_transitive_reservations_before_process_creation(tmp_path, monkeypatch):
+    """Actorless failed-launch model: descendants lose exemption, unrelated roots keep it."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+
+    def refused(*args, **kwargs):
+        raise OSError("modelled process creation refusal")
+
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": None},
+                 "worker": {"kind": "M", "parent": "actor", "child": None},
+                 "grandchild": {"kind": "W", "parent": "worker", "child": None},
+                 "unrelated": {"kind": "W", "parent": None, "child": None}}
+        custody.plan(nodes, fixture_only=tuple(nodes))
+        config = custody.config({"actor": nodes["actor"]}, tmp_path / "unused.py", tmp_path / "actor.json")
+        monkeypatch.setattr(handshake_tests, "WitnessedPopen", refused)
+        with pytest.raises(OSError, match="^modelled process creation refusal$"):
+            custody.launch(config, "actor", os.environ)
+        assert all(custody.slot_provenance[slot]["handed_to_actor"]
+                   for slot in ("actor", "worker", "grandchild"))
+        assert custody.slot_provenance["unrelated"]["handed_to_actor"] is False
+        custody.LIMIT = 0.01
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["unresolved_slots"] == ["actor", "grandchild", "worker"]
+        assert caught.value.report["uncreated_slots"] == ["unrelated"]
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("silent", [True, False], ids=["silent", "rejected"])
+def test_r2_omitted_ungranted_descendant_keeps_quarantine(tmp_path, silent):
+    require_r2_indirect_exit()
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    actor_read, actor_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    receipt_read, receipt_write = os.pipe()
+    witness = None
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": None},
+                 "worker": {"kind": "W", "parent": "actor", "child": None}}
+        custody.plan(nodes, fixture_only=tuple(nodes))
+        script, path = tmp_path / "ungranted.py", tmp_path / "ungranted.json"
+        script.write_text(R2_UNREPORTED_WORKER)
+        config = custody.config({"actor": nodes["actor"]}, script, path, actor_exit=actor_read,
+                                 worker_stop=stop_read, worker_receipt=receipt_write,
+                                 ungranted=True, silent=silent)
+        config["inherited"].extend((actor_read, stop_read, receipt_write))
+        path.write_text(json.dumps(config))
+        actor = custody.launch(config, "actor", os.environ)
+        _close_fds(actor_read, stop_read, receipt_write)
+        actor_read = stop_read = receipt_write = -1
+        custody.await_event("actor", "hello")
+        worker_pid = _r2_read_worker_receipt(receipt_read)
+        witness = _r2_independent_worker_witness(custody, "worker", worker_pid)
+        assert custody.slots["worker"]["permitted"] is False
+        os.write(actor_write, b"X")
+        assert actor.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        report = caught.value.report
+        assert report["entries"]["actor"]["exit"]["proof"] == "native_waitpid"
+        assert "worker" in report["unresolved_slots"] and "worker" not in report["uncreated_slots"]
+        assert R2Custody.observe(witness, "worker") is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is report
+        assert report["slot_provenance"]["worker"]["handed_to_actor"] is True
+        with pytest.raises(R2CleanupUnknown):
+            R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+    finally:
+        _close_fds(actor_read, actor_write, stop_read, stop_write, receipt_read, receipt_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if witness is not None:
+            try:
+                _r2_wait_worker_exit(witness, "worker")
+                _retain_r2_independent_exit(custody, "worker", witness)
+            finally:
+                r2_identity_transition(witness.entries["worker"], "release")
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+R2_REPARENTED_HELLO_WORKER = r'''import json, os, select, sys
+from pathlib import Path
+config = json.loads(Path(sys.argv[1]).read_text())
+def wait(fd):
+    assert select.select([fd], [], [], 60)[0]
+    return os.read(fd, 1)
+def birth(pid):
+    return Path("/proc/%d/stat" % pid).read_bytes().rpartition(b")")[2].split()[19].decode()
+def emit(slot, event, **fields):
+    raw = (json.dumps(dict(nonce=config["nonce"], slot=slot, event=event, **fields)) + "\n").encode()
+    assert os.write(config["report_write"], raw) == len(raw)
+emit("actor", "hello", pid=os.getpid(), birth=birth(os.getpid()))
+assert wait(config["nodes"]["actor"]["gate"]) == b"G"
+worker = os.fork()
+if worker == 0:
+    os.close(config["worker_receipt"])
+    assert wait(config["hello_read"]) == b"H"
+    emit("worker", "hello", pid=os.getpid(), birth=birth(os.getpid()))
+    os.write(config["ack_write"], b"A")
+    os.close(config["report_write"])
+    wait(config["worker_stop"])
+    os._exit(0)
+emit("actor", "created", child="worker", child_pid=worker, child_birth=birth(worker))
+os.write(config["worker_receipt"], (json.dumps(dict(pid=worker)) + "\n").encode())
+wait(config["actor_exit"])
+os._exit(7)
+'''
+
+
+def _r2_read_scope_file(path, limit, reason):
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+    except OSError:
+        raise AssertionError(reason) from None
+    if len(raw) > limit:
+        raise AssertionError(reason)
+    return raw
+
+
+def _r2_run_identity_scope(tmp_path, node):
+    """A real permanent-loss regression owns a child scope and retains its quarantine."""
+    if os.environ.get("R2_IDENTITY_SCOPE_NODE") == node:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            pytest.skip("R2 fixture: identity subreaper ownership unavailable")
+        return False
+    folder = tmp_path / "identity-scope"
+    folder.mkdir()
+    outcome = folder / "outcome.xml"
+    command = [sys.executable, "-m", "pytest", "-n", "0", "-q", "--tb=short",
+               "--basetemp=" + str(folder / "pytest"), "--junitxml=" + str(outcome), node]
+    result = subprocess.run(command, env={**os.environ, "R2_IDENTITY_SCOPE_NODE": node,
+                            "R2_IDENTITY_SCOPE_FOLDER": str(folder)}, cwd=str(ROOT),
+                            text=True, capture_output=True, timeout=180)
+    stdout = _r2_untrusted_text(result.stdout, 65536)
+    stderr = _r2_untrusted_text(result.stderr, 65536)
+    (folder / "pytest.log").write_text("stdout:\n" + stdout + "\nstderr:\n" + stderr)
+    failure = "R2 fixture: identity scope child failed"
+    if result.returncode != 0:
+        raise AssertionError(failure + "\nstdout:\n" + _r2_untrusted_text(result.stdout, 4096) +
+                             "\nstderr:\n" + _r2_untrusted_text(result.stderr, 4096))
+    from xml.etree import ElementTree
+    unavailable = "R2 fixture: identity scope child outcome unavailable"
+    raw = _r2_read_scope_file(outcome, 65536, unavailable)
+    try:
+        cases = ElementTree.fromstring(raw).findall(".//testcase")
+    except ElementTree.ParseError:
+        raise AssertionError(unavailable) from None
+    if len(cases) != 1:
+        raise AssertionError(unavailable)
+    case = cases[0]
+    if case.find("failure") is not None or case.find("error") is not None:
+        raise AssertionError(failure)
+    skipped = case.find("skipped")
+    if skipped is not None:
+        reason = skipped.get("message") or skipped.text or "R2 fixture: identity scope child skipped"
+        pytest.skip(_r2_untrusted_text(reason, 1024))
+    raw = _r2_read_scope_file(folder / "proof.json", 1 << 20,
+                              "R2 fixture: identity scope child passed without closure proof")
+    try:
+        proof = json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError):
+        raise AssertionError("R2 fixture: identity scope child proof unavailable") from None
+    try:
+        worker = proof["report"]["entries"]["worker"]
+        valid = (proof["report"]["state"] == "UNKNOWN" and worker["lost"] is True and
+                 worker["exit"] is None and proof["scope_exit"]["proof"] == "subreaper_native_ECHILD" and
+                 any(row["wait_pid"] == worker["pid"] for row in proof["scope_exit"]["reaped"]))
+    except (KeyError, TypeError):
+        valid = False
+    if not valid:
+        raise AssertionError("R2 fixture: identity scope child proof unavailable")
+    return True
+
+
+def _r2_finish_identity_scope(custody):
+    reaped = []
+    deadline = time.monotonic() + R2_HANDSHAKE_CEILING_SECONDS
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if pid:
+            reaped.append(dict(wait_pid=pid, wait_status=status))
+        else:
+            assert time.monotonic() < deadline, "R2 fixture: identity scope exit unproven"
+            time.sleep(0.01)
+    assert R2Custody.quarantine_report is custody.report and custody.report["state"] == "UNKNOWN"
+    data = {"report": custody.report, "scope_exit": {"proof": "subreaper_native_ECHILD", "reaped": reaped}}
+    (Path(os.environ["R2_IDENTITY_SCOPE_FOLDER"]) / "proof.json").write_text(json.dumps(data, indent=2))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open") or
+                    not hasattr(signal, "pidfd_send_signal"), reason="original-instance signals require Linux pidfds")
+@pytest.mark.parametrize("changed_birth", [False, True], ids=["reparented", "birth-conflict"])
+def test_r2_live_recapture_keeps_original_ancestry(tmp_path, monkeypatch, request, changed_birth):
+    require_r2_indirect_exit(pidfd=True)
+    if changed_birth and _r2_run_identity_scope(tmp_path, request.node.nodeid):
+        return
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    actor_read, actor_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    receipt_read, receipt_write = os.pipe()
+    hello_read, hello_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    real_kernel, real_signal = handshake_tests.r2_kernel_process, handshake_tests.signal
+    witness = None
+    signals = []
+
+    def sent(fd, number, *args):
+        signals.append((fd, number))
+        return real_signal.pidfd_send_signal(fd, number, *args)
+
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": "worker"},
+                 "worker": {"kind": "W", "parent": "actor", "child": None}}
+        custody.plan(nodes)
+        script, path = tmp_path / "reparent.py", tmp_path / "reparent.json"
+        script.write_text(R2_REPARENTED_HELLO_WORKER)
+        config = custody.config(nodes, script, path, actor_exit=actor_read, worker_stop=stop_read,
+                                 worker_receipt=receipt_write, hello_read=hello_read, ack_write=ack_write)
+        config["inherited"].extend((actor_read, stop_read, receipt_write, hello_read, ack_write))
+        path.write_text(json.dumps(config))
+        actor = custody.launch(config, "actor", os.environ)
+        _close_fds(actor_read, stop_read, receipt_write, hello_read, ack_write)
+        actor_read = stop_read = receipt_write = hello_read = ack_write = -1
+        custody.await_event("actor", "hello")
+        custody.release("actor")
+        worker_pid = _r2_read_worker_receipt(receipt_read)  # created was written before this receipt.
+        custody.pump()
+        entry = custody.entries["worker"]
+        assert custody.slots["worker"]["hello"] is False
+        witness = _r2_independent_worker_witness(custody, "worker", worker_pid)
+        retained_fd, retained_lineage = entry["fd"], entry["lineage"]
+        assert isinstance(retained_fd, int) and entry["verified_fd"]
+        os.write(hello_write, b"H")
+        _read_ack(ack_read)  # hello is queued, but has not been parsed.
+        os.write(actor_write, b"X")
+        assert actor.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        assert real_kernel(worker_pid)["ppid"] != actor.pid
+        monkeypatch.setattr(handshake_tests, "signal", R2Facade(real_signal, pidfd_send_signal=sent))
+        if changed_birth:
+            def replacement(pid):
+                physical = real_kernel(pid)
+                return {**physical, "birth": str(int(physical["birth"]) + 1)} if pid == worker_pid else physical
+            monkeypatch.setattr(handshake_tests, "r2_kernel_process", replacement)
+            with pytest.raises(RuntimeError, match="^R2 fixture: physical birth/UID/parent mismatch$"):
+                custody.pump()
+            assert entry["lost"] and custody.control_unknown
+            with pytest.raises(RuntimeError, match="^R2 fixture: no physical authority after identity loss$"):
+                custody.kill_owned("worker")
+            assert signals == []
+            with pytest.raises(R2CleanupUnknown) as caught:
+                custody.close()
+            assert caught.value.report["entries"]["worker"]["lost"] is True
+            assert caught.value.report["entries"]["worker"]["exit"] is None
+            assert not _captured_exit_proven(caught.value.report)
+            _clear_r2_quarantine(custody, expected_unknown=True)
+            with pytest.raises(R2CleanupUnknown):
+                R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+        else:
+            custody.await_event("worker", "hello")
+            assert not entry["lost"] and not custody.control_unknown
+            assert entry["fd"] == retained_fd and entry["lineage"] == retained_lineage
+            custody.kill_owned("worker")
+            assert signals == [(retained_fd, signal.SIGKILL)]
+            _r2_wait_worker_exit(witness, "worker")
+            assert custody.close()["state"] == "CLOSED"
+    finally:
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        monkeypatch.setattr(handshake_tests, "signal", real_signal)
+        _close_fds(actor_read, actor_write, stop_read, stop_write, receipt_read, receipt_write,
+                   hello_read, hello_write, ack_read, ack_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if witness is not None:
+            try:
+                _r2_wait_worker_exit(witness, "worker")
+                _retain_r2_independent_exit(custody, "worker", witness)
+            finally:
+                r2_identity_transition(witness.entries["worker"], "release")
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        if changed_birth:
+            _r2_finish_identity_scope(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("boundary", ["observe", "capture"])
+def test_r2_indirect_metadata_permission_loss_is_permanent(tmp_path, monkeypatch, boundary):
+    """Actorless negative model: no real actor is ever admitted or signalled."""
+    import errno
+
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    real_os = handshake_tests.os
+    physical = r2_kernel_process(os.getpid())
+    reads, probes = [], []
+
+    def metadata(pid):
+        reads.append(pid)
+        if len(reads) == 1:
+            raise PermissionError("modelled denied identity metadata")
+        raise FileNotFoundError("modelled later metadata absence")
+
+    def absent(pid, number):
+        assert pid == os.getpid() and number == 0
+        probes.append(pid)
+        raise ProcessLookupError("modelled later numeric absence")
+
+    def unavailable(*args):
+        raise OSError(errno.ENOSYS, "modelled unavailable pidfd")
+
+    try:
+        custody.plan({"actor": {"kind": "W", "parent": None, "child": None}})
+        custody.slots["actor"]["permitted"] = True
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), physical["birth"], process=None)
+        custody.kill_owned = lambda slot: None  # This model never acquires signal authority over pytest.
+        custody.LIMIT = 0.01
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, kill=absent, pidfd_open=unavailable))
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", metadata)
+        if boundary == "capture":
+            raw = (json.dumps(dict(nonce=custody.nonce, slot="actor", event="hello",
+                                   pid=os.getpid(), birth=physical["birth"])) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+                custody.pump()
+        else:
+            assert custody.observe("actor") is None
+        assert custody.observe("actor") is None
+        assert custody.entries["actor"]["lost"] and custody.control_unknown
+        assert custody.entries["actor"]["exit"] is None
+        assert reads == [os.getpid()] and probes == []
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["entries"]["actor"]["exit"] is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+        with pytest.raises(R2CleanupUnknown):
+            R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if custody.report is None or custody.report["state"] == "UNKNOWN":
+            _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("fixture_only", [False, True])
+def test_r2_unreported_worker_keeps_quarantine_until_independent_exit(tmp_path, fixture_only):
+    require_r2_indirect_exit()
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    actor_read, actor_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    receipt_read, receipt_write = os.pipe()
+    witness = None
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": "worker"},
+                 "worker": {"kind": "M", "parent": "actor", "child": None}}
+        custody.plan(nodes, fixture_only=tuple(nodes) if fixture_only else ())
+        script, path = tmp_path / "unreported-worker.py", tmp_path / "unreported-worker.json"
+        script.write_text(R2_UNREPORTED_WORKER)
+        config = custody.config(nodes, script, path, actor_exit=actor_read,
+                                 worker_stop=stop_read, worker_receipt=receipt_write)
+        config["inherited"].extend((actor_read, stop_read, receipt_write))
+        path.write_text(json.dumps(config))
+        actor = custody.launch(config, "actor", os.environ)
+        _close_fds(actor_read, stop_read, receipt_write)
+        actor_read = stop_read = receipt_write = -1
+        custody.await_event("actor", "hello")
+        custody.release("actor")
+        worker_pid = _r2_read_worker_receipt(receipt_read)
+        witness = _r2_independent_worker_witness(custody, "worker", worker_pid)
+        os.write(actor_write, b"X")
+        assert actor.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        report = caught.value.report
+        assert report["slot_provenance"]["worker"]["fixture_only"] is fixture_only
+        assert report["slot_provenance"]["worker"]["handed_to_actor"] is True
+        assert "worker" in report["unresolved_slots"] and "worker" not in report["entries"]
+        assert report["entries"]["actor"]["exit"]["proof"]
+        assert R2Custody.observe(witness, "worker") is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is report
+        with pytest.raises(R2CleanupUnknown):
+            R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+        _close_fds(stop_write)
+        stop_write = -1
+        _r2_wait_worker_exit(witness, "worker")
+        _retain_r2_independent_exit(custody, "worker", witness)
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is None
+        next_scope = R2Custody(tmp_path / "next", tmp_path / "next.json")
+        assert next_scope.close()["state"] == "CLOSED"
+    finally:
+        _close_fds(actor_read, actor_write, stop_read, stop_write, receipt_read, receipt_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if witness is not None:
+            try:
+                _r2_wait_worker_exit(witness, "worker")
+                _retain_r2_independent_exit(custody, "worker", witness)
+            finally:
+                r2_identity_transition(witness.entries["worker"], "release")
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("deadline_position", ["before_exit", "during_exit", "before_eof", "after_drain"])
+@pytest.mark.parametrize("pump_state", ["empty", "partial", "saturated"])
+@pytest.mark.parametrize("worker_state", ["none", "reported", "unreported", "exited"])
+def test_r2_close_requires_post_exit_eof_matrix(tmp_path, monkeypatch, deadline_position, pump_state, worker_state):
+    """Real process exits and pipe EOF; only deadline placement is modelled.
+
+    The worker is a second owned root here, isolating drain/EOF behavior from
+    ancestry. The separate forked-worker regression covers a real descendant.
+    """
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_os, real_time = os, time
+    actor_read, actor_write = os.pipe()
+    worker_read, worker_write = os.pipe()
+    witness = None
+    worker = None
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": None}}
+        if worker_state != "none":
+            nodes["worker"] = {"kind": "H", "parent": None, "child": None}
+        custody.plan(nodes)
+        actor = _start_handshake_child(custody, tmp_path, "actor", "exit", "hello", actor_read)
+        if worker_state == "reported":
+            worker = _start_handshake_child(custody, tmp_path, "worker", "prompt", "hello", worker_read)
+            custody.await_event("worker", "hello")
+            custody.kill_owned("worker")
+            worker.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        elif worker_state in ("unreported", "exited"):
+            worker = WitnessedPopen(
+                [sys.executable, "-c", "import os,sys; os.read(int(sys.argv[1]), 1)", str(worker_read)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=(worker_read, custody.report_write))
+            witness = _r2_independent_worker_witness(custody, "worker", worker.pid, process=worker)
+            if worker_state == "exited":
+                _close_fds(worker_write)
+                worker_write = -1
+                worker.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+                _retain_r2_independent_exit(custody, "worker", witness)
+        _close_fds(actor_read, worker_read)
+        actor_read = worker_read = -1
+        os.write(actor_write, b"X")
+        assert actor.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 7
+        if pump_state == "partial":
+            os.write(custody.report_write, b'{"nonce":')
+        elif pump_state == "saturated":
+            frame = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "timeout"}) + "\n").encode()
+            os.write(custody.report_write, frame * 2)
+            monkeypatch.setattr(handshake_tests, "R2_CONTROL_LINES_PER_PUMP", 1)
+        trace = {"now": 0.0, "exit_seen": False, "eof_returned": False, "eof_clock_sampled": False}
+
+        def clock():
+            if deadline_position == "after_drain" and trace["eof_returned"]:
+                if not trace["eof_clock_sampled"]:
+                    trace["eof_clock_sampled"] = True
+                    return 0.0
+                return 2.0
+            return trace["now"]
+
+        observing = custody.observe
+
+        def observed(slot):
+            proof = observing(slot)
+            if proof is not None:
+                trace["exit_seen"] = True
+                if deadline_position == "during_exit":
+                    trace["now"] = 2.0
+            return proof
+
+        def reading(fd, size):
+            try:
+                part = real_os.read(fd, size)
+            except BlockingIOError:
+                if fd == custody.report_read:
+                    if deadline_position == "before_exit" and not trace["exit_seen"]:
+                        trace["now"] = 2.0
+                    elif trace["exit_seen"] and custody.report_writer_retired and worker_state == "unreported":
+                        # This live, unreported writer cannot produce EOF. Spend
+                        # the ceiling instead of waiting forever for a model clock.
+                        trace["now"] = 2.0
+                raise
+            if fd == custody.report_read:
+                if deadline_position == "before_exit" and not trace["exit_seen"]:
+                    trace["now"] = 2.0
+                if not part:
+                    trace["eof_returned"] = True
+                    if deadline_position == "before_eof":
+                        trace["now"] = 2.0
+            return part
+
+        custody.observe = observed
+        custody.LIMIT = 1.0
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, read=reading))
+        monkeypatch.setattr(handshake_tests, "time", R2Facade(real_time, monotonic=clock))
+        expected_closed = (deadline_position == "after_drain" and pump_state != "partial" and
+                           worker_state != "unreported")
+        if expected_closed:
+            report = custody.close()
+            assert report["state"] == "CLOSED"
+            assert report["post_exit_drain"]["complete"] is True
+            assert report["post_exit_drain"]["eof_at"] <= report["post_exit_drain"]["deadline"]
+            assert trace["exit_seen"] and trace["eof_returned"]
+            assert clock() > report["post_exit_drain"]["deadline"]
+        else:
+            with pytest.raises(R2CleanupUnknown) as caught:
+                custody.close()
+            assert caught.value.report["state"] == "UNKNOWN"
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "time", real_time)
+        _close_fds(actor_read, actor_write, worker_read, worker_write)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        if witness is not None:
+            try:
+                worker.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+                if custody.report["state"] == "UNKNOWN":
+                    _r2_wait_worker_exit(witness, "worker")
+                    _retain_r2_independent_exit(custody, "worker", witness)
+            finally:
+                r2_identity_transition(witness.entries["worker"], "release")
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("fixture_only", [False, True])
+def test_r2_quarantine_requires_positive_synthetic_slot_proof(tmp_path, monkeypatch, fixture_only):
+    """Actorless proof model: an unexposed ordinary reservation is not synthetic."""
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}},
+                     fixture_only=("actor",) if fixture_only else ())
+        os.write(custody.report_write, b"[]\n")
+        with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+            custody.pump()
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert _captured_exit_proven(caught.value.report) is fixture_only
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        if fixture_only:
+            assert R2Custody.quarantine_report is None
+            next_scope = R2Custody(tmp_path / "next", tmp_path / "next.json")
+            assert next_scope.close()["state"] == "CLOSED"
+        else:
+            assert R2Custody.quarantine_report is caught.value.report
+            with pytest.raises(R2CleanupUnknown):
+                R2Custody(tmp_path / "blocked", tmp_path / "blocked.json")
+    finally:
+        # No actor was created or given a slot. Restore this negative model's
+        # global state via monkeypatch, after proving the constructor refusal.
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_report_writer_retirement_closes_its_temporary_descriptor(tmp_path, monkeypatch):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    real_os = os
+    opened = []
+
+    def opening(*args, **kwargs):
+        fd = real_os.open(*args, **kwargs)
+        if args[0] == real_os.devnull:
+            opened.append(fd)
+        return fd
+
+    def failed(*args, **kwargs):
+        raise OSError("token=supersecretvalue")
+
+    try:
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, open=opening, dup2=failed))
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["post_exit_drain"]["complete"] is False
+        assert caught.value.report["errors"] == ["R2 fixture: report writer retirement failed"]
+        assert opened
+        for fd in opened:
+            with pytest.raises(OSError):
+                real_os.fstat(fd)
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("frame", [b"\xff\n", b"[]\n", b'{"pid":"token=supersecretvalue"}\n',
+                                  b'{"pid":9223372036854775808}\n', b"Q" * 4096,
+                                  b"[" * 9 + b"]" * 9 + b"\n"],
+                         ids=["encoding", "schema", "type", "pid-range", "size", "depth"])
+def test_r2_independent_worker_receipt_refuses_invalid_frames(frame):
+    read_fd, write_fd = os.pipe()
+    try:
+        assert os.write(write_fd, frame) == len(frame)
+        with pytest.raises(RuntimeError, match="^R2 fixture: independent worker receipt refused$"):
+            _r2_read_worker_receipt(read_fd)
+    finally:
+        _close_fds(read_fd, write_fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("boundary", ["observe", "intake", "kill"])
+def test_r2_conflicting_birth_read_cannot_be_retried_into_absence(tmp_path, monkeypatch, boundary):
+    """A real two-read birth conflict remains lost when the numeric PID later disappears."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    real_path, real_kernel, real_os = handshake_tests.Path, handshake_tests.r2_kernel_process, handshake_tests.os
+    reads = {"stat": 0, "kernel": 0}
+
+    class UnstablePath:
+        def __init__(self, path):
+            self.path = real_path(path)
+
+        def __truediv__(self, name):
+            return UnstablePath(self.path / name)
+
+        def read_bytes(self):
+            raw = self.path.read_bytes()
+            if self.path.name == "stat":
+                reads["stat"] += 1
+                if reads["stat"] == 2:
+                    prefix, closing, tail = raw.rpartition(b")")
+                    fields = tail.split()
+                    fields[19] = str(int(fields[19]) + 1).encode("ascii")
+                    return prefix + closing + b" " + b" ".join(fields)
+            return raw
+
+    def gone(pid, number):
+        assert pid == os.getpid() and number == 0
+        raise ProcessLookupError("modelled replacement disappeared")
+
+    try:
+        physical = real_kernel(os.getpid())
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        custody.slots["actor"]["permitted"] = True
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), physical["birth"], process=None)
+        monkeypatch.setattr(handshake_tests, "Path", UnstablePath)
+        with pytest.raises(RuntimeError, match="^R2 fixture: unstable physical birth evidence$") as conflict:
+            real_kernel(os.getpid())
+        monkeypatch.setattr(handshake_tests, "Path", real_path)
+
+        def unstable_then_missing(pid):
+            reads["kernel"] += 1
+            if boundary == "kill" and reads["kernel"] == 1:
+                return physical
+            if reads["kernel"] == (2 if boundary == "kill" else 1):
+                raise conflict.value
+            raise FileNotFoundError("modelled numeric absence")
+
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", unstable_then_missing)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, kill=gone))
+        if boundary == "intake":
+            raw = (json.dumps({"nonce": custody.nonce, "slot": "actor", "event": "hello",
+                               "pid": os.getpid(), "birth": physical["birth"]}) + "\n").encode()
+            assert os.write(custody.report_write, raw) == len(raw)
+            with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+                custody.pump()
+        elif boundary == "kill":
+            with pytest.raises(R2IdentityConflict, match="^R2 fixture: unstable physical birth evidence$"):
+                custody.kill_owned("actor")
+        else:
+            assert custody.observe("actor") is None
+        assert custody.observe("actor") is None
+        assert custody.entries["actor"]["lost"] is True
+        assert custody.control_unknown is True
+        assert reads["kernel"] == (2 if boundary == "kill" else 1)
+        custody.kill_owned = lambda slot: None  # Actorless model never grants authority over this test process.
+        custody.LIMIT = 0.01
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["entries"]["actor"]["exit"] is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+    finally:
+        monkeypatch.setattr(handshake_tests, "Path", real_path)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+@pytest.mark.parametrize("target", ["actor", "worker", "duplicate"])
+def test_r2_forged_identity_never_weakens_genuine_custody(tmp_path, monkeypatch, target):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    latch_read, latch_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    process = None
+    retained = None
+    real_os, candidate_fds = handshake_tests.os, []
+
+    def candidate_pidfd(pid, *args):
+        fd = real_os.pidfd_open(pid, *args)
+        candidate_fds.append(fd)
+        return fd
+
+    try:
+        _plan_reserved_sibling(custody)
+        script = tmp_path / "handshake-child.py"
+        # This real actor ignores safety EOF. Cleanup must keep its original kill authority.
+        script.write_text(R2_HANDSHAKE_CHILD.replace('if mode == "exit" and field == "running":',
+            'if mode == "stubborn":\n    if field == "announce":\n        hello()\n'
+            '    ack_fd = config["ack_write"]\n'
+            '    os.write(ack_fd, b"A")\n    select.select([], [], [], None)\n'
+            'if mode == "exit" and field == "running":'), encoding="utf-8")
+        process = _start_handshake_child(custody, tmp_path, "actor", "stubborn",
+                                         "announce" if target == "duplicate" else "hello",
+                                         latch_read, ack_write=ack_write)
+        _read_ack(ack_read)
+        if target == "duplicate":
+            custody.await_event("actor", "hello")
+        else:
+            assert custody.slots["actor"]["hello"] is False
+        retained = dict(custody.entries["actor"])
+        # The unpermitted sibling is refused before capture. The real exposed-worker
+        # regression separately exercises a forged candidate after an actual grant.
+        if hasattr(real_os, "pidfd_open"):
+            monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=candidate_pidfd))
+        raw = (json.dumps({"nonce": custody.nonce, "slot": "actor" if target == "duplicate" else target,
+                           "event": "hello", "pid": retained["pid"] if target == "duplicate" else 1,
+                           "birth": retained["birth"] if target == "duplicate" else "9"}) + "\n").encode()
+        assert os.write(custody.report_write, raw) == len(raw)
+        with pytest.raises(RuntimeError):
+            custody.pump()
+        assert custody.report_rejected and custody.control_unknown
+        assert custody.entries["actor"] == retained
+        assert "worker" not in custody.entries
+        for fd in candidate_fds:
+            with pytest.raises(OSError):
+                real_os.fstat(fd)
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["entries"]["actor"]["exit"]["returncode"] == -signal.SIGKILL
+        assert process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == -signal.SIGKILL
+        _assert_exit_proofs(caught.value.report)
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        _close_fds(latch_read, latch_write, ack_read, ack_write)
+        if process is not None:
+            if process.poll() is None:
+                process.kill()  # Independent original-instance owner recovery, including the RED baseline.
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+            if retained is not None and custody.report is None:
+                # Restore only the independently retained genuine identity before retiring this scope.
+                candidate = custody.entries.get("worker")
+                if candidate is not None and isinstance(candidate.get("fd"), int):
+                    _close_fds(candidate["fd"])
+                custody.entries = {"actor": retained}
+                r2_identity_transition(retained, "native_exit")
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="handshake custody reads Linux /proc")
+def test_r2_unterminated_frame_at_eof_is_rejected_and_keeps_reserved_slots(tmp_path):
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    try:
+        _plan_reserved_sibling(custody)  # Actorless model; neither synthetic slot is handed to an actor.
+        assert os.write(custody.report_write, b"{}") == 2
+        assert custody._retire_report_writer()
+        with pytest.raises(RuntimeError, match="^R2 fixture: control message refused$"):
+            custody.pump()
+        assert custody.report_rejected and custody.control_unknown
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["unresolved_slots"] == ["actor", "worker"]
+        assert caught.value.report["uncreated_slots"] == []
+    finally:
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupUnknown:
+                pass
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"),
+                    reason="indirect custody requires Linux pidfds")
+def test_r2_reaped_indirect_worker_hello_uses_retained_pidfd(tmp_path, monkeypatch):
+    require_r2_indirect_exit(pidfd=True)
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    hello_read, hello_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    real_kernel = handshake_tests.r2_kernel_process
+    process = None
+    try:
+        nodes = {"actor": {"kind": "H", "parent": None, "child": "worker"},
+                 "worker": {"kind": "W", "parent": "actor", "child": None}}
+        custody.plan(nodes)
+        script = tmp_path / "indirect-reap.py"
+        script.write_text('''import json, os, select, sys
+from pathlib import Path
+config = json.loads(Path(sys.argv[1]).read_text())
+def emit(slot, event, **fields):
+    raw = (json.dumps(dict(nonce=config["nonce"], slot=slot, event=event, **fields)) + "\\n").encode()
+    assert os.write(config["report_write"], raw) == len(raw)
+def birth():
+    return Path("/proc/self/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+def wait(fd):
+    assert select.select([fd], [], [], 60)[0]
+    return os.read(fd, 1)
+emit("actor", "hello", pid=os.getpid(), birth=birth())
+assert wait(config["nodes"]["actor"]["gate"]) == b"G"
+pid = os.fork()
+if pid == 0:
+    assert wait(config["hello_read"]) == b"H"
+    emit("worker", "hello", pid=os.getpid(), birth=birth())
+    os._exit(7)
+worker_birth = Path("/proc") / str(pid) / "stat"
+emit("actor", "created", child="worker", child_pid=pid,
+     child_birth=worker_birth.read_bytes().rpartition(b")")[2].split()[19].decode())
+os.write(config["ack_write"], b"A")
+assert os.waitpid(pid, 0)[0] == pid
+os.write(config["ack_write"], b"A")
+wait(config["safety_read"])
+''', encoding="utf-8")
+        config_path = tmp_path / "indirect.json"
+        config = custody.config(nodes, script, config_path, hello_read=hello_read, ack_write=ack_write)
+        config["inherited"].extend((hello_read, ack_write))
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        process = custody.launch(config, "actor", os.environ)
+        custody.await_event("actor", "hello")
+        custody.release("actor")
+        _read_ack(ack_read)
+        custody.pump()
+        worker = custody.entries["worker"]
+        assert isinstance(worker["fd"], int) and worker["verified_fd"], "qualified worker pidfd unavailable"
+        assert worker["process"] is None and worker["exit"] is None
+        os.write(hello_write, b"H")
+        _read_ack(ack_read)  # Parent has actually reaped the worker; hello remains queued.
+        assert not (Path("/proc") / str(worker["pid"])).exists()
+        reads = []
+
+        def kernel_without_reaped_worker(pid):
+            if pid == worker["pid"]:
+                reads.append(pid)
+                raise FileNotFoundError("reaped worker has no proc metadata")
+            return real_kernel(pid)
+
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", kernel_without_reaped_worker)
+        custody.await_event("worker", "hello")
+        assert reads == []
+        assert worker["exit"] == {"proof": "original_pidfd_exit"}
+        assert worker["lost"] is False
+        assert custody.close()["state"] == "CLOSED"
+    finally:
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        _close_fds(hello_read, hello_write, ack_read, ack_write)
+        entry = custody.entries.get("worker")
+        if entry is not None and entry["verified_fd"] and isinstance(entry["fd"], int):
+            poller = select.poll()
+            poller.register(entry["fd"], select.POLLIN)
+            if poller.poll(0):
+                # Independent retained-pidfd recovery also retires the failing RED baseline safely.
+                if not entry["lost"]:
+                    r2_identity_transition(entry, "pidfd_exit")
+        if custody.report is None:
+            try:
+                custody.close()
+            except R2CleanupError:
+                pass
+        if process is not None:
+            process.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        _clear_r2_quarantine(custody, expected_unknown=True)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="proof custody reads Linux /proc")
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError, R2IdentityConflict, KeyboardInterrupt])
+def test_r2_candidate_handle_is_never_committed_before_identity(tmp_path, monkeypatch, failure):
+    """Actorless recycled-PID model: a readable candidate is not the original child's proof."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    real_os, real_kernel = handshake_tests.os, handshake_tests.r2_kernel_process
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)  # A candidate which exits before metadata is available is immediately readable.
+    candidates = []
+    physical = r2_kernel_process(os.getpid())
+
+    def opening(pid):
+        candidate = real_os.dup(read_fd)
+        candidates.append(candidate)
+        return candidate
+
+    def refused(pid):
+        raise failure("modelled candidate identity unavailable")
+
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None},
+                      "worker": {"kind": "W", "parent": "actor", "child": None}})
+        custody.entries["actor"] = r2_pending_test_entry(os.getpid(), physical["birth"], process=None)
+        custody.entries["worker"] = r2_pending_test_entry(os.getpid(), physical["birth"], process=None)
+        r2_identity_transition(custody.entries["worker"], "capture", verified=True)
+        custody.kill_owned = lambda slot: None  # This model never owns the pytest process.
+        custody.LIMIT = 0.01
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=opening))
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", refused)
+        with pytest.raises(failure, match="^modelled candidate identity unavailable$"):
+            custody.capture("worker", os.getpid())
+        assert len(candidates) == 1
+        with pytest.raises(OSError):
+            real_os.fstat(candidates[0])
+        candidates.clear()
+        entry = custody.entries["worker"]
+        assert entry["fd"] is None and entry["verified_fd"] is False
+        assert custody.observe("worker") is None
+        assert entry["exit"] is None
+        with pytest.raises(R2CleanupUnknown) as caught:
+            custody.close()
+        assert caught.value.report["entries"]["worker"]["exit"] is None
+        _clear_r2_quarantine(custody, expected_unknown=True)
+        assert R2Custody.quarantine_report is caught.value.report
+    finally:
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        _close_fds(read_fd, *candidates)
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="proof custody reads Linux /proc")
+@pytest.mark.parametrize("failure", ["lost", "poll-error"])
+def test_r2_handshake_never_calls_unproven_identity_an_exit(tmp_path, monkeypatch, failure):
+    """Actorless diagnostic model; no process or descriptor acquires signal authority."""
+    custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    physical = r2_kernel_process(os.getpid())
+
+    calls = []
+
+    def unavailable():
+        calls.append(True)
+        raise OSError("modelled native wait unavailable")
+
+    try:
+        custody.plan({"actor": {"kind": "H", "parent": None, "child": None}})
+        entry = r2_pending_test_entry(os.getpid(), physical["birth"])
+        if failure == "poll-error":
+            entry["process"] = SimpleNamespace(pid=os.getpid(), poll=unavailable, returncode=None,
+                                               native_wait_evidence=None, native_wait_unavailable=False)
+            entry["native_owner"] = entry["process"]
+            r2_identity_transition(entry, "capture", verified=True)
+        else:
+            r2_identity_transition(entry, "lost")
+        custody.entries["actor"] = entry
+        with pytest.raises(RuntimeError) as caught:
+            custody.await_event("actor", "hello")
+        _, evidence = _handshake_evidence(caught)
+        assert evidence["reason"] == ("identity lost" if failure == "lost" else "wait unavailable")
+        assert "exit_proof" not in evidence and evidence["returncode"] is None
+        assert custody.control_unknown
+        if failure == "poll-error":
+            assert calls and entry["wait_status"] == "unavailable" and entry["wait_error"]
+    finally:
+        _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="proof custody reads Linux /proc")
+@pytest.mark.parametrize("state", ["pending", "captured", "lost", "exited"])
+@pytest.mark.parametrize("event", ["register", "capture", "lost", "native_exit", "pidfd_exit", "adopt_exit", "release", "invalid"])
+def test_r2_identity_transition_table(state, event):
+    """Every state/event pair is defined; no unverified handle or terminal loss proves exit."""
+    if not hasattr(os, "pidfd_open"):
+        pytest.skip("state table requires Linux pidfds")
+    child = WitnessedPopen([sys.executable, "-I", "-c", "import os; os.read(0,1)"], stdin=subprocess.PIPE)
+    entry = dict(pid=child.pid, birth=child.native_birth, process=child, native_owner=child)
+    candidate = None
+    try:
+        try:
+            candidate = os.pidfd_open(child.pid)
+        except OSError:
+            pytest.skip("kernel refused the state-table pidfd")
+        handshake_tests.r2_identity_transition(entry, "register")
+        if state != "pending":
+            handshake_tests.r2_identity_transition(entry, "capture", fd=candidate, verified=True)
+            candidate = None
+        if state == "lost":
+            handshake_tests.r2_identity_transition(entry, "lost")
+        elif state == "exited":
+            child.stdin.close()
+            assert child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 0
+            handshake_tests.r2_identity_transition(entry, "native_exit")
+        source = entry
+        if event == "adopt_exit":
+            if not child.stdin.closed:
+                child.stdin.close()
+            assert child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS) == 0
+            source = dict(pid=child.pid, birth=child.native_birth, process=child, native_owner=child)
+            handshake_tests.r2_identity_transition(source, "register")
+            handshake_tests.r2_identity_transition(source, "capture", verified=True)
+            handshake_tests.r2_identity_transition(source, "native_exit")
+        illegal = event in ("invalid", "register") or (state in ("lost", "exited") and event == "capture") or (
+            state in ("pending", "lost") and event in ("native_exit", "pidfd_exit")) or (
+            event == "adopt_exit" and state == "lost")
+        if illegal:
+            with pytest.raises(RuntimeError, match="^R2 fixture: illegal identity proof transition$"):
+                handshake_tests.r2_identity_transition(entry, event, source=source)
+        else:
+            handle = candidate if candidate is not None else entry.get("fd")
+            handshake_tests.r2_identity_transition(entry, event, fd=handle, verified=True, source=source)
+            if event == "capture":
+                candidate = None
+            expected = "lost" if event == "lost" else "captured" if event == "capture" else (
+                "exited" if event == "adopt_exit" else "pending" if event == "release" and
+                state == "captured" else state)
+            assert entry["proof_state"] == expected
+        assert entry["verified_fd"] is isinstance(entry["fd"], int)
+        if entry["proof_state"] == "captured":
+            assert isinstance(entry["fd"], int)
+        assert not (entry["lost"] and entry["exit"] is not None)
+    finally:
+        _close_fds(candidate)
+        if "proof_state" in entry:
+            r2_identity_transition(entry, "release")
+        if child.stdin is not None and not child.stdin.closed:
+            child.stdin.close()
+        child.wait(timeout=R2_HANDSHAKE_CEILING_SECONDS)
+        child.close_native_handle()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"),
+                    reason="pending original-instance evidence requires Linux pidfds")
+@pytest.mark.parametrize("observation", ["zombie", "missing", "read-error"])
+def test_r2_verified_handle_pending_exit_does_not_poison_intake(tmp_path, monkeypatch, observation):
+    """Actorless OS-boundary model of leader exit before the original handle becomes readable."""
+    try:
+        candidate = os.pidfd_open(os.getpid())
+    except OSError:
+        pytest.skip("kernel pidfd capability unavailable")
+    custody = None
+    real_os, real_kernel = handshake_tests.os, handshake_tests.r2_kernel_process
+    physical = None
+    probes = []
+
+    def metadata(pid):
+        assert pid == os.getpid()
+        if observation == "missing":
+            raise FileNotFoundError("modelled metadata gone before pidfd readiness")
+        if observation == "read-error":
+            raise ProcessLookupError("modelled exit during metadata read")
+        return {**physical, "state": "Z"}
+
+    def numeric(pid, number):
+        probes.append((pid, number))
+        raise ProcessLookupError("modelled numeric absence")
+
+    try:
+        physical = real_kernel(os.getpid())
+        custody = R2Custody(tmp_path / "custody", tmp_path / "quarantine.json")
+        custody.plan({"actor": {"kind": "W", "parent": None, "child": None}})
+        entry = r2_pending_test_entry(os.getpid(), physical["birth"])
+        r2_identity_transition(entry, "capture", fd=candidate, verified=True)
+        candidate = None
+        custody.entries["actor"] = entry
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", metadata)
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, kill=numeric))
+        assert custody.observe("actor") is None
+        assert not custody.control_unknown
+        assert not entry["lost"] and entry["exit"] is None
+        assert entry.get("wait_status") is None and probes == []
+    finally:
+        monkeypatch.setattr(handshake_tests, "r2_kernel_process", real_kernel)
+        monkeypatch.setattr(handshake_tests, "os", real_os)
+        _close_fds(candidate)
+        if custody is not None:
+            _release_r2_test_descriptors(custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="indirect custody reads Linux /proc")
+@pytest.mark.parametrize("consumer", ["independent", "omitted", "unreported", "reaped", "identity-scope"])
+def test_r2_indirect_tests_refuse_unavailable_capability_before_spawn(tmp_path, monkeypatch, consumer):
+    spawned = []
+
+    def forbidden(*args, **kwargs):
+        spawned.append(True)
+        raise AssertionError("capability refusal must precede actor creation")
+
+    monkeypatch.setattr(handshake_tests, "r2_indirect_exit_capability", lambda: {"pidfd": False, "subreaper": False})
+    monkeypatch.setattr(handshake_tests, "WitnessedPopen", forbidden)
+    with pytest.raises(pytest.skip.Exception, match="indirect exit evidence unavailable"):
+        if consumer == "independent":
+            test_r2_closure_requires_independent_evidence_for_exposed_workers(
+                tmp_path, monkeypatch, "silent-never", "W")
+        elif consumer == "omitted":
+            test_r2_omitted_ungranted_descendant_keeps_quarantine(tmp_path, True)
+        elif consumer == "unreported":
+            test_r2_unreported_worker_keeps_quarantine_until_independent_exit(tmp_path, False)
+        elif consumer == "reaped":
+            test_r2_reaped_indirect_worker_hello_uses_retained_pidfd(tmp_path, monkeypatch)
+        else:
+            request = SimpleNamespace(node=SimpleNamespace(nodeid="unused-child-scope"))
+            test_r2_live_recapture_keeps_original_ancestry(tmp_path, monkeypatch, request, True)
+    assert spawned == []
+    assert not (tmp_path / "identity-scope").exists()
+    assert not (tmp_path / "custody").exists()
+    assert R2Custody.quarantine_report is None
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "passed-without-proof", "missing-outcome", "failed",
+                                     "reported-failure", "invalid-outcome", "oversize-outcome", "invalid-proof"])
+def test_r2_identity_scope_distinguishes_child_outcomes(tmp_path, monkeypatch, outcome):
+    """Model only the external child boundary; no actor or exit proof is manufactured."""
+    real_subprocess = handshake_tests.subprocess
+
+    def child(command, **kwargs):
+        folder = tmp_path / "identity-scope"
+        if outcome != "missing-outcome":
+            from xml.etree import ElementTree
+            suite = ElementTree.Element("testsuite")
+            case = ElementTree.SubElement(suite, "testcase", name="identity-child")
+            if outcome == "skipped":
+                ElementTree.SubElement(case, "skipped", message="kernel denied indirect exit evidence")
+            elif outcome in ("failed", "reported-failure"):
+                ElementTree.SubElement(case, "failure", message="child assertion failed")
+            ElementTree.ElementTree(suite).write(folder / "outcome.xml", encoding="utf-8")
+            if outcome == "invalid-outcome":
+                (folder / "outcome.xml").write_bytes(b"invalid XML")
+            elif outcome == "oversize-outcome":
+                (folder / "outcome.xml").write_bytes(b"X" * 65537)
+            elif outcome == "invalid-proof":
+                (folder / "proof.json").write_text("[]")
+        return real_subprocess.CompletedProcess(command, 1 if outcome == "failed" else 0, "", "")
+
+    monkeypatch.setattr(handshake_tests, "subprocess", R2Facade(real_subprocess, run=child))
+    if outcome == "skipped":
+        with pytest.raises(pytest.skip.Exception, match="^kernel denied indirect exit evidence$"):
+            _r2_run_identity_scope(tmp_path, "identity-child")
+    else:
+        expected = {"passed-without-proof": "R2 fixture: identity scope child passed without closure proof",
+                    "missing-outcome": "R2 fixture: identity scope child outcome unavailable",
+                    "failed": "R2 fixture: identity scope child failed",
+                    "reported-failure": "R2 fixture: identity scope child failed",
+                    "invalid-outcome": "R2 fixture: identity scope child outcome unavailable",
+                    "oversize-outcome": "R2 fixture: identity scope child outcome unavailable",
+                    "invalid-proof": "R2 fixture: identity scope child proof unavailable"}[outcome]
+        with pytest.raises(AssertionError, match="^" + re.escape(expected)):
+            _r2_run_identity_scope(tmp_path, "identity-child")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="native subreaper probes require Linux")
+@pytest.mark.parametrize("opening,native,expected", [
+    ("absent", False, {"pidfd": False, "subreaper": False}),
+    ("denied", False, {"pidfd": False, "subreaper": False}),
+    ("denied", True, {"pidfd": False, "subreaper": True}),
+    ("usable", False, {"pidfd": True, "subreaper": False}),
+    ("usable", True, {"pidfd": True, "subreaper": True}),
+])
+def test_r2_indirect_capability_uses_only_existing_native_ownership(opening, native, expected):
+    """Any native ownership change belongs to this empty child scope, never the pytest worker."""
+    if opening == "usable":
+        require_r2_indirect_exit(pidfd=True)
+    program = '''import ctypes, errno, json, os, sys
+sys.path.insert(0, sys.argv[1])
+from tests.integration import test_hierarchy_launcher as helper
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, int(sys.argv[3]), 0, 0, 0) != 0:
+    sys.exit(77)
+def denied(pid):
+    raise OSError(errno.ENOSYS, "modelled denied pidfd")
+if sys.argv[2] != "usable":
+    helper.os = helper.R2Facade(os, pidfd_open=None if sys.argv[2] == "absent" else denied)
+print(json.dumps(helper.r2_indirect_exit_capability()))
+'''
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", program, str(ROOT), opening, str(int(native))],
+                            text=True, capture_output=True, timeout=R2_HANDSHAKE_CEILING_SECONDS)
+    if result.returncode == 77:
+        pytest.skip("native subreaper capability unavailable")
+    assert result.returncode == 0, _r2_untrusted_text(result.stderr, 4096)
+    assert json.loads(result.stdout) == expected
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"),
+                    reason="pidfd descriptor probes require Linux pidfds")
+@pytest.mark.parametrize("reject_poll", [False, True], ids=["usable", "poll-denied"])
+def test_r2_indirect_capability_closes_its_probe_descriptor(monkeypatch, reject_poll):
+    if not reject_poll:
+        require_r2_indirect_exit(pidfd=True)
+    real_os, real_select = handshake_tests.os, handshake_tests.select
+    original, opened = None, []
+
+    def opening(pid):
+        assert pid == os.getpid()
+        descriptor = real_os.dup(original)
+        opened.append(descriptor)
+        return descriptor
+
+    class Rejected:
+        def register(self, *args):
+            raise OSError("modelled pidfd polling unavailable")
+
+    try:
+        try:
+            original = real_os.pidfd_open(os.getpid())
+        except OSError:
+            pytest.skip("kernel pidfd capability unavailable")
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=opening))
+        if reject_poll:
+            monkeypatch.setattr(handshake_tests, "select", R2Facade(real_select, poll=Rejected))
+        capability = r2_indirect_exit_capability()
+        assert capability["pidfd"] is (not reject_poll)
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            real_os.fstat(opened[0])
+        opened.clear()
+        real_os.fstat(original)
+    finally:
+        _close_fds(original, *opened)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not hasattr(os, "pidfd_open"),
+                    reason="signal authority probes require Linux pidfds")
+@pytest.mark.parametrize("unavailable", ["absent", "denied"])
+def test_r2_indirect_capability_requires_signal_authority(monkeypatch, unavailable):
+    real_os, real_signal = handshake_tests.os, handshake_tests.signal
+    original, opened = None, []
+
+    def opening(pid):
+        assert pid == os.getpid()
+        descriptor = real_os.dup(original)
+        opened.append(descriptor)
+        return descriptor
+
+    def denied(*args):
+        raise OSError("modelled pidfd signal permission denied")
+
+    try:
+        try:
+            original = real_os.pidfd_open(os.getpid())
+        except OSError:
+            pytest.skip("kernel pidfd capability unavailable")
+        monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=opening))
+        monkeypatch.setattr(handshake_tests, "signal", R2Facade(
+            real_signal, pidfd_send_signal=None if unavailable == "absent" else denied))
+        assert r2_indirect_exit_capability()["pidfd"] is False
+        with pytest.raises(pytest.skip.Exception, match="usable pidfd required"):
+            require_r2_indirect_exit(pidfd=True)
+        assert len(opened) == 2
+        for descriptor in opened:
+            with pytest.raises(OSError):
+                real_os.fstat(descriptor)
+        opened.clear()
+        real_os.fstat(original)
+    finally:
+        _close_fds(original, *opened)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["unavailable", "subreaper-only"])
+@pytest.mark.parametrize("consumer", ["tree", "group", "captured", "caller"])
+def test_r2_indirect_case_skips_before_reservation_or_spawn(launch, monkeypatch, consumer, native):
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case, _teardown_r2_case
+    spawned = []
+
+    def forbidden(*args, **kwargs):
+        spawned.append(True)
+        raise AssertionError("unavailable indirect evidence must precede spawn")
+
+    monkeypatch.setattr(handshake_tests.R2Custody, "quarantine_report", None)
+    monkeypatch.setattr(handshake_tests, "r2_indirect_exit_capability", lambda: {"pidfd": False, "subreaper": native})
+    monkeypatch.setattr(handshake_tests, "WitnessedPopen", forbidden)
+    context = R2Case(launch)
+    monkeypatch.setattr(handshake_tests.R2Custody, "plan", forbidden)
+    try:
+        with pytest.raises(pytest.skip.Exception, match="indirect exit evidence unavailable"):
+            if consumer == "tree":
+                context.spawn(tree=True)
+            elif consumer == "group":
+                context.spawn_group(None)
+            elif consumer == "captured":
+                context.spawn_exec([sys.executable], None, [sys.executable],
+                                   captured=[{"argv": [], "expected_argv": [], "logical_argv": None}])
+            else:
+                context.runner(session="modelled-caller")
+        assert spawned == [] and context.configs == [] and context.custody.slots == {}
+        assert context.close()["state"] == "CLOSED"
+        _teardown_r2_case(context)
+    finally:
+        # The Popen boundary is forbidden throughout this actorless negative model.
+        try:
+            context.close()
+        except R2CleanupError:
+            pass
+        if context.custody.report is None or context.custody.report["state"] == "UNKNOWN":
+            _release_r2_test_descriptors(context.custody)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="indirect custody reads Linux /proc")
+@pytest.mark.parametrize("case", ["reaped", "wait_unavailable"])
+@pytest.mark.parametrize("kind", list("HMWCR"))
+def test_r2_indirect_signal_cases_refuse_subreaper_without_pidfd(tmp_path, monkeypatch, case, kind):
+    admitted = []
+
+    def forbidden(*args, **kwargs):
+        admitted.append(True)
+        raise AssertionError("indirect signalling requires a pidfd before custody admission")
+
+    monkeypatch.setattr(handshake_tests, "r2_indirect_exit_capability", lambda: {"pidfd": False, "subreaper": True})
+    monkeypatch.setattr(handshake_tests.R2Custody, "__init__", forbidden)
+    monkeypatch.setattr(handshake_tests, "WitnessedPopen", forbidden)
+    with pytest.raises(pytest.skip.Exception, match="usable pidfd required"):
+        test_r2_closure_requires_independent_evidence_for_exposed_workers(tmp_path, monkeypatch, case, kind)
+    assert admitted == [] and not (tmp_path / "custody").exists()
+    assert R2Custody.quarantine_report is None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="native custody reads Linux /proc")
+def test_r2_direct_case_without_pidfd_uses_owned_native_wait(launch, monkeypatch):
+    from tests.integration.test_hierarchy_launcher_stop_ownership import R2Case, _teardown_r2_case
+    import errno
+    real_os = handshake_tests.os
+
+    def denied(*args):
+        raise OSError(errno.ENOSYS, "modelled pidfd unavailable")
+
+    monkeypatch.setattr(handshake_tests, "os", R2Facade(real_os, pidfd_open=denied))
+    monkeypatch.setattr(handshake_tests, "r2_indirect_exit_capability", lambda: {"pidfd": False, "subreaper": True})
+    require_r2_indirect_exit()
+    context = R2Case(launch)
+    try:
+        child = context.spawn()
+        entry = next(row for row in context.custody.entries.values() if row["process"] is child)
+        assert entry["fd"] is None and child.native_handle is None
+        report = context.close()
+        assert report["state"] == "CLOSED"
+        proof = next(row["exit"] for row in report["entries"].values() if row["pid"] == child.pid)
+        assert proof["proof"] == "native_waitpid" and proof["wait_pid"] == child.pid
+        assert proof["wait_status"] == child.native_wait_evidence["wait_status"]
+        (launch.tmp / "native-only-proof.json").write_text(json.dumps({"report": report,
+                                                                    "native_wait": child.native_wait_evidence}))
+        assert R2Custody.quarantine_report is None
+        _teardown_r2_case(context)
     finally:
         context.close()
