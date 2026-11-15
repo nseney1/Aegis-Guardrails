@@ -7,22 +7,19 @@ ordinary team service users and hooks do not enter or import this CLI boundary.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
-import io
 import os
 from pathlib import Path
 import stat
-import sys
 
 from aegis_core import gitsafe, gitsafe_run, storage_confined
 
-__all__ = ["custody", "verify", "next_action", "descriptor_supported", "operation"]
+__all__ = ["custody", "verify", "next_action", "descriptor_supported"]
 
 _ACTIVE = ContextVar("aegis_lease_repository", default=None)
 _SCRATCH = "aegis-lease-scratch"
 _LIMIT = 65536
-_OUTPUT_LIMIT = 2 * 1024 * 1024
 _SELECTORS = (gitsafe_run.LOCAL_ENV - {"GIT_NO_REPLACE_OBJECTS"}) | {"GIT_NAMESPACE"}
 
 
@@ -320,27 +317,3 @@ def verify(root):
         _refuse("ambient_git_environment" if exc.code == "ambient_git_environment" else "liveness_unknown")
     except (OSError, ValueError, RuntimeError):
         _refuse()
-
-
-class _Output(io.StringIO):
-    def write(self, value):
-        if len(value) > _OUTPUT_LIMIT - self.tell():
-            raise gitsafe.GitError("liveness_unknown", code="git_output_limit")
-        return super().write(value)
-
-
-def operation(root, handler, args, now, *, refused=None, refusal_type=()):
-    """Publish one bounded result after descriptor cleanup has succeeded."""
-    with _Output() as output, _Output() as errors:
-        with redirect_stdout(output), redirect_stderr(errors):
-            with custody(root):
-                try:
-                    result = handler(args, root, now)
-                except refusal_type as exc:
-                    try:
-                        result = refused(args, root, now, exc)
-                    except Exception:
-                        _refuse()  # Rendering failure still produces one typed refusal.
-        sys.stdout.write(output.getvalue())
-        sys.stderr.write(errors.getvalue())
-        return result
